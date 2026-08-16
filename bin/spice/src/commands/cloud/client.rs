@@ -438,6 +438,11 @@ impl CloudClient {
 
     pub async fn delete_project(&self, target: &ProjectTarget) -> Result<()> {
         let project_id = self.resolve_id(target).await?;
+        self.delete_project_by_id(project_id).await
+    }
+
+    /// Delete the project with an already-resolved immutable Cloud ID.
+    pub async fn delete_project_by_id(&self, project_id: i64) -> Result<()> {
         self.inner
             .delete_project(project_id)
             .await

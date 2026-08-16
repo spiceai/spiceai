@@ -22,14 +22,17 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use runtime_cloud_connect::EnrollmentDraft;
+use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::identity::Identity;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt as _, Snafu};
 
 use super::project::ProjectMutation;
 
-pub(super) const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
-pub(super) const PROJECT_OPERATION_FILE: &str = "connect-project-operation.json";
+// Shared with the runtime, which removes these journals when the control plane
+// releases the instance.
+pub(super) const CONNECT_OPERATION_FILE: &str = CloudConnectConfig::CONNECT_OPERATION_FILE;
+pub(super) const PROJECT_OPERATION_FILE: &str = CloudConnectConfig::PROJECT_OPERATION_FILE;
 
 const CONNECT_OPERATION_SCHEMA_VERSION: u32 = 3;
 const PROJECT_OPERATION_SCHEMA_VERSION: u32 = 3;
@@ -447,6 +450,13 @@ impl ProjectOperation {
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    read_bounded_regular_file_with_metadata(path, max_bytes).map(|(bytes, _)| bytes)
+}
+
+pub(super) fn read_bounded_regular_file_with_metadata(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -481,7 +491,7 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec
             "the Cloud Connect state file exceeded its size limit",
         ));
     }
-    Ok(bytes)
+    Ok((bytes, metadata))
 }
 
 pub(super) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -534,40 +544,6 @@ fn promote_candidate(candidate: &Path, path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn promote_candidate(candidate: &Path, path: &Path) -> std::io::Result<()> {
     std::fs::rename(candidate, path)
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn promote_candidate(candidate: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(candidate, path)
-}
-
-/// Exercise the legacy non-replacing-filesystem rollback behavior in tests.
-/// Production Windows builds use `ReplaceFileW`, which is atomic and requires
-/// no backup window.
-#[cfg(test)]
-fn promote_candidate_without_replace(candidate: &Path, path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        let file_name = path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or(CONNECT_OPERATION_FILE);
-        let backup = path.with_file_name(format!(".{file_name}.{}.backup", rand::random::<u64>()));
-        std::fs::rename(path, &backup)?;
-        match std::fs::rename(candidate, path) {
-            Ok(()) => std::fs::remove_file(backup),
-            Err(promote_source) => {
-                std::fs::rename(&backup, path).map_err(|rollback_source| {
-                    std::io::Error::other(format!(
-                        "replacement failed ({promote_source}); rollback from {} also failed ({rollback_source})",
-                        backup.display()
-                    ))
-                })?;
-                Err(promote_source)
-            }
-        }
-    } else {
-        std::fs::rename(candidate, path)
-    }
 }
 
 #[cfg(unix)]
@@ -970,28 +946,6 @@ mod tests {
         )
         .expect("recover exact operation");
         assert_eq!(recovered, operation);
-    }
-
-    #[test]
-    fn non_replacing_promotion_replaces_an_existing_journal() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join(CONNECT_OPERATION_FILE);
-        let candidate = dir.path().join("candidate");
-        std::fs::write(&target, "prepared").expect("write old journal");
-        std::fs::write(&candidate, "enrolled").expect("write new journal");
-
-        promote_candidate_without_replace(&candidate, &target).expect("promote replacement");
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("read promoted journal"),
-            "enrolled"
-        );
-        assert!(!candidate.exists());
-        assert!(
-            std::fs::read_dir(dir.path())
-                .expect("read directory")
-                .flatten()
-                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".backup"))
-        );
     }
 
     #[cfg(unix)]

@@ -212,6 +212,13 @@ impl ReconnectableIdentity {
         self.identity.app_id.as_deref()
     }
 
+    /// The portal URL for monitoring this instance, when supplied at
+    /// enrollment.
+    #[must_use]
+    pub fn monitor_url(&self) -> Option<&str> {
+        self.identity.monitor_url.as_deref()
+    }
+
     /// Decode the local delivered-secrets cache key without exposing the
     /// identity's mTLS or encryption private keys.
     #[must_use]

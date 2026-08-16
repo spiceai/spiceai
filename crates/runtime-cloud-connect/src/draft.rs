@@ -49,13 +49,6 @@ use snafu::{ResultExt, Snafu};
 use crate::enroll::InstanceFacts;
 use crate::identity::{EnrollmentMaterial, IdentityStore};
 
-fn same_directory(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 /// File name (relative to `$SPICE_CONFIG_DIR`) of the enrollment draft.
 pub const ENROLLMENT_DRAFT_FILE: &str = "enrollment-draft.json";
 
@@ -173,7 +166,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// identity after promotion has started and race a new operation against the
 /// first process.
 pub struct EnrollmentTransactionLock {
+    /// Canonical name observed when the transaction was acquired. Retained for
+    /// diagnostics and, for ordinary callers, replacement detection.
     config_dir: PathBuf,
+    /// Directory root used for every protected state operation. On Linux a
+    /// removal that arrived through a retained descriptor gets a descriptor
+    /// owned by this guard, so a later rename cannot redirect its cleanup.
+    protected_config_dir: PathBuf,
+    directory_is_pinned: bool,
     draft_path: PathBuf,
     file: std::fs::File,
     #[cfg(unix)]
@@ -194,12 +194,47 @@ impl EnrollmentTransactionLock {
     }
 
     fn acquire_with_budget(config_dir: &Path, wait_budget: std::time::Duration) -> Result<Self> {
-        std::fs::create_dir_all(config_dir).context(IoSnafu {
-            path: config_dir.to_path_buf(),
-        })?;
+        #[cfg(target_os = "linux")]
+        let directory_is_pinned = is_retained_descriptor_path(config_dir);
+        #[cfg(not(target_os = "linux"))]
+        let directory_is_pinned = false;
+
+        // A retained `/proc/self/fd/N` path is already the caller's pinned
+        // authority. Duplicate N directly before any pathname operation; a
+        // canonicalize-then-open sequence would resolve the descriptor back to
+        // its mutable name and could lock a replacement directory instead.
+        #[cfg(target_os = "linux")]
+        let pinned_directory = if directory_is_pinned {
+            let draft_path = EnrollmentDraft::path_in(config_dir);
+            let (directory, _) =
+                crate::identity::open_verified_state_parent_unix(&draft_path, || {}).context(
+                    IoSnafu {
+                        path: config_dir.to_path_buf(),
+                    },
+                )?;
+            Some(directory)
+        } else {
+            None
+        };
+
+        if !directory_is_pinned {
+            std::fs::create_dir_all(config_dir).context(IoSnafu {
+                path: config_dir.to_path_buf(),
+            })?;
+        }
         // Pin every later draft and identity operation to the directory named
         // at acquisition time. Retargeting a symlink ancestor after this point
         // must not redirect state while the lock stays on the original inode.
+        #[cfg(target_os = "linux")]
+        let config_dir = if let Some(directory) = pinned_directory.as_ref() {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        } else {
+            std::fs::canonicalize(config_dir).context(IoSnafu {
+                path: config_dir.to_path_buf(),
+            })?
+        };
+        #[cfg(not(target_os = "linux"))]
         let config_dir = std::fs::canonicalize(config_dir).context(IoSnafu {
             path: config_dir.to_path_buf(),
         })?;
@@ -213,14 +248,39 @@ impl EnrollmentTransactionLock {
             });
         }
         #[cfg(unix)]
-        let directory = std::fs::File::open(&config_dir).context(IoSnafu {
-            path: config_dir.clone(),
-        })?;
-        let draft_path = EnrollmentDraft::path_in(&config_dir);
-        let lock_path = EnrollmentDraft::lock_path(&draft_path);
+        let directory = {
+            #[cfg(target_os = "linux")]
+            if let Some(directory) = pinned_directory {
+                directory
+            } else {
+                std::fs::File::open(&config_dir).context(IoSnafu {
+                    path: config_dir.clone(),
+                })?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::fs::File::open(&config_dir).context(IoSnafu {
+                    path: config_dir.clone(),
+                })?
+            }
+        };
+        let lock_path = EnrollmentDraft::lock_path(&EnrollmentDraft::path_in(&config_dir));
         let file = EnrollmentDraft::acquire_publication_lock_with_budget(&lock_path, wait_budget)?;
+
+        #[cfg(target_os = "linux")]
+        let protected_config_dir = if directory_is_pinned {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        } else {
+            config_dir.clone()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let protected_config_dir = config_dir.clone();
+        let draft_path = EnrollmentDraft::path_in(&protected_config_dir);
         let transaction = Self {
             config_dir,
+            protected_config_dir,
+            directory_is_pinned,
             draft_path,
             file,
             #[cfg(unix)]
@@ -230,10 +290,14 @@ impl EnrollmentTransactionLock {
         Ok(transaction)
     }
 
-    /// The canonical directory this transaction owns.
+    /// The directory root this transaction owns.
+    ///
+    /// Ordinary enrollment returns the canonical pathname. A Linux removal
+    /// acquired through a retained descriptor returns this guard's own
+    /// descriptor-relative root so the protected inode survives a rename.
     pub(crate) fn config_dir(&self) -> Result<&Path> {
         self.ensure_directory_stable()?;
-        Ok(&self.config_dir)
+        Ok(&self.protected_config_dir)
     }
 
     /// Verify that the canonical path still resolves to the directory inode
@@ -246,18 +310,27 @@ impl EnrollmentTransactionLock {
             let retained = self.directory.metadata().context(IoSnafu {
                 path: self.config_dir.clone(),
             })?;
-            let named = std::fs::metadata(&self.config_dir).context(IoSnafu {
-                path: self.config_dir.clone(),
+            let checked_path = if self.directory_is_pinned {
+                &self.protected_config_dir
+            } else {
+                &self.config_dir
+            };
+            let named = std::fs::metadata(checked_path).context(IoSnafu {
+                path: checked_path.clone(),
             })?;
-            let final_entry = std::fs::symlink_metadata(&self.config_dir).context(IoSnafu {
-                path: self.config_dir.clone(),
-            })?;
-            if final_entry.file_type().is_symlink()
-                || retained.dev() != named.dev()
-                || retained.ino() != named.ino()
-            {
+            let was_replaced = if self.directory_is_pinned {
+                false
+            } else {
+                std::fs::symlink_metadata(&self.config_dir)
+                    .context(IoSnafu {
+                        path: self.config_dir.clone(),
+                    })?
+                    .file_type()
+                    .is_symlink()
+            };
+            if was_replaced || retained.dev() != named.dev() || retained.ino() != named.ino() {
                 return Err(Error::Io {
-                    path: self.config_dir.clone(),
+                    path: checked_path.clone(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "the enrollment transaction directory was renamed or replaced",
@@ -287,6 +360,21 @@ impl EnrollmentTransactionLock {
     }
 
     pub(crate) fn protects(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        if self.directory_is_pinned {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            let Ok(retained) = self.directory.metadata() else {
+                return false;
+            };
+            let Ok(wanted) = std::fs::metadata(parent) else {
+                return false;
+            };
+            return retained.dev() == wanted.dev() && retained.ino() == wanted.ino();
+        }
         path.parent()
             .is_some_and(|wanted| same_directory(&self.config_dir, wanted))
     }
@@ -297,7 +385,8 @@ impl EnrollmentTransactionLock {
     pub(crate) fn protected_path(&self, path: &Path) -> Option<PathBuf> {
         self.ensure_directory_stable().ok()?;
         let file_name = path.file_name()?;
-        self.protects(path).then(|| self.config_dir.join(file_name))
+        self.protects(path)
+            .then(|| self.protected_config_dir.join(file_name))
     }
 
     /// Acquire exclusive ownership of a config directory's enrollment
@@ -468,6 +557,50 @@ fn open_unix_publication_lock(lock_path: &Path) -> std::io::Result<(std::fs::Fil
     }
     let lock = unsafe { std::fs::File::from_raw_fd(lock_descriptor) };
     Ok((lock, directory))
+}
+
+/// Whether two paths name the same directory, rather than the same spelling.
+///
+/// A config directory reached through a relative path, an absolute one, or an
+/// ancestor symlink is still that directory, and treating those as different is
+/// what makes a transaction refuse the very file it protects. Resolution needs
+/// both to exist; when either cannot be resolved there is nothing better than
+/// the spelling to go on.
+pub(crate) fn same_directory(one: &Path, other: &Path) -> bool {
+    // `Path::new("identity.json").parent()` is `Some("")`, the current
+    // directory said a different way. Canonicalizing the empty path fails while
+    // canonicalizing `.` succeeds, so without this the two spellings of one
+    // directory compare as different.
+    let one = if one.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        one
+    };
+    let other = if other.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        other
+    };
+    match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => one == other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_retained_descriptor_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(relative) = path.strip_prefix("/proc/self/fd") else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(descriptor)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && !descriptor.as_bytes().is_empty()
+        && descriptor.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
 /// The provisional, retry-stable state of one enrollment operation.
@@ -857,7 +990,18 @@ impl EnrollmentDraft {
                     path: path.to_path_buf(),
                 })?;
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match crate::identity::sync_parent_directory(path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(Error::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
             Err(source) => {
                 return Err(Error::Io {
                     path: path.to_path_buf(),
@@ -924,6 +1068,43 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec
 
 #[cfg(test)]
 mod tests {
+
+    /// A bare relative identity path has an empty parent, which is the current
+    /// directory written a different way. Canonicalizing `""` fails while `"."`
+    /// succeeds, so comparing the two spellings would make one directory look
+    /// like two — and the release would then try to take a second transaction on
+    /// a directory it already holds, which is a single non-blocking attempt, so
+    /// every `Remove` would fail.
+    #[test]
+    fn an_empty_directory_path_is_the_current_directory() {
+        assert!(
+            super::same_directory(std::path::Path::new(""), std::path::Path::new(".")),
+            "an empty path and `.` name the same directory"
+        );
+        assert_eq!(
+            std::path::Path::new("identity.json").parent(),
+            Some(std::path::Path::new("")),
+            "which is the parent a bare relative identity path has"
+        );
+    }
+
+    /// Directory identity, not spelling: the same directory reached through a
+    /// different route is still that directory.
+    #[test]
+    fn a_directory_reached_another_way_is_the_same_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let nested = dir.path().join("config");
+        std::fs::create_dir(&nested).expect("create the config dir");
+
+        assert!(
+            super::same_directory(&nested, &nested.join(".")),
+            "a trailing `.` does not make a different directory"
+        );
+        assert!(
+            !super::same_directory(&nested, dir.path()),
+            "but genuinely different directories still differ"
+        );
+    }
     use super::*;
 
     fn test_binding() -> EnrollmentRequestBinding {

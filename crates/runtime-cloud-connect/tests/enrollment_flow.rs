@@ -228,6 +228,9 @@ impl RuntimeHandle for AttachmentRuntime {
         capability == Capability::AttachApp
     }
 
+    // This attachment-only test handle cannot hold delivered secrets.
+    async fn clear_cloud_delivered_secrets(&self) {}
+
     /// Mirrors the production handle: the tuple is persisted into the identity
     /// file before the command is acknowledged, so the test can assert what
     /// ends up on disk — org durability across detach and bare re-attach —
@@ -259,6 +262,9 @@ impl RuntimeHandle for CapturedRuntime {
     fn supports(&self, capability: Capability) -> bool {
         capability == Capability::ApplySpicepod
     }
+
+    // This test adapter persists only the Spicepod and holds no secret store.
+    async fn clear_cloud_delivered_secrets(&self) {}
 
     async fn apply_spicepod(
         &self,

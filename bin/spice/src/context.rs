@@ -482,7 +482,7 @@ impl RuntimeContext {
     /// [`Self::spiced_path`] — which is derived from `HOME` — points at
     /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
     /// invoking user actually installed. That matters because
-    /// `sudo spice connect --install` is the documented way to install the
+    /// `sudo spice connect service install` is the documented way to install the
     /// service: without this, every such run concludes the runtime is missing
     /// and downloads the latest *release*, which on a machine tracking `trunk`
     /// silently pairs a dev CLI with a released runtime.
@@ -774,7 +774,7 @@ fn sudo_invoker_home() -> Option<PathBuf> {
 /// Absolute paths `getent` ships at, in the order they are tried.
 ///
 /// Resolving it through `PATH` would be a privilege-escalation hole: this runs
-/// under `sudo` on the documented `spice connect --install` path, so a `PATH`
+/// under `sudo` on the documented `spice connect service install` path, so a `PATH`
 /// entry the invoking user controls would have this process execute their binary
 /// as root. Only these known locations are accepted, and a host with `getent`
 /// somewhere else falls through to reading `/etc/passwd`.
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn passwd_home_resolves_a_user_macos_keeps_out_of_etc_passwd() {
         // Every ordinary macOS account lives in Directory Services only, so
-        // without the `dscl` step `sudo spice connect --install` cannot find the
+        // without the `dscl` step `sudo spice connect service install` cannot find the
         // runtime the invoking user installed.
         let Ok(user) = std::env::var("USER") else {
             return;
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
-    /// home must still be found — otherwise `sudo spice connect --install`
+    /// home must still be found — otherwise `sudo spice connect service install`
     /// concludes the runtime is missing and downloads a release over the
     /// operator's build.
     #[test]

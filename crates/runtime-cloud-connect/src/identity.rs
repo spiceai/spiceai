@@ -691,7 +691,7 @@ fn acquire_update_transaction(
 }
 
 fn acquire_removal_transaction(path: &Path) -> Result<crate::draft::EnrollmentTransactionLock> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let config_dir = parent_directory(path);
     crate::draft::EnrollmentTransactionLock::acquire_for_removal(config_dir).map_err(|source| {
         Error::UpdateTransaction {
             path: path.to_path_buf(),
@@ -742,16 +742,10 @@ pub fn snapshot_regular_file_create_new(
 
     #[cfg(unix)]
     let (mut source_file, mut destination_file) = {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::unix::fs::MetadataExt as _;
 
-        let mut source_options = std::fs::OpenOptions::new();
-        source_options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        let source_file = match source_options.open(source) {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => return Err(source),
+        let Some(source_file) = open_regular_file_optional_unix(source)? else {
+            return Ok(false);
         };
         let source_metadata = source_file.metadata()?;
         if !source_metadata.is_file() || source_metadata.nlink() != 1 {
@@ -761,13 +755,7 @@ pub fn snapshot_regular_file_create_new(
             ));
         }
 
-        let mut destination_options = std::fs::OpenOptions::new();
-        destination_options
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        let destination_file = destination_options.open(destination)?;
+        let destination_file = create_regular_file_new_unix(destination)?;
         (source_file, destination_file)
     };
 
@@ -793,10 +781,26 @@ pub fn snapshot_regular_file_create_new(
 /// rejected so a privileged bootstrap cannot be redirected outside its config
 /// directory or held indefinitely by a special file.
 pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<String>> {
+    const MAX_STATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+    let Some(bytes) = read_regular_file_optional_bounded(path, MAX_STATE_FILE_BYTES)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes).map(Some).map_err(|source| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the state file was not UTF-8: {source}"),
+        )
+    })
+}
+
+pub(crate) fn read_regular_file_optional_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
 
     #[cfg(unix)]
-    let Some(mut file) = open_regular_file_optional_unix(path)? else {
+    let Some(file) = open_regular_file_optional_unix(path)? else {
         return Ok(None);
     };
 
@@ -808,15 +812,34 @@ pub(crate) fn read_regular_file_optional(path: &Path) -> std::io::Result<Option<
         ));
     };
 
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "the state path must be a regular file",
+            "the state path must be a bounded regular file",
         ));
     }
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the state file must not be hard-linked",
+            ));
+        }
+    }
+
+    let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the state file exceeded its size limit",
+        ));
+    }
     Ok(Some(contents))
 }
 
@@ -880,7 +903,7 @@ fn open_regular_file_optional_unix_with(
 /// Open the directory containing a state file without allowing a path lookup
 /// to retarget it after validation.
 ///
-/// A Linux caller may intentionally root the path at the live directory
+/// A Linux removal may intentionally root the path at the live directory
 /// descriptor retained by [`crate::mutation_lock::MutationLock`]. That exact
 /// `/proc/self/fd/N` spelling is process-owned authority, so duplicate `N`
 /// directly instead of following procfs's magic symlink. Every ordinary path
@@ -983,6 +1006,45 @@ fn retained_directory_descriptor(path: &Path) -> Option<std::os::fd::RawFd> {
         .ok()?
         .parse()
         .ok()
+}
+
+#[cfg(unix)]
+fn create_regular_file_new_unix(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (directory, file_name) = open_verified_state_parent_unix(path, || {})?;
+    let file_name = CString::new(file_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the state path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `file_name` is NUL-terminated and `directory` remains live.
+    // `O_EXCL` and `O_NOFOLLOW` make an existing or redirected leaf fail.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new owned descriptor on success.
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} must be a singly-linked regular file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -1437,7 +1499,16 @@ impl IdentityStore {
             Ok(()) => sync_parent_directory(path).context(IoSnafu {
                 path: path.to_path_buf(),
             }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match sync_parent_directory(path) {
+                    Ok(()) => Ok(()),
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(source) => Err(Error::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }),
+                }
+            }
             Err(err) => Err(Error::Io {
                 path: path.to_path_buf(),
                 source: err,
@@ -1598,11 +1669,125 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// The directory a file lives in, as a path that can actually be opened.
+///
+/// `Path::parent` answers `Some("")` for a bare relative name like
+/// `identity.json` — the current directory, spelled in a way no syscall accepts.
+/// Left as-is it turns `read_dir` into a `NotFound` that reads as "no debris
+/// here" and turns the directory sync into a failure after the file is already
+/// unlinked.
+pub(crate) fn parent_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Which writer's artifacts may appear beside a file.
+///
+/// Two writers, two shapes, and they do not overlap: the runtime writes the
+/// cache, the draft and the identity through [`atomic_write_owner_only`], while
+/// `spice connect` writes the operation journals and the endpoint override
+/// through its own. Accepting both everywhere would delete a
+/// `.identity.json.7.candidate` nothing here can create, and let a
+/// `.cloud-endpoint.<uuid>.tmp` — equally impossible — fail every release.
+/// Dot-prefixed runtime artifacts are only the v4 UUID temps emitted by the
+/// current writer.
+#[derive(Clone, Copy, Debug)]
+pub enum ArtifactKinds {
+    /// `.tmp` from [`atomic_write_owner_only`].
+    Runtime,
+    /// `.candidate` from `spice connect`'s writer.
+    Connect,
+}
+
+/// The `(token, extension)` of a sibling `kinds` could have written beside
+/// `file_name`, or `None` for anything else in the directory.
+///
+/// Prefix and extension alone are not enough. A sibling somebody named
+/// themselves — `.cloud-endpoint.notes.candidate`, `.identity.json.manual.bak` —
+/// is not ours to delete, and a stray `.tmp` would be worse than deleted: the
+/// release reads an unreclaimable temp as a writer's in-flight file and fails, so
+/// one sitting in the directory would fail every `Remove` for good.
+///
+/// Every comparison is exact, because every emitted name is: the extensions are
+/// written lowercase, the UUID is `Uuid::new_v4`'s lowercase hyphenated
+/// `Display`, and the candidate token is `u64::to_string`.
+fn produced_artifact<'a>(
+    entry_name: &'a str,
+    prefix: &str,
+    kinds: ArtifactKinds,
+) -> Option<(&'a str, &'a str)> {
+    let (token, extension) = entry_name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.rsplit_once('.'))?;
+    let produced = match (kinds, extension) {
+        (ArtifactKinds::Runtime, "tmp") => uuid::Uuid::parse_str(token).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.hyphenated().to_string() == token
+        }),
+        (ArtifactKinds::Connect, "candidate") => token
+            .parse::<u64>()
+            .is_ok_and(|number| number.to_string() == token),
+        _ => false,
+    };
+    produced.then_some((token, extension))
+}
+
+/// Whether `entry_name` is an exact sibling artifact the runtime atomic writer
+/// can create for `path`: a canonical UUID-v4 `.tmp`.
+#[must_use]
+pub fn is_runtime_atomic_write_artifact(path: &Path, entry_name: &str) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = format!(".{file_name}.");
+    produced_artifact(entry_name, &prefix, ArtifactKinds::Runtime).is_some()
+}
+
+/// Whether an interrupted writer left an exact artifact beside `path`.
+///
+/// This is the non-mutating half of release discovery. Interactive removal
+/// uses it before confirmation so it can distinguish a genuinely empty
+/// directory from one that needs crash-debris cleanup without deleting
+/// anything the operator has not yet approved.
+///
+/// # Errors
+///
+/// Returns an error when the artifact directory cannot be inspected safely.
+pub fn release_artifacts_present(path: &Path, kinds: ArtifactKinds) -> std::io::Result<bool> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::other(format!(
+            "cannot identify interrupted writes beside {}: its file name is not valid UTF-8",
+            path.display()
+        )));
+    };
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(parent_directory(path)) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(source),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        if entry_name
+            .to_str()
+            .is_some_and(|name| produced_artifact(name, &prefix, kinds).is_some())
+            && entry.file_type()?.is_file()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A newly-created writer gets ample time to acquire its advisory lock before
 /// another process may consider its temp file abandoned. The lock remains the
 /// authoritative liveness signal after this age; time alone never authorizes
 /// deletion of an active writer.
-const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
+pub(crate) const ABANDONED_TEMP_MIN_AGE: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Reclaim secret-bearing temp files left by a process that exited before
 /// promotion.
@@ -1615,18 +1800,19 @@ fn cleanup_abandoned_atomic_temps(
     path: &Path,
     minimum_age: std::time::Duration,
 ) -> std::io::Result<()> {
-    cleanup_abandoned_atomic_temps_with(path, minimum_age, |_, _| Ok(()))
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, ArtifactKinds::Runtime, |_, _| Ok(()))
 }
 
 fn cleanup_abandoned_atomic_temps_with<F>(
     path: &Path,
     minimum_age: std::time::Duration,
+    kinds: ArtifactKinds,
     before_remove: F,
 ) -> std::io::Result<()>
 where
     F: Fn(&std::fs::File, &Path) -> std::io::Result<()>,
 {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1644,14 +1830,9 @@ where
         let Some(entry_name) = entry_name.to_str() else {
             continue;
         };
-        let is_temp = Path::new(entry_name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
-        if !entry_name.starts_with(&prefix)
-            || !is_temp
-            || entry_name.len() <= prefix.len() + ".tmp".len()
-            || !entry.file_type()?.is_file()
-        {
+        let is_temp = produced_artifact(entry_name, &prefix, kinds)
+            .is_some_and(|(_, extension)| extension == "tmp");
+        if !is_temp || !entry.file_type()?.is_file() {
             continue;
         }
 
@@ -1691,6 +1872,214 @@ where
     Ok(())
 }
 
+/// What a release could not reclaim, split by whether it can still be renamed
+/// onto the canonical path.
+#[derive(Debug, Default)]
+pub(crate) struct RemainingArtifacts {
+    /// Temps whose writer may still promote them, undoing the release.
+    pub(crate) promotable: Vec<PathBuf>,
+    /// Artifacts that remain on disk but cannot become the canonical file.
+    pub(crate) inert: Vec<PathBuf>,
+}
+
+/// Reclaim the secret-bearing artifacts an interrupted atomic write leaves beside
+/// `path`, for a release that is deleting `path` itself.
+///
+/// [`atomic_write_owner_only`] writes through a uniquely-named temp and unlinks
+/// it best-effort on failure. A temp can outlive the process that made it,
+/// holding the same credential the canonical file did — so a release that
+/// removed only the canonical file would report a host clean while leaving a
+/// complete copy of what it was supposed to destroy.
+///
+/// Temps are reclaimed on the same terms as anywhere else: a live writer holds an
+/// exclusive advisory lock on its own temp, so *acquiring* that lock is what
+/// establishes no writer owns the file, and only a temp older than `minimum_age`
+/// whose lock the reclaim takes may be removed. A release does not relax that —
+/// deleting a live writer's file to tidy up would be the worse outcome.
+///
+/// A temp that survives is therefore reported as **promotable**, not merely
+/// retained: whoever owns it can still rename it onto the canonical path, which
+/// would put back the very file the release is removing, after the release has
+/// reported success. A caller that cannot tolerate that must fail rather than
+/// acknowledge.
+///
+/// So are `.candidate` files, the artifact `spice connect` leaves for the state
+/// it writes — the operation journals and the endpoint override. Those get no
+/// per-file lock, so the temp rule cannot judge them; what authorizes removing
+/// them is that a release holds `connect.lock` for its whole run, which is the
+/// same lock their writer holds for its whole transaction. No `spice connect`
+/// can be mid-write, so any candidate present has been abandoned.
+///
+/// Returns what is still present afterwards, split by whether it can still
+/// become the canonical file.
+pub(crate) fn release_atomic_write_artifacts(
+    path: &Path,
+    minimum_age: std::time::Duration,
+    kinds: ArtifactKinds,
+) -> std::io::Result<RemainingArtifacts> {
+    // Fail closed on a name this cannot read, rather than scanning under the
+    // fallback prefix the writer uses. That fallback is `identity.json`, so the
+    // artifacts of an unreadable name are spelled exactly like a real
+    // `identity.json`'s and the two are indistinguishable from the outside:
+    // reclaiming them would delete the other file's debris, and finding one held
+    // would fail this release over the other file's writer. Neither is a
+    // judgement worth making blind. It stops the release before the identity is
+    // cleared — the only step that cannot be retried — so the instance stays
+    // connected and can be released once the path is one both sides can name.
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::other(format!(
+            "cannot identify interrupted writes beside {}: its file name is not valid UTF-8, so they cannot be told apart from another file's",
+            path.display()
+        )));
+    };
+    cleanup_abandoned_atomic_temps_with(path, minimum_age, kinds, |_, _| Ok(()))?;
+
+    let mut remaining = RemainingArtifacts::default();
+    let dir = parent_directory(path);
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RemainingArtifacts::default());
+        }
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some(entry_name) = entry_name.to_str() else {
+            continue;
+        };
+        let Some((_, extension)) = produced_artifact(entry_name, &prefix, kinds) else {
+            continue;
+        };
+        // Only regular files, as the temp cleanup requires: none of these writers
+        // creates a directory or a symlink, so anything else wearing the name came
+        // from somewhere else and is neither ours to delete nor evidence of a
+        // writer.
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let is_temp = extension == "tmp";
+        let is_abandoned = !is_temp;
+        if is_abandoned {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {}
+            }
+            // It could not be removed, but nothing renames a candidate into
+            // place on its own, so it cannot undo the release.
+            remaining.inert.push(entry.path());
+            continue;
+        }
+        remaining.promotable.push(entry.path());
+    }
+
+    // Durable, like the canonical removals: reporting that no credential copy
+    // remains is a claim about what survives a crash, and an unlink that is
+    // acknowledged but not synced can bring one back. One sync covers every
+    // unlink above, including the temps the reclaim removed.
+    sync_parent_directory(path)?;
+    Ok(remaining)
+}
+
+/// Prove that a release can scan every writer artifact and that no runtime temp
+/// could still be promoted, without deleting anything. Callers run this for
+/// every canonical release target before unlinking the first one; once their
+/// mutation/enrollment locks are held, no conforming writer can appear between
+/// this gate and cleanup.
+#[expect(
+    dead_code,
+    reason = "release preflight primitive is staged before its authenticated orchestration caller"
+)]
+pub(crate) fn preflight_release_atomic_write_artifacts(
+    path: &Path,
+    minimum_age: std::time::Duration,
+    kinds: ArtifactKinds,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(std::io::Error::other(format!(
+            "cannot identify interrupted writes beside {}: its file name is not valid UTF-8",
+            path.display()
+        )));
+    };
+
+    let prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(parent_directory(path)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let entry_name = entry.file_name();
+        let Some((_, extension)) = entry_name
+            .to_str()
+            .and_then(|name| produced_artifact(name, &prefix, kinds))
+        else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() || extension != "tmp" {
+            continue;
+        }
+
+        let old_enough = entry
+            .metadata()?
+            .modified()?
+            .elapsed()
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
+            return Ok(Some(entry.path()));
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&file)? {
+            return Ok(Some(entry.path()));
+        }
+        drop(file);
+    }
+    Ok(None)
+}
+
+/// Reclaim every interrupted-write artifact beside `path`, failing if any
+/// writer-owned or inert copy remains.
+///
+/// The caller must already exclude runtime and CLI writers for the complete
+/// operation. Under that exclusion, a zero age is safe: a live atomic writer
+/// still owns an advisory lock, while an unlocked artifact cannot become live
+/// again. This stricter form is used by local removal before it destroys the
+/// canonical credential that would make a retry possible.
+///
+/// # Errors
+///
+/// Returns an error when the artifact directory cannot be scanned or synced,
+/// an artifact cannot be reclaimed, or another writer still owns a promotable
+/// temporary file.
+pub fn reclaim_all_release_artifacts(path: &Path, kinds: ArtifactKinds) -> std::io::Result<()> {
+    let remaining = release_atomic_write_artifacts(path, std::time::Duration::ZERO, kinds)?;
+    if let Some(artifact) = remaining
+        .promotable
+        .first()
+        .or_else(|| remaining.inert.first())
+    {
+        return Err(std::io::Error::other(format!(
+            "interrupted-write artifact {} remains beside {}",
+            artifact.display(),
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Atomically write `bytes` to `path` with owner-only permissions.
 ///
 /// Shared with [`crate::secret_cache`]: both files hold secret material and need
@@ -1705,7 +2094,7 @@ pub(crate) fn atomic_write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Res
     use std::os::unix::fs::PermissionsExt as _;
 
     cleanup_abandoned_atomic_temps(path, ABANDONED_TEMP_MIN_AGE)?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -1753,10 +2142,12 @@ pub(crate) fn atomic_write_owner_only(_path: &Path, _bytes: &[u8]) -> std::io::R
 /// directory metadata durable across power loss.
 #[cfg(unix)]
 pub(crate) fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_directory(path);
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Directory metadata synchronization is unavailable on non-Unix platforms.
+/// File contents are still flushed before promotion.
 #[cfg(not(unix))]
 pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
@@ -2004,9 +2395,15 @@ mod tests {
     fn abandoned_atomic_temp_cleanup_preserves_a_locked_writer() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let path = dir.path().join("identity.json");
-        let active_temp = dir.path().join(".identity.json.active.tmp");
-        let abandoned_temp = dir.path().join(".identity.json.abandoned.tmp");
-        let unrelated = dir.path().join(".different.json.abandoned.tmp");
+        let active_temp = dir
+            .path()
+            .join(".identity.json.aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.tmp");
+        let abandoned_temp = dir
+            .path()
+            .join(".identity.json.11111111-2222-4333-8444-555555555555.tmp");
+        let unrelated = dir
+            .path()
+            .join(".different.json.66666666-7777-4888-8999-aaaaaaaaaaaa.tmp");
         let active = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -2019,18 +2416,23 @@ mod tests {
         std::fs::write(&unrelated, "unrelated").expect("write unrelated temp");
 
         let observed_locked_removal = std::cell::Cell::new(false);
-        cleanup_abandoned_atomic_temps_with(&path, std::time::Duration::ZERO, |_, candidate| {
-            let contender = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(candidate)?;
-            assert!(
-                !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
-                "the cleanup lock must remain held through removal"
-            );
-            observed_locked_removal.set(true);
-            Ok(())
-        })
+        cleanup_abandoned_atomic_temps_with(
+            &path,
+            std::time::Duration::ZERO,
+            ArtifactKinds::Runtime,
+            |_, candidate| {
+                let contender = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(candidate)?;
+                assert!(
+                    !fs4::fs_std::FileExt::try_lock_exclusive(&contender)?,
+                    "the cleanup lock must remain held through removal"
+                );
+                observed_locked_removal.set(true);
+                Ok(())
+            },
+        )
         .expect("clean abandoned temps");
 
         assert!(active_temp.exists(), "a live writer must not be deleted");
@@ -2050,6 +2452,30 @@ mod tests {
         assert!(
             !active_temp.exists(),
             "a writer temp becomes reclaimable after its process releases the lock"
+        );
+    }
+
+    /// A bare relative name has `parent() == Some("")`, the current directory
+    /// spelled in a way no syscall accepts. Every scan and directory sync in the
+    /// release resolves through this, so leaving it unnormalized turns `read_dir`
+    /// into a `NotFound` read as "no debris here" and turns the sync into a
+    /// failure after the canonical file is already unlinked.
+    #[test]
+    fn a_name_without_a_directory_resolves_to_the_current_one() {
+        assert_eq!(
+            super::parent_directory(Path::new("identity.json")),
+            Path::new("."),
+            "an empty parent is the current directory"
+        );
+        assert_eq!(
+            super::parent_directory(Path::new("/")),
+            Path::new("."),
+            "and so is no parent at all"
+        );
+        assert_eq!(
+            super::parent_directory(Path::new("/etc/spice/identity.json")),
+            Path::new("/etc/spice"),
+            "while a real parent is left alone"
         );
     }
 

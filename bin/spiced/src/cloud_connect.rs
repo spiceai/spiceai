@@ -959,6 +959,86 @@ struct SpicedRuntimeHandleParts {
     runtime_overrides: Vec<(String, String)>,
 }
 
+/// A test-only signal fired immediately before the test cache writer takes the
+/// connect mutation lock, while the cache key has not yet been read.
+///
+/// That ordering is what prevents a release from being undone — a key read
+/// before the lock stays usable across the release, so the write would republish
+/// a cache whose key is gone. Without a signal here a test cannot tell whether a
+/// writer had reached the key read before the release ran, so a key load that
+/// moved ahead of the lock would go unnoticed. Arming is keyed on the config
+/// directory so concurrent tests never observe one another.
+#[cfg(test)]
+mod cache_lock_seam {
+    use std::path::{Path, PathBuf};
+
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+    static ARMED: Mutex<Vec<(PathBuf, UnboundedSender<()>)>> = Mutex::new(Vec::new());
+
+    /// Watch for a writer in `config_dir` reaching the lock.
+    pub(super) fn arm(config_dir: &Path) -> UnboundedReceiver<()> {
+        let (tx, rx) = unbounded_channel();
+        ARMED.lock().push((config_dir.to_path_buf(), tx));
+        rx
+    }
+
+    /// Announce that a writer in `config_dir` is about to take the lock.
+    pub(super) fn reached(config_dir: &Path) {
+        for (dir, tx) in ARMED.lock().iter() {
+            if dir == config_dir {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    static ARMED_WRITE: Mutex<Vec<(PathBuf, UnboundedSender<bool>)>> = Mutex::new(Vec::new());
+
+    /// Watch a writer in `config_dir` reach the write itself, reporting whether
+    /// the connect mutation lock is still held at that moment.
+    pub(super) fn arm_write(config_dir: &Path) -> UnboundedReceiver<bool> {
+        let (tx, rx) = unbounded_channel();
+        ARMED_WRITE.lock().push((config_dir.to_path_buf(), tx));
+        rx
+    }
+
+    /// Announce that a writer in `config_dir` has read the key and is about to
+    /// write, and say whether the lock still covers it.
+    ///
+    /// Probed rather than assumed: the guard has to travel into the blocking
+    /// task, and a guard dropped on the way there leaves the write exposed to a
+    /// release with nothing in the outcome to show for it.
+    pub(super) fn reached_write(config_dir: &Path) {
+        let armed = ARMED_WRITE.lock();
+        if armed.iter().all(|(dir, _)| dir != config_dir) {
+            return;
+        }
+        let held = still_locked(config_dir);
+        for (dir, tx) in armed.iter() {
+            if dir == config_dir {
+                let _ = tx.send(held);
+            }
+        }
+    }
+
+    /// Whether someone holds `connect.lock` in `config_dir`. Same-process holders
+    /// count: these are advisory locks on the open file description, so a second
+    /// descriptor conflicts with the guard the writer is carrying.
+    fn still_locked(config_dir: &Path) -> bool {
+        let path = config_dir.join(runtime_cloud_connect::MUTATION_LOCK_FILE);
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open the connect mutation lock to probe it");
+        // Not `unwrap_or(false)`: that turns a filesystem without working advisory
+        // locks into a report of "held", which is exactly the answer that makes
+        // the assertion pass without proving anything.
+        !fs4::fs_std::FileExt::try_lock_exclusive(&probe).expect("probe the connect mutation lock")
+    }
+}
+
 impl SpicedRuntimeHandle {
     fn new(parts: SpicedRuntimeHandleParts) -> Self {
         let SpicedRuntimeHandleParts {
@@ -1054,7 +1134,13 @@ impl SpicedRuntimeHandle {
     /// both cases the cache is unavailable, which costs a redeploy after a
     /// restart rather than the deployment.
     fn cache_key(&self) -> Option<CacheKey> {
-        IdentityStore::load_optional(&self.identity_path)
+        Self::cache_key_at(&self.identity_path)
+    }
+
+    /// The path-taking form, for the blocking task that writes the cache: it owns
+    /// a clone of the path rather than borrowing the handle.
+    fn cache_key_at(identity_path: &Path) -> Option<CacheKey> {
+        IdentityStore::load_optional(identity_path)
             .ok()
             .flatten()
             .and_then(|identity| identity.cache_key())
@@ -1075,12 +1161,15 @@ impl SpicedRuntimeHandle {
         }
     }
 
-    fn cache_key_at(&self, config_dir: &Path) -> Option<CacheKey> {
-        IdentityStore::load_optional(&self.identity_path_at(config_dir))
-            .ok()
-            .flatten()
-            .and_then(|identity| identity.cache_key())
-    }
+    /// How long a deployment waits for the connect mutation lock before giving up
+    /// on caching.
+    ///
+    /// Short on purpose: the cache is best-effort and its failure is reported, so
+    /// a deployment must not stall behind a `spice connect` that runs for as long
+    /// as an operator takes. Long enough to outlast a release, which only unlinks
+    /// a few files.
+    #[cfg(test)]
+    const CACHE_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Persist the delivered secrets so the next start comes back up with them,
     /// without a control-plane round trip.
@@ -1089,23 +1178,111 @@ impl SpicedRuntimeHandle {
     /// the time this runs, so a cache failure costs a redeploy after the next
     /// start rather than the deployment. It is reported in the command result so
     /// the operator is not left to discover it at start time.
-    fn cache_delivered_secrets(
+    #[cfg(test)]
+    async fn cache_delivered_secrets(
         &self,
         config_dir: &Path,
-        secrets: &runtime_cloud_connect::sealed_secrets::DeliveredSecrets,
+        secrets: Arc<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
     ) -> Option<String> {
-        let Some(key) = self.cache_key_at(config_dir) else {
-            let error = "the enrolled identity has no delivered-secret cache key; reconnect this instance, then deploy again so the secrets survive a restart".to_string();
-            tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {error}");
-            return Some(error);
-        };
-        let path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
-        // No deployment version to record: the dispatch does not carry one.
-        match runtime_cloud_connect::secret_cache::write(&path, &key, "", secrets) {
-            Ok(()) => None,
+        // Excludes a release in ANOTHER process — a `Remove` handled by a second
+        // `spiced` on this config directory, or a local `spice connect remove` —
+        // which deletes this cache together with the identity holding its key.
+        // Within one process the control stream already serializes the two, but
+        // the lock is what makes that true across processes.
+        //
+        // The key is read under the lock, and that is the part that matters: with
+        // the lock alone, a key read beforehand would still let this write land
+        // after a release had deleted the cache, recreating it with a key that no
+        // longer exists. Reading it here means a release that has already run
+        // leaves no key to find, and this write is skipped.
+        // The seam sits here, not after the lock: this is the point the key must
+        // not have been read yet.
+        #[cfg(test)]
+        cache_lock_seam::reached(config_dir);
+
+        let mutation = match runtime_cloud_connect::MutationLock::acquire_with_timeout(
+            config_dir,
+            "cache-secrets",
+            Self::CACHE_WRITE_LOCK_TIMEOUT,
+        )
+        .await
+        {
+            Ok(held) => held,
             Err(err) => {
+                tracing::warn!(
+                    "Spice Cloud Connect: could not take the connect mutation lock to cache delivered secrets: {err}"
+                );
+                return Some(format!("could not take the connect mutation lock: {err}"));
+            }
+        };
+        let pinned_config_dir = match mutation.descriptor_relative_config_dir() {
+            Ok(config_dir) => config_dir.clone(),
+            Err(err) => {
+                tracing::warn!(
+                    "Spice Cloud Connect: could not pin the locked config directory before secrets could be cached: {err}"
+                );
+                return Some(format!("could not pin the locked config directory: {err}"));
+            }
+        };
+        self.cache_delivered_secrets_locked(&pinned_config_dir, config_dir, secrets, mutation)
+            .await
+    }
+
+    /// Blocking cache write that takes ownership of the mutation lock. Tokio
+    /// cannot cancel a running blocking task, so the guard has to travel into
+    /// that task too: aborting the async caller must not let removal acquire the
+    /// directory while the write is still finishing.
+    async fn cache_delivered_secrets_locked(
+        &self,
+        pinned_config_dir: &Path,
+        #[cfg_attr(
+            not(test),
+            expect(unused_variables, reason = "used by the test-only cache lock seam")
+        )]
+        diagnostic_config_dir: &Path,
+        secrets: Arc<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
+        mutation: runtime_cloud_connect::MutationLock,
+    ) -> Option<String> {
+        let identity_path = self.identity_path_at(pinned_config_dir);
+        #[cfg(test)]
+        let seam_dir = diagnostic_config_dir.to_path_buf();
+        let path = pinned_config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        let cached = tokio::task::spawn_blocking(move || {
+            // Owned by the closure, rather than the awaiting future. Dropping
+            // the JoinHandle on cancellation cannot release the exclusion
+            // before this closure completes.
+            let _mutation = mutation;
+            let identity = IdentityStore::load_optional(&identity_path)
+                .map_err(|error| format!("load the enrolled identity for secret caching: {error}"))?;
+            let Some(identity) = identity else {
+                // A release that won the mutation lock deliberately removed the
+                // identity and cache. There is nothing left for this delayed
+                // writer to persist, and that completed release is not a cache
+                // failure.
+                return Ok(());
+            };
+            let Some(key) = identity.cache_key() else {
+                return Err("the enrolled identity has no delivered-secret cache key; reconnect this instance, then deploy again so the secrets survive a restart".to_string());
+            };
+            #[cfg(test)]
+            cache_lock_seam::reached_write(&seam_dir);
+            // No deployment version to record: the dispatch does not carry one.
+            runtime_cloud_connect::secret_cache::write(&path, &key, "", &secrets)
+                .map_err(|error| error.to_string())
+        })
+        .await;
+
+        match cached {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => {
                 tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {err}");
-                Some(err.to_string())
+                Some(err)
+            }
+            Err(source) => {
+                tracing::warn!(
+                    "Spice Cloud Connect: the task caching delivered secrets stopped unexpectedly: {source}"
+                );
+                Some(format!("the caching task stopped unexpectedly: {source}"))
             }
         }
     }
@@ -1126,7 +1303,7 @@ impl SpicedRuntimeHandle {
     ) -> (SecretCachePromotion, Option<String>) {
         let incoming = config_dir.join(INCOMING_SECRET_CACHE_FILE);
         let _ = std::fs::remove_file(&incoming);
-        let Some(key) = self.cache_key_at(config_dir) else {
+        let Some(key) = Self::cache_key_at(&self.identity_path_at(config_dir)) else {
             let error = "the enrolled identity has no delivered-secret cache key; reconnect this instance, then deploy again so the secrets survive a restart".to_string();
             tracing::warn!("Spice Cloud Connect: could not cache delivered secrets: {error}");
             return (SecretCachePromotion::Remove, Some(error));
@@ -1148,12 +1325,19 @@ impl SpicedRuntimeHandle {
     /// reads, and a write that failed on an earlier deployment would otherwise
     /// never be retried: a redelivery is the last chance to repair it before a
     /// start needs it.
-    fn refresh_secret_cache(
+    async fn refresh_secret_cache(
         &self,
         config_dir: &Path,
-        delivered_secrets: Option<&runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
+        delivered_secrets: Option<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
+        mutation: runtime_cloud_connect::MutationLock,
     ) -> Option<String> {
-        self.cache_delivered_secrets(config_dir, delivered_secrets?)
+        self.cache_delivered_secrets_locked(
+            config_dir,
+            config_dir,
+            Arc::new(delivered_secrets?),
+            mutation,
+        )
+        .await
     }
 
     /// Install the delivered values this instance does not hold, and report the
@@ -1207,14 +1391,13 @@ impl SpicedRuntimeHandle {
     /// 2. The secrets cache is staged with the Spicepod, and both are promoted
     ///    under one write-ahead transaction before any delivered value becomes
     ///    visible in memory. A promotion failure therefore cannot unblock a
-    ///    component with a deployment that did not commit.
+    ///    component with a deployment that did not commit. A start interrupted
+    ///    anywhere in that swap restores the prior pair before reading either
+    ///    file.
     /// 3. Newly delivered values are installed only after that durable commit,
     ///    before the initial load is waited on. This still lets a deployment
     ///    carrying a missing credential unblock that load, while ensuring the
     ///    next start reads the same generation the process exposed.
-    ///    A start interrupted anywhere in the swap restores the prior pair
-    ///    before reading either file, so it never combines one deployment's
-    ///    configuration with another deployment's credentials.
     /// 4. What this process serves changes last, so a promotion that fails
     ///    leaves the instance serving the configuration it already had.
     ///
@@ -1240,6 +1423,10 @@ impl SpicedRuntimeHandle {
         } else {
             self.runtime.read_app().await
         };
+        // The cache writer crosses into the blocking pool. Put the potentially
+        // 1 MiB delivery behind an Arc once so that handoff is constant-time and
+        // this async driver never clones the secret names or values.
+        let delivered_secrets = delivered_secrets.map(Arc::new);
         let staged =
             stage_cloud_managed_spicepod(config_dir, spicepod_yaml, &self.runtime_overrides)
                 .await?;
@@ -1322,7 +1509,7 @@ impl SpicedRuntimeHandle {
         // section that only a start can pick up is a property of that section —
         // not a fault of this deployment. Both are reported at info, in one short
         // line; the persisted path and the full explanation belong to the command
-        // result and to `spice connect status`, which is where an operator asks.
+        // result.
         tracing::debug!(
             "Spice Cloud Connect: the deployed spicepod is persisted at {}",
             path.display()
@@ -1404,6 +1591,19 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         }
     }
 
+    async fn clear_cloud_delivered_secrets(&self) {
+        let names = self.delivered_secrets.names();
+        self.delivered_secrets
+            .replace(std::collections::BTreeMap::new());
+        if !names.is_empty() {
+            tracing::warn!(
+                "Spice Cloud Connect: removal cleared {} Cloud-delivered secret(s) from the runtime store ({}). Components that already resolved those values keep their in-memory configuration until the operator restarts or stops this local runtime.",
+                names.len(),
+                names.join(", ")
+            );
+        }
+    }
+
     async fn active_datasets(&self) -> u32 {
         match self.runtime.read_app().await {
             Some(app) => u32::try_from(app.datasets.len()).unwrap_or(u32::MAX),
@@ -1467,6 +1667,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             delivered_secrets,
             app_id,
         } = deployment;
+        let mut delivered_secrets = delivered_secrets;
 
         // One apply at a time. What this deployment is diffed against is only
         // immutable if nothing else can persist a spicepod, install secrets, or
@@ -1474,12 +1675,10 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // apply that follows.
         let _applying = self.applying.lock().await;
 
-        // This is the cross-process half of the same exclusion. Keep it for
-        // the whole apply so a CLI removal cannot interleave with staging,
-        // snapshotting, cache promotion, or the final in-memory reconcile.
-        // Every state lookup is rooted through the directory descriptor held
-        // by this guard, so renaming the config directory cannot redirect a
-        // later privileged file operation into its pathname replacement.
+        // Serialize the complete deployment with CLI removal and root every
+        // state lookup at the directory descriptor retained by the guard. A
+        // pathname replacement after this point cannot redirect app metadata,
+        // identity/cache access, snapshots, or promotion into another instance.
         let mutation = runtime_cloud_connect::MutationLock::acquire(config_dir, "apply")
             .await
             .map_err(|error| {
@@ -1550,13 +1749,19 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         // not be held across the awaits below.
         let desired = self.desired.read().clone();
         if secrets_settled && desired.as_deref() == Some(spicepod_yaml) {
-            let cache_error = self.refresh_secret_cache(config_dir, delivered_secrets.as_ref());
+            let secrets_redelivered = delivered_secrets.is_some();
+            let cache_error = self
+                // This branch returns after the cache outcome, so transfer the
+                // apply guard into the blocking writer. Cancellation then
+                // cannot release it while the uncancellable write continues.
+                .refresh_secret_cache(config_dir, delivered_secrets.take(), mutation)
+                .await;
             let restart_required = {
                 let mut pending = self.pending.write();
                 // A delivery this instance holds in full settles a rotation an
                 // earlier one left pending — but only once the cache holds it
                 // too, because that is what the next start resolves.
-                if delivered_secrets.is_some() {
+                if secrets_redelivered {
                     pending.secrets = cache_error.is_some();
                 }
                 pending.restart_required()
@@ -3404,6 +3609,201 @@ views:
             .collect()
     }
 
+    #[tokio::test]
+    async fn cloud_removal_clears_the_live_delivered_secret_store() {
+        let dir = scratch_dir("remove-live-delivered-secrets");
+        let handle = handle_serving(&dir, SERVING).await;
+        handle
+            .delivered_secrets
+            .replace(delivered("api_key", b"cloud-value"));
+        handle.clear_cloud_delivered_secrets().await;
+
+        assert!(handle.delivered_secrets.is_empty());
+        assert!(handle.delivered_secrets.names().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The interleaving the lock exists to prevent: a writer that starts while a
+    /// release is running must not publish a cache after it.
+    ///
+    /// The seam gives this a happens-before instead of a sleep. The writer is
+    /// known to have reached the lock before the release deletes anything, so in
+    /// a build where the key load moved ahead of the lock it holds a usable key
+    /// across the release and republishes the cache — which is the regression
+    /// this asserts against, not merely the exclusion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cache_write_started_during_a_release_does_not_republish_it() {
+        let dir = scratch_dir("cache-write-interleaved");
+        let handle = handle_serving(&dir, SERVING).await;
+        let cache = dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
+
+        assert!(
+            handle
+                .cache_delivered_secrets(&dir, Arc::new(delivered("api_key", b"first")))
+                .await
+                .is_none(),
+            "an enrolled instance caches what it was delivered"
+        );
+        assert!(cache.exists(), "the cache is what the next start reads");
+
+        let mut at_the_lock = cache_lock_seam::arm(&dir);
+
+        // A release in another process takes the directory and starts working.
+        let held = runtime_cloud_connect::MutationLock::acquire(&dir, "remove")
+            .await
+            .expect("a release takes the directory");
+
+        // A deployment lands mid-release.
+        let writer = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            let dir = dir.clone();
+            async move {
+                handle
+                    .cache_delivered_secrets(&dir, Arc::new(delivered("api_key", b"second")))
+                    .await
+            }
+        });
+
+        at_the_lock
+            .recv()
+            .await
+            .expect("the writer reaches the connect mutation lock");
+
+        // The release finishes: identity and cache gone, then the lock freed.
+        std::fs::remove_file(dir.join(IDENTITY_FILE)).expect("release clears the identity");
+        std::fs::remove_file(&cache).expect("release clears the cache");
+        drop(held);
+
+        let outcome = writer.await.expect("the caching task finishes");
+
+        assert!(
+            outcome.is_none(),
+            "a released instance has nothing to cache, which is not an error: {outcome:?}"
+        );
+        assert!(
+            !cache.exists(),
+            "the write must not republish a cache whose key the release destroyed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exclusion has to cover the write, not just the decision to write.
+    /// The guard travels into the blocking task, so this probes the lock at the
+    /// moment the write happens — a guard dropped on the way there would leave a
+    /// release free to delete the cache between the key read and the write, with
+    /// nothing in the outcome to show for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mutation_lock_still_covers_the_write_itself() {
+        let dir = scratch_dir("cache-write-locked-through");
+        let handle = handle_serving(&dir, SERVING).await;
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        let cache = dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+
+        let mut at_the_write = cache_lock_seam::arm_write(&dir);
+
+        assert!(
+            handle
+                .cache_delivered_secrets(&dir, Arc::new(delivered("api_key", b"value")))
+                .await
+                .is_none(),
+            "the write succeeds"
+        );
+        assert!(cache.exists(), "and the cache is there");
+
+        let held = at_the_write
+            .recv()
+            .await
+            .expect("the writer reaches the write");
+        assert!(
+            held,
+            "the connect mutation lock must still be held while the cache is written"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cache_write_stays_on_the_locked_directory_after_path_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("cache-write-directory-substitution");
+        let moved = dir.with_extension("moved");
+        let victim = dir.with_extension("victim");
+        let handle = handle_serving(&dir, SERVING).await;
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        std::fs::create_dir_all(&victim).expect("create replacement instance");
+        enroll_with_a_cache_key(&victim.join(IDENTITY_FILE));
+
+        let mutation = runtime_cloud_connect::MutationLock::acquire(&dir, "cache-secrets")
+            .await
+            .expect("lock original instance");
+        let protected = mutation
+            .descriptor_relative_config_dir()
+            .expect("pin original instance");
+        std::fs::rename(&dir, &moved).expect("rename locked instance");
+        symlink(&victim, &dir).expect("replace original pathname");
+
+        let outcome = handle
+            .cache_delivered_secrets_locked(
+                &protected,
+                &protected,
+                Arc::new(delivered("api_key", b"locked-instance")),
+                mutation,
+            )
+            .await;
+
+        assert!(outcome.is_none(), "cache write succeeds: {outcome:?}");
+        assert!(
+            moved
+                .join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE)
+                .exists(),
+            "the locked instance receives its cache"
+        );
+        assert!(
+            !victim
+                .join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE)
+                .exists(),
+            "the pathname replacement must not receive another instance's secrets"
+        );
+
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    /// The lock is what makes the exclusion cross-process. Held elsewhere, the
+    /// deployment reports the cache failure rather than writing through it.
+    #[tokio::test]
+    async fn a_cache_write_waits_for_a_release_holding_the_directory() {
+        let dir = scratch_dir("cache-write-contended");
+        let handle = handle_serving(&dir, SERVING).await;
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        let cache = dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+
+        let held = runtime_cloud_connect::MutationLock::acquire(&dir, "remove")
+            .await
+            .expect("a release in another process takes the directory");
+
+        let outcome = handle
+            .cache_delivered_secrets(&dir, Arc::new(delivered("api_key", b"contended")))
+            .await;
+
+        assert!(
+            outcome.is_some_and(|err| err.contains("mutation lock")),
+            "the deployment must report a cache it could not take the lock to write"
+        );
+        assert!(
+            !cache.exists(),
+            "and must not have written the cache the release is clearing"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Give the instance an identity carrying a cache key, which is what makes
     /// the delivered-secrets cache writable — without one the cache is skipped
     /// and a test asserting on it would pass for the wrong reason.
@@ -4044,8 +4444,8 @@ tools:
         let dir = scratch_dir("secret-cache-pending");
         let handle = handle_serving(&dir, SERVING).await;
         enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
-        // A directory where the staged cache file belongs: the write fails for a
-        // reason that has nothing to do with the values themselves.
+        // A directory where the staged cache file belongs: the write fails for
+        // a reason that has nothing to do with the values themselves.
         let incoming_cache = dir.join(INCOMING_SECRET_CACHE_FILE);
         std::fs::create_dir_all(&incoming_cache).expect("block the staged cache path");
 

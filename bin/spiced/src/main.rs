@@ -168,10 +168,8 @@ fn main() {
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");
     if runtime_failed {
-        // The foreground launcher has already seen the instance-claim ack at
-        // this point. Preserve every later startup/runtime failure in the
-        // process status so it cannot mistake "claimed, then failed" for a
-        // successfully running instance.
+        // Preserve startup and runtime failures in the process status observed
+        // by the foreground launcher or supervisor.
         std::process::exit(1);
     }
 }

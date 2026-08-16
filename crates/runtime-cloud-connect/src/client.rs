@@ -1408,10 +1408,10 @@ impl ClientDriver {
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        // Clear identity and any retryable draft under the same cross-process
-        // enrollment transaction that promotion holds. The work runs on the
-        // blocking pool so the active control stream is not stalled by file
-        // I/O or lock acquisition.
+        // Clear the persisted secret cache, identity, and any retryable draft
+        // under the same cross-process enrollment transaction that promotion
+        // holds. The work runs on the blocking pool so the active control
+        // stream is not stalled by file I/O or lock acquisition.
         if let Err(err) = clear_identity_state(&self.config).await {
             tracing::warn!(
                 "Cloud Connect: failed to clear identity at {}: {err}; \
@@ -1430,6 +1430,11 @@ impl ClientDriver {
             .await;
             return false;
         }
+
+        // Durable Cloud state is gone. Withdraw delivered values from the
+        // runtime store before acknowledging; already-loaded components keep
+        // their resolved configuration until the local operator restarts them.
+        self.runtime.clear_cloud_delivered_secrets().await;
 
         // Disk identity is gone — drop it from memory too and report success.
         self.identity = None;
@@ -1630,19 +1635,73 @@ fn validate_ca_bundle(
 
 async fn clear_identity_state(config: &CloudConnectConfig) -> std::result::Result<(), String> {
     let config_dir = config.config_dir.clone();
-    let identity_path = config.identity_path.clone();
+    let default_identity_path = config_dir.join(crate::config::IDENTITY_FILE);
+    let mutation = crate::MutationLock::acquire(&config_dir, "remove")
+        .await
+        .map_err(|source| format!("acquire the Cloud Connect mutation lock: {source}"))?;
+    let protected_config_dir = mutation
+        .descriptor_relative_config_dir()
+        .map_err(|source| format!("pin the locked Cloud Connect directory: {source}"))?;
+    let identity_path = if config.identity_path == default_identity_path {
+        protected_config_dir.join(crate::config::IDENTITY_FILE)
+    } else {
+        config.identity_path.clone()
+    };
+    let secret_cache_path = protected_config_dir.join(crate::secret_cache::SECRET_CACHE_FILE);
+    let connect_state_paths = [
+        protected_config_dir.join(CloudConnectConfig::CONNECT_OPERATION_FILE),
+        protected_config_dir.join(CloudConnectConfig::PROJECT_OPERATION_FILE),
+        protected_config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+    ];
     tokio::task::spawn_blocking(move || {
-        let transaction = EnrollmentTransactionLock::acquire(&config_dir)
+        // The blocking task owns the outer guard as well as the inner
+        // transaction. Cancelling its async caller therefore cannot let a CLI
+        // mutation or cache writer interleave before cleanup has finished.
+        let _mutation = mutation;
+        let transaction = EnrollmentTransactionLock::acquire(&protected_config_dir)
             .map_err(|source| format!("acquire the enrollment transaction: {source}"))?;
+        for path in &connect_state_paths {
+            crate::identity::reclaim_all_release_artifacts(
+                path,
+                crate::identity::ArtifactKinds::Connect,
+            )
+            .map_err(|source| {
+                format!(
+                    "clear interrupted Cloud Connect state writes beside {}: {source}",
+                    path.display()
+                )
+            })?;
+        }
+        crate::secret_cache::remove(&secret_cache_path)
+            .map_err(|source| format!("clear delivered-secret cache: {source}"))?;
+        for path in &connect_state_paths {
+            remove_durable_state_file(path).map_err(|source| {
+                format!("clear Cloud Connect state at {}: {source}", path.display())
+            })?;
+        }
         transaction
             .delete()
             .map_err(|source| format!("clear enrollment draft: {source}"))?;
-        IdentityStore::clear(&identity_path)
+        IdentityStore::clear_with_transaction(&identity_path, &transaction)
             .map_err(|source| format!("clear identity: {source}"))?;
         Ok(())
     })
     .await
     .map_err(|source| format!("identity cleanup task failed: {source}"))?
+}
+
+fn remove_durable_state_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => crate::identity::sync_parent_directory(path),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match crate::identity::sync_parent_directory(path) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(source),
+            }
+        }
+        Err(source) => Err(source),
+    }
 }
 
 fn build_channel(
@@ -1911,6 +1970,39 @@ fn renewal_rejection_revokes_identity(error: &enroll::Error) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn identity_cleanup_waits_for_the_instance_mutation_lock() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let config_dir = instance.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        let config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+        std::fs::write(&config.identity_path, b"identity material")
+            .expect("write identity fixture");
+
+        let held = crate::MutationLock::acquire(&config_dir, "cli-mutation")
+            .await
+            .expect("hold the instance mutation lock");
+        let mut cleanup = tokio::spawn(async move { clear_identity_state(&config).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut cleanup)
+                .await
+                .is_err(),
+            "remote cleanup must wait behind the same outer lock as CLI mutations"
+        );
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup proceeds when the CLI mutation releases the directory")
+            .expect("cleanup task completes")
+            .expect("cleanup succeeds");
+        assert!(
+            !config_dir.join(crate::config::IDENTITY_FILE).exists(),
+            "the identity is removed only after acquiring the outer lock"
+        );
+    }
+
     #[test]
     fn backoff_doubles_until_cap() {
         let mut d = MIN_BACKOFF;
@@ -2104,6 +2196,113 @@ mod tests {
             driver.durable_public_key_pem.as_deref(),
             Some("cloud-committed-key-c")
         );
+    }
+
+    #[tokio::test]
+    async fn remove_clears_the_durable_cache_and_live_secret_store_before_acknowledging() {
+        #[derive(Default)]
+        struct ClearingRuntime {
+            cleared: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeHandle for ClearingRuntime {
+            fn supports(&self, _capability: Capability) -> bool {
+                false
+            }
+
+            async fn clear_cloud_delivered_secrets(&self) {
+                self.cleared
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("create identity directory");
+        let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+        let identity = identity_with_not_after(None);
+        IdentityStore::store(&config.identity_path, &identity).expect("store identity");
+        let cache = config
+            .config_dir
+            .join(crate::secret_cache::SECRET_CACHE_FILE);
+        std::fs::write(&cache, b"encrypted cache").expect("write cache fixture");
+        let connect_state_paths = [
+            config
+                .config_dir
+                .join(CloudConnectConfig::CONNECT_OPERATION_FILE),
+            config
+                .config_dir
+                .join(CloudConnectConfig::PROJECT_OPERATION_FILE),
+            config
+                .config_dir
+                .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+        ];
+        for (index, path) in connect_state_paths.iter().enumerate() {
+            std::fs::write(path, b"local connect state").expect("write connect state fixture");
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("connect state file name");
+            std::fs::write(
+                config
+                    .config_dir
+                    .join(format!(".{file_name}.{index}.candidate")),
+                b"interrupted connect state write",
+            )
+            .expect("write interrupted connect state fixture");
+        }
+
+        let runtime = Arc::new(ClearingRuntime::default());
+        let mut driver = ClientDriver::new(
+            config.clone(),
+            Arc::<ClearingRuntime>::clone(&runtime),
+            crate::shutdown::Shutdown::new(),
+            Some(identity),
+            None,
+        );
+        let live_identifier = Arc::new(RwLock::new("inst_test".to_string()));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let removed = driver
+            .handle_remove(&tx, "remove-1", &live_identifier)
+            .await;
+        let acknowledgement = rx.recv().await.expect("receive Remove acknowledgement");
+        assert!(removed, "Remove failed: {acknowledgement:?}");
+        assert!(
+            !cache.exists(),
+            "Remove must durably clear the secret cache"
+        );
+        for (index, path) in connect_state_paths.iter().enumerate() {
+            assert!(
+                !path.exists(),
+                "Remove must durably clear {}",
+                path.display()
+            );
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("connect state file name");
+            assert!(
+                !config
+                    .config_dir
+                    .join(format!(".{file_name}.{index}.candidate"))
+                    .exists(),
+                "Remove must clear interrupted writes beside {}",
+                path.display()
+            );
+        }
+        assert!(
+            runtime.cleared.load(std::sync::atomic::Ordering::SeqCst),
+            "Remove must clear the live delivered-secret store before ACK"
+        );
+        assert!(driver.identity.is_none());
+        assert!(live_identifier.read().await.is_empty());
+        assert!(matches!(
+            acknowledgement.body,
+            Some(proto::client_message::Body::Result(proto::CommandResult {
+                code,
+                ..
+            })) if code == proto::ResultCode::Ok as i32
+        ));
     }
 
     fn identity_with_not_after(not_after_unix: Option<u64>) -> Identity {

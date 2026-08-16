@@ -19595,6 +19595,7 @@ dependencies = [
  "crash-handler",
  "datafusion",
  "event_stream",
+ "fs4",
  "futures",
  "libc",
  "mimalloc",

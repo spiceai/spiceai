@@ -993,6 +993,10 @@ impl RuntimeHandle for E2eRuntime {
         capability == Capability::ApplySpicepod
     }
 
+    async fn clear_cloud_delivered_secrets(&self) {
+        self.state.lock().await.delivered_secret_names = None;
+    }
+
     async fn active_datasets(&self) -> u32 {
         2
     }
@@ -1126,6 +1130,9 @@ impl RuntimeHandle for QueryRuntime {
             _ => false,
         }
     }
+
+    // This query-only test handle cannot hold delivered secrets.
+    async fn clear_cloud_delivered_secrets(&self) {}
 
     async fn execute_query(&self, sql: &str, max_rows: u32) -> Result<QueryOutcome, CommandError> {
         {

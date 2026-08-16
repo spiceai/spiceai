@@ -349,6 +349,15 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         )
     }
 
+    /// Clear Cloud-delivered values still held by the runtime after a
+    /// cloud-dispatched `Remove` has durably cleared their persisted cache.
+    ///
+    /// Already-loaded components may retain values they resolved into their
+    /// own in-memory configuration; a standalone runtime deliberately keeps
+    /// serving after removal, so stopping or restarting those components
+    /// remains the local operator's decision.
+    async fn clear_cloud_delivered_secrets(&self);
+
     /// Number of active datasets currently loaded.
     async fn active_datasets(&self) -> u32 {
         0
@@ -566,6 +575,9 @@ impl RuntimeHandle for NoopRuntimeHandle {
     fn supports(&self, _capability: Capability) -> bool {
         false
     }
+
+    // This stand-in has no delivered-secret store to clear.
+    async fn clear_cloud_delivered_secrets(&self) {}
 }
 
 #[cfg(test)]
@@ -632,6 +644,9 @@ mod tests {
             fn supports(&self, capability: Capability) -> bool {
                 capability == Capability::ExecuteQuery
             }
+
+            // This query-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
         }
 
         assert_eq!(
