@@ -96,6 +96,11 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
 
+# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
+# Cayenne), so the startup parallelism declaration is gated the same way.
+[target.'cfg(not(windows))'.dependencies]
+vortex-utils.workspace = true
+
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
 # Builds the `RequestContext` the trace-span test needs; `spiced` itself only
