@@ -17172,6 +17172,7 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",

@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
 };
 
-use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use crate::{
     App,
     component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
@@ -28,7 +29,6 @@ use crate::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
     },
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -698,7 +698,6 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -2658,7 +2657,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 

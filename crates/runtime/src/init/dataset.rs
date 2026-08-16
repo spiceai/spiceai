@@ -1761,12 +1761,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;

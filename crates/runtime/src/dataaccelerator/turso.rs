@@ -41,6 +41,7 @@ limitations under the License.
 //! connector** (for source datasets), where remote access patterns are the primary use case
 //! and local acceleration is not the goal.
 
+use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
@@ -61,9 +62,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{AcceleratorEngineRegistry, FilePathError},
+    dataaccelerator::FilePathError,
     datafusion::udf::deny_spice_specific_functions,
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -583,7 +583,6 @@ impl DataAccelerator for TursoAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
@@ -1051,7 +1050,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 
@@ -1091,9 +1090,7 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
-        let result = accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
-            .await;
+        let result = accelerator.init(&dataset).await;
         assert!(result.is_err());
         let error = result.expect_err("Expected error for remote Turso database");
         assert!(
@@ -1123,9 +1120,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result2 = accelerator
-            .init(&dataset2, dataset2.runtime.accelerator_engine_registry())
-            .await;
+        let result2 = accelerator.init(&dataset2).await;
         assert!(result2.is_err());
         let error2 = result2.expect_err("Expected error for remote Turso database with auth token");
         assert!(
@@ -1497,7 +1492,7 @@ mod tests {
 
         // Initialize the accelerator
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 

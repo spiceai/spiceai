@@ -62,8 +62,8 @@ pub mod upsert_dedup;
 
 /// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
 ///
-/// Moved here (from `runtime`) so the builder can name the accelerator data
-/// directory without an upward dependency; `runtime` re-exports it.
+/// Lives here so an engine below `runtime` can resolve it without an upward
+/// dependency; `runtime` re-exports it.
 #[must_use]
 pub fn spice_data_base_path() -> String {
     let Ok(working_dir) = std::env::current_dir() else {
@@ -72,6 +72,16 @@ pub fn spice_data_base_path() -> String {
 
     let base_folder = working_dir.join(".spice/data");
     base_folder.to_str().unwrap_or(".").to_string()
+}
+
+/// Creates [`spice_data_base_path`] if it does not already exist, so a file-mode
+/// engine can open its database under it.
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] when the directory cannot be created.
+pub fn make_spice_data_directory() -> std::io::Result<()> {
+    std::fs::create_dir_all(spice_data_base_path())
 }
 
 pub use runtime_acceleration::BootstrapStatus;
@@ -403,7 +413,6 @@ pub trait DataAccelerator: Send + Sync {
     async fn init(
         &self,
         _source: &dyn AccelerationSource,
-        _registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         Ok(BootstrapStatus::none())
     }

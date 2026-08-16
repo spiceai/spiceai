@@ -45,8 +45,8 @@ use tokio::sync::OnceCell;
 use util::concat_arrays;
 
 use super::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-    get_primary_keys_from_constraints, upsert_dedup,
+    AccelerationSource, BootstrapStatus, DataAccelerator, get_primary_keys_from_constraints,
+    upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::FilePathError;
@@ -2904,7 +2904,6 @@ impl DataAccelerator for CayenneAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is

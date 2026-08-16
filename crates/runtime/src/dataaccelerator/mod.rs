@@ -36,15 +36,16 @@ pub mod sqlite;
 pub mod turso;
 
 pub(crate) mod imds;
-pub(crate) mod snapshots;
+pub(crate) mod snapshot_validation;
 pub mod spice_sys;
 pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
 pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
-pub use snapshots::validate_cayenne_snapshot_consistency;
+pub use snapshot_validation::validate_cayenne_snapshot_consistency;
 
-// The accelerator contract moved to `data-accelerator-api`; re-export for path
-// compatibility. (The `register_data_accelerator!` macro is invoked path-qualified
-// as `data_accelerator_api::register_data_accelerator!` by the engine modules.)
+// The accelerator contract lives in `data-accelerator-api`; re-exported so
+// `crate::dataaccelerator::…` paths resolve. (The `register_data_accelerator!` macro
+// is invoked path-qualified as `data_accelerator_api::register_data_accelerator!` by
+// the engine modules.)
 pub use data_accelerator_api::*;
 
 #[cfg(test)]
@@ -167,7 +168,7 @@ mod test {
     #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation_default_path() {
         use crate::builder::RuntimeBuilder;
-        use crate::make_spice_data_directory;
+        use data_accelerator_api::make_spice_data_directory;
         use std::{fs, path::Path};
 
         let spice_data_dir = crate::spice_data_base_path();

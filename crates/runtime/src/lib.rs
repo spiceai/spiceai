@@ -2058,16 +2058,9 @@ impl Runtime {
     }
 }
 
-// Moved to `data-accelerator-api` (so the accelerator builder can name the data
-// directory without an upward dependency); re-exported here for path compatibility.
+// The accelerator data directory is named by `data-accelerator-api`, so an engine
+// below `runtime` can resolve it; re-exported here for path compatibility.
 pub use data_accelerator_api::spice_data_base_path;
-
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
-#[expect(clippy::result_large_err)]
-pub(crate) fn make_spice_data_directory() -> Result<()> {
-    make_spice_data_sub_directory(&[])?;
-    Ok(())
-}
 
 #[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {

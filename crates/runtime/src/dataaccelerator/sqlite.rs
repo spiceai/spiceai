@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
@@ -23,9 +24,8 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{AcceleratorEngineRegistry, FilePathError},
+    dataaccelerator::FilePathError,
     datafusion::udf::deny_spice_functions_for_table_providers,
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -382,7 +382,6 @@ impl DataAccelerator for SqliteAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -1030,7 +1029,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 
