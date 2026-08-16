@@ -439,16 +439,13 @@ pub fn replace_column_in_record(
 /// still cheaper to hold than to rebuild.
 const COMPACTION_RETENTION_RATIO: usize = 2;
 
-/// How many bytes a compaction must actually reclaim — summed across the
-/// batch's columns — to be worth its copies.
+/// Minimum bytes a compaction must reclaim, summed across the batch's
+/// columns, to be worth its copies.
 ///
-/// The floor is per batch, not per column: the consumers of this pass hold
-/// batches for a long time (a results cache entry, an in-memory index), where
-/// a wide result wasting a little per column still wastes a lot per entry.
-/// A ~30-column join row can retain ~40 KiB beyond its own bytes with no
-/// single column near a per-column floor (issue #13172). The per-column ratio
-/// gate already bounds every copy's cost by what it reclaims, so the floor
-/// only needs to keep near-compact batches — the common case — copy-free.
+/// Per batch, not per column: a wide result can waste under any per-column
+/// floor in every column and still waste many times its own bytes per entry
+/// (issue #13172). The ratio gate bounds each copy's cost, so the floor only
+/// keeps near-compact batches copy-free.
 const COMPACTION_MIN_RECLAIMED_BYTES: usize = 4 * 1024;
 
 /// Whether a type holds data in variadic buffers, which
@@ -510,9 +507,8 @@ fn contains_dictionary(data_type: &DataType) -> bool {
 /// How many bytes are reclaimable from a column retaining `retained` where its
 /// rows need `needed`, or `None` when the copy would not pay for itself.
 ///
-/// The gate here is only the retention *ratio*; whether the total reclaim is
-/// worth the copies is decided per batch, against
-/// [`COMPACTION_MIN_RECLAIMED_BYTES`].
+/// Gates only the retention ratio; the reclaim floor is applied per batch,
+/// against [`COMPACTION_MIN_RECLAIMED_BYTES`].
 fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
     (retained > needed && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
         .then(|| retained - needed)
@@ -533,12 +529,10 @@ fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
 fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
     let array = column.as_any().downcast_ref::<GenericByteViewArray<B>>()?;
 
-    // Every allocation [`compact_column`] rebuilds is counted: the views, the
-    // data buffers they point into, and the null buffer. A short-string
-    // column can be almost all views, and a wide-string one almost all data.
-    // For a slice, all three are the parent's whole allocations — including
-    // when the slice's own rows all fit inline, where the data buffers hold
-    // nothing the slice references and are dropped entirely.
+    // Count every allocation [`compact_column`] rebuilds: views, data
+    // buffers, and the null buffer. For a slice, all three are the parent's
+    // whole allocations — even an all-inline slice retains data buffers it
+    // references nothing of, which compaction drops entirely.
     let nulls = array.nulls();
     let retained = array.views().inner().capacity()
         + array
@@ -591,15 +585,11 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
 
 /// Copies `column`'s rows into buffers sized for exactly those rows.
 ///
-/// For most types this is what [`arrow::compute::concat`] does for more than
-/// one array; `concat` cannot be used because it returns a single input
-/// untouched. `MutableArrayData` rebuilds the views and null buffer of a view
-/// array exactly, but copies its data buffers wholesale — so those are
-/// narrowed first with `gc`, whose own gaps `MutableArrayData` covers in
-/// turn: `gc` reuses the incoming views allocation on its fast paths (a
-/// column with no data buffers, or a slice whose rows all fit inline) and the
-/// null buffer on every path, and for a slice those are the parent's whole
-/// allocations.
+/// ([`arrow::compute::concat`] cannot be used: it returns a single input
+/// untouched.) View arrays are `gc`'d first — `MutableArrayData` copies
+/// their data buffers wholesale — while `MutableArrayData` in turn rebuilds
+/// the views and null allocations that `gc`'s fast paths reuse, which for a
+/// slice belong to the parent.
 fn compact_column(column: &ArrayRef) -> ArrayRef {
     let gced: Option<ArrayRef> = match column.data_type() {
         DataType::Utf8View => column
@@ -632,10 +622,9 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
 /// index) should compact it first, so the memory it pins is proportional to
 /// the rows it kept.
 ///
-/// Columns that are already compact are shared, not copied — and so is the
-/// whole batch when its columns together would reclaim less than
-/// [`COMPACTION_MIN_RECLAIMED_BYTES`], so a batch with little to reclaim
-/// costs a reference-count clone.
+/// Already-compact columns are shared, not copied — as is the whole batch
+/// when its total reclaim is under [`COMPACTION_MIN_RECLAIMED_BYTES`] — so a
+/// batch with little to reclaim costs a reference-count clone.
 ///
 /// See [`compacted_memory_size`] for deciding whether the copy is worth making
 /// *before* paying for it.
@@ -647,10 +636,10 @@ pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
         return batch.clone();
     }
 
-    tracing::debug!(
+    tracing::trace!(
         rows = batch.num_rows(),
         reclaimable_bytes = total_reclaimable,
-        "Compacting a record batch that retains more memory than its rows need"
+        "Compacting record batch"
     );
 
     let columns: Vec<ArrayRef> = batch
@@ -703,11 +692,9 @@ pub fn compacted_memory_size(batch: &RecordBatch) -> usize {
 /// Per-column reclaimable bytes — `None` where a copy would not pay for
 /// itself or the type cannot be measured — and the batch-wide total.
 ///
-/// The total carries the batch-level floor: it is zero when the columns
-/// together reclaim less than [`COMPACTION_MIN_RECLAIMED_BYTES`], in which
-/// case [`compact_retained_buffers`] leaves the batch as it is and what would
-/// have been reclaimable is still what the batch occupies. Both entry points
-/// consume this so what one predicts is what the other frees.
+/// The total carries the floor: it is zero when the columns together reclaim
+/// less than [`COMPACTION_MIN_RECLAIMED_BYTES`], and both entry points
+/// consume it, so what one predicts is what the other frees.
 fn compaction_plan(batch: &RecordBatch) -> (Vec<Option<usize>>, usize) {
     let plan: Vec<Option<usize>> = batch.columns().iter().map(reclaimable_bytes).collect();
     let total: usize = plan.iter().flatten().sum();
