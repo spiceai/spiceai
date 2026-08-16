@@ -30,6 +30,7 @@ use std::{
     any::Any,
     cmp::Ordering,
     fmt,
+    fmt::Write as _,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -136,14 +137,14 @@ fn build_scored_sql(
     );
 
     if let Some(column) = &params.column {
-        sql.push_str(&format!(", \"{column}\""));
+        let _ = write!(sql, ", \"{column}\"");
     }
 
     if let Some(fetch) = effective_fetch {
-        sql.push_str(&format!(", {fetch}"));
+        let _ = write!(sql, ", {fetch}");
     }
 
-    sql.push_str(&format!(", global_stats => {})", sql_quote(encoded_stats)));
+    let _ = write!(sql, ", global_stats => {})", sql_quote(encoded_stats));
 
     sql
 }
@@ -325,7 +326,7 @@ impl ExtensionPlanner for DistributedSearchExtensionPlanner {
             )));
         }
 
-        let output_schema: SchemaRef = node.output_schema().inner().clone();
+        let output_schema: SchemaRef = Arc::clone(node.output_schema().inner());
         let exec = DistributedSearchExec::new(
             Arc::clone(&physical_inputs[0]),
             output_schema,

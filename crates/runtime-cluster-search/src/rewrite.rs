@@ -38,7 +38,7 @@ limitations under the License.
 //! drains that child, then scores each executor's partition with the global
 //! statistics and merges the comparable results.
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema, SchemaRef},
@@ -152,7 +152,7 @@ impl DistributedSearchRewrite {
         // caller projected it away (the outer projection drops it again).
         let merge_schema = merge_schema_with_score(&search_provider.schema());
 
-        let stats_plan = self.build_stats_plan(
+        let stats_plan = Self::build_stats_plan(
             &base_ref,
             &from_table_sql,
             &query,
@@ -198,7 +198,6 @@ impl DistributedSearchRewrite {
     /// Build the global-statistics aggregation: a `SUM ... GROUP BY term` over a
     /// union of one `text_search_stats(...)` Flight SQL leg per executor.
     fn build_stats_plan(
-        &self,
         base_ref: &TableReference,
         from_table_sql: &str,
         query: &str,
@@ -257,7 +256,7 @@ impl AnalyzerRule for DistributedSearchRewrite {
         .data()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DistributedSearchRewrite"
     }
 }
@@ -294,7 +293,7 @@ fn stats_leg(
 fn stats_from_function(from_table_sql: &str, query: &str, column: Option<&str>) -> String {
     let mut args = format!("{from_table_sql}, {}", sql_string_literal(query));
     if let Some(column) = column {
-        args.push_str(&format!(", {}", quote_identifier(column)));
+        let _ = write!(args, ", {}", quote_identifier(column));
     }
     format!("text_search_stats({args})")
 }
