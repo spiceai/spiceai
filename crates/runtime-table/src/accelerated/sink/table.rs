@@ -573,7 +573,11 @@ mod tests {
     #[test]
     fn cayenne_still_explains_a_pre_existing_microsecond_table() {
         let ts = |unit: TimeUnit| DataType::Timestamp(unit, Some("UTC".into()));
-        let input = schema(vec![Field::new("created_at", ts(TimeUnit::Nanosecond), true)]);
+        let input = schema(vec![Field::new(
+            "created_at",
+            ts(TimeUnit::Nanosecond),
+            true,
+        )]);
         let target = schema(vec![Field::new(
             "created_at",
             ts(TimeUnit::Microsecond),

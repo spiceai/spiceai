@@ -115,8 +115,7 @@ fn timestamp_batch(rows: usize) -> RecordBatch {
             Arc::new(TimestampNanosecondArray::from(nanos.clone()).with_timezone(TZ)),
             Arc::new(TimestampNanosecondArray::from(nanos.clone())),
             Arc::new(
-                TimestampMicrosecondArray::from(scaled(&nanos, NANOS_PER_MICRO))
-                    .with_timezone(TZ),
+                TimestampMicrosecondArray::from(scaled(&nanos, NANOS_PER_MICRO)).with_timezone(TZ),
             ),
             Arc::new(TimestampMillisecondArray::from(scaled(
                 &nanos,
@@ -266,9 +265,7 @@ async fn assert_timestamp_units_round_trip(vortex_config: VortexConfig, require_
     let rows = query(
         &table,
         table_name,
-        &format!(
-            "SELECT id, ts_ns, ts_ns_naive, ts_us, ts_ms, ts_s FROM {table_name} ORDER BY id"
-        ),
+        &format!("SELECT id, ts_ns, ts_ns_naive, ts_us, ts_ms, ts_s FROM {table_name} ORDER BY id"),
     )
     .await;
     let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
