@@ -816,9 +816,15 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Log spicepod load error now that tracing is initialized
     if let Some(err) = spicepod_load_error {
-        tracing::warn!(
-            "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
-        );
+        if awaiting_deployed_spicepod(cloud_connect_configured, &err) {
+            tracing::info!(
+                "Spice Cloud Connect: no local spicepod.yaml — this instance is waiting for an app to be deployed from Spice Cloud, and loads its components as soon as one arrives."
+            );
+        } else {
+            tracing::warn!(
+                "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided: {err}"
+            );
+        }
     }
     // Same reason: `build_app` chooses between the deployed spicepod and the
     // local one before tracing exists, and which one won is the first thing an
@@ -1241,6 +1247,22 @@ fn tolerates_missing_spicepod_when_cloud_managed(
     cloud_managed_state: bool,
 ) -> bool {
     cloud_managed_state && args.spicepod.is_none() && error.is_spicepod_missing()
+}
+
+/// Whether an absent local spicepod is the expected state of this start rather
+/// than something to warn about.
+///
+/// A Cloud-connected instance's app arrives by deployment, and the deployment is
+/// what writes the file — so an empty instance directory is where a freshly
+/// connected runtime is *supposed* to be while it waits. Reporting the local-only
+/// "run spice init" guidance there describes a failure that is not happening and
+/// sends operators looking for a broken configuration.
+///
+/// Everything else keeps the warning: a spicepod that exists but does not parse
+/// is a real defect, and a missing one with no Cloud Connect identity means
+/// nothing will ever arrive to fill it.
+fn awaiting_deployed_spicepod(cloud_connect_configured: bool, error: &app::Error) -> bool {
+    cloud_connect_configured && error.is_spicepod_missing()
 }
 
 /// What `build_app` decided about which spicepod this start serves, logged once
@@ -1935,6 +1957,37 @@ mod tests {
 
         let args = Args::parse_from(["spiced", "--token", TEST_ENROLLMENT_KEY]);
         assert!(!tolerates_missing_spicepod(&args, &error, true));
+    }
+
+    /// A connected instance with no spicepod yet is waiting for a deployment, so
+    /// the local-only failure guidance must not be reported for it.
+    #[tokio::test]
+    async fn a_connected_instance_awaiting_its_app_is_not_a_warning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        assert!(awaiting_deployed_spicepod(true, &error));
+    }
+
+    /// The warning survives where it is still true: a missing spicepod with no
+    /// Cloud Connect identity waiting to fill it, and a spicepod that exists but
+    /// does not parse.
+    #[tokio::test]
+    async fn an_unexplained_or_malformed_spicepod_still_warns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = missing_spicepod_error(dir.path()).await;
+        assert!(!awaiting_deployed_spicepod(false, &missing));
+
+        let malformed_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            malformed_dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: broken\ndatasets: 'not a list'\n",
+        )
+        .expect("write spicepod.yaml");
+        let malformed = AppBuilder::build_from_path(malformed_dir.path())
+            .await
+            .expect_err("a malformed spicepod.yaml must fail to load");
+        assert!(!awaiting_deployed_spicepod(true, &malformed));
     }
 
     /// `Debug` over the parsed arguments must never reproduce the `--token`

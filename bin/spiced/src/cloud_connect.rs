@@ -1280,15 +1280,20 @@ impl SpicedRuntimeHandle {
             pending.restart_required()
         };
 
+        // Applying a deployment is the normal course of a managed instance, and a
+        // section that only a start can pick up is a property of that section —
+        // not a fault of this deployment. Both are reported at info, in one short
+        // line; the persisted path and the full explanation belong to the command
+        // result and to `spice connect status`, which is where an operator asks.
+        tracing::debug!(
+            "Spice Cloud Connect: the deployed spicepod is persisted at {}",
+            path.display()
+        );
         if restart_required.is_empty() {
-            tracing::info!(
-                "Spice Cloud Connect: the deployed spicepod was validated, persisted to {} ({counts}), and applied to this running instance",
-                path.display(),
-            );
+            tracing::info!("Spice Cloud Connect: applied the deployed spicepod ({counts})");
         } else {
-            tracing::warn!(
-                "Spice Cloud Connect: the deployed spicepod was validated, persisted to {} ({counts}), and its components applied to this running instance; {} is read when spiced starts, so the value this instance is running with stays in effect until it next starts. See: https://spiceai.org/docs",
-                path.display(),
+            tracing::info!(
+                "Spice Cloud Connect: applied the deployed spicepod ({counts}); {} takes effect when this instance next starts",
                 restart_required.join(", "),
             );
         }

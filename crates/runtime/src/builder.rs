@@ -793,9 +793,7 @@ impl RuntimeBuilder {
         df.set_self_ref();
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
-            let is_task_history_enabled = spicepod_rt.task_history.enabled;
-            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df))
-                .with_task_history_enabled(is_task_history_enabled);
+            let datasets_health_monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
             datasets_health_monitor.start();
             Some(Arc::new(datasets_health_monitor))
         } else {
@@ -806,6 +804,9 @@ impl RuntimeBuilder {
             app: shared_app,
             apply_app_lock: Arc::new(tokio::sync::Mutex::new(())),
             initial_load: Arc::new(crate::InitialLoad::default()),
+            task_history_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            task_history_settings: Arc::new(std::sync::OnceLock::new()),
+            task_history_init_lock: Arc::new(tokio::sync::Mutex::new(())),
             df,
             llm_runtime_stores: Arc::new(crate::model::LlmRuntimeStores::default()),
             http_rate_control_registry,

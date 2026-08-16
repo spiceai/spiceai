@@ -589,6 +589,37 @@ pub struct Runtime {
     /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
     /// Shared, not copied, so every clone of the runtime supersedes the same load.
     initial_load: Arc<InitialLoad>,
+    /// Set once this runtime has registered the internal task-history table.
+    ///
+    /// Task history is initialized from the app, and an app can arrive after a
+    /// start that had none, so initialization can be reached twice. What makes the
+    /// second call a no-op is this flag and not the table's name: a spicepod may
+    /// declare a dataset called `runtime.task_history`, and on the arriving-app
+    /// path datasets are registered first — so a name check would mistake that
+    /// dataset for the internal table and send every task-history write to it.
+    task_history_initialized: Arc<AtomicBool>,
+    /// The task-history configuration of the first app this runtime read, which
+    /// is the one in effect for the life of the process.
+    ///
+    /// `runtime.task_history` takes effect at a start — `start_time_only_changes`
+    /// classifies it as `Process` and the reload path says so — but a start with no
+    /// app has no configuration to take effect, so the first app to arrive is what
+    /// decides. The whole section is kept and not only `enabled`, because a retry
+    /// after a failed initialization must build the table the first app asked for:
+    /// its retention, its captured output, its thresholds. Recorded separately from
+    /// whether the table was registered, so an initialization that lost the name
+    /// can still be retried without a later reload being able to change what it
+    /// builds.
+    task_history_settings: Arc<std::sync::OnceLock<spicepod::component::runtime::TaskHistory>>,
+    /// Serializes the whole of task-history initialization.
+    ///
+    /// The cluster executor deliberately races `init_task_history` against the
+    /// component load, and the steps are not independently safe: between one
+    /// caller registering the table and recording that it did, another would see
+    /// a table it cannot account for, take it for a foreign one, and turn
+    /// emission off for the process. Holding this across check, register and
+    /// record makes the second caller observe a finished initialization instead.
+    task_history_init_lock: Arc<tokio::sync::Mutex<()>>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,

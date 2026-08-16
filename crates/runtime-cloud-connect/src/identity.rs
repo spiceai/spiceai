@@ -314,6 +314,29 @@ where
 }
 
 impl Identity {
+    /// Drop any portal page this runtime would not accept today.
+    ///
+    /// Validating at the writer stops an unusable link becoming durable, but it
+    /// says nothing about links already on disk: these fields predate the rule,
+    /// so an identity written by an older runtime can hold one, and every
+    /// consumer — the startup report, `spice connect status`, a browser an
+    /// operator opens — reads the stored value rather than a freshly delivered
+    /// one. Applying the rule on the way in is what makes "nothing unusable
+    /// reaches a log or a browser" true of existing state and not just of new
+    /// writes. A dropped page is reduced to absent, never rewritten into
+    /// something else, and the file is not modified by reading it: the next write
+    /// that touches these fields persists the reduction.
+    fn drop_unusable_portal_pages(&mut self) {
+        self.monitor_url = self
+            .monitor_url
+            .take()
+            .and_then(|url| crate::config::safe_portal_url(&url));
+        self.new_project_url = self
+            .new_project_url
+            .take()
+            .and_then(|url| crate::config::safe_portal_url(&url));
+    }
+
     pub(crate) fn certificate_validity_unix(&self) -> Result<(i64, i64), &'static str> {
         let certificate_pem = pem::parse(&self.identity_cert_pem)
             .map_err(|_| "the client identity certificate is not valid PEM")?;
@@ -1068,8 +1091,13 @@ pub(crate) fn open_windows_owner_only_file(
 
 /// Reject Windows directories, reparse points, and multiply-linked state
 /// files after opening the object itself rather than following it.
+///
+/// Public because every Cloud Connect state file — the identity, the mutation
+/// lock, the journals the CLI writes beside them — needs the same check on the
+/// handle it just opened, and a security check with three copies is a security
+/// check with three chances to drift.
 #[cfg(windows)]
-pub(crate) fn validate_windows_regular_single_link(file: &std::fs::File) -> std::io::Result<()> {
+pub fn validate_windows_regular_single_link(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -1147,9 +1175,10 @@ impl IdentityStore {
         })?;
         match read_regular_file_optional(path) {
             Ok(Some(s)) => {
-                let identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
+                let mut identity: Identity = serde_json::from_str(&s).context(ParseSnafu {
                     path: path.to_path_buf(),
                 })?;
+                identity.drop_unusable_portal_pages();
                 Ok(Some(identity))
             }
             Ok(None) => Ok(None),
@@ -1304,19 +1333,30 @@ impl IdentityStore {
         let resolved = match attachment {
             Some(attachment) => {
                 let same_app = identity.app_id.as_deref() == Some(attachment.app_id.as_str());
+                // The monitor page is Cloud-constructed portal metadata that the
+                // runtime prints and an operator opens, so it passes the one
+                // portal-link rule here, at the writer — the same place the
+                // enrollment validates its create-project page.
+                //
+                // The outer `Option` is what keeps presence-updates and
+                // absence-preserves intact through that check: a command that
+                // named a page the rule rejects has still *named* one, so it
+                // clears the stale page rather than leaving the old one standing
+                // behind an invalid delivery. Only an omitted page preserves.
+                let delivered = attachment
+                    .monitor_url
+                    .as_deref()
+                    .map(crate::config::safe_portal_url);
                 let (app_name, monitor_url) = if same_app {
                     (
                         attachment
                             .app_name
                             .clone()
                             .or_else(|| identity.app_name.clone()),
-                        attachment
-                            .monitor_url
-                            .clone()
-                            .or_else(|| identity.monitor_url.clone()),
+                        delivered.unwrap_or_else(|| identity.monitor_url.clone()),
                     )
                 } else {
-                    (attachment.app_name.clone(), attachment.monitor_url.clone())
+                    (attachment.app_name.clone(), delivered.flatten())
                 };
                 AttachmentState {
                     app_id: Some(attachment.app_id.clone()),
@@ -2859,6 +2899,184 @@ mod tests {
             loaded.new_project_url.as_deref(),
             Some("https://spice.ai/acme/new?instance=inst_1")
         );
+    }
+
+    /// A monitor page the portal-link rule rejects is not stored, and never
+    /// reaches the log line or the browser that would open it. The attachment
+    /// itself still lands — losing the page is not losing the attachment.
+    #[test]
+    fn an_unsafe_monitor_page_is_not_stored() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+
+        for unsafe_url in [
+            "javascript:alert(1)",
+            "http://attacker.example/acme/monitor",
+            "https://user:secret@spice.ai/acme/monitor",
+            "/acme/monitor",
+        ] {
+            let attachment = AppAttachment {
+                monitor_url: Some(unsafe_url.to_string()),
+                ..sample_attachment()
+            };
+            let persisted = IdentityStore::set_attachment(&path, Some(&attachment))
+                .expect("attach")
+                .expect("the identity still exists");
+            assert_eq!(
+                persisted.monitor_url, None,
+                "{unsafe_url} must not be reported as this attachment's page"
+            );
+            let loaded = IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present");
+            assert_eq!(loaded.monitor_url, None, "{unsafe_url} must not be stored");
+            assert_eq!(
+                loaded.app_id.as_deref(),
+                Some(attachment.app_id.as_str()),
+                "the attachment itself must still land"
+            );
+            // Back to detached so the next iteration starts from the same state.
+            IdentityStore::set_attachment(&path, None).expect("detach");
+        }
+    }
+
+    /// Portal pages written before the rule existed are dropped when the
+    /// identity is read, so nothing unusable reaches the startup report, a
+    /// status output, or a browser — the writer-side check cannot speak for
+    /// state that is already on disk.
+    #[test]
+    fn portal_pages_a_legacy_identity_holds_are_dropped_on_load() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        // Written straight into the file, the way a runtime without the rule
+        // would have written them.
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read identity"))
+                .expect("identity JSON");
+        let object = document
+            .as_object_mut()
+            .expect("identity document is an object");
+        object.insert(
+            "monitor_url".to_string(),
+            serde_json::Value::String("javascript:alert(1)".to_string()),
+        );
+        object.insert(
+            "new_project_url".to_string(),
+            serde_json::Value::String("https://user:secret@spice.ai/acme/new".to_string()),
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("serialize identity"),
+        )
+        .expect("write the legacy identity");
+
+        let loaded = IdentityStore::load_optional(&path)
+            .expect("a legacy identity remains loadable")
+            .expect("present");
+        assert_eq!(
+            loaded.monitor_url, None,
+            "an unusable monitor page must not reach a consumer"
+        );
+        assert_eq!(
+            loaded.new_project_url, None,
+            "an unusable create-project page must not reach a consumer"
+        );
+        assert_eq!(
+            loaded.identifier, identity.identifier,
+            "the rest of the identity is untouched"
+        );
+        assert_eq!(loaded.private_key_pem, identity.private_key_pem);
+    }
+
+    /// A rejected page is not the same as an omitted one. Naming a page the rule
+    /// refuses clears the stale one — leaving the old page standing would point an
+    /// operator at metadata this attachment never delivered — while omitting the
+    /// field preserves what is stored.
+    #[test]
+    fn a_rejected_monitor_page_clears_a_stale_one_but_an_omitted_page_preserves_it() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        IdentityStore::store(&path, &sample_identity()).expect("store");
+        IdentityStore::set_attachment(&path, Some(&sample_attachment())).expect("attach");
+        let stored = IdentityStore::load_optional(&path)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            stored.monitor_url.as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor"),
+            "the delivered page is the starting state"
+        );
+
+        // Omitted: the stored page survives.
+        let omitted = AppAttachment {
+            monitor_url: None,
+            ..sample_attachment()
+        };
+        IdentityStore::set_attachment(&path, Some(&omitted)).expect("attach");
+        assert_eq!(
+            IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present")
+                .monitor_url
+                .as_deref(),
+            Some("https://spice.ai/acme/retail-analytics/monitor"),
+            "an omitted page preserves what is stored"
+        );
+
+        // Named but rejected: the stale page goes.
+        let rejected = AppAttachment {
+            monitor_url: Some("javascript:alert(1)".to_string()),
+            ..sample_attachment()
+        };
+        let persisted = IdentityStore::set_attachment(&path, Some(&rejected))
+            .expect("attach")
+            .expect("the identity still exists");
+        assert_eq!(
+            persisted.monitor_url, None,
+            "a rejected page must not be reported as this attachment's page"
+        );
+        assert_eq!(
+            IdentityStore::load_optional(&path)
+                .expect("load")
+                .expect("present")
+                .monitor_url,
+            None,
+            "a rejected page must clear the stale one rather than leave it standing"
+        );
+    }
+
+    /// An identity written before the enrollment portal page was recorded must
+    /// still load, reporting no page rather than failing — and no page is
+    /// invented for it.
+    #[test]
+    fn an_identity_without_the_enrollment_portal_page_still_loads() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("identity.json");
+        let identity = sample_identity();
+        IdentityStore::store(&path, &identity).expect("store");
+
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read identity"))
+                .expect("identity JSON");
+        document
+            .as_object_mut()
+            .expect("identity document is an object")
+            .remove("new_project_url");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("serialize identity"),
+        )
+        .expect("write legacy identity");
+
+        let legacy = IdentityStore::load_optional(&path)
+            .expect("a legacy identity remains loadable")
+            .expect("present");
+        assert_eq!(legacy.new_project_url, None);
+        assert_eq!(legacy.identifier, identity.identifier);
     }
 
     #[test]

@@ -111,7 +111,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
-use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
+use runtime_datafusion::schema_provider::{
+    EnsureSchemaError, SpiceSchemaProvider, ensure_schema_exists,
+};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -275,6 +277,11 @@ pub enum Error {
         schema: String,
         source: DataFusionError,
     },
+
+    #[snafu(display(
+        "Failed to create the internal table {table}: the {schema} schema cannot reserve a name for it, so the runtime cannot keep the table it writes to. This is a bug in Spice; please report it at https://github.com/spiceai/spiceai/issues"
+    ))]
+    UnableToReserveInternalTable { table: String, schema: String },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -821,7 +828,17 @@ pub struct DataFusion {
     // EXECUTE (not lightweight PREPARE/DEALLOCATE/SET) — i.e. query admission
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
-    pub(crate) task_history_enabled: bool,
+    /// Whether a query emits a task-history row.
+    ///
+    /// Settable because the app that decides it can arrive after this was built:
+    /// a runtime can start with no configuration at all, and the deployment or
+    /// watched spicepod that follows carries the setting. Read once per query
+    /// build, so a stale value would either fill a table nothing created or spend
+    /// every query writing to one that is not the runtime's.
+    pub(crate) task_history_enabled: std::sync::atomic::AtomicBool,
+    /// The value `runtime.task_history.enabled` had when this process started.
+    /// See [`DataFusion::task_history_enabled_at_start`].
+    task_history_enabled_at_start: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
@@ -1130,6 +1147,98 @@ impl DataFusion {
             .insert(table_name);
 
         Ok(())
+    }
+
+    /// Register an internal table under a name no one else may then take.
+    ///
+    /// Returns the provider that already holds `table_name`, left in place, when
+    /// the name is taken. Otherwise the name is reserved: registrations that come
+    /// afterwards — a dataset load, a view, a `CREATE TABLE` — are refused rather
+    /// than silently replacing a table the runtime resolves by name every time it
+    /// writes to it.
+    ///
+    /// The test and the claim happen inside [`SpiceSchemaProvider::reserve_table`]
+    /// as one step. Component loading registers datasets concurrently with the
+    /// runtime's own tables, so a caller that checks the name and registers second
+    /// can act on an answer that is no longer true.
+    pub fn reserve_internal_table(
+        &self,
+        table_name: TableReference,
+        table: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<Option<Arc<dyn datafusion::datasource::TableProvider>>> {
+        // Every branch that cannot reserve the name is an error, never a quiet
+        // success: this method's whole guarantee is that the name is held
+        // afterwards, and reporting one that was never claimed is how an internal
+        // table ends up replaced by something else.
+        let schema_name = table_name
+            .schema()
+            .context(UnableToReserveInternalTableSnafu {
+                table: table_name.to_string(),
+                schema: "(unqualified)",
+            })?
+            .to_string();
+        let registered_schema =
+            self.schema(&schema_name)
+                .context(UnableToReserveInternalTableSnafu {
+                    table: table_name.to_string(),
+                    schema: schema_name.clone(),
+                })?;
+        // Only this provider can promise the name will still be free when it is
+        // claimed. Anything else is refused rather than registered without that
+        // promise.
+        let spice_schema = registered_schema
+            .downcast_ref::<SpiceSchemaProvider>()
+            .context(UnableToReserveInternalTableSnafu {
+                table: table_name.to_string(),
+                schema: schema_name,
+            })?;
+
+        let claimed = table_name.table().to_string();
+        if let Err(incumbent) = spice_schema.reserve_table(claimed.clone(), table) {
+            return Ok(Some(incumbent));
+        }
+
+        // Past the claim, an error may not leave the name claimed. A reservation
+        // this runtime abandoned half-made is one it would meet again as an
+        // incumbent, with nothing able to release it — the schema API refuses a
+        // reserved name and the caller was told the reservation failed.
+        let Ok(mut writers) = self.data_writers.write() else {
+            spice_schema.release_reserved_table(&claimed);
+            return Err(Error::UnableToLockDataWriters {});
+        };
+        writers.insert(table_name);
+
+        Ok(None)
+    }
+
+    /// Hand back a reservation made by [`DataFusion::reserve_internal_table`].
+    ///
+    /// For a component that claims more than one name and fails partway: the
+    /// names it did claim are released rather than left holding tables nothing
+    /// exposes.
+    pub fn release_internal_table(&self, table_name: &TableReference) {
+        {
+            // The writer marker goes first, while the name is still reserved and
+            // nothing else can be registered under it — so the marker removed here
+            // is certainly the one this reservation added. Releasing the name
+            // first would let a dataset claim it and mark itself writable in
+            // between, and this cleanup would then strip *that* dataset's marker,
+            // leaving a read-write dataset registered and treated as read-only.
+            let Ok(mut writers) = self.data_writers.write() else {
+                // Nothing is released at all rather than handing the name over
+                // with a stale marker behind it: a name left reserved is a
+                // recoverable state, a dataset silently made read-only is not.
+                return;
+            };
+            writers.remove(table_name);
+        }
+
+        if let Some(schema_name) = table_name.schema()
+            && let Some(registered_schema) = self.schema(schema_name)
+            && let Some(spice_schema) = registered_schema.downcast_ref::<SpiceSchemaProvider>()
+        {
+            spice_schema.release_reserved_table(table_name.table());
+        }
     }
 
     pub async fn register_catalog(
@@ -2477,6 +2586,36 @@ impl DataFusion {
         let table_reference = dataset.into();
         let table_provider = self.get_table_provider(&table_reference).await?;
         Ok(table_provider.schema().as_ref().clone())
+    }
+
+    /// The value `runtime.task_history.enabled` had when this process started.
+    ///
+    /// `runtime.task_history` is a start-time section: a reload installs the new
+    /// value in the app but the running process keeps what it booted with. A start
+    /// with no configuration booted from a default instead, which is why this is
+    /// only the fallback until an app has decided the setting — never the mutable
+    /// emission flag, which describes the table as it stands rather than what was
+    /// asked for.
+    #[must_use]
+    pub fn task_history_enabled_at_start(&self) -> bool {
+        self.task_history_enabled_at_start
+    }
+
+    /// Turn task-history emission on or off for every later query.
+    ///
+    /// Called when the app that decides it becomes known — which, for a runtime
+    /// that started with no configuration, is after this was built — and when a
+    /// conflict means the runtime must stop writing to a table it does not own.
+    pub fn set_task_history_enabled(&self, enabled: bool) {
+        self.task_history_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a query emits a task-history row right now.
+    #[must_use]
+    pub fn task_history_emission_enabled(&self) -> bool {
+        self.task_history_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[must_use]
@@ -6524,6 +6663,240 @@ mod tests {
                     Constraint::Unique(vec![2]),
                 ]))
             );
+        }
+    }
+
+    /// The runtime's own tables are reserved through the schema provider, so a
+    /// name it holds cannot be taken by a dataset load afterwards.
+    mod reserve_internal_table_tests {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::{SPICE_RUNTIME_SCHEMA, builder::DataFusionBuilder};
+        use crate::status::RuntimeStatus;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::empty::EmptyTable;
+        use datafusion::sql::TableReference;
+        use std::sync::Arc;
+        use tokio::runtime::Handle;
+
+        fn table(field: &str) -> Arc<dyn TableProvider> {
+            Arc::new(EmptyTable::new(Arc::new(arrow::datatypes::Schema::new(
+                vec![arrow::datatypes::Field::new(
+                    field,
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )],
+            ))))
+        }
+
+        #[tokio::test]
+        async fn a_free_name_is_reserved_and_kept_against_a_later_registration() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "reserved");
+
+            let taken = df
+                .reserve_internal_table(name.clone(), table("internal"))
+                .expect("reserve a free name");
+            assert!(taken.is_none(), "nothing held the name");
+
+            let incumbent = df.get_table(&name).await.expect("the table resolves");
+
+            // What a dataset named `runtime.reserved` would do.
+            let error = df
+                .ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect_err("a reserved name is refused, not overwritten");
+            assert!(
+                error.to_string().contains("reserved"),
+                "and the refusal says why: {error}"
+            );
+
+            let held = df.get_table(&name).await.expect("the table still resolves");
+            assert!(
+                Arc::ptr_eq(&held, &incumbent),
+                "the runtime keeps the table it resolves by name at write time"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_name_already_taken_is_reported_and_left_alone() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "occupied");
+
+            df.ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect("something registers first");
+            let incumbent = df.get_table(&name).await.expect("the dataset resolves");
+
+            let taken = df
+                .reserve_internal_table(name.clone(), table("internal"))
+                .expect("a taken name is reported, not an error")
+                .expect("the caller is told who holds it");
+            assert!(
+                Arc::ptr_eq(&taken, &incumbent),
+                "and which provider that is"
+            );
+
+            let held = df.get_table(&name).await.expect("the name is still held");
+            assert!(
+                Arc::ptr_eq(&held, &incumbent),
+                "nothing was displaced to find that out"
+            );
+        }
+        /// The guarantee is that the name is held when this returns `Ok(None)`, so
+        /// a reference it cannot reserve has to be an error rather than a quiet
+        /// success that registered nothing.
+        #[tokio::test]
+        async fn a_name_that_cannot_be_reserved_is_an_error_not_a_quiet_success() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+
+            let bare = TableReference::bare("unqualified");
+            let error = df
+                .reserve_internal_table(bare.clone(), table("internal"))
+                .expect_err("a name with no schema cannot be reserved");
+            assert!(error.to_string().contains("unqualified"), "{error}");
+            assert!(!df.table_exists(&bare), "and nothing was registered");
+
+            let elsewhere = TableReference::partial("not_a_registered_schema", "internal");
+            let error = df
+                .reserve_internal_table(elsewhere.clone(), table("internal"))
+                .expect_err("an unregistered schema cannot be reserved in");
+            assert!(
+                error.to_string().contains("not_a_registered_schema"),
+                "{error}"
+            );
+            assert!(!df.table_exists(&elsewhere), "and nothing was registered");
+        }
+
+        /// A reservation is either made and reported, or not made at all.
+        ///
+        /// The name is claimed before the writer registry is touched, so a failure
+        /// after that point has to undo the claim: the runtime would otherwise meet
+        /// its own half-made reservation as an incumbent, with nothing able to
+        /// release it.
+        #[tokio::test]
+        async fn a_failure_after_the_claim_leaves_the_name_free() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "claimed");
+
+            // What a panicking writer leaves behind.
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = df.data_writers.write().expect("take the writer registry");
+                panic!("poison the writer registry");
+            }));
+            assert!(poisoned.is_err(), "the panic was caught, not swallowed");
+
+            df.reserve_internal_table(name.clone(), table("internal"))
+                .expect_err("the reservation could not be completed");
+
+            assert!(
+                !df.table_exists(&name),
+                "so it left nothing registered under the name"
+            );
+            df.ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect("and nothing reserved: the name is free for the next claim");
+        }
+
+        /// A release that cannot finish keeps the name rather than exposing it.
+        ///
+        /// The writer marker is removed while the name is still reserved, so it is
+        /// certainly this reservation's own. If that cannot be done, handing the
+        /// name over anyway would leave the marker behind for whatever claims it
+        /// next — a dataset registered read-write and then stripped to read-only.
+        /// A name left reserved is recoverable; that is not.
+        #[tokio::test]
+        async fn a_release_that_cannot_finish_keeps_the_name() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let name = TableReference::partial(SPICE_RUNTIME_SCHEMA, "held");
+            df.reserve_internal_table(name.clone(), table("internal"))
+                .expect("reserve the name");
+
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = df.data_writers.write().expect("take the writer registry");
+                panic!("poison the writer registry");
+            }));
+            assert!(poisoned.is_err(), "the panic was caught, not swallowed");
+
+            df.release_internal_table(&name);
+
+            assert!(df.table_exists(&name), "the reservation is kept");
+            let error = df
+                .ctx
+                .register_table(name.clone(), table("dataset"))
+                .expect_err("and the name is not exposed to anything else");
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+
+        /// Task history claims two names in scheduler mode and the pair is not
+        /// atomic, so the first has to be releasable when the second is lost.
+        #[tokio::test]
+        async fn a_reservation_is_released_without_touching_the_others() {
+            let df = DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build();
+            let first = TableReference::partial(SPICE_RUNTIME_SCHEMA, "local_task_history");
+            let second = TableReference::partial(SPICE_RUNTIME_SCHEMA, "task_history");
+
+            df.reserve_internal_table(first.clone(), table("local"))
+                .expect("reserve the first name");
+            df.reserve_internal_table(second.clone(), table("federated"))
+                .expect("reserve the second name");
+
+            assert!(
+                df.is_writable(&first),
+                "a reserved internal table is writable"
+            );
+            df.release_internal_table(&first);
+
+            assert!(
+                !df.table_exists(&first),
+                "the released name holds nothing and is free again"
+            );
+            assert!(
+                !df.is_writable(&first),
+                "and the writer marker went with it"
+            );
+            df.ctx
+                .register_table(first.clone(), table("dataset"))
+                .expect("so something else may take it");
+
+            assert!(
+                df.table_exists(&second),
+                "and the name that was kept is untouched"
+            );
+            let error = df
+                .ctx
+                .register_table(second.clone(), table("dataset"))
+                .expect_err("still reserved");
+            assert!(error.to_string().contains("reserved"), "{error}");
         }
     }
 

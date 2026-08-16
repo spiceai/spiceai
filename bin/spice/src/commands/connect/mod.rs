@@ -78,11 +78,18 @@ leaves the instance unattached and prints the Cloud-provided recovery link.
 The transaction is retry-safe: an interrupted enrollment reuses its durable
 operation and key material, while project creation uses the enrolled instance's
 single attachment as its exact replay key. Existing identities always win and
-are never duplicated.
+are never duplicated. A re-run continues the pending enrollment in the mode that
+started it — it never asks which authentication to use again, and an enrollment
+key is asked for again only because keys are never stored. A login operation
+keeps the organization it was authorized for; a key operation asserts one, and
+--org corrects that assertion so an operation that named the wrong organization
+can still be redeemed.
 
 NON-INTERACTIVE
   Login mode requires both --org <org> and --project <name>.
   Key mode requires --token <enrollment-key> and rejects --project.
+  A pending enrollment needs only what it cannot recover: --token
+  <enrollment-key> for a key operation, --project <name> for a login one.
 
   spice connect status                    Show this directory's Cloud
                                           connection, service, and deployment
@@ -742,7 +749,7 @@ async fn remove_identity(
     assume_yes: bool,
     force: bool,
 ) -> Result<()> {
-    let _connect_lock = state::ConnectLock::acquire(config_dir, "remove")
+    let _connect_lock = runtime_cloud_connect::MutationLock::acquire(config_dir, "remove")
         .await
         .map_err(|error| Error::CloudConnectIo {
             message: error.to_string(),
