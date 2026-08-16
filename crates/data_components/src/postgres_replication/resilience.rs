@@ -170,7 +170,6 @@ fn is_transient_by_display(msg: &str) -> bool {
         "unexpected end of file",
         "early eof",
         "eof while reading",
-        "end of file",
         "temporarily unavailable",
         "timed out",
         "timeout",
@@ -355,6 +354,9 @@ mod tests {
         ));
         assert!(!is_transient_by_display(
             "database \"db\" has been dropped (SQLSTATE 57P04)"
+        ));
+        assert!(!is_transient_by_display(
+            "could not seek to end of file (SQLSTATE XX000)"
         ));
     }
 
