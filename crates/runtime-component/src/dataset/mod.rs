@@ -446,6 +446,39 @@ impl PartialEq for DatasetSpec {
 }
 
 impl DatasetSpec {
+    /// A spec for the dataset `name` read from `from`, with every other field at
+    /// its default. Callers that need more set the fields they care about;
+    /// `DatasetBuilder` in the runtime builds the fully-configured spec from a
+    /// Spicepod definition.
+    #[must_use]
+    pub fn new(from: impl Into<String>, name: TableReference) -> Self {
+        Self {
+            from: from.into(),
+            name,
+            access: AccessMode::default(),
+            params: HashMap::default(),
+            metadata: HashMap::default(),
+            columns: Vec::default(),
+            schema: None,
+            has_metadata_table: false,
+            replication: None,
+            time_column: None,
+            time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
+            acceleration: None,
+            embeddings: Vec::default(),
+            unsupported_type_action: None,
+            on_schema_change: OnSchemaChange::default(),
+            ready_state: ReadyState::default(),
+            metrics: Metrics::default(),
+            vectors: None,
+            full_text_search: None,
+            check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
+        }
+    }
+
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
     pub fn source(&self) -> &str {
