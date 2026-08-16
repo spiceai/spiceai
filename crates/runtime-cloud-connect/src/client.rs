@@ -48,6 +48,7 @@ limitations under the License.
 //! driver stays connected with the still-valid identity rather than
 //! falsely reporting the instance as released.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,13 +61,18 @@ use tonic::Streaming;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use crate::config::CloudConnectConfig;
+use snafu::Snafu;
+
+use crate::draft::{EnrollmentDraft, EnrollmentTransactionLock};
 use crate::enroll::EnrollClient;
 use crate::handlers::{
     Capability, CommandError, MAX_QUERY_RESULT_BYTES, RestartMode, RuntimeHandle,
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
+use crate::identity::ArtifactKinds;
 use crate::identity::{AppAttachment, Identity, IdentityStore};
+use crate::mutation_lock::MutationLock;
 use crate::proto;
 use crate::session::SessionAck;
 use crate::shutdown::Shutdown;
@@ -1356,9 +1362,13 @@ impl ClientDriver {
         .await;
     }
 
-    /// Handle a `Remove` command. Returns `true` only if the on-disk identity
-    /// was actually removed (or was already absent) — i.e. the instance is
-    /// genuinely released and the caller may exit as such.
+    /// Handle a `Remove` command: release this instance from cloud management by
+    /// clearing the cloud-issued state it holds on disk, the way
+    /// `spice connect remove` does locally.
+    ///
+    /// Returns `true` only if the on-disk identity was actually removed (or was
+    /// already absent) — i.e. the instance is genuinely released and the caller
+    /// may exit as such.
     ///
     /// If clearing `identity.json` fails, the file would still be loaded on the
     /// next start and Cloud Connect would silently reconnect, so reporting
@@ -1366,43 +1376,558 @@ impl ClientDriver {
     /// in-memory identity, report the command as failed, and return `false`
     /// so the driver stays connected with the still-valid identity instead of
     /// exiting as removed.
+    ///
+    /// What it removes, and in this order:
+    ///
+    /// 1. The **delivered-secrets cache**, before the identity. The only key that
+    ///    opens it lives in `identity.json`, so clearing the identity first
+    ///    strands the file: its values become undecryptable, while its plaintext
+    ///    authenticated header keeps the secret NAMES and the deployment version
+    ///    readable to anyone on the box (that header is what lets `spice connect
+    ///    status` list a cache with no key at all). A released host would keep an
+    ///    inventory of the app's secret names beside ciphertext nobody can open —
+    ///    the hazard [`crate::secret_cache::remove`] exists to prevent.
+    /// 2. The **enrollment draft**, so the next enrollment in this directory
+    ///    starts clean. A draft is reused verbatim by
+    ///    `EnrollmentTransactionLock::load_or_create`, replay key and all, so one
+    ///    left behind sends the next `spiced --token` either into a replay of the
+    ///    operation that produced the instance just removed, or into an
+    ///    idempotency mismatch whose guidance is to preserve the file and contact
+    ///    support.
+    ///
+    /// 3. The **operation journals**, the enrollment one and the
+    ///    project-assignment one, which go with the draft for the same reason:
+    ///    `spice connect` writes them to resume an interrupted operation, and
+    ///    either one left beside a removed identity stops the next enrollment
+    ///    rather than helping it — the enrollment journal is quarantined, the
+    ///    project journal fails as a pending mismatch.
+    ///
+    /// 4. The **`cloud-endpoint` override**. `spice connect` persists it both for
+    ///    an explicit `--endpoint` and for a binding taken from the durable
+    ///    identity or a pending draft (`EndpointSource::Bound`), so it can hold a
+    ///    value derived from the very enrollment being released. Left behind, the
+    ///    next plain `spiced --token` in this directory would silently enroll
+    ///    against the released instance's control plane. An operator who chose
+    ///    the endpoint themselves re-supplies it, which is what the local command
+    ///    already makes them do.
+    ///
+    /// 5. The **identity**, which is what actually releases the instance and
+    ///    stops it reconnecting — last, because it is the one step that cannot be
+    ///    retried. Up to here the instance is still connected and still holds a
+    ///    live credential, so a crash leaves the control plane free to dispatch
+    ///    `Remove` again; afterwards there is nothing left to retry into. Doing it
+    ///    last means a crash cannot strand the stale enrollment state above on a
+    ///    host that has already been released.
+    ///
+    /// Each file is taken with the debris an interrupted atomic write can leave
+    /// beside it — a `.tmp` no live writer holds, a `.bak` from a replacement
+    /// that did not finish, or a `.candidate` from a `spice connect` that did
+    /// not — because each holds what the canonical file held.
+    ///
+    /// A canonical file that cannot be removed does not stop the release: it is
+    /// named in `retained` and logged, because aborting with the identity intact
+    /// leaves a live credential on an instance the control plane has already
+    /// released, which is worse than leaving a file behind. So does a `.bak` or
+    /// `.candidate` that survives, since nothing renames one into place on its
+    /// own. This is the one place the ordering differs from the local command,
+    /// which can abort and let the operator retry.
+    ///
+    /// Three things do stop it, all before the identity is cleared, so the
+    /// instance stays connected and the control plane can dispatch `Remove`
+    /// again: a lock it cannot take, a `.tmp` whose writer could still promote it
+    /// over the release, and a scan that could not finish — which cannot be told
+    /// apart from finding nothing. They are the [`ReleaseError`] variants.
     async fn handle_remove(
         &mut self,
         tx: &mpsc::Sender<proto::ClientMessage>,
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        // Clear identity from disk first. Use the async clear so the remote
-        // `Remove` path does not block a Tokio worker on `std::fs` I/O while
-        // the Cloud Connect stream is active. `clear_async` treats a missing
-        // file as success, so reaching the error branch means the file exists
-        // but could not be removed.
-        if let Err(err) = IdentityStore::clear_async(&self.config.identity_path).await {
-            tracing::warn!(
-                "Cloud Connect: failed to clear identity at {}: {err}; \
-                 reporting Remove as failed and staying connected (the unchanged \
-                 identity would otherwise reconnect on restart)",
-                self.config.identity_path.display()
-            );
-            send_failed(
-                tx,
-                command_id,
-                &format!(
-                    "failed to clear identity at {}: {err}",
-                    self.config.identity_path.display()
-                ),
-            )
-            .await;
-            return false;
-        }
+        let retained = match release_local_state(&self.config, ReleasePolicy::DISPATCHED).await {
+            Ok(retained) => retained,
+            Err(message) => {
+                send_failed(tx, command_id, &message.to_string()).await;
+                return false;
+            }
+        };
 
         // Disk identity is gone — drop it from memory too and report success.
         self.identity = None;
         live_identifier.write().await.clear();
 
-        send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
+        let mut result = serde_json::json!({ "status": "removed" });
+        if !retained.is_empty()
+            && let Some(result) = result.as_object_mut()
+        {
+            result.insert("retained".to_string(), serde_json::json!(retained));
+        }
+        send_ok_json(tx, command_id, &result).await;
         true
     }
+}
+
+/// Why a release could not complete.
+///
+/// Every variant stops the removal with the identity still on disk, so the
+/// instance stays connected and the control plane can dispatch `Remove` again.
+/// What a release survives instead — a canonical file or an inert artifact it
+/// could not remove — is reported in `retained`, never here.
+#[derive(Snafu, Debug)]
+pub(crate) enum ReleaseError {
+    #[snafu(display("failed to take the connect mutation lock for {}: {source}", config_dir.display()))]
+    MutationLock {
+        config_dir: PathBuf,
+        source: crate::mutation_lock::Error,
+    },
+
+    #[snafu(display("failed to acquire the enrollment transaction for {}: {source}", config_dir.display()))]
+    EnrollmentTransaction {
+        config_dir: PathBuf,
+        source: crate::draft::Error,
+    },
+
+    #[snafu(display("failed to clear identity at {}: {source}", path.display()))]
+    ClearIdentity {
+        path: PathBuf,
+        source: crate::identity::Error,
+    },
+
+    /// The scan stops at its first error, so it cannot distinguish "no writer
+    /// holds a temp here" from "I could not finish looking" — and the release
+    /// treats the first as permission to delete the canonical file.
+    #[snafu(display("failed to check for interrupted writes beside {}: {source}", released.display()))]
+    ArtifactScan {
+        released: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// Its writer can still rename it onto the canonical path once this release
+    /// drops its locks, undoing the removal after the control plane was told the
+    /// instance was gone.
+    #[snafu(display(
+        "an interrupted write at {} could still be published as {}",
+        artifact.display(),
+        released.display()
+    ))]
+    PromotableArtifact {
+        artifact: PathBuf,
+        released: PathBuf,
+    },
+
+    #[snafu(display("the release task stopped unexpectedly: {source}"))]
+    ReleaseTask { source: tokio::task::JoinError },
+}
+
+/// How long a cloud-dispatched `Remove` waits for the connect mutation lock:
+/// one attempt.
+///
+/// Contention means a local `spice connect` is mid-transaction, and those last as
+/// long as the operator takes. Waiting out
+/// [`crate::mutation_lock::MUTATION_LOCK_TIMEOUT`] would hold the control stream
+/// until the gateway's own command timeout had passed, so the control plane would
+/// see the dispatch expire instead of a failure it can retry — the same reason
+/// the enrollment transaction is a single `try_acquire_async`.
+const REMOVE_LOCK_ATTEMPT: Duration = Duration::ZERO;
+
+/// The timing a release runs under.
+///
+/// Both values are liveness judgements about another process, and both are fixed
+/// in production. They are grouped and named so tests can drive contention and
+/// reclaim decisions deterministically without two bare `Duration` arguments that
+/// would silently swap.
+#[derive(Clone, Copy)]
+struct ReleasePolicy {
+    /// How long to wait for the connect mutation lock.
+    lock_timeout: Duration,
+    /// How old an interrupted write's temp must be before the advisory lock on it
+    /// is treated as an authoritative liveness signal.
+    temp_min_age: Duration,
+}
+
+impl ReleasePolicy {
+    /// What a cloud-dispatched `Remove` uses.
+    const DISPATCHED: Self = Self {
+        lock_timeout: REMOVE_LOCK_ATTEMPT,
+        temp_min_age: crate::identity::ABANDONED_TEMP_MIN_AGE,
+    };
+}
+
+/// Clear the cloud-issued state this instance holds on disk, under the same two
+/// locks a local `spice connect` takes.
+///
+/// `Ok` names whatever could not be removed, for the command result; an `Err`
+/// carries the message for a failed `Remove`. Failing to take any of the locks is
+/// one such `Err`, and all of them are taken before anything is deleted: a
+/// removal that cannot exclude a concurrent local mutation must not proceed, and
+/// one that gives up partway through would leave an instance that is still
+/// connected — because its identity is still live — missing state it needs. See [`ClientDriver::handle_remove`] for what is removed, in which
+/// order, and why.
+async fn release_local_state(
+    config: &CloudConnectConfig,
+    policy: ReleasePolicy,
+) -> std::result::Result<Vec<String>, ReleaseError> {
+    // The OUTER lock, taken first. This is the same `connect.lock` a local
+    // `spice connect` holds for its whole transaction, so it is what actually
+    // excludes one: the enrollment transaction alone does not, because the
+    // endpoint override and the operation journals are written outside it
+    // (`commands::connect::transaction`), and a local run could rewrite state
+    // this removal had already deleted while still reporting success. Ordering is
+    // fixed by `mutation_lock`: MutationLock outer, then the enrollment
+    // transaction — never the reverse.
+    let mutation = MutationLock::acquire_with_timeout(&config.config_dir, "remove", policy.lock_timeout)
+        .await
+        .inspect_err(|err| {
+            tracing::warn!(
+                "Cloud Connect: failed to take the connect mutation lock for {} before removal: {err}; reporting Remove as failed and staying connected",
+                config.config_dir.display()
+            );
+        })
+        .context(MutationLockSnafu {
+            config_dir: config.config_dir.clone(),
+        })?;
+
+    // Then the inner one: it is what a draft publication takes, so holding it
+    // stops a removal interleaving with an enrollment promoting a replacement
+    // identity. One non-blocking attempt — a contended directory means an
+    // enrollment is in flight, and letting the control plane retry beats holding
+    // the control stream while we wait on it.
+    let transaction = Arc::new(
+        EnrollmentTransactionLock::try_acquire_async(&config.config_dir)
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(
+                    "Cloud Connect: failed to acquire the enrollment transaction for {} before removal: {err}; reporting Remove as failed and staying connected",
+                    config.config_dir.display()
+                );
+            })
+            .context(EnrollmentTransactionSnafu {
+                config_dir: config.config_dir.clone(),
+            })?,
+    );
+    // The cache writer is excluded by the outer lock above: the only caller of
+    // `secret_cache::write` takes that same lock and reads the cache key under
+    // it, so it cannot be mid-write here and cannot publish a cache afterwards
+    // with a key this release destroyed.
+
+    // Everything destructive runs in ONE blocking task, and the guards move into
+    // it. `CloudConnect::shutdown` aborts the driver when it overruns its drain
+    // budget, which drops this future — but an in-flight `spawn_blocking` is not
+    // cancelled, so a per-step task would keep unlinking files after the guards
+    // its caller held had been dropped, racing a `spice connect` that could by
+    // then have taken the directory. Holding the guards here means the exclusion
+    // ends when the work does, not when the future does.
+    let identity_path = config.identity_path.clone();
+    let config_dir = config.config_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let _mutation = mutation;
+        release_local_state_locked(&config_dir, &identity_path, policy, &transaction)
+    })
+    .await
+    .context(ReleaseTaskSnafu)?
+}
+
+/// The destructive half of a release, under guards its caller holds for the
+/// whole call. Synchronous throughout: it is all file work, and splitting it
+/// across tasks is what would let a cancelled release outlive its exclusion.
+fn release_local_state_locked(
+    config_dir: &Path,
+    identity_path: &Path,
+    policy: ReleasePolicy,
+    transaction: &Arc<EnrollmentTransactionLock>,
+) -> std::result::Result<Vec<String>, ReleaseError> {
+    // The identity is guarded by whichever transaction protects ITS directory.
+    // `clear_with_transaction` refuses a guard whose draft path has a different
+    // parent, and `identity_path` is a public field documented as only
+    // "typically" inside the config dir — so for a split configuration the
+    // config-dir transaction is the wrong guard, and passing it would fail every
+    // Remove rather than protect anything. Acquiring the identity directory's own
+    // transaction keeps the split shape working without tightening the field.
+    //
+    // Taken here, before anything is deleted and inside this task, because
+    // deciding which guard applies resolves both directories on disk — work that
+    // has no business on the driver thread.
+    let identity_transaction = identity_transaction(identity_path, config_dir, transaction)
+        .inspect_err(|err| {
+            tracing::warn!(
+                "Cloud Connect: failed to acquire the enrollment transaction for the identity directory of {}: {err}; reporting Remove as failed and staying connected",
+                identity_path.display()
+            );
+        })
+        .context(EnrollmentTransactionSnafu {
+            // The directory whose transaction is contended, not the file inside
+            // it: the message names a config directory, and on a split
+            // configuration those are not the same path.
+            config_dir: crate::identity::parent_directory(identity_path).to_path_buf(),
+        })?;
+
+    // Named in the command result so the control plane and the portal learn that
+    // a released host still holds something, rather than the operator
+    // discovering it later.
+    let mut retained: Vec<String> = Vec::new();
+
+    let cache_path = config_dir.join(crate::secret_cache::SECRET_CACHE_FILE);
+    let removal = crate::secret_cache::remove(&cache_path);
+    retained.extend(release_atomic_write_artifacts(
+        &cache_path,
+        policy.temp_min_age,
+        ArtifactKinds::Runtime,
+    )?);
+    if let Err(err) = removal
+        && still_present(&cache_path)
+    {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the delivered-secrets cache at {}: {err}; the instance is still being released, but this host retains secrets it can no longer open",
+            cache_path.display()
+        );
+        retained.push(format!(
+            "delivered-secrets cache at {}",
+            cache_path.display()
+        ));
+    }
+
+    let draft_path = EnrollmentDraft::path_in(config_dir);
+    let removal = transaction.delete();
+    // The draft holds the provisional private key of an enrollment in progress,
+    // and it is published through the same atomic write, so it strands the same
+    // credential debris the identity and the cache do.
+    retained.extend(release_atomic_write_artifacts(
+        &draft_path,
+        policy.temp_min_age,
+        ArtifactKinds::Runtime,
+    )?);
+    if let Err(err) = removal
+        && still_present(&draft_path)
+    {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the enrollment draft in {}: {err}; the removal is continuing, and if it completes the next enrollment in this directory will need it removed first",
+            config_dir.display()
+        );
+        retained.push("enrollment draft".to_string());
+    }
+
+    // The journals go with the draft, for the same reason: `spice connect` writes
+    // them to resume an interrupted operation, and either one left beside a
+    // removed identity stops the next enrollment rather than helping it — the
+    // enrollment journal is quarantined, the project journal fails as a pending
+    // mismatch.
+    for (label, file) in [
+        (
+            "enrollment journal",
+            CloudConnectConfig::CONNECT_OPERATION_FILE,
+        ),
+        (
+            "project assignment journal",
+            CloudConnectConfig::PROJECT_OPERATION_FILE,
+        ),
+    ] {
+        let path = config_dir.join(file);
+        let removal = remove_file_if_present(&path);
+        retained.extend(release_atomic_write_artifacts(
+            &path,
+            policy.temp_min_age,
+            ArtifactKinds::Connect,
+        )?);
+        if let Err(err) = removal
+            && still_present(&path)
+        {
+            tracing::warn!(
+                "Cloud Connect: failed to remove the {label} at {}: {err}; the removal is continuing, and if it completes the next enrollment in this directory will stop on it",
+                path.display()
+            );
+            retained.push(format!("{label} at {}", path.display()));
+        }
+    }
+
+    let endpoint_path = config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE);
+    let removal = remove_file_if_present(&endpoint_path);
+    retained.extend(release_atomic_write_artifacts(
+        &endpoint_path,
+        policy.temp_min_age,
+        ArtifactKinds::Connect,
+    )?);
+    if let Err(err) = removal
+        && still_present(&endpoint_path)
+    {
+        tracing::warn!(
+            "Cloud Connect: failed to remove the endpoint override at {}: {err}; the removal is continuing, and if it completes a later enrollment in this directory would still reach the control plane it names",
+            endpoint_path.display()
+        );
+        retained.push(format!("endpoint override at {}", endpoint_path.display()));
+    }
+
+    // The identity goes LAST, and it is the only step that is not retryable:
+    // once it is gone this instance is released and stops connecting, so a
+    // crash immediately after it cannot be handed a retry. Everything above
+    // therefore runs first — a crash before this point leaves an instance that
+    // is still connected, still holding a live credential, and still reachable
+    // for the control plane to dispatch `Remove` again. Reclaiming the
+    // identity's own write debris belongs on this side of the line for the same
+    // reason: after the canonical file is gone, a crash would strand a complete
+    // copy of the credential that nothing is left to come back and remove.
+    retained.extend(release_atomic_write_artifacts(
+        identity_path,
+        policy.temp_min_age,
+        ArtifactKinds::Runtime,
+    )?);
+
+    if let Err(err) = IdentityStore::clear_with_transaction(identity_path, &identity_transaction) {
+        tracing::warn!(
+            "Cloud Connect: failed to clear identity at {}: {err}; \
+             reporting Remove as failed and staying connected (the unchanged \
+             identity would otherwise reconnect on restart)",
+            identity_path.display()
+        );
+        return Err(err).context(ClearIdentitySnafu {
+            path: identity_path.to_path_buf(),
+        });
+    }
+
+    Ok(retained)
+}
+
+/// The transaction guarding the identity file.
+///
+/// Usually the config directory's own — the identity lives inside it, and one
+/// transaction covers the draft, the journals and the identity together. When
+/// [`CloudConnectConfig::identity_path`] points somewhere else, that directory
+/// has its own enrollment transaction, and it is the one that excludes an
+/// enrollment racing this removal for that file; the config-dir guard protects
+/// nothing there and `clear_with_transaction_async` rightly refuses it.
+///
+/// # Errors
+///
+/// Returns the acquisition failure when the identity directory's transaction is
+/// held elsewhere, which is a reason to fail the removal rather than clear the
+/// identity unguarded.
+fn identity_transaction(
+    identity_path: &Path,
+    config_dir: &Path,
+    config_dir_transaction: &Arc<EnrollmentTransactionLock>,
+) -> std::result::Result<Arc<EnrollmentTransactionLock>, crate::draft::Error> {
+    let Some(identity_dir) = identity_path.parent() else {
+        return Ok(Arc::clone(config_dir_transaction));
+    };
+    // Directory identity, not spelling: an identity path reached through a
+    // relative path or an ancestor symlink is still inside the config directory,
+    // and taking a second transaction for it would contend with the one already
+    // held — one non-blocking attempt, so `Remove` would fail every time on a
+    // path the split-config support is meant to allow. `protects` resolves the
+    // same way, so the guard chosen here is the guard the clear accepts.
+    if crate::draft::same_directory(identity_dir, config_dir) {
+        return Ok(Arc::clone(config_dir_transaction));
+    }
+    Ok(Arc::new(EnrollmentTransactionLock::try_acquire(
+        identity_dir,
+    )?))
+}
+
+/// Whether a released file is still on disk.
+///
+/// Answers "yes" when it cannot tell, which is the conservative direction: a
+/// `retained` entry for a file that is gone sends an operator looking for
+/// nothing, but a missing entry for one that remains is the operator never
+/// learning their released host still holds it.
+///
+/// Asked *after* the artifact reclaim for the same path, never from the
+/// removal's own result. `secret_cache::remove` and the draft's delete report a
+/// parent-directory sync failure alongside a failed unlink, and the reclaim syncs
+/// that same directory afterwards — so a transient first sync would otherwise
+/// report a file that the release went on to remove and synchronize.
+fn still_present(path: &Path) -> bool {
+    // `symlink_metadata`, not `try_exists`: the latter follows the final link, so
+    // a dangling symlink reads as absent when the directory entry is very much
+    // still there — and an entry whose unlink failed is exactly what this is
+    // asked about.
+    // Anything but a definite "no entry here" counts as present, including an
+    // error that leaves it unknown.
+    std::fs::symlink_metadata(path)
+        .err()
+        .is_none_or(|err| err.kind() != std::io::ErrorKind::NotFound)
+}
+
+/// Delete `path` off the Tokio driver task, treating a missing file as success.
+///
+/// `std::fs` on the blocking pool rather than `tokio::fs`, to match the other
+/// removals here and keep one failure vocabulary across them.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    // Only the unlink is reported. Making it durable is the job of the artifact
+    // reclaim that follows every one of these, which syncs this same parent
+    // directory unconditionally and fails the release if it cannot — one sync
+    // covers every unlink pending in the directory. Reporting a sync failure here
+    // would name a file as retained that is in fact gone, and gone durably once
+    // that reclaim succeeds.
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Reclaim the artifacts an interrupted atomic write can leave beside a released
+/// file, and name whatever is still there.
+///
+/// Split by whether the release can still be undone, which is what decides fatal
+/// from merely reported:
+///
+/// - **Fatal**: a temp its writer may still promote onto the canonical path, and
+///   a scan that could not finish — which cannot tell that case from its absence.
+///   Both stop the removal while the identity is live, so the control plane can
+///   retry.
+/// - **Reported**: a backup or candidate that could not be removed. Nothing
+///   renames one into place on its own, so the release stands and the operator is
+///   told what remains.
+fn release_atomic_write_artifacts(
+    path: &Path,
+    minimum_age: Duration,
+    kinds: ArtifactKinds,
+) -> std::result::Result<Vec<String>, ReleaseError> {
+    let released = path.display().to_string();
+    let remaining = match crate::identity::release_atomic_write_artifacts(path, minimum_age, kinds)
+    {
+        Ok(remaining) => remaining,
+        // Fatal for the same reason a promotable temp is. The scan stops at the
+        // first error, so it may have given up before reaching a temp a writer
+        // still owns — and this cannot tell the difference between "there is
+        // none" and "I could not finish looking". Releasing on the strength of an
+        // incomplete scan is what would let that writer publish afterwards.
+        Err(err) => {
+            tracing::warn!(
+                "Cloud Connect: failed to reclaim interrupted-write artifacts beside {released}: {err}; reporting Remove as failed and staying connected, because an unfinished scan cannot rule out a writer that would publish over the release"
+            );
+            return Err(err).context(ArtifactScanSnafu {
+                released: path.to_path_buf(),
+            });
+        }
+    };
+
+    // A temp its writer still owns is not something to report and move on from:
+    // that writer can rename it onto the canonical path once this release drops
+    // its locks, putting back the file the release just removed after the control
+    // plane has been told the instance is gone. Fail instead, while the identity
+    // is still live and the dispatch can be retried.
+    if let Some(promotable) = remaining.promotable.first() {
+        tracing::warn!(
+            "Cloud Connect: {} is still owned by a writer that could publish it as {released}; reporting Remove as failed and staying connected so the control plane can retry",
+            promotable.display()
+        );
+        return PromotableArtifactSnafu {
+            artifact: promotable.clone(),
+            released: path.to_path_buf(),
+        }
+        .fail();
+    }
+
+    Ok(remaining
+        .inert
+        .into_iter()
+        .map(|left| {
+            let left = left.display().to_string();
+            tracing::warn!(
+                "Cloud Connect: {left} could not be removed; the removal is continuing, and if it completes this host retains a copy of what was removed"
+            );
+            format!("interrupted-write artifact at {left}")
+        })
+        .collect())
 }
 
 /// Outcome of the pre-connect credential phase
@@ -2085,5 +2610,813 @@ mod tests {
         let trust = server_trust("", None);
         assert!(trust.native_roots);
         assert!(trust.extra_cas.is_empty());
+    }
+
+    /// A cloud-dispatched `Remove` has to leave the host in the state
+    /// `spice connect remove` leaves it in: none of the cloud-issued state
+    /// behind, and in particular no secrets whose key it just destroyed.
+    mod removal {
+        use super::super::{
+            EnrollmentTransactionLock, MutationLock, ReleaseError, ReleasePolicy,
+            release_local_state, still_present,
+        };
+        use crate::config::CloudConnectConfig;
+        use crate::draft::EnrollmentDraft;
+        use crate::secret_cache::SECRET_CACHE_FILE;
+
+        struct Host {
+            _dir: tempfile::TempDir,
+            config: CloudConnectConfig,
+        }
+
+        impl Host {
+            /// A config directory holding every piece of cloud-issued state a
+            /// released instance could have on disk.
+            fn enrolled() -> Self {
+                let dir = tempfile::tempdir().expect("create tempdir");
+                let config =
+                    CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+                std::fs::write(&config.identity_path, "{}").expect("write identity");
+                std::fs::write(Self::cache_path_in(&config), "cached-secrets")
+                    .expect("write secrets cache");
+                std::fs::write(EnrollmentDraft::path_in(&config.config_dir), "{}")
+                    .expect("write enrollment draft");
+                for journal in [
+                    CloudConnectConfig::CONNECT_OPERATION_FILE,
+                    CloudConnectConfig::PROJECT_OPERATION_FILE,
+                ] {
+                    std::fs::write(config.config_dir.join(journal), "{}")
+                        .expect("write operation journal");
+                }
+                Self { _dir: dir, config }
+            }
+
+            fn cache_path_in(config: &CloudConnectConfig) -> std::path::PathBuf {
+                config.config_dir.join(SECRET_CACHE_FILE)
+            }
+
+            fn cache_path(&self) -> std::path::PathBuf {
+                Self::cache_path_in(&self.config)
+            }
+
+            fn draft_path(&self) -> std::path::PathBuf {
+                EnrollmentDraft::path_in(&self.config.config_dir)
+            }
+
+            fn endpoint_path(&self) -> std::path::PathBuf {
+                self.config
+                    .config_dir
+                    .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE)
+            }
+
+            fn journal_path(&self, file: &str) -> std::path::PathBuf {
+                self.config.config_dir.join(file)
+            }
+
+            async fn release(&self) -> std::result::Result<Vec<String>, ReleaseError> {
+                release_local_state(&self.config, Self::policy()).await
+            }
+
+            /// The reclaim rule under test is the advisory lock, not the clock,
+            /// so the age margin is zero here and a held lock is what has to
+            /// save a live writer's temp.
+            fn policy() -> ReleasePolicy {
+                ReleasePolicy {
+                    lock_timeout: std::time::Duration::from_secs(5),
+                    temp_min_age: std::time::Duration::ZERO,
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn it_clears_the_identity_the_secrets_cache_and_the_draft() {
+            let host = Host::enrolled();
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+            assert!(
+                !host.config.identity_path.exists(),
+                "the identity is what actually releases the instance"
+            );
+            assert!(
+                !host.cache_path().exists(),
+                "a released host must not keep the app's secrets"
+            );
+            assert!(
+                !host.draft_path().exists(),
+                "a draft is reused verbatim, so one left behind replays the removed enrollment"
+            );
+            for journal in [
+                CloudConnectConfig::CONNECT_OPERATION_FILE,
+                CloudConnectConfig::PROJECT_OPERATION_FILE,
+            ] {
+                assert!(
+                    !host.journal_path(journal).exists(),
+                    "{journal} left beside a removed identity stops the next enrollment"
+                );
+            }
+        }
+
+        /// The split configuration the public `identity_path` field allows: the
+        /// identity lives outside the config directory. The config-dir guard does
+        /// not protect it, so passing that guard would fail every Remove — the
+        /// release has to take the identity directory's own transaction instead.
+        #[tokio::test]
+        async fn it_releases_an_identity_kept_outside_the_config_directory() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config_dir = dir.path().join("config");
+            let identity_dir = dir.path().join("elsewhere");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::create_dir_all(&identity_dir).expect("create identity dir");
+            let mut config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+            config.identity_path = identity_dir.join("identity.json");
+            std::fs::write(&config.identity_path, "{}").expect("write identity");
+            std::fs::write(config_dir.join(SECRET_CACHE_FILE), "cached").expect("write cache");
+
+            let retained = release_local_state(&config, Host::policy())
+                .await
+                .expect("a split identity path must still release");
+
+            assert!(
+                !config.identity_path.exists(),
+                "the identity outside the config dir must still be cleared"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// The outer lock is the one a local `spice connect` holds, so a release
+        /// must not proceed while one is running. Deterministic: the lock is held
+        /// for the whole assertion, and released before the retry succeeds.
+        #[tokio::test]
+        async fn a_release_waits_for_a_local_connect_to_finish() {
+            let host = Host::enrolled();
+
+            let held = MutationLock::acquire(&host.config.config_dir, "connect")
+                .await
+                .expect("a local connect takes the directory");
+
+            let contended = release_local_state(
+                &host.config,
+                ReleasePolicy {
+                    lock_timeout: std::time::Duration::from_millis(50),
+                    ..Host::policy()
+                },
+            )
+            .await;
+            let message = contended
+                .expect_err("a release must not run while a local connect holds it")
+                .to_string();
+            assert!(
+                message.contains("connect mutation lock"),
+                "the failure must name the lock it could not take, got {message}"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "and it must remove nothing before giving up, so the instance stays connected"
+            );
+
+            drop(held);
+            host.release()
+                .await
+                .expect("and it must proceed once that connect finishes");
+            assert!(
+                !host.config.identity_path.exists(),
+                "the release that took the lock still removes the identity"
+            );
+        }
+
+        /// Every lock is taken before anything is deleted. A split identity
+        /// path needs a second transaction, and failing to take it must leave the
+        /// host exactly as it was — the identity is still live, so the instance
+        /// stays connected and still needs its delivered secrets.
+        #[tokio::test]
+        async fn a_removal_that_cannot_lock_the_identity_deletes_nothing() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config_dir = dir.path().join("config");
+            let identity_dir = dir.path().join("elsewhere");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::create_dir_all(&identity_dir).expect("create identity dir");
+            let mut config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+            config.identity_path = identity_dir.join("identity.json");
+            std::fs::write(&config.identity_path, "{}").expect("write identity");
+            let cache = config_dir.join(SECRET_CACHE_FILE);
+            std::fs::write(&cache, "cached").expect("write cache");
+
+            let contender = EnrollmentTransactionLock::try_acquire_async(&identity_dir)
+                .await
+                .expect("an enrollment holds the identity directory");
+
+            let message = release_local_state(&config, Host::policy())
+                .await
+                .expect_err("a removal that cannot lock the identity must fail")
+                .to_string();
+
+            assert!(
+                message.contains(&identity_dir.display().to_string()),
+                "the failure must name the directory whose transaction it could not take, got {message}"
+            );
+            assert!(
+                !message.contains(&config.identity_path.display().to_string()),
+                "and must not name the file instead — the contended transaction belongs to the \
+                 directory, and the message calls it one: {message}"
+            );
+            assert!(
+                cache.exists(),
+                "the secrets cache must survive: the identity is still live, so the \
+                 instance stays connected and still needs it"
+            );
+            assert!(
+                config.identity_path.exists(),
+                "and the identity itself is untouched"
+            );
+            drop(contender);
+        }
+
+        /// An interrupted atomic write leaves a temp holding the same credential
+        /// the canonical file did. A release that removed only the canonical file
+        /// would report the host clean while a complete copy stayed behind.
+        #[tokio::test]
+        async fn it_reclaims_the_debris_of_an_interrupted_write() {
+            let host = Host::enrolled();
+            let abandoned = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
+            std::fs::write(&abandoned, "ciphertext and secret names").expect("write the temp");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !abandoned.exists(),
+                "a temp no live writer holds must not outlive the cache it copies"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// A temp its writer still owns is not merely reported: that writer can
+        /// rename it onto the canonical path once the release drops its locks,
+        /// putting back the file the release removed after the control plane has
+        /// been told the instance is gone. So the release fails instead, while
+        /// the identity is still live and the dispatch can be retried.
+        #[tokio::test]
+        async fn a_live_writers_temp_fails_the_release_rather_than_being_deleted() {
+            let host = Host::enrolled();
+            let in_flight = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.66666666-7777-4888-8999-aaaaaaaaaaaa.tmp"
+            ));
+            let writer = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&in_flight)
+                .expect("a writer creates its temp");
+            assert!(
+                fs4::fs_std::FileExt::try_lock_exclusive(&writer).expect("lock the temp"),
+                "the writer holds its own temp"
+            );
+
+            let message = host
+                .release()
+                .await
+                .expect_err("a temp that could still be published must fail the removal")
+                .to_string();
+
+            assert!(
+                message.contains("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+                "the failure must name what could still be published, got {message}"
+            );
+            assert!(
+                in_flight.exists(),
+                "a live writer's temp must survive: deleting it to tidy up is the worse outcome"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "and the identity stays, so the instance is still reachable for a retry"
+            );
+            drop(writer);
+        }
+
+        /// A scan that cannot finish cannot prove no writer is holding a temp,
+        /// and the release treats a known one as fatal, so it must treat "I could
+        /// not tell" the same way. The alternative is releasing on an incomplete
+        /// answer and letting that writer publish afterwards.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_reclaim_that_cannot_finish_fails_the_release() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let host = Host::enrolled();
+            // A temp the reclaim cannot open: it decides liveness by taking the
+            // file's lock, so a file it cannot open is one it cannot judge.
+            let unreadable = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
+            std::fs::write(&unreadable, "an interrupted write").expect("write the temp");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+                .expect("make the temp unopenable");
+
+            let message = host
+                .release()
+                .await
+                .expect_err("an unfinished scan must fail the removal")
+                .to_string();
+
+            assert!(
+                message.contains("failed to check for interrupted writes"),
+                "the failure must say what it could not establish, got {message}"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "the identity stays, so the instance is still reachable for a retry"
+            );
+        }
+
+        /// The draft carries the provisional private key of an enrollment in
+        /// progress, so an interrupted publication strands a credential exactly
+        /// as the identity and the cache do.
+        #[tokio::test]
+        async fn it_reclaims_the_debris_of_an_interrupted_draft_publication() {
+            let host = Host::enrolled();
+            let draft_name = host
+                .draft_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("the draft has a name")
+                .to_string();
+            let abandoned = host.config.config_dir.join(format!(
+                ".{draft_name}.bbbbbbbb-cccc-4ddd-8eee-ffffffffffff.tmp"
+            ));
+            std::fs::write(&abandoned, "provisional private key").expect("write the temp");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !abandoned.exists(),
+                "a draft temp no live writer holds must not outlive the draft it copies"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// A release deletes an interrupted replacement's backup, which is the
+        /// deliberate opposite of `cleanup_stale_identity_backups`: that one
+        /// preserves an orphaned backup as possibly the last recoverable
+        /// identity, and once the control plane has released the instance there
+        /// is nothing left to recover it for. Left behind it is a complete copy
+        /// of the credential the release just destroyed.
+        #[tokio::test]
+        async fn it_deletes_the_backup_of_an_interrupted_identity_replacement() {
+            let host = Host::enrolled();
+            let identity_name = host
+                .config
+                .identity_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("the identity has a name")
+                .to_string();
+            let backup = host.config.config_dir.join(format!(
+                ".{identity_name}.12341234-5678-49ab-8cde-f01234567890.bak"
+            ));
+            std::fs::write(&backup, "the complete previous credential").expect("write the backup");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !backup.exists(),
+                "a released host must not keep a copy of the identity it just gave up"
+            );
+            assert!(
+                !host.config.identity_path.exists(),
+                "and the canonical identity is gone, which is what makes the backup an orphan"
+            );
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// A file that was unlinked is gone, whatever happens to the directory
+        /// sync afterwards, so it must not be named as retained. The reclaim that
+        /// follows every removal syncs this same parent and fails the release if
+        /// it cannot, which is what makes the unlink durable — reporting the file
+        /// here would tell the operator to go remove something that is not there.
+        #[tokio::test]
+        async fn a_file_it_unlinked_is_never_reported_as_retained() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            for (label, path) in [
+                ("delivered-secrets cache", host.cache_path()),
+                ("enrollment draft", host.draft_path()),
+                (
+                    "enrollment journal",
+                    host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE),
+                ),
+                (
+                    "project assignment journal",
+                    host.journal_path(CloudConnectConfig::PROJECT_OPERATION_FILE),
+                ),
+                ("endpoint override", host.endpoint_path()),
+            ] {
+                assert!(!path.exists(), "the {label} is gone");
+                assert!(
+                    !retained.iter().any(|item| item.contains(label)),
+                    "and must not be reported as retained: {retained:?}"
+                );
+            }
+        }
+
+        /// A name this cannot read is a name it cannot tell apart from
+        /// `identity.json`, because that is the fallback the writer uses when
+        /// naming temps for it. Reclaiming under that prefix would delete another
+        /// file's debris, or fail this release over another file's writer. Stop
+        /// before anything is deleted instead.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_identity_whose_name_it_cannot_read_stops_the_release() {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let host = Host::enrolled();
+            let mut config = host.config.clone();
+            // Not created on disk: this filesystem rejects the name outright, and
+            // the check reads the path rather than the directory, so it fires
+            // either way.
+            config.identity_path = host
+                .config
+                .config_dir
+                .join(std::ffi::OsStr::from_bytes(b"identity-\xff.json"));
+
+            let message = release_local_state(&config, Host::policy())
+                .await
+                .expect_err("an unreadable name must stop the release")
+                .to_string();
+
+            assert!(
+                message.contains("not valid UTF-8"),
+                "the failure must say why it could not judge the debris, got {message}"
+            );
+            assert!(
+                host.config.identity_path.exists(),
+                "and must stop before the identity is cleared, so the instance stays connected"
+            );
+        }
+
+        /// The two writers do not overlap: the runtime writes `.tmp`/`.bak`
+        /// beside the cache, draft and identity, `spice connect` writes
+        /// `.candidate` beside the journals and endpoint override. A shape the
+        /// writer for a given file cannot produce is somebody else's — and for a
+        /// `.tmp` it is worse than deleted, since an unreclaimable temp fails
+        /// every release.
+        #[tokio::test]
+        async fn it_matches_each_file_against_only_its_own_writer() {
+            let host = Host::enrolled();
+            let strays = [
+                // The runtime never writes a `.candidate` beside the identity.
+                ".identity.json.7.candidate".to_string(),
+                // `spice connect` never writes a `.tmp` beside the endpoint.
+                format!(
+                    ".{}.11111111-2222-4333-8444-555555555555.tmp",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a shape the writer cannot produce must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} is not a shape that file's writer produces and must survive"
+                );
+            }
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// None of these writers creates a directory or a symlink, so something
+        /// wearing an artifact name that is not a regular file came from
+        /// elsewhere: not ours to delete, and not evidence of a live writer.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn it_classifies_only_regular_files_as_artifacts() {
+            let host = Host::enrolled();
+            let link = host.config.config_dir.join(format!(
+                ".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.tmp"
+            ));
+            std::os::unix::fs::symlink(host.config.config_dir.join("nothing-here"), &link)
+                .expect("create the symlink");
+
+            let retained = host
+                .release()
+                .await
+                .expect("a non-regular file must not fail the removal");
+
+            assert!(
+                link.symlink_metadata().is_ok(),
+                "a symlink is not an artifact this code wrote and must survive"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// The spellings `Uuid::parse_str` and `u64::from_str` accept but these
+        /// writers never produce. A file named with a v1 UUID, a braced one, or a
+        /// zero-padded number came from somewhere else.
+        #[tokio::test]
+        async fn it_leaves_alone_names_its_writers_would_not_produce() {
+            let host = Host::enrolled();
+            let strays = [
+                // v1, not v4.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-1333-8444-555555555555.bak"),
+                // v4, but braced rather than plain hyphenated.
+                format!(".{SECRET_CACHE_FILE}.{{11111111-2222-4333-8444-555555555555}}.bak"),
+                // Version 4, but the variant nibble is `c` — not RFC 4122, so not
+                // something `Uuid::new_v4` produces.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-4333-c444-555555555555.bak"),
+                // Uppercase suffix; every emitted one is lowercase.
+                format!(".{SECRET_CACHE_FILE}.11111111-2222-4333-8444-555555555555.BAK"),
+                // A number, but not one `u64::to_string` would write.
+                format!(
+                    ".{}.007.candidate",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a stray must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} is not a name this code writes and must survive the release"
+                );
+            }
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// What `retained` is decided from. A dangling symlink is a directory
+        /// entry that is still there — an unlink that failed leaves exactly that
+        /// — and following it would report the file gone and drop it from the
+        /// release's report.
+        #[cfg(unix)]
+        #[test]
+        fn a_directory_entry_counts_as_present_even_when_it_leads_nowhere() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let dangling = dir.path().join("dangling");
+            std::os::unix::fs::symlink(dir.path().join("nothing-here"), &dangling)
+                .expect("create the dangling symlink");
+
+            assert!(
+                still_present(&dangling),
+                "the entry is still in the directory, whatever it points at"
+            );
+            assert!(
+                !still_present(&dir.path().join("never-existed")),
+                "and a name with no entry at all is gone"
+            );
+            let real = dir.path().join("real");
+            std::fs::write(&real, "x").expect("write the file");
+            assert!(still_present(&real), "as is an ordinary file");
+        }
+
+        /// A sibling somebody named themselves is not this code's to touch, even
+        /// where it shares the prefix and extension. Deleting one would be a
+        /// release destroying an unrelated local file; worse, a stray `.tmp`
+        /// read as a writer's in-flight file would fail every `Remove` for good.
+        #[tokio::test]
+        async fn it_leaves_alone_files_it_did_not_write() {
+            let host = Host::enrolled();
+            let strays = [
+                format!(".{SECRET_CACHE_FILE}.notes.tmp"),
+                format!(".{SECRET_CACHE_FILE}.manual.bak"),
+                format!(
+                    ".{}.notes.candidate",
+                    CloudConnectConfig::ENDPOINT_OVERRIDE_FILE
+                ),
+            ];
+            for stray in &strays {
+                std::fs::write(host.config.config_dir.join(stray), "someone's own file")
+                    .expect("write the stray");
+            }
+
+            let retained = host
+                .release()
+                .await
+                .expect("a stray must not fail the removal");
+
+            for stray in &strays {
+                assert!(
+                    host.config.config_dir.join(stray).exists(),
+                    "{stray} was not written by this code and must survive the release"
+                );
+            }
+            assert!(
+                retained.is_empty(),
+                "and a stray is not something to report either: {retained:?}"
+            );
+        }
+
+        /// `spice connect` writes the journals and the endpoint override through
+        /// its own atomic write, whose interrupted artifact is `.candidate` — a
+        /// different name from the runtime's `.tmp`, so a reclaim that knew only
+        /// the runtime's would report a clean release over a complete copy.
+        ///
+        /// Nothing holds a per-file lock on a candidate. What makes removing one
+        /// safe is that this release holds `connect.lock` for its whole run, the
+        /// same lock the writer holds for its whole transaction, so no writer can
+        /// be mid-write and any candidate present was abandoned.
+        #[tokio::test]
+        async fn it_reclaims_the_candidates_a_connect_left_behind() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
+
+            let candidates: Vec<std::path::PathBuf> = [
+                CloudConnectConfig::CONNECT_OPERATION_FILE,
+                CloudConnectConfig::PROJECT_OPERATION_FILE,
+                CloudConnectConfig::ENDPOINT_OVERRIDE_FILE,
+            ]
+            .into_iter()
+            .map(|file| {
+                let candidate = host.config.config_dir.join(format!(".{file}.7.candidate"));
+                std::fs::write(&candidate, "an interrupted connect wrote this")
+                    .expect("write the candidate");
+                candidate
+            })
+            .collect();
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            for candidate in &candidates {
+                assert!(
+                    !candidate.exists(),
+                    "a released host must not keep {}",
+                    candidate.display()
+                );
+            }
+            assert!(retained.is_empty(), "nothing should be left: {retained:?}");
+        }
+
+        /// The journals are non-fatal like the cache and the draft: the instance
+        /// is released either way, and what could not be taken is named.
+        #[tokio::test]
+        async fn an_unremovable_journal_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            let journal = host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE);
+            std::fs::remove_file(&journal).expect("replace the journal with a directory");
+            std::fs::create_dir(&journal).expect("create the journal directory");
+            std::fs::write(journal.join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                retained
+                    .iter()
+                    .any(|item| item.contains("enrollment journal")),
+                "the operator has to learn the next enrollment will stop on it: {retained:?}"
+            );
+        }
+
+        /// The endpoint override goes too. `spice connect` writes it for a
+        /// binding taken from the identity or a pending draft, so it can name the
+        /// control plane of the very enrollment being released — and a file left
+        /// behind would silently point the next `spiced --token` at it.
+        #[tokio::test]
+        async fn it_removes_the_endpoint_override() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://api.spice.ai")
+                .expect("write endpoint override");
+
+            let retained = host.release().await.expect("the removal succeeds");
+
+            assert!(
+                !host.endpoint_path().exists(),
+                "a released instance must not keep the control plane it was released from"
+            );
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// The draft's removal is non-fatal, like the cache's: the instance is
+        /// released either way, and what could not be taken is named rather than
+        /// silently left. Without this the branch is never exercised.
+        #[tokio::test]
+        async fn an_unremovable_draft_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            std::fs::remove_file(host.draft_path()).expect("replace the draft with a directory");
+            std::fs::create_dir(host.draft_path()).expect("create the draft directory");
+            std::fs::write(host.draft_path().join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                !host.cache_path().exists(),
+                "and its secrets must still be gone"
+            );
+            assert!(
+                retained
+                    .iter()
+                    .any(|item| item.contains("enrollment draft")),
+                "the operator has to learn the next enrollment needs it cleared: {retained:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn it_succeeds_with_nothing_on_disk_to_remove() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+            let retained = release_local_state(&config, Host::policy())
+                .await
+                .expect("a removal with nothing to remove is not a failure");
+
+            assert!(retained.is_empty(), "{retained:?}");
+        }
+
+        /// This is what the cache-before-identity ordering buys. A directory in
+        /// the cache's place cannot be unlinked, so the removal continues to the
+        /// identity — releasing the instance — and names what it could not take.
+        /// Aborting instead would leave a live credential on an instance the
+        /// control plane has already released.
+        #[tokio::test]
+        async fn an_unremovable_secrets_cache_still_releases_the_instance_and_is_reported() {
+            let host = Host::enrolled();
+            std::fs::remove_file(host.cache_path()).expect("replace the cache with a directory");
+            std::fs::create_dir(host.cache_path()).expect("create the cache directory");
+            std::fs::write(host.cache_path().join("occupant"), "x").expect("occupy it");
+
+            let retained = host.release().await.expect("the removal still succeeds");
+
+            assert!(
+                !host.config.identity_path.exists(),
+                "the instance must still be released"
+            );
+            assert!(
+                retained.iter().any(|item| item.contains("secrets cache")),
+                "the operator has to learn the host kept secrets: {retained:?}"
+            );
+        }
+
+        /// The identity is the only fatal part: if it survives, the instance
+        /// reconnects on the next start, so reporting success would lie to the
+        /// control plane.
+        ///
+        /// It is also the last thing removed, so reaching it proves everything
+        /// else is already gone. That is what makes the step safe to be the
+        /// unretryable one — a crash anywhere before it leaves a live credential
+        /// on a connected instance the control plane can dispatch `Remove` to
+        /// again, rather than stale enrollment state on a released host.
+        #[tokio::test]
+        async fn an_unremovable_identity_fails_the_removal_after_everything_else_is_gone() {
+            let host = Host::enrolled();
+            std::fs::write(host.endpoint_path(), "https://control.example\n")
+                .expect("write the endpoint override");
+            std::fs::remove_file(&host.config.identity_path)
+                .expect("replace the identity with a directory");
+            std::fs::create_dir(&host.config.identity_path).expect("create the identity directory");
+            std::fs::write(host.config.identity_path.join("occupant"), "x").expect("occupy it");
+
+            let message = host
+                .release()
+                .await
+                .expect_err("an identity left on disk must fail the removal")
+                .to_string();
+
+            assert!(message.contains("failed to clear identity"), "{message}");
+            for (label, path) in [
+                ("delivered-secrets cache", host.cache_path()),
+                ("enrollment draft", host.draft_path()),
+                (
+                    "enrollment journal",
+                    host.journal_path(CloudConnectConfig::CONNECT_OPERATION_FILE),
+                ),
+                (
+                    "project journal",
+                    host.journal_path(CloudConnectConfig::PROJECT_OPERATION_FILE),
+                ),
+                ("endpoint override", host.endpoint_path()),
+            ] {
+                assert!(
+                    !path.exists(),
+                    "the {label} is removed before the identity, so it is gone even when the identity cannot be cleared"
+                );
+            }
+        }
     }
 }

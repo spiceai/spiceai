@@ -28,15 +28,22 @@ limitations under the License.
 //! it reaches the same state through the control stream, and two exclusion
 //! primitives over one directory would exclude nothing.
 //!
-//! What takes it today is the CLI — the `spice connect` transaction and
-//! `spice connect remove`. The runtime's own mutation paths (the `--token`
-//! bootstrap, and the command handlers that persist an app id or an attachment)
-//! do not yet, so a runtime mutation can still interleave with a CLI
-//! transaction. Moving them onto this lock is what this module exists for, and
-//! it is deliberately not a change made from here: a control-stream handler that
-//! blocks on a directory a long CLI transaction holds stalls the stream, so each
-//! path has to adopt the lock with that in view. Until a path does, this module
-//! is the one place the exclusion is defined rather than a second one.
+//! What takes it today:
+//!
+//! - the CLI's `spice connect` transaction and `spice connect remove`;
+//! - the runtime's cloud-dispatched `Remove`, for the whole release;
+//! - the runtime's delivered-secrets cache write, which reads the cache key
+//!   under the lock so a release cannot be undone by a write that already held
+//!   one.
+//!
+//! The runtime's remaining mutation paths — the `--token` bootstrap, and the
+//! command handlers that persist an app id or an attachment — do not yet, so
+//! those can still interleave with a CLI transaction. Each has to adopt the lock
+//! with the stream in view: a control-stream handler that blocks on a directory a
+//! long CLI transaction holds stalls the stream, which is why the two paths above
+//! take it for a single attempt and a short wait respectively rather than the
+//! default timeout. Until a path adopts it, this module is still the one place
+//! the exclusion is defined rather than a second one.
 //!
 //! The lock is advisory and file-descriptor-scoped: the operating system drops
 //! it when the holding process exits, so a crash cannot leave a directory

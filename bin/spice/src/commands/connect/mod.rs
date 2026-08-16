@@ -61,7 +61,11 @@ use status::{ConnectStatus, ConnectionState};
 
 /// File (relative to the config dir) holding a `--endpoint` override so later
 /// `spiced` starts reach the same control plane the enroll did.
-const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
+///
+/// Shared with the runtime, which removes this override on release: defining the
+/// name on each side independently would let a rename here leave a persisted
+/// override behind for the next enrollment to pick up.
+const CLOUD_ENDPOINT_FILE: &str = CloudConnectConfig::ENDPOINT_OVERRIDE_FILE;
 
 /// Arguments for the `spice connect` command.
 #[derive(Args, Debug)]
