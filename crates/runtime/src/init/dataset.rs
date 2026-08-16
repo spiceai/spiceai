@@ -19,8 +19,6 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Insta
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
@@ -1936,30 +1934,22 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at().await {
-                if is_shutdown_cancellation(&e) {
-                    tracing::debug!(
-                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                        dataset.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Failed to update _fetched_at for cached dataset {}: {e}",
-                        dataset.name
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "Updated _fetched_at for all records in cached dataset {}",
-                    dataset.name
-                );
-            }
+    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
+        Ok(()) => {
+            tracing::info!(
+                "Updated _fetched_at for all records in cached dataset {}",
+                dataset.name
+            );
+        }
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(
+                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                dataset.name
+            );
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to initialize caching engine for {}: {e}",
+                "Failed to update _fetched_at for cached dataset {}: {e}",
                 dataset.name
             );
         }

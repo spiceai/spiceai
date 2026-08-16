@@ -34,8 +34,10 @@ use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint};
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataconnector::DataConnector;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 
 /// A [`DataConnector`] bound to the dataset it resolves, as a [`RefreshSource`].
 #[derive(Debug)]
@@ -81,10 +83,13 @@ impl RefreshSource for ConnectorRefreshSource {
         }
 
         let registry = self.dataset.runtime.accelerator_engine_registry();
-        let checkpoint =
-            DatasetCheckpoint::try_new(self.dataset.as_ref(), registry, OpenOption::OpenExisting)
-                .await
-                .ok()?;
-        Some(checkpoint.to_arc())
+        dataset_checkpointer(
+            self.dataset.as_ref(),
+            registry,
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .ok()
     }
 }

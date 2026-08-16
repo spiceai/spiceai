@@ -445,6 +445,7 @@ fn probe_storage_perf_blocking(path: &std::path::Path) -> StoragePerf {
 /// mount point is the longest prefix of the canonicalized path), or `None` when
 /// undetectable / remote / empty. Best-effort, for a low-disk startup warning: a
 /// full data or spill volume turns a memory-pressure spill into a crash.
+#[must_use]
 pub fn disk_space_bytes(path: &str) -> Option<(u64, u64)> {
     if path.is_empty() {
         return None;

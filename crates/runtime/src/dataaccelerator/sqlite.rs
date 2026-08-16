@@ -50,7 +50,12 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_sqlite::SqliteSidecar;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -379,6 +384,36 @@ impl DataAccelerator for SqliteAccelerator {
     /// If the dataset is not file-accelerated, this is a no-op
     /// This step is required for federation, as `SQLite` connections attach to all other configured `SQLite` databases.
     /// Federation then requires that all attached databases exist before dataset registration.
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let sqlite_file =
+            self.sqlite_file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&sqlite_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("SQLite file does not exist at {sqlite_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(SqliteSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,

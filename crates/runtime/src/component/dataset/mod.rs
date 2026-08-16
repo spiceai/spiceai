@@ -237,7 +237,7 @@ impl AccelerationSource for Dataset {
         &self,
         snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
     ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
-        crate::dataaccelerator::spice_sys::dataset_checkpoint::checkpointer_factory(
+        crate::dataaccelerator::spice_sys::checkpointer_factory(
             self,
             self.runtime.accelerator_engine_registry(),
             snapshot_behavior,

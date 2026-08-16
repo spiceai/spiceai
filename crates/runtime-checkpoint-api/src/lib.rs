@@ -50,20 +50,16 @@ limitations under the License.
 //!
 //! # Where each shape is implemented
 //!
-//! In every case the `runtime` crate resolves a dataset to its accelerator connection
-//! and constructs the matching store, so a caller never names an engine. Where the SQL
-//! for that store lives differs by shape today:
+//! Every shape is implemented **per storage engine**, in the sibling
+//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine, so
+//! the stitch binary links only the engines it enables. Each of those crates bundles its
+//! stores behind `runtime_acceleration::sidecar::AcceleratorSidecar`, which the engine's
+//! accelerator returns from `DataAccelerator::sidecar`.
 //!
-//! - [`BlobCheckpointStore`] is implemented **per storage engine** in the sibling
-//!   `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine,
-//!   so the stitch binary links only the engines it enables (`feature = crate`).
-//! - The structured shapes ([`kafka`], [`debezium`], [`mysql_binlog`], [`mongodb`]) are
-//!   implemented inside `runtime`, on the `spice_sys` sidecar types, with their
-//!   per-engine SQL behind `runtime`'s accelerator-backend features.
-//!
-//! The split is incidental rather than a design distinction: the engine crates are where
-//! per-engine persistence belongs, and the structured shapes have not moved there yet.
-//! Nothing in this crate's contract depends on which side a store is implemented on.
+//! That indirection is what keeps a caller from naming an engine: the runtime resolves a
+//! dataset to its accelerator, asks for the sidecar, and takes the store it wants. It
+//! never learns which engine answered, and — more importantly — never has to depend on
+//! the engine crate to ask.
 
 use std::time::SystemTime;
 
@@ -74,6 +70,8 @@ pub mod debezium;
 pub mod kafka;
 pub mod mongodb;
 pub mod mysql_binlog;
+pub mod offsets;
+pub mod retry;
 
 /// A persisted **blob** checkpoint for one dataset: the connector-serialized, opaque
 /// `data` payload plus the store-managed timestamp of its last write (connectors use

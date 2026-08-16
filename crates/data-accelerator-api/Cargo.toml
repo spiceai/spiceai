@@ -20,6 +20,7 @@ linkme.workspace = true
 paste.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-component = { path = "../runtime-component" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-parameters = { path = "../runtime-parameters" }

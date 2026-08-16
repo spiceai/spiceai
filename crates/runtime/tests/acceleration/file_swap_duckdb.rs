@@ -38,7 +38,9 @@ use futures::TryStreamExt;
 
 use anyhow::anyhow;
 use runtime::Runtime;
-use runtime::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint};
+use runtime::dataaccelerator::spice_sys::dataset_checkpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
@@ -688,8 +690,13 @@ async fn test_duckdb_file_swap_preserves_concurrent_out_of_band_writes() -> Resu
                 .clone();
             let registry = writer_dataset.runtime.accelerator_engine_registry();
             let checkpoint =
-                DatasetCheckpoint::try_new(&writer_dataset, registry, OpenOption::OpenExisting)
-                    .await
+                dataset_checkpointer(
+                    &writer_dataset,
+                    registry,
+                    OpenOption::OpenExisting,
+                    SnapshotBehavior::Disabled,
+                )
+                .await
                     .map_err(|e| anyhow!("failed to open the writer's checkpoint: {e}"))?;
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new("marker", arrow::datatypes::DataType::Int64, true),

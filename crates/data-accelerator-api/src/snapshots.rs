@@ -171,6 +171,11 @@ pub async fn snapshot_before_recreate(
     }
 }
 
+/// Rejects a configuration in which two datasets snapshot to the same path.
+///
+/// # Errors
+///
+/// Returns [`SharedAccelerationSnapshotError`] naming the datasets that collide.
 pub async fn validate_snapshot_paths(
     sources: Vec<Arc<dyn AccelerationSource>>,
     registry: &AcceleratorEngineRegistry,

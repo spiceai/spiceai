@@ -44,7 +44,9 @@ use datafusion_table_providers::util::{
 use linkme::distributed_slice;
 use runtime_acceleration::Engine;
 use runtime_acceleration::acceleration::{self, Acceleration, IndexType, Mode};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationLayout;
+use runtime_checkpoint_api::CheckpointError;
 use runtime_parameters::ParameterSpec;
 use runtime_parameters::Parameters;
 use runtime_secrets::{ExposeSecret, Secrets, get_params_with_secrets};
@@ -416,6 +418,31 @@ pub trait DataAccelerator: Send + Sync {
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         Ok(BootstrapStatus::none())
     }
+
+    /// This engine's sidecar tables for `source` — the `spice_sys_*` metadata the
+    /// runtime keeps beside the accelerated data (CDC stream positions, the dataset
+    /// schema checkpoint, the caching engine's fetch marker).
+    ///
+    /// The runtime calls this instead of naming a concrete accelerator to borrow its
+    /// connection pool, which is what keeps the engine crates off `runtime`'s
+    /// dependency graph.
+    ///
+    /// `registry` is passed rather than captured because one engine's sidecar can live
+    /// in another engine's database: a Cayenne accelerator configured with
+    /// `cayenne_metastore: turso` must take the *`Turso`* accelerator's path-keyed pool
+    /// for `cayenne.db`, since the lock serializing sidecar DDL against concurrent
+    /// writes lives on that pool instance — a pool of its own would hold a lock no
+    /// other sidecar observes.
+    ///
+    /// Deliberately has no default: an engine that hosts nothing must say so with
+    /// [`runtime_acceleration::sidecar::unsupported_sidecar`], because a defaulted
+    /// no-op would silently disable checkpointing for it.
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
 
     /// Drops an existing table from the acceleration engine.
     ///

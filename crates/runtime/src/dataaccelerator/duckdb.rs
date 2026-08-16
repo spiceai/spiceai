@@ -20,7 +20,7 @@ use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
 };
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
 use crate::{
     App,
     component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
@@ -66,7 +66,10 @@ use datafusion_table_providers::{
 use duckdb::AccessMode;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_duckdb::DuckDbSidecar;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -693,6 +696,36 @@ impl DataAccelerator for DuckDBAccelerator {
 
         // otherwise, we're initialized if the file exists
         self.has_existing_file(source)
+    }
+
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let duckdb_file =
+            self.duckdb_file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("DuckDB file does not exist at {duckdb_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(DuckDbSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
     }
 
     async fn init(

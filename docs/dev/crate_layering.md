@@ -524,18 +524,24 @@ different prefixes:
   `data-kafka`, which persists through the generic store and so **names no accelerator
   engine and pulls in zero engine drivers**.
 
-The generic checkpointer already exists as
-`runtime_acceleration::dataset_checkpoint::DatasetCheckpointer` — but in
-`runtime-acceleration` (too high for a `data`-tier connector to depend on). It must be
-**extracted down** into `runtime-checkpoint-api`; the accelerator keeps the impl and
-depends on the new crate. The rule that decides *where the trait lives* every time:
-**the shared crate must be below everyone who depends on it** — else it is the upward
-edge the guard rejects.
+**This has since landed, and the shape it settled into is worth recording.** The rule
+that decided *where each piece lives*: **the shared crate must be below everyone who
+depends on it** — else it is the upward edge the guard rejects.
 
-*Trade-off to decide when this lands:* today's offsets are a typed, relationally
-queryable table; a generic keyed-blob store loses per-column queryability and needs a
-migration for existing accelerator sidecar tables — acceptable for connector-internal
-checkpoints, but call it out (data-correctness sensitive).
+- `runtime-checkpoint-api` holds one dependency-free `struct` per checkpoint *shape*
+  plus a trait per shape, so the typed, relationally-queryable offset table survives —
+  the trade-off feared here (collapsing everything into a keyed blob and losing
+  per-column queryability) was avoided by keeping a shape per connector.
+- Each engine implements every shape in `runtime-checkpoint-{duckdb,sqlite,postgres,
+  turso}`, and bundles them behind `runtime_acceleration::sidecar::AcceleratorSidecar`.
+- `DataAccelerator::sidecar` hands that bundle back, so the runtime resolves a dataset
+  to its stores without naming an engine — which is what lets the engine crates sit
+  below `runtime` rather than inside it.
+
+The generic `DatasetCheckpointer` stayed in `runtime-acceleration` rather than moving to
+`runtime-checkpoint-api`, because it is Arrow-typed and that crate is deliberately
+Arrow-free. `AcceleratorSidecar` therefore lives beside it, one crate up from the store
+traits it returns — the only crate that can name both.
 
 The lesson generalizes twice: most "hard" edges `cargo-crate-split` reports are
 implementation leaks that dependency injection dissolves — and once inverted, push the

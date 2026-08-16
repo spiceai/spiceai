@@ -68,7 +68,12 @@ use crate::{
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_turso::TursoSidecar;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -580,6 +585,33 @@ impl DataAccelerator for TursoAccelerator {
     ///
     /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
     /// parameters are provided in the acceleration configuration.
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let turso_file = self
+            .turso_file_path(source)
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&turso_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("Turso file does not exist at {turso_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,

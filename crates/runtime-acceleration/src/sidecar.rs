@@ -51,7 +51,7 @@ use runtime_checkpoint_api::{
     kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
 };
 
-use crate::dataset_checkpoint::DatasetCheckpointer;
+use crate::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
 
 /// Whether resolving a sidecar may create the accelerator's database, or must find one
 /// that already exists.
@@ -81,33 +81,73 @@ pub trait AcceleratorSidecar: Send + Sync {
     ///
     /// `table_name` is a parameter because several connectors keep independent blob
     /// checkpoints in the same database, one sidecar table each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when this engine cannot host the store.
     fn blob_checkpoint_store(
         &self,
         table_name: &'static str,
     ) -> Result<Arc<dyn BlobCheckpointStore>, CheckpointError>;
 
     /// The per-partition Kafka offset store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when this engine cannot host the store.
     fn kafka_checkpoint_store(&self) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError>;
 
     /// The Debezium checkpoint store. Shares the Kafka offset rows, because Debezium
     /// events arrive over Kafka.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when this engine cannot host the store.
     fn debezium_checkpoint_store(
         &self,
     ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError>;
 
     /// The `MySQL` binlog position store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when this engine cannot host the store.
     fn mysql_binlog_store(&self) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError>;
 
     /// The `MongoDB` resume-token store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when this engine cannot host the store.
     fn mongo_checkpoint_store(&self) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError>;
 
     /// The dataset schema/refresh-SQL checkpoint.
-    fn dataset_checkpointer(&self) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError>;
+    ///
+    /// Async because the sidecar table is created and migrated here rather than
+    /// lazily on first use: `exists()` has to be able to answer "no checkpoint" on a
+    /// fresh accelerator without the missing table reading as a failure.
+    ///
+    /// `snapshot_behavior` is what the checkpoint consults to decide whether writing
+    /// one should also produce a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the checkpoint table cannot be opened,
+    /// or when this engine cannot host one.
+    async fn dataset_checkpointer(
+        &self,
+        snapshot_behavior: SnapshotBehavior,
+    ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError>;
 
     /// Records that the caching engine fetched this dataset just now.
     ///
     /// `DuckDB`-only: it is the only engine Spice serves cached results from, so every
     /// other engine reports it cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the marker cannot be written, or when
+    /// this engine does not serve cached results.
     async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError>;
 }
 
