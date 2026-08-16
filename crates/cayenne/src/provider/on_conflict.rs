@@ -398,6 +398,52 @@ pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
     })
 }
 
+/// Taints the maintained live row count's exactness around a user `DELETE`.
+///
+/// A delete tombstones rows the persisted `num_rows` still counts, and nothing
+/// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
+/// the drift while `has_pending_deletions()` holds. Any path that folds the
+/// tombstone (compaction, overwrite, datalake promotion, the seq-prefix bake)
+/// drops that mask, and one that does not also re-baseline the count with
+/// [`RowCountUpdate::Set`] leaves it served `Exact` over a stale value — which a
+/// distributed `COUNT(*)` can substitute into its result. Tainting exactness at
+/// delete time makes the mask no longer the only thing standing between a stale
+/// count and an `Exact` answer, for every fold path at once.
+///
+/// The count itself is deliberately left alone rather than decremented: the
+/// deleted total spans tiers the persisted count does not uniformly include (a
+/// delete-all also purges the mem tier), so subtracting it can under-count. An
+/// over-count served `Inexact` is a planner estimate; an under-count that a later
+/// `Set` has not yet corrected would be a wrong answer.
+///
+/// [`RowCountUpdate::Set`]: super::column_stats::RowCountUpdate::Set
+pub(crate) struct RowCountExactnessTaintingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for RowCountExactnessTaintingDeletionSink {
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Taint BEFORE the inner delete, which publishes durably and cannot be
+        // undone. Taint-then-delete can only leave the count conservative (a
+        // delete that removes nothing, errors, or is cancelled costs the metadata
+        // `COUNT(*)` fast path until the next full rewrite); delete-then-taint
+        // leaves the *unsafe* residue — a cancellation, crash, or failed
+        // statistics write between the two, after which the tombstone is durable
+        // while `num_rows_exact` still claims the stale count is the live one, and
+        // a later fold un-masks it as `Exact`. This mirrors
+        // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
+        // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
+        // conservative direction is free and the optimistic one is a wrong answer.
+        self.table.taint_persisted_row_count_exactness().await;
+        self.inner.delete_from(context).await
+    }
+}
+
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,

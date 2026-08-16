@@ -204,8 +204,11 @@ pub struct AppliedLsn {
 ///
 /// * `watermark` — the LSN the acceleration's contents are complete as of, or
 ///   `None` when none has been recorded.
-/// * `slot_restart_lsn` — the earliest LSN the slot can still stream from, or
-///   `None` when the slot does not exist.
+/// * `slot_earliest_streamable_lsn` — the earliest LSN the slot can still stream
+///   from, or `None` when the slot does not exist. This is the later of its
+///   `restart_lsn` and its `confirmed_flush_lsn`, not `restart_lsn` alone:
+///   Postgres forwards a start position below `confirmed_flush_lsn` up to it, so
+///   an acknowledged change cannot be re-streamed even while its WAL is retained.
 /// * `absence_implies_gap` — whether a *missing* watermark is evidence of one.
 ///   True when the acceleration survives restarts (so it can hold rows this
 ///   process did not load) and a position could have been recorded (so absence
@@ -225,7 +228,7 @@ pub struct AppliedLsn {
 #[must_use]
 pub fn needs_rebuild(
     position: &RecordedPosition,
-    slot_restart_lsn: Option<u64>,
+    slot_earliest_streamable_lsn: Option<u64>,
     absence_implies_gap: bool,
 ) -> bool {
     match position {
@@ -238,10 +241,10 @@ pub fn needs_rebuild(
         // leave the old source's rows in place while never loading the new
         // source's.
         RecordedPosition::ForeignSource => true,
-        // A gap when there is no slot at all, or when the slot's earliest
-        // retained position is already past the watermark.
+        // A gap when there is no slot at all, or when the slot can no longer
+        // stream from as far back as the watermark.
         RecordedPosition::At(watermark) => {
-            slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn)
+            slot_earliest_streamable_lsn.is_none_or(|earliest| earliest > watermark.lsn)
         }
     }
 }
@@ -518,5 +521,26 @@ mod tests {
         // being mistaken for "never loaded".
         assert!(needs_rebuild_persist(at(0), Some(1)));
         assert!(needs_rebuild_persist(at(0), None));
+    }
+
+    /// The caller passes the later of `restart_lsn` and `confirmed_flush_lsn`,
+    /// because Postgres forwards a start position below `confirmed_flush_lsn` up to
+    /// it. Retained WAL that the slot has already acknowledged is therefore *not*
+    /// streamable, and treating it as such is a silent skip (#11289).
+    #[test]
+    fn an_acknowledged_change_is_a_gap_even_while_its_wal_is_retained() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+        // A slot retaining from 40 but acknowledged to 200 cannot supply a
+        // watermark of 100, even though 100 sits inside the retained range.
+        let restart_lsn: u64 = 40;
+        let confirmed_flush_lsn: u64 = 200;
+        assert!(
+            needs_rebuild(&at(100), Some(restart_lsn.max(confirmed_flush_lsn)), true),
+            "a watermark behind the acknowledged position is unreachable"
+        );
+        assert!(
+            !needs_rebuild(&at(100), Some(restart_lsn), true),
+            "control: comparing against retention alone calls the same gap resumable"
+        );
     }
 }

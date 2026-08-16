@@ -88,6 +88,7 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
+            .field("drasi", &self.drasi)
             .field("check_availability", &self.check_availability)
             .field(
                 "check_availability_interval",

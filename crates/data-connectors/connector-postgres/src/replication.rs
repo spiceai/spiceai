@@ -944,6 +944,10 @@ fn replication_params_from_connector_params(
         // formatting. Not a user-facing parameter; the per-column text fallback
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
     })
 }
 

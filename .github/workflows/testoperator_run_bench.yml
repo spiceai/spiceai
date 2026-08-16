@@ -98,6 +98,14 @@ on:
         required: false
         type: boolean
         default: false
+      # Defaults on because a benchmark should time the engine, not the cache. Turn
+      # it off only for a spicepod that is benchmarking the cache itself, such as
+      # those under test/spicepods/tpch/sf5/cache.
+      disable_caching:
+        description: 'Bypass the SQL results cache so the timings measure query execution?'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run-bench:
@@ -489,6 +497,12 @@ jobs:
           connection.close()
           PY
 
+      # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
+      # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
+      # default with a one-second `item_ttl`, and the harness runs one warmup query
+      # followed by N timed iterations of the identical SQL back-to-back. Without it
+      # the warmup populates the cache and every timed iteration is a cache read, so
+      # the recorded durations describe the cache rather than the engine.
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
@@ -503,6 +517,7 @@ jobs:
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
+            --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
