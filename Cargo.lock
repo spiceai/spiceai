@@ -6097,7 +6097,6 @@ dependencies = [
  "object_store 0.13.2",
  "paste",
  "reqwest 0.13.4",
- "runtime",
  "runtime-checkpoint-api",
  "runtime-component",
  "runtime-datafusion",

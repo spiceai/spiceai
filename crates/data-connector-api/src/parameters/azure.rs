@@ -231,13 +231,11 @@ impl Validator for AzureSasTokenNormalizer {
 mod tests {
     use super::*;
     use crate::ConnectorComponent;
-    use app::AppBuilder;
+    use datafusion::sql::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
-    use runtime::builder::RuntimeBuilder;
-    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_component::dataset::DatasetSpec;
     use runtime_parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
-    use std::sync::Arc;
     use tokio::runtime::Handle;
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[
@@ -258,20 +256,14 @@ mod tests {
         ParameterSpec::runtime("allow_http").is_boolean(),
     ];
 
-    async fn create_mock_connector_component() -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let spice_runtime = RuntimeBuilder::new().build().await;
-
-        let dataset = DatasetBuilder::try_new("abfs://container/path".to_string(), "test_dataset")
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
+    fn mock_connector_component() -> ConnectorComponent {
+        ConnectorComponent::from(&DatasetSpec::new(
+            "abfs://container/path",
+            TableReference::bare("test_dataset"),
+        ))
     }
 
-    async fn create_test_params(params: HashMap<String, String>) -> ConnectorParams {
+    fn create_test_params(params: HashMap<String, String>) -> ConnectorParams {
         ConnectorParams {
             parameters: Parameters::new(
                 to_secret_map(params).into_iter().collect(),
@@ -279,7 +271,7 @@ mod tests {
                 TEST_PARAMETERS,
             ),
             unsupported_type_action: None,
-            component: create_mock_connector_component().await,
+            component: mock_connector_component(),
             io_runtime: Handle::current(),
         }
     }
@@ -293,8 +285,7 @@ mod tests {
                 "https://example.blob.core.windows.net".to_string(),
             )]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureEndpointValidator;
         validator
             .validate(&mut params)
@@ -306,8 +297,7 @@ mod tests {
     async fn test_endpoint_validator_http_without_allow_http() {
         let mut params = create_test_params(
             [("endpoint".to_string(), "http://localhost:10000".to_string())].into(),
-        )
-        .await;
+        );
         let validator = AzureEndpointValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(
@@ -324,8 +314,7 @@ mod tests {
                 ("allow_http".to_string(), "true".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureEndpointValidator;
         validator
             .validate(&mut params)
@@ -336,8 +325,7 @@ mod tests {
     #[tokio::test]
     async fn test_endpoint_validator_invalid_protocol() {
         let mut params =
-            create_test_params([("endpoint".to_string(), "ftp://example.com".to_string())].into())
-                .await;
+            create_test_params([("endpoint".to_string(), "ftp://example.com".to_string())].into());
         let validator = AzureEndpointValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(result, Err(Error::InvalidEndpoint { .. })));
@@ -351,8 +339,7 @@ mod tests {
                 "https://example.blob.core.windows.net/".to_string(),
             )]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureEndpointValidator;
         validator
             .validate(&mut params)
@@ -367,7 +354,7 @@ mod tests {
     // AzureAccountValidator tests
     #[tokio::test]
     async fn test_account_validator_missing_account() {
-        let mut params = create_test_params(HashMap::new()).await;
+        let mut params = create_test_params(HashMap::new());
         let validator = AzureAccountValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(result, Err(Error::MissingAccount)));
@@ -376,8 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_account_validator_with_account() {
         let mut params =
-            create_test_params([("account".to_string(), "mystorageaccount".to_string())].into())
-                .await;
+            create_test_params([("account".to_string(), "mystorageaccount".to_string())].into());
         let validator = AzureAccountValidator;
         validator
             .validate(&mut params)
@@ -388,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn test_account_validator_emulator_mode_no_account() {
         let mut params =
-            create_test_params([("use_emulator".to_string(), "true".to_string())].into()).await;
+            create_test_params([("use_emulator".to_string(), "true".to_string())].into());
         let validator = AzureAccountValidator;
         validator
             .validate(&mut params)
@@ -405,8 +391,7 @@ mod tests {
                 ("access_key".to_string(), "myaccesskey".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         validator
             .validate(&mut params)
@@ -423,8 +408,7 @@ mod tests {
                 ("sas_string".to_string(), "sv=2020-08-04".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(result, Err(Error::MultipleAuthMethods)));
@@ -440,8 +424,7 @@ mod tests {
                 // Missing tenant_id
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(result, Err(Error::IncompleteClientCredentials)));
@@ -457,8 +440,7 @@ mod tests {
                 ("tenant_id".to_string(), "mytenantid".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         validator
             .validate(&mut params)
@@ -476,8 +458,7 @@ mod tests {
                 ("skip_signature".to_string(), "false".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         validator
             .validate(&mut params)
@@ -495,8 +476,7 @@ mod tests {
                 ("skip_signature".to_string(), "true".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         let result = validator.validate(&mut params).await;
         assert!(matches!(result, Err(Error::MultipleAuthMethods)));
@@ -512,8 +492,7 @@ mod tests {
                 ("sas_string".to_string(), "sas1".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureAuthValidator;
         validator
             .validate(&mut params)
@@ -530,8 +509,7 @@ mod tests {
                 "?sv=2020-08-04&sig=abc".to_string(),
             )]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureSasTokenNormalizer;
         validator
             .validate(&mut params)
@@ -551,8 +529,7 @@ mod tests {
                 "sv=2020-08-04&sig=abc".to_string(),
             )]
             .into(),
-        )
-        .await;
+        );
         let validator = AzureSasTokenNormalizer;
         validator
             .validate(&mut params)

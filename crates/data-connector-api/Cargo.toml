@@ -50,14 +50,14 @@ util = { path = "../util", features = ["datafusion"] }
 [target.'cfg(not(windows))'.dependencies]
 vortex-datafusion.workspace = true
 
+# This crate declares the `DATA_CONNECTOR_REGISTRATIONS` distributed slice, so it
+# must not depend — even for tests — on anything that depends on it. Cargo would
+# link two copies of the crate into the test binary and `linkme` panics at startup
+# with `duplicate #[distributed_slice]`. Tests build a `DatasetSpec` rather than a
+# `runtime::component::dataset::Dataset` for exactly this reason.
 [dev-dependencies]
-app = { path = "../app" }
 chrono.workspace = true
 paste.workspace = true
-# The listing-connector tests build a `Dataset`, which is bound to a `Runtime`.
-# A dev-dependency does not form a layering edge (the guard exempts them) and
-# cargo permits the cycle, so the tests keep exercising the real component.
-runtime = { path = "../runtime" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
