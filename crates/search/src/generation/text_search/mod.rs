@@ -40,7 +40,7 @@ use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Searcher, TantivyError,
+    DocAddress, Score, Searcher, TantivyError,
     collector::TopDocs,
     query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
@@ -397,13 +397,16 @@ impl FullTextSearchFieldIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    fn search_query_literal(
+    /// Score the query against the index in a single `TopDocs` pass, bounded to `limit`.
+    /// Returns lightweight (score, address) pairs without resolving any stored document
+    /// contents — see [`Self::hits_to_json`], which resolves them in bounded chunks so a
+    /// large `limit` doesn't force every matched document's stored fields into memory at once.
+    fn search_top_docs(
         &self,
         literal: &str,
         filters: &[Box<dyn Query>],
         limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<(Score, DocAddress)>> {
         // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
         // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
         // are honored. Fall back to a bag-of-words OR clause for inputs the
@@ -436,17 +439,16 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        let top_docs = self
-            .reader
-            .search(
-                &q,
-                &TopDocs::with_limit(limit)
-                    .and_offset(offset)
-                    .order_by_score(),
-            )
-            .context(TextSearchSnafu)?
-            .into_iter()
-            .map(|(score, addr)| {
+        self.reader
+            .search(&q, &TopDocs::with_limit(limit).order_by_score())
+            .context(TextSearchSnafu)
+    }
+
+    /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
+    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks.
+    fn hits_to_json(&self, hits: &[(Score, DocAddress)]) -> Result<Vec<Value>> {
+        hits.iter()
+            .map(|&(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
                     self.reader.doc(addr).context(TextSearchSnafu)?;
 
@@ -471,9 +473,7 @@ impl FullTextSearchFieldIndex {
                 }
                 Ok(v)
             })
-            .collect::<Result<Vec<Value>>>()?;
-
-        Ok(top_docs)
+            .collect()
     }
 
     fn tantivy_json_to_arrow_decoder(
@@ -573,17 +573,20 @@ fn make_stream(
             return;
         }
 
-        // Share the searcher into the blocking task that runs the synchronous
-        // tantivy search (mmap/disk reads + scoring + stored-field decode) off
-        // the async runtime thread (which also serves `/health`, `/v1/search`).
+        // Share the searcher into the blocking tasks that run synchronous tantivy work
+        // (mmap/disk reads + scoring + stored-field decode) off the async runtime thread
+        // (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
 
-        // Collect the full result set (bounded by `limit`) in a single search.
-        // The searcher is a fixed snapshot, so paging with `TopDocs` offsets is unnecessary.
+        // Score the whole result set in a single `TopDocs` pass (bounded by `limit`), without
+        // resolving any stored document contents yet. The searcher is a fixed snapshot, so
+        // paging with `TopDocs` offsets would rescore the whole growing prefix on every page;
+        // a single pass avoids that, and these lightweight (score, address) pairs are cheap to
+        // hold in full even when `limit` is large, unlike the stored documents they address.
         let blocking_fts = std::sync::Arc::clone(&fts);
         let query = query.clone();
-        let hits = match tokio::task::spawn_blocking(move || {
-            blocking_fts.search_query_literal(query.as_str(), filters.as_slice(), limit, 0)
+        let top_docs = match tokio::task::spawn_blocking(move || {
+            blocking_fts.search_top_docs(query.as_str(), filters.as_slice(), limit)
         }).await {
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
@@ -598,10 +601,26 @@ fn make_stream(
             }
         };
 
-        // Emit the hits as bounded record batches so downstream consumers still
-        // receive a stream rather than one large batch.
-        for chunk in hits.chunks(DEFAULT_BATCH_SIZE) {
-            let mut decoder = match fts.tantivy_json_to_arrow_decoder(chunk)
+        // Resolve stored documents and emit Arrow batches `DEFAULT_BATCH_SIZE` hits at a
+        // time, so memory stays bounded by the batch size rather than by `limit`.
+        for chunk in top_docs.chunks(DEFAULT_BATCH_SIZE) {
+            let blocking_fts = std::sync::Arc::clone(&fts);
+            let chunk = chunk.to_vec();
+            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&chunk)).await {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Internal(e.to_string()));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(DataFusionError::Internal(format!(
+                        "full text search task failed: {e}"
+                    )));
+                    return;
+                }
+            };
+
+            let mut decoder = match fts.tantivy_json_to_arrow_decoder(&hits)
                 .map_err(DataFusionError::from) {
                     Ok(h) => h,
                     Err(e) => {
