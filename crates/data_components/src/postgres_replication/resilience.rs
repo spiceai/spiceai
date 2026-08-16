@@ -320,16 +320,32 @@ mod tests {
         assert!(is_transient_by_display("Connection reset by peer"));
         assert!(is_transient_by_display("broken pipe"));
         assert!(is_transient_by_display("unexpected EOF"));
-        assert!(is_transient_by_display("EOF while reading backend message header"));
+        assert!(is_transient_by_display(
+            "EOF while reading backend message header"
+        ));
         assert!(is_transient_by_display("EOF while reading backend message"));
         assert!(is_transient_by_display("operation timed out"));
-        assert!(is_transient_by_display("server error: terminating connection due to administrator command (SQLSTATE 57P01)"));
-        assert!(is_transient_by_display("the database system is shutting down (SQLSTATE 57P01)"));
-        assert!(is_transient_by_display("the database system is shutting down (SQLSTATE 57P02)"));
-        assert!(is_transient_by_display("the database system is in recovery mode (SQLSTATE 57P03)"));
-        assert!(is_transient_by_display("the database system is starting up (SQLSTATE 57P03)"));
-        assert!(is_transient_by_display("connection exception (SQLSTATE 08006)"));
-        assert!(!is_transient_by_display("protocol violation (SQLSTATE 08P01)"));
+        assert!(is_transient_by_display(
+            "server error: terminating connection due to administrator command (SQLSTATE 57P01)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is shutting down (SQLSTATE 57P01)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is shutting down (SQLSTATE 57P02)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is in recovery mode (SQLSTATE 57P03)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is starting up (SQLSTATE 57P03)"
+        ));
+        assert!(is_transient_by_display(
+            "connection exception (SQLSTATE 08006)"
+        ));
+        assert!(!is_transient_by_display(
+            "protocol violation (SQLSTATE 08P01)"
+        ));
         assert!(!is_transient_by_display("syntax error at or near"));
         assert!(!is_transient_by_display(
             "permission denied for table users"
@@ -362,36 +378,31 @@ mod tests {
     #[test]
     fn io_and_eof_errors_are_transient() {
         // All pgwire IO errors are transient regardless of description
-        let eof_header = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
-            std::io::Error::new(
+        let eof_header =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF while reading backend message header",
-            ),
-        ));
+            )));
         assert!(is_transient_pgwire(&eof_header));
 
-        let eof_payload = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
-            std::io::Error::new(
+        let eof_payload =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF while reading backend message payload",
-            ),
-        ));
+            )));
         assert!(is_transient_pgwire(&eof_payload));
 
-        let eof_message = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
-            std::io::Error::new(
+        let eof_message =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "EOF while reading backend message",
-            ),
-        ));
+            )));
         assert!(is_transient_pgwire(&eof_message));
 
-        let reset = pgwire_replication::PgWireError::Io(std::sync::Arc::new(
-            std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "Connection reset by peer",
-            ),
-        ));
+        let reset = pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer",
+        )));
         assert!(is_transient_pgwire(&reset));
 
         let task_err = pgwire_replication::PgWireError::Task("worker task dropped".to_string());
@@ -415,14 +426,18 @@ mod tests {
         );
         assert!(!is_transient_pgwire(&server_dropped));
 
-        let auth_err = pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
+        let auth_err =
+            pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
         assert!(!is_transient_pgwire(&auth_err));
 
         // Protocol & internal errors must never be transient, even if their message contains EOF markers
-        let proto_err = pgwire_replication::PgWireError::Protocol("unexpected end of file while decoding a tuple".to_string());
+        let proto_err = pgwire_replication::PgWireError::Protocol(
+            "unexpected end of file while decoding a tuple".to_string(),
+        );
         assert!(!is_transient_pgwire(&proto_err));
 
-        let internal_err = pgwire_replication::PgWireError::Internal("unexpected eof in parser".to_string());
+        let internal_err =
+            pgwire_replication::PgWireError::Internal("unexpected eof in parser".to_string());
         assert!(!is_transient_pgwire(&internal_err));
     }
 
