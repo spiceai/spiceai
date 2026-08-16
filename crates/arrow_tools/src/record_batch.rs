@@ -19,7 +19,7 @@ use arrow::{
         Array, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray, MutableArrayData,
         RecordBatch, RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
     },
-    buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer},
+    buffer::{Buffer, OffsetBuffer},
     datatypes::{
         BinaryViewType, ByteViewType, DataType, Field, SchemaRef, StringViewType, TimeUnit,
     },
@@ -514,9 +514,8 @@ fn contains_dictionary(data_type: &DataType) -> bool {
 /// worth the copies is decided per batch, against
 /// [`COMPACTION_MIN_RECLAIMED_BYTES`].
 fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
-    let reclaimed = retained.checked_sub(needed)?;
-    (reclaimed > 0 && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
-        .then_some(reclaimed)
+    (retained > needed && retained >= needed.saturating_mul(COMPACTION_RETENTION_RATIO))
+        .then(|| retained - needed)
 }
 
 /// How many bytes a view column retains beyond the bytes its own rows use.
@@ -534,32 +533,32 @@ fn worth_compacting(retained: usize, needed: usize) -> Option<usize> {
 fn view_reclaimable_bytes<B: ByteViewType>(column: &ArrayRef) -> Option<usize> {
     let array = column.as_any().downcast_ref::<GenericByteViewArray<B>>()?;
 
-    // Every allocation [`compact_view_array`] rebuilds is counted: the views,
-    // the data buffers they point into, and the null buffer. A short-string
+    // Every allocation [`compact_column`] rebuilds is counted: the views, the
+    // data buffers they point into, and the null buffer. A short-string
     // column can be almost all views, and a wide-string one almost all data.
     // For a slice, all three are the parent's whole allocations — including
     // when the slice's own rows all fit inline, where the data buffers hold
     // nothing the slice references and are dropped entirely.
+    let nulls = array.nulls();
     let retained = array.views().inner().capacity()
         + array
             .data_buffers()
             .iter()
             .map(Buffer::capacity)
             .sum::<usize>()
-        + array
-            .nulls()
-            .map_or(0, |nulls| nulls.inner().inner().capacity());
+        + nulls.map_or(0, |nulls| nulls.inner().inner().capacity());
     let views_bytes = array.len().saturating_mul(std::mem::size_of::<u128>());
-    let null_bytes = array.nulls().map_or(0, |_| array.len().div_ceil(8));
+    let null_bytes = nulls.map_or(0, |_| array.len().div_ceil(8));
 
     // `total_buffer_bytes_used` walks every view, so bound the reclaim first:
     // the compacted array cannot be smaller than its views alone. This is what
     // keeps an already-compact column — the common case — off that walk.
     worth_compacting(retained, views_bytes)?;
 
-    let bytes_used = array.total_buffer_bytes_used();
-
-    worth_compacting(retained, views_bytes + bytes_used + null_bytes)
+    worth_compacting(
+        retained,
+        views_bytes + array.total_buffer_bytes_used() + null_bytes,
+    )
 }
 
 /// How many bytes compacting `column` would reclaim, or `None` when the copy
@@ -590,58 +589,34 @@ fn reclaimable_bytes(column: &ArrayRef) -> Option<usize> {
     worth_compacting(column.get_array_memory_size(), needed)
 }
 
-/// Rebuilds a view array so every allocation it holds is sized for exactly
-/// its own rows.
-///
-/// `gc` rebuilds the views and the data buffers they point into on its main
-/// path, but it has two fast paths — a column with no data buffers, and a
-/// slice whose rows all fit inline — that reuse the incoming views allocation,
-/// and it reuses the null buffer on every path. For a slice those are the
-/// parent's whole allocations, so both are rebuilt here after `gc` runs.
-/// Copying the views verbatim is sound: they reference the gc result's own
-/// data buffers, which are carried over unchanged.
-fn compact_view_array<B: ByteViewType>(array: &GenericByteViewArray<B>) -> ArrayRef {
-    let gced = array.gc();
-    let views = ScalarBuffer::from(gced.views().to_vec());
-    let nulls = gced
-        .nulls()
-        .map(|nulls| NullBuffer::new(nulls.inner().iter().collect()));
-
-    match GenericByteViewArray::<B>::try_new(views, gced.data_buffers().to_vec(), nulls) {
-        Ok(rebuilt) => Arc::new(rebuilt),
-        Err(e) => {
-            // The rebuild changes no view and no buffer, so this is
-            // unreachable; the gc result is still a valid compaction.
-            tracing::warn!("Failed to rebuild a compacted view column, keeping the gc result: {e}");
-            Arc::new(gced)
-        }
-    }
-}
-
 /// Copies `column`'s rows into buffers sized for exactly those rows.
 ///
 /// For most types this is what [`arrow::compute::concat`] does for more than
 /// one array; `concat` cannot be used because it returns a single input
-/// untouched. A view array instead goes through [`compact_view_array`] —
-/// `MutableArrayData` copies a view array's data buffers wholesale.
+/// untouched. `MutableArrayData` rebuilds the views and null buffer of a view
+/// array exactly, but copies its data buffers wholesale — so those are
+/// narrowed first with `gc`, whose own gaps `MutableArrayData` covers in
+/// turn: `gc` reuses the incoming views allocation on its fast paths (a
+/// column with no data buffers, or a slice whose rows all fit inline) and the
+/// null buffer on every path, and for a slice those are the parent's whole
+/// allocations.
 fn compact_column(column: &ArrayRef) -> ArrayRef {
-    match column.data_type() {
-        DataType::Utf8View => {
-            if let Some(array) = column.as_any().downcast_ref::<StringViewArray>() {
-                return compact_view_array(array);
-            }
-        }
-        DataType::BinaryView => {
-            if let Some(array) = column.as_any().downcast_ref::<BinaryViewArray>() {
-                return compact_view_array(array);
-            }
-        }
-        _ => {}
-    }
+    let gced: Option<ArrayRef> = match column.data_type() {
+        DataType::Utf8View => column
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|array| Arc::new(array.gc()) as ArrayRef),
+        DataType::BinaryView => column
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .map(|array| Arc::new(array.gc()) as ArrayRef),
+        _ => None,
+    };
+    let source = gced.as_ref().unwrap_or(column);
 
-    let data = column.to_data();
-    let mut compacted = MutableArrayData::new(vec![&data], false, column.len());
-    compacted.extend(0, 0, column.len());
+    let data = source.to_data();
+    let mut compacted = MutableArrayData::new(vec![&data], false, source.len());
+    compacted.extend(0, 0, source.len());
     make_array(compacted.freeze())
 }
 
@@ -657,8 +632,10 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
 /// index) should compact it first, so the memory it pins is proportional to
 /// the rows it kept.
 ///
-/// Columns that are already compact are shared, not copied, so a batch with
-/// nothing to reclaim costs a reference-count clone.
+/// Columns that are already compact are shared, not copied — and so is the
+/// whole batch when its columns together would reclaim less than
+/// [`COMPACTION_MIN_RECLAIMED_BYTES`], so a batch with little to reclaim
+/// costs a reference-count clone.
 ///
 /// See [`compacted_memory_size`] for deciding whether the copy is worth making
 /// *before* paying for it.
@@ -666,9 +643,15 @@ fn compact_column(column: &ArrayRef) -> ArrayRef {
 pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
     let (plan, total_reclaimable) = compaction_plan(batch);
 
-    if total_reclaimable < COMPACTION_MIN_RECLAIMED_BYTES {
+    if total_reclaimable == 0 {
         return batch.clone();
     }
+
+    tracing::debug!(
+        rows = batch.num_rows(),
+        reclaimable_bytes = total_reclaimable,
+        "Compacting a record batch that retains more memory than its rows need"
+    );
 
     let columns: Vec<ArrayRef> = batch
         .columns()
@@ -712,27 +695,28 @@ pub fn compact_retained_buffers(batch: &RecordBatch) -> RecordBatch {
 pub fn compacted_memory_size(batch: &RecordBatch) -> usize {
     let (_, total_reclaimable) = compaction_plan(batch);
 
-    // Below the floor, `compact_retained_buffers` leaves the batch as it is,
-    // so what would be reclaimable is still what the batch occupies.
-    let reclaimed = if total_reclaimable < COMPACTION_MIN_RECLAIMED_BYTES {
-        0
-    } else {
-        total_reclaimable
-    };
-
-    batch.get_array_memory_size().saturating_sub(reclaimed)
+    batch
+        .get_array_memory_size()
+        .saturating_sub(total_reclaimable)
 }
 
 /// Per-column reclaimable bytes — `None` where a copy would not pay for
 /// itself or the type cannot be measured — and the batch-wide total.
 ///
-/// [`compact_retained_buffers`] and [`compacted_memory_size`] share this so
-/// what one predicts is what the other frees, including the batch-level floor
-/// both apply to the total.
+/// The total carries the batch-level floor: it is zero when the columns
+/// together reclaim less than [`COMPACTION_MIN_RECLAIMED_BYTES`], in which
+/// case [`compact_retained_buffers`] leaves the batch as it is and what would
+/// have been reclaimable is still what the batch occupies. Both entry points
+/// consume this so what one predicts is what the other frees.
 fn compaction_plan(batch: &RecordBatch) -> (Vec<Option<usize>>, usize) {
     let plan: Vec<Option<usize>> = batch.columns().iter().map(reclaimable_bytes).collect();
-    let total = plan.iter().flatten().sum();
-    (plan, total)
+    let total: usize = plan.iter().flatten().sum();
+
+    if total < COMPACTION_MIN_RECLAIMED_BYTES {
+        (plan, 0)
+    } else {
+        (plan, total)
+    }
 }
 
 #[cfg(test)]
@@ -1456,8 +1440,8 @@ mod test {
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/13172>.
     /// The reclaim floor applies to the batch, not to each column: a wide
-    /// result can waste well under the floor in every column and still waste
-    /// many times its own bytes per entry.
+    /// result can waste under the floor in every single column and still
+    /// waste many times its own bytes per entry.
     #[test]
     fn compact_retained_buffers_compacts_a_wide_batch_wasting_little_per_column() {
         let columns = 24;
@@ -1465,11 +1449,22 @@ mod test {
             .map(|i| Field::new(format!("c{i}"), DataType::Utf8, false))
             .collect();
         let arrays: Vec<ArrayRef> = (0..columns)
-            .map(|_| Arc::new(StringArray::from(payloads(100, 100))) as ArrayRef)
+            .map(|_| Arc::new(StringArray::from(payloads(150, 8))) as ArrayRef)
             .collect();
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("valid batch");
         let sliced = batch.slice(50, 1);
+
+        // The fixture must keep every column under the floor on its own —
+        // otherwise this would pass under a per-column floor too and guard
+        // nothing.
+        for (index, column) in sliced.columns().iter().enumerate() {
+            let reclaim = reclaimable_bytes(column).expect("column should be reclaimable");
+            assert!(
+                reclaim < COMPACTION_MIN_RECLAIMED_BYTES,
+                "column {index} reclaims {reclaim} on its own, at or above the floor"
+            );
+        }
 
         let compacted = compact_retained_buffers(&sliced);
 
@@ -1479,19 +1474,7 @@ mod test {
             compacted.get_array_memory_size(),
             sliced.get_array_memory_size()
         );
-        for column in 0..columns {
-            let before = sliced
-                .column(column)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("StringArray");
-            let after = compacted
-                .column(column)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("StringArray");
-            assert_eq!(after.value(0), before.value(0), "column {column} changed");
-        }
+        assert_eq!(compacted, sliced, "compaction must not change any value");
     }
 
     fn wide_view_batch(rows: usize, value_len: usize) -> RecordBatch {
@@ -1695,32 +1678,18 @@ mod test {
             true,
         )]));
         // 12 bytes or fewer is stored inline, with no data buffer.
-        let values: Vec<Option<String>> = (0..200_000)
+        let values = (0..200_000)
             .map(|row| (row % 7 != 0).then(|| format!("r{row:0>8}")))
-            .collect();
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from_iter(values))])
-                .expect("valid batch");
+            .collect::<StringViewArray>();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).expect("valid batch");
         let sliced = batch.slice(100_000, 2);
 
         let compacted = compact_retained_buffers(&sliced);
 
-        let before = sliced
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("StringViewArray");
-        let after = compacted
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .expect("StringViewArray");
-        for row in 0..before.len() {
-            assert_eq!(after.is_null(row), before.is_null(row), "row {row} nullity");
-            if !before.is_null(row) {
-                assert_eq!(after.value(row), before.value(row), "row {row} value");
-            }
-        }
+        assert_eq!(
+            compacted, sliced,
+            "compaction must preserve every value and null"
+        );
         assert!(
             compacted.get_array_memory_size() * 100 < sliced.get_array_memory_size(),
             "a two-row inline slice should release its parent's views and null buffers, got {} of {}",
@@ -1762,12 +1731,12 @@ mod test {
 
         let compacted = compact_retained_buffers(&sliced);
 
+        assert_eq!(compacted, sliced, "the row's value changed");
         let after = compacted
             .column(0)
             .as_any()
             .downcast_ref::<StringViewArray>()
             .expect("StringViewArray");
-        assert_eq!(after.value(0), column.value(0), "the row's value changed");
         assert!(
             after.data_buffers().is_empty(),
             "no view references out-of-line data, so no data buffer should survive"
@@ -1785,12 +1754,29 @@ mod test {
     /// within the rounding that buffer allocation adds.
     #[test]
     fn compacted_memory_size_tracks_the_compacted_batch() {
+        let nullable_view_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8View,
+                true,
+            )])),
+            vec![Arc::new(
+                payloads(2_000, 4_096)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, value)| (row % 3 != 0).then_some(value))
+                    .collect::<StringViewArray>(),
+            )],
+        )
+        .expect("valid batch");
+
         for (name, sliced) in [
             (
                 "string slice",
                 wide_string_batch(2_000, 4_096).slice(1_000, 1),
             ),
             ("view slice", wide_view_batch(2_000, 4_096).slice(1_000, 1)),
+            ("nullable view slice", nullable_view_batch.slice(1_000, 2)),
             ("already compact", wide_string_batch(8, 16)),
         ] {
             let predicted = compacted_memory_size(&sliced);

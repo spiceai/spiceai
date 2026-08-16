@@ -31,18 +31,7 @@ use arrow::array::RecordBatch;
 /// holds.
 pub(crate) fn compact_for_storage(mut batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
     for batch in &mut batches {
-        let retained = batch.get_array_memory_size();
-        let compacted = arrow_tools::record_batch::compact_retained_buffers(batch);
-        let stored = compacted.get_array_memory_size();
-        if stored < retained {
-            tracing::debug!(
-                rows = batch.num_rows(),
-                retained_bytes = retained,
-                stored_bytes = stored,
-                "Compacted a result batch before caching it"
-            );
-        }
-        *batch = compacted;
+        *batch = arrow_tools::record_batch::compact_retained_buffers(batch);
     }
     batches
 }
