@@ -499,7 +499,8 @@ pub struct AppBundle {
 }
 
 /// Resolve the CPU entitlement from all three configuration surfaces plus host
-/// detection, log it, and install it as the process-wide budget.
+/// detection, install it as the process-wide budget, and log the budget in
+/// effect.
 ///
 /// Must run before any thread pool, `DataFusion` session, or accelerator is
 /// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
@@ -528,10 +529,13 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     );
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
-    budget.log_summary();
     if let Err(err) = budget.install() {
         tracing::warn!("{err}");
     }
+    // Log the budget in effect, not the resolved candidate: when the install
+    // lost to an earlier one, the summary and the Vortex declaration below must
+    // still report the same numbers.
+    cpu_budget::cpu_budget().log_summary();
     #[cfg(not(windows))]
     declare_vortex_parallelism();
     Ok(())
