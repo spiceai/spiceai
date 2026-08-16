@@ -15,5 +15,8 @@ spicepod = { path = "../spicepod" }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

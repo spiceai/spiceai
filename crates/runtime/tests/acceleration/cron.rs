@@ -19,8 +19,9 @@ use app::AppBuilder;
 
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
+use podswatcher::PodsWatcher;
 use runtime::Runtime;
-use runtime::{auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
+use runtime::{auth::EndpointAuth, config::Config};
 use spicepod::acceleration::Acceleration;
 use spicepod::component::dataset::Dataset;
 use std::io::Write;

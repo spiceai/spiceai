@@ -46,10 +46,8 @@ use rand::RngExt;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use runtime::{
-    cluster::ClusterTlsConfig,
-    tls::{ReloadScope, flight_incoming::tls_incoming, reload::reload_count_for_tests},
-};
+use runtime::cluster::ClusterTlsConfig;
+use runtime_tls::{ReloadScope, flight_incoming::tls_incoming, reload::reload_count_for_tests};
 use tempfile::TempDir;
 use tonic::{
     Request, Response, Status, Streaming,

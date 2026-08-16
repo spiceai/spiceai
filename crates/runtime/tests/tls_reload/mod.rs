@@ -48,12 +48,8 @@ use rand::RngExt;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use runtime::{
-    Runtime,
-    auth::EndpointAuth,
-    config::Config,
-    tls::{ReloadScope, TlsConfig, reload::reload_count_for_tests},
-};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_tls::{ReloadScope, TlsConfig, reload::reload_count_for_tests};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tonic::transport::Channel;

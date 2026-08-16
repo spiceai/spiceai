@@ -996,8 +996,8 @@ mod tests {
     #[test]
     fn build_from_pem_round_trips() {
         install_crypto_provider();
-        let cert = include_bytes!("../../../../test/tls/spiced_cert.pem");
-        let key = include_bytes!("../../../../test/tls/spiced_key.pem");
+        let cert = include_bytes!("../../../test/tls/spiced_cert.pem");
+        let key = include_bytes!("../../../test/tls/spiced_key.pem");
         let r = ReloadableServerCerts::from_pem(cert, key, ReloadScope::Public)
             .expect("build from pem");
         let resolved = r
@@ -1015,7 +1015,7 @@ mod tests {
         install_crypto_provider();
         let err = ReloadableServerCerts::from_pem(
             b"not a pem",
-            include_bytes!("../../../../test/tls/spiced_key.pem"),
+            include_bytes!("../../../test/tls/spiced_key.pem"),
             ReloadScope::Public,
         )
         .expect_err("must reject malformed cert");
