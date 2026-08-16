@@ -24,6 +24,7 @@ use crate::{
     component::dataset::acceleration::Acceleration,
     dataaccelerator::{
         AccelerationSource, AcceleratorEngineRegistry, acceleration_file_path,
+        resolved_refresh_mode,
         spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     },
 };
@@ -49,12 +50,23 @@ use snafu::{ResultExt, Snafu};
 /// but nothing is bootstrapped back in and the next refresh reloads from the
 /// source with the source's current schema.
 ///
-/// `refresh_mode: snapshot` is exempt because there the snapshot store is the
-/// dataset's data source rather than a bootstrap accelerant; skipping the
-/// download would leave the dataset with no way to load anything at all.
-fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration) -> bool {
+/// That only holds while a refresh actually reads the federated source. Two
+/// resolved refresh modes never do, and for them the snapshot is the only
+/// remaining copy of the data — skipping the bootstrap would discard it for good,
+/// so both keep bootstrapping:
+///
+/// * `snapshot` reads the snapshot store itself; it never queries the source.
+/// * `disabled` — what a `sink:` dataset resolves an unset `refresh_mode` to —
+///   never refreshes at all, because its rows arrive by `INSERT INTO`.
+fn mode_allows_snapshot_bootstrap(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> bool {
     acceleration.mode != Mode::FileCreate
-        || acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+        || matches!(
+            resolved_refresh_mode(source, acceleration),
+            RefreshMode::Snapshot | RefreshMode::Disabled
+        )
 }
 
 /// Downloads a snapshot if needed for bootstrapping.
@@ -77,7 +89,7 @@ pub(super) async fn download_snapshot_if_needed(
         return BootstrapStatus::none();
     }
 
-    if !mode_allows_snapshot_bootstrap(acceleration) {
+    if !mode_allows_snapshot_bootstrap(source, acceleration) {
         tracing::info!(
             "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
             source.name()
@@ -163,7 +175,7 @@ pub(super) async fn download_snapshot_if_needed(
 /// `engine_override` parallels [`download_snapshot_if_needed`].
 pub(crate) async fn snapshot_before_recreate(
     acceleration: &Acceleration,
-    dataset_name: &str,
+    source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     schema: Arc<arrow_schema::Schema>,
@@ -173,8 +185,25 @@ pub(crate) async fn snapshot_before_recreate(
         return;
     }
 
+    let dataset_name = source.name().to_string();
+
+    // `refresh_mode: snapshot` is a read-only consumer of the snapshot store, so it
+    // must never publish — `build_snapshot_creation_config` withholds a
+    // `SnapshotManager` from it for the same reason. Its local acceleration is a copy
+    // of a snapshot someone else owns, and creating a snapshot makes the uploaded
+    // bytes the store's `current-snapshot-id`: a replica lagging behind the current
+    // snapshot would publish its stale copy under a higher id and roll every other
+    // reader back onto it.
+    if resolved_refresh_mode(source, acceleration) == RefreshMode::Snapshot {
+        tracing::debug!(
+            dataset = %dataset_name,
+            "refresh_mode: snapshot consumes snapshots without publishing them; skipping pre-recreation snapshot"
+        );
+        return;
+    }
+
     let Some(manager) = SnapshotManager::try_new(
-        dataset_name.to_string(),
+        dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
         layout,
         engine,
@@ -395,13 +424,81 @@ pub fn validate_cayenne_snapshot_consistency(
 mod bootstrap_gate_tests {
     use super::mode_allows_snapshot_bootstrap;
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
+    use crate::dataaccelerator::AccelerationSource;
+    use datafusion::sql::TableReference;
+    use std::sync::Arc;
 
-    fn acceleration(mode: Mode, refresh_mode: Option<RefreshMode>) -> Acceleration {
-        Acceleration {
-            mode,
-            refresh_mode,
-            ..Default::default()
+    /// A source that carries only what the bootstrap gate reads: the acceleration
+    /// and the connector name the unset-`refresh_mode` fill-in is keyed on.
+    struct GateSource {
+        name: TableReference,
+        connector: Option<&'static str>,
+        acceleration: Acceleration,
+    }
+
+    impl AccelerationSource for GateSource {
+        fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+            Arc::new(GateSource {
+                name: self.name.clone(),
+                connector: self.connector,
+                acceleration: self.acceleration.clone(),
+            })
         }
+
+        fn is_file_accelerated(&self) -> bool {
+            matches!(
+                self.acceleration.mode,
+                Mode::File | Mode::FileCreate | Mode::FileUpdate
+            )
+        }
+
+        fn app(&self) -> Arc<app::App> {
+            unimplemented!("the bootstrap gate never reads the app")
+        }
+
+        fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
+            unimplemented!("the bootstrap gate never reads secrets")
+        }
+
+        fn acceleration(&self) -> Option<&Acceleration> {
+            Some(&self.acceleration)
+        }
+
+        fn name(&self) -> &TableReference {
+            &self.name
+        }
+
+        fn connector_name(&self) -> Option<&str> {
+            self.connector
+        }
+
+        fn time_column(&self) -> Option<&str> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn source(
+        connector: Option<&'static str>,
+        mode: Mode,
+        refresh_mode: Option<RefreshMode>,
+    ) -> GateSource {
+        GateSource {
+            name: TableReference::bare("gated"),
+            connector,
+            acceleration: Acceleration {
+                mode,
+                refresh_mode,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn allows(source: &GateSource) -> bool {
+        mode_allows_snapshot_bootstrap(source, &source.acceleration)
     }
 
     #[test]
@@ -411,9 +508,10 @@ mod bootstrap_gate_tests {
             Some(RefreshMode::Full),
             Some(RefreshMode::Append),
             Some(RefreshMode::Changes),
+            Some(RefreshMode::Caching),
         ] {
             assert!(
-                !mode_allows_snapshot_bootstrap(&acceleration(Mode::FileCreate, refresh_mode)),
+                !allows(&source(Some("postgres"), Mode::FileCreate, refresh_mode)),
                 "file_create must not restore the acceleration it deleted ({refresh_mode:?})"
             );
         }
@@ -422,7 +520,8 @@ mod bootstrap_gate_tests {
     #[test]
     fn file_create_still_bootstraps_when_snapshots_are_the_data_source() {
         assert!(
-            mode_allows_snapshot_bootstrap(&acceleration(
+            allows(&source(
+                Some("postgres"),
                 Mode::FileCreate,
                 Some(RefreshMode::Snapshot),
             )),
@@ -430,14 +529,43 @@ mod bootstrap_gate_tests {
         );
     }
 
+    /// A `sink:` dataset resolves an unset `refresh_mode` to `disabled`, so no refresh
+    /// ever rebuilds it from a source. Skipping the bootstrap there would discard the
+    /// only remaining copy of the data.
+    #[test]
+    fn file_create_still_bootstraps_when_no_refresh_will_rebuild() {
+        assert!(
+            allows(&source(Some("sink"), Mode::FileCreate, None)),
+            "a sink dataset has no source to rebuild from, so the snapshot is its only copy"
+        );
+    }
+
+    /// The `changes` fill-in has to come from the connector too: a `debezium:` stream
+    /// leaves `refresh_mode` unset and still refreshes from the source.
+    #[test]
+    fn file_create_reads_the_connector_fill_in_for_an_unset_refresh_mode() {
+        for connector in ["debezium", "cdc"] {
+            assert!(
+                !allows(&source(Some(connector), Mode::FileCreate, None)),
+                "{connector} resolves to changes, which rebuilds from the source"
+            );
+        }
+    }
+
     #[test]
     fn modes_that_keep_their_acceleration_still_bootstrap() {
         for mode in [Mode::File, Mode::FileUpdate, Mode::Memory] {
             assert!(
-                mode_allows_snapshot_bootstrap(&acceleration(mode, None)),
+                allows(&source(Some("postgres"), mode, None)),
                 "{mode:?} does not discard the acceleration, so bootstrapping still applies"
             );
         }
+    }
+
+    /// A source with no connector (a view, an Iceberg DDL table) falls back to `full`.
+    #[test]
+    fn file_create_without_a_connector_falls_back_to_full() {
+        assert!(!allows(&source(None, Mode::FileCreate, None)));
     }
 }
 

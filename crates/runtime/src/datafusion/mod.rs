@@ -3554,7 +3554,7 @@ impl DataFusion {
             {
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset_name,
+                    dataset,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
