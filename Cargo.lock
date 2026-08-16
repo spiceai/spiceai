@@ -43,7 +43,7 @@ dependencies = [
  "regex",
  "toml 1.1.2+spec-1.1.0",
  "windows-registry",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -339,7 +339,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -350,7 +350,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -461,6 +461,12 @@ name = "arcref"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28f6098a1e8ab66ff91324cce8fea6643101882cf7d09c85acdb1485ecf61e29"
+
+[[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "arg_enum_proc_macro"
@@ -2675,7 +2681,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -3277,6 +3283,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
+ "arrow_tools",
  "async-compression",
  "async-openai",
  "async-stream",
@@ -4122,7 +4129,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4132,7 +4139,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
+ "futures-core",
  "memchr",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4628,8 +4639,10 @@ name = "connector-kafka"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "dataformat-json",
  "datafusion",
@@ -4639,6 +4652,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4657,6 +4671,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "criterion 0.7.0",
@@ -4670,6 +4685,7 @@ dependencies = [
  "mongodb",
  "paste",
  "runtime",
+ "runtime-checkpoint-api",
  "runtime-parameters",
  "secrecy",
  "serde_json",
@@ -4698,9 +4714,11 @@ dependencies = [
 name = "connector-mysql"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4712,6 +4730,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-udfs-api",
@@ -4784,6 +4803,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4793,6 +4813,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4853,6 +4874,7 @@ dependencies = [
 name = "connector-sharepoint"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "async-stream",
  "async-trait",
@@ -5998,11 +6020,14 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "async-trait",
  "data_components",
+ "datafusion",
  "globset",
  "runtime-component",
  "serde_json",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
@@ -6104,6 +6129,7 @@ dependencies = [
  "rdkafka",
  "regex",
  "reqwest 0.13.4",
+ "runtime-checkpoint-api",
  "runtime-rate-control",
  "runtime-request-context",
  "rusqlite",
@@ -6159,7 +6185,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6211,7 +6237,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6235,7 +6261,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6259,7 +6285,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6284,7 +6310,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "futures",
  "log",
@@ -6294,7 +6320,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-compression",
@@ -6331,7 +6357,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -6354,7 +6380,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6376,7 +6402,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6398,7 +6424,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6447,12 +6473,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 
 [[package]]
 name = "datafusion-execution"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6473,7 +6499,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -6495,7 +6521,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6547,7 +6573,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -6578,7 +6604,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6598,7 +6624,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6622,7 +6648,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -6646,7 +6672,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6661,7 +6687,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6677,7 +6703,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -6686,7 +6712,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -6696,7 +6722,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "chrono",
@@ -6747,7 +6773,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6768,7 +6794,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6782,7 +6808,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "chrono",
@@ -6798,7 +6824,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6818,7 +6844,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "arrow-data",
@@ -6850,7 +6876,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "chrono",
@@ -6879,7 +6905,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6891,7 +6917,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -6906,7 +6932,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "async-trait",
  "datafusion-common",
@@ -6919,7 +6945,7 @@ dependencies = [
 [[package]]
 name = "datafusion-spark"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6947,7 +6973,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -6965,7 +6991,7 @@ dependencies = [
 [[package]]
 name = "datafusion-substrait"
 version = "54.1.0"
-source = "git+https://github.com/spiceai/datafusion.git?rev=edd8861e69c2eb268d4e8e4e6c45485b714eb9ce#edd8861e69c2eb268d4e8e4e6c45485b714eb9ce"
+source = "git+https://github.com/spiceai/datafusion.git?rev=b5cb7bb321acbbff749bb9147130f6b47bb36034#b5cb7bb321acbbff749bb9147130f6b47bb36034"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -7404,7 +7430,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7902,7 +7928,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8895,8 +8921,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -10064,7 +10090,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -10715,7 +10741,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10729,15 +10755,6 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
 dependencies = [
  "either",
 ]
@@ -12473,7 +12490,7 @@ dependencies = [
 [[package]]
 name = "model2vec-rs"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/model2vec-rs.git?rev=f1190f1f140105f0c5ac8335fbbac402051ab072#f1190f1f140105f0c5ac8335fbbac402051ab072"
+source = "git+https://github.com/spiceai/model2vec-rs.git?rev=55fef28a3556895b20204634b788f7c836b610bc#55fef28a3556895b20204634b788f7c836b610bc"
 dependencies = [
  "anyhow",
  "clap",
@@ -12484,6 +12501,8 @@ dependencies = [
  "safetensors 0.5.3",
  "serde_json",
  "tokenizers 0.21.4",
+ "unicode-normalization",
+ "unicode_categories",
 ]
 
 [[package]]
@@ -12990,7 +13009,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14753,12 +14772,12 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pingora-lru"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
+checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
+ "hashbrown 0.17.1",
  "parking_lot",
  "rand 0.8.6",
 ]
@@ -15235,7 +15254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -15256,7 +15275,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16088,6 +16107,35 @@ name = "recvmsg"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
+name = "redis"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
+dependencies = [
+ "arc-swap",
+ "arcstr",
+ "async-lock",
+ "backon",
+ "bytes",
+ "cfg-if",
+ "combine",
+ "futures-channel",
+ "futures-util",
+ "itoa",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2 0.6.4",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "redox_syscall"
@@ -16964,6 +17012,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-drasi",
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
@@ -17126,6 +17175,7 @@ name = "runtime-checkpoint-api"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "serde",
  "snafu",
 ]
 
@@ -17384,6 +17434,26 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-drasi"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "chrono",
+ "percent-encoding",
+ "redis",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -17963,7 +18033,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -18031,7 +18101,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -18453,6 +18523,7 @@ dependencies = [
  "snafu",
  "spice-table",
  "tantivy",
+ "tantivy_datafusion_filter",
  "tempfile",
  "tokio",
  "tracing",
@@ -18602,7 +18673,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -18769,9 +18840,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e72c1c2cb7b223fafb600a619537a871c2818583d619401b785e7c0b746ccde2"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -18789,9 +18860,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.20.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b90c488738ecb4fb0262f41f43bc40efc5868d9fb744319ddf5f5317f417bfac"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -19254,7 +19325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -19382,6 +19453,7 @@ dependencies = [
  "datafusion",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-secrets",
  "serde",
  "serde_json",
  "snafu",
@@ -19496,7 +19568,6 @@ dependencies = [
  "mimalloc",
  "opentelemetry",
  "opentelemetry-http",
- "opentelemetry-prometheus",
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
@@ -19512,6 +19583,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-query-engine",
  "runtime-request-context",
+ "runtime-secrets",
  "rustls",
  "serde_json",
  "snafu",
@@ -19775,7 +19847,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -20448,6 +20520,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tantivy_datafusion_filter"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "snafu",
+ "tantivy",
+]
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -20502,7 +20584,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -20564,7 +20646,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -20778,7 +20860,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -22492,7 +22574,6 @@ dependencies = [
  "ctrlc",
  "datafusion",
  "futures",
- "globset",
  "http-body 1.0.1",
  "humantime",
  "parking_lot",
@@ -22638,7 +22719,7 @@ dependencies = [
 [[package]]
 name = "vortex"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "vortex-alp",
  "vortex-array",
@@ -22673,7 +22754,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -22691,7 +22772,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arc-swap",
  "arcref",
@@ -22738,7 +22819,7 @@ dependencies = [
 [[package]]
 name = "vortex-array-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -22748,7 +22829,7 @@ dependencies = [
 [[package]]
 name = "vortex-arrow"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -22770,7 +22851,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "pco",
@@ -22796,7 +22877,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -22809,7 +22890,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -22821,7 +22902,7 @@ dependencies = [
 [[package]]
 name = "vortex-compressor"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -22839,7 +22920,7 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "vortex-buffer",
 ]
@@ -22851,6 +22932,7 @@ dependencies = [
  "anyhow",
  "arrow-schema",
  "async-trait",
+ "cpu-budget",
  "criterion 0.7.0",
  "datafusion",
  "datafusion-catalog",
@@ -22890,7 +22972,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "num-traits",
  "prost",
@@ -22904,7 +22986,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "num-traits",
  "prost",
@@ -22918,7 +23000,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -22931,7 +23013,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "fastlanes",
  "itertools 0.14.0",
@@ -22948,7 +23030,7 @@ dependencies = [
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "async-trait",
  "bytes",
@@ -22992,7 +23074,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -23002,7 +23084,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "fsst-rs",
  "num-traits",
@@ -23017,7 +23099,7 @@ dependencies = [
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "async-fs",
  "async-stream",
@@ -23047,7 +23129,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -23064,7 +23146,7 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arcref",
  "arrow-array",
@@ -23107,7 +23189,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "vortex-buffer",
@@ -23117,7 +23199,7 @@ dependencies = [
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "parking_lot",
  "sketches-ddsketch",
@@ -23126,7 +23208,7 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "pco",
  "prost",
@@ -23140,7 +23222,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "prost",
  "prost-types",
@@ -23149,7 +23231,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -23164,7 +23246,7 @@ dependencies = [
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "async-trait",
  "futures",
@@ -23180,7 +23262,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "num-traits",
  "prost",
@@ -23196,7 +23278,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "arc-swap",
  "lasso",
@@ -23208,7 +23290,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -23223,7 +23305,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "dashmap",
  "hashbrown 0.17.1",
@@ -23232,7 +23314,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "vortex-array",
  "vortex-buffer",
@@ -23245,7 +23327,7 @@ dependencies = [
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=53b08c10cf4a717422a8c2d7232cb577acd1b997#53b08c10cf4a717422a8c2d7232cb577acd1b997"
+source = "git+https://github.com/spiceai/vortex.git?rev=4e2d626544b1317f5a1f65f081419e19f8a79462#4e2d626544b1317f5a1f65f081419e19f8a79462"
 dependencies = [
  "itertools 0.14.0",
  "prost",
@@ -23912,7 +23994,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -24714,6 +24796,12 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "y4m"

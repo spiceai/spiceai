@@ -36,8 +36,10 @@ limitations under the License.
 //!
 //! Coverage is env-scalable for CI without code changes (see `env_scale`):
 //! `CAYENNE_PROPTEST_SCALE` multiplies the seed count of every config, and
-//! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both default
-//! to 1 (a fast local run).
+//! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both accept
+//! fractional values (e.g. `0.25` for a lighter per-PR pass) and default to 1
+//! (the current fast local run). Scaling never drops a config below 1 seed/op,
+//! so every config still runs on every PR — only its depth changes.
 //!
 //! All configs currently converge — the convergence/resurrection defects this
 //! harness surfaced are fixed (see the PR description for the linked fixes). If
@@ -986,20 +988,45 @@ async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
 //   * `CAYENNE_PROPTEST_OPS_SCALE` — multiplies the per-seed OP count (longer
 //     sequences = deeper histories; costlier in the concurrent configs because
 //     each op carries a small real-time sleep, so scale this more gently).
-// Both default to 1 and accept any positive integer; a missing/zero/unparseable
-// value is treated as 1.
-fn env_scale(var: &str) -> u64 {
+// Both default to 1 and accept any positive number, including fractions below 1
+// (e.g. `0.25` for a lighter per-PR pass); a missing/non-positive/unparseable
+// value is treated as 1. The scaled result is always rounded up to at least 1,
+// so no config's seed/op count can be scaled away to 0 — every config still
+// runs, just shallower.
+fn env_scale(var: &str) -> f64 {
     std::env::var(var)
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(1)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(1.0)
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "base seed counts are small (<1_000); exact in f64"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
 fn scaled_seeds(base: u64) -> u64 {
-    base * env_scale("CAYENNE_PROPTEST_SCALE")
+    ((base as f64) * env_scale("CAYENNE_PROPTEST_SCALE"))
+        .round()
+        .max(1.0) as u64
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "base op counts are small (<1_000); exact in f64"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
 fn scaled_ops(base: usize) -> usize {
-    base * usize::try_from(env_scale("CAYENNE_PROPTEST_OPS_SCALE")).expect("scale fits usize")
+    ((base as f64) * env_scale("CAYENNE_PROPTEST_OPS_SCALE"))
+        .round()
+        .max(1.0) as usize
 }
 
 // ============================================================================

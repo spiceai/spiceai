@@ -47,7 +47,7 @@ use datafusion_catalog::TableProvider;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -243,24 +243,27 @@ impl FileBasedDeletionSink {
     ) -> crate::provider::Result<u64> {
         let mut total_rows: u64 = 0;
         let mut deleted_count: u64 = 0;
+        let mut retired_cache_paths = HashSet::new();
+        let mut delete_error = None;
 
         for (meta, num_rows) in eligible_files {
+            let row_count = num_rows.unwrap_or(0);
+            let Ok(rows) = u64::try_from(row_count) else {
+                delete_error = Some(Error::Internal {
+                    table: self.table_name.clone(),
+                    message: format!(
+                        "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
+                        meta.location
+                    ),
+                });
+                break;
+            };
             // Delete the file from the object store. This does not invalidate the listing table cache; cache invalidation is handled separately.
             match object_store.delete(&meta.location).await {
                 Ok(()) => {
-                    let row_count = num_rows.unwrap_or(0);
-                    let Ok(rows) = u64::try_from(row_count) else {
-                        return Err(Error::Internal {
-                            table: self.table_name.clone(),
-                            message: format!(
-                                "Retention: invalid row count {row_count} for file {} (cannot convert to u64)",
-                                meta.location
-                            ),
-                        });
-                    };
-
                     total_rows = total_rows.saturating_add(rows);
                     deleted_count += 1;
+                    retired_cache_paths.insert(meta.location.clone());
 
                     tracing::debug!(
                         table = %self.table_name,
@@ -272,6 +275,7 @@ impl FileBasedDeletionSink {
                 }
                 Err(object_store::Error::NotFound { .. }) => {
                     // File already deleted (race with another retention check) — safe to ignore
+                    retired_cache_paths.insert(meta.location.clone());
                     tracing::debug!(
                         table = %self.table_name,
                         path = %meta.location,
@@ -285,13 +289,26 @@ impl FileBasedDeletionSink {
                         error = %e,
                         "Retention: failed to delete expired file"
                     );
-                    return Err(Error::ObjectStore {
+                    delete_error = Some(Error::ObjectStore {
                         operation: "delete expired retention file",
                         table: self.table_name.clone(),
                         source: e,
                     });
+                    break;
                 }
             }
+        }
+
+        // Exact paths are invalidated only after DeleteObject confirms that the
+        // object is absent. Do this even when a later delete failed so every
+        // file already removed by this partial batch releases its cached
+        // segments immediately and cannot disappear from a later directory
+        // listing before ever being invalidated.
+        self.provider
+            .invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
+        if let Some(error) = delete_error {
+            return Err(error);
         }
 
         tracing::debug!(

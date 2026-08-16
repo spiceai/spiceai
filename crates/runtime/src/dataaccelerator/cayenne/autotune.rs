@@ -324,8 +324,12 @@ impl HardwareProfile {
         usize::try_from(hardware_ceiling).unwrap_or(256)
     }
 
-    /// Size (in MB) of the in-memory Vortex decompressed-segment cache, which
-    /// accelerates repeated scans (the OLAP side of an HTAP workload).
+    /// Size (in MB) of the in-memory Vortex segment cache, which accelerates
+    /// repeated scans (the OLAP side of an HTAP workload) by holding segments as
+    /// they are stored — serialized, still in Vortex's compressed encodings — so a
+    /// hit skips the read, not the decode. Canonicalizing those encodings into
+    /// flat Arrow happens downstream and is charged to the query memory pool
+    /// separately, so the two never account for the same bytes.
     ///
     /// Scales up on memory-rich hosts (~1/128 of RAM) but never below the
     /// historical 256 MiB default, so no host regresses on the query path, and

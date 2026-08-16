@@ -182,8 +182,9 @@ files the gate itself reads**:
 - `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
   the root `clippy.toml`; `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
-- `layers.toml`, `scripts/check_crate_layers.py`, and
-  `scripts/check_rust_gate_paths.py` — the no-compile guards it runs
+- `layers.toml`, `scripts/check_crate_layers.py`,
+  `scripts/check_rust_gate_paths.py`, and
+  `scripts/check_module_reachability.py` — the no-compile guards it runs
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -199,6 +200,28 @@ tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
 what must be gated from what the `lint-rust` recipe reads and from the tracked
 config-file names, rather than from a list someone has to remember, and fails
 when the three drift. Change them together.
+
+### The unreachable-module guard
+
+`make lint-rust` also runs `scripts/check_module_reachability.py`, which fails
+when a file under a workspace crate's `src/` is not reachable from that crate's
+roots through `mod` declarations. Such a file compiles into nothing, so
+`cargo build`, `cargo clippy`, `cargo fmt --all` and `cargo test` are all silent
+about it — it looks like source and ships nothing. Four stale trees had
+accumulated this way, together holding ~2,200 lines and 26 tests that had never
+run ([#12735](https://github.com/spiceai/spiceai/issues/12735),
+[#12737](https://github.com/spiceai/spiceai/issues/12737)).
+
+Roots come from `cargo metadata`, so a `path = "…"` target override in a
+`Cargo.toml` is honoured without the script parsing manifests. Only `src/` is in
+scope: cargo auto-discovers `benches/`, `tests/` and `examples/` files as their
+own targets, so they are reachable with no `mod` declaration and including them
+reports ~200 files that are all fine.
+
+The walk handles the cases a regex over `mod` alone gets wrong — `#[path = "…"]`
+redirects, declarations behind `#[cfg(…)]` (still declarations), inline
+`mod x { … }` nesting, and `mod` tokens inside comments and string literals.
+`scripts/test_check_module_reachability.py` covers each one.
 
 ### Dependabot bumps are fast-tracked
 

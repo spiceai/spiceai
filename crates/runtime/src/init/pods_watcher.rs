@@ -71,6 +71,7 @@ fn start_time_only_changes(
         metrics,
         scheduler,
         source_rate_control,
+        drasi,
         functions: _,
     } = new;
 
@@ -156,6 +157,9 @@ fn start_time_only_changes(
                 current.source_rate_control.as_ref(),
             ),
         ),
+        // The forwarders are installed once into a `OnceLock` during the initial
+        // component load, so a reload leaves the running ones in place.
+        ("runtime.drasi", Process, *drasi != current.drasi),
     ]
     .into_iter()
     .filter_map(|(section, scope, changed)| changed.then_some((section, scope)))
@@ -463,6 +467,7 @@ mod tests {
                 default_partition_discovery_timeout,
             },
         },
+        drasi::{DrasiForwarding, DrasiTransport, RuntimeDrasi},
         metric::{Metric, Metrics},
     };
     use tracing_subscriber::fmt::MakeWriter;
@@ -645,6 +650,18 @@ mod tests {
                     rt.source_rate_control = Some(SourceRateControl {
                         github_concurrent_connections_limit: Some(2),
                         ..SourceRateControl::default()
+                    });
+                }),
+            ),
+            (
+                "runtime.drasi",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.drasi = Some(RuntimeDrasi {
+                        source_id: "spice-runtime".to_string(),
+                        forwarding: DrasiForwarding::default(),
+                        tables: Vec::new(),
+                        transport: DrasiTransport::default(),
+                        params: None,
                     });
                 }),
             ),

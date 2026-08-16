@@ -36,16 +36,14 @@ use data_components::mysql_replication::{
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
 use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
-use runtime::dataaccelerator::spice_sys::{
-    OpenOption,
-    mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
-};
-use runtime::federated::FederatedTable;
+use runtime::dataconnector::parameters::ConnectorContext;
+use runtime_checkpoint_api::mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogStore};
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use runtime_parameters::Parameters;
 use std::collections::hash_map::DefaultHasher;
@@ -58,7 +56,8 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 pub fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    context: Option<Arc<dyn ConnectorContext>>,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
@@ -201,7 +200,7 @@ pub fn build_changes_stream(
         // File-accelerated datasets persist their binlog position in the
         // accelerator sidecar; everything else re-bootstraps on each start.
         let position_store: Arc<dyn PositionStore> = if dataset.is_file_accelerated() {
-            match MySqlBinlogSys::try_new(&dataset, OpenOption::CreateIfNotExists).await {
+            match resolve_binlog_store(context.as_ref(), &dataset).await {
                 Ok(sys) => Arc::new(SidecarPositionStore { sys }),
                 Err(e) => {
                     tracing::error!(
@@ -222,7 +221,12 @@ pub fn build_changes_stream(
             Arc::new(NoopPositionStore)
         };
 
-        let schema_json = match MySqlBinlogSys::serialize_schema(&schema) {
+        // The store is all this stream needs; the context is only the route to it. The
+        // context is weak, so retaining it would not pin the runtime, but a long-lived
+        // change stream should not hold a handle it has finished with.
+        drop(context);
+
+        let schema_json = match arrow_tools::schema::schema_to_json(&schema) {
             Ok(json) => Some(json),
             Err(e) => {
                 tracing::warn!(
@@ -253,17 +257,34 @@ pub fn build_changes_stream(
     })
 }
 
+/// Resolve the binlog-position store over the dataset's own accelerator.
+///
+/// A missing context means no runtime is attached, which only happens in unit tests;
+/// it is reported the same way as an unresolvable accelerator so the caller has one
+/// fallback path.
+async fn resolve_binlog_store(
+    context: Option<&Arc<dyn ConnectorContext>>,
+    dataset: &Dataset,
+) -> Result<Arc<dyn MySqlBinlogStore>, StoreError> {
+    let context = context.ok_or_else(|| -> StoreError {
+        "no runtime is attached to the connector, so the binlog position cannot be persisted".into()
+    })?;
+    context
+        .mysql_binlog_store(dataset)
+        .await
+        .map_err(|e| Box::new(e) as StoreError)
+}
+
 /// [`PositionStore`] over the accelerator's `spice_sys_mysql_binlog` sidecar.
 struct SidecarPositionStore {
-    sys: MySqlBinlogSys,
+    sys: Arc<dyn MySqlBinlogStore>,
 }
 
 #[async_trait]
 impl PositionStore for SidecarPositionStore {
     async fn load(&self) -> Result<Option<PersistedPosition>, StoreError> {
-        // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
-        // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
-        // wedging the dataset.
+        // The store reports a read failure as `None`, matching the MongoDB sidecar: an
+        // unreadable checkpoint re-bootstraps rather than wedging the dataset.
         let Some(cp) = self.sys.get().await else {
             return Ok(None);
         };

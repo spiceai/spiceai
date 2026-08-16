@@ -57,3 +57,8 @@ pub static ACCELERATION_TABLES_BY_KIND: LazyLock<Gauge<u64>> = LazyLock::new(|| 
         )
         .build()
 });
+
+/// See [`crate::publish_component_counters_at_zero`].
+pub fn publish_counters_at_zero() {
+    LOAD_ERROR.add(0, &[]);
+}

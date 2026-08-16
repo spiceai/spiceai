@@ -11,7 +11,11 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-cast.workspace = true
-arrow-schema.workspace = true
+# `serde` for the schema JSON encoding in `schema::schema_to_json`, which is a
+# durable on-disk format: declared here rather than inherited from another crate's
+# feature selection, so the encoding cannot lose its impls to a feature change
+# elsewhere in the graph.
+arrow-schema = { workspace = true, features = ["serde"] }
 base64 = "0.22.1"
 snafu.workspace = true
 datafusion.workspace = true

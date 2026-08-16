@@ -33,9 +33,10 @@ use rand::RngExt as _;
 use runtime::{
     Runtime, accelerated::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table, secrets::Secrets,
+    flight::RateLimits, internal_table::create_internal_accelerated_table,
 };
 use runtime_auth::FlightBasicAuth;
+use runtime_secrets::Secrets;
 use spicepod::component::dataset::Dataset;
 use tokio::{sync::RwLock, time::sleep};
 use tonic::transport::Channel;

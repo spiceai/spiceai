@@ -50,6 +50,14 @@ pub(crate) struct MemoryVectorStore {
     /// output uses, as required by `VectorScanTableProvider`).
     pub(crate) stored_schema: SchemaRef,
     batches: Vec<StoredBatch>,
+    /// Rows written since a replace window opened, held aside from [`Self::batches`].
+    ///
+    /// `None` outside a replace window, which is every append and every CDC write. While it
+    /// is `Some`, writes land here and reads still see [`Self::batches`], so the wipe and the
+    /// repopulation of a full refresh become visible together at
+    /// [`Self::commit_replace_window`] rather than a searcher observing an empty index for
+    /// the length of the refresh.
+    replacement: Option<Vec<StoredBatch>>,
 }
 
 impl MemoryVectorStore {
@@ -57,7 +65,39 @@ impl MemoryVectorStore {
         Self {
             stored_schema,
             batches: Vec::new(),
+            replacement: None,
         }
+    }
+
+    /// Open a replace window: stage subsequent writes instead of adding them to the rows
+    /// readers see.
+    ///
+    /// A replacing write reproduces the table's whole contents, so every row this store
+    /// already holds is either re-sent inside the window or belongs to a row the source
+    /// dropped. Discards anything staged by a window that was abandoned without either
+    /// terminator running, so it cannot be swept into this one.
+    pub(crate) fn begin_replace_window(&mut self) {
+        self.replacement = Some(Vec::new());
+    }
+
+    /// Close a replace window by publishing what it staged, replacing the previous contents
+    /// in one step. A no-op when no window is open — the terminators run after an append too.
+    pub(crate) fn commit_replace_window(&mut self) {
+        if let Some(staged) = self.replacement.take() {
+            self.batches = staged;
+        }
+    }
+
+    /// Close a replace window by discarding what it staged, leaving the previous contents
+    /// readable. A no-op when no window is open.
+    pub(crate) fn abandon_replace_window(&mut self) {
+        self.replacement = None;
+    }
+
+    /// The batches a write acts on: the staged set inside a replace window, else the rows
+    /// readers see.
+    fn write_target(&mut self) -> &mut Vec<StoredBatch> {
+        self.replacement.as_mut().unwrap_or(&mut self.batches)
     }
 
     /// Replace-on-rewrite insert: drops any stored row whose formatted primary
@@ -72,7 +112,7 @@ impl MemoryVectorStore {
 
         self.delete_by_keys(&keys)?;
         if batch.num_rows() > 0 {
-            self.batches.push(StoredBatch { batch, keys });
+            self.write_target().push(StoredBatch { batch, keys });
         }
         Ok(())
     }
@@ -92,8 +132,9 @@ impl MemoryVectorStore {
         // Filter every overlapping batch before touching the stored ones. This store holds
         // the only copy of the rows it is filtering, so a partially applied delete would
         // lose the batches it had already consumed. `None` marks a batch with no overlap.
-        let mut filtered: Vec<Option<RecordBatch>> = Vec::with_capacity(self.batches.len());
-        for stored in &self.batches {
+        let target = self.write_target();
+        let mut filtered: Vec<Option<RecordBatch>> = Vec::with_capacity(target.len());
+        for stored in target.iter() {
             if !stored
                 .keys
                 .iter()
@@ -113,8 +154,9 @@ impl MemoryVectorStore {
         }
 
         // Every fallible step is done, so the store can be rebuilt without dropping rows.
-        let mut retained = Vec::with_capacity(self.batches.len());
-        for (stored, filtered) in self.batches.drain(..).zip(filtered) {
+        let target = self.write_target();
+        let mut retained = Vec::with_capacity(target.len());
+        for (stored, filtered) in target.drain(..).zip(filtered) {
             let Some(batch) = filtered else {
                 // No overlap — keep the batch untouched (zero-copy).
                 retained.push(stored);
@@ -133,12 +175,16 @@ impl MemoryVectorStore {
                 keys: kept_keys,
             });
         }
-        self.batches = retained;
+        *target = retained;
         Ok(())
     }
 
     /// Current contents as batches conforming to [`Self::stored_schema`].
     /// Cheap: Arrow buffers are shared, not copied.
+    ///
+    /// Always the published rows. Rows staged by an open replace window are deliberately
+    /// invisible here: a query during a full refresh reads the previous contents rather than
+    /// the partially rebuilt ones.
     pub(crate) fn batches(&self) -> Vec<RecordBatch> {
         self.batches.iter().map(|s| s.batch.clone()).collect()
     }
@@ -286,6 +332,38 @@ mod tests {
             stored_ids(&store),
             vec![vec![1, 2], vec![3, 4], vec![5, 6]],
             "an upsert that could not delete the rows it supersedes must not add its own"
+        );
+    }
+
+    #[test]
+    fn a_failed_delete_inside_a_replace_window_leaves_every_staged_row_in_place() {
+        let mut store = store_of(&[&[1, 2]]);
+        store.begin_replace_window();
+        store
+            .upsert(batch(&[3, 4]), keys(&[3, 4]))
+            .expect("staging a batch inside a replace window succeeds");
+        store.write_target().push(StoredBatch {
+            batch: batch(&[5, 6]),
+            keys: keys(&[5, 6, 7]),
+        });
+
+        // "3" overlaps the first staged batch, so it filters successfully before "5" reaches
+        // the second and fails.
+        store
+            .delete_by_keys(&keys(&[3, 5]))
+            .expect_err("a batch whose mask does not match its rows cannot be filtered");
+
+        assert_eq!(
+            stored_ids(&store),
+            vec![vec![1, 2]],
+            "a failed delete inside a window must leave the published rows alone"
+        );
+
+        store.commit_replace_window();
+        assert_eq!(
+            stored_ids(&store),
+            vec![vec![3, 4], vec![5, 6]],
+            "a delete that could not be applied must not remove any staged row"
         );
     }
 }

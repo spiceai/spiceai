@@ -7,6 +7,7 @@ license-file.workspace = true
 description = "SharePoint data connector for Spice.ai runtime"
 
 [dependencies]
+app = { path = "../../app" }
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true

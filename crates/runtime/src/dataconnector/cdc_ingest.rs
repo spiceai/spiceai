@@ -48,7 +48,7 @@ use crate::component::dataset::{
     Dataset,
     acceleration::{Engine, RefreshMode},
 };
-use crate::federated::FederatedTable;
+use data_connector_api::federated::FederatedTableProvider;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -433,7 +433,7 @@ impl DataConnector for CdcIngest {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
+        federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
     ) -> Option<ChangesStream> {
         let dataset_name = dataset.name.to_string();
