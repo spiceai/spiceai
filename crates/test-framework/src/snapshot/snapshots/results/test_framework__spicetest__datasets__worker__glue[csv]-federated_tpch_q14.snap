@@ -2,8 +2,8 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpch_q14"
 ---
-+--------------------+
-| promo_revenue      |
-+--------------------+
-| 16.380778626395536 |
-+--------------------+
++-------------------+
+| promo_revenue     |
++-------------------+
+| 16.38077862639554 |
++-------------------+
