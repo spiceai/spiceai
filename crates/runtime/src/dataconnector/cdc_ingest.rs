@@ -27,8 +27,8 @@ use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
-    build_ready_signal_envelope,
+    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
+    CommitError, build_ready_signal_envelope,
 };
 use data_components::debezium::avro::AvroDecodeOptions;
 use data_components::debezium::decode::{self, CdcFormat};
@@ -435,6 +435,7 @@ impl DataConnector for CdcIngest {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let dataset_name = dataset.name.to_string();
         Some(Box::pin(stream! {

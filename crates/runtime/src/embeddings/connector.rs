@@ -31,7 +31,9 @@ use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
-use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
+use data_components::cdc::{
+    AccelerationContents, ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data,
+};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
@@ -348,6 +350,7 @@ impl DataConnector for EmbeddingConnector {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) =
@@ -383,7 +386,7 @@ impl DataConnector for EmbeddingConnector {
 
             let stream = self
                 .inner_connector
-                .changes_stream(underlying_federated_table, dataset)?
+                .changes_stream(underlying_federated_table, dataset, acceleration)?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
@@ -398,6 +401,7 @@ impl DataConnector for EmbeddingConnector {
                     &vector_scan.table_provider,
                 ))),
                 dataset,
+                acceleration,
             )
         } else if let Some(embedding_table) =
             find_layer::<EmbeddingTable>(table_provider.as_ref(), LayerWalk::CdcDetection)
@@ -408,7 +412,7 @@ impl DataConnector for EmbeddingConnector {
 
             Some(
                 self.inner_connector
-                    .changes_stream(underlying_federated_table, dataset)?
+                    .changes_stream(underlying_federated_table, dataset, acceleration)?
                     .then(move |item| {
                         Self::embed_change_envelope(item, Arc::clone(&embedding_table))
                     })
@@ -769,6 +773,7 @@ mod tests {
             &self,
             _federated_table: Arc<dyn FederatedTableProvider>,
             _dataset: &Dataset,
+            _acceleration: AccelerationContents,
         ) -> Option<ChangesStream> {
             Some(futures::stream::empty().boxed())
         }
@@ -878,7 +883,11 @@ mod tests {
 
         assert!(
             embedding_connector()
-                .changes_stream(vector_scan_over_memtable(), &dataset)
+                .changes_stream(
+                    vector_scan_over_memtable(),
+                    &dataset,
+                    AccelerationContents::Unknown,
+                )
                 .is_some(),
             "a vector scan must resolve to the source's changes stream"
         );

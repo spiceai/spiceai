@@ -52,7 +52,8 @@ use super::{
 };
 use crate::component::dataset::Dataset;
 use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
+    CommitError,
 };
 use data_components::flight::{FlightFactory, FlightTable};
 use data_components::{Read, ReadWrite};
@@ -571,6 +572,7 @@ impl DataConnector for SpiceAI {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }

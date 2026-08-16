@@ -107,6 +107,7 @@ impl DataConnector for DeferredConnector {
         &self,
         _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         _dataset: &Dataset,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }

@@ -25,7 +25,7 @@ pub(crate) use crate::parameters::ParameterSpec;
 pub(crate) use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
@@ -381,10 +381,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
+    /// Build the change stream that feeds `refresh_mode: changes`.
+    ///
+    /// `acceleration` reports what the accelerator already holds, so a source
+    /// that must otherwise assume the worst about contents it cannot place — see
+    /// [`AccelerationContents`] — can tell an acceleration that is starting from
+    /// nothing apart from one that may be carrying rows the source has since
+    /// deleted. Sources that place their position by other means may ignore it.
+    ///
+    /// Wrappers must forward this argument unchanged. Substituting
+    /// [`AccelerationContents::Unknown`] is safe but costs the inner connector
+    /// the distinction, which for `PostgreSQL` means re-reading the whole table
+    /// on a first load.
     fn changes_stream(
         &self,
         _federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         None
     }

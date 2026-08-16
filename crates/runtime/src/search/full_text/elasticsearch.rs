@@ -22,7 +22,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use tokio::sync::RwLock;
@@ -266,9 +266,10 @@ impl DataConnector for ElasticsearchFullTextConnector {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &Dataset,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, table| {
-            inner.changes_stream(table, dataset)
+            inner.changes_stream(table, dataset, acceleration)
         })
     }
 

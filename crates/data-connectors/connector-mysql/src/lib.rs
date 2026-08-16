@@ -619,6 +619,7 @@ impl DataConnector for MySQL {
         &self,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &Dataset,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,

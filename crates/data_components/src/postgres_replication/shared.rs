@@ -2113,10 +2113,17 @@ async fn attach_member(
     let earliest_streamable_lsn = setup
         .slot_restart_lsn
         .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
+    // A durable acceleration that has recorded no position is rebuilt, because a
+    // missing watermark cannot be told apart from one whose write failed — except
+    // when the acceleration is observed to hold no rows at all, which is proof
+    // enough on its own: nothing is present that could be stale, and no deletion
+    // can be missing. Such a load is a first load, and takes the ordinary
+    // snapshot bootstrap.
+    let acceleration_is_empty = params.acceleration.is_provably_empty();
     let rebuild_via_consumer = super::needs_rebuild(
         &watermark,
         earliest_streamable_lsn,
-        !params.ephemeral_accelerator && tracks_positions,
+        !params.ephemeral_accelerator && tracks_positions && !acceleration_is_empty,
     );
 
     // Why the rebuild, in the terms the operator can act on. The four causes are
@@ -2125,7 +2132,7 @@ async fn attach_member(
     // re-stream what it has already acknowledged.
     let rebuild_reason = match &watermark {
         super::RecordedPosition::Absent => {
-            "it has no recorded position, so the rows it already holds cannot be shown to be current"
+            "it has no recorded position, so any rows it already holds cannot be shown to be current"
         }
         super::RecordedPosition::ForeignSource => {
             "the position it recorded belongs to a different source, so it does not describe these rows"
@@ -3894,6 +3901,7 @@ mod tests {
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
+            acceleration: crate::cdc::AccelerationContents::Unknown,
             status_interval: std::time::Duration::from_secs(5),
             watermark_flush_interval: std::time::Duration::from_secs(30),
             bootstrap_batch_size: 8192,

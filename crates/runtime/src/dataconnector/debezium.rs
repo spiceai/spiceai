@@ -30,7 +30,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
@@ -602,6 +602,7 @@ impl DataConnector for Debezium {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &Dataset,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
