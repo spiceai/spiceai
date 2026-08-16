@@ -120,15 +120,17 @@ fn jitter(d: Duration) -> Duration {
 ///
 /// Anything that looks like an IO / connection / EOF error, worker task termination,
 /// or a connection-lifecycle / server-shutdown SQLSTATE is transient; authentication,
-/// protocol, slot-not-found, or decoding errors are fatal.
+/// protocol, slot-not-found, internal, or decoding errors are fatal.
 #[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
-    let transient = match err {
+    match err {
         pgwire_replication::PgWireError::Io(_) | pgwire_replication::PgWireError::Task(_) => true,
-        _ => is_transient_by_display(&err.to_string()),
-    };
-    tracing::info!(transient, %err, "classified pgwire error");
-    transient
+        pgwire_replication::PgWireError::Server(msg)
+        | pgwire_replication::PgWireError::Tls(msg) => is_transient_by_display(msg),
+        pgwire_replication::PgWireError::Auth(_)
+        | pgwire_replication::PgWireError::Protocol(_)
+        | pgwire_replication::PgWireError::Internal(_) => false,
+    }
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
@@ -137,15 +139,19 @@ pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
     if err.is_closed() {
         return true;
     }
-    // Postgres SQLSTATE classes: 08xxx = connection exception (transient),
-    // 57P0x = admin shutdown / cannot-connect-now (transient).
+    // Postgres SQLSTATE classes: 08xxx = connection exception (transient, excluding 08P01 protocol_violation),
+    // 57P0x = admin shutdown / cannot-connect-now (transient: 57P01, 57P02, 57P03).
     if let Some(db_err) = err.as_db_error() {
         let code = db_err.code().code();
-        if code.starts_with("08") || code == "57P01" || code == "57P02" || code == "57P03" {
+        if (code.starts_with("08") && code != "08P01")
+            || code == "57P01"
+            || code == "57P02"
+            || code == "57P03"
+        {
             return true;
         }
         // Anything else from the server is a structured error (permission,
-        // syntax, constraint). Don't retry those.
+        // syntax, constraint, database dropped 57P04, protocol violation 08P01). Don't retry those.
         return false;
     }
     is_transient_by_display(&err.to_string())
@@ -189,20 +195,29 @@ fn is_transient_by_display(msg: &str) -> bool {
         "max_wal_senders",
         "too many connections",
         // SQLSTATE 57P01/57P02/57P03 (operator_intervention): admin shutdown, crash shutdown,
-        // cannot connect now. Note that 57P04 (database_dropped) is fatal and not retryable.
+        // cannot connect now. Note that 57P04 (database_dropped) is fatal and excluded below.
         "sqlstate 57p01",
         "sqlstate 57p02",
         "sqlstate 57p03",
         "admin shutdown",
         "administrator command",
-        "terminating connection",
         "crash shutdown",
         "cannot connect now",
         // SQLSTATE 08xxx (connection_exception): connection does not exist,
         // connection failure, sqlclient unable to establish sqlconnection, etc.
+        // Note that 08P01 (protocol_violation) is excluded below.
         "sqlstate 08",
     ];
+
     let lower = msg.to_ascii_lowercase();
+
+    // Explicit fatal exclusions:
+    // - SQLSTATE 08P01 is protocol_violation (fatal)
+    // - SQLSTATE 57P04 is database_dropped (fatal)
+    if lower.contains("08p01") || lower.contains("57p04") {
+        return false;
+    }
+
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
@@ -309,8 +324,11 @@ mod tests {
         assert!(is_transient_by_display("operation timed out"));
         assert!(is_transient_by_display("server error: terminating connection due to administrator command (SQLSTATE 57P01)"));
         assert!(is_transient_by_display("the database system is shutting down (SQLSTATE 57P01)"));
+        assert!(is_transient_by_display("the database system is shutting down (SQLSTATE 57P02)"));
         assert!(is_transient_by_display("the database system is in recovery mode (SQLSTATE 57P03)"));
+        assert!(is_transient_by_display("the database system is starting up (SQLSTATE 57P03)"));
         assert!(is_transient_by_display("connection exception (SQLSTATE 08006)"));
+        assert!(!is_transient_by_display("protocol violation (SQLSTATE 08P01)"));
         assert!(!is_transient_by_display("syntax error at or near"));
         assert!(!is_transient_by_display(
             "permission denied for table users"
@@ -378,10 +396,18 @@ mod tests {
         let task_err = pgwire_replication::PgWireError::Task("worker task dropped".to_string());
         assert!(is_transient_pgwire(&task_err));
 
+        let tls_timeout = pgwire_replication::PgWireError::Tls("handshake timed out".to_string());
+        assert!(is_transient_pgwire(&tls_timeout));
+
         let server_shutdown = pgwire_replication::PgWireError::Server(
             "terminating connection due to administrator command (SQLSTATE 57P01)".to_string(),
         );
         assert!(is_transient_pgwire(&server_shutdown));
+
+        let server_proto_violation = pgwire_replication::PgWireError::Server(
+            "protocol violation (SQLSTATE 08P01)".to_string(),
+        );
+        assert!(!is_transient_pgwire(&server_proto_violation));
 
         let server_dropped = pgwire_replication::PgWireError::Server(
             "database \"test\" has been dropped (SQLSTATE 57P04)".to_string(),
@@ -391,8 +417,12 @@ mod tests {
         let auth_err = pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
         assert!(!is_transient_pgwire(&auth_err));
 
-        let proto_err = pgwire_replication::PgWireError::Protocol("malformed pgoutput tuple".to_string());
+        // Protocol & internal errors must never be transient, even if their message contains EOF markers
+        let proto_err = pgwire_replication::PgWireError::Protocol("unexpected end of file while decoding a tuple".to_string());
         assert!(!is_transient_pgwire(&proto_err));
+
+        let internal_err = pgwire_replication::PgWireError::Internal("unexpected eof in parser".to_string());
+        assert!(!is_transient_pgwire(&internal_err));
     }
 
     #[tokio::test]
