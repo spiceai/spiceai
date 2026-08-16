@@ -6871,7 +6871,7 @@ mod tests {
                 "so it left nothing registered under the name"
             );
             df.ctx
-                .register_table(name.clone(), table("dataset"))
+                .register_table(name, table("dataset"))
                 .expect("and nothing reserved: the name is free for the next claim");
         }
 
@@ -6905,7 +6905,7 @@ mod tests {
             assert!(df.table_exists(&name), "the reservation is kept");
             let error = df
                 .ctx
-                .register_table(name.clone(), table("dataset"))
+                .register_table(name, table("dataset"))
                 .expect_err("and the name is not exposed to anything else");
             assert!(error.to_string().contains("reserved"), "{error}");
         }
@@ -6943,7 +6943,7 @@ mod tests {
                 "and the writer marker went with it"
             );
             df.ctx
-                .register_table(first.clone(), table("dataset"))
+                .register_table(first, table("dataset"))
                 .expect("so something else may take it");
 
             assert!(
@@ -6952,7 +6952,7 @@ mod tests {
             );
             let error = df
                 .ctx
-                .register_table(second.clone(), table("dataset"))
+                .register_table(second, table("dataset"))
                 .expect_err("still reserved");
             assert!(error.to_string().contains("reserved"), "{error}");
         }
