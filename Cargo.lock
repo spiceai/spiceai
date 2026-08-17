@@ -3779,6 +3779,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "rand 0.10.1",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+]
+
+[[package]]
 name = "chbench-driver"
 version = "2.2.0-unstable"
 dependencies = [
@@ -7788,6 +7805,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "cache",
+ "chunking",
+ "hf-hub",
+ "runtime-rate-control",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11553,10 +11585,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "cache",
+ "chat-api",
  "chunking",
  "cudarc 0.19.8",
  "dotenv 2.2.0-unstable",
  "either",
+ "embed-api",
  "futures",
  "google-genai",
  "governor",
@@ -11573,6 +11607,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
+ "rerank-api",
  "rstest 0.26.1",
  "runtime-rate-control",
  "schemars 1.2.1",
@@ -16636,6 +16671,14 @@ dependencies = [
  "tokio",
  "tracing",
  "wasmtimer",
+]
+
+[[package]]
+name = "rerank-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "snafu",
 ]
 
 [[package]]
