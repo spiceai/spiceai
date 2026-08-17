@@ -399,7 +399,8 @@ impl VectorScanTableProvider {
                     .iter()
                     .filter(|f| {
                         let refs = f.column_refs();
-                        refs.iter().any(|col| !entry.primary_key.contains(&col.name))
+                        refs.iter()
+                            .any(|col| !entry.primary_key.contains(&col.name))
                             && refs.iter().all(|col| {
                                 available_columns.contains(col.name.as_str())
                                     || this_index_columns.contains(col.name.as_str())
@@ -1285,8 +1286,8 @@ mod tests {
     /// `body` join is built first — embedding a filter on `a_number` there references a
     /// column absent from that join's schema and fails to plan.
     #[tokio::test]
-    pub async fn test_vector_scan_multiple_indexes_filter_crosses_index_boundary() -> Result<(), String>
-    {
+    pub async fn test_vector_scan_multiple_indexes_filter_crosses_index_boundary()
+    -> Result<(), String> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("pk", DataType::Int64, false),
             Field::new("body", DataType::Utf8, false),
@@ -1325,9 +1326,9 @@ mod tests {
                             DataType::new_fixed_size_list(DataType::Float32, 10, false),
                             false,
                         ),
-                        Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from(
-                            [("filterable".to_string(), "true".to_string())],
-                        )),
+                        Field::new("a_number", DataType::Int64, false).with_metadata(
+                            HashMap::from([("filterable".to_string(), "true".to_string())]),
+                        ),
                     ]),
                 )) as Arc<dyn VectorIndex>,
             ],
