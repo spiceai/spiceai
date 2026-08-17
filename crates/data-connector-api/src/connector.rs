@@ -89,13 +89,13 @@ pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
 ///
 /// # Example (simple form)
 ///
-/// ```
+/// ```text
 /// register_data_connector!("file", FileFactory);
 /// ```
 ///
 /// # Example (explicit form)
 ///
-/// ```
+/// ```text
 /// register_data_connector!(
 ///     register_file_connector,
 ///     FILE_CONNECTOR_REGISTRATION,
