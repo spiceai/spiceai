@@ -1904,7 +1904,7 @@ impl CayenneAccelerator {
                 )
                 .unwrap_or(i64::MAX);
                 tracing::info!(
-                    "Dataset '{table_name}': warm-tier data will move to the datalake once it reaches {} bytes (default). Set 'cayenne_datalake_warm_max_bytes' to override.",
+                    "Dataset '{table_name}': data will move to the datalake once local data reaches {} bytes (default). Set 'cayenne_datalake_warm_max_bytes' to override.",
                     config.cold_tier_warm_max_bytes
                 );
             }
@@ -1922,7 +1922,7 @@ impl CayenneAccelerator {
             {
                 config.deletion_mode = cayenne::metadata::DeletionMode::Key;
                 tracing::warn!(
-                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (the datalake tier requires key-based deletes)."
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (Cayenne Datalake requires key-based deletes)."
                 );
             }
 
@@ -2620,7 +2620,7 @@ impl CayenneAccelerator {
             if !matches!(refresh_mode, RefreshMode::Changes | RefreshMode::Append) {
                 return Err(Error::AccelerationCreationFailed {
                     source: Box::new(std::io::Error::other(format!(
-                        "Failed to register dataset {table_name} (cayenne): the datalake tier supports refresh_mode 'changes' or 'append'; found '{refresh_mode:?}'. \
+                        "Failed to register dataset {table_name} (cayenne): Cayenne Datalake supports refresh_mode 'changes' or 'append'; found '{refresh_mode:?}'. \
                         Set 'refresh_mode: changes' or 'refresh_mode: append', or remove 'cayenne_datalake_location'."
                     ))),
                 });
@@ -2755,7 +2755,7 @@ fn validate_datalake_table_options(
     let mut warnings = Vec::new();
     // First, so it heads the datalake warnings emitted at registration.
     warnings.push(format!(
-        "Dataset '{table_name}': the Cayenne datalake tier is in preview; verify query correctness and performance before using it for production workloads."
+        "Dataset '{table_name}': Cayenne Datalake is in preview; verify query correctness and performance before using it for production workloads."
     ));
     if options.primary_key.is_empty() {
         // Promotion classifies and rewrites cold files by primary key, and
@@ -2763,7 +2763,7 @@ fn validate_datalake_table_options(
         // early-returns for PK-less tables — the tier is configured but
         // inactive. Warn loudly instead of failing registration.
         warnings.push(format!(
-            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so the datalake tier stays INACTIVE (data never moves to the datalake and stays in the warm tier). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
+            "Dataset '{table_name}': 'cayenne_datalake_location' is set but the dataset has no primary key, so Cayenne Datalake stays INACTIVE (data never moves to the datalake and stays on local disk). Add 'primary_key' to the acceleration to activate it, or remove 'cayenne_datalake_location'."
         ));
     }
     // Position deletes are file-path scoped and cannot survive the warm→cold
@@ -2771,7 +2771,7 @@ fn validate_datalake_table_options(
     // explicit conflict is an error, not a silent override.
     if vc.deletion_mode == cayenne::metadata::DeletionMode::Position {
         return Err(format!(
-            "Failed to register dataset {table_name} (cayenne): the datalake tier requires key-based deletes, but 'cayenne_deletion_mode: position' is set. \
+            "Failed to register dataset {table_name} (cayenne): Cayenne Datalake requires key-based deletes, but 'cayenne_deletion_mode: position' is set. \
             Set 'cayenne_deletion_mode: key' (or remove it), or remove 'cayenne_datalake_location'."
         ));
     }
@@ -2783,7 +2783,7 @@ fn validate_datalake_table_options(
     // data never moves to the datalake and superseded objects are never reclaimed.
     if vc.cold_tier_background_interval_ms == 0 {
         return Err(format!(
-            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_tiering_check_interval_ms' is 0, which disables the datalake tiering loop — warm-tier data would never move to the datalake and superseded objects would never be reclaimed. \
+            "Failed to register dataset {table_name} (cayenne): 'cayenne_datalake_tiering_check_interval_ms' is 0, which disables the background check — data would never move to the datalake and superseded objects would never be reclaimed. \
             Set a positive interval (default {}), or remove 'cayenne_datalake_location'.",
             defaults.cold_tier_background_interval_ms
         ));
@@ -2886,8 +2886,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    64,
-    { S3_PARAMS_LEN + 64 },
+    65,
+    { S3_PARAMS_LEN + 65 },
 >(
     S3_PARAMETERS,
     [
@@ -2919,9 +2919,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_location")
-            .description("Object-store URL prefix for the datalake tier, e.g. 's3://bucket/prefix' — the storage-cascade bottom tier. When set, a background tiering loop moves warm local-disk data to read-optimized, Z-order-clustered Vortex files on this store, and queries span warm + datalake with per-tier pushdown. Unset (default) disables the tier. Requires key-based deletes and a primary key (auto-resolved). Partitioned and position-delete tables are not supported."),
+            .description("Object-store URL prefix for the Cayenne Datalake, e.g. 's3://bucket/prefix'. When set, older data moves off local disk into read-optimized, Z-order-clustered Vortex files on this store and stays fully queryable alongside local data, with filter and projection pushdown. Unset (default) keeps all data on local disk. Requires a primary key and key-based deletes (auto-resolved); partitioned and position-delete tables are not supported."),
         ParameterSpec::component("datalake_clustering_columns")
-            .description("Comma-separated liquid-clustering key columns for datalake files (multi-column Z-order), e.g. 'tenant_id,ts'. When unset, falls back to cayenne_sort_columns, then the primary key. Clustering tightens each cold file's per-column zone maps so selective queries on any clustering dimension prune at the storage layer."),
+            .description("Comma-separated columns to Z-order cluster datalake files by, e.g. 'tenant_id,ts'. Tightens each file's per-column zone maps so selective queries on any clustering column prune at the storage layer. When unset, falls back to cayenne_sort_columns, then the primary key."),
         ParameterSpec::component("datalake_s3_auth")
             .description("Authentication method for the datalake S3 store. 'iam_role' (default) uses environment/SDK credentials; 'key' uses cayenne_datalake_s3_key/_secret.")
             .one_of(&["iam_role", "key"])
@@ -2950,17 +2950,17 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["true", "false"])
             .default("true"),
         ParameterSpec::component("datalake_target_file_size_mb")
-            .description("Target size for datalake (cold) tier Vortex files in MB. Larger than the warm cayenne_target_file_size_mb because object stores favor fewer, larger objects and cold scans are range reads. Default: 512."),
+            .description("Target size in MB for Vortex files written to the datalake. Larger than the local cayenne_target_file_size_mb because object stores favor fewer, larger objects read as byte ranges. Default: 512."),
         ParameterSpec::component("datalake_warm_max_bytes")
-            .description("Warm-tier data moves to the datalake once the warm tier's total Vortex bytes reach this threshold. Pairs with cayenne_datalake_warm_max_files; 0 disables the byte trigger, but when BOTH triggers are 0/unset this one defaults to 16 x cayenne_datalake_target_file_size_mb."),
+            .description("Data moves to the datalake once local data not yet published reaches this many bytes. 0 disables this trigger; when both it and cayenne_datalake_warm_max_files are 0/unset, it defaults to 16 x cayenne_datalake_target_file_size_mb."),
         ParameterSpec::component("datalake_warm_max_files")
-            .description("Warm-tier data moves to the datalake once the warm tier's Vortex file count reaches this threshold. 0 (default) disables the file-count trigger; when cayenne_datalake_warm_max_bytes is also 0/unset, the byte trigger defaults to 16 x cayenne_datalake_target_file_size_mb."),
+            .description("Data moves to the datalake once local data not yet published reaches this many Vortex files. 0 (default) disables this trigger."),
         ParameterSpec::component("datalake_warm_max_age_ms")
-            .description("Warm-tier data moves to the datalake once it has been resident this long, even when below the byte and file thresholds — the backstop for a low-volume table that never reaches cayenne_datalake_warm_max_bytes and would otherwise stay in the warm tier indefinitely. 0 (default) disables the age trigger. Residency is measured from the first tiering check that observed the data, so it is accurate to within one cayenne_datalake_tiering_check_interval_ms and resets across a restart. An age-triggered move publishes whatever has accumulated, so a small value produces small datalake files."),
+            .description("Data moves to the datalake once it has been on local disk this long, even when below the byte and file thresholds — the backstop for a low-volume table that never reaches them. 0 (default) disables this trigger. A small value publishes small datalake files."),
         ParameterSpec::component("datalake_tiering_check_interval_ms")
-            .description("How often the background loop checks whether warm-tier data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s)."),
+            .description("How often the background worker checks whether data should move to the datalake (a check does not guarantee a move). Normally auto-tuned; override for testing. Default: 60000 (60s)."),
         ParameterSpec::component("datalake_gc_interval_ms")
-            .description("Physical-GC cadence and orphan grace for superseded datalake objects: the background sweep runs about this often and deletes an object no longer referenced by the manifest only once it has been observed orphaned for at least this long (so an in-flight scan has a full interval to finish). Default: 300000 (5min)."),
+            .description("How often superseded datalake objects are swept, and the grace period before one is deleted: an object no longer referenced by the manifest is removed only after it has been seen orphaned for this long, so an in-flight scan has a full interval to finish. Default: 300000 (5min)."),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("sort_columns_origin")
