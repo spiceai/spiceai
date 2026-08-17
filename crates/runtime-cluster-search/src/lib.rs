@@ -25,17 +25,19 @@ limitations under the License.
 //!
 //! - [`rewrite::DistributedSearchRewrite`] — the analyzer rule (scheduler only).
 //! - [`exec::DistributedSearchExec`] — the physical operator that runs the two
-//!   rounds, planned from [`exec::DistributedSearchNode`] by
+//!   rounds, planned from [`node::DistributedSearchNode`] by
 //!   [`exec::DistributedSearchExtensionPlanner`].
 //!
 //! Registration (adding the rule and the extension planner to the session) lives
 //! in the runtime crate, which owns the wiring and the accelerated-table check.
 
 pub mod exec;
+pub mod node;
 pub mod rewrite;
 
 pub use exec::{
     DistributedExecutor, DistributedSearchExec, DistributedSearchExtensionPlanner,
-    DistributedSearchNode, DistributedSearchParams,
+    DistributedSearchParams,
 };
+pub use node::DistributedSearchNode;
 pub use rewrite::{DistributedSearchRewrite, SearchDistributionGate};

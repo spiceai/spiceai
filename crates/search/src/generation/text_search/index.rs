@@ -220,6 +220,13 @@ pub struct FullTextDatabaseIndex {
     /// partition. Propagated to the [`FullTextSearchFieldIndex`] that scores.
     /// `None` scores with the local partition's statistics.
     global_stats: Option<Arc<GlobalBm25Stats>>,
+
+    /// This partition's Tantivy reader generation observed while gathering
+    /// `global_stats`, set alongside it. `full_text_search_field_index` checks
+    /// this against the reader's current generation, so a commit landing
+    /// between statistics gathering and scoring is detected rather than
+    /// silently scored against out-of-date statistics.
+    expected_generation: Option<u64>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -430,6 +437,7 @@ impl FullTextDatabaseIndex {
             defer_commit: Arc::new(AtomicBool::new(false)),
             cdc_attached: Arc::new(AtomicBool::new(false)),
             global_stats: None,
+            expected_generation: None,
         })
     }
 
@@ -465,6 +473,13 @@ impl FullTextDatabaseIndex {
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
+        if let Some(expected) = self.expected_generation {
+            let actual = search_index.generation_id();
+            ensure!(
+                actual == expected,
+                super::IndexGenerationChangedSnafu { expected, actual }
+            );
+        }
         search_index.add_type_hints(&self.underlying_table().schema());
         Ok(search_index.with_global_stats(self.global_stats.clone()))
     }
@@ -476,6 +491,16 @@ impl FullTextDatabaseIndex {
     #[must_use]
     pub fn with_global_stats(mut self, global_stats: Option<Arc<GlobalBm25Stats>>) -> Self {
         self.global_stats = global_stats;
+        self
+    }
+
+    /// Check, in [`Self::full_text_search_field_index`], that the reader's
+    /// generation still matches the one observed while gathering the
+    /// statistics passed to [`Self::with_global_stats`]. `None` skips the
+    /// check (single-node search, or a distributed search that opted out).
+    #[must_use]
+    pub fn with_expected_generation(mut self, expected_generation: Option<u64>) -> Self {
+        self.expected_generation = expected_generation;
         self
     }
 
@@ -690,6 +715,7 @@ impl FullTextDatabaseIndex {
             // same tantivy writer and must agree on whether deferral is allowed.
             cdc_attached: Arc::clone(&self.cdc_attached),
             global_stats: self.global_stats.clone(),
+            expected_generation: self.expected_generation,
         }
     }
 
@@ -859,6 +885,10 @@ impl SearchIndex for FullTextDatabaseIndex {
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         self.update_index(slice::from_ref(&record)).await.boxed()?;
         Ok(record)
+    }
+
+    fn supports_distributed_global_stats(&self) -> bool {
+        true
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {

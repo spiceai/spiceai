@@ -55,8 +55,8 @@ use std::sync::{Arc, Weak};
 
 use crate::table_provider_explorer::TableProviderExplorer;
 use crate::udtf::{
-    TEXT_SEARCH_GLOBAL_STATS_ARG, TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs,
-    parse_limit_scalar, table_ref_from_column_expr,
+    TEXT_SEARCH_EXPECTED_GENERATION_ARG, TEXT_SEARCH_GLOBAL_STATS_ARG, TEXT_SEARCH_UDTF_NAME,
+    TextSearchTableFuncArgs, parse_limit_scalar, table_ref_from_column_expr,
 };
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -82,8 +82,10 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "include_score".to_string(),
         "rank_weight".to_string(),
         // Reserved for runtime use: a distributed search binds the global BM25
-        // collection statistics on each executor's scored query.
+        // collection statistics on each executor's scored query, plus the
+        // partition generation those statistics were gathered at.
         TEXT_SEARCH_GLOBAL_STATS_ARG.to_string(),
+        TEXT_SEARCH_EXPECTED_GENERATION_ARG.to_string(),
     ];
     // SAFETY: These are valid ASCII parameter names
     Signature::user_defined(Volatility::Stable)
@@ -243,6 +245,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             limit: args.limit,
             include_score: args.include_score,
             global_stats: args.global_stats.clone(),
+            expected_generation: args.expected_generation,
         };
 
         let normalized_table = owned.normalize_source_table(table_provider)?;
@@ -411,6 +414,13 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             _ => None,
         };
 
+        // `expected_generation` is likewise a runtime-only named argument, set
+        // alongside `global_stats` by a distributed search.
+        let expected_generation = match named.get(TEXT_SEARCH_EXPECTED_GENERATION_ARG) {
+            Some(Expr::Literal(ScalarValue::UInt64(Some(g)), _)) => Some(*g),
+            _ => None,
+        };
+
         let limit_usize = limit
             .map(|l| {
                 usize::try_from(l).map_err(|_| {
@@ -429,6 +439,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
             limit: limit_usize,
             include_score,
             global_stats,
+            expected_generation,
         })
     }
 }
@@ -511,6 +522,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
                     limit: args.limit,
                     include_score: args.include_score,
                     global_stats: args.global_stats.clone(),
+                    expected_generation: args.expected_generation,
                 };
                 return Ok(Arc::new(
                     SearchQueryProvider::try_from_index(
@@ -619,6 +631,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             })?;
             fts_index = fts_index.with_global_stats(Some(Arc::new(stats)));
         }
+        fts_index = fts_index.with_expected_generation(args.expected_generation);
 
         // Create UDTF source for distributed serialization
         let udtf_source = UdtfSource::TextSearch {
@@ -628,6 +641,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             limit: args.limit,
             include_score: args.include_score,
             global_stats: args.global_stats.clone(),
+            expected_generation: args.expected_generation,
         };
 
         Ok(Arc::new(
@@ -728,6 +742,7 @@ mod tests {
             limit: None,
             include_score: Some(true),
             global_stats: None,
+            expected_generation: None,
         }
     }
 

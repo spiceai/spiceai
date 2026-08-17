@@ -60,6 +60,7 @@ impl CandidateGeneration for UdtfTextSearchCandidate {
             limit: None,
             include_score: Some(true),
             global_stats: None,
+            expected_generation: None,
         }
         .to_expr();
 

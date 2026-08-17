@@ -50,9 +50,15 @@ use datafusion::{
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     functions_aggregate::expr_fn::sum,
-    logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, TableScan, col},
+    logical_expr::{
+        Expr, Extension, LogicalPlan, LogicalPlanBuilder, TableScan, col,
+        utils::{conjunction, split_conjunction_owned},
+    },
     optimizer::AnalyzerRule,
-    sql::TableReference,
+    sql::{
+        TableReference,
+        unparser::{Unparser, dialect::PostgreSqlDialect},
+    },
 };
 
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
@@ -66,7 +72,8 @@ use search::generation::text_search::bm25_stats::{
 };
 use search::provider::{SearchQueryProvider, UdtfSource};
 
-use crate::exec::{DistributedExecutor, DistributedSearchNode, DistributedSearchParams};
+use crate::exec::{DistributedExecutor, DistributedSearchParams};
+use crate::node::DistributedSearchNode;
 
 /// Decides whether a searched table should be distributed across executors.
 ///
@@ -103,7 +110,20 @@ impl DistributedSearchRewrite {
     /// The distributed rewrite of one `text_search` table scan, or `None` when
     /// the scan is not a distributable search (not a `SearchQueryProvider`, not
     /// a text search, or not over an accelerated table).
-    fn rewrite_scan(&self, scan: &TableScan) -> Result<Option<LogicalPlan>> {
+    ///
+    /// `filter_predicate` is the predicate of a `Filter` node directly wrapping
+    /// `scan`, if any. Conjuncts that reference only the search result schema are
+    /// pushed into each executor's scored query as a `WHERE` clause (applied by
+    /// the executor's own `SearchQueryProvider::scan`, before its internal
+    /// top-N cutoff — the same "filter before limit" guarantee the
+    /// non-distributed path already enforces); any remaining conjuncts are
+    /// returned in [`RewrittenScan::remaining_filter`] for the caller to
+    /// re-apply above the rewritten plan.
+    fn rewrite_scan(
+        &self,
+        scan: &TableScan,
+        filter_predicate: Option<&Expr>,
+    ) -> Result<Option<RewrittenScan>> {
         let Some(default_source) = scan.source.downcast_ref::<DefaultTableSource>() else {
             return Ok(None);
         };
@@ -132,17 +152,27 @@ impl DistributedSearchRewrite {
             return Ok(None);
         }
 
+        // Only a local Tantivy-backed index can score against externally
+        // supplied collection statistics — a `text_search` over a compound or
+        // Elasticsearch-backed index accepts `global_stats` but ignores it, so
+        // distributing would silently merge incomparable local scores. Run
+        // those backends through the existing (non-distributed-exact) scan.
+        if !search_provider.supports_distributed_global_stats {
+            return Ok(None);
+        }
+
         let base_ref = TableReference::parse_str(&table);
         let executors = self.registry.resolve_search_executors(&base_ref);
         if executors.is_empty() {
             // No live executor covers the table's partitions; produce no rows
             // rather than silently scoring against an empty scheduler index.
-            return Ok(Some(LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
+            return Ok(Some(RewrittenScan {
+                plan: LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
                     produce_one_row: false,
                     schema: Arc::clone(&scan.projected_schema),
-                },
-            )));
+                }),
+                remaining_filter: filter_predicate.cloned(),
+            }));
         }
 
         let from_table_sql = base_ref.to_quoted_string();
@@ -151,6 +181,18 @@ impl DistributedSearchRewrite {
         // always including `_score` so the merge can rank by it even when the
         // caller projected it away (the outer projection drops it again).
         let merge_schema = merge_schema_with_score(&search_provider.schema());
+
+        // Split the surrounding filter (if any) into conjuncts that reference
+        // only the search result schema — pushed into each executor's scored
+        // query as a `WHERE` clause — and everything else, left for the caller
+        // to re-apply above the rewritten plan. The statistics query is never
+        // filtered: BM25 collection statistics are whole-partition, exactly
+        // like the non-distributed Tantivy path, whose statistics are unaffected
+        // by any `WHERE` predicate.
+        let (filter_sql, remaining_filter) = match filter_predicate {
+            Some(predicate) => split_pushable_filter(predicate, &merge_schema),
+            None => (None, None),
+        };
 
         let stats_plan = Self::build_stats_plan(
             &base_ref,
@@ -167,6 +209,7 @@ impl DistributedSearchRewrite {
             primary_key: search_provider.primary_key.clone(),
             fetch: limit,
             skip: 0,
+            filter_sql,
         };
 
         let node = DistributedSearchNode::new(
@@ -181,7 +224,7 @@ impl DistributedSearchRewrite {
 
         // Project back to the scan's advertised schema (drops `_score` when the
         // caller passed `include_score => false`). Identity when the schemas match.
-        let projected = LogicalPlanBuilder::new(LogicalPlan::Extension(Extension {
+        let plan = LogicalPlanBuilder::new(LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         }))
         .project(
@@ -192,7 +235,10 @@ impl DistributedSearchRewrite {
         )?
         .build()?;
 
-        Ok(Some(projected))
+        Ok(Some(RewrittenScan {
+            plan,
+            remaining_filter,
+        }))
     }
 
     /// Build the global-statistics aggregation: a `SUM ... GROUP BY term` over a
@@ -243,13 +289,34 @@ impl DistributedSearchRewrite {
 impl AnalyzerRule for DistributedSearchRewrite {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_down(|plan| {
+            // A `Filter` directly wrapping the target scan carries predicates
+            // that would otherwise be applied only after the distributed merge
+            // (after each executor's local top-N cutoff), silently dropping rows
+            // that belong in the filtered top-N. Match this shape so pushable
+            // conjuncts reach each executor's query before its cutoff.
+            if let LogicalPlan::Filter(filter) = &plan
+                && let LogicalPlan::TableScan(scan) = filter.input.as_ref()
+            {
+                return match self.rewrite_scan(scan, Some(&filter.predicate))? {
+                    Some(rewritten) => Ok(Transformed::new(
+                        rewrap_remaining_filter(rewritten)?,
+                        true,
+                        TreeNodeRecursion::Jump,
+                    )),
+                    None => Ok(Transformed::no(plan)),
+                };
+            }
             let LogicalPlan::TableScan(scan) = &plan else {
                 return Ok(Transformed::no(plan));
             };
-            match self.rewrite_scan(scan)? {
+            match self.rewrite_scan(scan, None)? {
                 // Jump so the injected Flight SQL / aggregate subtree is not
                 // re-examined by this rule (federation handles it afterward).
-                Some(rewritten) => Ok(Transformed::new(rewritten, true, TreeNodeRecursion::Jump)),
+                Some(rewritten) => Ok(Transformed::new(
+                    rewrap_remaining_filter(rewritten)?,
+                    true,
+                    TreeNodeRecursion::Jump,
+                )),
                 None => Ok(Transformed::no(plan)),
             }
         })
@@ -259,6 +326,57 @@ impl AnalyzerRule for DistributedSearchRewrite {
     fn name(&self) -> &'static str {
         "DistributedSearchRewrite"
     }
+}
+
+/// The result of rewriting one distributable `text_search` scan: the replacement
+/// plan, plus any filter conjuncts that could not be pushed into the executors'
+/// queries and must still be applied above it.
+struct RewrittenScan {
+    plan: LogicalPlan,
+    remaining_filter: Option<Expr>,
+}
+
+/// Re-wrap `rewritten.plan` in a `Filter` over its unpushed conjuncts, if any.
+fn rewrap_remaining_filter(rewritten: RewrittenScan) -> Result<LogicalPlan> {
+    match rewritten.remaining_filter {
+        Some(predicate) => LogicalPlanBuilder::new(rewritten.plan)
+            .filter(predicate)?
+            .build(),
+        None => Ok(rewritten.plan),
+    }
+}
+
+/// Split `predicate` into the conjuncts that reference only `schema`'s columns
+/// (and can be unparsed to SQL) — safe to push into an executor's scored query —
+/// and everything else, re-combined into a single remaining predicate.
+fn split_pushable_filter(predicate: &Expr, schema: &SchemaRef) -> (Option<String>, Option<Expr>) {
+    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let mut pushed_sql: Vec<String> = Vec::new();
+    let mut remaining: Vec<Expr> = Vec::new();
+
+    for conjunct in split_conjunction_owned(predicate.clone()) {
+        let references_known_columns = conjunct
+            .column_refs()
+            .iter()
+            .all(|c| schema.column_with_name(c.name()).is_some());
+
+        if references_known_columns {
+            match unparser.expr_to_sql(&conjunct) {
+                Ok(ast) => {
+                    pushed_sql.push(ast.to_string());
+                    continue;
+                }
+                Err(_) => {
+                    // Cannot render this conjunct as SQL; leave it for the
+                    // caller to apply above the merge instead of dropping it.
+                }
+            }
+        }
+        remaining.push(conjunct);
+    }
+
+    let filter_sql = (!pushed_sql.is_empty()).then(|| pushed_sql.join(" AND "));
+    (filter_sql, conjunction(remaining))
 }
 
 /// One executor's statistics leg: a Flight SQL scan whose FROM source is a

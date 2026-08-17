@@ -85,6 +85,20 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
     fn as_vector_index(self: Arc<Self>) -> Option<Arc<dyn VectorIndex>> {
         None
     }
+
+    /// Whether this index can score a `text_search` query against externally
+    /// supplied collection statistics (the `global_stats` UDTF argument used by
+    /// distributed full-text search to make BM25 scores comparable across a
+    /// multi-node accelerated table's partitions).
+    ///
+    /// Only a local Tantivy-backed full-text index currently implements this.
+    /// Other full-text backends (Elasticsearch, a DuckDB-backed compound index)
+    /// accept the `global_stats` argument but score locally regardless of it, so
+    /// a caller must not distribute a search over them expecting comparable
+    /// scores.
+    fn supports_distributed_global_stats(&self) -> bool {
+        false
+    }
 }
 
 /// Extracts the derived column names from a vector index implementation.

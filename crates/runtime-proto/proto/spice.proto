@@ -391,6 +391,10 @@ message TextSearchArgs {
     // Encoded global BM25 collection statistics (GlobalBm25Stats, JSON) a
     // distributed search scores against. Absent scores with local statistics.
     optional string global_stats = 6;
+    // The partition's Tantivy reader generation observed while gathering
+    // global_stats. When present, text_search errors instead of scoring if the
+    // reader's current generation no longer matches.
+    optional uint64 expected_generation = 7;
 }
 
 // Arguments for vector_search(tbl, query, [col], [limit], [include_score], [distance_metric]).

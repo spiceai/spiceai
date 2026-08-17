@@ -51,6 +51,13 @@ pub const STATS_DOC_FREQ_COLUMN: &str = "doc_freq";
 pub const STATS_TOTAL_NUM_DOCS_COLUMN: &str = "total_num_docs";
 /// Column of the `text_search_stats` output: the partition's total token count.
 pub const STATS_TOTAL_NUM_TOKENS_COLUMN: &str = "total_num_tokens";
+/// Column of the `text_search_stats` output: the partition's Tantivy reader
+/// generation at the moment these statistics were read. Unlike the other
+/// columns, this is per-partition and meaningless to sum across executors — a
+/// distributed search reads it directly, per executor (bypassing the `SUM
+/// ... GROUP BY term` aggregate), to detect an index change between gathering
+/// statistics and scoring against them.
+pub const STATS_GENERATION_COLUMN: &str = "generation";
 
 /// Collection statistics for BM25 scoring over a single search field.
 ///
@@ -124,30 +131,46 @@ impl GlobalBm25Stats {
             ArrowField::new(STATS_DOC_FREQ_COLUMN, DataType::UInt64, false),
             ArrowField::new(STATS_TOTAL_NUM_DOCS_COLUMN, DataType::UInt64, false),
             ArrowField::new(STATS_TOTAL_NUM_TOKENS_COLUMN, DataType::UInt64, false),
+            ArrowField::new(STATS_GENERATION_COLUMN, DataType::UInt64, false),
         ]))
     }
 
     /// Encode these local statistics as one row per term for the
-    /// `text_search_stats` UDTF. The document and token counts repeat on every
-    /// row so a downstream `SUM ... GROUP BY term` sums each of `N`, the token
-    /// count, and per-term `df` across partitions into the global statistics.
+    /// `text_search_stats` UDTF, plus `generation` (this partition's Tantivy
+    /// reader generation at read time). The document, token, and generation
+    /// values repeat on every row so a downstream `SUM ... GROUP BY term` sums
+    /// each of `N`, the token count, and per-term `df` across partitions into
+    /// the global statistics; `generation` is not part of that sum (a
+    /// distributed search reads it directly, per executor, instead).
+    ///
+    /// Always emits at least one row, even when `doc_freq` is empty (e.g. a
+    /// query that parses to no terms on this field), carrying an empty-string
+    /// term with `doc_freq = 0` — Tantivy's tokenizers never emit an empty
+    /// token, so this cannot collide with a real term — so the document/token
+    /// counts and generation still reach the scheduler rather than collapsing
+    /// to an empty batch.
     ///
     /// # Errors
     ///
     /// Returns an error when the Arrow arrays cannot be assembled.
-    pub fn to_record_batch(&self) -> Result<RecordBatch, ArrowError> {
-        let terms: Vec<&str> = self.doc_freq.keys().map(String::as_str).collect();
-        let dfs: Vec<u64> = self.doc_freq.values().copied().collect();
+    pub fn to_record_batch(&self, generation: u64) -> Result<RecordBatch, ArrowError> {
+        let mut terms: Vec<&str> = self.doc_freq.keys().map(String::as_str).collect();
+        let mut dfs: Vec<u64> = self.doc_freq.values().copied().collect();
+        if terms.is_empty() {
+            terms.push("");
+            dfs.push(0);
+        }
         let n = terms.len();
 
         let term_col: ArrayRef = Arc::new(StringArray::from(terms));
         let df_col: ArrayRef = Arc::new(UInt64Array::from(dfs));
         let docs_col: ArrayRef = Arc::new(UInt64Array::from(vec![self.total_num_docs; n]));
         let tokens_col: ArrayRef = Arc::new(UInt64Array::from(vec![self.total_num_tokens; n]));
+        let generation_col: ArrayRef = Arc::new(UInt64Array::from(vec![generation; n]));
 
         RecordBatch::try_new(
             Self::stats_schema(),
-            vec![term_col, df_col, docs_col, tokens_col],
+            vec![term_col, df_col, docs_col, tokens_col, generation_col],
         )
     }
 
@@ -290,5 +313,36 @@ mod tests {
         let encoded = stats.encode().expect("encode");
         let decoded = GlobalBm25Stats::decode(&encoded).expect("decode");
         assert_eq!(stats, decoded);
+    }
+
+    #[test]
+    fn to_record_batch_carries_generation_per_row() {
+        let stats = GlobalBm25Stats {
+            total_num_docs: 10,
+            total_num_tokens: 100,
+            doc_freq: BTreeMap::from([("run".to_string(), 3)]),
+        };
+        let batch = stats.to_record_batch(7).expect("to_record_batch");
+        assert_eq!(batch.num_rows(), 1);
+        let generation = downcast_u64(&batch, STATS_GENERATION_COLUMN).expect("generation column");
+        assert_eq!(generation.value(0), 7);
+    }
+
+    #[test]
+    fn to_record_batch_emits_one_row_when_no_terms() {
+        let stats = GlobalBm25Stats {
+            total_num_docs: 10,
+            total_num_tokens: 100,
+            doc_freq: BTreeMap::new(),
+        };
+        let batch = stats.to_record_batch(3).expect("to_record_batch");
+        // A zero-term query must not collapse to an empty batch: the
+        // document/token counts and generation still need to reach the
+        // scheduler.
+        assert_eq!(batch.num_rows(), 1);
+        let docs = downcast_u64(&batch, STATS_TOTAL_NUM_DOCS_COLUMN).expect("docs column");
+        assert_eq!(docs.value(0), 10);
+        let generation = downcast_u64(&batch, STATS_GENERATION_COLUMN).expect("generation column");
+        assert_eq!(generation.value(0), 3);
     }
 }

@@ -178,6 +178,12 @@ pub enum Error {
         persisted: String,
         configured: String,
     },
+
+    #[snafu(display(
+        "This partition's full text index changed while a distributed search was gathering \
+        collection statistics (generation {expected} then, {actual} now). Retry the search."
+    ))]
+    IndexGenerationChanged { expected: u64, actual: u64 },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -380,6 +386,17 @@ impl FullTextSearchFieldIndex {
     pub fn with_global_stats(mut self, global_stats: Option<Arc<GlobalBm25Stats>>) -> Self {
         self.global_stats = global_stats;
         self
+    }
+
+    /// This partition's Tantivy reader generation at the moment this index was
+    /// opened (each call that opens a fresh searcher — e.g. one `text_search` or
+    /// `text_search_stats` UDTF invocation — observes the reader's current
+    /// generation; a `reload()` between two calls bumps it). A distributed
+    /// search compares this against the generation observed while gathering
+    /// statistics, to detect a commit landing between the two rounds.
+    #[must_use]
+    pub fn generation_id(&self) -> u64 {
+        self.reader.generation().generation_id()
     }
 
     /// Parse `query` with this index's analyzer and gather the local BM25

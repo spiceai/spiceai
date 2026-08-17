@@ -59,6 +59,10 @@ pub enum UdtfSource {
         /// partition's statistics.
         #[serde(default)]
         global_stats: Option<String>,
+        /// The partition's Tantivy reader generation observed while gathering
+        /// `global_stats`, set alongside it. `None` when `global_stats` is.
+        #[serde(default)]
+        expected_generation: Option<u64>,
     },
     /// Created by `vector_search(tbl, query, [col], [limit], [include_score], [distance_metric => "cosine" | "l2"])`
     VectorSearch {
@@ -97,6 +101,10 @@ pub struct SearchQueryProvider {
     /// This is set when the provider is created via a UDTF like `text_search()` or `vector_search()`.
     /// It enables `SpiceLogicalCodec` to serialize and reconstruct this provider on remote executors.
     pub udtf_source: Option<UdtfSource>,
+    /// Mirrors [`SearchIndex::supports_distributed_global_stats`] for the index
+    /// this provider was built from. `false` unless constructed via
+    /// [`SearchQueryProvider::try_from_index`] with a capable index.
+    pub supports_distributed_global_stats: bool,
 }
 
 impl std::fmt::Debug for SearchQueryProvider {
@@ -130,6 +138,7 @@ impl SearchQueryProvider {
             scan_callback: None,
             constraints: None,
             udtf_source: None,
+            supports_distributed_global_stats: false,
         };
 
         // Create `constraints` based on [`Self::schema`]
@@ -200,7 +209,7 @@ impl SearchQueryProvider {
         limit: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let search_index_query = search_index.query_table_provider(query)?;
-        Ok(Self::new(
+        let mut provider = Self::new(
             search_index_query,
             table_provider,
             search_index.search_column(),
@@ -210,7 +219,10 @@ impl SearchQueryProvider {
                 .map(|f| f.name().clone())
                 .collect(),
             limit,
-        ))
+        );
+        provider.supports_distributed_global_stats =
+            search_index.supports_distributed_global_stats();
+        Ok(provider)
     }
 
     /// Build the underlying table scan, removing search index metadata columns from projection

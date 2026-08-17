@@ -184,7 +184,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchStatsTa
             .local_bm25_stats(&args.query)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let batch = stats
-            .to_record_batch()
+            .to_record_batch(field_index.generation_id())
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
         let schema: SchemaRef = batch.schema();

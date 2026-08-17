@@ -349,6 +349,13 @@ pub static TEXT_SEARCH_UDTF_NAME: &str = "text_search";
 /// scheduler sets it on each executor's scored query; users do not pass it.
 pub static TEXT_SEARCH_GLOBAL_STATS_ARG: &str = "global_stats";
 
+/// Named argument that carries the partition's Tantivy reader generation
+/// observed while gathering the `global_stats` this query scores against.
+/// Reserved for runtime use, like `global_stats`. When present, `text_search`
+/// compares it against the reader's current generation and errors on a
+/// mismatch instead of scoring against out-of-date statistics.
+pub static TEXT_SEARCH_EXPECTED_GENERATION_ARG: &str = "expected_generation";
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct TextSearchTableFuncArgs {
     pub tbl: TableReference,
@@ -360,6 +367,10 @@ pub struct TextSearchTableFuncArgs {
     /// score against, set on an executor by a distributed search. `None` scores
     /// with the local partition's statistics.
     pub global_stats: Option<String>,
+    /// This partition's Tantivy reader generation observed while gathering
+    /// `global_stats`, set alongside it by a distributed search. `None` when
+    /// `global_stats` is also `None`, or the scheduler chose not to check.
+    pub expected_generation: Option<u64>,
 }
 
 impl TextSearchTableFuncArgs {
@@ -399,6 +410,19 @@ impl TextSearchTableFuncArgs {
             )]));
             expr.push(Expr::Literal(
                 ScalarValue::Utf8(Some(global_stats.clone())),
+                Some(meta),
+            ));
+        }
+
+        // `expected_generation` is likewise a named argument, set alongside
+        // `global_stats` by a distributed search.
+        if let Some(expected_generation) = self.expected_generation {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                TEXT_SEARCH_EXPECTED_GENERATION_ARG.to_string(),
+            )]));
+            expr.push(Expr::Literal(
+                ScalarValue::UInt64(Some(expected_generation)),
                 Some(meta),
             ));
         }

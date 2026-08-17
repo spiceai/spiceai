@@ -26,17 +26,10 @@ limitations under the License.
 //! returned by the executors are merged, sorted by score (then primary key for
 //! a stable order), and trimmed to the requested `skip`/`fetch` window.
 
-use std::{
-    any::Any,
-    cmp::Ordering,
-    fmt,
-    fmt::Write as _,
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::{any::Any, collections::HashMap, fmt, fmt::Write as _, sync::Arc};
 
 use arrow::{
-    array::{ArrayRef, RecordBatch},
+    array::{ArrayRef, RecordBatch, UInt64Array},
     compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take},
     datatypes::{Schema, SchemaRef},
     error::ArrowError,
@@ -45,11 +38,11 @@ use async_trait::async_trait;
 use data_components::flightsql::{FlightSqlClient, query_to_stream};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::{
-    common::{DFSchemaRef, Statistics},
+    common::Statistics,
     config::ConfigOptions,
     error::{DataFusionError, Result},
     execution::{SendableRecordBatchStream, SessionState, TaskContext},
-    logical_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore},
+    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
         PlanProperties,
@@ -64,11 +57,15 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
-    prelude::Expr,
 };
 use flight_client::cookie::CookieStore;
 use futures::{TryStreamExt, future::try_join_all, stream};
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::text_search::GlobalBm25Stats};
+use search::{
+    SEARCH_SCORE_COLUMN_NAME,
+    generation::text_search::{GlobalBm25Stats, bm25_stats::STATS_GENERATION_COLUMN},
+};
+
+use crate::node::DistributedSearchNode;
 
 /// A ready executor to send a scored search query to.
 #[derive(Clone)]
@@ -99,6 +96,12 @@ pub struct DistributedSearchParams {
     pub fetch: Option<usize>,
     /// Offset applied on the scheduler after the merge.
     pub skip: usize,
+    /// Pushable filter conjuncts (already rendered as SQL, joined by `AND`),
+    /// applied as a `WHERE` clause on each executor's scored query so they run
+    /// before that executor's local top-N cutoff. `None` when the original
+    /// scan had no filter, or none of it could be pushed. Never applied to the
+    /// statistics query — BM25 collection statistics stay whole-partition.
+    pub filter_sql: Option<String>,
 }
 
 /// Escape a string for use as a single-quoted SQL string literal, doubling any
@@ -108,23 +111,35 @@ fn sql_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Escape `name` for use as a double-quoted SQL identifier, doubling any
+/// embedded double quotes, and wrap it in the surrounding quotes.
+#[must_use]
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Build the scored `text_search` query sent to a single executor.
 ///
 /// Renders `SELECT <cols> FROM text_search(<from>, '<query>'[, "<column>"][,
-/// <effective_fetch>], global_stats => '<encoded>')`, where `<cols>` are the
-/// double-quoted fields of `schema` in order and `effective_fetch` is
-/// `fetch + skip` (each executor must return enough rows for the scheduler to
-/// apply the global offset after the merge).
+/// <effective_fetch>], global_stats => '<encoded>'[, expected_generation =>
+/// <g>])[ WHERE <filter_sql>]`, where `<cols>` are the double-quoted fields of
+/// `schema` in order and `effective_fetch` is `fetch + skip` (each executor
+/// must return enough rows for the scheduler to apply the global offset after
+/// the merge). `expected_generation`, when known for this executor, is this
+/// partition's Tantivy reader generation observed while gathering
+/// `encoded_stats` — the executor errors instead of scoring if its reader has
+/// since moved on, rather than silently scoring against out-of-date statistics.
 #[must_use]
 fn build_scored_sql(
     params: &DistributedSearchParams,
     schema: &Schema,
     encoded_stats: &str,
+    expected_generation: Option<u64>,
 ) -> String {
     let cols = schema
         .fields()
         .iter()
-        .map(|f| format!("\"{}\"", f.name()))
+        .map(|f| quote_identifier(f.name()))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -137,16 +152,74 @@ fn build_scored_sql(
     );
 
     if let Some(column) = &params.column {
-        let _ = write!(sql, ", \"{column}\"");
+        let _ = write!(sql, ", {}", quote_identifier(column));
     }
 
     if let Some(fetch) = effective_fetch {
         let _ = write!(sql, ", {fetch}");
     }
 
-    let _ = write!(sql, ", global_stats => {})", sql_quote(encoded_stats));
+    let _ = write!(sql, ", global_stats => {}", sql_quote(encoded_stats));
+
+    if let Some(generation) = expected_generation {
+        let _ = write!(sql, ", expected_generation => {generation}");
+    }
+
+    sql.push(')');
+
+    if let Some(filter_sql) = &params.filter_sql {
+        let _ = write!(sql, " WHERE {filter_sql}");
+    }
 
     sql
+}
+
+/// Build the query that reads only this executor's current index generation:
+/// `SELECT generation FROM text_search_stats(<from>, '<query>'[, "<column>"])
+/// LIMIT 1`. Reuses the exact same `text_search_stats(...)` call as the
+/// statistics round (so the reported generation reflects the same read), but
+/// bypasses the scheduler's `SUM ... GROUP BY term` aggregate, which discards
+/// which executor contributed which row.
+#[must_use]
+fn build_generation_sql(params: &DistributedSearchParams) -> String {
+    let mut sql = format!(
+        "SELECT {STATS_GENERATION_COLUMN} FROM text_search_stats({from}, {query}",
+        from = params.from_table_sql,
+        query = sql_quote(&params.query),
+    );
+    if let Some(column) = &params.column {
+        let _ = write!(sql, ", {}", quote_identifier(column));
+    }
+    sql.push_str(") LIMIT 1");
+    sql
+}
+
+/// The single `generation` value from a [`build_generation_sql`] result, or
+/// `None` if the executor returned no rows. `None` skips the generation check
+/// for that executor rather than failing the whole search.
+fn extract_generation(batches: &[RecordBatch]) -> Result<Option<u64>> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let column = batch
+            .column_by_name(STATS_GENERATION_COLUMN)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "text_search_stats generation query missing '{STATS_GENERATION_COLUMN}' column"
+                ))
+            })?;
+        let array = column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "text_search_stats '{STATS_GENERATION_COLUMN}' column is not UInt64"
+                ))
+            })?;
+        return Ok(Some(array.value(0)));
+    }
+    Ok(None)
 }
 
 /// Reproject `batch` into `target`'s field order, selecting columns by name.
@@ -163,134 +236,6 @@ fn project_batch_to_schema(batch: &RecordBatch, target: &SchemaRef) -> Result<Re
     }
     RecordBatch::try_new(Arc::clone(target), columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-/// Logical extension node for a distributed full-text search.
-#[derive(Debug)]
-pub struct DistributedSearchNode {
-    stats_input: LogicalPlan,
-    schema: DFSchemaRef,
-    params: DistributedSearchParams,
-    executors: Vec<DistributedExecutor>,
-}
-
-impl DistributedSearchNode {
-    #[must_use]
-    pub fn new(
-        stats_input: LogicalPlan,
-        schema: DFSchemaRef,
-        params: DistributedSearchParams,
-        executors: Vec<DistributedExecutor>,
-    ) -> Self {
-        Self {
-            stats_input,
-            schema,
-            params,
-            executors,
-        }
-    }
-
-    #[must_use]
-    pub fn params(&self) -> &DistributedSearchParams {
-        &self.params
-    }
-
-    #[must_use]
-    pub fn executors(&self) -> &[DistributedExecutor] {
-        &self.executors
-    }
-
-    #[must_use]
-    pub fn output_schema(&self) -> &DFSchemaRef {
-        &self.schema
-    }
-}
-
-impl Hash for DistributedSearchNode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.stats_input.hash(state);
-        self.params.hash(state);
-        for executor in &self.executors {
-            executor.id.hash(state);
-        }
-    }
-}
-
-impl PartialEq for DistributedSearchNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.stats_input == other.stats_input
-            && self.params == other.params
-            && self
-                .executors
-                .iter()
-                .map(|e| &e.id)
-                .eq(other.executors.iter().map(|e| &e.id))
-    }
-}
-
-impl Eq for DistributedSearchNode {}
-
-impl PartialOrd for DistributedSearchNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.stats_input.partial_cmp(&other.stats_input)
-    }
-}
-
-impl UserDefinedLogicalNodeCore for DistributedSearchNode {
-    fn name(&self) -> &'static str {
-        "DistributedSearchNode"
-    }
-
-    fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.stats_input]
-    }
-
-    fn schema(&self) -> &DFSchemaRef {
-        &self.schema
-    }
-
-    fn expressions(&self) -> Vec<Expr> {
-        Vec::new()
-    }
-
-    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "DistributedSearchNode query={} executors={}",
-            self.params.query,
-            self.executors.len()
-        )
-    }
-
-    /// The output schema differs from the stats input schema, so there is no
-    /// column passthrough mapping to expose for projection push-down.
-    fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        None
-    }
-
-    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
-        if !exprs.is_empty() {
-            return Err(DataFusionError::Internal(format!(
-                "DistributedSearchNode expects no expressions, got {}",
-                exprs.len()
-            )));
-        }
-        if inputs.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
-                "DistributedSearchNode expects exactly one input, got {}",
-                inputs.len()
-            )));
-        }
-        let stats_input = inputs.into_iter().next().ok_or_else(|| {
-            DataFusionError::Internal("DistributedSearchNode requires one input".to_string())
-        })?;
-        Ok(Self {
-            stats_input,
-            schema: Arc::clone(&self.schema),
-            params: self.params.clone(),
-            executors: self.executors.clone(),
-        })
-    }
 }
 
 /// [`ExtensionPlanner`] that turns a [`DistributedSearchNode`] into a
@@ -517,9 +462,43 @@ impl ExecutionPlan for DistributedSearchExec {
 
         let fut = async move {
             // 1. Drain the stats subplan (one partition) to recover the summed
-            //    per-term rows.
-            let stats_batches: Vec<RecordBatch> =
-                stats_input.execute(0, context)?.try_collect().await?;
+            //    per-term rows, concurrently with a tiny per-executor query for
+            //    each partition's current index generation. Running these
+            //    together (rather than after draining stats) minimizes the
+            //    window in which a refresh could land between "what the
+            //    statistics saw" and "what the scored query will see" to these
+            //    two nearly-simultaneous round trips.
+            let generation_sql = build_generation_sql(&params);
+            let generation_queries = executors.iter().map(|executor| {
+                let sql = generation_sql.clone();
+                let cookie_store = Arc::clone(&cookie_store);
+                let client = executor.client.clone();
+                let id = executor.id.clone();
+                async move {
+                    let batches: Vec<RecordBatch> = query_to_stream(client, sql, cookie_store)
+                        .try_collect()
+                        .await?;
+                    Ok::<(String, Option<u64>), DataFusionError>((
+                        id,
+                        extract_generation(&batches)?,
+                    ))
+                }
+            });
+            let (stats_result, generations_result) = futures::future::join(
+                async {
+                    stats_input
+                        .execute(0, context)?
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                },
+                try_join_all(generation_queries),
+            )
+            .await;
+            let stats_batches = stats_result?;
+            let generations: HashMap<String, u64> = generations_result?
+                .into_iter()
+                .filter_map(|(id, generation)| generation.map(|g| (id, g)))
+                .collect();
 
             // 2. Reconstruct the global BM25 statistics and encode them for
             //    transport as the `global_stats` UDTF argument.
@@ -529,10 +508,16 @@ impl ExecutionPlan for DistributedSearchExec {
                 .encode()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // 3./4. Fan the scored query out to every executor concurrently.
-            let sql = build_scored_sql(&params, output_schema.as_ref(), &encoded);
+            // 3./4. Fan the scored query out to every executor concurrently,
+            //    each with its own observed generation (if any) so the
+            //    executor can detect a commit landing between the two rounds.
             let queries = executors.iter().map(|executor| {
-                let sql = sql.clone();
+                let sql = build_scored_sql(
+                    &params,
+                    output_schema.as_ref(),
+                    &encoded,
+                    generations.get(&executor.id).copied(),
+                );
                 let cookie_store = Arc::clone(&cookie_store);
                 let client = executor.client.clone();
                 async move {
@@ -634,13 +619,23 @@ impl ExecutionPlan for DistributedSearchExec {
         Ok(None)
     }
 
+    /// Parent filters are never forwarded to `stats_input`: that child's schema
+    /// (`term`/`doc_freq`/`total_num_docs`/`total_num_tokens`) is unrelated to
+    /// the search-result schema filters are written against. Any filter that
+    /// reaches here is one [`crate::rewrite::DistributedSearchRewrite`] could
+    /// not push into the executors' scored queries, so it must run as an actual
+    /// `Filter` above this node rather than being (incorrectly) applied to the
+    /// statistics child or (silently) dropped.
     fn gather_filters_for_pushdown(
         &self,
         _phase: FilterPushdownPhase,
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        FilterDescription::from_children(parent_filters, &self.children())
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
     }
 
     fn handle_child_pushdown_result(
@@ -663,7 +658,10 @@ mod test {
 
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::{DistributedSearchParams, Hash, Hasher, build_scored_sql, sql_quote};
+    use super::{
+        DistributedSearchParams, Hash, Hasher, build_generation_sql, build_scored_sql,
+        extract_generation, sql_quote,
+    };
 
     fn score_and_id_schema() -> Schema {
         Schema::new(vec![
@@ -694,8 +692,9 @@ mod test {
             primary_key: vec!["id".to_string()],
             fetch: Some(5),
             skip: 0,
+            filter_sql: None,
         };
-        let sql = build_scored_sql(&params, &score_and_id_schema(), "{\"x\":1}");
+        let sql = build_scored_sql(&params, &score_and_id_schema(), "{\"x\":1}", None);
         assert_eq!(
             sql,
             "SELECT \"_score\", \"id\" FROM text_search(\"spice\".\"public\".\"docs\", 'it''s', 5, global_stats => '{\"x\":1}')"
@@ -711,9 +710,10 @@ mod test {
             primary_key: vec!["id".to_string()],
             fetch: Some(10),
             skip: 5,
+            filter_sql: None,
         };
         // effective_fetch = fetch + skip = 15, and the column arg is rendered.
-        let sql = build_scored_sql(&params, &score_and_id_schema(), "{}");
+        let sql = build_scored_sql(&params, &score_and_id_schema(), "{}", None);
         assert_eq!(
             sql,
             "SELECT \"_score\", \"id\" FROM text_search(\"spice\".\"public\".\"docs\", 'hello', \"body\", 15, global_stats => '{}')"
@@ -729,12 +729,93 @@ mod test {
             primary_key: vec![],
             fetch: None,
             skip: 0,
+            filter_sql: None,
         };
-        let sql = build_scored_sql(&params, &score_and_id_schema(), "{}");
+        let sql = build_scored_sql(&params, &score_and_id_schema(), "{}", None);
         assert_eq!(
             sql,
             "SELECT \"_score\", \"id\" FROM text_search(\"docs\", 'q', global_stats => '{}')"
         );
+    }
+
+    #[test]
+    fn build_scored_sql_appends_filter_and_escapes_quoted_identifiers() {
+        let schema = Schema::new(vec![
+            Field::new("_score", DataType::Float64, true),
+            Field::new("a\"b", DataType::Int64, false),
+        ]);
+        let params = DistributedSearchParams {
+            from_table_sql: "\"docs\"".to_string(),
+            query: "q".to_string(),
+            column: Some("a\"b".to_string()),
+            primary_key: vec![],
+            fetch: None,
+            skip: 0,
+            filter_sql: Some("category = 'x'".to_string()),
+        };
+        let sql = build_scored_sql(&params, &schema, "{}", None);
+        assert_eq!(
+            sql,
+            "SELECT \"_score\", \"a\"\"b\" FROM text_search(\"docs\", 'q', \"a\"\"b\", global_stats => '{}') WHERE category = 'x'"
+        );
+    }
+
+    #[test]
+    fn build_scored_sql_includes_expected_generation() {
+        let params = DistributedSearchParams {
+            from_table_sql: "\"docs\"".to_string(),
+            query: "q".to_string(),
+            column: None,
+            primary_key: vec![],
+            fetch: None,
+            skip: 0,
+            filter_sql: None,
+        };
+        let sql = build_scored_sql(&params, &score_and_id_schema(), "{}", Some(7));
+        assert_eq!(
+            sql,
+            "SELECT \"_score\", \"id\" FROM text_search(\"docs\", 'q', global_stats => '{}', expected_generation => 7)"
+        );
+    }
+
+    #[test]
+    fn build_generation_sql_renders_expected_string() {
+        let params = DistributedSearchParams {
+            from_table_sql: "\"spice\".\"public\".\"docs\"".to_string(),
+            query: "it's".to_string(),
+            column: Some("body".to_string()),
+            primary_key: vec![],
+            fetch: None,
+            skip: 0,
+            filter_sql: None,
+        };
+        let sql = build_generation_sql(&params);
+        assert_eq!(
+            sql,
+            "SELECT generation FROM text_search_stats(\"spice\".\"public\".\"docs\", 'it''s', \"body\") LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn extract_generation_reads_first_row() {
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "generation",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(arrow::array::UInt64Array::from(vec![
+                42,
+            ]))],
+        )
+        .expect("record batch");
+        assert_eq!(extract_generation(&[batch]).expect("ok"), Some(42));
+    }
+
+    #[test]
+    fn extract_generation_is_none_for_no_rows() {
+        assert_eq!(extract_generation(&[]).expect("ok"), None);
     }
 
     #[test]
@@ -746,6 +827,7 @@ mod test {
             primary_key: vec!["id".to_string()],
             fetch: Some(3),
             skip: 1,
+            filter_sql: None,
         };
         let b = a.clone();
         let mut c = a.clone();
