@@ -14,19 +14,3 @@ services:
       interval: 2s
       timeout: 2s
       retries: 10
-
-  generator:
-    image: postgres:16-alpine
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      PGPASSWORD: spice
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        while true; do
-          psql -h postgres -U spice -d spice -c "INSERT INTO append_events (event_timestamp, message, score) VALUES (clock_timestamp(), 'generated event', 1.5);"
-          sleep 5
-        done

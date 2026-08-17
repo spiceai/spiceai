@@ -2,7 +2,7 @@
 
 This example exercises a PostgreSQL `timestamptz` source accelerated by Cayenne with append refreshes. PostgreSQL exposes `timestamptz` to Arrow as `Timestamp(ns, "UTC")`; Cayenne stores timestamps at microsecond precision.
 
-Start the source and its continuous insert generator:
+Start the source with the fixed sample rows:
 
 ```shell
 docker compose up -d
@@ -14,7 +14,12 @@ Start Spice from this directory:
 spice run
 ```
 
-The initial load contains the seeded rows. The generator inserts a row every five seconds, and the append refresh should load those rows without a timestamp schema mismatch.
+The initial load contains three fixed rows. Query the runtime to confirm that the
+stored timestamps are at Cayenne's supported microsecond precision:
+
+```shell
+spice sql --query 'SELECT id, event_timestamp, message, score FROM append_events ORDER BY id'
+```
 
 Stop and remove the source when finished:
 
