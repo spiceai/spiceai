@@ -398,7 +398,7 @@ impl RefreshingCatalogProvider {
                 tokio::time::sleep(interval).await;
                 if let Err(e) = inner.refresh().await {
                     tracing::error!(
-                        "Catalog {catalog_name} is still serving the tables from its last successful refresh, which may now be out of date: a table added, renamed or dropped in the source since then is not reflected. It is retried in {retry_secs}s. Failed to refresh it: {e}"
+                        "Failed to refresh catalog '{catalog_name}', so it is still serving the tables from its last successful refresh, which may now be out of date: a table added, renamed or dropped in the source since then is not reflected. It is retried in {retry_secs}s. Cause: {e}"
                     );
                 }
             }

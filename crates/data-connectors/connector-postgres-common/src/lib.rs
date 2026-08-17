@@ -30,19 +30,22 @@ use datafusion_common::utils::quote_identifier;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
 
-/// The catalog documentation, linked by the errors these queries raise for a
-/// catalog. The CDC prerequisite errors below link the connector documentation,
-/// which is where `wal_level` and replication-slot setup are described.
-const POSTGRES_CATALOG_DOCS: &str = "https://spiceai.org/docs/components/catalogs/postgres";
+/// Connection parameters and role grants behave identically for a dataset using
+/// the `PostgreSQL` data connector, and are documented with the connector, so the
+/// connector's page is the one that answers these for a catalog user too -- the
+/// same page the CDC prerequisite errors below already link.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
 
-/// Every variant is worded to read as the *cause* clause of the message that
-/// reports it: the caller names the catalog, schema or table affected and what
-/// the user will observe, and these supply the specific failure and its fix. A
-/// variant that named a resource itself would duplicate the caller's.
+/// Every variant is worded to read as the `Cause:` clause of the message that
+/// reports it: the caller states the problem -- naming the catalog, schema or
+/// table and the step that failed -- and its impact, and these supply the
+/// specific failure and its fix. A variant that named a resource or a step
+/// itself would duplicate the caller's.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
+        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -50,9 +53,11 @@ pub enum Error {
 
     // The queries this reports are Spice's own discovery queries against
     // `information_schema` and `pg_catalog`, never anything the user wrote, so
-    // the fix is a grant or a reachable database -- not "check your SQL".
+    // the fix is a grant -- not "check your SQL". The step being performed is
+    // named by the message reporting this, and the relation the server objected
+    // to by `source`; the query text itself is debug detail and stays out.
     #[snafu(display(
-        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 

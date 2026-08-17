@@ -40,42 +40,58 @@ use crate::{
     RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
-/// Every variant is worded to read as the *cause* clause of the message that
-/// reports it. Each is raised inside a schema or table refresh whose own
-/// message names the catalog, the schema and what the user will observe, so a
-/// variant that named the catalog itself would say it twice; what they owe the
-/// user is the specific failure and its fix.
+/// Every variant is worded to read as the `Cause:` clause of the message that
+/// reports it. Each is raised inside a schema or table refresh whose own message
+/// states the problem -- naming the catalog, the schema and the step that failed
+/// -- and the impact on what the user can query, so a variant that named any of
+/// those would say it twice. What they owe the user is the specific failure and
+/// its fix.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
+        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     // Reports Spice's own discovery queries against `information_schema`, never
-    // anything the user wrote, so the fix is a grant -- not "check your SQL".
+    // anything the user wrote, so the fix is a grant -- not "check your SQL". The
+    // step being performed is named by the message reporting this, and the
+    // relation the server objected to by `source`; the query text itself is
+    // debug detail and stays out.
     #[snafu(display(
-        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 
+    /// The bulk column-type lookup failing is reported by the fallback warning,
+    /// which names the catalog, the schema and the step, so this adds only the
+    /// fix -- hence a display that opens with its own source.
     #[snafu(display(
-        "The column types could not be read: {source}. Check that the connected role can read `pg_catalog`, and that every column type is supported or `unsupported_type_action` permits it. Docs: {POSTGRES_CATALOG_DOCS}"
+        "{source}. Check that the connected role can read `pg_catalog`, and that every column type is supported or `unsupported_type_action` permits it. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     SchemaResolutionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "The column types could not be read: an unexpected error occurred. Report this bug: https://github.com/spiceai/spiceai/issues"
+        "An unexpected error occurred. Report this bug: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedConnectionType {},
 
+    /// Listing the catalog's schemas is the one discovery step with no
+    /// per-schema warning to report it -- it fails the whole refresh -- so
+    /// naming the step is this variant's job. The catalog is named by the error
+    /// that wraps this one.
+    #[snafu(display("Failed to list the catalog's schemas. Cause: {source}"))]
+    SchemaListingFailed {
+        source: connector_postgres_common::Error,
+    },
+
     /// Wraps errors from the shared `connector-postgres-common` queries
-    /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
-    /// callers can still propagate them with `?`.
+    /// (`list_tables`, re-exported below) so this crate's own callers can still
+    /// propagate them with `?`.
     #[snafu(display("{source}"), context(false))]
     Common {
         source: connector_postgres_common::Error,
@@ -84,7 +100,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Linked by the messages about include/exclude patterns and catalog
+/// registration, which have no data-connector equivalent.
 const POSTGRES_CATALOG_DOCS: &str = "https://spiceai.org/docs/components/catalogs/postgres";
+
+/// Linked by everything a dataset using the `PostgreSQL` data connector would hit
+/// identically -- connection parameters, role grants, `unsupported_type_action`.
+/// Those are documented with the connector, so the connector's page is the one
+/// that answers them for a catalog user too.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
 
 pub use connector_postgres_common::{
     ReplicaIdentityOutcome, ReplicationSlotStatus, SkipReason, ViewRelation,
@@ -168,7 +193,7 @@ impl PostgresCatalogProvider {
             // queries issued, never the catalog's namespace.
             if !self.selector.may_select_within(schema_name) {
                 tracing::debug!(
-                    "Schema {schema_name} of PostgreSQL catalog {} cannot match any include pattern; skipping its metadata queries",
+                    "Schema '{schema_name}' of PostgreSQL catalog '{}' cannot match any include pattern; skipping its table discovery",
                     self.catalog_name
                 );
                 schemas.insert(
@@ -447,7 +472,9 @@ impl PostgresCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        Ok(list_schemas(&self.pool).await?)
+        list_schemas(&self.pool)
+            .await
+            .context(SchemaListingFailedSnafu)
     }
 }
 
@@ -732,7 +759,7 @@ fn empty_catalog_warning(
     };
 
     Some(format!(
-        "PostgreSQL catalog {catalog_name} registered no tables, so queries against it will not resolve any table. {cause}. Docs: {POSTGRES_CATALOG_DOCS}"
+        "PostgreSQL catalog '{catalog_name}' registered no tables, so queries against it will not resolve any table. {cause}. Docs: {POSTGRES_CATALOG_DOCS}"
     ))
 }
 
@@ -748,9 +775,12 @@ enum SchemaMetadata {
 ///
 /// Discovery failing is not fatal (#11724), which is exactly what makes the
 /// wording load-bearing: the user's symptom is a schema that is empty or stale,
-/// and this line is the only explanation they get. So it leads with what they
-/// will observe and ends with the cause, which already carries the specific fix
-/// and a documentation link -- repeating those here would say them twice.
+/// and this line is the only explanation they get.
+///
+/// Every message here states one problem and then its impact -- "failed to X, so
+/// Y" -- rather than reporting the impact and the failure as if they were two
+/// separate events, and ends with the cause, which carries the specific fix and
+/// a documentation link where it has one.
 ///
 /// Returns `None` for a schema that refreshed successfully, which has nothing
 /// to report.
@@ -763,16 +793,16 @@ fn schema_discovery_warning(
     match outcome {
         SchemaRefreshOutcome::InsertNew => None,
         SchemaRefreshOutcome::KeepPrevious => Some(format!(
-            "PostgreSQL catalog {catalog_name} is still serving the tables it discovered earlier in schema {schema_name}, which may now be out of date: a table added, renamed or dropped since then is not reflected. It is retried on the next refresh. Failed to list its tables: {cause}"
+            "PostgreSQL catalog '{catalog_name}' failed to list the tables of schema '{schema_name}', so it is still serving the tables it discovered earlier, which may now be out of date: a table added, renamed or dropped since then is not reflected. The schema is retried on the next refresh. Cause: {cause}"
         )),
         SchemaRefreshOutcome::Skip => Some(format!(
-            "PostgreSQL catalog {catalog_name} registered no table from schema {schema_name}, so queries against {catalog_name}.{schema_name} will not resolve. The rest of the catalog is unaffected, and the schema is retried on the next refresh. Failed to list its tables: {cause}"
+            "PostgreSQL catalog '{catalog_name}' failed to list the tables of schema '{schema_name}', so no table in that schema is registered and queries against '{catalog_name}.{schema_name}' will not resolve. The rest of the catalog is unaffected, and the schema is retried on the next refresh. Cause: {cause}"
         )),
     }
 }
 
-/// The one-line report for a schema whose tables registered, but without the
-/// foreign keys or descriptions that a metadata query would have attached.
+/// The one-line report for a schema whose tables registered without the foreign
+/// keys or descriptions a metadata query would have attached.
 fn schema_metadata_warning(
     catalog_name: &str,
     schema_name: &str,
@@ -781,10 +811,10 @@ fn schema_metadata_warning(
 ) -> String {
     match metadata {
         SchemaMetadata::ForeignKeys => format!(
-            "PostgreSQL catalog {catalog_name} registered the tables of schema {schema_name} without their foreign keys, so anything relying on them -- including SQL generated from natural language -- cannot see how these tables join. Failed to read them: {cause}"
+            "PostgreSQL catalog '{catalog_name}' failed to determine the foreign keys of schema '{schema_name}', so anything relying on them -- including SQL generated from natural language -- cannot see how its tables join. Cause: {cause}"
         ),
         SchemaMetadata::Descriptions => format!(
-            "PostgreSQL catalog {catalog_name} registered the tables of schema {schema_name} without their descriptions, so the table and column comments defined in PostgreSQL are unavailable to queries and to the tools that read them. Failed to read them: {cause}"
+            "PostgreSQL catalog '{catalog_name}' failed to read the table and column descriptions of schema '{schema_name}', so the comments defined in PostgreSQL are unavailable to queries and to the tools that read them. Cause: {cause}"
         ),
     }
 }
@@ -795,7 +825,7 @@ fn schema_metadata_warning(
 /// missing.
 fn column_types_fallback_warning(catalog_name: &str, schema_name: &str, cause: &str) -> String {
     format!(
-        "PostgreSQL catalog {catalog_name} is describing the tables of schema {schema_name} one at a time, which makes each refresh slower; the tables it registers are unaffected. Failed to describe them in a single query: {cause}"
+        "PostgreSQL catalog '{catalog_name}' failed to describe the tables of schema '{schema_name}' in a single query, so each is described separately and this refresh is slower; the tables it registers are unaffected. Cause: {cause}"
     )
 }
 
@@ -815,7 +845,7 @@ struct SchemaLocation<'a> {
 fn table_skipped_warning(location: SchemaLocation<'_>, table_name: &str, cause: &str) -> String {
     let SchemaLocation { catalog, schema } = location;
     format!(
-        "PostgreSQL catalog {catalog} did not register table {schema}.{table_name}, so queries against {catalog}.{schema}.{table_name} will not resolve. It is retried on the next refresh. Failed to load it: {cause}. Check that the connected role has SELECT on the table, and that its column types are supported or `unsupported_type_action` permits them. Docs: {POSTGRES_CATALOG_DOCS}"
+        "PostgreSQL catalog '{catalog}' failed to load table '{schema}.{table_name}', so it is absent from the catalog and queries against '{catalog}.{schema}.{table_name}' will not resolve. It is retried on the next refresh. Cause: {cause}. Check that the connected role has SELECT on the table, and that its column types are supported or `unsupported_type_action` permits them. Docs: {POSTGRES_CONNECTOR_DOCS}"
     )
 }
 
@@ -829,7 +859,7 @@ fn table_foreign_keys_warning(
 ) -> String {
     let SchemaLocation { catalog, schema } = location;
     format!(
-        "PostgreSQL catalog {catalog} registered table {schema}.{table_name} without its foreign keys, so anything relying on them cannot see how it joins to other tables. Failed to record them: {cause}. Report this bug: https://github.com/spiceai/spiceai/issues"
+        "PostgreSQL catalog '{catalog}' failed to record the foreign keys of table '{schema}.{table_name}', so anything relying on them cannot see how it joins to other tables. Cause: {cause}. Report this bug: https://github.com/spiceai/spiceai/issues"
     )
 }
 
@@ -880,7 +910,7 @@ async fn build_table_providers_for_schema(
         let schema_with_table = format!("{schema_name}.{table_name}");
         if let Some(reason) = selector.rejection_reason(&schema_with_table) {
             tracing::debug!(
-                "Table {schema_with_table} is not selected ({reason}); it is absent from PostgreSQL catalog {catalog_name}"
+                "Table '{schema_with_table}' is not selected ({reason}); it is absent from PostgreSQL catalog '{catalog_name}'"
             );
             continue;
         }
@@ -1023,11 +1053,12 @@ impl SchemaProvider for PostgresSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommentMap, ForeignKeyConstraint, ForeignKeyMap, POSTGRES_CATALOG_DOCS, SchemaLocation,
-        SchemaMetadata, SchemaRefreshOutcome, TableComments, build_table_providers_for_schema,
-        column_types_fallback_warning, empty_catalog_warning, foreign_key_target,
-        schema_discovery_warning, schema_metadata_warning, schema_refresh_outcome,
-        select_relations, table_foreign_keys_warning, table_skipped_warning,
+        CommentMap, ForeignKeyConstraint, ForeignKeyMap, POSTGRES_CATALOG_DOCS,
+        POSTGRES_CONNECTOR_DOCS, SchemaLocation, SchemaMetadata, SchemaRefreshOutcome,
+        TableComments, build_table_providers_for_schema, column_types_fallback_warning,
+        empty_catalog_warning, foreign_key_target, schema_discovery_warning,
+        schema_metadata_warning, schema_refresh_outcome, select_relations,
+        table_foreign_keys_warning, table_skipped_warning,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -1279,16 +1310,21 @@ mod tests {
         .expect("a failed discovery should report");
 
         assert!(
-            skipped.contains("PostgreSQL catalog pg") && skipped.contains("schema sales"),
+            skipped.contains("PostgreSQL catalog 'pg'") && skipped.contains("schema 'sales'"),
             "names the catalog and the schema: {skipped}"
         );
         assert!(
-            skipped.contains("queries against pg.sales will not resolve"),
-            "states the observable consequence: {skipped}"
+            skipped.contains("failed to list the tables of schema 'sales'"),
+            "states the problem first: {skipped}"
         );
         assert!(
-            skipped.contains("connection refused"),
-            "keeps the cause: {skipped}"
+            skipped.contains("so no table in that schema is registered")
+                && skipped.contains("queries against 'pg.sales' will not resolve"),
+            "then its impact, as one situation rather than two: {skipped}"
+        );
+        assert!(
+            skipped.contains("Cause: Failed to connect to PostgreSQL: connection refused"),
+            "and ends with the cause, labelled: {skipped}"
         );
 
         let kept = schema_discovery_warning(
@@ -1299,7 +1335,8 @@ mod tests {
         )
         .expect("a failed discovery should report");
         assert!(
-            kept.contains("out of date"),
+            kept.contains("failed to list the tables of schema 'sales'")
+                && kept.contains("out of date"),
             "a schema held at its last known contents is stale, not absent: {kept}"
         );
 
@@ -1324,16 +1361,16 @@ mod tests {
     fn degraded_refresh_warnings_name_the_catalog_and_the_loss() {
         let fks = schema_metadata_warning("pg", "sales", SchemaMetadata::ForeignKeys, "denied");
         assert!(
-            fks.contains("PostgreSQL catalog pg")
-                && fks.contains("schema sales")
-                && fks.contains("without their foreign keys"),
-            "{fks}"
+            fks.contains(
+                "PostgreSQL catalog 'pg' failed to determine the foreign keys of schema 'sales'"
+            ) && fks.contains("cannot see how its tables join"),
+            "one problem, then its impact: {fks}"
         );
 
         let comments =
             schema_metadata_warning("pg", "sales", SchemaMetadata::Descriptions, "denied");
         assert!(
-            comments.contains("without their descriptions"),
+            comments.contains("failed to read the table and column descriptions of schema 'sales'"),
             "{comments}"
         );
 
@@ -1349,12 +1386,12 @@ mod tests {
         };
         let skipped = table_skipped_warning(location, "orders", "unsupported type");
         assert!(
-            skipped.contains("did not register table sales.orders")
-                && skipped.contains("queries against pg.sales.orders will not resolve"),
+            skipped.contains("failed to load table 'sales.orders'")
+                && skipped.contains("queries against 'pg.sales.orders' will not resolve"),
             "{skipped}"
         );
         assert!(
-            skipped.contains("SELECT on the table") && skipped.contains(POSTGRES_CATALOG_DOCS),
+            skipped.contains("SELECT on the table") && skipped.contains(POSTGRES_CONNECTOR_DOCS),
             "the loader's error carries no fix, so this message must: {skipped}"
         );
 
@@ -1366,6 +1403,10 @@ mod tests {
 
         for message in [&fks, &comments, &fallback, &skipped, &table_fks] {
             assert!(!message.contains('\n'), "stays on one line: {message:?}");
+            assert!(
+                message.contains("failed to") && message.contains(", so "),
+                "states one problem and then its impact: {message}"
+            );
             assert!(
                 !message.contains("metadata")
                     && !message.contains("table provider")
@@ -1406,7 +1447,7 @@ mod tests {
 
         let message = empty_catalog_warning("pg", None, 0, 0, 2, &filtered)
             .expect("an empty filtered catalog should warn");
-        assert!(message.contains("pg"), "names the catalog: {message}");
+        assert!(message.contains("'pg'"), "names the catalog: {message}");
         assert!(
             message.contains("include: ['public.orders']")
                 && message.contains("exclude: ['public.secret']"),

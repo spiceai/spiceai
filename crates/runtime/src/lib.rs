@@ -381,7 +381,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to load catalog {catalog}: {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToLoadCatalogConnector {
         catalog: String,
