@@ -1726,7 +1726,7 @@ fn build_hello(
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        fingerprint: fingerprint::compute(),
+        fingerprint: fingerprint::compute(&config.config_dir),
         public_ip_hint: String::new(),
         operator_version: String::new(),
         runtime_versions: std::collections::HashMap::new(),

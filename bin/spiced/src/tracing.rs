@@ -186,6 +186,92 @@ where
     )
 }
 
+/// The bounded, rotating log files a supervised runtime writes, shared between
+/// every `fmt` layer that writes to them.
+///
+/// One handle behind a mutex rather than one per call: rotation renames the
+/// live file, and two writers rotating independently would each keep their own
+/// idea of which file they are appending to.
+#[derive(Clone)]
+struct ServiceLogWriter(Arc<std::sync::Mutex<runtime_cloud_connect::service_log::RotatingLog>>);
+
+impl ServiceLogWriter {
+    /// Open the log files for a service started with `--service-log-dir`.
+    fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self(Arc::new(std::sync::Mutex::new(
+            runtime_cloud_connect::service_log::RotatingLog::open(dir)?,
+        ))))
+    }
+}
+
+impl std::io::Write for ServiceLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // A poisoned mutex means another thread panicked mid-record. The
+        // remedy is still to write this one: losing the log of a process that
+        // is failing is losing the account of why.
+        let mut log = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut log = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.flush()
+    }
+}
+
+impl<'a> fmt::MakeWriter<'a> for ServiceLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Build the layer that writes the console log to a supervised instance's own
+/// bounded files, or `None` when this runtime was not started with
+/// `--service-log-dir`.
+///
+/// Added *alongside* the terminal layer rather than replacing it: a supervisor
+/// may also be capturing stdout, and a runtime started by hand with the flag
+/// must still print to the terminal it was started from.
+///
+/// Never coloured. These files are read back by `spice connect service logs`
+/// and by whatever an operator greps them with, and SGR escapes between the
+/// level and the target defeat a pattern written the way the line reads.
+///
+/// # Errors
+///
+/// Returns an error when the directory or its live file cannot be opened. This
+/// fails startup on purpose: these files are the only log a managed service
+/// has, and a service that came up with nowhere to write them would be
+/// diagnosed by nothing.
+fn service_log_layer<S>(
+    dir: Option<&std::path::Path>,
+) -> std::io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let writer = ServiceLogWriter::open(dir)?;
+    Ok(Some(
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_filter(filter::filter_fn(|metadata| {
+                metadata.target() != "task_history"
+            }))
+            .boxed(),
+    ))
+}
+
 /// The layer that writes the human-readable log to `writer`, `spiced`'s stdout
 /// in production.
 ///
@@ -242,6 +328,7 @@ pub(crate) async fn init_tracing(
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
     cloud_connect_configured: bool,
+    service_log_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -267,6 +354,17 @@ pub(crate) async fn init_tracing(
         .with(task_history_layer)
         .with(progress_layer())
         .with(console_layer(ansi, std::io::stdout))
+        .with(service_log_layer(service_log_dir).map_err(|e| {
+            format!(
+                "Failed to open the Spice service log directory {}: {e}. A managed service writes \
+                 its only log here, so it is not started without one. Check the directory exists \
+                 and that this account can write it, then re-run \
+                 `spice connect service install`. See: https://spiceai.org/docs",
+                service_log_dir
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .display()
+            )
+        })?)
         .with(cloud_connect_log_capture_layer(cloud_connect_configured));
 
     tracing::subscriber::set_global_default(subscriber)?;

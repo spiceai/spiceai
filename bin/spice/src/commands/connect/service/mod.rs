@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![cfg_attr(not(target_os = "linux"), expect(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
 
 //! `spice connect service`: run `spiced` as a persistent service for an
 //! enrolled instance directory, and manage its lifecycle.
@@ -23,14 +23,26 @@ limitations under the License.
 //! the supervisor is what keeps the instance up across the things that do end
 //! it — a host reboot, an OOM kill, an unhandled failure.
 //!
-//! The supported Linux backend uses `Restart=on-failure`: a failure comes back,
-//! and an exit an operator asked for stays down.
+//! Both supported back ends restart a failure and leave a clean exit alone:
+//! systemd's `Restart=on-failure` and launchd's `KeepAlive={SuccessfulExit=false}`
+//! are the same policy in two vocabularies. A failure comes back, and an exit an
+//! operator asked for stays down.
 //!
 //! ## Support matrix
 //!
-//! Linux with systemd. Containers get the same guarantee from their runtime's restart policy
+//! Linux with systemd, and macOS with launchd. Containers get the same
+//! guarantee from their runtime's restart policy
 //! (`docker run --restart unless-stopped`) and enroll directly with
 //! `spiced --token`.
+//!
+//! ## Boot persistence is not the same thing on both platforms
+//!
+//! A system service — a systemd system unit, a launchd `LaunchDaemon` — comes
+//! up at boot with nobody logged in. A user service does not: a systemd user
+//! unit needs its account to linger, and a launchd `LaunchAgent` starts with
+//! its owner's GUI login session and cannot be made to start before one. That
+//! difference is reported rather than papered over, in
+//! [`model::ServiceStarts`].
 //!
 //! ## One service per instance directory
 //!
@@ -50,15 +62,14 @@ limitations under the License.
 
 pub(crate) mod backend;
 pub(crate) mod cli;
-// Each back end is compiled only for the host it drives: its helpers and
-// constants exist to serve one supervisor, and carrying them onto a platform
-// that has no such supervisor would be dead code the compiler is right to
-// flag. The naming, staging, manifest, and status code every platform shares
-// lives here instead, and is covered on every target.
-// The launchd implementation remains in trunk for the macOS lifecycle
-// follow-up, but this Linux-only service surface deliberately does not compile
-// or expose it yet.
-#[cfg(any())]
+mod host;
+// launchd drives macOS. The module is also compiled under `cfg(test)` on Linux,
+// the other platform this suite runs on, so its rendering, parsing, and
+// state-translation tests are covered by every run rather than only by the ones
+// on the platform that dispatches to it. Nowhere else compiles it, so no target
+// it cannot serve carries dead code. systemd's tools exist on no other
+// platform, so its module is compiled only where they do.
+#[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
 mod launchd;
 pub(crate) mod manifest;
 pub(crate) mod model;
@@ -110,14 +121,37 @@ struct ServiceAccount {
     gid: u32,
 }
 
-/// Resolve the non-root account the installed service should run as.
+/// Whether a back end accepts running the service as root when a direct root
+/// session installs from a root-owned instance directory.
 ///
-/// `sudo` records the invoking uid/gid. For a direct root session, the owner of
-/// the instance directory is the only safe local signal. A root-owned instance
-/// with no sudo caller is ambiguous and is rejected instead of installing a
-/// privileged service over user-controlled configuration.
+/// Named per back end rather than shared, because the two supervisors differ:
+/// launchd's contract calls for it, and enabling it for systemd would run a
+/// unit as `User=0` on a platform this change does not target.
+///
+/// The policy itself is platform-independent — only the account resolution it
+/// feeds is Unix-only — so it is available on every target that compiles the
+/// shared install path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootFallback {
+    Allow,
+    Deny,
+}
+
+/// Resolve the account the installed service should run as.
+///
+/// `sudo` records the invoking uid/gid, and that verified operator is who the
+/// service runs as. For a direct root session there is no caller to name, so
+/// the owner of the instance directory is the only safe local signal: a service
+/// runs as whoever already controls the configuration it is about to execute.
+///
+/// A root-owned instance directory under a direct root session is accepted only
+/// where the back end asks for it: launchd, whose contract says a daemon
+/// installed by a direct root session runs as root. systemd keeps refusing it,
+/// because running a unit as `User=0` is a privilege escalation nobody asked
+/// this change for. Mixed ownership is rejected either way rather than guessed
+/// at.
 #[cfg(unix)]
-fn service_account(instance_dir: &Path) -> Result<ServiceAccount> {
+fn service_account(instance_dir: &Path, root_fallback: RootFallback) -> Result<ServiceAccount> {
     let caller_ids = (std::env::var_os("SUDO_UID"), std::env::var_os("SUDO_GID"));
     if caller_ids.0.is_some() || caller_ids.1.is_some() {
         let uid = caller_ids
@@ -149,61 +183,22 @@ fn service_account(instance_dir: &Path) -> Result<ServiceAccount> {
             gid: metadata.gid(),
         });
     }
+    if metadata.uid() == 0 && metadata.gid() == 0 && root_fallback == RootFallback::Allow {
+        // Root's own state under a root session: there is no operator this
+        // could drop privileges to, and `verify_config_ownership` still
+        // requires the enrolled state to belong to the account named here.
+        return Ok(ServiceAccount { uid: 0, gid: 0 });
+    }
 
     Err(Error::InvalidArgument {
         message: format!(
-            "Failed to install the Spice Cloud Connect service: {} is root-owned and no non-root sudo caller is available. Run the command from the intended operator account with `sudo spice connect service install`.",
-            instance_dir.display()
+            "Failed to install the Spice Cloud Connect service: {} is owned by uid {} and gid {}, so the account the service should run as cannot be determined. Give the directory to one account (`chown <user>:<group> {}`), or re-run the command from the intended operator account with `sudo spice connect service install`.",
+            instance_dir.display(),
+            metadata.uid(),
+            metadata.gid(),
+            instance_dir.display(),
         ),
     })
-}
-
-/// Read the source runtime's version without giving an operator-controlled
-/// binary the installer's elevated privileges or environment.
-///
-/// A host-wide install is normally invoked through `sudo`, while the runtime
-/// lives under the invoking operator's home. The version probe therefore has
-/// to cross the same privilege boundary as the installed service: resolve the
-/// non-root service account first, then set its uid/gid and drop supplementary
-/// groups on the child before `exec`. Clearing the environment also keeps
-/// sudo-only credentials and dynamic-loader settings out of that untrusted
-/// process.
-fn runtime_version_for_service(spiced_path: &Path, instance_dir: &Path) -> Result<String> {
-    let mut command = std::process::Command::new(spiced_path);
-    command
-        .arg("--version")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .current_dir("/");
-
-    #[cfg(unix)]
-    if is_root() {
-        use std::os::unix::process::CommandExt as _;
-
-        let account = service_account(instance_dir)?;
-        // `CommandExt::uid` clears supplementary groups before dropping the
-        // uid, so the child cannot retain a privileged group from sudo.
-        command.uid(account.uid).gid(account.gid);
-    }
-
-    let output = command.output().map_err(|source| Error::CloudConnectIo {
-        message: format!(
-            "read the Spice runtime version from {} as the service account: {source}",
-            spiced_path.display()
-        ),
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(Error::RuntimeVersion {
-            message: if stderr.is_empty() {
-                format!("{} exited with {}", spiced_path.display(), output.status)
-            } else {
-                stderr
-            },
-        });
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// The local account name for a uid, when the host has one.
@@ -339,7 +334,8 @@ fn sanitize_fragment(name: &str) -> String {
 /// printed on.
 #[derive(Debug)]
 pub(crate) enum PreflightFailure {
-    /// Not Linux — this release does not expose another service backend.
+    /// Neither Linux nor macOS — this release exposes no other service
+    /// backend.
     UnsupportedPlatform,
     /// Linux, but systemd is not the running init.
     #[cfg(target_os = "linux")]
@@ -348,6 +344,14 @@ pub(crate) enum PreflightFailure {
     /// service to live in.
     #[cfg(target_os = "linux")]
     SystemdUserManagerUnavailable,
+    /// launchd's `launchctl` is not where it puts it. Gated exactly as the
+    /// launchd back end is, because that back end is what constructs it.
+    #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+    LaunchctlUnavailable,
+    /// launchd is there, but this account has no GUI login session for a
+    /// `LaunchAgent` to be bootstrapped into.
+    #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+    LaunchdGuiDomainUnavailable,
 }
 
 impl PreflightFailure {
@@ -356,7 +360,7 @@ impl PreflightFailure {
         match self {
             Self::UnsupportedPlatform => format!(
                 "Failed to install the Spice Cloud Connect service: a service needs \
-                 Linux with systemd (this host is {}). Run `spiced` from \
+                 Linux with systemd or macOS with launchd (this host is {}). Run `spiced` from \
                  the enrolled directory under your own supervisor, or run Spice in a container \
                  with a restart policy (`docker run --restart unless-stopped`). \
                  See: https://spiceai.org/docs",
@@ -378,6 +382,26 @@ impl PreflightFailure {
                  it (`sudo loginctl enable-linger <user>`), or install a host-wide service with \
                  `sudo spice connect service install`. See: https://spiceai.org/docs",
                 std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/<uid>".to_string())
+            ),
+            #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+            Self::LaunchctlUnavailable => format!(
+                "Failed to install the Spice Cloud Connect service: launchd's `launchctl` is not \
+                 at {}, so this command cannot manage a service on this host. Run `spiced` from \
+                 the enrolled directory under your own supervisor instead. \
+                 See: https://spiceai.org/docs",
+                launchd::LAUNCHCTL
+            ),
+            #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
+            Self::LaunchdGuiDomainUnavailable => format!(
+                "Failed to install the Spice Cloud Connect service: this account has no macOS \
+                 login session for a LaunchAgent to run in (launchd has no {domain} domain, which \
+                 is normal over SSH or in a headless session). Log in to this Mac as {account} at \
+                 the desktop and re-run `spice connect service install`, or install a system \
+                 service that starts at boot without any login with \
+                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                domain = launchd::gui_domain(),
+                account = account_name(nix::unistd::Uid::effective().as_raw())
+                    .unwrap_or_else(|| format!("uid {}", nix::unistd::Uid::effective().as_raw())),
             ),
         }
     }
@@ -406,7 +430,7 @@ fn preflight(
     backend: &dyn ServiceBackend,
     scope: ServiceScope,
 ) -> std::result::Result<(), PreflightFailure> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Err(PreflightFailure::UnsupportedPlatform);
     }
     backend.preflight(scope)
@@ -708,7 +732,9 @@ pub(crate) fn install_with_state(
     // Resolve the service account before the back end mutates supervisor
     // state. A sudo environment or directory-owner failure must not leave a
     // newly installed service that cannot be described durably.
-    let owner = install_owner(instance_dir)?;
+    // The direct-root question belongs to the back end, not to this shared
+    // path: launchd accepts it, systemd refuses it.
+    let owner = install_owner(instance_dir, root_fallback_for(backend.supervisor()))?;
     let installed = backend.install(&InstallRequest {
         instance_dir,
         config_dir: service_config_dir,
@@ -753,10 +779,23 @@ pub(crate) fn install_with_state(
     Ok(manifest)
 }
 
+/// Whether this supervisor accepts a root-owned instance directory under a
+/// direct root session.
+///
+/// Ungated for the same reason as [`RootFallback`]: `install_with_state`
+/// compiles on every target and calls this to build the argument, so gating it
+/// to Unix breaks the shared path everywhere else.
+fn root_fallback_for(supervisor: model::Supervisor) -> RootFallback {
+    match supervisor {
+        model::Supervisor::Launchd => RootFallback::Allow,
+        model::Supervisor::Systemd => RootFallback::Deny,
+    }
+}
+
 /// The account the freshly installed service runs as.
 #[cfg(unix)]
-fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
-    let account = service_account(instance_dir)?;
+fn install_owner(instance_dir: &Path, root_fallback: RootFallback) -> Result<ServiceOwner> {
+    let account = service_account(instance_dir, root_fallback)?;
     Ok(ServiceOwner {
         uid: account.uid,
         gid: account.gid,
@@ -765,9 +804,73 @@ fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
 }
 
 #[cfg(not(unix))]
-fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
+fn install_owner(instance_dir: &Path, _root_fallback: RootFallback) -> Result<ServiceOwner> {
     Ok(installed_owner(instance_dir))
 }
+
+/// The runtime's version, probed the way the service will run it.
+///
+/// The runtime an operator installed normally lives under their own home, so
+/// under `sudo` the resolved path is a binary that account can rewrite.
+/// Probing it as the current process would execute it as root with the
+/// caller's environment intact — full privilege handed to a user-writable
+/// binary, and before the staged-runtime check that deliberately runs it as
+/// the service account. So the probe drops to that account and clears the
+/// environment, matching what staging already does.
+fn probe_runtime_version(spiced: &Path, owner: &ServiceOwner) -> Result<String> {
+    let mut command = std::process::Command::new(spiced);
+    command
+        .arg("--version")
+        // The candidate is operator-supplied. Give it no CLI secrets or
+        // dynamic-loader overrides while probing it.
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/");
+    drop_to_service_account(&mut command, owner);
+
+    let output = command.output().map_err(|source| Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service: the runtime at {spiced} could \
+             not be run to read its version: {source}. Check that it is executable by {account}, \
+             then re-run `spice connect service install`. See: https://spiceai.org/docs",
+            spiced = spiced.display(),
+            account = owner
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("uid {}", owner.uid)),
+        ),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: the runtime at {spiced} \
+                 exited with {status} instead of reporting its version{detail}. The manifest \
+                 records the version installed, so nothing was installed. See: \
+                 https://spiceai.org/docs",
+                spiced = spiced.display(),
+                status = output.status,
+                detail = if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                },
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run the probe as the account the service will run as.
+#[cfg(unix)]
+fn drop_to_service_account(command: &mut std::process::Command, owner: &ServiceOwner) {
+    use std::os::unix::process::CommandExt as _;
+    command.uid(owner.uid).gid(owner.gid);
+}
+
+/// No account to drop to off Unix, where no supervisor this module drives runs.
+#[cfg(not(unix))]
+fn drop_to_service_account(_command: &mut std::process::Command, _owner: &ServiceOwner) {}
 
 /// Refuse to install a service into a different domain from the one this
 /// directory already has a service in.
@@ -1111,6 +1214,65 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn ensure_root_only_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| Error::CloudConnectIo {
+        message: format!("create {}: {e}", dir.display()),
+    })
+}
+
+/// Create `dir` if absent and refuse it unless this account alone can change
+/// what it holds.
+///
+/// The counterpart of [`ensure_root_only_dir`] for a user service, whose assets
+/// live in the account's own tree rather than in a root-owned one.
+///
+/// The leaf is what is checked, not the whole path to it: everything above a
+/// user's data directory is the account's own home, and anyone who can write
+/// that can already replace the `spiced` on the operator's `PATH`. What this
+/// rules out is the thing that is not implied — a directory shared with another
+/// account, or a symlink pointing the service's assets somewhere this check
+/// cannot vouch for.
+#[cfg(unix)]
+fn ensure_account_only_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(dir)
+        .map_err(|e| Error::CloudConnectIo {
+            message: format!("create {}: {e}", dir.display()),
+        })?;
+
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| Error::CloudConnectIo {
+        message: format!("inspect {}: {e}", dir.display()),
+    })?;
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let mode = meta.permissions().mode() & 0o7777;
+    if meta.file_type().is_symlink() || meta.uid() != uid || mode & 0o022 != 0 {
+        // Name what was found, not only what is required: the three conditions
+        // fail identically otherwise, and "owned by uid N with mode M" is what
+        // tells an operator whether to chown or to chmod.
+        let found = if meta.file_type().is_symlink() {
+            "is a symlink".to_string()
+        } else {
+            format!("is owned by uid {} with mode {mode:04o}", meta.uid())
+        };
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service: {dir} {found}, but it must be \
+                 a real directory owned by this account (uid {uid}) that no other account can \
+                 write, so the runtime the service executes cannot be replaced behind it. Fix it \
+                 (`chown {uid} {dir}` and `chmod go-w {dir}`) and re-run \
+                 `spice connect service install`.",
+                dir = dir.display(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_account_only_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| Error::CloudConnectIo {
         message: format!("create {}: {e}", dir.display()),
     })
@@ -1717,6 +1879,38 @@ mod tests {
             .expect("re-installing in the same domain is the upgrade path");
     }
 
+    /// #12906 asks for a direct-root launchd daemon to run as root. Nothing
+    /// asked for that on systemd, where it would mean running a unit as
+    /// `User=0`, so the two back ends answer differently and this pins which.
+    #[cfg(unix)]
+    #[test]
+    fn only_launchd_accepts_a_root_owned_directory_under_a_root_session() {
+        assert_eq!(
+            root_fallback_for(model::Supervisor::Launchd),
+            RootFallback::Allow
+        );
+        assert_eq!(
+            root_fallback_for(model::Supervisor::Systemd),
+            RootFallback::Deny,
+            "enabling this for systemd would be a privilege change this work does not target"
+        );
+
+        // `/` is root-owned, so it stands in for a root-owned instance
+        // directory without needing one. Under a non-root test session there is
+        // no SUDO_UID either, which is the exact condition the fallback covers.
+        if !is_root() && std::env::var_os("SUDO_UID").is_none() {
+            let denied = service_account(Path::new("/"), RootFallback::Deny);
+            assert!(
+                denied.is_err(),
+                "systemd must keep refusing root-owned state, got {denied:?}"
+            );
+            let allowed =
+                service_account(Path::new("/"), RootFallback::Allow).expect("launchd accepts it");
+            assert_eq!(allowed.uid, 0);
+            assert_eq!(allowed.gid, 0);
+        }
+    }
+
     /// The manifest a fake back end would write for `instance_dir`.
     fn manifest_for(backend: &FakeBackend, instance_dir: &Path) -> ServiceManifest {
         let scope = ServiceScope::System;
@@ -1727,10 +1921,14 @@ mod tests {
             name: name.clone(),
             scope,
             supervisor: backend.supervisor(),
+            // The account running the test, because writing a manifest refuses
+            // an owner that does not match the directory it is written into.
+            // A fixed id passes only on a host whose operator happens to have
+            // it.
             owner: ServiceOwner {
-                uid: 1000,
-                gid: 1000,
-                name: Some("alice".to_string()),
+                uid: nix::unistd::Uid::effective().as_raw(),
+                gid: nix::unistd::Gid::effective().as_raw(),
+                name: account_name(nix::unistd::Uid::effective().as_raw()),
             },
             definition_path: backend.definition_path(&name, scope),
             runtime_path: PathBuf::from("/usr/local/lib/spice/edge-1/spiced"),
@@ -1913,7 +2111,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// Only Linux pins the locked directory by descriptor
+    /// (`/proc/self/fd/<n>`); elsewhere `descriptor_relative_config_dir`
+    /// falls back to the pathname, so the redirection this rules out is not
+    /// ruled out there. The guarantee is scoped the same way the mechanism is.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn locked_uninstall_cannot_be_redirected_by_config_path_replacement() {
         let dir = tempfile::tempdir().expect("create tempdir");

@@ -40,18 +40,19 @@ limitations under the License.
 //! previous unit and the previous runtime back before failing — an upgrade must
 //! never leave an instance worse off than the one it replaced.
 
-use std::io::{Read as _, Write as _};
-use std::net::{TcpStream, ToSocketAddrs as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::backend::{
     InstallRequest, LogRequest, ServiceBackend, ServiceConflict, ServiceObservation,
 };
+use super::host::{CommandOutput, HealthProbe, folded, is_probeable, probe_http_health};
 use super::manifest::ServiceManifest;
 use super::model::{LogSource, ServiceScope, ServiceStarts, ServiceState, Supervisor};
 use super::{
     InstalledService, PreflightFailure, SYSTEMD_RUNTIME_MARKER, ServiceAccount, ServiceOwner,
+    ensure_account_only_dir,
 };
 use crate::error::{Error, Result};
 
@@ -115,13 +116,6 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LIFECYCLE_ATTEMPTS: u32 = 40;
 
-/// How long the health probe waits for the instance to accept a connection and
-/// answer. Short: it is retried for the whole of the gate.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Bytes of a health response read before giving up on finding a status line.
-const PROBE_READ_LIMIT: usize = 512;
-
 /// How long one uninterrupted run stands in for an unanswered health probe: a
 /// runtime that has served this long on the same start is up, whatever the
 /// recorded health URL points at. Measured on the clock and against systemd's
@@ -141,33 +135,6 @@ pub(super) fn unit_name_for_dir(dir: &Path) -> String {
         "{UNIT_PREFIX}-{stem}{UNIT_SUFFIX}",
         stem = super::name_stem_for_dir(dir)
     )
-}
-
-/// One completed supervisor command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CommandOutput {
-    /// Whether the command reported success.
-    pub(super) success: bool,
-    /// The exit code, when the command exited on its own.
-    pub(super) code: Option<i32>,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
-}
-
-impl CommandOutput {
-    /// How a failure is named in an error message: the supervisor's own words
-    /// when it said any, because they diagnose the problem far better than an
-    /// exit code.
-    fn describe_failure(&self) -> String {
-        let stderr = folded(self.stderr.trim());
-        if !stderr.is_empty() {
-            return stderr;
-        }
-        match self.code {
-            Some(code) => format!("exit status {code}"),
-            None => "terminated by a signal".to_string(),
-        }
-    }
 }
 
 /// Everything this back end does outside its own process.
@@ -208,16 +175,6 @@ pub(super) trait SystemdHost {
 
     /// Wait before polling again.
     fn sleep(&self, duration: Duration);
-}
-
-/// A health endpoint can be absent while the service starts or deliberately
-/// configured elsewhere; that is different from a runtime that answered with
-/// an explicit unhealthy status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HealthProbe {
-    Healthy,
-    Unhealthy,
-    Unreachable,
 }
 
 /// The host as it really is.
@@ -277,99 +234,6 @@ fn trusted_supervisor_program(program: &str) -> std::io::Result<PathBuf> {
             TRUSTED_SUPERVISOR_DIRS.join(", ")
         ),
     ))
-}
-
-/// Whether a health URL is one this back end can probe.
-///
-/// Only plain HTTP is: the recorded URL is the loopback endpoint the runtime
-/// serves, and a gate that cannot reach an unusual one must not fail an install
-/// that is fine — it gates on what systemd reports instead.
-fn is_probeable(url: &str) -> bool {
-    url.strip_prefix("http://")
-        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-}
-
-/// `GET` the health URL and report whether it answered `2xx`.
-///
-/// Blocking and dependency-free on purpose: this runs inside the installer's
-/// own thread, between two filesystem operations, and answers one question
-/// about one loopback address.
-fn probe_http_health(url: &str) -> HealthProbe {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return HealthProbe::Unreachable;
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, "/"),
-    };
-    let authority = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:80")
-    };
-
-    let Ok(mut addrs) = authority.to_socket_addrs() else {
-        return HealthProbe::Unreachable;
-    };
-    let Some(addr) = addrs.next() else {
-        return HealthProbe::Unreachable;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) else {
-        return HealthProbe::Unreachable;
-    };
-    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
-    {
-        return HealthProbe::Unreachable;
-    }
-
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: spice\r\nConnection: close\r\n\r\n"
-    );
-    if stream.write_all(request.as_bytes()).is_err() {
-        return HealthProbe::Unreachable;
-    }
-
-    let mut response = Vec::with_capacity(PROBE_READ_LIMIT);
-    let mut chunk = [0_u8; 128];
-    while response.len() < PROBE_READ_LIMIT {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => response.extend_from_slice(&chunk[..read]),
-            Err(_) => return HealthProbe::Unreachable,
-        }
-        if response.contains(&b'\n') {
-            break;
-        }
-    }
-    status_line_probe(&String::from_utf8_lossy(&response))
-}
-
-/// Classify a complete HTTP status line without treating transport failures as
-/// an explicit unhealthy response.
-///
-/// The terminator is required: a response that ended before one arrived is a
-/// connection that was cut mid-answer, and reading `HTTP/1.1 20` as a success
-/// would report an instance healthy on the strength of a truncated read.
-fn status_line_probe(response: &str) -> HealthProbe {
-    let Some((line, _)) = response.split_once('\n') else {
-        return HealthProbe::Unreachable;
-    };
-    let mut fields = line.split_whitespace();
-    let Some(version) = fields.next() else {
-        return HealthProbe::Unreachable;
-    };
-    if !version.starts_with("HTTP/") {
-        return HealthProbe::Unreachable;
-    }
-    let Some(code) = fields.next().and_then(|code| code.parse::<u16>().ok()) else {
-        return HealthProbe::Unreachable;
-    };
-    if (200..300).contains(&code) {
-        HealthProbe::Healthy
-    } else {
-        HealthProbe::Unhealthy
-    }
 }
 
 /// Render the unit file for an instance.
@@ -591,7 +455,10 @@ fn prepare_account(request: &InstallRequest<'_>) -> Result<Option<ServiceAccount
     if request.scope == ServiceScope::User {
         return Ok(None);
     }
-    let account = super::service_account(request.instance_dir)?;
+    // Deny: a direct root session installing from root-owned state is refused
+    // here as it always has been. Running a unit as `User=0` is not a change
+    // this back end asked for.
+    let account = super::service_account(request.instance_dir, super::RootFallback::Deny)?;
     super::verify_config_ownership(request.config_dir, account)?;
     Ok(Some(account))
 }
@@ -1073,46 +940,6 @@ fn ensure_stage_dir(dir: &Path, scope: ServiceScope) -> Result<()> {
     }
 }
 
-/// Create `dir` if absent and refuse it unless this account alone can change
-/// what it holds.
-///
-/// The leaf is what is checked, not the whole path to it: everything above a
-/// user's data directory is the account's own home, and anyone who can write
-/// that can already replace the `spiced` on the operator's `PATH`. What this
-/// rules out is the thing that is not implied — a staging directory shared with
-/// another account, or a symlink pointing the service's binary somewhere this
-/// check cannot vouch for.
-fn ensure_account_only_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
-
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(dir)
-        .map_err(|e| Error::CloudConnectIo {
-            message: format!("create {}: {e}", dir.display()),
-        })?;
-
-    let meta = std::fs::symlink_metadata(dir).map_err(|e| Error::CloudConnectIo {
-        message: format!("inspect {}: {e}", dir.display()),
-    })?;
-    let uid = nix::unistd::Uid::effective().as_raw();
-    let mode = meta.permissions().mode() & 0o7777;
-    if meta.file_type().is_symlink() || meta.uid() != uid || mode & 0o022 != 0 {
-        return Err(Error::InvalidArgument {
-            message: format!(
-                "Failed to install the Spice Cloud Connect service: {dir} must be a real \
-                 directory owned by this account (uid {uid}) that no other account can write, so \
-                 the runtime the service executes cannot be replaced behind it. Fix it \
-                 (`chown {uid} {dir}` and `chmod go-w {dir}`) and re-run \
-                 `spice connect service install`.",
-                dir = dir.display(),
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// Write a unit file, creating its directory and replacing it atomically.
 fn write_unit(path: &Path, unit: &str) -> Result<()> {
     write_unit_bytes(path, unit.as_bytes())
@@ -1509,7 +1336,7 @@ fn installation_unit_dirs(instance_dir: &Path) -> Vec<PathBuf> {
     if let Some(user_units) = unit_dir(ServiceScope::User) {
         directories.push(user_units);
     }
-    if let Ok(account) = super::service_account(instance_dir)
+    if let Ok(account) = super::service_account(instance_dir, super::RootFallback::Deny)
         && let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(account.uid))
     {
         directories.push(user.dir.join(".config").join(SYSTEMD_USER_UNIT_SUBDIR));
@@ -1981,14 +1808,6 @@ fn systemctl_action(
             ),
         }
     })
-}
-
-/// One line, whatever the source said.
-///
-/// Supervisor output arrives with newlines in it, and a log line that carries
-/// them is two records that only one of which can be searched for.
-fn folded(message: &str) -> String {
-    message.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The Linux back end.
@@ -3076,31 +2895,6 @@ mod tests {
         .expect("systemd's own report is the answer here");
     }
 
-    #[test]
-    fn status_lines_distinguish_unhealthy_answers_from_transport_failures() {
-        assert_eq!(
-            status_line_probe("HTTP/1.1 200 OK\r\nDate: now\r\n"),
-            HealthProbe::Healthy
-        );
-        assert_eq!(
-            status_line_probe("HTTP/1.0 204 No Content\r\n"),
-            HealthProbe::Healthy
-        );
-        assert_eq!(
-            status_line_probe("HTTP/1.1 503 Service Unavailable\r\n"),
-            HealthProbe::Unhealthy
-        );
-        // A response that ended before the status line did is a cut
-        // connection, not a healthy instance.
-        assert_eq!(
-            status_line_probe("HTTP/1.1 200"),
-            HealthProbe::Unreachable,
-            "no terminator"
-        );
-        assert_eq!(status_line_probe(""), HealthProbe::Unreachable);
-        assert_eq!(status_line_probe("garbage\r\n"), HealthProbe::Unreachable);
-    }
-
     /// An install request pointing at a runtime and directories under `root`.
     fn install_request<'a>(
         instance_dir: &'a Path,
@@ -3555,13 +3349,5 @@ mod tests {
             .expect("a gate is a small number of polls")
             + 1;
         assert_eq!(samples, SAMPLES_IN_A_GATE);
-    }
-
-    #[test]
-    fn a_folded_message_stays_on_one_line() {
-        assert_eq!(
-            folded("Failed to start.\nSee `systemctl status`.\n"),
-            "Failed to start. See `systemctl status`."
-        );
     }
 }

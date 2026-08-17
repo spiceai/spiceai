@@ -1345,7 +1345,9 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
         },
     };
     let (enrollment_transaction, mut operation) = tokio::task::spawn_blocking(move || {
-        let facts = InstanceFacts::gather(&runtime_version);
+        // The instance's own config directory is what makes the fingerprint
+        // name this instance rather than the host it runs on.
+        let facts = InstanceFacts::gather(&runtime_version, &prepare_dir);
         // A resumed run exists to finish one operation, so it settles that
         // question before anything can publish a new one. `load_or_create`
         // creates when the draft is absent, and creating here would answer a
@@ -2206,7 +2208,7 @@ mod tests {
             if let Some(binding) = self.replacement.take() {
                 EnrollmentDraft::load_or_create(
                     &self.config_dir,
-                    &InstanceFacts::gather("v0.0.0-racing-test"),
+                    &InstanceFacts::gather("v0.0.0-racing-test", &self.config_dir),
                     Some("lab-seoul"),
                     &binding,
                 )
@@ -2238,7 +2240,7 @@ mod tests {
     fn pending_draft(config_dir: &Path, authority: EnrollmentAuthorityBinding) -> EnrollmentDraft {
         EnrollmentDraft::load_or_create(
             config_dir,
-            &InstanceFacts::gather("v0.0.0-resume-test"),
+            &InstanceFacts::gather("v0.0.0-resume-test", config_dir),
             Some("lab-seoul"),
             &EnrollmentRequestBinding {
                 endpoint: "https://api.spice.ai".to_string(),
@@ -2509,7 +2511,7 @@ mod tests {
         let endpoint = closed_endpoint();
         let published = EnrollmentDraft::load_or_create(
             &config_dir,
-            &InstanceFacts::gather("v0.0.0-resume-test"),
+            &InstanceFacts::gather("v0.0.0-resume-test", &config_dir),
             Some("lab-seoul"),
             &EnrollmentRequestBinding {
                 endpoint: endpoint.clone(),
@@ -2602,7 +2604,7 @@ mod tests {
             let config_dir = CloudConnectConfig::resolve_config_dir(Some(&directory));
             let routed = EnrollmentDraft::load_or_create(
                 &config_dir,
-                &InstanceFacts::gather("v0.0.0-racing-test"),
+                &InstanceFacts::gather("v0.0.0-racing-test", &config_dir),
                 Some("lab-seoul"),
                 &routed_binding,
             )
@@ -2667,7 +2669,7 @@ mod tests {
         let endpoint = closed_endpoint();
         let published = EnrollmentDraft::load_or_create(
             &config_dir,
-            &InstanceFacts::gather("v0.0.0-ordering-test"),
+            &InstanceFacts::gather("v0.0.0-ordering-test", &config_dir),
             Some("lab-seoul"),
             &EnrollmentRequestBinding {
                 endpoint: endpoint.clone(),
@@ -2731,7 +2733,7 @@ mod tests {
         let endpoint = closed_endpoint();
         EnrollmentDraft::load_or_create(
             &config_dir,
-            &InstanceFacts::gather("v0.0.0-racing-test"),
+            &InstanceFacts::gather("v0.0.0-racing-test", &config_dir),
             Some("lab-seoul"),
             &EnrollmentRequestBinding {
                 endpoint: endpoint.clone(),

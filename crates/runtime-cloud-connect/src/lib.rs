@@ -72,6 +72,7 @@ pub mod release;
 pub mod runtime_lock;
 pub mod sealed_secrets;
 pub mod secret_cache;
+pub mod service_log;
 pub mod session;
 
 mod client;
@@ -506,6 +507,11 @@ impl CloudConnect {
 
         let runtime_for_task = runtime;
         let task = tokio::spawn(async move {
+            // Resolving the machine id can cost a subprocess (macOS reads the
+            // platform UUID out of `ioreg`), and the first `Hello` is built on
+            // this task. Pay for it once, off the worker, so the frame that
+            // follows never blocks one.
+            let _ = tokio::task::spawn_blocking(fingerprint::prime_machine_id).await;
             let driver = client::ClientDriver::new(
                 config,
                 runtime_for_task,

@@ -500,10 +500,10 @@ async fn start_instance(ctx: &RuntimeContext, dir: Option<&Path>, verbosity: u8)
     // a defensive boundary for callers that invoke this helper directly.
     ctx.ensure_local_runtime_supported()?;
 
-    // This release exposes persistent lifecycle only on Linux/systemd. Keep
-    // macOS on the same foreground path as an unmanaged host until launchd's
-    // start, stop, restart, and logs contract is complete.
-    if !cfg!(target_os = "linux") {
+    // A host with no supervisor this release drives has nothing that could own
+    // the process, so the runtime runs in the foreground and this command stays
+    // attached to it.
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         println!("Starting the Spice runtime. Press Ctrl-C to stop it.");
         return crate::runtime_launcher::run_runtime(
             ctx,
@@ -551,11 +551,9 @@ async fn start_instance(ctx: &RuntimeContext, dir: Option<&Path>, verbosity: u8)
     };
 
     // A service that is already up is the state this command asks for, so it is
-    // reported without being touched. That is not just an optimization: it is
-    // what makes `spice connect` answer on every host whose supervisor this
-    // release cannot yet drive (launchd's lifecycle actions are still
-    // unimplemented), and it is what keeps the command from interrupting a
-    // serving instance. Anything else is asked to start.
+    // reported without being touched: interrupting a serving instance to prove
+    // it can be started is the one thing this must not do. Anything else is
+    // asked to start.
     if backend.observe(&manifest).state != ServiceState::Running {
         backend.start(&manifest)?;
     }

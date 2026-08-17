@@ -425,6 +425,21 @@ pub struct Args {
     #[arg(long, value_name = "CORES")]
     pub cpu_cores: Option<String>,
 
+    /// Write the console log to bounded, rotating files in this directory
+    /// instead of relying on the supervisor to store it.
+    ///
+    /// Set by `spice connect service install` on a supervisor that owns no log
+    /// store of its own — launchd writes whatever a job prints to the files its
+    /// definition names and never bounds them, so the runtime bounds its own
+    /// output instead. The policy is fixed
+    /// (`runtime_cloud_connect::service_log`) because `spice connect service
+    /// logs` reads these files back against the same constants.
+    ///
+    /// Hidden: this is the service installer's interface to the runtime, not an
+    /// operator's. `spice connect service logs` is how the files are read.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub service_log_dir: Option<PathBuf>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
 }
@@ -805,6 +820,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             app.as_ref().and_then(|a| a.runtime.output_level),
         ),
         cloud_connect_configured,
+        args.service_log_dir.as_deref(),
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;

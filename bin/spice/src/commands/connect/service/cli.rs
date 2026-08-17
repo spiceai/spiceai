@@ -172,7 +172,7 @@ pub async fn execute(
         return Ok(());
     };
     if !matches!(&command, ServiceCommand::Status(_)) {
-        ensure_linux_service_lifecycle()?;
+        ensure_service_lifecycle_supported()?;
     }
 
     let backend = backend();
@@ -289,22 +289,29 @@ pub async fn execute(
     }
 }
 
+/// Refuse a lifecycle action on a host with no supervisor this release drives.
+///
+/// `status` is deliberately exempt: it has to render something on every host,
+/// and it already reports `not_installed` there.
 #[cfg_attr(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "macos"),
     expect(
         clippy::unnecessary_wraps,
         reason = "the cross-platform command boundary returns Result so unsupported targets can reject the lifecycle"
     )
 )]
-fn ensure_linux_service_lifecycle() -> Result<()> {
-    #[cfg(target_os = "linux")]
+fn ensure_service_lifecycle_supported() -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(Error::InvalidArgument {
-            message: "`spice connect service` currently supports Linux with systemd. macOS lifecycle support will follow once launchd start, stop, restart, and logs are complete. See: https://spiceai.org/docs".to_string(),
+            message: format!(
+                "`spice connect service` supports Linux with systemd and macOS with launchd (this host is {}). Run `spiced` from the enrolled directory under your own supervisor instead. See: https://spiceai.org/docs",
+                std::env::consts::OS
+            ),
         })
     }
 }
@@ -331,9 +338,17 @@ async fn install(
     })?;
     // Propagated, not defaulted: the manifest records the version installed, so
     // a lookup that failed has to fail the install rather than publish a
-    // manifest that claims no version at all. A sudo invocation must probe the
-    // operator-owned binary as the service account, never as root.
-    let runtime_version = super::runtime_version_for_service(&spiced_path, instance_dir)?;
+    // manifest that claims no version at all.
+    //
+    // Resolved and probed as the account the service will run as, not as this
+    // process: the runtime the operator installed is normally under their own
+    // home, so under `sudo` reading its version here as root would execute a
+    // user-writable binary with full privilege and the caller's environment.
+    let service_owner = super::install_owner(
+        instance_dir,
+        super::root_fallback_for(super::backend().supervisor()),
+    )?;
+    let runtime_version = super::probe_runtime_version(&spiced_path, &service_owner)?;
     let health_url = format!("{}/health", ctx.http_endpoint().trim_end_matches('/'));
 
     // Staging files, invoking systemd, and polling the blocking health gate are

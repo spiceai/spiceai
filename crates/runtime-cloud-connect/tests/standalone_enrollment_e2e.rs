@@ -2479,7 +2479,10 @@ async fn an_existing_identity_wins_without_redeeming_the_key() {
     // scrub this provisional private material without contacting the cloud.
     runtime_cloud_connect::EnrollmentDraft::load_or_create(
         dir.path(),
-        &runtime_cloud_connect::enroll::InstanceFacts::gather(&config.runtime_version),
+        &runtime_cloud_connect::enroll::InstanceFacts::gather(
+            &config.runtime_version,
+            &config.config_dir,
+        ),
         config.instance_region.as_deref(),
         &runtime_cloud_connect::EnrollmentRequestBinding {
             endpoint: config.enroll_endpoint.trim_end_matches('/').to_string(),

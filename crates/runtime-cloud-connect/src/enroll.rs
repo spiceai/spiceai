@@ -316,9 +316,10 @@ impl Error {
 }
 
 /// Host facts a standalone `spiced` reports at enroll — recorded on the
-/// cloud `instances` registry row. `fingerprint` is the stable machine
-/// identity: re-enrolling the same host lands on its existing row instead
-/// of minting a duplicate.
+/// cloud `instances` registry row. `fingerprint` is the stable *instance*
+/// identity: re-enrolling the same instance lands on its existing row instead
+/// of minting a duplicate, while a second instance on the same host gets a row
+/// of its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceFacts {
     pub fingerprint: String,
@@ -329,14 +330,19 @@ pub struct InstanceFacts {
 }
 
 impl InstanceFacts {
-    /// Gather the local host facts. All fields are guaranteed non-empty
-    /// (the enroll endpoint rejects empty strings): unknown values degrade
-    /// to `"unknown"` rather than failing enrollment.
+    /// Gather the local host facts for the instance rooted at `config_dir`.
+    ///
+    /// All fields are guaranteed non-empty (the enroll endpoint rejects empty
+    /// strings): unknown values degrade to `"unknown"` rather than failing
+    /// enrollment.
+    ///
+    /// `config_dir` is what makes the fingerprint name *this* instance rather
+    /// than the host it happens to run on — see [`crate::fingerprint`].
     #[must_use]
-    pub fn gather(runtime_version: &str) -> Self {
+    pub fn gather(runtime_version: &str, config_dir: &std::path::Path) -> Self {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         Self {
-            fingerprint: crate::fingerprint::compute(),
+            fingerprint: crate::fingerprint::compute(config_dir),
             hostname: non_empty_or_unknown(hostname),
             os: non_empty_or_unknown(std::env::consts::OS.to_string()),
             arch: non_empty_or_unknown(std::env::consts::ARCH.to_string()),
@@ -1404,8 +1410,6 @@ where
     }
     let authority = authority()?;
 
-    let facts = InstanceFacts::gather(&config.runtime_version);
-    let draft_facts = facts.clone();
     let draft_region = config.instance_region.clone();
     let draft_binding = EnrollmentRequestBinding {
         endpoint: normalized_endpoint,
@@ -1421,8 +1425,17 @@ where
         },
     };
     let draft_transaction = Arc::clone(&enrollment_transaction);
+    // Gathered inside the blocking task, not before it: the fingerprint
+    // canonicalizes the config directory and, on macOS, resolves the platform
+    // UUID by running `ioreg`. Both are filesystem and process work that would
+    // otherwise run straight on a Tokio worker, and priming the machine id when
+    // the client starts does not help here — enrollment computes the
+    // fingerprint first.
+    let facts_runtime_version = config.runtime_version.clone();
+    let facts_config_dir = config.config_dir.clone();
     let draft = tokio::task::spawn_blocking(move || {
-        draft_transaction.load_or_create(&draft_facts, draft_region.as_deref(), &draft_binding)
+        let facts = InstanceFacts::gather(&facts_runtime_version, &facts_config_dir);
+        draft_transaction.load_or_create(&facts, draft_region.as_deref(), &draft_binding)
     })
     .await
     .unwrap_or_else(|join| {
@@ -2926,7 +2939,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let published = EnrollmentDraft::load_or_create(
             dir.path(),
-            &InstanceFacts::gather("v0.0.0-assertion-test"),
+            &InstanceFacts::gather("v0.0.0-assertion-test", dir.path()),
             None,
             &EnrollmentRequestBinding {
                 endpoint: "https://api.spice.ai".to_string(),

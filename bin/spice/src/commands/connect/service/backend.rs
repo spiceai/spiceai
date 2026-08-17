@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![cfg_attr(not(target_os = "linux"), expect(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
 
 //! The interface every service back end implements.
 //!
-//! One trait for the supported systemd back end, with no defaulted methods: a back end
+//! One trait for both supported back ends, with no defaulted methods: a back end
 //! that forgets an operation fails to compile rather than silently inheriting
 //! a no-op, which is the failure mode a defaulted lifecycle method has.
 //!
@@ -217,8 +217,14 @@ pub(crate) fn for_host() -> &'static dyn ServiceBackend {
     &super::systemd::SystemdBackend
 }
 
+/// The back end for macOS.
+#[cfg(target_os = "macos")]
+pub(crate) fn for_host() -> &'static dyn ServiceBackend {
+    &super::launchd::LaunchdBackend
+}
+
 /// The back end for a host with no supported supervisor.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn for_host() -> &'static dyn ServiceBackend {
     &unsupported::UnsupportedBackend
 }
@@ -228,7 +234,7 @@ pub(crate) fn for_host() -> &'static dyn ServiceBackend {
 /// [`ServiceBackend::preflight`] rejects such a host before any state changes,
 /// so the remaining operations exist to keep the CLI building and to give the
 /// same refusal if one is somehow reached.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported {
     use super::{
         InstallRequest, InstalledService, LogRequest, LogSource, Path, PathBuf, PreflightFailure,
