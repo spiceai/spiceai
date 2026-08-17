@@ -328,8 +328,9 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
-        // The outer .instrument is redundant and interferes with parent span context
+        // Deliberately not instrumented: the call inherits the caller's span, and adding
+        // an explicit `.instrument(Span::current())` here nests a second span that breaks
+        // propagation to the parent rather than preserving it.
         self.chat_request(
             CreateChatCompletionRequestArgs::default()
                 .messages(vec![
@@ -406,8 +407,8 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        // BUG FIX: The stream() call should inherit the current span context automatically
-        // No need to explicitly instrument here as it interferes with parent span propagation
+        // `stream()` inherits the caller's span; instrumenting it here would interfere
+        // with propagation to the parent rather than adding context.
         let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -437,8 +438,8 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        // BUG FIX: The run() call should inherit the current span context automatically
-        // No need to explicitly instrument here as it interferes with parent span propagation
+        // `run()` inherits the caller's span; instrumenting it here would interfere with
+        // propagation to the parent rather than adding context.
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
