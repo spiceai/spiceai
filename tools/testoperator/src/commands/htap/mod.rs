@@ -592,9 +592,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
-    // For Cayenne backend report additional metrics
+    // For Cayenne backend report additional metrics. One end-of-run scrape serves
+    // both: every series they read is cumulative for the run, so its value here is
+    // the run's total.
     match crate::spiced_metrics::MetricsScraper::scrape_once().await {
-        Ok(final_metrics) => reporting::emit_cayenne_compaction_metrics(&final_metrics),
+        Ok(final_metrics) => {
+            reporting::emit_cayenne_compaction_metrics(&final_metrics);
+            reporting::emit_cayenne_maintenance_metrics(&final_metrics);
+        }
         Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
     }
 

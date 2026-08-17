@@ -18866,6 +18866,17 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if a bake merge was committed, `Ok(false)` for a no-op
     /// (position mode, fewer than `K + 2` protected snapshots, no clean prefix with
     /// a populated manifest, or the CAS lost a race).
+    ///
+    /// Records compaction telemetry under `kind="bake"`, on the same terms as the
+    /// subset path ([`Self::compact_protected_snapshots_subset`]): a pass that
+    /// committed a merge (`Ok(true)`) or attempted one and failed (`Err`) emits
+    /// `cayenne_compaction_duration_ms`, whose count is the bake-pass counter; the
+    /// no-op early-outs (`Ok(false)`) are intentionally not counted. The bake is a
+    /// selection variant of the subset compaction but reports its own `kind` — the
+    /// two are triggered independently and shrink different things (a bake targets
+    /// the deletion index), so a shared label would make neither rate readable.
+    /// Unlike the subset path it emits no `cayenne_compaction_merged_bytes`, so the
+    /// merged-bytes series has no `kind="bake"` member.
     /// Resurrect-rows-critical clean-prefix gate for the seq-prefix bake. Pruning
     /// the deletion index at/below `prefix_cutoff` (T) is sound iff EVERY live
     /// snapshot — the current snapshot ∪ the protected snapshots NOT being baked
@@ -18943,6 +18954,7 @@ impl CayenneTableProvider {
     /// `run_compaction_trigger`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        let pass_start = std::time::Instant::now();
         // Boxed so the whole bake body lives on the heap rather than in the caller's
         // frame. This is one of the largest async fns in the crate, and its future is
         // inlined into every caller's — the compaction trigger, and the property tests
@@ -18950,7 +18962,41 @@ impl CayenneTableProvider {
         // put a `#[tokio::test(flavor = "multi_thread")]` worker over the default 2 MiB
         // stack; issue #12436 records the same budget for neighbouring tests in this
         // family. One allocation per pass on a background path.
-        Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await
+        let result = Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await;
+
+        // Count only passes that did real work (committed a bake merge) or attempted
+        // one and failed, matching the subset path's convention
+        // ([`Self::compact_protected_snapshots_subset`]) so `kind` values are counted
+        // on the same terms and the no-op early-outs do not inflate the rate.
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::cayenne::track_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "bake"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if matches!(
+                &result,
+                Result::Err(Error::DataFusion {
+                    source: DataFusionError::ResourcesExhausted(_)
+                })
+            ) {
+                telemetry::cayenne::track_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "bake"),
+                ]);
+            }
+        }
+
+        result
     }
 
     /// Records how a seq-prefix bake pass ended. The duration histogram counts only

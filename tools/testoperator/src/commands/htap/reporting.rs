@@ -416,8 +416,131 @@ pub(super) fn emit_cayenne_read_amp_percentiles(metrics: &crate::spiced_metrics:
     println!();
 }
 
+/// Cayenne's background maintenance operations, as `(reported name, scraped
+/// series)`. Each series is cumulative for the run, so its end value is how many
+/// times that operation ran.
+///
+/// Compaction passes are deliberately absent: they carry `table`/`kind` labels
+/// worth keeping apart, so [`emit_cayenne_compaction_metrics`] reports them at
+/// that granularity instead of collapsing them to one number here.
+///
+/// A histogram contributes its `_count` series; a counter is already a count.
+/// Everything here is an operation *count*, so a quantity in other units (e.g.
+/// `cayenne_metastore_incremental_vacuum_pages_total`, which counts pages rather
+/// than vacuums) does not belong.
+const CAYENNE_MAINTENANCE_SERIES: &[(&str, &str)] = &[
+    ("write_phases", "cayenne_write_phase_duration_ms_count"),
+    (
+        "mem_tier_checkpoint_ticks",
+        "cayenne_mem_tier_checkpoint_tick_total",
+    ),
+    (
+        "metastore_checkpoints",
+        "cayenne_metastore_checkpoint_ms_count",
+    ),
+    (
+        "metastore_vacuums",
+        "cayenne_metastore_incremental_vacuum_ms_count",
+    ),
+    (
+        "inline_cache_full_rebuilds",
+        "cayenne_inline_cache_full_rebuilds_total",
+    ),
+    (
+        "inline_cache_delta_populates",
+        "cayenne_inline_cache_delta_populates_total",
+    ),
+    (
+        "inline_tombstone_writes",
+        "cayenne_inline_tombstone_writes_total",
+    ),
+    (
+        "compaction_memory_exhausted",
+        "cayenne_compaction_memory_exhausted_total",
+    ),
+    (
+        "mem_tier_reserve_refused",
+        "cayenne_mem_tier_reserve_refused_total",
+    ),
+    ("autotune_adjustments", "cayenne_autotune_adjustments_total"),
+];
+
+/// Sums a cumulative series to its end-of-run total.
+///
+/// Every sample of a cumulative series is a running total, so the run's value for
+/// one label-set is that series' maximum, and the total is the sum across
+/// label-sets. Taking the max rather than the last sample keeps this correct
+/// whichever order the scrapes are stored in, and a counter reset (a restart)
+/// would under- rather than over-count.
+///
+/// Returns `None` when the series was never scraped, which distinguishes "this
+/// build never ran the operation" from "this run had no Cayenne at all" — a
+/// `DuckDB` baseline emits none of these.
+fn cumulative_series_total(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    name: &str,
+) -> Option<f64> {
+    use std::collections::BTreeMap;
+
+    let samples = metrics.samples.get(name)?;
+    let mut series_max: BTreeMap<String, f64> = BTreeMap::new();
+    for sample in samples {
+        let mut fingerprint: Vec<String> = sample
+            .labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        fingerprint.sort();
+        let entry = series_max.entry(fingerprint.join(",")).or_insert(f64::MIN);
+        if sample.value > *entry {
+            *entry = sample.value;
+        }
+    }
+    if series_max.is_empty() {
+        return None;
+    }
+    Some(series_max.values().sum())
+}
+
+/// Emits how many times each Cayenne background maintenance operation ran during
+/// the run.
+///
+/// Compaction passes answer the same question per table and kind
+/// ([`emit_cayenne_compaction_metrics`]); this covers the rest of the background
+/// work — write phases, checkpoints, metastore vacuums, inline-cache rebuilds —
+/// so a throughput or freshness delta between two runs can be attributed to a
+/// change in that work rather than inferred. The refusal/exhaustion counters are
+/// included because they should normally be zero: a non-zero value is back
+/// pressure that would otherwise only show up as an unexplained slowdown.
+///
+/// Silent when nothing was scraped, so a `DuckDB` baseline prints no empty section.
+pub(super) fn emit_cayenne_maintenance_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+    let totals: Vec<(&str, f64)> = CAYENNE_MAINTENANCE_SERIES
+        .iter()
+        .filter_map(|(label, series)| {
+            cumulative_series_total(metrics, series).map(|total| (*label, total))
+        })
+        .collect();
+
+    if totals.is_empty() {
+        return;
+    }
+
+    println!("\nCayenne Maintenance Operations");
+    println!("  {:<30} {:>12}", "operation", "count");
+    for (label, total) in &totals {
+        println!("  {label:<30} {total:>12.0}");
+        crate::metrics::CAYENNE_MAINTENANCE_OPERATIONS
+            .record(to_u64(*total), &[KeyValue::new("operation", *label)]);
+    }
+    println!();
+}
+
 /// Emits Cayenne compaction metrics scraped from spiced's `/metrics` endpoint,
 /// reported per `table` and compaction `kind`
+///
+/// `kind` is whatever Cayenne labels its passes with, so a newly-labelled pass
+/// type (e.g. the seq-prefix `bake`) appears here without a change to this code.
 pub(super) fn emit_cayenne_compaction_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1075,4 +1198,104 @@ fn histogram_quantile(bounds: &[(f64, f64)], q: f64) -> f64 {
         lower_cum = cum;
     }
     bounds.last().map_or(0.0, |&(le, _)| le)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spiced_metrics::{MetricSample, MetricType, SpicedMetrics};
+    use std::collections::HashMap;
+
+    fn sample(name: &str, labels: &[(&str, &str)], value: f64, ts_ms: i64) -> MetricSample {
+        MetricSample {
+            name: name.to_string(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            value,
+            metric_type: MetricType::Counter,
+            ts_ms,
+        }
+    }
+
+    fn metrics(samples: Vec<MetricSample>) -> SpicedMetrics {
+        let mut by_name: HashMap<String, Vec<MetricSample>> = HashMap::new();
+        for sample in samples {
+            by_name.entry(sample.name.clone()).or_default().push(sample);
+        }
+        SpicedMetrics { samples: by_name }
+    }
+
+    /// A cumulative series is a running total, so the run's value is its maximum —
+    /// summing the samples instead would multiply the count by the scrape count.
+    #[test]
+    fn cumulative_total_takes_the_series_maximum_not_the_sample_sum() {
+        let m = metrics(vec![
+            sample("op_total", &[("table", "orders")], 3.0, 1),
+            sample("op_total", &[("table", "orders")], 7.0, 2),
+            sample("op_total", &[("table", "orders")], 11.0, 3),
+        ]);
+        assert_eq!(cumulative_series_total(&m, "op_total"), Some(11.0));
+    }
+
+    /// Distinct label-sets are distinct series, so their end values add.
+    #[test]
+    fn cumulative_total_sums_across_label_sets() {
+        let m = metrics(vec![
+            sample("op_total", &[("table", "orders")], 10.0, 2),
+            sample("op_total", &[("table", "orders")], 4.0, 1),
+            sample("op_total", &[("table", "stock")], 5.0, 1),
+        ]);
+        assert_eq!(cumulative_series_total(&m, "op_total"), Some(15.0));
+    }
+
+    /// Order must not matter: the scrape store is a map, so a later sample is not
+    /// guaranteed to sit last.
+    #[test]
+    fn cumulative_total_is_independent_of_sample_order() {
+        let ascending = metrics(vec![
+            sample("op_total", &[], 1.0, 1),
+            sample("op_total", &[], 9.0, 2),
+        ]);
+        let descending = metrics(vec![
+            sample("op_total", &[], 9.0, 2),
+            sample("op_total", &[], 1.0, 1),
+        ]);
+        assert_eq!(
+            cumulative_series_total(&ascending, "op_total"),
+            cumulative_series_total(&descending, "op_total")
+        );
+        assert_eq!(cumulative_series_total(&ascending, "op_total"), Some(9.0));
+    }
+
+    /// An unscraped series is absent rather than zero, so a run with no Cayenne at
+    /// all (a `DuckDB` baseline) reports nothing instead of a row of zeros.
+    #[test]
+    fn cumulative_total_is_absent_for_an_unscraped_series() {
+        assert_eq!(cumulative_series_total(&metrics(vec![]), "op_total"), None);
+    }
+
+    /// Zero is a real observation — the operation is instrumented and did not run —
+    /// and must not be conflated with the series being missing.
+    #[test]
+    fn cumulative_total_reports_an_observed_zero() {
+        let m = metrics(vec![sample("op_total", &[("kind", "bake")], 0.0, 1)]);
+        assert_eq!(cumulative_series_total(&m, "op_total"), Some(0.0));
+    }
+
+    /// Every reported operation must name a distinct series, or one would overwrite
+    /// another's gauge point.
+    #[test]
+    fn maintenance_series_are_uniquely_named() {
+        let mut labels: Vec<&str> = CAYENNE_MAINTENANCE_SERIES.iter().map(|(l, _)| *l).collect();
+        let mut series: Vec<&str> = CAYENNE_MAINTENANCE_SERIES.iter().map(|(_, s)| *s).collect();
+        let (labels_len, series_len) = (labels.len(), series.len());
+        labels.sort_unstable();
+        labels.dedup();
+        series.sort_unstable();
+        series.dedup();
+        assert_eq!(labels.len(), labels_len, "duplicate operation label");
+        assert_eq!(series.len(), series_len, "duplicate scraped series");
+    }
 }
