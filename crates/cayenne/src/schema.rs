@@ -42,6 +42,14 @@ static CAYENNE_CREATION_REWRITE_RULES: TypeRewriteRules = &[&Float16ToFloat32];
 /// — every `PostgreSQL` `timestamptz`, which infers as `Timestamp(ns, "UTC")` — reads as
 /// an incompatible schema change on the first batch after upgrade, which stops CDC
 /// replication under `on_schema_change: fail` for a schema that never changed.
+///
+/// The list is accelerator-wide, so it cannot tell a microsecond column an older build
+/// normalized from one whose source is itself microsecond. A table of the second kind
+/// whose source later widens to nanoseconds reports the cast as the engine's own rather
+/// than as the source schema change it is, so `on_schema_change` does not act on it —
+/// the behavior every Cayenne table had while creation normalized unconditionally.
+/// Telling the two apart needs per-table provenance, which the metastore does not
+/// record today.
 pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
     &[&Float16ToFloat32, &TimestampToMicrosecond];
 
