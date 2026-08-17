@@ -91,7 +91,10 @@ pub enum GoogleAuthError {
     #[snafu(display(
         "`{params_prefix}.google_project` ('{project}') is not a valid GCP project id: only lowercase letters, digits, and hyphens are allowed."
     ))]
-    InvalidProject { params_prefix: String, project: String },
+    InvalidProject {
+        params_prefix: String,
+        project: String,
+    },
 
     #[snafu(display(
         "`{params_prefix}.google_location` ('{location}') is not a valid GCP region: only lowercase letters, digits, and hyphens are allowed (or `global`)."
