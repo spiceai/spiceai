@@ -2652,11 +2652,11 @@ impl RefreshTask {
         }
         let target_schema = self.accelerator.schema();
         // The accelerated table holds the engine's own creation-time rewrite by
-        // construction (Cayenne/Vortex stores every timestamp at microsecond precision),
-        // so the comparison has to be made against what the engine would store from this
-        // input. Without it the classifier reads that permanent rewrite as `Incompatible`
-        // drift on every CDC batch, and `on_schema_change: fail` stops replication for a
-        // schema that never changed.
+        // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
+        // comparison has to be made against what the engine would store from this input.
+        // Without it the classifier reads that permanent rewrite as `Incompatible` drift
+        // on every CDC batch, and `on_schema_change: fail` stops replication for a schema
+        // that never changed.
         //
         // The match test is rule-aware rather than rebuilding the schema up front: this
         // runs per upsert sub-batch and almost always matches, and rewriting one
@@ -4813,19 +4813,24 @@ mod tests {
         .build()
     }
 
-    /// Regression test for #13014, CDC leg. Cayenne stores every timestamp at
-    /// microsecond precision because Vortex has no other option, so a Postgres
-    /// `timestamptz` CDC stream arrives as `Timestamp(ns, "UTC")` against a
-    /// `Timestamp(us, "UTC")` accelerated table forever. `classify` reads that as
-    /// `Incompatible`, so before the engine's own rewrites were consulted here,
-    /// `on_schema_change: fail` rejected the first batch and stopped replication for a
-    /// schema that never changed.
+    /// Regression test for #13014, CDC leg. `DuckDB` stores every timezone-aware
+    /// timestamp at microsecond precision, so a Postgres `timestamptz` CDC stream
+    /// arrives as `Timestamp(ns, "UTC")` against a `Timestamp(us, "UTC")` accelerated
+    /// table forever. `classify` reads that as `Incompatible`, so before the engine's
+    /// own rewrites were consulted here, `on_schema_change: fail` rejected the first
+    /// batch and stopped replication for a schema that never changed.
     #[tokio::test]
     async fn cdc_schema_evolution_accepts_an_engine_required_timestamp_rewrite() {
         use crate::accelerated::refresh_task::RefreshTaskBuilder;
         use crate::federated::FederatedTable;
         use arrow::datatypes::TimeUnit;
         use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+        /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds.
+        /// Spelled out rather than imported because the `DuckDB` accelerator sits
+        /// above this crate.
+        static DUCKDB_LIKE_RULES: arrow_tools::type_rewrite::TypeRewriteRules =
+            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
 
         let stored = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -4871,10 +4876,22 @@ mod tests {
             .build()
         };
 
-        let task = build("cdc_engine_rewrite_accepted", CAYENNE_TYPE_REWRITE_RULES);
+        let task = build("cdc_engine_rewrite_accepted", DUCKDB_LIKE_RULES);
         task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
             "an engine-required rewrite is not a schema change and must not fail the write",
         );
+
+        // The upgrade case for #13018. A Cayenne table created before the engine
+        // preserved timestamp units stores microseconds; Cayenne now creates such a
+        // column as nanoseconds, but this table's stored type does not change. Its
+        // rules must still explain that, or upgrading stops replication on the first
+        // batch of an unchanged Postgres `timestamptz` stream. `classify` cannot save
+        // it: nanosecond is excluded as a widening target because rescaling to ns
+        // overflows i64 past ~2262, so us -> ns is `Incompatible`, not `Widening`.
+        let task = build("cdc_legacy_microsecond_table", CAYENNE_TYPE_REWRITE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming)
+            .await
+            .expect("a pre-existing microsecond Cayenne table must keep replicating after upgrade");
 
         // Neuter: with no engine rules the same pair is classified as incompatible and
         // `on_schema_change: fail` rejects it - so the pass above is the rules working,

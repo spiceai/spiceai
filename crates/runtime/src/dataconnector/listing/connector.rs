@@ -53,7 +53,7 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
@@ -509,7 +509,7 @@ pub trait ListingTableConnector: DataConnector {
     /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url>;
 
@@ -526,7 +526,7 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
-    fn get_object_store(&self, dataset: &Dataset) -> DataConnectorResult<Arc<dyn ObjectStore>>
+    fn get_object_store(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn ObjectStore>>
     where
         Self: Display,
     {
@@ -562,7 +562,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn construct_metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
@@ -598,7 +598,7 @@ pub trait ListingTableConnector: DataConnector {
     /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
     async fn get_file_format_and_extension(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
     where
         Self: Display,
@@ -851,7 +851,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_jsonl_format(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         params: &Parameters,
         file_compression_type: FileCompressionType,
     ) -> DataConnectorResult<Arc<JsonFormat>>
@@ -880,7 +880,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_json_format(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         params: &Parameters,
         default_format: Format,
         file_compression_type: FileCompressionType,
@@ -1005,7 +1005,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn get_table_parquet_options(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<TableParquetOptions>
     where
         Self: Display,
@@ -1027,7 +1027,7 @@ pub trait ListingTableConnector: DataConnector {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
         _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
@@ -1040,7 +1040,7 @@ pub trait ListingTableConnector: DataConnector {
     /// for why.
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError
     where
@@ -1055,7 +1055,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_text_table(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
@@ -1096,7 +1096,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_listing_table(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
@@ -1311,7 +1311,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn deduplicate_partition_columns_expressed_in_file(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         schema: SchemaRef,
         partition_cols: &[(String, DataType)],
     ) -> DataConnectorResult<SchemaRef> {
@@ -1367,7 +1367,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !dataset.has_metadata_table {
             return None;
@@ -1378,7 +1378,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
 
@@ -1398,7 +1398,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         let url = self.get_object_store_url(dataset, None)?;
@@ -1445,7 +1445,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
@@ -1503,7 +1503,7 @@ pub fn object_store_timeout_message(
     ))
 }
 
-fn refresh_skip_enabled(dataset: &Dataset) -> bool {
+fn refresh_skip_enabled(dataset: &DatasetSpec) -> bool {
     match dataset.params.get("refresh_skip").map(String::as_str) {
         None | Some("enabled") => true,
         Some("disabled") => false,
@@ -1522,7 +1522,7 @@ fn add_metadata_columns_if_required(
     options: ListingOptions,
     table_url: &Url,
     schema: &Schema,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> ListingOptions {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
@@ -1555,7 +1555,7 @@ fn get_url_prefix(table_url: &Url) -> String {
 
 fn resolve_file_compression_type(
     dataconnector: &str,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     params: &Parameters,
     detected_compression: Option<FileCompressionType>,
 ) -> DataConnectorResult<FileCompressionType> {
@@ -1616,7 +1616,7 @@ const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 /// - If no files with the specified extension are found
 async fn get_last_modified(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1710,7 +1710,7 @@ async fn get_last_modified(
 
 async fn verify_schema_source_path(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     extension: &str,
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1776,7 +1776,7 @@ fn file_matches_extension(location: &Path, extension: &str) -> bool {
 fn to_listing_table_url(
     original_url: &Url,
     path: &Path,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     dataconnector: &str,
 ) -> DataConnectorResult<SensitiveListingTableUrl> {
     let mut new_url = original_url.clone();
@@ -1890,6 +1890,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
     use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -1961,7 +1962,7 @@ mod tests {
 
         fn get_object_store_url(
             &self,
-            dataset: &Dataset,
+            dataset: &DatasetSpec,
             _url: Option<&str>,
         ) -> DataConnectorResult<Url> {
             Url::parse("test")
