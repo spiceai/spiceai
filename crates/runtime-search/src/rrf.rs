@@ -106,8 +106,44 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
 }
 });
 
-pub static SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::variadic_any(Volatility::Stable));
+/// Upper bound on nested search-subquery arguments `rrf` accepts positionally.
+///
+/// `Signature::user_defined`'s named-argument resolution assigns each declared
+/// parameter name a fixed slot equal to its index in `parameter_names`, and
+/// fills positional args into slots `0..N` in call order. `rrf`'s real
+/// positional arguments are a variable-length list of nested search
+/// subqueries, so the named option slots below must sit past any plausible
+/// source count — otherwise a named option (e.g. `k => 60`) can land in the
+/// same slot as a positional search subquery, and `DataFusion` rejects the
+/// call ("Parameter 'k' specified multiple times") instead of accepting it.
+const RRF_MAX_SOURCES: usize = 16;
+
+/// Signature for the scalar documentation stub used when `rrf` is nested in
+/// another table function, such as `rerank`.
+pub static SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    let param_names = (0..RRF_MAX_SOURCES)
+        .map(|i| format!("_source_{i}"))
+        .chain(
+            [
+                "k",
+                "limit",
+                "join_key",
+                "time_column",
+                "recency_decay",
+                "decay_constant",
+                "decay_scale_secs",
+                "decay_window_secs",
+                "rank_weight",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .collect();
+    match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
+        Ok(signature) => signature,
+        Err(_) => Signature::variadic_any(Volatility::Stable),
+    }
+});
 
 macro_rules! extract_scalar_base {
     ($map:expr, $key:literal, $datatype:expr, $pattern:pat => $value:expr) => {
@@ -325,6 +361,12 @@ impl ReciprocalRankFusionArgs {
         if search_udtfs.len() < 2 {
             return Err(DataFusionError::Plan(format!(
                 "{RRF_UDF_NAME} needs at least 2 search queries to fuse results."
+            )));
+        }
+        if search_udtfs.len() > RRF_MAX_SOURCES {
+            return Err(DataFusionError::Plan(format!(
+                "{RRF_UDF_NAME} supports at most {RRF_MAX_SOURCES} search queries, got {}.",
+                search_udtfs.len()
             )));
         }
 
@@ -1335,6 +1377,7 @@ mod tests {
     use crate::rrf::RecencyDecay;
     use crate::rrf::ReciprocalRankFusion;
     use crate::rrf::ReciprocalRankFusionArgs;
+    use crate::rrf::{RRF_MAX_SOURCES, SIGNATURE};
     use arrow::array::{Float64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::arrow::datatypes::DataType;
@@ -1518,6 +1561,89 @@ mod tests {
             Some(2.5),
             "rank_weight should be 2.5"
         );
+    }
+
+    #[test]
+    fn scalar_stub_declares_named_arguments() {
+        let parameter_names = SIGNATURE
+            .parameter_names
+            .as_ref()
+            .expect("rrf scalar stub should declare named parameters");
+        assert!(parameter_names.iter().any(|name| name == "join_key"));
+        assert!(parameter_names.iter().any(|name| name == "rank_weight"));
+    }
+
+    #[tokio::test]
+    async fn nested_rrf_named_arguments_do_not_fail_signature_validation() {
+        let ctx = Arc::new(SessionContext::new());
+        let stub = |name| {
+            create_udf(
+                name,
+                vec![],
+                DataType::Utf8,
+                Volatility::Stable,
+                Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))),
+            )
+        };
+        ctx.register_udf(stub("vector_search"));
+        ctx.register_udf(stub("text_search"));
+        ctx.register_udf(ReciprocalRankFusion::from_ctx(&ctx).into());
+
+        let error = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT rrf(vector_search('foo', 'query'), text_search('foo', 'query'), join_key => 'id')",
+            )
+            .await
+            .expect_err("the scalar documentation stub must not be executable");
+        assert!(
+            !error
+                .to_string()
+                .contains("does not support named arguments")
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_rrf_named_k_does_not_collide_with_positional_sources() {
+        // Regression test: with only 2 leading positional search sources, `k`
+        // (the 2nd entry in SIGNATURE's un-padded parameter list) used to land
+        // in the same resolved slot as the 2nd positional source, producing
+        // "Parameter 'k' specified multiple times" instead of accepting the call.
+        let ctx = Arc::new(SessionContext::new());
+        let stub = |name| {
+            create_udf(
+                name,
+                vec![],
+                DataType::Utf8,
+                Volatility::Stable,
+                Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None)))),
+            )
+        };
+        ctx.register_udf(stub("vector_search"));
+        ctx.register_udf(stub("text_search"));
+        ctx.register_udf(ReciprocalRankFusion::from_ctx(&ctx).into());
+
+        let error = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT rrf(vector_search('foo', 'query'), text_search('foo', 'query'), join_key => 'id', k => 60.0)",
+            )
+            .await
+            .expect_err("the scalar documentation stub must not be executable");
+        assert!(
+            !error.to_string().contains("specified multiple times"),
+            "named args must not collide with positional search sources, got: {error}"
+        );
+    }
+
+    #[test]
+    fn from_udtf_exprs_rejects_too_many_search_sources() {
+        let sources = (0..=RRF_MAX_SOURCES)
+            .map(|i| vector_search_expr("foo", &format!("query{i}")))
+            .collect::<Vec<_>>();
+        let error = ReciprocalRankFusionArgs::from_udtf_exprs(&sources)
+            .expect_err("more than RRF_MAX_SOURCES search queries must be rejected");
+        assert!(error.to_string().contains("supports at most"));
     }
 
     #[tokio::test]

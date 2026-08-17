@@ -17,7 +17,8 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use super::DataConnector;
-use crate::component::{ComponentInitialization, dataset::Dataset};
+use crate::component::ComponentInitialization;
+use crate::component::dataset::DatasetSpec;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -61,21 +62,21 @@ impl DataConnector for DeferredConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> super::DataConnectorResult<()> {
         self.inner
@@ -106,7 +107,8 @@ impl DataConnector for DeferredConnector {
     fn changes_stream(
         &self,
         _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         None
     }
@@ -124,14 +126,14 @@ impl DataConnector for DeferredConnector {
 
     async fn metadata_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerator: &mut dyn data_connector_api::accelerated::AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.on_accelerator_setup(dataset, accelerator).await
@@ -139,7 +141,7 @@ impl DataConnector for DeferredConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn data_connector_api::accelerated::RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner
@@ -155,7 +157,7 @@ impl DataConnector for DeferredConnector {
         ComponentInitialization::OnTrigger
     }
 
-    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
     }
 }

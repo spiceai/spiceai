@@ -18,7 +18,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
@@ -27,7 +27,7 @@ use runtime_metrics::component::MetricsProvider;
 
 use crate::component::{
     ComponentInitialization,
-    dataset::{Dataset, acceleration::RefreshMode},
+    dataset::{DatasetSpec, acceleration::RefreshMode},
 };
 use crate::dataconnector::{DataConnector, DataConnectorResult};
 use crate::drasi::{DeliveryMode, forward_change_envelope};
@@ -72,28 +72,28 @@ impl DataConnector for DrasiConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.inner_connector.read_provider(dataset).await
     }
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.read_write_provider(dataset).await
     }
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         self.inner_connector
@@ -105,7 +105,7 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.initialization()
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
 
@@ -115,7 +115,7 @@ impl DataConnector for DrasiConnector {
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         builder: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -125,7 +125,7 @@ impl DataConnector for DrasiConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -148,12 +148,14 @@ impl DataConnector for DrasiConnector {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        self.with_forwarded_stream(
-            self.inner_connector
-                .changes_stream(federated_table, dataset),
-        )
+        self.with_forwarded_stream(self.inner_connector.changes_stream(
+            federated_table,
+            dataset,
+            acceleration,
+        ))
     }
 
     fn supports_append_stream(&self) -> bool {

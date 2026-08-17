@@ -37,11 +37,11 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -885,7 +885,7 @@ fn natural_order_sort_candidate(
 /// independently at debug level, so a partial gap may surface no info log.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     let (mut table_metadata, field_metadata) =
@@ -985,7 +985,7 @@ impl DataConnector for Postgres {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
             .factory
@@ -1035,7 +1035,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
         {
@@ -1084,7 +1084,8 @@ impl DataConnector for Postgres {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
@@ -1092,6 +1093,7 @@ impl DataConnector for Postgres {
             self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
+            acceleration,
         ))
     }
 

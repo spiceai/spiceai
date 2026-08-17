@@ -27,7 +27,7 @@ use super::{
 use app::App;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 
@@ -330,7 +330,7 @@ impl ListingTableConnector for S3 {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -368,7 +368,7 @@ impl ListingTableConnector for S3 {
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
