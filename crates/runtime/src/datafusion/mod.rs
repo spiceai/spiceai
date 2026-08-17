@@ -138,6 +138,7 @@ pub use runtime_datafusion::composed_catalog;
 // through these aliases, but they belong to `runtime-datafusion`. Crate-visible
 // so a crate outside the runtime has to depend on `runtime-datafusion` directly
 // rather than route through here.
+#[cfg(any(feature = "duckdb", test))]
 pub(crate) use runtime_datafusion::dialect;
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
