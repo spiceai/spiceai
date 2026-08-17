@@ -31,7 +31,9 @@ use arrow::{
     error::ArrowError,
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
+use arrow_tools::type_rewrite::apply_rules;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
@@ -2008,9 +2010,24 @@ impl RefreshTask {
         }
 
         // Use the update stream's schema for dedup comparison, not the full federated
-        // provider schema.  When `refresh_sql` selects a column subset, the incoming
-        // batches and accelerated table only contain those columns.
-        let filter_schema = update.data.schema();
+        // provider schema. When `refresh_sql` selects a column subset, the incoming
+        // batches and accelerated table only contain those columns. Normalize the stream to
+        // the accelerator engine's creation-time representation first: Cayenne stores an
+        // incoming Postgres `timestamptz` at microsecond precision, so comparing the original
+        // nanosecond batch with the stored rows would reject a valid overlap as a schema change.
+        //
+        // This is deliberately limited to the engine's declared rewrites. Any other difference
+        // between the normalized source schema and stored rows remains an error in
+        // `filter_records`, rather than silently treating an actual source schema change as
+        // compatible.
+        let filter_schema = if self.engine_type_rewrites.is_empty() {
+            update.data.schema()
+        } else {
+            Arc::new(apply_rules(
+                update.data.schema().as_ref(),
+                self.engine_type_rewrites,
+            ))
+        };
         let update_type = update.update_type.clone();
 
         // The dedup subtracts the accelerator's overlap window from the source's as a
@@ -2023,18 +2040,17 @@ impl RefreshTask {
             .map(|existing| vec![false; existing.num_rows()])
             .collect();
 
-        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&update.data.schema()),
-            {
-                stream! {
-                    while let Some(batch) = update.data.next().await {
-                        let batch =
-                            filter_records(&batch?, &existing_records, &filter_schema, &mut used);
-                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
-                    }
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&filter_schema), {
+            stream! {
+                while let Some(batch) = update.data.next().await {
+                    let batch = batch?;
+                    let batch = try_cast_to(batch, Arc::clone(&filter_schema))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let batch = filter_records(&batch, &existing_records, &filter_schema, &mut used);
+                    yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                 }
-            },
-        ));
+            }
+        }));
 
         Ok(StreamingDataUpdate::new(filtered_data, update_type))
     }
@@ -2892,10 +2908,11 @@ mod tests {
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
-        Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-        StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+        Date32Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, UInt32Array, UInt64Array,
     };
-    use arrow::datatypes::TimeUnit;
+    use arrow::datatypes::{ArrowPrimitiveType, TimeUnit};
     use arrow_schema::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use data_components::arrow::write::MemTable;
@@ -4183,6 +4200,114 @@ mod tests {
             total_rows, 1,
             "one copy is already stored, so exactly one of the two must be appended"
         );
+    }
+
+    /// Regression test for append refreshes from PostgreSQL into Cayenne.
+    ///
+    /// PostgreSQL `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
+    /// at microseconds. Cayenne also promotes Float16 to Float32. Both engine rewrites must
+    /// happen before the overlap comparison so the already-stored row is removed rather than
+    /// rejected as a schema mismatch.
+    #[tokio::test]
+    async fn test_except_existing_records_from_normalizes_cayenne_timestamp_before_dedup() {
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float16, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let accelerator_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&accelerator_schema),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_i64]).with_timezone("UTC")),
+                Arc::new(Float32Array::from(vec![1.5_f32])),
+                Arc::new(Int32Array::from(vec![1_i32])),
+            ],
+        )
+        .expect("existing Cayenne batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&accelerator_schema), vec![vec![existing_batch]])
+                .expect("Cayenne-like accelerator table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&source_schema), vec![vec![]])
+                .expect("PostgreSQL-like source table"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("events_partitioned"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            Some("postgres".to_string()),
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_engine_type_rewrites(cayenne::CAYENNE_TYPE_REWRITE_RULES)
+        .build();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("timestamp".to_string());
+
+        type F16 = <arrow::datatypes::Float16Type as ArrowPrimitiveType>::Native;
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                // 1µs is already in the accelerator; 2µs is a new source row.
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![1_000_i64, 2_000]).with_timezone("UTC"),
+                ),
+                Arc::new(Float16Array::from(vec![
+                    F16::from_f32(1.5),
+                    F16::from_f32(2.5),
+                ])),
+                Arc::new(Int32Array::from(vec![1_i32, 2])),
+            ],
+        )
+        .expect("PostgreSQL update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&source_schema), None)
+                .expect("PostgreSQL update stream"),
+        );
+
+        let result = task
+            .except_existing_records_from(
+                &refresh,
+                StreamingDataUpdate::new(update_stream, UpdateType::Append),
+                Some(0),
+            )
+            .await
+            .expect("Cayenne timestamp normalization should allow append de-duplication");
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collect filtered append update");
+
+        assert_eq!(collected.data.len(), 1, "one update batch should remain");
+        assert_eq!(collected.data[0].num_rows(), 1, "the stored row is removed");
+        assert_eq!(
+            collected.data[0].schema(),
+            accelerator_schema,
+            "the deduplicated stream uses Cayenne's stored timestamp precision"
+        );
+        let ids = collected.data[0]
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id column");
+        assert_eq!(ids.values(), &[2], "the new row survives de-duplication");
     }
 
     /// Regression test for the schema-mismatch half of #12492.
