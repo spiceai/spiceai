@@ -111,6 +111,14 @@ impl Client {
         format!("{}{}", self.base_url, path)
     }
 
+    /// Whether this client talks to Vertex AI (Bearer-token auth) rather than Google AI
+    /// Studio. Vertex AI's embedding models use a different request/response contract
+    /// (`:predict`) than the Gemini Developer API's `:embedContent`/`:batchEmbedContents` —
+    /// see `embeddings.rs`.
+    pub(crate) fn is_vertex(&self) -> bool {
+        matches!(self.auth, AuthMode::Bearer(_))
+    }
+
     /// Attaches this client's authentication to outgoing request headers: an
     /// `x-goog-api-key` header for Google AI Studio, or an `Authorization: Bearer`
     /// header for Vertex AI.

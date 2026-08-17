@@ -18,7 +18,7 @@ limitations under the License.
 
 use crate::client::Client;
 use crate::error::{HttpSnafu, Result, handle_unsuccessful_response};
-use crate::types::Content;
+use crate::types::{Content, Part};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -90,6 +90,13 @@ impl Client {
         model: &str,
         request: EmbedContentRequest,
     ) -> Result<EmbedContentResponse> {
+        if self.is_vertex() {
+            let mut embeddings = self.vertex_predict_embed(model, &[request]).await?;
+            return Ok(EmbedContentResponse {
+                embedding: embeddings.remove(0),
+            });
+        }
+
         let url = self.build_url(&format!("/models/{model}:embedContent"));
 
         let headers = self.auth_headers(HeaderMap::new());
@@ -118,6 +125,11 @@ impl Client {
         model: &str,
         requests: Vec<EmbedContentRequest>,
     ) -> Result<BatchEmbedContentResponse> {
+        if self.is_vertex() {
+            let embeddings = self.vertex_predict_embed(model, &requests).await?;
+            return Ok(BatchEmbedContentResponse { embeddings });
+        }
+
         let url = self.build_url(&format!("/models/{model}:batchEmbedContents"));
 
         let headers = self.auth_headers(HeaderMap::new());
@@ -142,6 +154,116 @@ impl Client {
             .await
             .context(HttpSnafu)
     }
+
+    /// Vertex AI's publisher text-embedding models (e.g. `text-embedding-004`) don't expose
+    /// the Gemini Developer API's `:embedContent`/`:batchEmbedContents` actions — they use the
+    /// older Vertex `PredictionService` `:predict` RPC instead, with a different request/response
+    /// shape. This translates to/from that shape so callers see the same [`Embedding`] type
+    /// regardless of backend.
+    async fn vertex_predict_embed(
+        &self,
+        model: &str,
+        requests: &[EmbedContentRequest],
+    ) -> Result<Vec<Embedding>> {
+        let url = self.build_url(&format!("/models/{model}:predict"));
+        let headers = self.auth_headers(HeaderMap::new());
+
+        let instances: Vec<VertexPredictInstance> = requests
+            .iter()
+            .map(|r| VertexPredictInstance {
+                content: text_content(&r.content),
+                task_type: r.task_type.clone(),
+            })
+            .collect();
+
+        // Vertex's `:predict` takes a single `parameters` object for the whole batch, so this
+        // only carries over the first request's `output_dimensionality` — every request built
+        // by `llms::google::embed` shares the same value anyway (it comes from one
+        // `embeddings.params.dimensions` config).
+        let output_dimensionality = requests.first().and_then(|r| r.output_dimensionality);
+
+        let predict_request = VertexPredictRequest {
+            instances,
+            parameters: output_dimensionality.map(|d| VertexPredictParameters {
+                output_dimensionality: Some(d),
+            }),
+        };
+
+        let response = self
+            .http_client()
+            .post(&url)
+            .headers(headers)
+            .json(&predict_request)
+            .send()
+            .await
+            .context(HttpSnafu)?;
+
+        if !response.status().is_success() {
+            return Err(handle_unsuccessful_response(response).await);
+        }
+
+        let parsed: VertexPredictResponse = response.json().await.context(HttpSnafu)?;
+        Ok(parsed
+            .predictions
+            .into_iter()
+            .map(|p| Embedding {
+                values: p.embeddings.values,
+            })
+            .collect())
+    }
+}
+
+/// Concatenates every text part of `content`, in order. Embedding requests built by
+/// `llms::google::embed` always construct single-`Part::Text` content, but this degrades
+/// gracefully (rather than panicking or erroring) if that ever changes.
+fn text_content(content: &Content) -> String {
+    content
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexPredictInstance {
+    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_type: Option<TaskType>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexPredictParameters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimensionality: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexPredictRequest {
+    instances: Vec<VertexPredictInstance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<VertexPredictParameters>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VertexPredictResponse {
+    predictions: Vec<VertexPrediction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VertexPrediction {
+    embeddings: VertexPredictEmbedding,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VertexPredictEmbedding {
+    values: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,4 +276,66 @@ struct BatchEmbedContentRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BatchEmbedContentResponse {
     pub embeddings: Vec<Embedding>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_content_extracts_single_text_part() {
+        assert_eq!(text_content(&Content::user("hello world")), "hello world");
+    }
+
+    #[test]
+    fn text_content_ignores_non_text_parts() {
+        let content = Content {
+            role: Some("user".to_string()),
+            parts: vec![
+                Part::Text {
+                    text: "hello ".to_string(),
+                },
+                Part::Text {
+                    text: "world".to_string(),
+                },
+            ],
+        };
+        assert_eq!(text_content(&content), "hello world");
+    }
+
+    #[test]
+    fn vertex_predict_request_serializes_expected_shape() {
+        let request = VertexPredictRequest {
+            instances: vec![VertexPredictInstance {
+                content: "hello".to_string(),
+                task_type: Some(TaskType::RetrievalDocument),
+            }],
+            parameters: Some(VertexPredictParameters {
+                output_dimensionality: Some(256),
+            }),
+        };
+
+        let json = serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "instances": [{"content": "hello", "taskType": "RETRIEVAL_DOCUMENT"}],
+                "parameters": {"outputDimensionality": 256}
+            })
+        );
+    }
+
+    #[test]
+    fn vertex_predict_response_parses_real_shape() {
+        // Real Vertex `:predict` response shape for text-embedding models.
+        let json = r#"{
+            "predictions": [
+                {"embeddings": {"values": [0.1, 0.2, 0.3], "statistics": {"truncated": false, "token_count": 2}}}
+            ]
+        }"#;
+        let parsed: VertexPredictResponse =
+            serde_json::from_str(json).expect("should parse a real Vertex predict response");
+        assert_eq!(parsed.predictions.len(), 1);
+        assert_eq!(parsed.predictions[0].embeddings.values, vec![0.1, 0.2, 0.3]);
+    }
 }
