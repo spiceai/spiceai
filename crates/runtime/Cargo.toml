@@ -148,6 +148,7 @@ runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-drasi = { path = "../runtime-drasi" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }

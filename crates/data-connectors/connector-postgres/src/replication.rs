@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
@@ -36,8 +36,10 @@ use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
+use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -55,6 +57,25 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
+/// Sidecar table, in the dataset's own accelerator, holding the serialized applied-LSN
+/// watermark.
+const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
+
+/// Resolve the applied-LSN watermark store over the dataset's own accelerator.
+///
+/// `None` means nothing durable can record a position — no runtime attached, or no
+/// usable accelerator connection. The caller treats that as "never loaded", which is
+/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
+/// for one to describe.
+async fn resolve_watermark_store(
+    context: Option<&Arc<dyn ConnectorContext>>,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    context?
+        .blob_checkpoint_store(dataset, WATERMARK_TABLE)
+        .await
+}
+
 /// [`AppliedLsnStore`] over the accelerator's `spice_sys_postgres_replication`
 /// sidecar.
 ///
@@ -62,7 +83,7 @@ const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 /// so the record can gain fields (a slot identity, a snapshot as-of marker)
 /// without a migration.
 struct SidecarAppliedLsnStore {
-    blobs: Arc<dyn runtime::dataaccelerator::spice_sys::postgres_replication::WatermarkBlobStore>,
+    blobs: Arc<dyn BlobCheckpointStore>,
     /// Which source the recorded position belongs to (see [`source_identity`]).
     ///
     /// LSNs are only comparable within one source's history. Without this, a
@@ -147,9 +168,11 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
+    context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -180,6 +203,9 @@ pub fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -335,11 +361,7 @@ pub fn build_changes_stream(
         let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
             Arc::new(NoopAppliedLsnStore)
         } else {
-            match runtime::dataaccelerator::spice_sys::postgres_replication::init_watermark_store(
-                &dataset_for_watermark,
-            )
-            .await
-            {
+            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
                 Some(blobs) => Arc::new(SidecarAppliedLsnStore {
                     blobs,
                     identity: source_identity(&params_for_stream, &schema_name, &table_name),
@@ -347,6 +369,10 @@ pub fn build_changes_stream(
                 None => Arc::new(NoopAppliedLsnStore),
             }
         };
+
+        // See the note in the MySQL connector: the store is what the stream needs, and
+        // the context has served its purpose once the store is resolved.
+        drop(context);
 
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
@@ -920,6 +946,7 @@ fn replication_params_from_connector_params(
         // Derived from the dataset's accelerator, which this function does not
         // see; `build_changes_stream` sets it right after.
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -929,6 +956,10 @@ fn replication_params_from_connector_params(
         // formatting. Not a user-facing parameter; the per-column text fallback
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
     })
 }
 

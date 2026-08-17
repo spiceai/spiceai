@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;
@@ -112,7 +112,7 @@ impl ListingTableConnector for File {
     ///   2. Datasets prefixed with `file://` (not just `file:/`). This is to mirror the UX of [`Url::parse`].
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         path: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let path = match path {
@@ -154,7 +154,7 @@ impl ListingTableConnector for File {
     /// accelerated table, so the watcher is aborted when that table is dropped.
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Only enable the file watcher if the acceleration has the file_watcher parameter set to "enabled"
@@ -236,7 +236,7 @@ impl ListingTableConnector for File {
 
 register_data_connector!("file", FileFactory);
 
-fn get_path(dataset: &Dataset) -> PathBuf {
+fn get_path(dataset: &DatasetSpec) -> PathBuf {
     PathBuf::from(dataset.path())
 }
 

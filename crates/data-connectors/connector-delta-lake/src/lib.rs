@@ -21,12 +21,12 @@ use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::build_table_parquet_options;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use std::any::Any;
@@ -182,7 +182,7 @@ impl DataConnector for DeltaLake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.delta_table_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),
@@ -205,7 +205,7 @@ impl DataConnector for DeltaLake {
     /// buckets outside `us-east-1`.
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         let storage_location = dataset.path();

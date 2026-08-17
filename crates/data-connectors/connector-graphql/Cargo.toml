@@ -36,6 +36,7 @@ paste.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-rate-control = { path = "../../runtime-rate-control" }

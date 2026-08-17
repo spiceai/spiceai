@@ -95,9 +95,17 @@ pub struct SharedMemberSetup {
     /// has subscribed yet — the caller holds the ack floor for the ones that
     /// have not, so their changes are not acked away before they join.
     pub publication_tables: Vec<(String, String)>,
-    /// The earliest LSN this slot can still stream from — see
-    /// [`read_slot_restart_lsn`] — read *after* the slot is ensured, so a slot
-    /// just created reports its own creation point rather than `None`.
+    /// The earliest LSN this slot still *retains* — see [`read_slot_restart_lsn`]
+    /// — read *after* the slot is ensured, so a slot just created reports its own
+    /// creation point rather than `None`.
+    ///
+    /// This is **not** the earliest LSN the slot can be streamed from, and must not
+    /// be used as one: Postgres forwards a `START_REPLICATION` position below the
+    /// slot's `confirmed_flush_lsn` up to it (`CreateDecodingContext`), so an
+    /// acknowledged change can never be re-streamed even while its WAL is retained
+    /// here. Anything deciding whether a position is still reachable wants the later
+    /// of this and `confirmed_flush_lsn`; using retention alone reads an unfillable
+    /// gap as resumable and skips it silently (#11289).
     ///
     /// `None` only when the slot does not exist, which cannot normally follow
     /// `ensure_slot`; it is carried as an `Option` so a slot dropped underneath

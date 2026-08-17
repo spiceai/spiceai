@@ -998,6 +998,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     if needs_metrics {
         rt.init_cache_metrics();
+        rt.init_component_metrics();
     }
 
     let cloned_rt = Arc::clone(&rt);
@@ -1452,14 +1453,7 @@ fn init_metrics(
 
     // Case 1: Prometheus scrape
     if let Some(registry) = registry {
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry)
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()?;
-        provider_builder = provider_builder.with_reader(prometheus_exporter);
+        provider_builder = provider_builder.with_reader(runtime::prometheus_reader(registry)?);
 
         let spice_metrics_exporter =
             OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
