@@ -193,10 +193,35 @@ impl VectorScanTableProvider {
         Ok(columns_requested)
     }
 
-    /// Every column in `entry.vector_index_list` absent from `base`, plus all of
-    /// `entry`'s primary keys.
+    /// For every column across all indexes that isn't already on `base`, the single
+    /// index that supplies it — the first index (in list order) whose schema
+    /// contributes that name, matching the precedence [`Self::schema_over`] merges
+    /// by. A later index sharing the same column name (e.g. a fixed metadata field
+    /// name shared by every chunked embedding column, such as
+    /// `chunking::CHUNKED_INDEX_FULL_SEARCH_FIELD`) is not also asked to supply it —
+    /// each shared name is projected and joined in from exactly one place, so the
+    /// plan never ends up with two columns under the same unqualified name.
+    fn column_owners(&self, base: &Arc<dyn TableProvider>) -> HashMap<String, usize> {
+        let table_schema = base.schema();
+        let mut owners = HashMap::new();
+        for (i, entry) in self.indexes.iter().enumerate() {
+            for f in entry.vector_index_list.schema().fields() {
+                if table_schema.column_with_name(f.name()).is_none() {
+                    owners.entry(f.name().clone()).or_insert(i);
+                }
+            }
+        }
+        owners
+    }
+
+    /// Every column `entry` (at position `index_position` in `self.indexes`) supplies
+    /// to the join: all of its primary keys (needed for the join predicate regardless
+    /// of ownership), plus the non-base columns it is the assigned owner of per
+    /// [`Self::column_owners`].
     fn columns_needed_from_index(
         entry: &VectorIndexJoin,
+        index_position: usize,
+        owners: &HashMap<String, usize>,
         base: &Arc<dyn TableProvider>,
     ) -> Vec<Expr> {
         let table_schema = base.schema();
@@ -206,51 +231,34 @@ impl VectorScanTableProvider {
             .columns()
             .into_iter()
             .filter(|c| {
-                table_schema.column_with_name(&c.name).is_none()
-                    || entry.primary_key.contains(&c.name)
+                entry.primary_key.contains(&c.name)
+                    || (table_schema.column_with_name(&c.name).is_none()
+                        && owners.get(&c.name).copied() == Some(index_position))
             })
             .map(Expr::Column)
             .collect()
     }
 
-    /// The columns `entry` alone contributes: its own schema's columns absent
-    /// from `base` — i.e. the columns only a join against this specific index can
-    /// supply.
-    fn unique_columns_of(
-        entry: &VectorIndexJoin,
-        base: &Arc<dyn TableProvider>,
-    ) -> HashSet<String> {
-        let table_schema = base.schema();
-        entry
-            .vector_index_list
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .filter(|name| table_schema.column_with_name(name).is_none())
-            .collect()
-    }
-
-    /// Whether a query needing `columns_requested` (with `filters`) requires a
-    /// join against `entry` specifically — i.e. whether any column only this
-    /// index supplies is projected or filtered on. An index whose columns are
-    /// never referenced is skipped rather than joined unconditionally, so a
-    /// dataset with several embedding columns pays for only the joins a given
-    /// query actually needs.
+    /// Whether a query needing `columns_requested` (with `filters`) requires a join
+    /// against the index at `index_position` specifically — i.e. whether any column
+    /// only it owns (per [`Self::column_owners`]) is projected or filtered on. An
+    /// index whose owned columns are never referenced is skipped rather than joined
+    /// unconditionally, so a dataset with several embedding columns pays for only the
+    /// joins a given query actually needs.
     fn index_is_needed(
-        entry: &VectorIndexJoin,
-        base: &Arc<dyn TableProvider>,
+        index_position: usize,
+        owners: &HashMap<String, usize>,
         columns_requested: &HashSet<String>,
         filters: &[Expr],
     ) -> bool {
-        let unique = Self::unique_columns_of(entry, base);
-        if columns_requested.iter().any(|c| unique.contains(c)) {
+        let owns = |name: &str| owners.get(name).copied() == Some(index_position);
+        if columns_requested.iter().any(|c| owns(c)) {
             return true;
         }
         filters.iter().any(|f| {
             f.column_refs()
                 .iter()
-                .any(|col| unique.contains(col.name.as_str()))
+                .any(|col| owns(col.name.as_str()))
         })
     }
 }
@@ -338,10 +346,14 @@ impl VectorScanTableProvider {
 
         // Join in only the indexes this query actually needs, on primary keys, prefer to use
         // columns from base table, push down filters where we can.
-        let needed_indexes: Vec<&VectorIndexJoin> = self
+        let owners = self.column_owners(below);
+        let needed_indexes: Vec<(usize, &VectorIndexJoin)> = self
             .indexes
             .iter()
-            .filter(|entry| Self::index_is_needed(entry, below, &columns_requested, filters))
+            .enumerate()
+            .filter(|(index_position, _)| {
+                Self::index_is_needed(*index_position, &owners, &columns_requested, filters)
+            })
             .collect();
 
         let mut join = LogicalPlanBuilder::scan(
@@ -361,27 +373,29 @@ impl VectorScanTableProvider {
             .map(|f| f.name().clone())
             .collect();
 
-        for (i, entry) in needed_indexes.into_iter().enumerate() {
+        for (loop_position, (index_position, entry)) in needed_indexes.into_iter().enumerate() {
             // Match the single-index alias exactly (`vector_index`, unsuffixed) so a dataset
             // with one index keeps producing the same plan it always has; only a second and
             // later index needs a distinguishing suffix.
-            let alias = if i == 0 {
+            let alias = if loop_position == 0 {
                 "vector_index".to_string()
             } else {
-                format!("vector_index_{i}")
+                format!("vector_index_{loop_position}")
             };
 
-            let this_index_columns: HashSet<&str> = entry
-                .vector_index_list
-                .schema()
-                .fields()
+            let this_index_projection =
+                Self::columns_needed_from_index(entry, index_position, &owners, below);
+            let this_index_columns: HashSet<String> = this_index_projection
                 .iter()
-                .map(|f| f.name().as_str())
+                .filter_map(|e| match e {
+                    Expr::Column(c) => Some(c.name.clone()),
+                    _ => None,
+                })
                 .collect();
 
             join = join.join(
                 LogicalPlanBuilder::new_from_arc(Arc::clone(&entry.vector_index_list))
-                    .project(Self::columns_needed_from_index(entry, below))?
+                    .project(this_index_projection)?
                     .alias(alias.clone())?
                     .build()?,
                 JoinType::Left,
@@ -403,7 +417,7 @@ impl VectorScanTableProvider {
                             .any(|col| !entry.primary_key.contains(&col.name))
                             && refs.iter().all(|col| {
                                 available_columns.contains(col.name.as_str())
-                                    || this_index_columns.contains(col.name.as_str())
+                                    || this_index_columns.contains(&col.name)
                             })
                     })
                     .cloned()
@@ -426,7 +440,7 @@ impl VectorScanTableProvider {
                     }),
             )?;
 
-            available_columns.extend(this_index_columns.into_iter().map(String::from));
+            available_columns.extend(this_index_columns);
         }
 
         if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
@@ -1342,6 +1356,82 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
             "scan_table_multi_index_filter_crosses_boundary",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Repro for a suspected bug: two indexes whose schemas both expose a
+    /// non-primary-key column of the *same name* (e.g. `crates/search/src/index/chunking.rs`'s
+    /// `CHUNKED_INDEX_FULL_SEARCH_FIELD`, a fixed name added to any chunked embedding column
+    /// that also carries its own vector metadata — two chunked columns on one dataset would
+    /// both contribute a field under that identical name). Requesting that shared column
+    /// should mark both indexes needed; this test checks whether the join loop can actually
+    /// build a plan for that case.
+    #[tokio::test]
+    pub async fn test_vector_scan_multiple_indexes_shared_non_key_column_name() -> Result<(), String>
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("summary", DataType::Utf8, false),
+        ]));
+
+        let shared_field = || {
+            Field::new("shared_meta", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "filterable".to_string(),
+                "true".to_string(),
+            )]))
+        };
+
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+                "BaseTable",
+            )),
+            &[
+                Arc::new(PretendVectorIndex::new(
+                    "body".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "body_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                        shared_field(),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+                Arc::new(PretendVectorIndex::new(
+                    "summary".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "summary_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                        shared_field(),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+            ],
+        )
+        .expect("could not make 'VectorScanTableProvider' over two indexes sharing a column name");
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding, summary_embedding, shared_meta from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_shared_non_key_column",
         )
         .await?;
 
