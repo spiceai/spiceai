@@ -30,17 +30,29 @@ use datafusion_common::utils::quote_identifier;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
 
+/// The catalog documentation, linked by the errors these queries raise for a
+/// catalog. The CDC prerequisite errors below link the connector documentation,
+/// which is where `wal_level` and replication-slot setup are described.
+const POSTGRES_CATALOG_DOCS: &str = "https://spiceai.org/docs/components/catalogs/postgres";
+
+/// Every variant is worded to read as the *cause* clause of the message that
+/// reports it: the caller names the catalog, schema or table affected and what
+/// the user will observe, and these supply the specific failure and its fix. A
+/// variant that named a resource itself would duplicate the caller's.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the catalog or dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    // The queries this reports are Spice's own discovery queries against
+    // `information_schema` and `pg_catalog`, never anything the user wrote, so
+    // the fix is a grant or a reachable database -- not "check your SQL".
     #[snafu(display(
-        "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`, and that the database is reachable from Spice. Docs: {POSTGRES_CATALOG_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 

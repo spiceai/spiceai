@@ -118,6 +118,12 @@ Async code must reach an `.await` at least every ~100µs — blocking a runtime 
 
 `tracing::` macros only — never the `log::` crate. Keep every log/error message on a single line: no embedded newlines or `\`-continuations that insert them.
 
+**Every `error!`/`warn!`/`info!` a user can see is a user-facing message** and follows the same guidelines as the errors above (`docs/dev/error_handling.md`): name the affected dataset/model/catalog (and schema/table), give an actionable fix with a docs link, and use no internal vocabulary ("table provider", "read provider", "connection pool", "metadata"). Put the resource *in the message text*, not only in a `tracing` field.
+
+- **A `warn!` on a degrade-and-continue path must say what the user will observe**, not only what failed internally — "catalog `X` registered no table from schema `Y`, so queries against `X.Y` will not resolve" beats "failed to discover tables, skipping schema". That line is the only explanation they will ever get for a table that is silently absent, so it is load-bearing rather than cosmetic.
+- **Don't repeat the fix.** When a message embeds a nested error that already carries the action and docs link, the outer message supplies the resource and the consequence and lets the cause supply the rest. Word an inner error as the *cause clause* it will appear as.
+- **Make the wording testable**: build a message a user depends on in a pure function and assert its text in a unit test (see `empty_catalog_warning` and `schema_discovery_warning` in `crates/data_components/src/postgres/provider.rs`), so a reword cannot quietly drop the resource, the consequence, or the docs link.
+
 ### User-facing configuration
 
 - **No boolean params in user-facing config** (Spicepod fields, connector `params`, CLI flags): a bool can't grow a third state and hides which value means "on". Use `#[serde(rename_all = "snake_case")]` enums whose variants describe behavior, mirroring precedent: `on_zero_results: return_empty|use_source`, `unsupported_type_action: error|warn|ignore|string`, `ready_state: on_load|on_registration|on_schema_resolved`, `check_availability: auto|disabled`, `on_schema_change: block|fail|append_new_columns|sync_all_columns`. Default (`#[default]`) to the conservative, back-compat-preserving variant. Booleans remain fine in internal, non-config code.
