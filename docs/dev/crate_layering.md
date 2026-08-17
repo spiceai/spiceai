@@ -474,6 +474,25 @@ three); each is a separate `-api` crate a `data-<source>` implements as applicab
 - **Catalog** (`data-catalog-api`) — discover datasets/schemas rather than serve
   rows (`runtime/src/catalogconnector`, `unity_catalog`, iceberg/glue).
 
+### How finely to split a family: on dependencies, not on capabilities
+
+Once a family is inverted behind a contract, the next question is how many crates it becomes. The
+axis that looks natural is the trait surface — one crate per capability per vendor. The axis that
+pays is the **dependency set**.
+
+A crate boundary earns its keep by taking something out of a prerequisite closure. If two
+capabilities of one vendor are built on the same client library, splitting them yields two crates
+that pull the same heavy dependency: nothing is shed, and the vendor's client construction now has
+two homes that can drift apart. If two capabilities are built on *different* stacks, splitting them
+lets a deployment take one and shed the other entirely.
+
+> **The test:** would the split remove a dependency from somebody's build? If not, it is a module,
+> not a crate.
+
+This is the same judgement as [interface vs. implementation](#worked-example-interface-vs-implementation-dependency-cdc-checkpoints),
+applied to granularity rather than direction — and it is why a family's crate count tracks its
+vendors and backends rather than its trait count.
+
 ### Worked example: interface vs. implementation dependency (CDC checkpoints)
 
 `cargo-crate-split` flags `dataconnector -> dataaccelerator` (the CDC connectors
