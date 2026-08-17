@@ -4230,7 +4230,7 @@ mod tests {
         );
     }
 
-    /// Regression test for append refreshes from PostgreSQL into Cayenne.
+    /// Regression test for append refreshes from `PostgreSQL` into Cayenne.
     ///
     /// PostgreSQL `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
     /// at microseconds. Cayenne also promotes Float16 to Float32. Both engine rewrites must
@@ -4238,6 +4238,8 @@ mod tests {
     /// rejected as a schema mismatch.
     #[tokio::test]
     async fn test_except_existing_records_from_normalizes_cayenne_timestamp_before_dedup() {
+        type F16 = <arrow::datatypes::Float16Type as ArrowPrimitiveType>::Native;
+
         let source_schema = Arc::new(Schema::new(vec![
             Field::new(
                 "timestamp",
@@ -4288,7 +4290,6 @@ mod tests {
         .build();
         let refresh = Refresh::new(RefreshMode::Append).time_column("timestamp".to_string());
 
-        type F16 = <arrow::datatypes::Float16Type as ArrowPrimitiveType>::Native;
         let update_batch = RecordBatch::try_new(
             Arc::clone(&source_schema),
             vec![
