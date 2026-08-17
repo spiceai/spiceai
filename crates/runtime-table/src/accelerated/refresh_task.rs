@@ -4232,7 +4232,7 @@ mod tests {
 
     /// Regression test for append refreshes from `PostgreSQL` into Cayenne.
     ///
-    /// PostgreSQL `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
+    /// `PostgreSQL` `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
     /// at microseconds. Cayenne also promotes Float16 to Float32. Both engine rewrites must
     /// happen before the overlap comparison so the already-stored row is removed rather than
     /// rejected as a schema mismatch.
