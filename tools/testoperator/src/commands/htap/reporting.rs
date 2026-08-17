@@ -416,9 +416,38 @@ pub(super) fn emit_cayenne_read_amp_percentiles(metrics: &crate::spiced_metrics:
     println!();
 }
 
-/// Cayenne's background maintenance operations, as `(reported name, scraped
-/// series)`. Each series is cumulative for the run, so its end value is how many
-/// times that operation ran.
+/// Which path an operation runs on. Reported alongside the count, because a
+/// count only means something once you know whether it scales with the workload:
+/// `Write` and `Read` counts rise with the changes applied and the queries
+/// served, while `Background` counts are the accelerator's own housekeeping.
+/// Summing them into one "maintenance" figure would report a run that merely
+/// applied more changes as having done more housekeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OperationPath {
+    Background,
+    Write,
+    Read,
+}
+
+impl OperationPath {
+    fn label(self) -> &'static str {
+        match self {
+            OperationPath::Background => "background",
+            OperationPath::Write => "write",
+            OperationPath::Read => "read",
+        }
+    }
+}
+
+/// Instrumented Cayenne operations, as `(reported name, scraped series, path)`.
+/// Each series is cumulative for the run, so its end value is how many times that
+/// operation ran.
+///
+/// The path of each was read off its emit site, not inferred from its name:
+/// `cayenne_write_phase_duration_ms` comes from `record_cayenne_write_phase` on
+/// the write path, the inline-cache populates come from `read_inlined_batches` /
+/// `cached_inlined_view` on the scan path, and the inline tombstone writes come
+/// from the on-conflict apply.
 ///
 /// Compaction passes are deliberately absent: they carry `table`/`kind` labels
 /// worth keeping apart, so [`emit_cayenne_compaction_metrics`] reports them at
@@ -428,41 +457,57 @@ pub(super) fn emit_cayenne_read_amp_percentiles(metrics: &crate::spiced_metrics:
 /// Everything here is an operation *count*, so a quantity in other units (e.g.
 /// `cayenne_metastore_incremental_vacuum_pages_total`, which counts pages rather
 /// than vacuums) does not belong.
-const CAYENNE_MAINTENANCE_SERIES: &[(&str, &str)] = &[
-    ("write_phases", "cayenne_write_phase_duration_ms_count"),
+const CAYENNE_OPERATION_SERIES: &[(&str, &str, OperationPath)] = &[
     (
         "mem_tier_checkpoint_ticks",
         "cayenne_mem_tier_checkpoint_tick_total",
+        OperationPath::Background,
     ),
     (
         "metastore_checkpoints",
         "cayenne_metastore_checkpoint_ms_count",
+        OperationPath::Background,
     ),
     (
         "metastore_vacuums",
         "cayenne_metastore_incremental_vacuum_ms_count",
+        OperationPath::Background,
     ),
     (
-        "inline_cache_full_rebuilds",
-        "cayenne_inline_cache_full_rebuilds_total",
-    ),
-    (
-        "inline_cache_delta_populates",
-        "cayenne_inline_cache_delta_populates_total",
-    ),
-    (
-        "inline_tombstone_writes",
-        "cayenne_inline_tombstone_writes_total",
+        "autotune_adjustments",
+        "cayenne_autotune_adjustments_total",
+        OperationPath::Background,
     ),
     (
         "compaction_memory_exhausted",
         "cayenne_compaction_memory_exhausted_total",
+        OperationPath::Background,
+    ),
+    (
+        "write_phases",
+        "cayenne_write_phase_duration_ms_count",
+        OperationPath::Write,
+    ),
+    (
+        "inline_tombstone_writes",
+        "cayenne_inline_tombstone_writes_total",
+        OperationPath::Write,
     ),
     (
         "mem_tier_reserve_refused",
         "cayenne_mem_tier_reserve_refused_total",
+        OperationPath::Write,
     ),
-    ("autotune_adjustments", "cayenne_autotune_adjustments_total"),
+    (
+        "inline_cache_full_rebuilds",
+        "cayenne_inline_cache_full_rebuilds_total",
+        OperationPath::Read,
+    ),
+    (
+        "inline_cache_delta_populates",
+        "cayenne_inline_cache_delta_populates_total",
+        OperationPath::Read,
+    ),
 ];
 
 /// Sums a cumulative series to its end-of-run total.
@@ -502,23 +547,27 @@ fn cumulative_series_total(
     Some(series_max.values().sum())
 }
 
-/// Emits how many times each Cayenne background maintenance operation ran during
-/// the run.
+/// Emits how many times each instrumented Cayenne operation ran during the run,
+/// grouped by the path it runs on.
 ///
 /// Compaction passes answer the same question per table and kind
-/// ([`emit_cayenne_compaction_metrics`]); this covers the rest of the background
-/// work — write phases, checkpoints, metastore vacuums, inline-cache rebuilds —
-/// so a throughput or freshness delta between two runs can be attributed to a
-/// change in that work rather than inferred. The refusal/exhaustion counters are
-/// included because they should normally be zero: a non-zero value is back
-/// pressure that would otherwise only show up as an unexplained slowdown.
+/// ([`emit_cayenne_compaction_metrics`]); this covers the rest — the accelerator's
+/// own housekeeping, plus the write- and read-path work that housekeeping competes
+/// with — so a throughput or freshness delta between two runs can be attributed to
+/// a change in that work rather than inferred.
+///
+/// The path matters to reading the number and is reported with it: only the
+/// `background` counts are housekeeping, while `write` and `read` counts scale
+/// with the changes applied and the queries served. The refusal/exhaustion
+/// counters are included because they should normally be zero — a non-zero value
+/// is back pressure that would otherwise only show up as an unexplained slowdown.
 ///
 /// Silent when nothing was scraped, so a `DuckDB` baseline prints no empty section.
-pub(super) fn emit_cayenne_maintenance_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
-    let totals: Vec<(&str, f64)> = CAYENNE_MAINTENANCE_SERIES
+pub(super) fn emit_cayenne_operation_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+    let totals: Vec<(&str, OperationPath, f64)> = CAYENNE_OPERATION_SERIES
         .iter()
-        .filter_map(|(label, series)| {
-            cumulative_series_total(metrics, series).map(|total| (*label, total))
+        .filter_map(|(label, series, path)| {
+            cumulative_series_total(metrics, series).map(|total| (*label, *path, total))
         })
         .collect();
 
@@ -526,12 +575,18 @@ pub(super) fn emit_cayenne_maintenance_metrics(metrics: &crate::spiced_metrics::
         return;
     }
 
-    println!("\nCayenne Maintenance Operations");
-    println!("  {:<30} {:>12}", "operation", "count");
-    for (label, total) in &totals {
-        println!("  {label:<30} {total:>12.0}");
-        crate::metrics::CAYENNE_MAINTENANCE_OPERATIONS
-            .record(to_u64(*total), &[KeyValue::new("operation", *label)]);
+    println!("\nCayenne Operation Counts");
+    println!("  {:<30} {:<12} {:>12}", "operation", "path", "count");
+    for (label, path, total) in &totals {
+        let path_label = path.label();
+        println!("  {label:<30} {path_label:<12} {total:>12.0}");
+        crate::metrics::CAYENNE_OPERATION_COUNTS.record(
+            to_u64(*total),
+            &[
+                KeyValue::new("operation", *label),
+                KeyValue::new("path", path_label),
+            ],
+        );
     }
     println!();
 }
@@ -1287,9 +1342,12 @@ mod tests {
     /// Every reported operation must name a distinct series, or one would overwrite
     /// another's gauge point.
     #[test]
-    fn maintenance_series_are_uniquely_named() {
-        let mut labels: Vec<&str> = CAYENNE_MAINTENANCE_SERIES.iter().map(|(l, _)| *l).collect();
-        let mut series: Vec<&str> = CAYENNE_MAINTENANCE_SERIES.iter().map(|(_, s)| *s).collect();
+    fn operation_series_are_uniquely_named() {
+        let mut labels: Vec<&str> = CAYENNE_OPERATION_SERIES.iter().map(|(l, ..)| *l).collect();
+        let mut series: Vec<&str> = CAYENNE_OPERATION_SERIES
+            .iter()
+            .map(|(_, s, _)| *s)
+            .collect();
         let (labels_len, series_len) = (labels.len(), series.len());
         labels.sort_unstable();
         labels.dedup();
@@ -1297,5 +1355,38 @@ mod tests {
         series.dedup();
         assert_eq!(labels.len(), labels_len, "duplicate operation label");
         assert_eq!(series.len(), series_len, "duplicate scraped series");
+    }
+
+    /// The write- and read-path counts scale with the workload, so classifying one
+    /// as `background` would report a run that merely applied more changes or
+    /// served more queries as having done more housekeeping. These three were read
+    /// off their emit sites; pin them so a later edit cannot quietly relabel them.
+    #[test]
+    fn workload_scaling_operations_are_not_classified_as_background() {
+        for (label, expected) in [
+            ("write_phases", OperationPath::Write),
+            ("inline_tombstone_writes", OperationPath::Write),
+            ("mem_tier_reserve_refused", OperationPath::Write),
+            ("inline_cache_full_rebuilds", OperationPath::Read),
+            ("inline_cache_delta_populates", OperationPath::Read),
+        ] {
+            let found = CAYENNE_OPERATION_SERIES
+                .iter()
+                .find(|(name, ..)| *name == label)
+                .map(|(_, _, path)| *path);
+            assert_eq!(found, Some(expected), "{label} is on the wrong path");
+        }
+    }
+
+    /// Housekeeping is what the section exists to surface, so at least the
+    /// background group must be populated — an all-workload list would make the
+    /// report unable to answer the question it was added for.
+    #[test]
+    fn the_background_group_is_populated() {
+        let background = CAYENNE_OPERATION_SERIES
+            .iter()
+            .filter(|(_, _, path)| *path == OperationPath::Background)
+            .count();
+        assert!(background >= 5, "got {background} background operations");
     }
 }

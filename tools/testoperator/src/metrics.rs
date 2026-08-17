@@ -654,11 +654,11 @@ pub static CAYENNE_COMPACTION_PASSES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-pub static CAYENNE_MAINTENANCE_OPERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+pub static CAYENNE_OPERATION_COUNTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     meter()
-        .u64_gauge("cayenne_maintenance_operations")
+        .u64_gauge("cayenne_operation_counts")
         .with_description(
-            "How many times each Cayenne background maintenance operation ran during the test, by operation — the work the accelerator does outside serving a query or applying a change, so a throughput or freshness difference between two runs can be attributed to a change in that background work rather than guessed at. Compaction passes are reported separately per table and kind by cayenne_compaction_passes.",
+            "How many times each instrumented Cayenne operation ran during the test, by operation and the path it runs on, so a throughput or freshness difference between two runs can be attributed to a change in that work rather than guessed at. The path is reported because it decides how to read the count: only path=background is the accelerator's own housekeeping, while path=write and path=read scale with the changes applied and the queries served. Compaction passes are reported separately per table and kind by cayenne_compaction_passes.",
         )
         .with_unit("operations")
         .build()

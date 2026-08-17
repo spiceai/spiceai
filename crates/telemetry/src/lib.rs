@@ -1080,7 +1080,7 @@ pub mod cayenne {
         operational_meter()
             .f64_histogram("cayenne_compaction_duration_ms")
             .with_description(
-                "Wall-clock time of Cayenne compaction passes (kind=full current-snapshot rewrite | subset protected-snapshot merge).",
+                "Wall-clock time of Cayenne compaction passes (kind=full current-snapshot rewrite | subset protected-snapshot merge | subset_current current-snapshot subset merge | datalake datalake-tier merge | bake seq-prefix deletion-index bake).",
             )
             .with_unit("ms")
             .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
@@ -1089,9 +1089,21 @@ pub mod cayenne {
     }
 
     /// Records the wall-clock duration of a Cayenne compaction pass. `dimensions`
-    /// should carry `table`, `kind` (`"full"` current-snapshot rewrite | `"subset"`
-    /// protected-snapshot merge), and `result` (`"completed"` | `"failed"`). The
+    /// should carry `table`, `kind`, and `result` (`"completed"` | `"failed"`). The
     /// histogram's count doubles as the per-kind compaction-pass counter.
+    ///
+    /// `kind` is one of:
+    /// - `"full"` — current-snapshot rewrite
+    /// - `"subset"` — protected-snapshot size-tier merge
+    /// - `"subset_current"` — current-snapshot subset merge
+    /// - `"datalake"` — datalake-tier merge
+    /// - `"bake"` — seq-prefix bake, which consolidates the settled protected
+    ///   prefix to shrink the deletion index. Unlike the others it records no
+    ///   [`track_compaction_merged_bytes`], so that series has no `bake` member.
+    ///
+    /// Keep this list and the instrument description above in step with the call
+    /// sites: the description is the exported HELP text, so a `kind` missing from
+    /// it is undocumented for everyone consuming the metric.
     pub fn track_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
         compaction_duration_ms().record(duration.as_secs_f64() * 1000.0, dimensions);
     }
