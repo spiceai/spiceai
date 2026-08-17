@@ -350,6 +350,17 @@ impl VectorScanTableProvider {
             None,
         )?;
 
+        // Columns resolvable in the join built so far — starts at the base table's own
+        // columns and gains each index's columns once that index has actually been
+        // joined in. A filter naming a column only a *later* index supplies cannot be
+        // embedded in an *earlier* index's join: that join's schema doesn't have it yet.
+        let mut available_columns: HashSet<String> = below
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
         for (i, entry) in needed_indexes.into_iter().enumerate() {
             // Match the single-index alias exactly (`vector_index`, unsuffixed) so a dataset
             // with one index keeps producing the same plan it always has; only a second and
@@ -359,6 +370,14 @@ impl VectorScanTableProvider {
             } else {
                 format!("vector_index_{i}")
             };
+
+            let this_index_columns: HashSet<&str> = entry
+                .vector_index_list
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
 
             join = join.join(
                 LogicalPlanBuilder::new_from_arc(Arc::clone(&entry.vector_index_list))
@@ -372,12 +391,19 @@ impl VectorScanTableProvider {
                     .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
                     .collect(),
                 // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+                // Only push a filter into this join if every column it references is already
+                // resolvable here (the base table, an index joined earlier, or this index's
+                // own columns) — the unconditional filter after all joins below still applies
+                // it, so a filter that isn't embeddable yet is simply deferred, not dropped.
                 filters
                     .iter()
                     .filter(|f| {
-                        f.column_refs()
-                            .iter()
-                            .any(|col| !entry.primary_key.contains(&col.name))
+                        let refs = f.column_refs();
+                        refs.iter().any(|col| !entry.primary_key.contains(&col.name))
+                            && refs.iter().all(|col| {
+                                available_columns.contains(col.name.as_str())
+                                    || this_index_columns.contains(col.name.as_str())
+                            })
                     })
                     .cloned()
                     .reduce(Expr::and),
@@ -398,6 +424,8 @@ impl VectorScanTableProvider {
                         None => Column::new(None::<TableReference>, field_ref.name()),
                     }),
             )?;
+
+            available_columns.extend(this_index_columns.into_iter().map(String::from));
         }
 
         if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
@@ -1244,6 +1272,75 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, another_column from my_vectored_table ORDER BY pk desc LIMIT 5",
             "scan_table_multi_index_no_join",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Regression test: a filter naming a column that only a *later* index in the join
+    /// chain supplies must not be pushed into an *earlier* index's join. Selecting
+    /// `body_embedding` (only the `body` index) while filtering on `a_number` (only the
+    /// `summary` index's metadata column) makes `summary` a needed index too, but the
+    /// `body` join is built first — embedding a filter on `a_number` there references a
+    /// column absent from that join's schema and fails to plan.
+    #[tokio::test]
+    pub async fn test_vector_scan_multiple_indexes_filter_crosses_index_boundary() -> Result<(), String>
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("summary", DataType::Utf8, false),
+        ]));
+
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+                "BaseTable",
+            )),
+            &[
+                Arc::new(PretendVectorIndex::new(
+                    "body".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "body_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+                Arc::new(PretendVectorIndex::new(
+                    "summary".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "summary_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                        Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from(
+                            [("filterable".to_string(), "true".to_string())],
+                        )),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+            ],
+        )
+        .expect("could not make 'VectorScanTableProvider' over two indexes");
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_filter_crosses_boundary",
         )
         .await?;
 
