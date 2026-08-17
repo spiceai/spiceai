@@ -805,6 +805,7 @@ impl DataConnector for MongoDB {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),

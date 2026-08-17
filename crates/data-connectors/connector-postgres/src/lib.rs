@@ -1085,6 +1085,7 @@ impl DataConnector for Postgres {
         &self,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
+        acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
@@ -1092,6 +1093,7 @@ impl DataConnector for Postgres {
             self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
+            acceleration,
         ))
     }
 
