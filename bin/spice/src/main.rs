@@ -1339,7 +1339,7 @@ mod tests {
         let cli = parse_normalized(&[
             "spice",
             "connect",
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F",
+            "spice-enroll-abcdefghijklmnopqrstuvwxyz012345",
             "--cloud-region",
             "us-west-2",
         ]);

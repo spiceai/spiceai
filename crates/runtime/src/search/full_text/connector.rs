@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::chunking::ChunkedSearchIndex;
@@ -208,9 +208,10 @@ impl DataConnector for FullTextConnector {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
-            inner.changes_stream(ft, dataset)
+            inner.changes_stream(ft, dataset, acceleration)
         })
     }
 

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
@@ -3131,9 +3132,19 @@ impl DataFusion {
                 },
             );
 
+            // Observed before the stream exists, so the CDC writer — the only
+            // writer on this path — cannot have touched the acceleration yet.
+            // A source that cannot place an acceleration's contents has to
+            // assume they may be hiding rows deleted at the source; this is how
+            // it recognizes a load that starts from nothing instead. See
+            // `AccelerationContents`.
+            let acceleration =
+                probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+
             let changes_stream = source.changes_stream(
                 Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
                 dataset,
+                acceleration,
             );
 
             if let Some(changes_stream) = changes_stream {
@@ -3209,10 +3220,10 @@ impl DataFusion {
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         // The engine rewrites some incoming types at table creation because its storage
-        // format cannot hold them (Cayenne/Vortex keeps every timestamp at microsecond
-        // precision, DuckDB does the same for TIMESTAMPTZ). The refresh sink compares the
-        // incoming schema against the accelerated one, so without these rules it reports
-        // the engine's own type as the acceleration lagging the source.
+        // format cannot hold them (DuckDB stores every TIMESTAMPTZ at microsecond
+        // precision, Cayenne/Vortex has no half-precision float). The refresh sink
+        // compares the incoming schema against the accelerated one, so without these
+        // rules it reports the engine's own type as the acceleration lagging the source.
         let engine_type_rewrites = self
             .accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
