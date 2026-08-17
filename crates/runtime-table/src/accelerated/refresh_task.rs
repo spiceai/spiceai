@@ -2042,18 +2042,24 @@ impl RefreshTask {
             .collect();
 
         // The sink must receive the source schema so it can report engine-imposed narrowing
-        // and account for it. The normalized batches exist only for this comparison; cast the
-        // surviving rows back after de-duplication, then let the ordinary write path perform
-        // its normal source-to-engine cast.
+        // and account for it. The normalized batches exist only for comparison: use their
+        // de-duplication predicate to filter the original batch, then let the ordinary write
+        // path perform its normal source-to-engine cast.
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
-                    let batch = batch?;
-                    let batch = try_cast_to(batch, Arc::clone(&filter_schema))
+                    let source_batch = batch?;
+                    let normalized_batch = try_cast_to(source_batch.clone(), Arc::clone(&filter_schema))
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let batch = filter_records(&batch, &existing_records, &filter_schema, &mut used)
+                    let predicates = dedup_predicates(
+                        &normalized_batch,
+                        &existing_records,
+                        &filter_schema,
+                        &mut used,
+                    )
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let batch = try_cast_to(batch, Arc::clone(&output_schema))
+                    let batch = filter_record_batch(&source_batch, &predicates.into())
+                        .context(super::FailedToFilterUpdatesSnafu)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     yield Ok(batch);
                 }
@@ -2761,12 +2767,26 @@ fn ensure_dedup_column_type(
 /// stored rows are NULL-backfilled while the source re-emits them with real values in
 /// the new column - those rows compare unequal here and are appended once more for
 /// the overlap window. This is a documented one-time effect, not a defect.
+#[cfg(test)]
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &[RecordBatch],
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
+    let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
+
+    filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
+/// each matching existing row at most once across the append overlap stream.
+fn dedup_predicates(
+    update_data: &RecordBatch,
+    existing_records: &[RecordBatch],
+    filter_schema: &SchemaRef,
+    used: &mut [Vec<bool>],
+) -> super::Result<Vec<bool>> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
@@ -2853,7 +2873,7 @@ fn filter_records(
         predicates.push(not_matched);
     }
 
-    filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+    Ok(predicates)
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
