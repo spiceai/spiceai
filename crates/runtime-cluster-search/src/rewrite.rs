@@ -360,14 +360,13 @@ fn split_pushable_filter(predicate: &Expr, schema: &SchemaRef) -> (Option<String
             .iter()
             .all(|c| schema.column_with_name(c.name()).is_some());
 
-        if references_known_columns {
-            if let Ok(ast) = unparser.expr_to_sql(&conjunct) {
-                pushed_sql.push(ast.to_string());
-                continue;
-            }
-            // Cannot render this conjunct as SQL; leave it for the caller to
-            // apply above the merge instead of dropping it.
+        if references_known_columns && let Ok(ast) = unparser.expr_to_sql(&conjunct) {
+            pushed_sql.push(ast.to_string());
+            continue;
         }
+        // Not pushable (references an unknown column, or cannot be rendered
+        // as SQL); leave it for the caller to apply above the merge instead
+        // of dropping it.
         remaining.push(conjunct);
     }
 
