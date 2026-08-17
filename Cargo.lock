@@ -25245,3 +25245,8 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "datafusion-federation"
+version = "0.4.2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=eba20fd9f539b8c1bb993e29373b2a644d3bcea8#eba20fd9f539b8c1bb993e29373b2a644d3bcea8"
