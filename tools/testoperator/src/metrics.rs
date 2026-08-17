@@ -654,6 +654,16 @@ pub static CAYENNE_COMPACTION_PASSES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static CAYENNE_MAINTENANCE_OPERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_maintenance_operations")
+        .with_description(
+            "How many times each Cayenne background maintenance operation ran during the test, by operation — the work the accelerator does outside serving a query or applying a change, so a throughput or freshness difference between two runs can be attributed to a change in that background work rather than guessed at. Compaction passes are reported separately per table and kind by cayenne_compaction_passes.",
+        )
+        .with_unit("operations")
+        .build()
+});
+
 pub static CAYENNE_COMPACTION_MERGED_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     meter()
         .u64_gauge("cayenne_compaction_merged_bytes")
