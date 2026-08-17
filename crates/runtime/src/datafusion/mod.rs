@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
@@ -3134,11 +3135,21 @@ impl DataFusion {
                 },
             );
 
+            // Observed before the stream exists, so the CDC writer — the only
+            // writer on this path — cannot have touched the acceleration yet.
+            // A source that cannot place an acceleration's contents has to
+            // assume they may be hiding rows deleted at the source; this is how
+            // it recognizes a load that starts from nothing instead. See
+            // `AccelerationContents`.
+            let acceleration =
+                probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+
             let changes_stream = source
                 .changes_stream(
                     &RuntimeConnectorContext::for_dataset(dataset),
                     Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
                     dataset,
+                    acceleration,
                 )
                 .await;
 
