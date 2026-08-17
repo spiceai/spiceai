@@ -137,8 +137,8 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<()> {
-    // Read the PDF bytes once. liteparse's `DocumentParser::parse` takes bytes;
-    // pdf-inspector reads the path itself, so we pass the path through to it.
+    // Read the PDF bytes once and hand the same buffer to both backends, so
+    // neither backend's measured duration includes file I/O the other skips.
     let raw = tokio::fs::read(&args.pdf_path)
         .await
         .context(ReadFileSnafu {
@@ -152,17 +152,38 @@ async fn run(args: Args) -> Result<()> {
     }
 
     let mut outputs = Vec::new();
+    let mut had_backend_error = false;
 
     if matches!(args.parser, ParserChoice::Liteparse | ParserChoice::Both) {
-        outputs.push(run_liteparse(&raw, args.format).await?);
+        match run_liteparse(&raw, args.format).await {
+            Ok(output) => outputs.push(output),
+            // In `both` mode, report this backend's failure but keep going so
+            // the other backend still runs and its result is still reported.
+            Err(e) if args.parser == ParserChoice::Both => {
+                eprintln!("{e}");
+                had_backend_error = true;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     if matches!(args.parser, ParserChoice::PdfInspector | ParserChoice::Both) {
-        outputs.push(run_pdf_inspector(&args.pdf_path, args.format)?);
+        match run_pdf_inspector(&raw, args.format) {
+            Ok(output) => outputs.push(output),
+            Err(e) if args.parser == ParserChoice::Both => {
+                eprintln!("{e}");
+                had_backend_error = true;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     for output in &outputs {
         report(output, args.out.as_deref())?;
+    }
+
+    if had_backend_error {
+        exit(1);
     }
 
     Ok(())
@@ -194,25 +215,27 @@ async fn run_liteparse(raw: &[u8], format: OutputFormat) -> Result<BackendOutput
     })
 }
 
-/// Parse with the candidate `pdf-inspector` backend. For text we use
-/// `extract_text`; for markdown we use `process_pdf`, whose full pipeline
-/// populates `PdfProcessResult::markdown`.
-fn run_pdf_inspector(path: &Path, format: OutputFormat) -> Result<BackendOutput> {
+/// Parse with the candidate `pdf-inspector` backend, from the same buffered
+/// bytes read for liteparse (via the `_mem` entry points) so the timing
+/// comparison doesn't charge one backend for file I/O the other skips. For
+/// text we use `extract_text_mem`; for markdown we use `process_pdf_mem`,
+/// whose full pipeline populates `PdfProcessResult::markdown`.
+fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> {
     let start = Instant::now();
     let (content, actual_format, note) = match format {
         OutputFormat::Text => {
-            let text = pdf_inspector::extract_text(path).context(PdfInspectorSnafu)?;
+            let text = pdf_inspector::extract_text_mem(raw).context(PdfInspectorSnafu)?;
             (text, OutputFormat::Text, None)
         }
         OutputFormat::Markdown => {
-            let result = pdf_inspector::process_pdf(path).context(PdfInspectorSnafu)?;
+            let result = pdf_inspector::process_pdf_mem(raw).context(PdfInspectorSnafu)?;
             if let Some(md) = result.markdown {
                 (md, OutputFormat::Markdown, None)
             } else {
                 // The full pipeline did not produce markdown (e.g. a scanned
                 // page needing OCR); fall back to plain text so the run is
                 // still comparable rather than empty.
-                let text = pdf_inspector::extract_text(path).context(PdfInspectorSnafu)?;
+                let text = pdf_inspector::extract_text_mem(raw).context(PdfInspectorSnafu)?;
                 (
                     text,
                     OutputFormat::Text,
