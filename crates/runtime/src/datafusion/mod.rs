@@ -3220,10 +3220,10 @@ impl DataFusion {
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         // The engine rewrites some incoming types at table creation because its storage
-        // format cannot hold them (Cayenne/Vortex keeps every timestamp at microsecond
-        // precision, DuckDB does the same for TIMESTAMPTZ). The refresh sink compares the
-        // incoming schema against the accelerated one, so without these rules it reports
-        // the engine's own type as the acceleration lagging the source.
+        // format cannot hold them (DuckDB stores every TIMESTAMPTZ at microsecond
+        // precision, Cayenne/Vortex has no half-precision float). The refresh sink
+        // compares the incoming schema against the accelerated one, so without these
+        // rules it reports the engine's own type as the acceleration lagging the source.
         let engine_type_rewrites = self
             .accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
