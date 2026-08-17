@@ -1452,6 +1452,7 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
+                Arc::downgrade(&self.datafusion()),
             ));
         }
 
@@ -2186,6 +2187,7 @@ fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
         register_connector_factory,
@@ -2229,7 +2231,7 @@ mod tests {
         fn static_schema(
             &self,
             _params: &ConnectorParams,
-            dataset: &crate::component::dataset::Dataset,
+            dataset: &DatasetSpec,
         ) -> Option<arrow_schema::SchemaRef> {
             crate::component::dataset::declared_schema::declared_schema_for(dataset)
                 .ok()
@@ -2248,7 +2250,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
         }
@@ -2400,7 +2402,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "id",

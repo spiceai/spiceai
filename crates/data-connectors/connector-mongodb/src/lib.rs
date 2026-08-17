@@ -35,12 +35,12 @@ use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use mongodb::bson::{Bson, Document, doc};
-use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, parameters::ConnectorContext,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -741,7 +741,7 @@ async fn mongodb_inferred_schema_metadata(
 /// best-effort, degrading gracefully when the source restricts catalog access.
 async fn enrich_with_mongodb_metadata(
     pool: &Arc<MongoDBConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     tracing::debug!(
@@ -778,7 +778,7 @@ impl DataConnector for MongoDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
         // primary key and must stay a declared column when a catch-all is used.
@@ -804,7 +804,8 @@ impl DataConnector for MongoDB {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),

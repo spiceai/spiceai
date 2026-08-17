@@ -28,12 +28,12 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
@@ -503,7 +503,7 @@ async fn mysql_inferred_schema_metadata(
 /// `enrich_with_postgres_metadata`.
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     table_reference: &datafusion::sql::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
@@ -566,7 +566,7 @@ impl DataConnector for MySQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
             .parse_path(true, Some(&MySqlDialect {}))
@@ -618,7 +618,8 @@ impl DataConnector for MySQL {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
