@@ -20,8 +20,8 @@ limitations under the License.
 //! This module explicitly references all connector modules to ensure they are linked into the
 //! binary and their `linkme` distributed slice registrations are included.
 
+use data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS;
 use data_connector_api::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
 use spicepod::component::model::ModelSource;

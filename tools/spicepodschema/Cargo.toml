@@ -81,6 +81,7 @@ connector-smb = { path = "../../crates/data-connectors/connector-smb" }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
 connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 
+data-accelerator-api = { path = "../../crates/data-accelerator-api" }
 runtime-parameters = { path = "../../crates/runtime-parameters" }
 
 [lints]
