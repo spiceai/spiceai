@@ -13,7 +13,7 @@ limitations under the License.
 
 use std::fmt::Write;
 
-// The NSQL contract lives in `model-api` beside the `Chat` trait that returns it.
+// The NSQL contract lives in `chat-api` beside the `Chat` trait that returns it.
 pub use chat_api::{FailedAttempt, QueryGenerationContext, SqlGeneration};
 
 pub mod default;

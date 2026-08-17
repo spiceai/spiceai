@@ -490,8 +490,10 @@ lets a deployment take one and shed the other entirely.
 > not a crate.
 
 This is the same judgement as [interface vs. implementation](#worked-example-interface-vs-implementation-dependency-cdc-checkpoints),
-applied to granularity rather than direction — and it is why a family's crate count tracks its
-vendors and backends rather than its trait count.
+applied to granularity rather than direction. Note what it does *not* say: crate count is not a
+function of vendors, or of backends, or of traits. It is a function of **distinct dependency
+sets** — which usually lands on one crate per vendor, but splits a single vendor in two whenever
+its capabilities are built on unrelated stacks.
 
 ### Worked example: interface vs. implementation dependency (CDC checkpoints)
 

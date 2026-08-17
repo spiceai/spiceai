@@ -14,7 +14,7 @@ limitations under the License.
 
 pub use async_openai::types::embeddings::EmbeddingInput;
 
-// The contract lives in `model-api`, below every provider; re-exported so existing
+// The contract lives in `embed-api`, below every provider; re-exported so existing
 // `llms::embeddings::…` paths resolve, including SNAFU's generated context selectors.
 pub use embed_api::*;
 use std::sync::Arc;

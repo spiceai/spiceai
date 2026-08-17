@@ -33,7 +33,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 
-// The contract lives in `model-api`, below every provider; re-exported so existing
+// The contract lives in `rerank-api`, below every provider; re-exported so existing
 // `llms::rerank::…` paths resolve, including SNAFU's generated context selectors.
 pub use rerank_api::*;
 use std::fmt::Debug;

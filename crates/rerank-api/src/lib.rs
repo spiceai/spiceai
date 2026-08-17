@@ -77,7 +77,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// order as the input: `rerank(query, &docs)[i]` is the score for `docs[i]`.
 /// Any mismatch surfaces as [`Error::MismatchedScoreCount`].
 ///
-/// Note: the built-in [`LlmRerank`] adapter is deliberately lenient with
+/// Note: `llms::rerank::LlmRerank`, the adapter that drives a chat model as a
+/// reranker, is deliberately lenient with
 /// partial LLM output — missing ids in a listwise response default to `0.0`
 /// (least relevant) rather than erroring — because models occasionally skip
 /// entries. Native rerankers are expected to score every document.

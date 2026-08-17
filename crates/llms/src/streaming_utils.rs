@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Stream plumbing shared by every chat provider.
 //!
-//! Lives in `model-api` beside the `Chat` trait whose default bodies use it; re-exported
+//! Lives in `chat-api` beside the `Chat` trait whose default bodies use it; re-exported
 //! so existing `llms::streaming_utils::…` paths resolve.
 
 pub use chat_api::streaming_utils::*;

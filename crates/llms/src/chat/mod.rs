@@ -12,7 +12,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-// The contract lives in `model-api`, below every provider; re-exported so existing
+// The contract lives in `chat-api`, below every provider; re-exported so existing
 // `llms::chat::…` paths resolve, including SNAFU's generated context selectors.
 pub use chat_api::*;
 #[cfg(feature = "local_llm")]
