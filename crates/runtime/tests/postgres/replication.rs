@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
+use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
     NoopAppliedLsnStore, PgOutputFormat, ReplicationMetricsCollector, ReplicationParams,
     ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
@@ -72,12 +72,17 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         initial_snapshot: true,
         snapshot_on_resume: false,
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: false,
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
         ready_lag: Duration::from_secs(2),
     }
 }

@@ -23,13 +23,33 @@ use arrow_tools::type_rewrite::{Float16ToFloat32, TimestampToMicrosecond, TypeRe
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_table_providers::UnsupportedTypeAction;
 
-/// The type rewrites Cayenne always applies when it creates a table, because Vortex
-/// cannot represent the incoming type.
+/// The type rewrites Cayenne applies when it creates a table, because Vortex cannot
+/// represent the incoming type.
 ///
-/// This is the definition [`transform_schema_for_vortex`] itself applies, published so
-/// callers that need only the always-applied part — the acceleration write path, which
-/// must tell an engine-imposed type from a schema that has genuinely drifted — can reuse
-/// it without the unsupported-type handling.
+/// This is what [`transform_schema_for_vortex`] applies. It is deliberately narrower
+/// than [`CAYENNE_TYPE_REWRITE_RULES`]: a rewrite belongs here only while the engine
+/// still performs it.
+static CAYENNE_CREATION_REWRITE_RULES: TypeRewriteRules = &[&Float16ToFloat32];
+
+/// The stored types the acceleration write path must recognize as Cayenne's own, so it
+/// can tell a type the engine produced from a schema that has genuinely drifted.
+///
+/// This is a superset of [`CAYENNE_CREATION_REWRITE_RULES`], because a table keeps the
+/// types it was created with. [`TimestampToMicrosecond`] is here and *not* in the
+/// creation rules: Cayenne once normalized every timestamp to microseconds, and a table
+/// created then still stores microseconds even though a table created now keeps its
+/// source's unit. Without it, an existing microsecond table fed by a nanosecond source
+/// — every `PostgreSQL` `timestamptz`, which infers as `Timestamp(ns, "UTC")` — reads as
+/// an incompatible schema change on the first batch after upgrade, which stops CDC
+/// replication under `on_schema_change: fail` for a schema that never changed.
+///
+/// The list is accelerator-wide, so it cannot tell a microsecond column an older build
+/// normalized from one whose source is itself microsecond. A table of the second kind
+/// whose source later widens to nanoseconds reports the cast as the engine's own rather
+/// than as the source schema change it is, so `on_schema_change` does not act on it —
+/// the behavior every Cayenne table had while creation normalized unconditionally.
+/// Telling the two apart needs per-table provenance, which the metastore does not
+/// record today.
 pub static CAYENNE_TYPE_REWRITE_RULES: TypeRewriteRules =
     &[&Float16ToFloat32, &TimestampToMicrosecond];
 
@@ -70,9 +90,9 @@ fn transform_data_type_for_vortex(
 ) -> Option<DataType> {
     // The always-applied rewrites. These are leaf rules (never a container type), so
     // consulting them before the nested walk below is what `apply_rules` would do too -
-    // which is what lets `CAYENNE_TYPE_REWRITE_RULES` be published as an equivalent
-    // description of this step rather than a second copy of it.
-    for rule in CAYENNE_TYPE_REWRITE_RULES {
+    // which is what lets `CAYENNE_CREATION_REWRITE_RULES` describe this step rather
+    // than be a second copy of it.
+    for rule in CAYENNE_CREATION_REWRITE_RULES {
         if let Some(rewritten) = rule.rewrite(data_type) {
             tracing::debug!(
                 "Converting field '{path}' from {data_type:?} to {rewritten:?} for Vortex compatibility"
@@ -249,7 +269,10 @@ fn handle_unsupported_type(
 ///
 /// Always applies:
 /// - `Float16` → `Float32`
-/// - Non-microsecond `Timestamp` → `Timestamp(Microsecond, tz)`
+///
+/// `Timestamp` passes through with its time unit and timezone intact: Vortex
+/// represents second, millisecond, microsecond and nanosecond timestamps, so a
+/// table stores the precision its source reports.
 ///
 /// Truly unsupported types (`Interval`, `Duration`, `FixedSizeBinary`) are
 /// handled according to `unsupported_type_action` at the top level. Nested
@@ -312,18 +335,57 @@ mod tests {
         assert_eq!(out.field(0).data_type(), &DataType::Float32);
     }
 
+    /// Vortex represents all four Arrow timestamp units, so a table stores the
+    /// precision its source reports. Coercing to microseconds instead left a
+    /// Postgres `timestamptz` (inferred as ns) permanently unable to match its
+    /// own accelerated schema — regression test for
+    /// <https://github.com/spiceai/spiceai/issues/13014>.
     #[test]
-    fn non_microsecond_timestamp_converted() {
-        let schema = Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        )]);
-        let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+    fn timestamp_units_are_preserved() {
+        for unit in [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ] {
+            for tz in [None, Some("UTC".into()), Some("+05:30".into())] {
+                let data_type = DataType::Timestamp(unit, tz);
+                let schema = Schema::new(vec![Field::new("ts", data_type.clone(), false)]);
+                let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                    .expect("should succeed");
+                assert_eq!(
+                    out.field(0).data_type(),
+                    &data_type,
+                    "timestamp unit and timezone must pass through unchanged"
+                );
+            }
+        }
+    }
+
+    /// The compatibility rules must keep explaining a stored microsecond timestamp
+    /// while creation preserves nanoseconds. Folding the two lists back together
+    /// breaks one side or the other: creation would down-convert again (#13018), or
+    /// an existing microsecond table would read as drifted and stop CDC (#13014).
+    #[test]
+    fn creation_preserves_units_while_the_compatibility_rules_still_explain_microseconds() {
+        use arrow_tools::type_rewrite::rewrite_data_type;
+
+        let ns = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+        let us = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+        let schema = Schema::new(vec![Field::new("ts", ns.clone(), false)]);
+        let created = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect("should succeed");
         assert_eq!(
-            out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            created.field(0).data_type(),
+            &ns,
+            "a table created now stores the source's unit"
+        );
+
+        assert_eq!(
+            rewrite_data_type(&ns, super::CAYENNE_TYPE_REWRITE_RULES),
+            us,
+            "the write path must still recognize the microseconds a pre-existing table stores"
         );
     }
 
@@ -358,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn field_metadata_preserved_on_timestamp_conversion() {
+    fn field_metadata_preserved_on_timestamp_passthrough() {
         let mut field_metadata = HashMap::new();
         field_metadata.insert("logicalType".to_string(), "TIMESTAMP_NTZ".to_string());
 
@@ -370,7 +432,7 @@ mod tests {
 
         assert_eq!(
             out.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
         );
         assert_eq!(out.field(0).metadata(), &field_metadata);
     }
@@ -429,7 +491,8 @@ mod tests {
         };
         assert_eq!(
             item.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            "a nested timestamp keeps its unit, like a top-level one"
         );
         assert_eq!(item.metadata(), &nested_metadata);
     }

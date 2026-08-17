@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use app::App;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
@@ -30,6 +29,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
@@ -283,7 +283,7 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -339,7 +339,7 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
@@ -438,6 +438,7 @@ mod tests {
     use app::AppBuilder;
     use object_store::client::{HttpError, HttpErrorKind};
     use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime_secrets::Secrets;
     use tokio::sync::RwLock;

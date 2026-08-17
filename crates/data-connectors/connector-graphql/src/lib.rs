@@ -29,11 +29,11 @@ use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult, default_spice_client,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
@@ -50,6 +50,9 @@ use url::Url;
 #[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
+    /// Spicepod name, which keys the persisted shared-rate-controller state. Captured at
+    /// construction because it is not part of a dataset's configuration spec.
+    app_name: Arc<str>,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
@@ -112,6 +115,9 @@ impl DataConnectorFactory for GraphQLFactory {
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
+            let app_name: Arc<str> = params
+                .app()
+                .map_or_else(|| Arc::from(""), |app| Arc::from(app.name.as_str()));
             let rate_control_registry = params
                 .http_rate_control_registry()
                 .unwrap_or_else(http_rate_control::global_registry);
@@ -138,6 +144,7 @@ impl DataConnectorFactory for GraphQLFactory {
 
             let graphql = GraphQL {
                 params: params.parameters,
+                app_name,
                 runtime_rate_control_params,
                 rate_control_registry,
                 metrics,
@@ -160,7 +167,7 @@ impl DataConnectorFactory for GraphQLFactory {
 impl GraphQL {
     async fn get_client(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -258,7 +265,7 @@ impl GraphQL {
             .reserve_shared_rate_controller_for_component(
                 &endpoint,
                 &rate_control,
-                dataset.app.name.as_str(),
+                self.app_name.as_ref(),
                 &ConnectorComponent::from(dataset),
                 "graphql",
             )
@@ -303,7 +310,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -370,6 +377,7 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 mod tests {
     use super::*;
     use runtime::Runtime;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime_secrets::Secrets;
     use std::collections::HashMap;
@@ -432,6 +440,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_rate_control_dataset_params_parse_and_update_metrics() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[
                 ("max_concurrent_requests", "4"),
                 ("requests_per_second_limit", "2"),
@@ -470,6 +479,7 @@ mod tests {
             ),
         ]);
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[("max_concurrent_requests", "2")]).await,
             runtime_rate_control_params: Some(runtime_params),
             rate_control_registry: http_rate_control::global_registry(),
@@ -492,6 +502,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_rate_control_rejects_invalid_limits() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[("requests_per_second_limit", "0")]).await,
             runtime_rate_control_params: None,
             rate_control_registry: http_rate_control::global_registry(),
@@ -519,6 +530,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_metrics_provider_can_be_suppressed_for_non_owner() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[]).await,
             runtime_rate_control_params: None,
             rate_control_registry: http_rate_control::global_registry(),

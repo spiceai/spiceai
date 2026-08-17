@@ -361,6 +361,8 @@ fn arrow_schemas_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
+    use crate::component::dataset::DatasetSpec;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -370,7 +372,6 @@ mod tests {
     use datafusion::datasource::TableProvider;
 
     use super::{DatasetInitialization, LazyConnectorBuilder};
-    use crate::component::dataset::Dataset;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::BootstrapStatus;
     use crate::dataconnector::{
@@ -424,7 +425,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            dataset: &Dataset,
+            dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             if self.fail_read {
                 return Err(DataConnectorError::UnableToGetReadProvider {

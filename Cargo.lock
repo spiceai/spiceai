@@ -463,6 +463,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28f6098a1e8ab66ff91324cce8fea6643101882cf7d09c85acdb1485ecf61e29"
 
 [[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4133,7 +4139,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
+ "futures-core",
  "memchr",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4207,6 +4217,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4233,6 +4244,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "sha2 0.10.9",
@@ -4260,6 +4272,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -4283,6 +4296,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
@@ -4307,6 +4321,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4331,6 +4346,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4354,6 +4370,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4372,6 +4389,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
@@ -4388,6 +4406,7 @@ dependencies = [
  "duckdb",
  "linkme",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
@@ -4423,6 +4442,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
@@ -4444,6 +4464,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "snafu",
@@ -4463,6 +4484,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4475,6 +4497,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4489,6 +4512,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4514,6 +4538,7 @@ dependencies = [
  "reqwest 0.13.4",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "secrecy",
@@ -4545,6 +4570,7 @@ dependencies = [
  "linkme",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4588,6 +4614,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4619,6 +4646,7 @@ dependencies = [
  "paste",
  "regex",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "snafu",
@@ -4643,6 +4671,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4676,6 +4705,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "serde_json",
@@ -4695,6 +4725,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tiberius",
@@ -4721,6 +4752,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-udfs-api",
@@ -4737,6 +4769,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4760,6 +4793,7 @@ dependencies = [
  "odbc-api",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -4782,6 +4816,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tracing",
@@ -4804,6 +4839,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4841,6 +4877,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "scylla",
  "snafu",
@@ -4854,6 +4891,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4883,6 +4921,7 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
@@ -4902,6 +4941,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4921,6 +4961,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4937,6 +4978,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
 ]
@@ -14753,9 +14795,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pingora-lru"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
+checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
  "hashbrown 0.17.1",
@@ -16090,6 +16132,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
+name = "redis"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
+dependencies = [
+ "arc-swap",
+ "arcstr",
+ "async-lock",
+ "backon",
+ "bytes",
+ "cfg-if",
+ "combine",
+ "futures-channel",
+ "futures-util",
+ "itoa",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2 0.6.4",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16964,6 +17035,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-drasi",
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
@@ -17377,6 +17449,26 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-drasi"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "chrono",
+ "percent-encoding",
+ "redis",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -19488,7 +19580,6 @@ dependencies = [
  "mimalloc",
  "opentelemetry",
  "opentelemetry-http",
- "opentelemetry-prometheus",
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
@@ -22492,7 +22583,6 @@ dependencies = [
  "ctrlc",
  "datafusion",
  "futures",
- "globset",
  "http-body 1.0.1",
  "humantime",
  "parking_lot",
@@ -24715,6 +24805,12 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "y4m"
