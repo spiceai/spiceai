@@ -194,7 +194,7 @@ pub async fn construct_model(
         ModelSource::Google => {
             let p = typed_params::<GoogleModelParams>(component, params, source.clone(), secrets)
                 .await?;
-            google(model_id.as_deref(), &p)
+            google(model_id.as_deref(), &p).await
         }
         ModelSource::Azure => {
             let p = typed_params::<AzureModelParams>(component, params, source.clone(), secrets)
@@ -328,23 +328,36 @@ fn anthropic(
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
 }
 
-fn google(model_id: Option<&str>, params: &GoogleModelParams) -> Result<Arc<dyn Chat>, LlmError> {
+async fn google(
+    model_id: Option<&str>,
+    params: &GoogleModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
     let Some(model_id) = model_id else {
         return Err(LlmError::ModelNotProvided {
             model_source: "google".to_string(),
         });
     };
-    let Some(api_key) = params.api_key.as_ref() else {
-        return Err(LlmError::FailedToLoadModel {
-            source: "`model.params.google_api_key` is required.".into(),
-        });
-    };
 
-    let google = Google::new(api_key, model_id).map_err(|e| LlmError::FailedToLoadModel {
-        source: format!("Failed to create Google client: {e}").into(),
+    let client = llms::google::auth::build_client(
+        params.api.unwrap_or_default(),
+        params.api_key.as_ref(),
+        llms::google::auth::VertexAuthParams {
+            project: params.project.as_deref(),
+            location: params.location.as_deref(),
+            service_account_path: params.service_account_path.as_deref(),
+            service_account_key: params.service_account_key.as_ref(),
+            application_default_credentials: params
+                .application_default_credentials
+                .unwrap_or(false),
+        },
+        "model.params",
+    )
+    .await
+    .map_err(|e| LlmError::FailedToLoadModel {
+        source: e.to_string().into(),
     })?;
 
-    Ok(Arc::new(google) as Arc<dyn Chat>)
+    Ok(Arc::new(Google::from_client(client, model_id)) as Arc<dyn Chat>)
 }
 
 #[cfg(feature = "models")]

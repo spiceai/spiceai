@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use llms::google::auth::GoogleApi;
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 
@@ -25,6 +26,22 @@ use secrecy::SecretString;
     emit_specs
 )]
 pub struct GoogleModelParams {
-    /// The Google Generative AI API key.
+    /// Which Google backend to use: `google_ai` (the public Google AI Studio API, the
+    /// default) or `vertex_ai` (GCP-project/region-scoped, for enterprise auth/governance).
+    pub api: Option<GoogleApi>,
+    /// The Google AI Studio API key. Required when `google_api` is `google_ai` (the default).
     pub api_key: Option<SecretString>,
+    /// The GCP project ID. Required when `google_api` is `vertex_ai`.
+    pub project: Option<String>,
+    /// The GCP region, e.g. `us-central1`, or `global`. Required when `google_api` is `vertex_ai`.
+    pub location: Option<String>,
+    /// Path to a GCP service account JSON key file. One of `google_service_account_path`,
+    /// `google_service_account_key`, or `google_application_default_credentials` is required
+    /// when `google_api` is `vertex_ai`.
+    pub service_account_path: Option<String>,
+    /// GCP service account JSON key as a string.
+    pub service_account_key: Option<SecretString>,
+    /// Use Google Application Default Credentials for authentication. If the
+    /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, uses that path.
+    pub application_default_credentials: Option<bool>,
 }

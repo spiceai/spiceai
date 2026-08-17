@@ -11,9 +11,10 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["form"] }
 secrecy = { workspace = true, features = ["serde"] }
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 tokio.workspace = true

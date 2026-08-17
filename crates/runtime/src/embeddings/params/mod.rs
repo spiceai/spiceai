@@ -177,21 +177,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn google_params_require_api_key() {
-        let Err(err) = google::GoogleEmbeddingParams::try_from_params(
+    async fn google_params_allow_missing_api_key_for_vertex_ai() {
+        // `api_key` is optional at the parse level so Vertex AI mode (which authenticates via
+        // a service account instead) can omit it. The "one of `google_api_key` or a Vertex AI
+        // auth method is required" check happens in `llms::google::auth::build_client`, not here
+        // — see its `missing_api_key_is_reported` / `vertex_requires_project_and_location` tests.
+        let typed = google::GoogleEmbeddingParams::try_from_params(
             "embedding test",
             params(&[]),
             &empty_secrets(),
         )
         .await
-        else {
-            panic!("google api_key is required")
-        };
-        assert!(
-            err.to_string()
-                .contains("Missing required parameter: google_api_key"),
-            "unexpected message: {err}"
-        );
+        .expect("google params should parse without api_key");
+        assert!(typed.api_key.is_none());
     }
 
     #[tokio::test]

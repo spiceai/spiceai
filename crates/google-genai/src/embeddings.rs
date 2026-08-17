@@ -92,7 +92,7 @@ impl Client {
     ) -> Result<EmbedContentResponse> {
         let url = self.build_url(&format!("/models/{model}:embedContent"));
 
-        let headers = self.add_api_key_header(HeaderMap::new());
+        let headers = self.auth_headers(HeaderMap::new());
 
         let response = self
             .http_client()
@@ -120,7 +120,7 @@ impl Client {
     ) -> Result<BatchEmbedContentResponse> {
         let url = self.build_url(&format!("/models/{model}:batchEmbedContents"));
 
-        let headers = self.add_api_key_header(HeaderMap::new());
+        let headers = self.auth_headers(HeaderMap::new());
 
         let batch_request = BatchEmbedContentRequest { requests };
 

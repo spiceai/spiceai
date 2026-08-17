@@ -15,6 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+pub mod auth;
 mod chat;
 mod embed;
 mod list_models;
@@ -58,6 +59,30 @@ impl Google {
             dimensions,
             embeddings_cache,
         })
+    }
+
+    /// Wraps an already-built [`google_genai::Client`] (Google AI Studio or Vertex AI — see
+    /// [`auth::build_client`]) for the given model.
+    #[must_use]
+    pub fn from_client(client: google_genai::Client, model: impl Into<String>) -> Self {
+        Self {
+            client,
+            model: model.into(),
+        }
+    }
+
+    /// Turns this chat client into an embeddings client for the same underlying connection.
+    #[must_use]
+    pub fn into_embeddings(
+        self,
+        dimensions: Option<u32>,
+        embeddings_cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> EmbedGoogle {
+        EmbedGoogle {
+            g: self,
+            dimensions,
+            embeddings_cache,
+        }
     }
 }
 

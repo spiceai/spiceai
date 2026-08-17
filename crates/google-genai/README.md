@@ -58,7 +58,28 @@ cargo run --example thinking
 
 ## Authentication
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/app/apikey).
+Two backends are supported, both via the same request/response types:
+
+- **Google AI Studio** (default) — an API key sent as the `x-goog-api-key` header. Get one from
+  [Google AI Studio](https://aistudio.google.com/app/apikey).
+  ```rust
+  let client = google_genai::Client::new(api_key)?;
+  ```
+- **Vertex AI** — GCP-project/region-scoped, authenticated with an `Authorization: Bearer` token
+  sourced from a `token_provider::TokenProvider` (e.g. a GCP service account JWT-bearer exchange
+  via `token_provider::gcp_service_account_token::GcpServiceAccountTokenProvider`). Use this for
+  enterprise GCP deployments that need IAM-scoped auth, VPC-SC, or data residency instead of a
+  bare API key.
+  ```rust
+  let token_provider = GcpServiceAccountTokenProvider::try_new(
+      &service_account_json,
+      "https://www.googleapis.com/auth/cloud-platform",
+  ).await?;
+  let base_url = format!(
+      "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google"
+  );
+  let client = google_genai::Client::with_bearer_token(Arc::new(token_provider), base_url)?;
+  ```
 
 ## License
 
