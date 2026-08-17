@@ -33,6 +33,7 @@ linkme.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["databricks"] }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }

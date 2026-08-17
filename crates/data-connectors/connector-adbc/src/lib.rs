@@ -30,7 +30,7 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
 use futures::TryStreamExt;
-use runtime::component::dataset::{Dataset, DatasetSpec};
+use runtime_component::dataset::DatasetSpec;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -1137,7 +1137,7 @@ fn auth_permission_hint(driver_name: &str) -> &'static str {
 fn classify_adbc_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     driver_name: &str,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     fallback_variant: fn(
         String,
         ConnectorComponent,
@@ -1165,7 +1165,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
             self.factory
@@ -1201,7 +1201,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
             self.factory
@@ -1270,6 +1270,7 @@ pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::component::dataset::Dataset;
     use secrecy::SecretString;
 
     #[test]
@@ -1810,7 +1811,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")
         }

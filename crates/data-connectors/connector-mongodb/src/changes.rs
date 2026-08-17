@@ -38,13 +38,11 @@ use mongodb::{
     options::FullDocumentType,
 };
 use runtime::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Engine, OnConflictBehavior},
-    },
+    component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior},
     dataconnector::parameters::ConnectorContext,
 };
 use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
@@ -57,7 +55,7 @@ const DEFAULT_CHANGE_STREAM_MAX_AWAIT_TIME: Duration = Duration::from_secs(1);
 pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
-    dataset: Dataset,
+    dataset: DatasetSpec,
     context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
@@ -297,7 +295,7 @@ pub fn build_changes_stream(
 
 async fn initialize_mongo_sys(
     context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn MongoCheckpointStore>> {
     // No context means no runtime is attached, which only happens in unit tests.
     let context = context?;
@@ -316,7 +314,7 @@ async fn initialize_mongo_sys(
 
 async fn persisted_checkpoint(
     mongo_sys: Option<&dyn MongoCheckpointStore>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     current_schema_json: Option<&str>,
 ) -> Option<MongoCheckpointMetadata> {
     let sys = mongo_sys?;
@@ -339,7 +337,10 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: Option<&dyn MongoCheckpointStore>, dataset: &Dataset) {
+async fn clear_persisted_token(
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
+) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
@@ -548,7 +549,7 @@ async fn snapshot_stream(
 
 fn collect_change_events(
     batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
     batch
         .into_iter()

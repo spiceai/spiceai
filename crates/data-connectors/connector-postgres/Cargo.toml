@@ -36,6 +36,7 @@ fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../../runtime-datafusion" }

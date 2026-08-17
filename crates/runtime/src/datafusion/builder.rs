@@ -1283,6 +1283,7 @@ impl DataFusionBuilder {
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
             query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
             plan_capture: OnceLock::new(),
+            drasi_forwarders: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             dataset_placements: dashmap::DashMap::new(),

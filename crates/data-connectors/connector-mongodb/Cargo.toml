@@ -38,6 +38,7 @@ linkme.workspace = true
 mongodb.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["mongodb"] }
+runtime-component = { path = "../../runtime-component" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true

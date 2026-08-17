@@ -16,12 +16,14 @@ limitations under the License.
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 #[cfg(feature = "duckdb")]
 use crate::component::dataset::acceleration::Engine;
 #[cfg(feature = "duckdb")]
 use crate::component::view::View;
+use crate::dataconnector::ConnectorComponent;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
+use crate::datafusion::DataFusion;
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
@@ -49,7 +51,7 @@ use spicepod::semantic::Column;
 use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::RwLock;
 
 use runtime_search::embeddings::table::EmbeddingTable;
@@ -59,6 +61,11 @@ pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     secrets: Arc<RwLock<Secrets>>,
+    /// The runtime's `DataFusion`, held **weakly** for the same reason
+    /// `RuntimeConnectorContext` holds the runtime weakly: this connector is reachable
+    /// from the session's own catalog, so a strong handle would close a cycle and stop
+    /// `AcceleratedTable::drop` from aborting its refresh handlers.
+    datafusion: Weak<DataFusion>,
 }
 
 impl std::fmt::Debug for EmbeddingConnector {
@@ -75,11 +82,13 @@ impl EmbeddingConnector {
         inner_connector: Arc<dyn DataConnector>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         secrets: Arc<RwLock<Secrets>>,
+        datafusion: Weak<DataFusion>,
     ) -> Self {
         Self {
             inner_connector,
             embedding_models,
             secrets,
+            datafusion,
         }
     }
 
@@ -88,7 +97,7 @@ impl EmbeddingConnector {
     pub(crate) async fn wrap_table(
         &self,
         inner_table_provider: Arc<dyn TableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         // Runtime isn't built with model support, but user specified a dataset to use embeddings.
         if !cfg!(feature = "models") {
@@ -124,8 +133,19 @@ impl EmbeddingConnector {
 
             let mut provider = Arc::clone(&inner_table_provider);
             for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
+                let Some(datafusion) = self.datafusion.upgrade() else {
+                    // The runtime is shutting down under this load; there is no session to
+                    // register an index against.
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "embeddings".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message:
+                            "The runtime shut down while the dataset's vector index was being built"
+                                .to_string(),
+                    });
+                };
                 provider = wrap_table_as_index(
-                    &dataset.runtime().datafusion().ctx,
+                    &datafusion.ctx,
                     &self.embedding_models,
                     &self.secrets,
                     &dataset.name,
@@ -245,7 +265,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.wrap_table(self.inner_connector.read_provider(dataset).await?, dataset)
             .await
@@ -253,7 +273,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(self.wrap_table(inner, dataset).await),
@@ -264,14 +284,14 @@ impl DataConnector for EmbeddingConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         self.inner_connector
@@ -289,7 +309,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -328,7 +348,7 @@ impl DataConnector for EmbeddingConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -347,7 +367,7 @@ impl DataConnector for EmbeddingConnector {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) =
@@ -485,14 +505,14 @@ impl DataConnector for EmbeddingConnector {
 
     fn initialization_for_dataset(
         &self,
-        dataset: &crate::component::dataset::Dataset,
+        dataset: &DatasetSpec,
     ) -> crate::component::ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
 }
 
 #[cfg(feature = "duckdb")]
-fn duckdb_vector_store_for_accelerated_table(dataset: &Dataset) -> Option<VectorStore> {
+fn duckdb_vector_store_for_accelerated_table(dataset: &DatasetSpec) -> Option<VectorStore> {
     if let Some(vector_engine) = &dataset.vectors
         && vector_engine.enabled
         && vector_engine.engine.as_deref() == Some("duckdb")
@@ -515,7 +535,7 @@ fn duckdb_vector_store_for_accelerated_table(dataset: &Dataset) -> Option<Vector
 
 fn vector_index_groups(
     vector_store: &VectorStore,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Vec<(VectorStore, Vec<Column>)> {
     let has_column_overrides = dataset.columns.iter().any(|column| {
         column
@@ -591,7 +611,7 @@ fn vector_store_for_embedding(
 }
 
 #[cfg(feature = "duckdb")]
-fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+fn duckdb_embedding_columns(dataset: &DatasetSpec) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
     let mut embedding_columns = dataset
         .embeddings
         .iter()
@@ -756,7 +776,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             Ok(memtable())
         }
@@ -768,7 +788,7 @@ mod tests {
         fn changes_stream(
             &self,
             _federated_table: Arc<dyn FederatedTableProvider>,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> Option<ChangesStream> {
             Some(futures::stream::empty().boxed())
         }
@@ -816,6 +836,7 @@ mod tests {
             Arc::new(StreamingSource),
             Arc::new(RwLock::new(EmbeddingModelStore::default())),
             Arc::new(RwLock::new(Secrets::default())),
+            std::sync::Weak::new(),
         )
     }
 
