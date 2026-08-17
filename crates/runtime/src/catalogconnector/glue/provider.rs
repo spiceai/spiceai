@@ -180,8 +180,11 @@ impl GlueCatalogProvider {
                     parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
                 }
 
-                let connector =
-                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
+                let connector = GlueDataConnector::new(
+                    parameters,
+                    self.parameters.app(),
+                    self.parameters.io_runtime.clone(),
+                );
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())

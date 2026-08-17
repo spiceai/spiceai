@@ -34,7 +34,7 @@ use rand::RngExt;
 use runtime::{
     Runtime,
     auth::EndpointAuth,
-    component::dataset::Dataset as RuntimeDataset,
+    component::dataset::DatasetSpec as RuntimeDataset,
     config::Config,
     dataconnector::{
         self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,

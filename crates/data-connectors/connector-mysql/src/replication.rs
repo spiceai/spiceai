@@ -41,9 +41,9 @@ use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_checkpoint_api::mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogStore};
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
 use runtime_parameters::Parameters;
 use std::collections::hash_map::DefaultHasher;
@@ -55,7 +55,7 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
@@ -264,7 +264,7 @@ pub fn build_changes_stream(
 /// fallback path.
 async fn resolve_binlog_store(
     context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Result<Arc<dyn MySqlBinlogStore>, StoreError> {
     let context = context.ok_or_else(|| -> StoreError {
         "no runtime is attached to the connector, so the binlog position cannot be persisted".into()

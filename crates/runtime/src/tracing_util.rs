@@ -124,6 +124,7 @@ fn acceleration_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::component::dataset::acceleration::Engine;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::DataConnectorResult;
@@ -144,7 +145,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()
         }

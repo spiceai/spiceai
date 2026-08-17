@@ -23,10 +23,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::changes::{Indexes, index_change_envelope};
-use crate::component::{
-    ComponentInitialization,
-    dataset::{Dataset, acceleration::RefreshMode},
-};
+use crate::component::dataset::DatasetSpec;
+use crate::component::{ComponentInitialization, dataset::acceleration::RefreshMode};
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
@@ -116,7 +114,7 @@ impl DataConnector for FullTextConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let inner = self.inner_connector.read_provider(dataset).await?;
         add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
@@ -131,7 +129,7 @@ impl DataConnector for FullTextConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
             Some(Ok(inner)) => Some(
@@ -151,14 +149,14 @@ impl DataConnector for FullTextConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         self.inner_connector
@@ -176,7 +174,7 @@ impl DataConnector for FullTextConnector {
 
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -186,7 +184,7 @@ impl DataConnector for FullTextConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
@@ -209,7 +207,7 @@ impl DataConnector for FullTextConnector {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
@@ -230,7 +228,7 @@ impl DataConnector for FullTextConnector {
 
     fn initialization_for_dataset(
         &self,
-        dataset: &crate::component::dataset::Dataset,
+        dataset: &DatasetSpec,
     ) -> crate::component::ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
