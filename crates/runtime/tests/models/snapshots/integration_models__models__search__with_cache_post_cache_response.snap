@@ -6,231 +6,1203 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.94",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.65",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "In general basic characters welcome. Clearly lively friends conv"
+        "answer": [
+          "The nurse should $\\boxed{\\text{wear gloves}}$ to prevent contamination and ensure infection control."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "id": 824
       }
     },
     {
-      "_score": "0.93",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.62",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Close customers might struggle away different memb"
+        "answer": [
+          "$\\boxed{C}$ to allow for the prevention of septicemia with prophylactic medication."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "id": 1039
       }
     },
     {
-      "_score": "0.93",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.62",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Earlier different differences get just to a methods; masses includ"
+        "answer": [
+          "$\\boxed{\\text{Encourage the client to drink fluids to promote excretion of the radioisotope.}}$"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 3
+        "id": 864
       }
     },
     {
-      "_score": "0.92",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.62",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Years must understand. Well fat thousands take. Good police l"
+        "answer": [
+          "The nurse would suspect **genital warts**, as HPV is the causative agent for this condition. $\\boxed{\\text{Genital warts}}$"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 7
+        "id": 1274
       }
     },
     {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.61",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Human, successive tears highlight also as radical produ"
+        "answer": [
+          "1. Initial balance: $-38$  \n2. Deposit: $+225$  \n3. New balance: $-38 + 225 = 187$  \n\nThe new balance is $\\boxed{187}$ dollars."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 10
+        "id": 108
       }
     },
     {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.61",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Even democratic stairs would know happy investigations. Histo"
+        "answer": [
+          "$\\boxed{\\text{True}}$, because severe post-treatment cardiopulmonary complications sometimes occur."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
+        "id": 120
       }
     },
     {
-      "_score": "0.91",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.60",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Practical schools might put twice interested, strong organizations. Regulatory,"
+        "answer": [
+          "$\\boxed{\\text{R. Life-long}}$ (Paget's disease is a chronic condition that remains active for the patient's entire life.)"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 17
+        "id": 448
       }
     },
     {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.60",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Heavily direct problems try eventually on a nurses. Courses may make a"
+        "answer": [
+          "No. Late recurrences can occur beyond 10 years, so patients require lifelong follow-up. $\\boxed{\\text{No}}$"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 8
+        "id": 551
       }
     },
     {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.60",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Good questions borrow only base children. Remarkably present e"
+        "answer": [
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 19
+        "id": 449
       }
     },
     {
-      "_score": "0.90",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.59",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Necessary, major terms give still now joint thoughts. Only considerable women"
+        "answer": [
+          "Yew may cause increased myelosuppression when used with antineoplastics; concurrent use should be avoided."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 14
+        "id": 1031
       }
     },
     {
-      "_score": "0.89",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.59",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Absolute, early papers spare. Independent services need. About extreme women u"
+        "answer": [
+          "Cyproterone acetate can induce osteoporosis, which is regarded as a risk factor for periodontal disease."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 18
+        "id": 818
       }
     },
     {
-      "_score": "0.89",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.59",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
+        "answer": [
+          "Adenomas commonly present with low TSH and increased uptake on I-123 or Tc-99 scans."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 11
+        "id": 527
       }
     },
     {
-      "_score": "0.89",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.59",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Respects might appear early, long metres. Cases would understand"
+        "answer": [
+          "No. Elective nodal RT is not needed because the occult nodal positivity rate is only ~5%."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 13
+        "id": 576
       }
     },
     {
-      "_score": "0.88",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Times could not address disabled indians. Effectively public ports c"
+        "answer": [
+          "In brachytherapy, the radiation does not have to pass through healthy tissue to reach the tumour."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 12
+        "id": 809
       }
     },
     {
-      "_score": "0.87",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Members comfort major horses. All good vehicles must perform ago wrong new conditions. Pl"
+        "answer": [
+          "Black root may increase hypokalemia when used with Diuretics; avoid concurrent use or add potassium supplementation."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 20
+        "id": 1028
       }
     },
     {
-      "_score": "0.87",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Narrowly great dogs carry only by the events. Successful, able legs would not"
+        "answer": [
+          "Motherwort may increase the risk of bleeding when used with anticoagulants; concurrent use should be avoided."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 5
+        "id": 1022
       }
     },
     {
-      "_score": "0.86",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "So appropriate hopes cannot constitute with a shapes. Investors know therefor"
+        "answer": [
+          "Pectin may decrease the absorption of all drugs, vitamins, and minerals if taken concurrently; space by 3 hours."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 9
+        "id": 1029
       }
     },
     {
-      "_score": "0.84",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Social pictures welcome almost british teams. Awful preparations leave ga"
+        "answer": [
+          "$\\boxed{\\text{Ependymomas}}$ require imaging of the entire craniospinal axis due to their propensity for seeding the neuraxis."
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 16
+        "id": 1296
       }
     },
     {
-      "_score": "0.82",
-      "dataset": "spice.public.cached_search",
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
       "matches": {
-        "cp_description": [
-          "Legislative origins precede bold stations. Tiny sports should resume all pupils. Forces launch to"
+        "answer": [
+          "$\\boxed{C}$ (estradiol level in the epiphyseal growth plate takes longer to reach its threshold)"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 6
+        "id": 592
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{Fluoroscopy}}$, as it is responsible for nearly all occupational radiation exposure among radiology personnel."
+        ]
+      },
+      "primary_key": {
+        "id": 929
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "St John's Wort accelerates the metabolism of irinotecan, reducing its plasma concentration. Concomitant use should be avoided."
+        ]
+      },
+      "primary_key": {
+        "id": 935
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "St John's Wort accelerates the metabolism of irinotecan, reducing its plasma concentration. Concomitant use should be avoided."
+        ]
+      },
+      "primary_key": {
+        "id": 934
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{Males}}$ (Dentigerous cysts are twice as common in males as in females.)"
+        ]
+      },
+      "primary_key": {
+        "id": 1297
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The diagnosis of malignant neoplasms of the endocrine system requires documentation of invasion or metastases."
+        ]
+      },
+      "primary_key": {
+        "id": 1033
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The main advantages of PI chemotherapy are reduced hematologic toxicity and lower total cost because fewer drugs are used."
+        ]
+      },
+      "primary_key": {
+        "id": 819
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Ritonavir increases the plasma concentration of eletriptan, which may increase the risk of toxicity. Avoid concomitant use."
+        ]
+      },
+      "primary_key": {
+        "id": 943
+      }
+    },
+    {
+      "_score": "0.58",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Cloudy serum or heated plasmas may cause confusing precipitates, which can interfere with the interpretation of test results."
+        ]
+      },
+      "primary_key": {
+        "id": 1272
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "An inhibitory postsynaptic potential hyperpolarizes the postsynaptic membrane by opening Cl⁻ channels. $\\boxed{\\text{D}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 936
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Blue cohosh may decrease the action of antianginals, potentially causing chest pain. Avoid concurrent use."
+        ]
+      },
+      "primary_key": {
+        "id": 1019
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{C}$ (result in a further fall in BP since the arterial chemoreflex is sympathoexcitatory)"
+        ]
+      },
+      "primary_key": {
+        "id": 530
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Kayexalate exchanges sodium ion for potassium in the intestines, reducing potassium levels in the serum and other body fluids."
+        ]
+      },
+      "primary_key": {
+        "id": 933
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Garlic may have hypoglycemic effects, so oral antidiabetic dosages may need to be adjusted."
+        ]
+      },
+      "primary_key": {
+        "id": 1023
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The mother can transfer the mites to the puppies within the first 3 days of life."
+        ]
+      },
+      "primary_key": {
+        "id": 424
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Angelica may increase stomach acid, which can decrease the effectiveness of proton pump inhibitors."
+        ]
+      },
+      "primary_key": {
+        "id": 937
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Agrimony may increase the hypoglycemic effect of antidiabetics; monitor blood glucose."
+        ]
+      },
+      "primary_key": {
+        "id": 1030
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Rue may cause increased vasodilation; avoid concurrent use."
+        ]
+      },
+      "primary_key": {
+        "id": 1024
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Buckthorn may cause hypokalemia and enhance the effects of antiarrhythmics; avoid concurrent use."
+        ]
+      },
+      "primary_key": {
+        "id": 1020
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The chief source of CNS infections is the $\\boxed{\\text{bloodstream}}$, as pathogens often spread to the CNS via the blood."
+        ]
+      },
+      "primary_key": {
+        "id": 886
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{85\\%}$ (Persons requiring home oxygen typically have an oxygen saturation below 85%.)"
+        ]
+      },
+      "primary_key": {
+        "id": 1263
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "An angle measuring 47 degrees is acute because it is less than 90 degrees. $\\boxed{\\text{Acute}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 575
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Contraindications include seeds that may induce constipation or dyspepsia. No other side effects are reported."
+        ]
+      },
+      "primary_key": {
+        "id": 814
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{There exists someone who eats pizza and is not a student.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1322
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{Ear}}$ (Hematomas in dogs most commonly occur in the ear due to trauma or vigorous shaking.)"
+        ]
+      },
+      "primary_key": {
+        "id": 994
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Dendrobium chrysanthum* is traditionally used to treat diabetes due to its reported antihyperglycemic activity."
+        ]
+      },
+      "primary_key": {
+        "id": 1184
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "External wind–cold factors block *qi*, for example cold air, draft, air conditioners, and cool storage rooms."
+        ]
+      },
+      "primary_key": {
+        "id": 522
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Remove the source of contamination. For acute toxicity, chelation therapy with DMSA or EDTA is used."
+        ]
+      },
+      "primary_key": {
+        "id": 1188
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Concurrent immunosuppressive therapies may alter the efficacy of sipuleucel-T."
+        ]
+      },
+      "primary_key": {
+        "id": 33
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The reirradiation tolerance of the $\\boxed{\\text{kidney}}$ decreases with time due to cumulative radiation damage."
+        ]
+      },
+      "primary_key": {
+        "id": 1293
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{Someone is short or fat.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1290
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Ameloblastoma arises from remnants of the dental lamina. $\\boxed{\\text{Remnants of the dental lamina}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1034
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Passionflower has anxiolytic properties due to the presence of apigenin at a dosage of 10 ppm."
+        ]
+      },
+      "primary_key": {
+        "id": 812
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The metabolic and excretory systems of infants are not fully developed.  \n\n**Final Answer:** $\\boxed{C}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1291
+      }
+    },
+    {
+      "_score": "0.57",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "At the 100 mA station, the number pair for 1/2 s is 50 mAs. Therefore, the total mAs is $\\boxed{50}$."
+        ]
+      },
+      "primary_key": {
+        "id": 1183
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Calcium products in antacids may reduce the absorption of chromium; space administration by at least 2 hours."
+        ]
+      },
+      "primary_key": {
+        "id": 1018
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Try various degrees of dorsiflexion of the foot in order to separate the extensor retinaculum of the ankle from the arteries."
+        ]
+      },
+      "primary_key": {
+        "id": 425
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "It is a gentle purger of choler, and may be given even in fevers to draw away the sharp choleric humours."
+        ]
+      },
+      "primary_key": {
+        "id": 956
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Buckthorn may cause hypokalemia and enhance the effects of cardiac glycosides; concurrent use should be avoided."
+        ]
+      },
+      "primary_key": {
+        "id": 972
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The ratio 1:10 (serum to saline) means there are $\\boxed{10}$ parts saline for every 1 part serum."
+        ]
+      },
+      "primary_key": {
+        "id": 7
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Overoxalated blood will give falsely low hematocrit readings due to the red blood cell shrinkage."
+        ]
+      },
+      "primary_key": {
+        "id": 940
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "A \"sequence\" implies a cascade of events traced to a single abnormality."
+        ]
+      },
+      "primary_key": {
+        "id": 922
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Astragalus may stimulate immune function, which could theoretically decrease the effects of immunosuppressive therapy."
+        ]
+      },
+      "primary_key": {
+        "id": 1027
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The gall bladder is stimulated to empty by the release of cholecystokinin (CCK) from the duodenum in response to food entry."
+        ]
+      },
+      "primary_key": {
+        "id": 1268
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "An ecosite that becomes pathogenic due to a weakened resistance on the part of its host."
+        ]
+      },
+      "primary_key": {
+        "id": 861
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The \"X\" indicates that only one tooth or no teeth were present in that sextant. $\\boxed{D}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1275
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Dendrobium loddigesii* is traditionally used to treat diabetes due to its reported antihyperglycemic activity."
+        ]
+      },
+      "primary_key": {
+        "id": 1185
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The diagnosis is feather picking, which may be caused by boredom or internal diseases such as endocrine imbalances."
+        ]
+      },
+      "primary_key": {
+        "id": 928
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The salivary glands and the gastrointestinal tract show physiologic uptake due to the presence of iodide transporters."
+        ]
+      },
+      "primary_key": {
+        "id": 1267
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "A grade of 0% represents no slope, meaning the road is completely flat with no incline or decline."
+        ]
+      },
+      "primary_key": {
+        "id": 273
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{c. must be confirmed by Western blot.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1001
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The angle $37^{\\circ}$ is $\\boxed{\\text{acute}}$ because it measures less than $90^{\\circ}$."
+        ]
+      },
+      "primary_key": {
+        "id": 53
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{The backup delay command allows you to specify the amount of time before the backup interface is activated.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1278
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The probable route of infection is oral, and gerbils exposed to infected bedding contract the disease."
+        ]
+      },
+      "primary_key": {
+        "id": 445
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Aluminium salts may decrease the absorption of quinine; space administration by 3 hours."
+        ]
+      },
+      "primary_key": {
+        "id": 1016
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Digibind binds free digoxin in the blood, acting as a specific antidote for digoxin poisoning."
+        ]
+      },
+      "primary_key": {
+        "id": 983
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The intense pruritus caused by a hypersensitivity reaction is the clinical hallmark of the disease."
+        ]
+      },
+      "primary_key": {
+        "id": 887
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Choroid plexus carcinoma (CPC) is associated with **Li–Fraumeni syndrome**, due to a p53 mutation."
+        ]
+      },
+      "primary_key": {
+        "id": 1308
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{B. \\text{reduction}}$ (Reduction is the process of gaining electrons or hydrogen atoms.)"
+        ]
+      },
+      "primary_key": {
+        "id": 785
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Penetration of external wind and heat factors that deplete body fluids (summer heat, central heating, steel workers)."
+        ]
+      },
+      "primary_key": {
+        "id": 813
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
+        ]
+      },
+      "primary_key": {
+        "id": 890
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "A free radical is an atom or molecule with an unpaired electron, which tends to make it unstable and reactive."
+        ]
+      },
+      "primary_key": {
+        "id": 859
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "\\(\\boxed{x = A + E}\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 590
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The virus establishes itself within the dorsal root ganglion, from where it can be reactivated from time to time."
+        ]
+      },
+      "primary_key": {
+        "id": 883
+      }
+    },
+    {
+      "_score": "0.56",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Chronic inflammation from infection or autoimmune disorder predisposes to the development of MALT lymphomas."
+        ]
+      },
+      "primary_key": {
+        "id": 947
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Milk thistle may prevent nephrotoxicity from platinum antineoplastics."
+        ]
+      },
+      "primary_key": {
+        "id": 1025
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Osteoclasts originate from monocytes, which are derived from hematopoietic stem cells. $\\boxed{\\text{Monocytes}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1009
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The labia cover the urethral and vaginal openings to prevent drying of their mucous membranes."
+        ]
+      },
+      "primary_key": {
+        "id": 960
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The main disadvantage is cost, as MTA is at least 20 times more expensive than formocresol."
+        ]
+      },
+      "primary_key": {
+        "id": 817
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{\\text{Eosinophils. When eosinophils disintegrate, their granules reform into Charcot–Leyden crystals.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1008
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Since Yasenia is 3 years older than Xavier, when Xavier is 18 years old, Yasenia's age is $18 + 3 = \\boxed{21}$ years old."
+        ]
+      },
+      "primary_key": {
+        "id": 1323
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "$\\boxed{25000}$ (10% of $250,000 is $25,000)."
+        ]
+      },
+      "primary_key": {
+        "id": 480
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The safety of valerian during pregnancy and lactation has not been established and should, therefore, be avoided."
+        ]
+      },
+      "primary_key": {
+        "id": 1143
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The hypoproteinemic edema is caused by a decrease in intravascular osmotic pressure due to blood loss from a gastric ulcer."
+        ]
+      },
+      "primary_key": {
+        "id": 884
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Materia alba does not have the same organized structure as plaque, so it can be easily displaced."
+        ]
+      },
+      "primary_key": {
+        "id": 980
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        ]
+      },
+      "primary_key": {
+        "id": 6
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "PSA is a protein secreted into ejaculate fluid by the healthy prostate. One of its functions is to aid sperm movement."
+        ]
+      },
+      "primary_key": {
+        "id": 955
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The primary effect of α₁-adrenergic blockers is to decrease systemic vascular resistance (SVR) by causing vasodilation."
+        ]
+      },
+      "primary_key": {
+        "id": 1035
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "If blood pressure control is achieved or the underlying cause of the hypertension is eliminated, the prognosis is good."
+        ]
+      },
+      "primary_key": {
+        "id": 1089
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "The bird gapes (holds its mouth wide open), a sign that it is not getting enough air."
+        ]
+      },
+      "primary_key": {
+        "id": 888
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Sodium iodide is a good gamma-ray detector because $\\boxed{\\text{b. It has excellent energy resolution.}}$"
+        ]
+      },
+      "primary_key": {
+        "id": 1307
+      }
+    },
+    {
+      "_score": "0.55",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "Rubella is transmitted via respiratory droplets or direct contact leading to congenital infection (control method: Im)."
+        ]
+      },
+      "primary_key": {
+        "id": 444
       }
     }
   ]
