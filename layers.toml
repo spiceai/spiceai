@@ -202,7 +202,10 @@ runtime-checkpoint-api = "foundation"
 # `chat-api` and `rerank-api` are foundation: their whole closure is external crates
 # plus `spicepod`. Keeping them there is the constraint — a contract that grows a
 # shared-utility dependency has stopped being a thin interface, and the guard says so.
+# `embed-api` is assigned explicitly rather than left to `default_tier`, so that
+# changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
+embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"

@@ -299,7 +299,11 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                         .collect();
                 x.join("\n")
             }
-            None => unimplemented!("Assistant message with no content is not supported"),
+            // A tool-call-only assistant message carries no text. This converter is
+            // lossy by contract — it already discards tool metadata — so the textual
+            // content of such a message is genuinely empty, matching the `Function`
+            // arm below.
+            None => String::new(),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -476,5 +480,41 @@ pub trait Chat: Sync + Send {
             usage: None,
             service_tier: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, FunctionCall,
+    };
+
+    /// An assistant message replaying a tool call carries no text content. The
+    /// flattener must yield an empty string rather than failing, since clients send
+    /// this shape whenever they include tool-call history in a request.
+    #[test]
+    #[expect(deprecated)]
+    fn tool_call_only_assistant_message_flattens_to_empty_text() {
+        let message =
+            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                content: None,
+                refusal: None,
+                name: None,
+                audio: None,
+                tool_calls: Some(vec![ChatCompletionMessageToolCalls::Function(
+                    ChatCompletionMessageToolCall {
+                        id: "call_123".to_string(),
+                        function: FunctionCall {
+                            name: "lookup".to_string(),
+                            arguments: "{\"q\":\"spice\"}".to_string(),
+                        },
+                    },
+                )]),
+                function_call: None,
+            });
+
+        assert_eq!(message_to_content(&message), "");
     }
 }
