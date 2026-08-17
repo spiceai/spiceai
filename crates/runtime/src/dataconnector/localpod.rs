@@ -27,7 +27,7 @@ use datafusion::sql::TableReference;
 
 use crate::DataConnector;
 use crate::datafusion::DataFusion;
-use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+use crate::{component::dataset::DatasetSpec, parameters::ParameterSpec};
 
 use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
@@ -96,7 +96,7 @@ impl DataConnector for LocalPodConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let path_table_ref = TableReference::parse_str(path);

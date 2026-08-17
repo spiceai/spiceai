@@ -54,7 +54,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use document_parse::DocumentParser;
 use graph_rs_sdk::GraphClient;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
 };
@@ -62,6 +61,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
@@ -162,7 +162,7 @@ impl Sharepoint {
     /// explicit `file_format=` param first, then falls back to the URL's
     /// trailing extension. `None` means "no document parsing" — raw bytes
     /// are surfaced as text, which is the right default for `.md` / `.txt`.
-    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
+    async fn get_formatter(&self, dataset: &DatasetSpec) -> Option<Arc<dyn DocumentParser>> {
         let key = dataset
             .params
             .get("file_format")
@@ -180,7 +180,7 @@ impl Sharepoint {
     /// URL schemes are case-insensitive, so we parse and compare on scheme
     /// and authority rather than a raw prefix match — `SharePoint://me/…`
     /// should route the same as `sharepoint://me/…`.
-    fn uses_object_store(dataset: &Dataset) -> bool {
+    fn uses_object_store(dataset: &DatasetSpec) -> bool {
         match Url::parse(&dataset.from) {
             Ok(u) => u.scheme().eq_ignore_ascii_case(CONNECTOR_NAME) && u.has_authority(),
             Err(_) => false,
@@ -204,7 +204,7 @@ impl Sharepoint {
     /// format for non-tabular extensions like `.xlsx`/`.pdf`.
     fn listing_connector(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<SharepointListingConnector> {
         let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
         let mut params = self.params.clone();
@@ -414,7 +414,7 @@ fn register_sharepoint_store(
     store_url: &Url,
     store: Arc<SharepointObjectStore>,
     fingerprint: u64,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<()> {
     let key_url = registry_key_for(store_url);
     let env_id = Arc::as_ptr(runtime_env) as usize;
@@ -476,7 +476,7 @@ fn register_sharepoint_store_on_fresh(
 /// drive-kind routing, and config.
 fn parse_object_store_components(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<(Url, Option<DriveKind>, SharepointObjectStoreConfig)> {
     let store_url =
         Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -742,7 +742,7 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
             return self
@@ -768,7 +768,7 @@ impl DataConnector for Sharepoint {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !Self::uses_object_store(dataset) {
             return None;
@@ -782,7 +782,7 @@ impl DataConnector for Sharepoint {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !dataset.has_metadata_table {
             return None;
@@ -813,7 +813,7 @@ impl DataConnector for Sharepoint {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         if !Self::uses_object_store(dataset) {
@@ -908,7 +908,7 @@ impl ListingTableConnector for SharepointListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url_str = url.unwrap_or(dataset.from.as_str());
@@ -939,7 +939,7 @@ impl ListingTableConnector for SharepointListingConnector {
     /// dataset, and `SpiceObjectStoreRegistry` doesn't.
     fn get_object_store(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn datafusion::object_store::ObjectStore>> {
         Ok(self.build_object_store())
     }
