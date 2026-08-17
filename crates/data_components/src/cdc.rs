@@ -89,6 +89,44 @@ pub fn shutdown_epoch() -> u64 {
 /// that may never arrive — see <https://github.com/spiceai/spiceai/issues/5201>.
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
+/// What the accelerator already holds at the moment its changes stream is built.
+///
+/// A CDC source that cannot prove where an acceleration's contents left off has
+/// to assume the worst: rows may have been deleted at the source while the
+/// acceleration was away, and no change row will ever arrive for them, so only
+/// re-reading the table removes them. That assumption is what makes an
+/// unprovable position expensive — it forces a rebuild.
+///
+/// An acceleration that holds no rows escapes the assumption outright, and it is
+/// the one case that can be settled by observation rather than inference: no row
+/// is present, so no row can be stale and no deletion can be missing. Only
+/// [`Self::Empty`] carries that proof. [`Self::Unknown`] is deliberately not a
+/// third answer callers may reason about — it means the question was not
+/// answered, and must be treated exactly like [`Self::NonEmpty`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccelerationContents {
+    /// Observed to hold no rows, so there is nothing that could be stale.
+    Empty,
+    /// Observed to hold at least one row.
+    NonEmpty,
+    /// Not determined — the probe failed, or the caller never ran one.
+    #[default]
+    Unknown,
+}
+
+impl AccelerationContents {
+    /// Whether the acceleration is *proven* to hold no rows.
+    ///
+    /// The only safe direction to read this type in: everything that is not a
+    /// positive proof of emptiness — including [`Self::Unknown`] — answers
+    /// `false`, so a failed probe degrades to the conservative behavior instead
+    /// of silently skipping work that protects correctness.
+    #[must_use]
+    pub fn is_provably_empty(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum CommitError {
     #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
@@ -2173,5 +2211,25 @@ mod deferred_tests {
         };
         let data_bearing = deferred(rows, false);
         assert!(!data_bearing.is_no_op_heartbeat());
+    }
+
+    /// Only a positive observation of emptiness may relax a rebuild, and the
+    /// failure mode this guards is silent: a probe that could not answer reads as
+    /// `Unknown`, and treating that as proof would skip the re-read an
+    /// acceleration needs to shed rows deleted at the source while it was away.
+    #[test]
+    fn only_an_observed_empty_acceleration_is_provably_empty() {
+        assert!(AccelerationContents::Empty.is_provably_empty());
+        assert!(!AccelerationContents::NonEmpty.is_provably_empty());
+        assert!(
+            !AccelerationContents::Unknown.is_provably_empty(),
+            "an unanswered probe is not proof of emptiness; treating it as one would skip a \
+             rebuild that protects against a missing deletion"
+        );
+        assert!(
+            !AccelerationContents::default().is_provably_empty(),
+            "the default must be the conservative answer, so a caller that never probes cannot \
+             accidentally opt out of the rebuild"
+        );
     }
 }
