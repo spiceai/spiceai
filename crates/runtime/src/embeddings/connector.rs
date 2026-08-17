@@ -825,11 +825,13 @@ mod tests {
     fn vector_scan_over_memtable() -> Arc<dyn FederatedTableProvider> {
         let vector_scan = VectorScanTableProvider {
             table_provider: memtable(),
-            vector_index_list: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
-                produce_one_row: false,
-                schema: Arc::new(datafusion::common::DFSchema::empty()),
-            })),
-            primary_key: vec!["id".to_string()],
+            indexes: vec![search::index::VectorIndexJoin {
+                vector_index_list: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(datafusion::common::DFSchema::empty()),
+                })),
+                primary_key: vec!["id".to_string()],
+            }],
         };
         Arc::new(FederatedTable::Immediate(
             Arc::new(vector_scan).into_table() as Arc<dyn TableProvider>,

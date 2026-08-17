@@ -175,13 +175,15 @@ mod tests {
 
         Arc::new(search::index::vector_table::VectorScanTableProvider {
             table_provider: base_table,
-            vector_index_list: Arc::new(datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
-                    produce_one_row: false,
-                    schema: Arc::new(datafusion::common::DFSchema::empty()),
-                },
-            )),
-            primary_key: vec!["id".to_string()],
+            indexes: vec![search::index::vector_table::VectorIndexJoin {
+                vector_index_list: Arc::new(datafusion::logical_expr::LogicalPlan::EmptyRelation(
+                    datafusion::logical_expr::EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::new(datafusion::common::DFSchema::empty()),
+                    },
+                )),
+                primary_key: vec!["id".to_string()],
+            }],
         })
         .into_table() as Arc<dyn TableProvider>
     }

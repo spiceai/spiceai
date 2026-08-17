@@ -191,8 +191,10 @@ mod tests {
             .expect("empty logical plan should build");
         let wrapped: Arc<dyn TableProvider> = Arc::new(VectorScanTableProvider {
             table_provider: Arc::clone(&base),
-            vector_index_list: Arc::new(plan),
-            primary_key: vec![],
+            indexes: vec![search::index::VectorIndexJoin {
+                vector_index_list: Arc::new(plan),
+                primary_key: vec![],
+            }],
         })
         .into_table();
 

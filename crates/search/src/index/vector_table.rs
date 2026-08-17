@@ -43,12 +43,24 @@ use util::session_state::builder_from_existing;
 use crate::index::VectorIndex;
 use datafusion::catalog::{ScanArgs, ScanResult};
 
-/// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
+/// One vector index's listing plan and join key, as composed onto a
+/// [`VectorScanTableProvider`]. A dataset with several embedding columns holds
+/// one of these per column, all on the same [`VectorScanTableProvider`], rather
+/// than nesting a separate layer per index.
+#[derive(Debug, Clone)]
+pub struct VectorIndexJoin {
+    pub vector_index_list: Arc<LogicalPlan>,
+    pub primary_key: Vec<String>,
+}
+
+/// A [`TableProvider`] that adds one or more embedding columns to an underlying
+/// [`TableProvider`] — one [`VectorIndexJoin`] per vector index, joined into the
+/// same scan rather than each index wrapping its own nested
+/// [`VectorScanTableProvider`] layer.
 #[derive(Debug, Clone)]
 pub struct VectorScanTableProvider {
     pub table_provider: Arc<dyn TableProvider>,
-    pub vector_index_list: Arc<LogicalPlan>,
-    pub primary_key: Vec<String>,
+    pub indexes: Vec<VectorIndexJoin>,
 }
 
 impl VectorScanTableProvider {
@@ -69,13 +81,15 @@ impl VectorScanTableProvider {
             .collect::<HashMap<String, FieldRef>>();
 
         // Only add if key not in base table (we chose base table over index columns in `scan` afterall).
-        for f in self.vector_index_list.schema().fields() {
-            if !fields_map.contains_key(f.name()) {
-                // Any field only present in vector index must be nullable since row may be in `self.table_provider` before `self.vector_index_list`.
-                fields_map.insert(
-                    f.name().clone(),
-                    Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
-                );
+        for entry in &self.indexes {
+            for f in entry.vector_index_list.schema().fields() {
+                if !fields_map.contains_key(f.name()) {
+                    // Any field only present in a vector index must be nullable since row may be in `self.table_provider` before that index.
+                    fields_map.insert(
+                        f.name().clone(),
+                        Arc::new(Arc::unwrap_or_clone(Arc::clone(f)).with_nullable(true)),
+                    );
+                }
             }
         }
 
@@ -97,18 +111,29 @@ impl VectorScanTableProvider {
         SpiceTable::over(self, below)
     }
 
+    /// Builds a layer over `table_provider` joining in every index in `indexes`.
+    /// Callers with a single index pass a one-element slice — `std::slice::from_ref`
+    /// works for an owned `Arc<dyn VectorIndex>` already in hand.
     pub fn try_new(
         table_provider: Arc<dyn TableProvider>,
-        index: &Arc<dyn VectorIndex>,
+        indexes: &[Arc<dyn VectorIndex>],
     ) -> Result<Self, DataFusionError> {
+        let indexes = indexes
+            .iter()
+            .map(|index| {
+                Ok(VectorIndexJoin {
+                    primary_key: index
+                        .primary_fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                    vector_index_list: Arc::new(index.list_table_provider()?),
+                })
+            })
+            .collect::<Result<Vec<_>, DataFusionError>>()?;
         Ok(Self {
             table_provider,
-            primary_key: index
-                .primary_fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect(),
-            vector_index_list: index.list_table_provider()?.into(),
+            indexes,
         })
     }
 
@@ -168,20 +193,65 @@ impl VectorScanTableProvider {
         Ok(columns_requested)
     }
 
-    /// Every column in [`Self::vector_index_list`] absent from `base`, plus all
-    /// primary keys.
-    fn columns_needed_from_index(&self, base: &Arc<dyn TableProvider>) -> Vec<Expr> {
+    /// Every column in `entry.vector_index_list` absent from `base`, plus all of
+    /// `entry`'s primary keys.
+    fn columns_needed_from_index(
+        entry: &VectorIndexJoin,
+        base: &Arc<dyn TableProvider>,
+    ) -> Vec<Expr> {
         let table_schema = base.schema();
-        self.vector_index_list
+        entry
+            .vector_index_list
             .schema()
             .columns()
             .into_iter()
             .filter(|c| {
                 table_schema.column_with_name(&c.name).is_none()
-                    || self.primary_key.contains(&c.name)
+                    || entry.primary_key.contains(&c.name)
             })
             .map(Expr::Column)
             .collect()
+    }
+
+    /// The columns `entry` alone contributes: its own schema's columns absent
+    /// from `base` — i.e. the columns only a join against this specific index can
+    /// supply.
+    fn unique_columns_of(
+        entry: &VectorIndexJoin,
+        base: &Arc<dyn TableProvider>,
+    ) -> HashSet<String> {
+        let table_schema = base.schema();
+        entry
+            .vector_index_list
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|name| table_schema.column_with_name(name).is_none())
+            .collect()
+    }
+
+    /// Whether a query needing `columns_requested` (with `filters`) requires a
+    /// join against `entry` specifically — i.e. whether any column only this
+    /// index supplies is projected or filtered on. An index whose columns are
+    /// never referenced is skipped rather than joined unconditionally, so a
+    /// dataset with several embedding columns pays for only the joins a given
+    /// query actually needs.
+    fn index_is_needed(
+        entry: &VectorIndexJoin,
+        base: &Arc<dyn TableProvider>,
+        columns_requested: &HashSet<String>,
+        filters: &[Expr],
+    ) -> bool {
+        let unique = Self::unique_columns_of(entry, base);
+        if columns_requested.iter().any(|c| unique.contains(c)) {
+            return true;
+        }
+        filters.iter().any(|f| {
+            f.column_refs()
+                .iter()
+                .any(|col| unique.contains(col.name.as_str()))
+        })
     }
 }
 
@@ -249,13 +319,15 @@ impl VectorScanTableProvider {
 
         // Reenable once we can distinguish between query and indexing `.scan()`.
         // See `<https://github.com/spiceai/spiceai/issues/7404>`
-        // if Self::schema_is_sufficient(
-        //     self.vector_index_list.schema().fields(),
-        //     &columns_requested,
-        //     filters,
-        // ) {
+        // if let [entry] = self.indexes.as_slice()
+        //     && Self::schema_is_sufficient(
+        //         entry.vector_index_list.schema().fields(),
+        //         &columns_requested,
+        //         filters,
+        //     )
+        // {
         //     let lp = Self::apply_proj_and_filter(
-        //         LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list)),
+        //         LogicalPlanBuilder::new_from_arc(Arc::clone(&entry.vector_index_list)),
         //         &columns_requested,
         //         filters,
         //     )?
@@ -264,49 +336,69 @@ impl VectorScanTableProvider {
         //     return state.create_physical_plan(&lp).await;
         // }
 
-        // Join on primary keys, prefer to use columns from base table, push down filters where we can.
+        // Join in only the indexes this query actually needs, on primary keys, prefer to use
+        // columns from base table, push down filters where we can.
+        let needed_indexes: Vec<&VectorIndexJoin> = self
+            .indexes
+            .iter()
+            .filter(|entry| Self::index_is_needed(entry, below, &columns_requested, filters))
+            .collect();
+
         let mut join = LogicalPlanBuilder::scan(
             "base_table",
             Arc::new(DefaultTableSource::new(Arc::clone(below))),
             None,
-        )?
-        .join(
-            LogicalPlanBuilder::new_from_arc(Arc::clone(&self.vector_index_list))
-                .project(self.columns_needed_from_index(below))?
-                .alias("vector_index")?
-                .build()?,
-            JoinType::Left,
-            self.primary_key
-                .iter()
-                .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
-                .collect(),
-            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
-            filters
-                .iter()
-                .filter(|f| {
-                    f.column_refs()
-                        .iter()
-                        .any(|col| !self.primary_key.contains(&col.name))
-                })
-                .cloned()
-                .reduce(Expr::and),
         )?;
 
-        let join_schema = Arc::clone(join.schema());
-        join = join.project(
-            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
-            // case, we will remove duplicate primary key columns from the right table.
-            join_schema
-                .iter()
-                .filter(|(tbl, f)| {
-                    !(self.primary_key.contains(f.name())
-                        && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
-                })
-                .map(|(tbl, field_ref)| match tbl {
-                    Some(table_ref) => Column::new(Some(table_ref.clone()), field_ref.name()),
-                    None => Column::new(None::<TableReference>, field_ref.name()),
-                }),
-        )?;
+        for (i, entry) in needed_indexes.into_iter().enumerate() {
+            // Match the single-index alias exactly (`vector_index`, unsuffixed) so a dataset
+            // with one index keeps producing the same plan it always has; only a second and
+            // later index needs a distinguishing suffix.
+            let alias = if i == 0 {
+                "vector_index".to_string()
+            } else {
+                format!("vector_index_{i}")
+            };
+
+            join = join.join(
+                LogicalPlanBuilder::new_from_arc(Arc::clone(&entry.vector_index_list))
+                    .project(Self::columns_needed_from_index(entry, below))?
+                    .alias(alias.clone())?
+                    .build()?,
+                JoinType::Left,
+                entry
+                    .primary_key
+                    .iter()
+                    .map(|pk| (Column::from_name(pk.clone()), Column::from_name(pk.clone())))
+                    .collect(),
+                // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+                filters
+                    .iter()
+                    .filter(|f| {
+                        f.column_refs()
+                            .iter()
+                            .any(|col| !entry.primary_key.contains(&col.name))
+                    })
+                    .cloned()
+                    .reduce(Expr::and),
+            )?;
+
+            let join_schema = Arc::clone(join.schema());
+            join = join.project(
+                // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+                // case, we will remove duplicate primary key columns from the right table.
+                join_schema
+                    .iter()
+                    .filter(|(tbl, f)| {
+                        !(entry.primary_key.contains(f.name())
+                            && tbl.is_some_and(|t| *t == TableReference::parse_str(&alias)))
+                    })
+                    .map(|(tbl, field_ref)| match tbl {
+                        Some(table_ref) => Column::new(Some(table_ref.clone()), field_ref.name()),
+                        None => Column::new(None::<TableReference>, field_ref.name()),
+                    }),
+            )?;
+        }
 
         if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
             join = join.filter(filter)?;
@@ -750,7 +842,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            &(Arc::new(PretendVectorIndex::new(
+            &[Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -761,7 +853,7 @@ mod tests {
                         false,
                     ),
                 ]),
-            )) as Arc<dyn VectorIndex>),
+            )) as Arc<dyn VectorIndex>],
         )
         .expect("could not make 'VectorScanTableProvider'");
 
@@ -817,7 +909,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            &(Arc::new(PretendVectorIndex::new(
+            &[Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -828,7 +920,7 @@ mod tests {
                         false,
                     ),
                 ]),
-            )) as Arc<dyn VectorIndex>),
+            )) as Arc<dyn VectorIndex>],
         )
         .expect("could not make 'VectorScanTableProvider'");
 
@@ -869,7 +961,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            &(Arc::new(PretendVectorIndex::new(
+            &[Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![Field::new("pk", DataType::Int64, false)],
                 Schema::new(vec![
@@ -886,7 +978,7 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )) as Arc<dyn VectorIndex>),
+            )) as Arc<dyn VectorIndex>],
         )
         .expect("could not make 'VectorScanTableProvider'");
 
@@ -971,7 +1063,7 @@ mod tests {
                 .expect("could not make MemTable"),
                 "BaseTable",
             )),
-            &(Arc::new(PretendVectorIndex::new(
+            &[Arc::new(PretendVectorIndex::new(
                 "body".to_string(),
                 vec![
                     Field::new("pk1", DataType::Int64, false),
@@ -994,7 +1086,7 @@ mod tests {
                         ("filterable".to_string(), "false".to_string()),
                     ])),
                 ]),
-            )) as Arc<dyn VectorIndex>),
+            )) as Arc<dyn VectorIndex>],
         )
         .expect("could not make 'VectorScanTableProvider'");
 
@@ -1045,6 +1137,113 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table WHERE a_number > 0 LIMIT 5",
             "scan_table_no_join_for_metadata_filter_multiple_pk",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/7020>: a dataset
+    /// with two embedding columns must produce a *single* `VectorScanTableProvider`
+    /// joining both indexes, not one index nested inside the other. A query naming
+    /// only one column's embedding joins only that index; a query naming both joins
+    /// both, in one flat plan.
+    #[tokio::test]
+    pub async fn test_vector_scan_multiple_indexes() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("summary", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+        ]));
+
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+                "BaseTable",
+            )),
+            &[
+                Arc::new(PretendVectorIndex::new(
+                    "body".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "body_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+                Arc::new(PretendVectorIndex::new(
+                    "summary".to_string(),
+                    vec![Field::new("pk", DataType::Int64, false)],
+                    Schema::new(vec![
+                        Field::new("pk", DataType::Int64, false),
+                        Field::new(
+                            "summary_embedding",
+                            DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                            false,
+                        ),
+                    ]),
+                )) as Arc<dyn VectorIndex>,
+            ],
+        )
+        .expect("could not make 'VectorScanTableProvider' over two indexes");
+
+        assert_eq!(
+            p.indexes.len(),
+            2,
+            "a dataset with two embedding columns must hold both indexes on one provider"
+        );
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p).into_table();
+
+        assert!(
+            provider.schema().field_with_name("body_embedding").is_ok()
+                && provider
+                    .schema()
+                    .field_with_name("summary_embedding")
+                    .is_ok(),
+            "the merged schema must expose both indexes' embedding columns"
+        );
+
+        // Only the referenced index's join should appear in the plan.
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_only_body",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, summary_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_only_summary",
+        )
+        .await?;
+
+        // Both indexes referenced: both joins must appear in one flat plan.
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding, summary_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_both",
+        )
+        .await?;
+
+        // Neither embedding column referenced: no join at all.
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_multi_index_no_join",
         )
         .await?;
 
