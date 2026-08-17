@@ -599,9 +599,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     match crate::spiced_metrics::MetricsScraper::scrape_once().await {
         Ok(final_metrics) => {
             reporting::emit_cayenne_compaction_metrics(&final_metrics);
-            reporting::emit_cayenne_maintenance_metrics(&final_metrics);
+            reporting::emit_cayenne_operation_metrics(&final_metrics);
         }
-        Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
+        // Names both sections this scrape feeds, so a missing operation-counts
+        // table is attributable to the scrape rather than read as "no operations".
+        Err(e) => {
+            eprintln!("Failed to scrape final Cayenne compaction and operation metrics: {e}");
+        }
     }
 
     telemetry.emit().await?;
