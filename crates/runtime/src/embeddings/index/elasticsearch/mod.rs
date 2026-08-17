@@ -515,6 +515,10 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
         DataType::Int64 | DataType::UInt64 => serde_json::json!({ "type": "long" }),
         DataType::Float32 => serde_json::json!({ "type": "float" }),
         DataType::Float64 => serde_json::json!({ "type": "double" }),
+        // Elasticsearch's 16-bit floating point type; falling through to `keyword` below would
+        // make the pushdown side (which maps `Float16` to a numeric `EsFieldType`) build
+        // numeric/range queries against a field actually mapped as a non-numeric string.
+        DataType::Float16 => serde_json::json!({ "type": "half_float" }),
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
             serde_json::json!({ "type": "date" })
         }

@@ -125,17 +125,22 @@ fn translate_comparison(
     }
 
     match op {
-        Operator::Eq => translate_eq(field_type, column, &value),
-        Operator::NotEq => negate_if_exact(translate_eq(field_type, column, &value)),
-        Operator::Lt => translate_range(field_type, column, "lt", &value),
-        Operator::LtEq => translate_range(field_type, column, "lte", &value),
-        Operator::Gt => translate_range(field_type, column, "gt", &value),
-        Operator::GtEq => translate_range(field_type, column, "gte", &value),
+        Operator::Eq => translate_eq(schema, field_type, column, &value),
+        Operator::NotEq => negate_if_exact(translate_eq(schema, field_type, column, &value)),
+        Operator::Lt => translate_range(schema, field_type, column, "lt", &value),
+        Operator::LtEq => translate_range(schema, field_type, column, "lte", &value),
+        Operator::Gt => translate_range(schema, field_type, column, "gt", &value),
+        Operator::GtEq => translate_range(schema, field_type, column, "gte", &value),
         _ => Outcome::Unsupported,
     }
 }
 
-fn translate_eq(field_type: &EsFieldType, column: &str, value: &Value) -> Outcome {
+fn translate_eq(
+    schema: &EsFilterSchema,
+    field_type: &EsFieldType,
+    column: &str,
+    value: &Value,
+) -> Outcome {
     // A literal longer than a `TextWithKeyword`'s `ignore_above` can never be indexed in the
     // sub-field, so pushing `term` for it would silently exclude a row whose real value equals
     // the literal — a subset, not a superset.
@@ -143,22 +148,33 @@ fn translate_eq(field_type: &EsFieldType, column: &str, value: &Value) -> Outcom
         return Outcome::Unsupported;
     }
     let field = field_type.value_field(column);
+    // `is_confirmed_scalar` caps exactness for a field whose cardinality Elasticsearch's mapping
+    // cannot confirm — see `EsFilterSchema::is_confirmed_scalar`.
+    let exact = field_type.is_exact_for_value_match() && schema.is_confirmed_scalar(column);
     Outcome::Pushable {
-        exact: field_type.is_exact_for_value_match(),
+        exact,
         clause: json!({ "term": { field: value.clone() } }),
     }
 }
 
-fn translate_range(field_type: &EsFieldType, column: &str, es_op: &str, value: &Value) -> Outcome {
-    // No safe superset for a range on a boolean field, or on a quantized float (see
-    // `EsFieldType::supports_range`).
-    if !field_type.supports_range() {
+fn translate_range(
+    schema: &EsFilterSchema,
+    field_type: &EsFieldType,
+    column: &str,
+    es_op: &str,
+    value: &Value,
+) -> Outcome {
+    // No safe superset for a range on a boolean field, a quantized float, or a keyword-family
+    // field over its `ignore_above` limit (see `EsFieldType::supports_range`); nor for a field
+    // Elasticsearch has no `doc_values` for.
+    if !field_type.supports_range() || !schema.has_doc_values(column) {
         return Outcome::Unsupported;
     }
     let field = field_type.value_field(column);
-    // Only integers compare exactly. Float representation and keyword collation can diverge from
-    // SQL ordering, so those are re-checked above the scan.
-    let exact = matches!(field_type, EsFieldType::Integer);
+    // Only integers compare exactly, and only when the field is confirmed scalar (see
+    // `translate_eq`). Float representation and keyword collation can diverge from SQL ordering,
+    // so those are re-checked above the scan.
+    let exact = matches!(field_type, EsFieldType::Integer) && schema.is_confirmed_scalar(column);
     Outcome::Pushable {
         exact,
         clause: json!({ "range": { field: { es_op: value.clone() } } }),
@@ -202,8 +218,10 @@ fn translate_in_list(
     }
 
     let field = field_type.value_field(column);
+    // See `translate_eq` on why exactness is also capped by `is_confirmed_scalar`.
+    let exact = field_type.is_exact_for_value_match() && schema.is_confirmed_scalar(column);
     let terms = Outcome::Pushable {
-        exact: field_type.is_exact_for_value_match(),
+        exact,
         clause: json!({ "terms": { field: values } }),
     };
     if in_list.negated {
@@ -228,7 +246,8 @@ fn translate_between(
     let Some(field_type) = schema.get(column) else {
         return Outcome::Unsupported;
     };
-    if !field_type.supports_range() {
+    // See `translate_range` on `supports_range` and `has_doc_values`.
+    if !field_type.supports_range() || !schema.has_doc_values(column) {
         return Outcome::Unsupported;
     }
     let (Some(low), Some(high)) = (scalar_to_json(low), scalar_to_json(high)) else {
@@ -239,7 +258,8 @@ fn translate_between(
     }
 
     let field = field_type.value_field(column);
-    let exact = matches!(field_type, EsFieldType::Integer);
+    // See `translate_eq` on why exactness is also capped by `is_confirmed_scalar`.
+    let exact = matches!(field_type, EsFieldType::Integer) && schema.is_confirmed_scalar(column);
     let range = Outcome::Pushable {
         exact,
         clause: json!({ "range": { field: { "gte": low, "lte": high } } }),
@@ -638,6 +658,8 @@ mod tests {
             keyword_subfield: None,
             keyword_ignore_above: None,
             has_null_value: true,
+            indexed: true,
+            has_doc_values: true,
         };
         let schema = EsFilterSchema::from_mapping([("code", &info)]);
         assert_eq!(
@@ -648,10 +670,12 @@ mod tests {
             classify_filter(&schema, &col("code").is_not_null()),
             TableProviderFilterPushDown::Unsupported
         );
-        // Equality is unaffected — `null_value` doesn't change term-query correctness.
+        // `null_value` doesn't change term-query correctness, but a mapping-derived field's
+        // cardinality is never confirmed scalar (see `EsFilterSchema::is_confirmed_scalar`), so
+        // equality is capped to `Inexact` regardless.
         assert_eq!(
             classify_filter(&schema, &col("code").eq(lit("open"))),
-            TableProviderFilterPushDown::Exact
+            TableProviderFilterPushDown::Inexact
         );
     }
 
@@ -690,6 +714,16 @@ mod tests {
         // Dropping just the over-length literal would still miss a row matching it.
         let expr = col("title").in_list(vec![lit("short"), lit("123456789")], false);
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn range_on_keyword_with_ignore_above_is_unsupported() {
+        // A value over "title"'s ignore_above: 8 has no entry in the sub-field at all, so no
+        // range boundary — regardless of the literal — can be trusted not to exclude a row that
+        // truly satisfies the predicate.
+        let expr = col("title").gt(lit("abc"));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+        assert_eq!(translate_filter(&schema(), &expr), None);
     }
 
     #[test]

@@ -108,6 +108,16 @@ pub struct FieldMapping {
     /// it from a genuine value.
     #[serde(default)]
     pub null_value: Option<serde_json::Value>,
+    /// Whether the field is searchable. Elasticsearch defaults this to `true` when the mapping
+    /// declares no `index` parameter; `Some(false)` means Elasticsearch cannot search the field
+    /// at all, so a query against it would be rejected or silently mis-answered.
+    #[serde(default)]
+    pub index: Option<bool>,
+    /// Whether the field has doc values (needed for sort/aggregation/scripting, and for a
+    /// `range` query against a `keyword`-family field). Elasticsearch defaults this to `true`
+    /// when the mapping declares no `doc_values` parameter.
+    #[serde(default)]
+    pub doc_values: Option<bool>,
 }
 
 /// A search request body sent to `POST /<index>/_search`.

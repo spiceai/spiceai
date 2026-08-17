@@ -98,6 +98,16 @@ fn collect_mapping_fields(
         // pre-filter unsafe for IS [NOT] NULL (see `EsFilterSchema::from_mapping`).
         let has_null_value = mapping.null_value.is_some()
             || keyword_sibling.is_some_and(|(_, sub_mapping)| sub_mapping.null_value.is_some());
+        // `index`/`doc_values` are read from whichever field the pushdown will actually query —
+        // the keyword sibling for `text`, or the field itself otherwise — same target as
+        // `keyword_ignore_above` above. Elasticsearch defaults both to `true` when absent.
+        let (indexed, has_doc_values) = if is_keyword_family {
+            (mapping.index, mapping.doc_values)
+        } else if let Some((_, sub_mapping)) = keyword_sibling {
+            (sub_mapping.index, sub_mapping.doc_values)
+        } else {
+            (mapping.index, mapping.doc_values)
+        };
         fields.insert(
             full_name,
             EsMappingField {
@@ -105,6 +115,8 @@ fn collect_mapping_fields(
                 keyword_subfield,
                 keyword_ignore_above,
                 has_null_value,
+                indexed: indexed.unwrap_or(true),
+                has_doc_values: has_doc_values.unwrap_or(true),
             },
         );
     }
@@ -290,14 +302,59 @@ mod tests {
             TableProviderFilterPushDown::Inexact
         );
 
-        // `null_value` makes `exists` untrustworthy for IS [NOT] NULL, but not for equality.
+        // `null_value` makes `exists` untrustworthy for IS [NOT] NULL. Equality is unaffected by
+        // `null_value`, but a mapping-derived field's cardinality is never confirmed scalar (see
+        // `EsFilterSchema::is_confirmed_scalar`), so it is capped to `Inexact` regardless.
         assert_eq!(
             classify_filter(&filter_schema, &col("code").is_null()),
             TableProviderFilterPushDown::Unsupported
         );
         assert_eq!(
             classify_filter(&filter_schema, &col("code").eq(lit("open"))),
-            TableProviderFilterPushDown::Exact
+            TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn filter_schema_honors_index_and_doc_values() {
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        let mut properties = HashMap::new();
+        properties.insert(
+            "internal".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                index: Some(false),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "unsorted".to_string(),
+            FieldMapping {
+                field_type: Some("long".to_string()),
+                doc_values: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        // `index: false` means Elasticsearch cannot search the field at all.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("internal").eq(lit("x"))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        // `doc_values: false` rules out a range clause, but not equality (`term` doesn't need
+        // doc values).
+        assert_eq!(
+            classify_filter(&filter_schema, &col("unsorted").gt(lit(5_i64))),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("unsorted").eq(lit(5_i64))),
+            TableProviderFilterPushDown::Inexact
         );
     }
 }

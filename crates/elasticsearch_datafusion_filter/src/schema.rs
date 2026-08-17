@@ -104,12 +104,21 @@ impl EsFieldType {
     }
 
     /// Whether a `range`/`BETWEEN` predicate is expressible against this field type at all.
-    /// `false` for [`EsFieldType::Boolean`] (nonsensical) and [`EsFieldType::QuantizedFloat`]
+    /// `false` for [`EsFieldType::Boolean`] (nonsensical), [`EsFieldType::QuantizedFloat`]
     /// (quantization can make a boundary comparison exclude a true SQL match — see the variant's
-    /// docs — so there is no safe superset to push).
+    /// docs — so there is no safe superset to push), and a [`EsFieldType::Keyword`]/
+    /// [`EsFieldType::TextWithKeyword`] with `ignore_above` set: a document whose value exceeds
+    /// that length has no entry in the field at all, so no boundary comparison — regardless of
+    /// where the query literal falls — can be trusted not to exclude a row that truly satisfies
+    /// the SQL predicate. Same subset hazard [`Self::supports_prefix`] guards against.
     #[must_use]
     pub fn supports_range(&self) -> bool {
-        !matches!(self, EsFieldType::Boolean | EsFieldType::QuantizedFloat)
+        match self {
+            EsFieldType::Boolean | EsFieldType::QuantizedFloat => false,
+            EsFieldType::Keyword { ignore_above }
+            | EsFieldType::TextWithKeyword { ignore_above, .. } => ignore_above.is_none(),
+            EsFieldType::Integer | EsFieldType::Float => true,
+        }
     }
 
     /// Whether a prefix (`LIKE 'x%'`) predicate is expressible against this field type. `false`
@@ -149,6 +158,19 @@ impl EsFieldType {
 struct ColumnEntry {
     field_type: EsFieldType,
     supports_null_check: bool,
+    /// Whether this column is known to hold at most one value per document. Elasticsearch never
+    /// distinguishes a scalar field from an array of the same type in its mapping — any field can
+    /// hold multiple values, and a `term`/`range` clause matches if *any* element satisfies it,
+    /// which is not the same as a scalar SQL comparison. `true` only when Spice itself controls
+    /// what is written to the field (a Spice-managed index, or a schema/tests constructed via
+    /// [`EsFilterSchema::with_field`]); a field read from a real, externally-managed mapping (see
+    /// [`EsFilterSchema::from_mapping`]) has no such guarantee, so exactness is capped to
+    /// `Inexact` for it regardless of what [`EsFieldType::is_exact_for_value_match`] would
+    /// otherwise say.
+    confirmed_scalar: bool,
+    /// Whether the field (or, for `text`, its keyword sibling) has Elasticsearch `doc_values`
+    /// enabled. `false` means a `range`/`BETWEEN` clause against it is not safe to issue.
+    has_doc_values: bool,
 }
 
 /// The set of columns that may be filtered in Elasticsearch, keyed by column name.
@@ -179,6 +201,8 @@ impl EsFilterSchema {
             ColumnEntry {
                 field_type,
                 supports_null_check: true,
+                confirmed_scalar: true,
+                has_doc_values: true,
             },
         );
         self
@@ -199,6 +223,24 @@ impl EsFilterSchema {
         self.fields
             .get(column)
             .is_some_and(|entry| entry.supports_null_check)
+    }
+
+    /// Whether `column` is known to hold at most one value per document — a field's exactness
+    /// documented on [`ColumnEntry::confirmed_scalar`] is capped by this.
+    #[must_use]
+    pub fn is_confirmed_scalar(&self, column: &str) -> bool {
+        self.fields
+            .get(column)
+            .is_some_and(|entry| entry.confirmed_scalar)
+    }
+
+    /// Whether a `range`/`BETWEEN` clause is safe to issue against `column` — `false` when the
+    /// real mapping declares `doc_values: false` for it.
+    #[must_use]
+    pub fn has_doc_values(&self, column: &str) -> bool {
+        self.fields
+            .get(column)
+            .is_some_and(|entry| entry.has_doc_values)
     }
 
     #[must_use]
@@ -224,6 +266,8 @@ impl EsFilterSchema {
                     ColumnEntry {
                         field_type,
                         supports_null_check: true,
+                        confirmed_scalar: true,
+                        has_doc_values: true,
                     },
                 );
             }
@@ -254,12 +298,16 @@ impl EsFilterSchema {
             } else {
                 continue;
             };
-            // Spice's own write path never sets a `null_value` sentinel on managed mappings.
+            // Spice's own write path never sets a `null_value` sentinel on managed mappings, and
+            // never writes more than one value into a column it declared scalar in the Arrow
+            // schema, so both are safe to assume here.
             fields.insert(
                 name.clone(),
                 ColumnEntry {
                     field_type,
                     supports_null_check: true,
+                    confirmed_scalar: true,
+                    has_doc_values: true,
                 },
             );
         }
@@ -286,6 +334,15 @@ pub struct EsMappingField {
     /// Whether `null_value` is set on this field, or (for `text`) on its keyword sibling — see
     /// [`EsFieldType`] docs on why that makes an `exists` pre-filter unsafe.
     pub has_null_value: bool,
+    /// Whether the field the pushdown will actually query — the keyword sibling for `text`, or
+    /// the field itself otherwise — is indexed (`index: false` in the mapping means Elasticsearch
+    /// cannot search it at all, so it must never be classified as pushable). Elasticsearch
+    /// defaults this to `true` when the mapping declares no `index` parameter.
+    pub indexed: bool,
+    /// Whether that same field has Elasticsearch `doc_values` enabled. `false` means a
+    /// `range`/`BETWEEN` clause against it is not safe to issue. Elasticsearch defaults this to
+    /// `true` when the mapping declares no `doc_values` parameter.
+    pub has_doc_values: bool,
 }
 
 impl EsFilterSchema {
@@ -301,6 +358,12 @@ impl EsFilterSchema {
     ) -> Self {
         let mut fields = HashMap::new();
         for (name, info) in mapping {
+            // `index: false` means Elasticsearch never indexed the field at all — no clause
+            // against it can be trusted to search correctly, so it must not be classified as
+            // pushable/filterable.
+            if !info.indexed {
+                continue;
+            }
             let field_type = match info.field_type.as_str() {
                 "boolean" => Some(EsFieldType::Boolean),
                 "byte" | "short" | "integer" | "long" | "unsigned_long" => {
@@ -329,6 +392,13 @@ impl EsFilterSchema {
                     ColumnEntry {
                         field_type,
                         supports_null_check: !info.has_null_value,
+                        // Elasticsearch mappings carry no scalar-vs-array signal at all — any
+                        // field can hold multiple values, and a `term`/`range` clause matches if
+                        // *any* element does, which a scalar SQL comparison does not mean. With
+                        // no way to confirm this field is single-valued, cap it to `Inexact`
+                        // rather than risk a false `Exact` (see `ColumnEntry::confirmed_scalar`).
+                        confirmed_scalar: false,
+                        has_doc_values: info.has_doc_values,
                     },
                 );
             }
@@ -351,7 +421,11 @@ fn arrow_type_to_es_numeric(dt: &DataType) -> Option<EsFieldType> {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => Some(EsFieldType::Integer),
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(EsFieldType::Float),
+        DataType::Float32 | DataType::Float64 => Some(EsFieldType::Float),
+        // The write path (`arrow_type_to_es_mapping`) maps `Float16` to Elasticsearch
+        // `half_float`, whose indexed value is quantized rather than round-tripped exactly, so
+        // it shares `half_float`/`scaled_float`'s `QuantizedFloat` classification, not `Float`'s.
+        DataType::Float16 => Some(EsFieldType::QuantizedFloat),
         _ => None,
     }
 }

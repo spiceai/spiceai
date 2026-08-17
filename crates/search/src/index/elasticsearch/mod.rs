@@ -302,6 +302,24 @@ impl ElasticsearchIndexWriteMaintenance {
     }
 }
 
+/// Primary-key column names safe to add to a filter schema's `filterable` set.
+///
+/// A primary key is filterable by default, but a user can also declare it a `NonFilterable`
+/// metadata column (e.g. via `metadata: { vectors: non-filterable }` on the column in the
+/// Spicepod config); that explicit opt-out must be honored even though the column is also the
+/// primary key.
+fn filterable_primary_key_names(
+    primary_key: &[Field],
+    metadata_columns: &MetadataColumns,
+) -> Vec<String> {
+    let non_filterable = metadata_columns.non_filterable_names();
+    primary_key
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|name| !non_filterable.contains(name))
+        .collect()
+}
+
 #[async_trait]
 impl SearchIndex for ElasticsearchIndex {
     fn search_column(&self) -> String {
@@ -324,9 +342,11 @@ impl SearchIndex for ElasticsearchIndex {
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let schema = self.query_result_schema();
         // Only Elasticsearch-indexed columns (primary keys + user-declared `filterable` metadata)
-        // may be pre-filtered; everything else stays a DataFusion filter above the scan.
-        let mut filterable: Vec<String> =
-            self.primary_key.iter().map(|f| f.name().clone()).collect();
+        // may be pre-filtered; everything else stays a DataFusion filter above the scan. A
+        // primary-key column is otherwise always filterable, but an explicit `NonFilterable`
+        // declaration in `metadata_columns` is honored even for it.
+        let mut filterable =
+            filterable_primary_key_names(&self.primary_key, &self.metadata_columns);
         filterable.extend(self.metadata_columns.filterable_names());
         let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchKnnTable {
@@ -710,9 +730,11 @@ impl SearchIndex for ElasticsearchTextIndex {
 
         // The text index indexes the primary key, the analyzed search fields, and any
         // user-declared filterable metadata columns (mapped `index: true`, mirroring the
-        // vector-index path) as safe exact-value pre-filter targets.
-        let mut filterable: Vec<String> =
-            self.primary_key.iter().map(|f| f.name().clone()).collect();
+        // vector-index path) as safe exact-value pre-filter targets. A primary-key column is
+        // otherwise always filterable, but an explicit `NonFilterable` declaration in
+        // `metadata_columns` is honored even for it.
+        let mut filterable =
+            filterable_primary_key_names(&self.primary_key, &self.metadata_columns);
         filterable.extend(self.metadata_columns.filterable_names());
         let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
 
@@ -1235,6 +1257,54 @@ mod write_maintenance_tests {
         let required = index.required_columns();
         assert!(required.contains(&"category".to_string()));
         assert!(required.contains(&"description".to_string()));
+    }
+
+    #[test]
+    fn primary_key_honors_explicit_non_filterable_declaration() {
+        use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown, col, lit};
+
+        // "id" is both the primary key and explicitly declared non-filterable; the opt-out must
+        // win over the primary key's usual default-filterable status.
+        let metadata_columns: MetadataColumns = vec![MetadataColumn::NonFilterable(Arc::new(
+            Field::new("id", DataType::Int64, false),
+        ))]
+        .into();
+        let index = ElasticsearchTextIndex {
+            client: Arc::new(MockElasticsearch::default()),
+            es_index: "test-index".to_string(),
+            search_column_name: "body".to_string(),
+            search_fields: vec!["body".to_string()],
+            primary_key: vec![Field::new("id", DataType::Int64, false)],
+            source_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("body", DataType::Utf8, true),
+            ])),
+            metadata_columns,
+            batch_write_rows: 1000,
+            write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+        };
+
+        let plan = index
+            .query_table_provider("query")
+            .expect("text search plan should build");
+        let LogicalPlan::TableScan(scan) = plan.as_ref() else {
+            panic!("expected a table scan");
+        };
+        let source = scan
+            .source
+            .downcast_ref::<DefaultTableSource>()
+            .expect("expected the default table source");
+        let table = source
+            .table_provider
+            .downcast_ref::<ElasticsearchTextSearchTable>()
+            .expect("expected an Elasticsearch text search table");
+        let filter = col("id").eq(lit(1_i64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter classification should succeed"),
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
     }
 
     // ── Chunked warm-index fallback contract ─────────────────────────────────────
