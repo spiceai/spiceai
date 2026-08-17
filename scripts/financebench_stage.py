@@ -62,7 +62,6 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
-DEFAULT_SOURCE = "https://raw.githubusercontent.com/patronus-ai/financebench/main"
 JSONL_RELATIVE = "data/financebench_open_source.jsonl"
 
 
@@ -198,13 +197,23 @@ def load_records(source: str) -> list[dict]:
 
 
 def evidence_pages(record: dict) -> list[tuple[str, int]]:
-    """Return `(doc_name, page_idx)` pairs from a record's evidence entries."""
+    """Return `(doc_name, page_idx)` pairs from a record's evidence entries.
+
+    Raises `SystemExit` on a malformed or empty evidence entry: a Qrel built
+    from ground truth that can't name its doc and page is worse than no Qrel
+    at all, so this fails the staging job loudly rather than dropping it.
+    """
+    fb_id = record.get("financebench_id")
     pairs: list[tuple[str, int]] = []
     for ev in record.get("evidence") or []:
+        if not ev:
+            raise SystemExit(f"{fb_id}: empty evidence entry")
         doc_name = ev.get("evidence_doc_name") or ev.get("doc_name") or record.get("doc_name")
         page = ev.get("evidence_page_num")
         if doc_name is None or page is None:
-            continue
+            raise SystemExit(
+                f"{fb_id}: malformed evidence entry {ev!r} (missing doc name or page number)"
+            )
         pairs.append((str(doc_name), int(page)))
     return pairs
 
@@ -325,14 +334,19 @@ def stage(args: argparse.Namespace) -> int:
             for r in records
             if r.get("financebench_id") is not None and r.get("question") is not None
         ]
-        query_schema = pa.schema([("_id", pa.string()), ("text", pa.string())])
+        query_schema = pa.schema([("_id", pa.large_string()), ("text", pa.large_string())])
 
         # relevance_data.parquet: query-id, corpus-id, score. One row per evidence
         # page; dedup identical (query, page) pairs a multi-evidence question may repeat.
         seen: set[tuple[str, str]] = set()
         rel_rows = []
         for record in records:
-            fb_id = str(record.get("financebench_id"))
+            fb_id = record.get("financebench_id")
+            if fb_id is None:
+                # No valid query id, so this record is already excluded from
+                # queries.parquet above — it must not emit a relevance row either.
+                continue
+            fb_id = str(fb_id)
             for doc_name, page in evidence_pages(record):
                 corpus_id = corpus_id_for(doc_name, page)
                 key = (fb_id, corpus_id)
@@ -341,7 +355,11 @@ def stage(args: argparse.Namespace) -> int:
                 seen.add(key)
                 rel_rows.append({"query-id": fb_id, "corpus-id": corpus_id, "score": 1})
         rel_schema = pa.schema(
-            [("query-id", pa.string()), ("corpus-id", pa.string()), ("score", pa.int64())]
+            [
+                ("query-id", pa.large_string()),
+                ("corpus-id", pa.large_string()),
+                ("score", pa.int64()),
+            ]
         )
 
         queries_path = work_dir / "queries.parquet"
@@ -367,10 +385,13 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--source",
-        default=DEFAULT_SOURCE,
+        required=True,
         help=(
             "FinanceBench source: a local checkout path or an HTTP(S) base URL "
-            f"(default: {DEFAULT_SOURCE})."
+            "pinned to a specific commit (e.g. "
+            "https://raw.githubusercontent.com/<org>/<repo>/<commit-sha>). "
+            "No default: a moving branch ref like `main` can change the corpus "
+            "out from under a staged run without notice."
         ),
     )
     parser.add_argument(

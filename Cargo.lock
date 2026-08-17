@@ -14505,6 +14505,7 @@ dependencies = [
 name = "pdf-split"
 version = "2.2.0-unstable"
 dependencies = [
+ "blake3",
  "clap",
  "lopdf",
  "snafu",

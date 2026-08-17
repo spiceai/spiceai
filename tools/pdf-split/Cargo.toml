@@ -17,6 +17,7 @@ name = "pdf-split"
 path = "src/main.rs"
 
 [dependencies]
+blake3.workspace = true
 clap = { workspace = true, features = ["derive"] }
 lopdf = { path = "../../crates/vendor/lopdf" }
 snafu.workspace = true

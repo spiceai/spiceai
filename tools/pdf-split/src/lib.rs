@@ -49,6 +49,24 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[snafu(display("Failed to read {path}: {source}", path = path.display()))]
+    ReadInput {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to remove stale page file {path}: {source}", path = path.display()))]
+    RemoveStalePage {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to write split digest {path}: {source}", path = path.display()))]
+    SaveDigest {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display(
         "PDF {path} has no pages. Confirm the file is a valid PDF and is not empty.",
         path = path.display()
@@ -83,7 +101,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// the written paths in page order.
 ///
 /// The split is idempotent: if `out_dir` already holds exactly one `pNNNN.pdf`
-/// per source page, the existing files are returned without re-writing them.
+/// per source page, written from a source with the same content digest, the
+/// existing files are returned without re-writing them. Otherwise `out_dir` is
+/// cleared of prior page outputs first, so a source whose page count has
+/// shrunk since the last run doesn't leave stale trailing page files behind.
 ///
 /// # Errors
 ///
@@ -102,9 +123,17 @@ pub fn split_pdf(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
         .map(|idx| out_dir.join(page_file_name(idx)))
         .collect();
 
-    if expected.iter().all(|p| p.is_file()) && count_page_pdfs(out_dir)? == page_numbers.len() {
+    let digest = source_digest(input)?;
+    let digest_path = out_dir.join(DIGEST_FILE_NAME);
+
+    if expected.iter().all(|p| p.is_file())
+        && count_page_pdfs(out_dir)? == page_numbers.len()
+        && std::fs::read_to_string(&digest_path).ok().as_deref() == Some(digest.as_str())
+    {
         return Ok(expected);
     }
+
+    clear_page_pdfs(out_dir)?;
 
     // `keep_page_id` is the leaf `Page` object for each 1-indexed page number.
     let pages: BTreeMap<u32, ObjectId> = doc.get_pages();
@@ -137,7 +166,35 @@ pub fn split_pdf(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
         written.push(out_path);
     }
 
+    std::fs::write(&digest_path, &digest).context(SaveDigestSnafu { path: digest_path })?;
+
     Ok(written)
+}
+
+/// Content digest of `input`, used to detect a same-name/same-page-count
+/// source whose bytes have actually changed since the last split.
+fn source_digest(input: &Path) -> Result<String> {
+    let bytes = std::fs::read(input).context(ReadInputSnafu { path: input })?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Sidecar file recording the source digest a directory was last split from.
+const DIGEST_FILE_NAME: &str = ".source.blake3";
+
+/// Remove every existing `pNNNN.pdf` file in `dir`.
+///
+/// Called before re-splitting so trailing page files from a previous, larger
+/// split (e.g. `p0002.pdf` when the source now has only two pages) don't
+/// survive alongside the freshly written, smaller set.
+fn clear_page_pdfs(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir).context(ReadDirSnafu { path: dir })? {
+        let entry = entry.context(ReadDirSnafu { path: dir })?;
+        if entry.file_name().to_str().is_some_and(is_page_pdf_name) {
+            let path = entry.path();
+            std::fs::remove_file(&path).context(RemoveStalePageSnafu { path })?;
+        }
+    }
+    Ok(())
 }
 
 /// Trim `doc`'s page tree so `keep_page_id` is the only reachable page.
@@ -210,12 +267,13 @@ fn strip_cross_page_catalog_refs(doc: &mut Document) {
 /// Returns an error if `input_dir` cannot be read or any contained PDF fails to
 /// split (see [`split_pdf`]).
 pub fn split_pdf_dir(input_dir: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut inputs: Vec<PathBuf> = std::fs::read_dir(input_dir)
-        .context(ReadDirSnafu { path: input_dir })?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| is_pdf(path))
-        .collect();
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(input_dir).context(ReadDirSnafu { path: input_dir })? {
+        let path = entry.context(ReadDirSnafu { path: input_dir })?.path();
+        if is_pdf(&path) {
+            inputs.push(path);
+        }
+    }
     inputs.sort();
 
     let mut written = Vec::new();
@@ -245,11 +303,13 @@ fn is_pdf(path: &Path) -> bool {
 
 /// Count files in `dir` whose names match the `pNNNN.pdf` page pattern.
 fn count_page_pdfs(dir: &Path) -> Result<usize> {
-    let count = std::fs::read_dir(dir)
-        .context(ReadDirSnafu { path: dir })?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_name().to_str().is_some_and(is_page_pdf_name))
-        .count();
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).context(ReadDirSnafu { path: dir })? {
+        let entry = entry.context(ReadDirSnafu { path: dir })?;
+        if entry.file_name().to_str().is_some_and(is_page_pdf_name) {
+            count += 1;
+        }
+    }
     Ok(count)
 }
 
