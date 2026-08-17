@@ -26,6 +26,7 @@ paste.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-object-store = { path = "../../runtime-object-store" }
 runtime-parameters = { path = "../../runtime-parameters" }
