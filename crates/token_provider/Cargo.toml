@@ -21,5 +21,9 @@ tokio.workspace = true
 tracing.workspace = true
 util = { path = "../util" }
 
+[dev-dependencies]
+base64.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
 [lints]
 workspace = true

@@ -75,8 +75,15 @@ Two backends are supported, both via the same request/response types:
       &service_account_json,
       "https://www.googleapis.com/auth/cloud-platform",
   ).await?;
+  // `location: global` uses the non-regional host (`aiplatform.googleapis.com`, no
+  // `{location}-` prefix); every other region uses the regional host.
+  let host = if location == "global" {
+      "https://aiplatform.googleapis.com".to_string()
+  } else {
+      format!("https://{location}-aiplatform.googleapis.com")
+  };
   let base_url = format!(
-      "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google"
+      "{host}/v1/projects/{project}/locations/{location}/publishers/google"
   );
   let client = google_genai::Client::with_bearer_token(Arc::new(token_provider), base_url)?;
   ```

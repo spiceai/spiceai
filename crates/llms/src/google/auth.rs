@@ -89,6 +89,19 @@ pub enum GoogleAuthError {
     MissingProjectOrLocation { params_prefix: String },
 
     #[snafu(display(
+        "`{params_prefix}.google_project` ('{project}') is not a valid GCP project id: only lowercase letters, digits, and hyphens are allowed."
+    ))]
+    InvalidProject { params_prefix: String, project: String },
+
+    #[snafu(display(
+        "`{params_prefix}.google_location` ('{location}') is not a valid GCP region: only lowercase letters, digits, and hyphens are allowed (or `global`)."
+    ))]
+    InvalidLocation {
+        params_prefix: String,
+        location: String,
+    },
+
+    #[snafu(display(
         "Exactly one of `{params_prefix}.google_service_account_path`, `{params_prefix}.google_service_account_key`, or `{params_prefix}.google_application_default_credentials` is required when `{params_prefix}.google_api` is `vertex_ai`."
     ))]
     NoAuthMethodSpecified { params_prefix: String },
@@ -155,6 +168,26 @@ async fn build_vertex_client(
         .fail();
     };
 
+    // `project`/`location` are concatenated directly into the request URL's host
+    // (`vertex_base_url`) and authority; without validation, a value containing `/` or `.`
+    // could redirect the outgoing request (carrying a live GCP bearer token) to an
+    // attacker-controlled host. GCP's own project-id/region syntax is a strict subset of
+    // this check, so rejecting anything else can't reject a legitimate value.
+    ensure!(
+        is_safe_gcp_identifier(project),
+        InvalidProjectSnafu {
+            params_prefix: params_prefix.to_string(),
+            project: project.to_string(),
+        }
+    );
+    ensure!(
+        location.eq_ignore_ascii_case("global") || is_safe_gcp_identifier(location),
+        InvalidLocationSnafu {
+            params_prefix: params_prefix.to_string(),
+            location: location.to_string(),
+        }
+    );
+
     let service_account_json = resolve_service_account_json(&vertex, params_prefix).await?;
 
     let token_provider =
@@ -219,6 +252,17 @@ async fn resolve_service_account_json(
         params_prefix: params_prefix.to_string(),
     }
     .fail()
+}
+
+/// Whether `s` is safe to interpolate into a URL host/path segment unescaped: this is a strict
+/// subset of valid GCP project-id and region syntax (lowercase letters, digits, hyphens; no
+/// leading/trailing hyphen), so it can never reject a legitimate project id or region.
+fn is_safe_gcp_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Builds the Vertex AI base URL for the Gemini publisher-model API:
@@ -378,5 +422,64 @@ mod tests {
         .await
         .expect_err("ADC without env var should fail");
         assert!(matches!(err, GoogleAuthError::MissingAdcEnvVar { .. }));
+    }
+
+    #[test]
+    fn is_safe_gcp_identifier_accepts_real_project_ids_and_regions() {
+        assert!(is_safe_gcp_identifier("my-project-123"));
+        assert!(is_safe_gcp_identifier("us-central1"));
+        assert!(is_safe_gcp_identifier("sacred-garden-23"));
+    }
+
+    #[test]
+    fn is_safe_gcp_identifier_rejects_url_injection_attempts() {
+        // A `/` or `.` would let `location`/`project` escape the intended URL segment and
+        // redirect the request (and its bearer token) to an attacker-controlled host.
+        assert!(!is_safe_gcp_identifier("evil.example"));
+        assert!(!is_safe_gcp_identifier("evil.example/"));
+        assert!(!is_safe_gcp_identifier("us-central1/../../evil"));
+        assert!(!is_safe_gcp_identifier(""));
+        assert!(!is_safe_gcp_identifier("-leading-hyphen"));
+        assert!(!is_safe_gcp_identifier("trailing-hyphen-"));
+    }
+
+    #[tokio::test]
+    async fn vertex_rejects_invalid_location() {
+        let key = SecretString::from("{}");
+        let err = build_client(
+            GoogleApi::VertexAi,
+            None,
+            VertexAuthParams {
+                project: Some("my-project"),
+                location: Some("evil.example/"),
+                service_account_path: None,
+                service_account_key: Some(&key),
+                application_default_credentials: false,
+            },
+            "model.params",
+        )
+        .await
+        .expect_err("an invalid location should be rejected before any network call");
+        assert!(matches!(err, GoogleAuthError::InvalidLocation { .. }));
+    }
+
+    #[tokio::test]
+    async fn vertex_rejects_invalid_project() {
+        let key = SecretString::from("{}");
+        let err = build_client(
+            GoogleApi::VertexAi,
+            None,
+            VertexAuthParams {
+                project: Some("evil.example/"),
+                location: Some("us-central1"),
+                service_account_path: None,
+                service_account_key: Some(&key),
+                application_default_credentials: false,
+            },
+            "model.params",
+        )
+        .await
+        .expect_err("an invalid project should be rejected before any network call");
+        assert!(matches!(err, GoogleAuthError::InvalidProject { .. }));
     }
 }
