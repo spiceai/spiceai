@@ -2020,8 +2020,9 @@ impl RefreshTask {
         // between the normalized source schema and stored rows remains an error in
         // `filter_records`, rather than silently treating an actual source schema change as
         // compatible.
+        let output_schema = update.data.schema();
         let filter_schema = if self.engine_type_rewrites.is_empty() {
-            update.data.schema()
+            Arc::clone(&output_schema)
         } else {
             Arc::new(apply_rules(
                 update.data.schema().as_ref(),
@@ -2040,14 +2041,21 @@ impl RefreshTask {
             .map(|existing| vec![false; existing.num_rows()])
             .collect();
 
-        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&filter_schema), {
+        // The sink must receive the source schema so it can report engine-imposed narrowing
+        // and account for it. The normalized batches exist only for this comparison; cast the
+        // surviving rows back after de-duplication, then let the ordinary write path perform
+        // its normal source-to-engine cast.
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
                     let batch = batch?;
                     let batch = try_cast_to(batch, Arc::clone(&filter_schema))
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let batch = filter_records(&batch, &existing_records, &filter_schema, &mut used);
-                    yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
+                    let batch = filter_records(&batch, &existing_records, &filter_schema, &mut used)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let batch = try_cast_to(batch, Arc::clone(&output_schema))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    yield Ok(batch);
                 }
             }
         }));
@@ -4298,8 +4306,8 @@ mod tests {
         assert_eq!(collected.data[0].num_rows(), 1, "the stored row is removed");
         assert_eq!(
             collected.data[0].schema(),
-            accelerator_schema,
-            "the deduplicated stream uses Cayenne's stored timestamp precision"
+            source_schema,
+            "the deduplicated stream retains the source schema for the sink diagnostic"
         );
         let ids = collected.data[0]
             .column_by_name("id")
