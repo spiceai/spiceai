@@ -3570,7 +3570,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .map(str::trim)
                 .filter(|sql| !sql.is_empty())
                 .map(|retention_sql| {
-                    match crate::datafusion::retention_sql::parse_retention_sql(
+                    match runtime_datafusion::retention_sql::parse_retention_sql(
                         source.name(),
                         retention_sql,
                         Arc::clone(&arrow_schema),
