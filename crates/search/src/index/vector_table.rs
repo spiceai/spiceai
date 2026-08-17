@@ -255,11 +255,9 @@ impl VectorScanTableProvider {
         if columns_requested.iter().any(|c| owns(c)) {
             return true;
         }
-        filters.iter().any(|f| {
-            f.column_refs()
-                .iter()
-                .any(|col| owns(col.name.as_str()))
-        })
+        filters
+            .iter()
+            .any(|f| f.column_refs().iter().any(|col| owns(col.name.as_str())))
     }
 }
 
