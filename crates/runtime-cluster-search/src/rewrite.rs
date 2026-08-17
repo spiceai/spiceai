@@ -361,16 +361,12 @@ fn split_pushable_filter(predicate: &Expr, schema: &SchemaRef) -> (Option<String
             .all(|c| schema.column_with_name(c.name()).is_some());
 
         if references_known_columns {
-            match unparser.expr_to_sql(&conjunct) {
-                Ok(ast) => {
-                    pushed_sql.push(ast.to_string());
-                    continue;
-                }
-                Err(_) => {
-                    // Cannot render this conjunct as SQL; leave it for the
-                    // caller to apply above the merge instead of dropping it.
-                }
+            if let Ok(ast) = unparser.expr_to_sql(&conjunct) {
+                pushed_sql.push(ast.to_string());
+                continue;
             }
+            // Cannot render this conjunct as SQL; leave it for the caller to
+            // apply above the merge instead of dropping it.
         }
         remaining.push(conjunct);
     }

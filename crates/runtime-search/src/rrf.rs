@@ -460,6 +460,7 @@ impl ReciprocalRankFusionArgs {
                         // RRF nests independent per-node searches; global BM25
                         // statistics do not apply to its fused ranking.
                         global_stats: None,
+                        expected_generation: None,
                     },
                     rank_weight,
                 ))
