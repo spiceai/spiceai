@@ -18,6 +18,7 @@ connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optiona
 connector-kafka = { path = "../../crates/data-connectors/connector-kafka", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
 connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
+datafusion = { workspace = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dynamodb = { path = "../../crates/data-connectors/connector-dynamodb", optional = true }
@@ -58,7 +59,6 @@ mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
 opentelemetry-http.workspace = true
 parking_lot.workspace = true
-opentelemetry-prometheus.workspace = true
 opentelemetry-zipkin.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
@@ -70,6 +70,9 @@ runtime-async = { path = "../../crates/runtime-async" }
 runtime-cloud-connect = { workspace = true }
 runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 runtime-query-engine = { path = "../../crates/runtime-query-engine" }
+# `default-features = false` matches how `runtime` declares it: the stores that
+# need a cloud SDK are enabled by the matching `spiced` feature, not by default.
+runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true
@@ -95,6 +98,9 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+# Builds the `RequestContext` the trace-span test needs; `spiced` itself only
+# ever sees one through `runtime`.
+runtime-request-context = { path = "../../crates/runtime-request-context" }
 tempfile.workspace = true
 
 [features]
@@ -142,7 +148,6 @@ default = [
     "iceberg-write",
     "turso",
     "smb",
-    "pingora",
     "scylladb",
     "models",
     "aws-secrets-manager",

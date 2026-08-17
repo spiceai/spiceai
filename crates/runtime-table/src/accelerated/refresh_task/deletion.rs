@@ -119,9 +119,9 @@ pub fn build_batch_delete_expr_from_change_batch(
 ///
 /// Companion to [`build_batch_delete_expr_from_change_batch`] (which builds a delete `Expr` for
 /// the accelerator) — this instead produces a [`RecordBatch`] of the same rows' key columns,
-/// shaped for [`runtime_datafusion_index::Index::delete_by_keys`], for call sites that bypass
+/// shaped for [`spice_table::Index::delete_by_keys`], for call sites that bypass
 /// `TableProvider::delete_from` entirely (Cayenne's fast CDC-delete path) and so need to drive
-/// index deletion explicitly rather than relying on `IndexedTableProvider::delete_from`.
+/// index deletion explicitly rather than relying on `IndexLayer::delete_from`.
 ///
 /// Returns `Ok(None)` for an empty `row_indices`, or if the first row has no primary keys.
 pub fn build_pk_only_batch_from_change_batch(

@@ -95,6 +95,23 @@ pub struct SharedMemberSetup {
     /// has subscribed yet — the caller holds the ack floor for the ones that
     /// have not, so their changes are not acked away before they join.
     pub publication_tables: Vec<(String, String)>,
+    /// The earliest LSN this slot still *retains* — see [`read_slot_restart_lsn`]
+    /// — read *after* the slot is ensured, so a slot just created reports its own
+    /// creation point rather than `None`.
+    ///
+    /// This is **not** the earliest LSN the slot can be streamed from, and must not
+    /// be used as one: Postgres forwards a `START_REPLICATION` position below the
+    /// slot's `confirmed_flush_lsn` up to it (`CreateDecodingContext`), so an
+    /// acknowledged change can never be re-streamed even while its WAL is retained
+    /// here. Anything deciding whether a position is still reachable wants the later
+    /// of this and `confirmed_flush_lsn`; using retention alone reads an unfillable
+    /// gap as resumable and skips it silently (#11289).
+    ///
+    /// `None` only when the slot does not exist, which cannot normally follow
+    /// `ensure_slot`; it is carried as an `Option` so a slot dropped underneath
+    /// us between the two reads is reported as the unfillable gap it is rather
+    /// than silently compared against a fabricated position.
+    pub slot_restart_lsn: Option<u64>,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -131,11 +148,13 @@ pub async fn setup_shared_member(
                 let publication_tables =
                     list_publication_tables(&client, &params.publication_name).await?;
                 let slot = ensure_slot(&client, params).await?;
+                let slot_restart_lsn = read_slot_restart_lsn(&client, &params.slot_name).await?;
                 Ok(SharedMemberSetup {
                     slot,
                     table_added,
                     generated_columns,
                     publication_tables,
+                    slot_restart_lsn,
                 })
             }
             .await;
@@ -243,10 +262,81 @@ async fn fetch_generated_columns(
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]
 /// for the semantics of the returned `consistent_lsn` / `created_fresh`.
+/// SQLSTATE `42703` (`undefined_column`) — `pg_replication_slots.wal_status` is
+/// `PostgreSQL` 13+.
+const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+
+/// Drop a slot the server has invalidated, so the caller's `ensure_slot`
+/// recreates it.
+///
+/// An invalidated slot (`wal_status = 'lost'`, from exhausted
+/// `max_slot_wal_keep_size` or `PostgreSQL` 18 idle-timeout invalidation) still
+/// exists in the catalog and can still report a non-null `confirmed_flush_lsn`,
+/// so every "does the slot exist" check passes while `START_REPLICATION` against
+/// it fails permanently with SQLSTATE 55000 ("can no longer get changes from
+/// replication slot"), which is classified non-transient and stops the stream. Left in place it produces the worst outcome available:
+/// the acceleration is rebuilt from the source, and then streaming never
+/// resumes.
+///
+/// Returns whether a slot was dropped. Best-effort — a failure here leaves the
+/// slot in place and surfaces through the streaming error it was going to cause
+/// anyway.
+async fn drop_slot_if_invalidated(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<bool> {
+    let row = client
+        .query_opt(
+            "SELECT wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await;
+    let wal_status = match row {
+        Ok(row) => row.and_then(|row| row.get::<_, Option<String>>(0)),
+        // `wal_status` is PostgreSQL 13+. On an older server there is nothing to
+        // read and nothing to detect.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == SQLSTATE_UNDEFINED_COLUMN) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e).context(SetupExecSnafu),
+    };
+
+    if wal_status.as_deref() != Some("lost") {
+        return Ok(false);
+    }
+
+    tracing::warn!(
+        slot = %slot_name,
+        "PostgreSQL invalidated this replication slot (wal_status=lost): the WAL it needed is gone, so it can never stream again. Dropping it and creating a replacement; the acceleration is rebuilt from the source. Raise max_slot_wal_keep_size, or reduce replication lag, to avoid this."
+    );
+    match client
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
+        .await
+    {
+        Ok(_) => Ok(true),
+        // Already gone: a concurrent drop raced us, which is the desired state.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == SQLSTATE_UNDEFINED_OBJECT) =>
+        {
+            Ok(true)
+        }
+        Err(e) => Err(e).context(SetupExecSnafu),
+    }
+}
+
 async fn ensure_slot(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
 ) -> Result<SlotInfo> {
+    // A slot the server has invalidated still looks present to every check
+    // below, so retire it first and let the rest of this function create its
+    // replacement.
+    drop_slot_if_invalidated(client, &params.slot_name).await?;
+
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
     //   * Some(0)         — slot exists but confirmed_flush_lsn is NULL. This
@@ -763,6 +853,48 @@ fn ignore_duplicate_object<T>(
                 Err(e).context(SetupExecSnafu)
             }
         }
+    }
+}
+
+/// The earliest LSN a slot can still stream from: its `restart_lsn`.
+///
+/// This is the authority on whether a gap is fillable. `confirmed_flush_lsn`
+/// says how far a consumer acknowledged; `restart_lsn` says how far back the
+/// server still holds WAL *for this slot*, and it is what `START_REPLICATION`
+/// can be asked to resume from. A recorded watermark older than this is a gap no
+/// stream can supply.
+///
+/// `Ok(None)` means the slot cannot be shown to reach *any* previously recorded
+/// position, so a caller comparing against a watermark must treat it as an
+/// unfillable gap. Two catalog states produce it:
+///
+///   * the slot does not exist — the widest possible gap; and
+///   * the slot exists with a NULL `restart_lsn`, i.e. it was just created and
+///     has never streamed. Its WAL reservation begins at its *creation point*,
+///     which is later than anything a previous run could have recorded — so it
+///     supplies nothing a watermark refers to.
+///
+/// That second case is easy to get backwards. Reporting it as `Some(0)` reads as
+/// "reserved from the beginning of time, so it can supply anything", which
+/// inverts the decision precisely when the slot was recreated after being
+/// dropped — the case gap detection exists for.
+pub async fn read_slot_restart_lsn(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<Option<u64>> {
+    let row = client
+        .query_opt(
+            "SELECT restart_lsn::text FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    match row.get::<_, Option<String>>(0) {
+        Some(lsn) => Ok(Some(parse_lsn(&lsn)?)),
+        None => Ok(None),
     }
 }
 

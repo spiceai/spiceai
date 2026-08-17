@@ -673,6 +673,10 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
+        DUCKDB_TYPE_REWRITE_RULES
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
     }
@@ -1517,7 +1521,7 @@ pub(crate) async fn create_table_provider(
         schema_metadata,
     ));
 
-    Ok(table_provider)
+    Ok(table_provider.into_table())
 }
 
 /// Reconstruct the DELETE statement with the internal `DuckDB` table name.
@@ -2046,9 +2050,11 @@ mod tests {
         let provider = accelerator
             .create_external_table(cmd, None, vec![], None)
             .await?;
-        let poly = provider
-            .downcast_ref::<data_components::poly::PolyTableProvider>()
-            .expect("PolyTableProvider");
+        let poly = spice_table::find_layer::<data_components::poly::PolyTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        )
+        .expect("the poly read/write layer");
         let writer = poly.writer();
         let writer = writer
             .downcast_ref::<datafusion_table_providers::duckdb::write::DuckDBTableWriter>()

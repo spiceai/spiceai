@@ -15,7 +15,7 @@ datasets:
       engine: s3_vectors
       params:
         s3_vectors_bucket: spice-ci-search-benchmarks-variant-001
-        s3_vectors_index: miracl_en
+        s3_vectors_index: miracl-en
         s3_vectors_aws_region: us-east-2
         s3_vectors_aws_access_key_id: ${env:AWS_S3_VECTORS_KEY}
         s3_vectors_aws_secret_access_key: ${env:AWS_S3_VECTORS_SECRET}

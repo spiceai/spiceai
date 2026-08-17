@@ -31,12 +31,11 @@ use data_components::oracle::connection::{
     OracleConnectionParams, OracleConnectionPool, OracleDirectConnectionParamsBuilder,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::fs;
@@ -334,7 +333,7 @@ impl DataConnector for Oracle {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = OracleTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await

@@ -28,20 +28,20 @@ pub mod stream;
 
 use async_trait::async_trait;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
+use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
 use mongodb::bson::{Bson, Document, doc};
-use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
-use runtime::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult,
+    DataConnectorResult, parameters::ConnectorContext,
 };
-use runtime::federated::FederatedTable;
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -55,6 +55,10 @@ pub struct MongoDB {
     mongodb_factory: MongoDBTableFactory,
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
+    /// Retained so the change stream can resolve the resume-token store over the
+    /// dataset's accelerator. `None` only in unit tests, which build params without a
+    /// runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl std::fmt::Debug for MongoDB {
@@ -317,6 +321,7 @@ impl DataConnectorFactory for MongoDBFactory {
             Ok(Arc::new(MongoDB {
                 mongodb_factory,
                 pool,
+                context: params.context.clone(),
                 params: params.parameters,
             }) as Arc<dyn DataConnector>)
         })
@@ -736,7 +741,7 @@ async fn mongodb_inferred_schema_metadata(
 /// best-effort, degrading gracefully when the source restricts catalog access.
 async fn enrich_with_mongodb_metadata(
     pool: &Arc<MongoDBConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     tracing::debug!(
@@ -773,7 +778,7 @@ impl DataConnector for MongoDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         // JSON-nesting / declared-schema projection. `_id` is MongoDB's only
         // primary key and must stay a declared column when a catch-all is used.
@@ -798,13 +803,14 @@ impl DataConnector for MongoDB {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        dataset: &DatasetSpec,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(changes::build_changes_stream(
             Arc::clone(&self.pool),
             self.params.clone(),
             dataset.clone(),
+            self.context.clone(),
             federated_table,
         ))
     }

@@ -81,10 +81,12 @@ const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
                                           command exits.
   sudo spice connect --install            Enroll (if needed) and install
                                           `spiced --cloud-connect` as a
-                                          persistent systemd service. Re-run to
-                                          upgrade in place: latest binary,
-                                          rewritten unit, service restarted,
-                                          staged identity untouched.
+                                          persistent system service — systemd
+                                          on Linux, a launchd daemon on macOS.
+                                          Re-run to upgrade in place: latest
+                                          binary, rewritten service definition,
+                                          service restarted, staged identity
+                                          untouched.
   spice connect status                    Show the current enrollment state.
   spice connect remove                    Release this instance: report the
                                           release to Spice Cloud, uninstall the
@@ -106,10 +108,10 @@ per-instance state lives under `<dir>/.spice`, so multiple instances on one
 host enroll independently. `SPICE_CONFIG_DIR` overrides the derived location
 entirely and wins over `--dir`.
 
-`--install` requires Linux with systemd and root. Containers use the env-var
-flow (`SPICE_CONNECT_ADOPT_CODE` plus `spiced --cloud-connect`) under the
-container runtime's restart policy; macOS and Windows enroll and run under the
-user's own supervisor.
+`--install` requires root, and either Linux with systemd or macOS with
+launchd. Containers use the env-var flow (`SPICE_CONNECT_ADOPT_CODE` plus
+`spiced --cloud-connect`) under the container runtime's restart policy; Windows
+enrolls and runs under the user's own supervisor.
 
 ENVIRONMENT
   SPICE_CONNECT_ADOPT_CODE                Adoption code, for hosts with no CLI.
@@ -144,7 +146,7 @@ pub struct ConnectArgs {
     pub target: Option<String>,
 
     /// Override the Spice Cloud enroll endpoint the adoption code is
-    /// presented to. Defaults to `https://cloud.spice.ai`. Also
+    /// presented to. Defaults to `https://api.spice.ai`. Also
     /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
     /// address is issued by the enroll response, not configured here.
     #[arg(long, value_name = "URL")]
@@ -199,9 +201,10 @@ pub struct ConnectArgs {
     #[arg(long, requires = "app_name")]
     pub create: bool,
 
-    /// Install and start `spiced --cloud-connect` as a persistent systemd
+    /// Install and start `spiced --cloud-connect` as a persistent system
     /// service running from the instance directory, so the instance survives
-    /// reboots and closed terminals. Requires Linux with systemd and root.
+    /// reboots and closed terminals. Requires root, and either Linux with
+    /// systemd or macOS with launchd.
     /// Combinable with a code, or run on its own after a prior enroll.
     /// Re-running is the idempotent in-place upgrade path.
     #[arg(long, global = true)]
@@ -415,7 +418,7 @@ async fn connect_without_code(
     if config_dir.join(IDENTITY_FILE).exists() {
         if enroll.install {
             // The `--install`-after-a-prior-enroll path, and the in-place
-            // upgrade path when a unit is already installed.
+            // upgrade path when a service is already installed.
             return install_service(ctx, config_dir);
         }
         println!("This host is already enrolled with Spice Cloud.");
@@ -467,8 +470,8 @@ async fn enroll_instance(
     config_dir: &Path,
     enroll: EnrollOptions,
 ) -> Result<()> {
-    // Preflight BEFORE the enroll: a host without systemd or without root must
-    // fail with nothing installed and the adoption code still redeemable.
+    // Preflight BEFORE the enroll: a host with no supervisor or without root
+    // must fail with nothing installed and the adoption code still redeemable.
     if enroll.install {
         service::preflight()?;
     }
@@ -660,20 +663,23 @@ async fn enroll_instance(
     }
 
     println!("Nothing is running yet. Choose how this instance runs:");
-    println!("  sudo spice connect --install   Install a persistent service (Linux/systemd)");
+    println!(
+        "  sudo spice connect --install   Install a persistent service (Linux/systemd, macOS/launchd)"
+    );
     println!("  spiced --cloud-connect         Run it in the foreground from this directory");
     println!("The instance shows as connected in the Spice Cloud portal once the runtime is up.");
 
     Ok(())
 }
 
-/// Install (or reinstall) the systemd service for this instance directory and
-/// report the unit name and how to manage it.
+/// Install (or reinstall) the service for this instance directory and report
+/// its name and how to manage it.
 fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
     service::preflight()?;
 
-    // The unit runs from the *instance* directory, not the `.spice` config dir
-    // beneath it: that directory is the spicepod root the runtime loads from.
+    // The service runs from the *instance* directory, not the `.spice` config
+    // dir beneath it: that directory is the spicepod root the runtime loads
+    // from.
     let instance_dir = instance_dir_for(config_dir);
     // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
     // the runtime the operator installed is normally under their own home.
@@ -686,28 +692,29 @@ fn install_service(ctx: &RuntimeContext, config_dir: &Path) -> Result<()> {
         ),
     })?;
 
-    let unit = service::install(&instance_dir, &spiced_path)?;
+    let installed = service::install(&instance_dir, config_dir, &spiced_path)?;
 
     println!("Installed the Spice Cloud Connect service.");
-    println!("  service:   {}", unit.name);
-    println!("  unit file: {}", unit.path.display());
+    println!("  service:   {}", installed.name);
+    println!("  file:      {}", installed.path.display());
     println!("  directory: {}", instance_dir.display());
     // Name both paths: the operator needs to know which build was installed and
     // that the service runs a root-owned copy of it, not the original.
-    println!("  runtime:   {}", unit.runtime.display());
-    if unit.runtime != spiced_path {
+    println!("  runtime:   {}", installed.runtime.display());
+    if installed.runtime != spiced_path {
         println!("             staged from {}", spiced_path.display());
     }
     if let Ok(version) = ctx.runtime_version() {
         println!("  version:   {version}");
     }
-    if let Some(state) = service::is_active(&unit.name) {
+    if let Some(state) = service::is_active(&installed.name) {
         println!("  state:     {state}");
     }
     println!();
     println!("Manage it with:");
-    println!("  systemctl status {}", unit.name);
-    println!("  journalctl -u {} -f", unit.name);
+    for hint in service::manage_hints(&installed.name) {
+        println!("  {hint}");
+    }
     println!(
         "Re-run `sudo spice connect --install` to upgrade the runtime in place; \
          `sudo spice connect remove` to release this instance and uninstall the service."
@@ -787,19 +794,19 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
     // No state in this directory. A host can still be connected from another
     // instance directory, so report the installed services rather than a
     // misleading "not connected".
-    let units = service::discover_all();
-    if !units.is_empty() {
+    let installed = service::discover_all();
+    if !installed.is_empty() {
         println!(
             "Spice Cloud Connect: no instance in this directory ({}).",
             instance_dir_for(config_dir).display()
         );
         println!("Installed services on this host:");
-        for unit in &units {
-            let state = service::is_active(&unit.name).unwrap_or_else(|| "unknown".to_string());
+        for service in &installed {
+            let state = service::is_active(&service.name).unwrap_or_else(|| "unknown".to_string());
             println!(
                 "  {} (dir {}) — {state}",
-                unit.name,
-                unit.working_dir.display()
+                service.name,
+                service.working_dir.display()
             );
         }
         println!();
@@ -863,13 +870,13 @@ fn print_delivered_secrets(config_dir: &Path) {
 /// Report the service installed for this instance directory, when there is one.
 fn print_service_for_dir(config_dir: &Path) {
     let instance_dir = instance_dir_for(config_dir);
-    let Some(unit) = service::find_for_dir(&instance_dir) else {
+    let Some(installed) = service::find_for_dir(&instance_dir) else {
         // Not an error: containers and foreground runs are supported ways to
-        // run, and `--install` is Linux/systemd only.
+        // run, and `--install` needs a supported supervisor.
         return;
     };
-    let state = service::is_active(&unit.name).unwrap_or_else(|| "unknown".to_string());
-    println!("  service:     {} — {state}", unit.name);
+    let state = service::is_active(&installed.name).unwrap_or_else(|| "unknown".to_string());
+    println!("  service:     {} — {state}", installed.name);
 }
 
 /// Measure the host clock against Spice Cloud and report a significant skew.
@@ -909,14 +916,14 @@ async fn remove_identity(
         .map_err(|e| Error::CloudConnectIo {
             message: format!("load identity: {e}"),
         })?;
-    let unit = service::find_for_dir(&instance_dir);
+    let installed = service::find_for_dir(&instance_dir);
 
     let had_identity = identity.is_some();
     let had_pending = pending_path.exists();
     let had_endpoint = endpoint_path.exists();
     let had_cache = cache_path.exists();
 
-    if !had_identity && !had_pending && !had_endpoint && !had_cache && unit.is_none() {
+    if !had_identity && !had_pending && !had_endpoint && !had_cache && installed.is_none() {
         println!("Spice Cloud Connect: nothing to remove.");
         return Ok(());
     }
@@ -924,11 +931,11 @@ async fn remove_identity(
     // Confirm before touching a running service: stopping it takes the
     // instance offline, and an operator who ran this in the wrong directory
     // needs the chance to say no. Name what will be affected.
-    if let Some(ref unit) = unit
+    if let Some(ref installed) = installed
         && !assume_yes
     {
         println!("This will release this instance from Spice Cloud and remove it from this host:");
-        println!("  service:   {} (stopped and uninstalled)", unit.name);
+        println!("  service:   {} (stopped and uninstalled)", installed.name);
         println!("  directory: {}", instance_dir.display());
         if had_identity {
             println!("  identity:  {} (deleted)", identity_path.display());
@@ -958,10 +965,10 @@ async fn remove_identity(
     // the command before the identity is cleared. The cloud has already
     // released the instance by this point, so keeping a dead credential on disk
     // is strictly worse than reporting the uninstall failure at the end.
-    let uninstall_failure = match unit {
-        Some(ref unit) => match service::uninstall(&instance_dir) {
+    let uninstall_failure = match installed {
+        Some(ref installed) => match service::uninstall(&instance_dir) {
             Ok(_) => {
-                println!("Stopped and uninstalled {}.", unit.name);
+                println!("Stopped and uninstalled {}.", installed.name);
                 None
             }
             Err(err) => Some(err),
@@ -1015,7 +1022,7 @@ async fn remove_identity(
     );
 
     // Surfaced last so the exit status still reports it: the local state is
-    // gone, but a unit left behind would keep restarting a runtime with no
+    // gone, but a service left behind would keep restarting a runtime with no
     // identity until someone removes it.
     match uninstall_failure {
         Some(err) => Err(err),

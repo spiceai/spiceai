@@ -10,9 +10,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+data_components = { path = "../data_components" }
+datafusion.workspace = true
 globset = { workspace = true }
 runtime-component = { path = "../runtime-component" }
+serde_json.workspace = true
 snafu.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

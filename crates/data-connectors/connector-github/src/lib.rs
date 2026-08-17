@@ -48,7 +48,7 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
-use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
 use snafu::ResultExt;
@@ -66,7 +66,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 
 pub mod github;
 
@@ -571,7 +571,7 @@ impl Github {
         owner: &str,
         repo: &str,
         requested_ref: Option<&str>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_rest_client().context(
             runtime::dataconnector::UnableToGetReadProviderSnafu {
@@ -624,7 +624,7 @@ impl Github {
         owner: &str,
         repo: &str,
         requested_ref: Option<&str>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
@@ -1100,7 +1100,7 @@ impl DataConnector for Github {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
 
@@ -1909,7 +1909,7 @@ mod tests {
     use runtime::dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
     };
-    use runtime::parameters::Parameters;
+    use runtime_parameters::Parameters;
     use runtime_secrets::Secrets;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1970,7 +1970,7 @@ mod tests {
             parameters,
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: Some(Arc::new(RuntimeConnectorContext::new(app, runtime))),
+            context: Some(Arc::new(RuntimeConnectorContext::new(app, &runtime))),
             io_runtime: tokio::runtime::Handle::current(),
         }
     }

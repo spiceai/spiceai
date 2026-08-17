@@ -12,6 +12,9 @@ version = { workspace = true }
 [dependencies]
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
+# Sole source of the CPU entitlement, which caps the derived intra-file scan
+# concurrency (see `VortexSource::resolved_scan_concurrency`).
+cpu-budget = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-common-runtime = { workspace = true }
@@ -29,7 +32,8 @@ itertools = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 object_store = { workspace = true }
 opentelemetry = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "time"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true, features = ["std", "attributes"] }
 twox-hash = { workspace = true }
@@ -42,6 +46,9 @@ anyhow = { workspace = true }
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion = { workspace = true }
 insta = { workspace = true }
+opentelemetry-prometheus = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+prometheus = { workspace = true }
 rstest = "0.26.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }

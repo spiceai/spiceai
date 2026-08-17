@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use runtime_component::ClusterRole;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -28,17 +29,17 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{
+    AcceleratorSetup, RefreshRequestError, RefreshRequester, RegisteredAcceleratedTable,
+    TableGoneSnafu,
+};
 use datafusion::catalog::Session;
-use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
-use datafusion::{
-    datasource::{TableProvider, TableType},
-    logical_expr::Expr,
-};
+use datafusion::{datasource::TableProvider, logical_expr::Expr};
 use opentelemetry::KeyValue;
 use refresh::RefreshOverrides;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -54,6 +55,7 @@ use runtime_datafusion::is_spice_internal_dataset;
 use runtime_status as status;
 use runtime_udfs_api::deny_spice_specific_functions;
 
+use datafusion::catalog::{ScanArgs, ScanResult};
 use runtime_metrics::acceleration as metrics;
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -421,6 +423,8 @@ pub struct Builder {
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
@@ -475,6 +479,7 @@ impl Builder {
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
@@ -726,6 +731,16 @@ impl Builder {
         self
     }
 
+    /// Declare the acceleration engine's own type rewrites, so the refresh sink can
+    /// tell an engine-imposed type from a stale acceleration schema.
+    pub fn engine_type_rewrites(
+        &mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> &mut Self {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
     pub fn accelerator_write_mutex(
@@ -941,6 +956,7 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+        refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
         let (refresh_handle, refresh_trigger) =
@@ -1366,6 +1382,28 @@ impl AcceleratedTable {
         Arc::clone(&self.accelerator)
     }
 
+    /// The schema this table presents to query planning.
+    ///
+    /// In caching mode the storage schema carries a hidden namespace column, so
+    /// what users see is not what the accelerator stores.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        if let Some(s) = self.user_facing_schema.as_ref() {
+            return Arc::clone(s);
+        }
+        self.accelerator.schema()
+    }
+
+    /// Presents this accelerated table as a layered [`SpiceTable`].
+    ///
+    /// The table beneath is this table's own accelerator, so the layer and its
+    /// `below` cannot disagree about which provider composition runs against.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let accelerator = Arc::clone(&self.accelerator);
+        SpiceTable::over(self, accelerator)
+    }
+
     #[must_use]
     pub fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
@@ -1494,63 +1532,52 @@ impl Drop for AcceleratedTable {
     }
 }
 
+impl AcceleratorSetup for Builder {
+    fn accelerator(&self) -> Arc<dyn TableProvider> {
+        self.get_accelerator()
+    }
+
+    fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        Builder::set_accelerator(self, accelerator);
+    }
+}
+
+impl RegisteredAcceleratedTable for AcceleratedTable {
+    fn refresh_requester(&self) -> Option<Arc<dyn RefreshRequester>> {
+        self.refresh_trigger()
+            .cloned()
+            .map(|trigger| Arc::new(RefreshTrigger { trigger }) as Arc<dyn RefreshRequester>)
+    }
+
+    fn attach_task(&mut self, task: JoinHandle<()>) {
+        self.handlers.push(task);
+    }
+}
+
+/// [`RefreshRequester`] over an accelerated table's refresh-trigger channel.
+///
+/// A request carries no overrides: the connector-side callers ask for the
+/// dataset's configured refresh, not a modified one.
+#[derive(Debug)]
+struct RefreshTrigger {
+    trigger: mpsc::Sender<Option<RefreshOverrides>>,
+}
+
 #[async_trait]
-impl TableProvider for AcceleratedTable {
-    fn constraints(&self) -> Option<&Constraints> {
-        self.accelerator.constraints()
+impl RefreshRequester for RefreshTrigger {
+    async fn request_refresh(&self) -> Result<(), RefreshRequestError> {
+        self.trigger.send(None).await.ok().context(TableGoneSnafu)
     }
+}
 
-    fn schema(&self) -> SchemaRef {
-        if let Some(s) = self.user_facing_schema.as_ref() {
-            return Arc::clone(s);
-        }
-        self.accelerator.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.accelerator.table_type()
-    }
-
-    fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        self.accelerator.statistics()
-    }
-
-    fn supports_filters_pushdown(
+impl AcceleratedTable {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
         &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // In caching mode, we handle filters ourselves (not pushed to accelerator)
-        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
-        if self.refresh_mode == RefreshMode::Caching {
-            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
-        }
-
-        match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => {
-                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
-                let function_support = deny_spice_specific_functions();
-                for (i, filter) in filters.iter().enumerate() {
-                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
-                        && !function_support.supports(filter)
-                    {
-                        results[i] = TableProviderFilterPushDown::Unsupported;
-                    }
-                }
-                Ok(results)
-            }
-            ZeroResultsAction::UseSource => {
-                // In UseSource mode, all filters must still flow into scan() so that
-                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
-                // its internal filter_plan to evaluate those predicates before making a
-                // correct fallback decision. Unsupported-function filters are therefore kept
-                // out of accelerator SQL pushdown, but still participate in the fallback check.
-                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-            }
-        }
-    }
-
-    async fn scan(
-        &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
@@ -1813,9 +1840,111 @@ impl TableProvider for AcceleratedTable {
 
         Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
     }
+}
+
+#[async_trait]
+impl TableLayer for AcceleratedTable {
+    /// A rebuild must not push a transform beneath this layer: it owns its
+    /// children and routes writes to one of them, so a transform landing
+    /// underneath would sit where a write walk stops — the CDC write path would
+    /// no longer find the accelerator it targets. Keeping the fold above it also
+    /// means `below` is never replaced, so the child held here and the table
+    /// handed to this layer cannot diverge.
+    fn rebuild_descends(&self) -> bool {
+        false
+    }
+
+    /// An accelerated table owns two tables, and the walk says which one is
+    /// meant: read-side questions are about where the data came from, write-side
+    /// questions about where it is stored. Answering here is what keeps callers
+    /// from having to name this type or know it has two sides.
+    ///
+    /// The federated side may not be resolved yet; `None` stops the walk here
+    /// rather than letting it fall through to the accelerator and report the
+    /// source as something it is not.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read | LayerWalk::Source | LayerWalk::CdcDetection => {
+                self.federated.try_table_provider_sync_ref()
+            }
+            LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => {
+                Some(&self.accelerator)
+            }
+        }
+    }
+
+    /// Index discovery is the one walk both sides can answer, so it gets both.
+    ///
+    /// An external vector or full-text index (S3 Vectors, Elasticsearch) attaches
+    /// to the *source* side, because the embedding connector wraps the source
+    /// connector; the `DuckDB` vector engine attaches to the *accelerator*. A walk
+    /// that saw only the side `route` names would report "no index" for a dataset
+    /// that has one. Every other walk means exactly one of the two tables, so it
+    /// has no second side.
+    fn route_secondary<'a>(
+        &'a self,
+        walk: LayerWalk,
+        _below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: see `route`.
+        match walk {
+            LayerWalk::Index => self.federated.try_table_provider_sync_ref(),
+            LayerWalk::Read
+            | LayerWalk::Source
+            | LayerWalk::CdcDetection
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete => None,
+        }
+    }
+
+    fn schema(&self, _below: &Arc<dyn TableProvider>) -> SchemaRef {
+        AcceleratedTable::schema(self)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        _below: &Arc<dyn TableProvider>,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // In caching mode, we handle filters ourselves (not pushed to accelerator)
+        // Return Inexact to indicate we'll use the filters but they shouldn't be optimized away
+        if self.refresh_mode == RefreshMode::Caching {
+            return Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]);
+        }
+
+        match self.zero_results_action {
+            ZeroResultsAction::ReturnEmpty => {
+                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
+                let function_support = deny_spice_specific_functions();
+                for (i, filter) in filters.iter().enumerate() {
+                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
+                        && !function_support.supports(filter)
+                    {
+                        results[i] = TableProviderFilterPushDown::Unsupported;
+                    }
+                }
+                Ok(results)
+            }
+            ZeroResultsAction::UseSource => {
+                // In UseSource mode, all filters must still flow into scan() so that
+                // FallbackOnZeroResultsScanExec receives the full predicate set and can use
+                // its internal filter_plan to evaluate those predicates before making a
+                // correct fallback decision. Unsupported-function filters are therefore kept
+                // out of accelerator SQL pushdown, but still participate in the fallback check.
+                Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+            }
+        }
+    }
 
     async fn insert_into(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         overwrite: InsertOp,
@@ -1881,6 +2010,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn delete_from(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -1925,6 +2055,7 @@ impl TableProvider for AcceleratedTable {
 
     async fn update(
         &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
@@ -1972,37 +2103,11 @@ impl TableProvider for AcceleratedTable {
         }
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.accelerator.get_table_definition()
-    }
-
-    fn get_logical_plan(
+    async fn truncate(
         &self,
-    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
-        self.accelerator.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.accelerator.get_column_default(column)
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
-        args: datafusion::catalog::ScanArgs<'a>,
-    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
-        let plan = self
-            .scan(
-                state,
-                args.projection().map(<[usize]>::to_vec).as_ref(),
-                args.filters().unwrap_or(&[]),
-                args.limit(),
-            )
-            .await?;
-        Ok(plan.into())
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if self.refresh_mode == RefreshMode::Snapshot {
             return Err(datafusion::error::DataFusionError::Execution(format!(
                 "truncate on accelerated table {} is not permitted when refresh_mode is 'snapshot'; the accelerator is driven exclusively from the snapshot store",
@@ -2025,6 +2130,25 @@ impl TableProvider for AcceleratedTable {
                 ))
             }
         }
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        below: &Arc<dyn TableProvider>,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        let projection = args.projection().map(<[usize]>::to_vec);
+        let plan = self
+            .scan_plan(
+                below,
+                state,
+                projection.as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
     }
 }
 

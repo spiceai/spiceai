@@ -36,7 +36,7 @@ use crate::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::initiate_config_with_credentials,
@@ -130,7 +130,7 @@ impl IcebergDataConnector {
     /// identity, used to build read, read-write, and distributed providers.
     async fn create_iceberg_table_parts(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
 
@@ -272,7 +272,7 @@ impl IcebergDataConnector {
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         source: &str,
         metadata_mode: MetadataMode,
     ) -> super::DataConnectorResult<IcebergTableParts> {
@@ -355,22 +355,24 @@ impl DataConnector for IcebergDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let parts = self.create_iceberg_table_parts(dataset).await?;
 
         // Wrap so the scan can be serialized for distributed (Ballista) execution.
         // In a single-node session this is a transparent pass-through.
+        let inner = parts.provider;
         Ok(Arc::new(IcebergClusterTableProvider::new(
             dataset.name.clone(),
-            parts.provider,
-        )))
+            Arc::clone(&inner),
+        ))
+        .into_table() as Arc<dyn TableProvider>)
     }
 
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Create the table parts which include catalog + identity for delete support
         let parts = match self.create_iceberg_table_parts(dataset).await {
@@ -378,19 +380,22 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support.
+        // Stack a deletion layer for DELETE FROM support.
+        let base = parts.provider;
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.table_identifier.namespace().clone(),
             parts.table_identifier.name().to_string(),
-            parts.provider,
+            Arc::clone(&base),
         );
+        let deletable = spice_table::SpiceTable::over(Arc::new(deletion_provider), base);
 
-        // Then wrap so the scan can be serialized for distributed execution.
+        // Then a cluster layer, so the scan can be serialized for distributed execution.
         Some(Ok(Arc::new(IcebergClusterTableProvider::new(
             dataset.name.clone(),
-            Arc::new(deletion_provider),
-        ))))
+            deletable as Arc<dyn TableProvider>,
+        ))
+        .into_table() as Arc<dyn TableProvider>))
     }
 }
 

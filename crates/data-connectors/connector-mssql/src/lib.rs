@@ -29,12 +29,12 @@ use data_components::mssql::{
     self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
 use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
 use std::future::Future;
@@ -260,7 +260,7 @@ impl DataConnector for SqlServer {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = SqlServerTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
             .await

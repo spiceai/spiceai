@@ -107,9 +107,9 @@ async fn create_refresh_task(
         .await
         .map_err(|e| e.to_string())?;
 
-    let accelerated_table = table
-        .downcast_ref::<AcceleratedTable>()
-        .ok_or("table is not an AcceleratedTable")?;
+    let accelerated_table =
+        spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read)
+            .ok_or("table is not an AcceleratedTable")?;
 
     Ok((
         RefreshTask::builder(
@@ -134,9 +134,9 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
         .await
         .map_err(|e| e.to_string())?;
 
-    let accelerated_table = table
-        .downcast_ref::<AcceleratedTable>()
-        .ok_or("table is not an AcceleratedTable")?;
+    let accelerated_table =
+        spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read)
+            .ok_or("table is not an AcceleratedTable")?;
 
     Ok(Arc::clone(&accelerated_table.get_accelerator()))
 }

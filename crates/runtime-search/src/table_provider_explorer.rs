@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 
 /// Handles finding specific [`TableProvider`] and [`Index`] for a given [`TableProvider`].
 ///

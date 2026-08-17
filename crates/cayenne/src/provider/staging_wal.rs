@@ -1295,7 +1295,7 @@ impl CayenneTableProvider {
         // cross-partition append. Refuse before cloning or consuming input until
         // those states are included in the coordinated transaction.
         let current_snapshot_id = self.get_current_snapshot_id();
-        let target_snapshot_id = Self::new_staging_snapshot_id();
+        let (_, target_snapshot_id) = Self::new_staging_snapshot_id_pair();
         let mut setup_cleanup = DeferredSetupCleanup {
             table: self.clone_for_write_operations(),
             snapshots: vec![target_snapshot_id.clone()],

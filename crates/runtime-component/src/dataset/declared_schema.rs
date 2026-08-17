@@ -41,7 +41,11 @@ pub enum DeclaredSchemaError {
     InvalidColumnType {
         dataset: String,
         column: String,
-        source: ParseTypeError,
+        // Boxed to keep `Result<_, DeclaredSchemaError>` — and the
+        // `dataset::Error` that wraps it — small enough for
+        // `clippy::result_large_err`.
+        #[snafu(source(from(ParseTypeError, Box::new)))]
+        source: Box<ParseTypeError>,
     },
 }
 

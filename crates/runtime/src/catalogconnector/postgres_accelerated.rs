@@ -91,15 +91,12 @@ use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use parking_lot::RwLock;
 use snafu::prelude::*;
-use spicepod::acceleration::{
-    Acceleration as SpicepodAcceleration, Mode as SpicepodMode, OnConflictBehavior,
-    RefreshMode as SpicepodRefreshMode,
-};
+use spicepod::acceleration::{Acceleration as SpicepodAcceleration, OnConflictBehavior};
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
 
 use crate::Runtime;
-use crate::component::catalog::{Catalog, table_selector};
+use crate::component::catalog::{Catalog, CatalogAcceleration, table_selector};
 use crate::component::dataset::builder::DatasetBuilder;
 
 /// Dataset param key carrying an explicit replication slot name (see
@@ -109,10 +106,6 @@ use crate::component::dataset::builder::DatasetBuilder;
 /// and one publication instead of each opening its own -- this is the
 /// catalog's single shared slot.
 const REPLICATION_SLOT_PARAM: &str = "pg_replication_slot";
-
-/// Accelerator engine name written onto every synthesized per-table dataset.
-/// Matches `CatalogAccelerationEngine`'s only variant.
-const CAYENNE_ENGINE: &str = "cayenne";
 
 /// Docs link appended to every user-facing warning and error this module emits
 /// (the skip warning, the REPLICA IDENTITY FULL warning, the view "not
@@ -457,14 +450,13 @@ pub struct AcceleratedCatalogProvider {
     /// this catalog, so WAL is decoded once by one shared connection rather
     /// than once per table.
     slot_name: String,
-    /// Storage mode written onto every synthesized dataset's acceleration block
-    /// (the catalog's `acceleration.mode`). `Memory` -- the default -- is fully
-    /// in-RAM, so every table re-snapshots from the source on each restart; a
-    /// file mode persists and resumes from the shared slot instead.
-    acceleration_mode: SpicepodMode,
-    /// Accelerator params written onto every synthesized dataset's acceleration
-    /// block (the catalog's `acceleration.params`, e.g. `cayenne_file_path`).
-    acceleration_params: HashMap<String, String>,
+    /// The acceleration block written onto every synthesized dataset, before the
+    /// per-table `primary_key`/`on_conflict` are filled in
+    /// (`CatalogAcceleration::to_dataset_acceleration`). Its `mode` -- the
+    /// catalog's -- decides persistence: `Memory`, the default, is fully in-RAM,
+    /// so every table re-snapshots from the source on each restart, while a file
+    /// mode persists and resumes from the shared slot instead.
+    table_acceleration: SpicepodAcceleration,
     selector: TableSelector,
     schemas: RwLock<HashMap<String, Arc<AcceleratedSchemaProvider>>>,
     /// `(schema_name, table_name)` -> the dataset name it was already
@@ -492,7 +484,11 @@ impl std::fmt::Debug for AcceleratedCatalogProvider {
 
 impl AcceleratedCatalogProvider {
     #[must_use]
-    pub fn new(catalog: &Catalog, pool: Arc<PostgresConnectionPool>) -> Self {
+    pub fn new(
+        catalog: &Catalog,
+        acceleration: &CatalogAcceleration,
+        pool: Arc<PostgresConnectionPool>,
+    ) -> Self {
         let slot_name = catalog_slot_name(&catalog.name);
 
         // Seed from the catalog's connection params, then let `dataset_params`
@@ -502,13 +498,8 @@ impl AcceleratedCatalogProvider {
         let mut dataset_params = catalog.params.clone();
         dataset_params.extend(catalog.dataset_params.clone());
 
-        // Absent only on a path that never accelerates (the connector builds this
-        // provider solely when `acceleration` is set); defaulting keeps `new`
-        // total rather than making callers unwrap.
-        let (acceleration_mode, acceleration_params) = catalog.acceleration.as_ref().map_or_else(
-            || (SpicepodMode::default(), HashMap::new()),
-            |acceleration| (acceleration.mode.into(), acceleration.params.clone()),
-        );
+        let table_acceleration = acceleration.to_dataset_acceleration();
+        let acceleration_mode = &table_acceleration.mode;
 
         // `mode: memory` (the default) and `mode: file_create` both start empty
         // on every boot. That is a supported configuration, not an error -- but
@@ -522,11 +513,7 @@ impl AcceleratedCatalogProvider {
         // `cayenne_cdc_durability` only defers the durable write of a file-backed
         // one. Choosing `mode: memory` for the throughput of the second is the
         // most likely way to arrive here by accident.
-        if catalog
-            .acceleration
-            .as_ref()
-            .is_some_and(|acceleration| !acceleration.is_durable())
-        {
+        if !acceleration.is_durable() {
             tracing::warn!(
                 "Catalog '{}': acceleration `mode: {acceleration_mode}` does not persist across restarts -- nothing is written to disk, so the acceleration starts empty and every table re-runs its initial snapshot from the source on every start. Set `acceleration.mode: file` with `acceleration.params.cayenne_file_path` to keep the acceleration across restarts and resume from the replication slot instead. If the goal was to keep CDC writes off the disk hot path rather than to discard them, use a file mode with `acceleration.params.cayenne_cdc_durability: memory`, which buffers in RAM but still drains to durable storage. Docs: {DOCS_URL}",
                 catalog.name,
@@ -540,8 +527,7 @@ impl AcceleratedCatalogProvider {
             app: catalog.app(),
             dataset_params,
             slot_name,
-            acceleration_mode,
-            acceleration_params,
+            table_acceleration,
             selector: table_selector(catalog),
             schemas: RwLock::new(HashMap::new()),
             spawned: RwLock::new(HashMap::new()),
@@ -711,19 +697,14 @@ impl AcceleratedCatalogProvider {
         // `connector-postgres`'s CDC path requires -- otherwise UPDATE events
         // append duplicate rows). Inference still fills sort/secondary-indexes.
         let key_ref = column_reference_string(key);
+        // The catalog's engine, storage mode and accelerator params apply uniformly
+        // to every table it accelerates; only the key is per-table. Under a file
+        // mode each table lands in its own directory beneath `cayenne_file_path`,
+        // named for the dataset (see `synthesized_dataset_name`).
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
-            engine: Some(CAYENNE_ENGINE.to_string()),
-            refresh_mode: Some(SpicepodRefreshMode::Changes),
-            // The catalog's storage mode and accelerator params apply uniformly
-            // to every table it accelerates. Under a file mode each table lands
-            // in its own directory beneath `cayenne_file_path`, named for the
-            // dataset (see `synthesized_dataset_name`).
-            mode: self.acceleration_mode.clone(),
-            params: (!self.acceleration_params.is_empty())
-                .then(|| Params::from_string_map(self.acceleration_params.clone())),
             primary_key: Some(key_ref.clone()),
             on_conflict: HashMap::from([(key_ref, OnConflictBehavior::Upsert)]),
-            ..SpicepodAcceleration::default()
+            ..self.table_acceleration.clone()
         });
 
         let dataset = DatasetBuilder::try_from(spicepod_ds)?

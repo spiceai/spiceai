@@ -122,7 +122,18 @@ macro_rules! generate_cache_metrics {
             pub static EVICTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
                 METER
                     .u64_counter(concat!($prefix, "_cache_evictions"))
-                    .with_description("Number of cache evictions.")
+                    .with_description(
+                        "Number of entries evicted because they expired or the cache was over capacity. Entries dropped by table invalidation are counted by the invalidations metric instead.",
+                    )
+                    .build()
+            });
+
+            pub static STALE_REJECTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_stale_rejections"))
+                    .with_description(
+                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. These are also counted as misses.",
+                    )
                     .build()
             });
 
@@ -167,6 +178,7 @@ macro_rules! generate_cache_metrics {
                 REQUESTS.add(0, &[]);
                 HITS.add(0, &[]);
                 MISSES.add(0, &[]);
+                STALE_REJECTIONS.add(0, &[]);
                 STALE_WHILE_REVALIDATE_SKIPPED.add(0, &[]);
                 STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(0, &[]);
                 for reason in EvictionReason::ALL {
@@ -189,6 +201,7 @@ pub trait CacheMetrics: Send + Sync {
         Self::record_item_count(0);
         Self::record_size(0);
         Self::record_max_size(0);
+        Self::update_hit_ratio(0, 0);
         Self::publish_counters_at_zero();
     }
 
@@ -211,6 +224,11 @@ pub trait CacheMetrics: Send + Sync {
     where
         Self: Sized;
     fn record_eviction(reason: EvictionReason)
+    where
+        Self: Sized;
+    /// Records a lookup that found an entry but could not serve it because a
+    /// table it read had since been invalidated.
+    fn record_stale_rejection()
     where
         Self: Sized;
     fn update_hit_ratio(hits: u64, total: u64)
@@ -263,6 +281,10 @@ impl CacheMetrics for CachedSearchResult {
         search_results::EVICTIONS.add(1, &[reason.key_value()]);
     }
 
+    fn record_stale_rejection() {
+        search_results::STALE_REJECTIONS.add(1, &[]);
+    }
+
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         search_results::HIT_RATIO.record(ratio, &[]);
@@ -302,6 +324,10 @@ impl CacheMetrics for CachedQueryResult {
         sql_results::EVICTIONS.add(1, &[reason.key_value()]);
     }
 
+    fn record_stale_rejection() {
+        sql_results::STALE_REJECTIONS.add(1, &[]);
+    }
+
     fn update_hit_ratio(hits: u64, total: u64) {
         let ratio = calculate_hit_ratio(hits, total);
         sql_results::HIT_RATIO.record(ratio, &[]);
@@ -339,6 +365,10 @@ impl CacheMetrics for CachedEmbeddingResult {
 
     fn record_eviction(reason: EvictionReason) {
         embeddings::EVICTIONS.add(1, &[reason.key_value()]);
+    }
+
+    fn record_stale_rejection() {
+        embeddings::STALE_REJECTIONS.add(1, &[]);
     }
 
     fn update_hit_ratio(hits: u64, total: u64) {

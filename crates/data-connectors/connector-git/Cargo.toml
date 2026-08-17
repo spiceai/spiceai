@@ -17,10 +17,12 @@ globset.workspace = true
 linkme.workspace = true
 opentelemetry.workspace = true
 regex.workspace = true
+runtime-parameters = { path = "../../runtime-parameters" }
 tempfile.workspace = true
 url.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
 secrecy.workspace = true

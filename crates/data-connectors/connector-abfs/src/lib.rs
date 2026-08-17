@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::Runtime;
-use runtime::component::dataset::Dataset;
+use app::App;
 use runtime::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
@@ -28,8 +27,10 @@ use runtime::dataconnector::parameters::{
 };
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -96,7 +97,7 @@ pub enum Error {
 
 pub struct AzureBlobFS {
     params: Parameters,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
     tokio_io_runtime: Handle,
 }
 
@@ -234,10 +235,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 validator.validate(&mut params).await?;
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = params.app();
             let azure = AzureBlobFS {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(azure) as Arc<dyn DataConnector>)
@@ -282,7 +283,7 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -332,13 +333,13 @@ impl ListingTableConnector for AzureBlobFS {
         Ok(azure_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
@@ -437,6 +438,7 @@ mod tests {
     use app::AppBuilder;
     use object_store::client::{HttpError, HttpErrorKind};
     use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime_secrets::Secrets;
     use tokio::sync::RwLock;
@@ -444,7 +446,7 @@ mod tests {
     fn create_test_connector(params: Parameters) -> AzureBlobFS {
         AzureBlobFS {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: Handle::current(),
         }
     }

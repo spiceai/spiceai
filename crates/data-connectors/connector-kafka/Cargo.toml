@@ -9,8 +9,10 @@ description = "Apache Kafka data connector for Spice.ai runtime"
 [dependencies]
 linkme.workspace = true
 arrow-schema.workspace = true
+arrow_tools = { path = "../../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["kafka"] }
 dataformat-json = { path = "../../dataformat-json" }
 datafusion.workspace = true
@@ -18,8 +20,12 @@ fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime", features = ["kafka"] }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
+runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

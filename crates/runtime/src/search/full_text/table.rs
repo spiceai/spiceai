@@ -15,9 +15,9 @@ limitations under the License.
 */
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use runtime_datafusion_index::{Index, IndexedTableProvider};
 use snafu::ResultExt;
-use spicepod::semantic::{Column, IndexStore, MetadataType};
+use spice_table::{Index, IndexLayer, SpiceTable};
+use spicepod::semantic::{Column, IndexStore};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -88,11 +88,24 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields = columns
             .iter()
             .filter_map(|c| {
-                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
-                    Some(c.name.clone())
-                } else {
-                    None
+                // Both metadata kinds are only about vector-search's own metadata filter;
+                // either one still means the column should be projectable and, per its
+                // tantivy type, filterable through the FTS index too.
+                c.as_vector_metadata()?;
+                let (_, field) = schema.column_with_name(&c.name)?;
+                if !FullTextDatabaseIndex::is_field_type_supported(field.data_type()) {
+                    // e.g. `Date32`/`Date64`/`Timestamp`: a valid `Filterable` metadata type for
+                    // other index backends (Elasticsearch), but not yet representable in the
+                    // local FTS schema. Skip it here rather than fail index construction.
+                    tracing::warn!(
+                        "Column {} on table {} has vector-search metadata but its type ({}) is not supported by the full text search index; it will not be filterable there",
+                        c.name,
+                        tbl,
+                        field.data_type()
+                    );
+                    return None;
                 }
+                Some(c.name.clone())
             })
             .collect::<Vec<_>>();
         derived_store_fields.as_slice()
@@ -108,19 +121,28 @@ pub(crate) fn build_full_text_database_index(
     .boxed()
 }
 
-/// Registers `index` on `inner_table_provider`, reusing the existing [`IndexedTableProvider`]
-/// chain when one is already present so multiple indexes compose onto a single provider.
+/// Registers `index` on `inner_table_provider`, reusing an index layer already at
+/// the top of the stack so several indexes compose onto one layer rather than
+/// stacking a layer apiece.
 fn register_index(
     inner_table_provider: &Arc<dyn TableProvider>,
     index: Arc<dyn Index + Send + Sync>,
-) -> IndexedTableProvider {
-    let provider =
-        if let Some(idx_tbl) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
-            idx_tbl.clone()
-        } else {
-            IndexedTableProvider::new(Arc::clone(inner_table_provider))
-        };
-    provider.add_index(index)
+) -> Arc<SpiceTable> {
+    if let Some(table) = inner_table_provider.downcast_ref::<SpiceTable>()
+        && !table.indexes().is_empty()
+    {
+        let mut indexes = table.indexes().to_vec();
+        indexes.push(index);
+        return SpiceTable::over(
+            Arc::new(IndexLayer::with_indexes(indexes)),
+            Arc::clone(table.below()),
+        );
+    }
+
+    SpiceTable::over(
+        Arc::new(IndexLayer::with_indexes(vec![index])),
+        Arc::clone(inner_table_provider),
+    )
 }
 
 /// Adds a [`FullTextDatabaseIndex`] to a [`TableProvider`].
@@ -130,7 +152,7 @@ pub(crate) fn add_full_text_search_to_table(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
     Ok(register_index(
@@ -146,7 +168,7 @@ pub(crate) fn add_full_text_search_to_table(
 /// Elasticsearch model. At query time `call_with_es_indexes` in the UDTF dispatcher
 /// selects the requested column from `search_fields` on that shared instance.
 ///
-/// The index is registered via [`IndexedTableProvider::add_index`] so it is visible to the
+/// The index is registered via [`IndexLayer::add_index`] so it is visible to the
 /// query optimizer and can be discovered by `find_index_in_table_provider` for `text_search()`
 /// queries. For the accelerator-side path, indexes are automatically discovered from the
 /// federated provider chain — no manual registration is needed.
@@ -156,7 +178,7 @@ pub(crate) async fn add_elasticsearch_fts_to_table(
     columns: &[spicepod::semantic::Column],
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     let index =
         build_elasticsearch_text_index(Arc::clone(&inner_table_provider), columns, tbl, fts_params)
             .await?;
@@ -191,7 +213,7 @@ pub(crate) async fn add_compound_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
     use search::index::compound::{CompoundReadMode, CompoundSearchIndex};
@@ -269,7 +291,7 @@ pub(crate) async fn add_compound_fts_to_table(
 /// Builds (but does not register) an [`ElasticsearchTextIndex`] for all FTS-enabled columns.
 ///
 /// The returned index is added to the federated provider chain via
-/// [`IndexedTableProvider::add_index`] in [`add_elasticsearch_fts_to_table`]. On the
+/// [`IndexLayer::add_index`] in [`add_elasticsearch_fts_to_table`]. On the
 /// accelerator write path, indexes are automatically discovered from the federated provider
 /// chain by [`RefreshTaskBuilder::build`] — no manual `sink_index` plumbing is needed.
 #[cfg(feature = "elasticsearch")]

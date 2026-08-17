@@ -23,6 +23,8 @@ use data_components::cdc::{
     ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
     build_ready_signal_envelope, wrap_data_as_change_batch,
 };
+use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use datafusion::{
     arrow::datatypes::SchemaRef, datasource::TableProvider,
     physical_plan::SendableRecordBatchStream, prelude::SessionContext,
@@ -36,18 +38,12 @@ use mongodb::{
     options::FullDocumentType,
 };
 use runtime::{
-    component::dataset::{
-        Dataset,
-        acceleration::{Acceleration, Engine, OnConflictBehavior},
-    },
-    dataaccelerator::spice_sys::{
-        OpenOption,
-        mongodb::{MongoCheckpointMetadata, MongoSys},
-    },
-    dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection},
-    federated::FederatedTable,
-    parameters::{ExposedParamLookup, Parameters},
+    component::dataset::acceleration::{Acceleration, Engine, OnConflictBehavior},
+    dataconnector::parameters::ConnectorContext,
 };
+use runtime_checkpoint_api::mongodb::{MongoCheckpointMetadata, MongoCheckpointStore};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt as TokioStreamExt;
 
@@ -59,8 +55,9 @@ const DEFAULT_CHANGE_STREAM_MAX_AWAIT_TIME: Duration = Duration::from_secs(1);
 pub fn build_changes_stream(
     pool: Arc<MongoDBConnectionPool>,
     params: Parameters,
-    dataset: Dataset,
-    federated_table: Arc<FederatedTable>,
+    dataset: DatasetSpec,
+    context: Option<Arc<dyn ConnectorContext>>,
+    federated_table: Arc<dyn FederatedTableProvider>,
 ) -> ChangesStream {
     // `try_stream!` keeps MongoDB cursor polling, snapshot reads, and commit-aware
     // CDC yields in one backpressured stream; a spawned channel would risk buffering
@@ -94,7 +91,7 @@ pub fn build_changes_stream(
             .collection::<Document>(&collection_name);
 
         let mongo_sys = if dataset.is_file_accelerated() {
-            initialize_mongo_sys(&dataset).await
+            initialize_mongo_sys(context.as_ref(), &dataset).await
         } else {
             tracing::info!(
                 dataset = %dataset.name,
@@ -103,6 +100,10 @@ pub fn build_changes_stream(
             );
             None
         };
+
+        // See the note in the MySQL connector: the store is what the stream needs, and
+        // the context has served its purpose once the store is resolved.
+        drop(context);
 
         let current_schema_json = serialize_current_schema(&schema, &dataset.name);
         let persisted =
@@ -215,7 +216,7 @@ pub fn build_changes_stream(
                 )))?;
             let ready = build_ready_signal_envelope(&schema)
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
-            let (_, batch, is_ready) = ready.into_parts()
+            let (_, batch, is_ready, _) = ready.into_parts()
                 .map_err(|error| StreamError::Arrow(error.to_string()))?;
             let committer: Box<dyn CommitChange + Send + Sync> = match mongo_sys.as_ref() {
                 Some(sys) => Box::new(MongoResumeTokenCommitter::new(
@@ -226,7 +227,9 @@ pub fn build_changes_stream(
                 )),
                 None => Box::new(NoOpCommitter),
             };
-            yield ChangeEnvelope::from_parts(committer, batch, is_ready);
+            // Not a history-unavailable signal: this is the readiness envelope
+            // re-wrapped with the resume-token committer.
+            yield ChangeEnvelope::from_parts(committer, batch, is_ready, false);
 
             tracing::info!(
                 dataset = %dataset.name,
@@ -290,9 +293,14 @@ pub fn build_changes_stream(
     })
 }
 
-async fn initialize_mongo_sys(dataset: &Dataset) -> Option<Arc<MongoSys>> {
-    match MongoSys::try_new(dataset, OpenOption::CreateIfNotExists).await {
-        Ok(sys) => Some(Arc::new(sys)),
+async fn initialize_mongo_sys(
+    context: Option<&Arc<dyn ConnectorContext>>,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn MongoCheckpointStore>> {
+    // No context means no runtime is attached, which only happens in unit tests.
+    let context = context?;
+    match context.mongo_checkpoint_store(dataset).await {
+        Ok(sys) => Some(sys),
         Err(error) => {
             tracing::error!(
                 dataset = %dataset.name,
@@ -305,8 +313,8 @@ async fn initialize_mongo_sys(dataset: &Dataset) -> Option<Arc<MongoSys>> {
 }
 
 async fn persisted_checkpoint(
-    mongo_sys: Option<&MongoSys>,
-    dataset: &Dataset,
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
     current_schema_json: Option<&str>,
 ) -> Option<MongoCheckpointMetadata> {
     let sys = mongo_sys?;
@@ -329,7 +337,10 @@ async fn persisted_checkpoint(
     Some(metadata)
 }
 
-async fn clear_persisted_token(mongo_sys: Option<&MongoSys>, dataset: &Dataset) {
+async fn clear_persisted_token(
+    mongo_sys: Option<&dyn MongoCheckpointStore>,
+    dataset: &DatasetSpec,
+) {
     if let Some(sys) = mongo_sys
         && let Err(error) = sys.delete().await
     {
@@ -345,7 +356,7 @@ fn serialize_current_schema(
     schema: &SchemaRef,
     dataset_name: &datafusion::sql::TableReference,
 ) -> Option<String> {
-    match MongoSys::serialize_schema(schema) {
+    match arrow_tools::schema::schema_to_json(schema) {
         Ok(json) => Some(json),
         Err(error) => {
             tracing::warn!(
@@ -378,7 +389,7 @@ fn resume_token_error_code(error: &mongodb::error::Error) -> Option<i32> {
 }
 
 fn build_batch_committer(
-    mongo_sys: Option<&Arc<MongoSys>>,
+    mongo_sys: Option<&Arc<dyn MongoCheckpointStore>>,
     tail_token: Option<ResumeToken>,
     tail_cluster_time: Option<i64>,
     schema_json: Option<&str>,
@@ -441,7 +452,7 @@ impl ResumeTokenInvalidBehavior {
 }
 
 pub(crate) struct MongoResumeTokenCommitter {
-    mongo_sys: Arc<MongoSys>,
+    mongo_sys: Arc<dyn MongoCheckpointStore>,
     resume_token_json: String,
     cluster_time_ts: Option<i64>,
     schema_json: Option<String>,
@@ -449,7 +460,7 @@ pub(crate) struct MongoResumeTokenCommitter {
 
 impl MongoResumeTokenCommitter {
     fn new(
-        mongo_sys: Arc<MongoSys>,
+        mongo_sys: Arc<dyn MongoCheckpointStore>,
         resume_token_json: String,
         cluster_time_ts: Option<i64>,
         schema_json: Option<String>,
@@ -538,7 +549,7 @@ async fn snapshot_stream(
 
 fn collect_change_events(
     batch: Vec<mongodb::error::Result<ChangeStreamEvent<Document>>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Result<Vec<ChangeStreamEvent<Document>>, data_components::cdc::StreamError> {
     batch
         .into_iter()

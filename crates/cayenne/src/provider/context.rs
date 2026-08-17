@@ -55,6 +55,20 @@ pub struct CayenneContext {
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
     upload_semaphore: Arc<Semaphore>,
+    /// Bounds concurrent inline-admission attempts on the OVERWRITE path across
+    /// every table sharing this context — i.e. across the partition children of a
+    /// partitioned dataset, whose overwrites all run at once under one
+    /// coordinator. Exactly one slot, so the host-memory the runtime reserves for
+    /// a single buffered admission (`inline_max_buffer_bytes`) plus its
+    /// serialized blob (`inline_max_bytes`) per acceleration is TRUE rather than
+    /// merely bigger.
+    ///
+    /// Acquired with `try_acquire`, never awaited: partition children are coupled
+    /// writers fed by one routing demux, so parking here would stall the router
+    /// and starve the slot-holding sibling of input — the hold-and-wait deadlock
+    /// of spiceai/spiceai#11818. A child that cannot take the slot writes Vortex
+    /// files instead, which is what every overwrite did before inlining existed.
+    overwrite_inline_admission: Arc<Semaphore>,
     /// Shared `RuntimeEnv` from the main Spice runtime.
     ///
     /// Cayenne uses this `RuntimeEnv` for all internal `SessionContext`
@@ -153,7 +167,7 @@ impl CayenneContext {
     /// is configured once by the owning runtime before table providers are created.
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
-        let vortex_format = Self::create_vortex_format(config, dataset);
+        let vortex_format = Self::create_vortex_format(config);
         // Seed the live actuators from the static config so every hot-path accessor
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
@@ -292,6 +306,7 @@ impl CayenneContext {
             dataset: dataset.to_string(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
+            overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
@@ -360,9 +375,12 @@ impl CayenneContext {
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
         let session = VortexSession::default().set(strategy);
-        let format =
-            VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
-                .with_dataset_label(self.dataset.as_str());
+        let mut options = Self::vortex_table_options(&self.config);
+        // This format only writes files, so it has no use for a read-path cache.
+        // Clearing the size keeps it from building a private one when no
+        // process-wide segment cache is installed.
+        options.segment_cache_size_bytes = None;
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -387,12 +405,10 @@ impl CayenneContext {
         }
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
-        // Write-only format: it never scans, so drop the read-path segment cache
-        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
-        // promotion.
+        // Write-only format: it never scans, so drop the read-path cache size and
+        // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options)
-            .with_dataset_label(self.dataset.as_str());
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -753,6 +769,19 @@ impl CayenneContext {
         &self.upload_semaphore
     }
 
+    /// Claim the single inline-admission slot for an overwrite, or `None` when a
+    /// sibling table on this context already holds it. Never blocks — see
+    /// [`Self::overwrite_inline_admission`]. The permit is held until the
+    /// overwrite commits and publishes, because the buffered batches and the
+    /// serialized blob stay resident for that whole span.
+    pub(crate) fn try_acquire_overwrite_inline_admission(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.overwrite_inline_admission)
+            .try_acquire_owned()
+            .ok()
+    }
+
     /// Record one CDC write's measurements into the rolling ingest accounting.
     /// Always on (cheap: a few atomics + a short-held mutex per *batch*); feeds
     /// the dynamic controller and observability. The inter-batch arrival interval
@@ -882,9 +911,10 @@ impl CayenneContext {
         self.live_actuators.values()
     }
 
-    /// Whether closed-loop dynamic tuning is active for this table (an SLO goal is
-    /// set / `cayenne_tuning: adaptive`). Gates the per-tick query-admission reserve
-    /// report so it is a strict no-op for non-adaptive tables.
+    /// Whether closed-loop dynamic tuning is active for this table
+    /// (`cayenne_tuning: adaptive`; a `cayenne_goal_*` setpoint alone does not
+    /// enable it). Gates the per-tick query-admission reserve report so it is a
+    /// strict no-op for non-adaptive tables.
     #[must_use]
     pub(crate) fn dynamic_tuning_enabled(&self) -> bool {
         self.dynamic_tuning
@@ -1030,7 +1060,7 @@ impl CayenneContext {
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
-    fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
+    fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings. The session's write
         // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
         // default, optionally extended with the Zstd string scheme when
@@ -1046,10 +1076,13 @@ impl CayenneContext {
             vortex_session = vortex_session.set(full_strategy);
         }
 
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
-                .with_dataset_label(dataset),
-        )
+        // Cayenne opts into the shared cache: its data files carry a uuid7 write
+        // id beneath a uuid7 snapshot directory, so a path is written once and
+        // never reused, and retirement invalidates it explicitly.
+        Arc::new(VortexFormat::new_with_process_segment_cache(
+            vortex_session,
+            Self::vortex_table_options(config),
+        ))
     }
 
     /// Table options shared by the base format and any per-write format
@@ -1072,6 +1105,7 @@ impl CayenneContext {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
+            scan_concurrency: config.scan_concurrency,
             ..VortexTableOptions::default()
         }
     }

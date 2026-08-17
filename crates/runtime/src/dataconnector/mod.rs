@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::federated::FederatedTable;
-pub use crate::parameters::ParameterSpec;
-pub use crate::parameters::Parameters;
+// A second alias for the `runtime-parameters` types, kept crate-visible for the
+// same reason as the `parameters` alias itself: it would otherwise be a way for
+// a connector to name them without depending on the crate that owns them.
+pub(crate) use crate::parameters::ParameterSpec;
+pub(crate) use crate::parameters::Parameters;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use linkme::distributed_slice;
 pub use parameters::ConnectorParams;
@@ -40,7 +44,9 @@ use std::future::Future;
 use std::time::Duration;
 
 pub mod client_identity;
-pub mod http_rate_control;
+// Re-exports `data-http-rate-control`; crate-visible so a connector outside the
+// runtime depends on that crate directly instead of routing through here.
+pub(crate) mod http_rate_control;
 pub mod listing;
 
 /// Creates a default reqwest client with standard Spice settings.
@@ -174,7 +180,16 @@ pub mod iceberg_cluster;
 pub mod parameters;
 pub mod refresh_source;
 pub mod s3;
-pub mod schema_projection;
+// Re-exports `data-connector-api`'s projection parser; crate-visible so a
+// connector outside the runtime depends on that crate directly. Shadowing the
+// same-named module the `data_connector_api::*` glob below would otherwise
+// re-export is the point: it is what withdraws `runtime::dataconnector::
+// schema_projection` from the public API, and a glob cannot exclude a name.
+#[expect(
+    hidden_glob_reexports,
+    reason = "deliberately withdraws the path so connectors name `data-connector-api` directly"
+)]
+pub(crate) mod schema_projection;
 pub mod sink;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
@@ -336,7 +351,11 @@ pub trait DataConnectorFactory: Send + Sync {
     /// Default: `None`. Most connectors do not have an intrinsic
     /// configuration-only schema and instead rely on either source
     /// inference or the user-declared `columns:` fallback.
-    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
+    fn static_schema(
+        &self,
+        _params: &ConnectorParams,
+        _dataset: &DatasetSpec,
+    ) -> Option<SchemaRef> {
         None
     }
 }
@@ -353,12 +372,14 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         refresh_mode.unwrap_or(RefreshMode::Full)
     }
 
-    async fn read_provider(&self, dataset: &Dataset)
-    -> DataConnectorResult<Arc<dyn TableProvider>>;
+    async fn read_provider(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
@@ -369,8 +390,8 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     fn changes_stream(
         &self,
-        _federated_table: Arc<FederatedTable>,
-        _dataset: &Dataset,
+        _federated_table: Arc<dyn FederatedTableProvider>,
+        _dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         None
     }
@@ -379,7 +400,10 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn append_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        _federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         None
     }
 
@@ -412,7 +436,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     async fn metadata_provider(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
@@ -432,25 +456,24 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// using the dataset's already secret-expanded params.
     async fn register_object_stores(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
         _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         Ok(())
     }
 
     /// A hook called **before** the accelerated table is built, giving the
-    /// connector a chance to wrap or replace the accelerator provider on the
-    /// [`Builder`](crate::accelerated::Builder).
+    /// connector a chance to wrap or replace the accelerator's provider.
     ///
-    /// Any provider set here will be shared with the [`Refresher`] that is
-    /// created during [`Builder::build`]. Use this hook instead of
+    /// Any provider set here will be shared with the [`Refresher`] created when
+    /// the table is built. Use this hook instead of
     /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
     /// when the wrapped provider must be visible to the refresh pipeline
     /// (e.g. to recreate indexes after a data refresh).
     async fn on_accelerator_setup(
         &self,
-        _dataset: &Dataset,
-        _builder: &mut accelerated::Builder,
+        _dataset: &DatasetSpec,
+        _accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -463,8 +486,8 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _dataset: &DatasetSpec,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -486,7 +509,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     ///
     /// This method allows connectors to make initialization decisions based on the specific
     /// dataset configuration. The default implementation delegates to `initialization()`.
-    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, _dataset: &DatasetSpec) -> ComponentInitialization {
         self.initialization()
     }
 }
@@ -642,7 +665,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -721,7 +744,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
-                _dataset: &Dataset,
+                _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
             }
@@ -784,7 +807,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("capability-forwarding test never reads")
         }
@@ -828,10 +851,36 @@ mod tests {
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
+            std::sync::Weak::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),
             "EmbeddingConnector must forward the source's delivery capability"
+        );
+
+        let drasi = crate::drasi::connector::DrasiConnector::new(
+            Arc::clone(&inner),
+            crate::drasi::DeliveryMode::Acknowledged(Arc::new(
+                runtime_drasi::DrasiSink::try_new(runtime_drasi::DrasiSinkConfig {
+                    dataset: "test".to_string(),
+                    source_id: "test".to_string(),
+                    mapping: runtime_drasi::ElementMapping::new(
+                        "test".to_string(),
+                        vec!["test".to_string()],
+                    ),
+                    // Never connected to: building the sink only builds a client.
+                    transport: runtime_drasi::TransportConfig::Http {
+                        endpoint: url::Url::parse("http://127.0.0.1:1").expect("valid url"),
+                        request_timeout: Duration::from_secs(1),
+                    },
+                    on_delivery_error: runtime_drasi::OnDeliveryError::Block,
+                })
+                .expect("builds a sink"),
+            )),
+        );
+        assert!(
+            drasi.supports_durable_write_back_delivery(),
+            "DrasiConnector must forward the source's delivery capability"
         );
     }
 }

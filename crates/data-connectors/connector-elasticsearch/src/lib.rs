@@ -28,12 +28,12 @@ use data_components::elasticsearch::query_table::ElasticsearchQueryTable;
 use data_components::elasticsearch::schema::mapping_to_schema;
 use datafusion::datasource::TableProvider;
 use elasticsearch::{Client, Elasticsearch};
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -180,7 +180,7 @@ impl DataConnector for ElasticsearchConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let index_name = dataset.path().to_string();
 

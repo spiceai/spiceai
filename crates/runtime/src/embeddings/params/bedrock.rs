@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use llms::bedrock::embed::{cohere::CohereEmbeddingInputType, nova::NovaEmbeddingPurpose};
+use llms::bedrock::embed::{
+    cohere::{CohereEmbeddingInputType, CohereEmbeddingTruncate},
+    nova::{NovaEmbeddingPurpose, NovaTruncationMode},
+};
 use runtime_parameters::TypedParams;
 use secrecy::SecretString;
 use std::collections::HashMap;
 
+use super::Truncation;
+
 /// Parameters for `from: bedrock` embedding models.
-///
-/// `truncate_mode` stays a string here because it targets a different enum per
-/// model family (`CohereEmbeddingTruncate` vs `NovaTruncationMode`); it is
-/// parsed once the model id is known.
 #[derive(TypedParams)]
 #[params(prefix = "bedrock")]
 pub struct BedrockEmbeddingParams {
@@ -57,9 +58,12 @@ pub struct BedrockEmbeddingParams {
     /// Whether to normalize the embedding output.
     #[param(runtime)]
     pub normalize: Option<bool>,
-    /// Truncation mode for input text that exceeds the model's token limit.
+    /// Truncation mode for input text that exceeds the model's token limit:
+    /// `NONE` to reject it, `END` to discard the end of the input, or `START`
+    /// to discard the start of the input. Unset defaults to each model
+    /// family's own default (Cohere: `END`; Nova: `NONE`).
     #[param(runtime, alias = "truncate")]
-    pub truncate_mode: Option<String>,
+    pub truncate_mode: Option<Truncation>,
     /// The input type for Cohere embedding models.
     #[param(runtime)]
     pub input_type: Option<CohereEmbeddingInputType>,
@@ -105,5 +109,25 @@ impl BedrockEmbeddingParams {
         }
 
         params
+    }
+}
+
+impl From<Truncation> for CohereEmbeddingTruncate {
+    fn from(value: Truncation) -> Self {
+        match value {
+            Truncation::None => Self::None,
+            Truncation::End => Self::End,
+            Truncation::Start => Self::Start,
+        }
+    }
+}
+
+impl From<Truncation> for NovaTruncationMode {
+    fn from(value: Truncation) -> Self {
+        match value {
+            Truncation::None => Self::None,
+            Truncation::End => Self::End,
+            Truncation::Start => Self::Start,
+        }
     }
 }

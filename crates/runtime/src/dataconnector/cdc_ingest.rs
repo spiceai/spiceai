@@ -45,10 +45,10 @@ use snafu::prelude::*;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::component::dataset::{
-    Dataset,
+    DatasetSpec,
     acceleration::{Engine, RefreshMode},
 };
-use crate::federated::FederatedTable;
+use data_connector_api::federated::FederatedTableProvider;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -367,7 +367,7 @@ impl DataConnector for CdcIngest {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -433,8 +433,8 @@ impl DataConnector for CdcIngest {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        dataset: &DatasetSpec,
     ) -> Option<ChangesStream> {
         let dataset_name = dataset.name.to_string();
         Some(Box::pin(stream! {
