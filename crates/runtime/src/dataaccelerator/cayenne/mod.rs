@@ -5912,7 +5912,9 @@ mod tests {
             ..Default::default()
         });
 
-        CayenneAccelerator::get_vortex_config("dl_age", &dataset).await
+        CayenneAccelerator::get_vortex_config("dl_age", &dataset)
+            .await
+            .expect("the datalake params under test resolve to a valid config")
     }
 
     #[tokio::test]
