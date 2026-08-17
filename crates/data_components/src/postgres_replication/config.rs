@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use crate::cdc::AccelerationContents;
 use pgwire_replication::{CaCertificate, PgOutputFormat};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -96,6 +97,22 @@ pub struct ReplicationParams {
     /// also set via `pg_replication_initial_snapshot: always` — dropping that
     /// slot would be wrong.
     pub ephemeral_accelerator: bool,
+    /// What the dataset's accelerator held when this stream was built.
+    ///
+    /// Only [`AccelerationContents::Empty`] carries weight, and only over the
+    /// single question of whether a *missing* watermark is evidence of a gap: an
+    /// acceleration holding no rows cannot be hiding a row the source deleted
+    /// while it was away, which is the divergence a rebuild exists to repair.
+    /// Anything else — including a probe that could not answer — leaves the
+    /// rebuild in place.
+    ///
+    /// Even then it only applies when an initial snapshot is going to run, since
+    /// otherwise the rebuild is the only thing that would load the table at all.
+    ///
+    /// Per-dataset, so it is deliberately not part of the shared-slot params
+    /// compatibility check: two datasets legitimately share a slot while one is
+    /// empty and the other is populated.
+    pub acceleration: AccelerationContents,
     pub status_interval: Duration,
     /// How often an idle member's durably-recorded applied position is carried
     /// forward to what the slot has acknowledged on its behalf (see
@@ -854,6 +871,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
+            acceleration: AccelerationContents::Unknown,
             status_interval: Duration::from_secs(5),
             watermark_flush_interval: Duration::from_secs(30),
             ready_lag: Duration::from_secs(2),

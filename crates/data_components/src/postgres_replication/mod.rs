@@ -211,8 +211,9 @@ pub struct AppliedLsn {
 ///   an acknowledged change cannot be re-streamed even while its WAL is retained.
 /// * `absence_implies_gap` — whether a *missing* watermark is evidence of one.
 ///   True when the acceleration survives restarts (so it can hold rows this
-///   process did not load) and a position could have been recorded (so absence
-///   is informative rather than permanent).
+///   process did not load), a position could have been recorded (so absence is
+///   informative rather than permanent), and the acceleration is not known to be
+///   empty (see below).
 ///
 /// A watermark the slot cannot reach is a gap nothing can fill: the changes in
 /// between are gone from the source's log, so a row deleted there would never be
@@ -225,6 +226,20 @@ pub struct AppliedLsn {
 /// acceleration with no recorded position is rebuilt rather than assumed fresh:
 /// on a genuinely first load the rebuild reads the same rows the bootstrap would
 /// have, and on an upgraded one it repairs divergence that is already there.
+///
+/// What settles that question is the acceleration's *contents*, not its record.
+/// An acceleration observed to hold no rows has nothing that could be stale and
+/// no deletion it could be missing, so absence of a watermark tells against
+/// nothing and the load can proceed through the ordinary snapshot bootstrap.
+/// Only a positive observation of emptiness counts
+/// ([`crate::cdc::AccelerationContents::is_provably_empty`]); a probe that could
+/// not answer leaves the rebuild in place.
+///
+/// Emptiness alone is not enough, and callers must not pass it through on its
+/// own: it licenses skipping the rebuild only when a snapshot is actually going
+/// to run. If nothing else loads the table, the rebuild is the only thing that
+/// would, and skipping it resumes from the slot's position with every earlier
+/// row missing for good.
 #[must_use]
 pub fn needs_rebuild(
     position: &RecordedPosition,

@@ -33,6 +33,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_stream::stream;
+use data_components::cdc::AccelerationContents;
 use data_components::poly::PolyTableProvider;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
@@ -2665,6 +2666,60 @@ fn accelerator_df(
     Ok(DataFrame::new(ctx.state(), logical_plan))
 }
 
+/// Observe whether the acceleration currently holds any rows.
+///
+/// A CDC source that cannot prove where an acceleration left off must rebuild it
+/// from the source, because a row deleted while the acceleration was away
+/// produces no change row and only a re-read removes it. An acceleration holding
+/// no rows has nothing that could be stale, which makes emptiness the one thing
+/// that settles the question by observation instead of inference — see
+/// [`AccelerationContents`].
+///
+/// Never returns an error: a probe that cannot answer returns
+/// [`AccelerationContents::Unknown`], which callers must treat as
+/// [`AccelerationContents::NonEmpty`]. Failing to read the acceleration is
+/// grounds for doing the safe, expensive thing, not for skipping it.
+///
+/// Called once per dataset while the accelerated table is being registered,
+/// before its changes stream starts, so the answer cannot be raced by the CDC
+/// writer — which is the only writer on this path.
+pub async fn probe_acceleration_contents(
+    accelerator: &Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+) -> AccelerationContents {
+    // A bare context is enough: the scan never leaves the accelerator, so none of
+    // the source-federation wiring a refresh needs applies. `accelerator_df`
+    // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
+    // left un-federated scans its inner provider directly.
+    let ctx = SessionContext::new();
+    let batches = async {
+        accelerator_df(accelerator, &ctx)
+            .and_then(|df| df.limit(0, Some(1)))?
+            .collect()
+            .await
+    }
+    .await
+    .map_err(find_datafusion_root);
+
+    match batches {
+        Ok(batches) => {
+            if batches.iter().any(|batch| batch.num_rows() > 0) {
+                AccelerationContents::NonEmpty
+            } else {
+                AccelerationContents::Empty
+            }
+        }
+        Err(e) => {
+            // Debug, not warn: the conservative fallback is the same work the
+            // caller would have done anyway, so this costs time, not correctness.
+            tracing::debug!(
+                "Dataset {dataset_name}: could not read the acceleration to check whether it is empty, so it will be treated as populated: {e}"
+            );
+            AccelerationContents::Unknown
+        }
+    }
+}
+
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     match spice_table::find_layer::<PolyTableProvider>(
         accelerator.as_ref(),
@@ -3180,6 +3235,50 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("`id`"), "{message}");
         assert!(message.contains("type mismatch"), "{message}");
+    }
+
+    /// The probe answers about *contents*, not about whether a table exists or
+    /// how it was configured. A CDC source relaxes an expensive rebuild on this
+    /// answer, so a table holding rows must never read as empty.
+    #[tokio::test]
+    async fn probe_reports_acceleration_contents() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let dataset_name = TableReference::bare("probe");
+
+        let empty = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("empty mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&empty, &dataset_name).await,
+            AccelerationContents::Empty
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .expect("batch should be created");
+        let populated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("populated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&populated, &dataset_name).await,
+            AccelerationContents::NonEmpty
+        );
+
+        // A partition holding an empty batch is still an empty acceleration: the
+        // answer must come from the rows, not from the presence of a batch.
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let empty_batches = Arc::new(
+            MemTable::try_new(schema, vec![vec![empty_batch]])
+                .expect("mem table with an empty batch should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&empty_batches, &dataset_name).await,
+            AccelerationContents::Empty
+        );
     }
 
     #[tokio::test]
