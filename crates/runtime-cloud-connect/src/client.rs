@@ -31,9 +31,9 @@ limitations under the License.
 //! The identity is renewed on a ~12h cadence (see
 //! [`crate::config::DEFAULT_RENEWAL_LEAD`]) against the cloud `/renew`
 //! endpoint, both from the live stream loop and before reconnect attempts;
-//! every renewal rotates the keypair. The control plane is authoritative for
-//! whether an expired leaf can still renew; a host clock never discards a
-//! durable identity on its own.
+//! every renewal rotates the keypair. The control plane decides whether an
+//! expired leaf can still renew; the client does not impose its own grace
+//! deadline on a credential the cloud may still accept.
 //!
 //! `Adopt` over the stream is a trust/marker message (the portal admin
 //! confirmed the instance) — the cert was already issued at enroll, so the
@@ -63,12 +63,13 @@ use crate::config::CloudConnectConfig;
 use crate::draft::EnrollmentTransactionLock;
 use crate::enroll::EnrollClient;
 use crate::handlers::{
-    Capability, CommandError, MAX_QUERY_RESULT_BYTES, PostApply, RestartMode, RuntimeHandle,
+    Capability, CommandError, MAX_QUERY_RESULT_BYTES, RestartMode, RuntimeHandle,
     SpicepodDeployment, advertised_capabilities, effective_max_rows,
 };
 use crate::heartbeat::{build_heartbeat, build_telemetry, now_unix};
 use crate::identity::{AppAttachment, Identity, IdentityStore};
 use crate::proto;
+use crate::session::SessionAck;
 use crate::shutdown::Shutdown;
 use crate::{Error, Result, enroll, fingerprint};
 
@@ -85,15 +86,6 @@ const RENEW_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 /// Outbound channel size: bounded to keep memory predictable.
 const CLIENT_CHANNEL_SIZE: usize = 64;
 
-/// How long the client waits for the outbound channel to drain before exiting
-/// the process to apply a deployment, and how often it re-checks.
-///
-/// Best-effort by design: the spicepod is already persisted and the restart is
-/// what makes it live, so a slow gateway delays the exit by at most this budget
-/// rather than stalling the deployment on a result nobody is waiting for.
-const APPLY_FLUSH_BUDGET: Duration = Duration::from_secs(5);
-const APPLY_FLUSH_POLL: Duration = Duration::from_millis(25);
-
 /// State held by the driver across reconnects.
 pub(crate) struct ClientDriver {
     config: CloudConnectConfig,
@@ -103,6 +95,14 @@ pub(crate) struct ClientDriver {
     /// replaced on renewal (rotated keypair); cleared on `Remove` or when
     /// the cloud permanently refuses renewal (revocation).
     identity: Option<Identity>,
+    /// Public key of the credential generation last known to be durable.
+    ///
+    /// This can lag [`Self::identity`] after Cloud commits a renewal but the
+    /// local write fails. The next write must fence against this durable key,
+    /// not the newer in-memory key: disk still contains the former, and treating
+    /// that ancestor as a concurrent winner would roll memory back to a
+    /// credential Cloud has already replaced.
+    durable_public_key_pem: Option<String>,
     /// Earliest instant the next in-stream renewal attempt may run — set
     /// after every renewal attempt (failed or successful) so attempts are
     /// paced by [`RENEW_RETRY_INTERVAL`] rather than spinning on a
@@ -114,6 +114,9 @@ pub(crate) struct ClientDriver {
     /// stream so a reconnect cannot hand out a second slot while the first
     /// query is still running.
     query_slot: Arc<Semaphore>,
+    /// Latch for the first control-plane acknowledgement, when a caller asked
+    /// to be told. `None` for callers that do not report a connection.
+    session_ack: Option<Arc<SessionAck>>,
 }
 
 impl ClientDriver {
@@ -122,15 +125,44 @@ impl ClientDriver {
         runtime: Arc<dyn RuntimeHandle>,
         shutdown: Arc<Shutdown>,
         identity: Option<Identity>,
+        session_ack: Option<Arc<SessionAck>>,
     ) -> Self {
+        let durable_public_key_pem = identity
+            .as_ref()
+            .map(|identity| identity.public_key_pem.clone());
         Self {
             config,
             runtime,
             shutdown,
             identity,
+            durable_public_key_pem,
             renew_not_before: None,
             query_slot: Arc::new(Semaphore::new(1)),
+            session_ack,
         }
+    }
+
+    /// Record that the control plane has answered this session.
+    ///
+    /// Called for every message the control plane sends, because every one of
+    /// them proves the same thing: the gateway holds a session for this
+    /// instance and has dispatched to it. The `Ack` for the `Hello` is the
+    /// usual first, but an instance the control plane immediately commands is
+    /// no less connected. The latch keeps only the first.
+    ///
+    /// The portal metadata this carries is a snapshot, not a verdict: the
+    /// message being recorded here may be the `AttachApp` that is about to
+    /// change it, so a consumer resolves it from the durable identity when it
+    /// reports (`AcknowledgedSession::refreshed`).
+    fn note_session_acknowledged(&self) {
+        let (Some(ack), Some(identity)) = (self.session_ack.as_ref(), self.identity.as_ref())
+        else {
+            return;
+        };
+        ack.record(crate::session::AcknowledgedSession::of_identity(
+            identity,
+            &self.config.identity_path,
+        ));
     }
 
     /// Run the driver until shutdown is requested.
@@ -235,15 +267,22 @@ impl ClientDriver {
             return CredentialStep::Exit;
         }
 
-        // Renew before connecting when due. The control plane decides whether
-        // an expired credential remains renewable; its credential-rejection
-        // response is the only authority that clears the durable identity.
+        // Renew before connecting when due. The control plane, not the host
+        // clock, decides whether the credential remains renewable: dropping it
+        // locally on a calculated grace deadline could destroy a valid identity
+        // on a fast-clock host.
         if self
             .identity
             .as_ref()
             .is_some_and(|id| renewal_due(id, self.config.renewal_lead))
         {
             match self.renew_once(enroll_client).await {
+                Ok(()) if self.identity.is_none() => {
+                    tracing::info!(
+                        "Cloud Connect: the durable identity was removed while renewal was in flight; exiting cloud-connect without replaying the stale credential"
+                    );
+                    return CredentialStep::Exit;
+                }
                 Ok(()) => {}
                 Err(err) if renewal_rejection_revokes_identity(&err) => {
                     // A 401 is the cloud's credential revocation signal. It
@@ -307,7 +346,7 @@ impl ClientDriver {
     /// `None` when the identity carries no gateway address (a pre-split
     /// identity file) — non-recoverable without re-enrolling.
     fn stream_endpoint(&self) -> Option<String> {
-        effective_stream_endpoint(&self.config, self.identity.as_ref()?)
+        self.config.stream_endpoint(self.identity.as_ref()?)
     }
 
     /// Renew the identity against the cloud `/renew` endpoint with a fresh
@@ -322,7 +361,21 @@ impl ClientDriver {
                 reason: format!("failed to generate renewal key material: {source}"),
             }
         })?;
+        let expected_identifier = current.identifier.clone();
         let outcome = client.renew(&current, &material).await?;
+
+        // Identities written before endpoint binding was added relied on the
+        // instance-local `cloud-endpoint` file. `spiced` resolves that legacy
+        // source before constructing this client; the first successful renewal
+        // promotes the exact endpoint that accepted the credential into the
+        // identity so every later start is independent of the migration file.
+        let control_plane_endpoint = match current.control_plane_endpoint.as_deref() {
+            Some(endpoint) => Some(endpoint.to_string()),
+            None => Some(
+                crate::config::normalize_control_plane_endpoint(&self.config.enroll_endpoint)
+                    .map_err(|error| client.invalid_renew_response(error.to_string()))?,
+            ),
+        };
 
         let mut rotated = Identity {
             identifier: current.identifier,
@@ -332,9 +385,10 @@ impl ClientDriver {
             // The CA bundle and gateway address are not re-sent on renewal.
             ca_bundle_pem: current.ca_bundle_pem,
             gateway_addr: current.gateway_addr,
-            // Renewal is bound to the authority that issued the identity.
-            control_plane_endpoint: current.control_plane_endpoint,
-            not_after_unix: Some(outcome.not_after_unix),
+            // The response's unsigned `not_after` hint is deliberately
+            // ignored. Validation below derives this cache exclusively from
+            // the signed leaf the cloud has already committed.
+            not_after_unix: None,
             // The attachment tuple is not part of the credential and /renew
             // does not re-send it, so it rides across the rotation unchanged
             // (and is re-merged from disk by the persist below, in case a
@@ -343,6 +397,8 @@ impl ClientDriver {
             org_name: current.org_name,
             app_name: current.app_name,
             monitor_url: current.monitor_url,
+            new_project_url: current.new_project_url,
+            control_plane_endpoint,
             // Seeded with the OUTGOING keypair and rotated by the call below,
             // which shifts it into `enc_previous_private_key_pem` — assigning
             // `material` here instead would leave the retained key equal to the
@@ -363,26 +419,33 @@ impl ClientDriver {
         // a payload sealed moments before this point is still addressed to it and
         // cannot be re-sealed in flight.
         rotated.rotate_encryption_key(material.enc_private_key_pem, material.enc_public_key_pem);
-        if let Some(reason) =
-            rotated.reconnect_validation_error(self.config.gateway_endpoint.as_deref())
-        {
-            return Err(client.invalid_renew_response(reason));
-        }
-        if let Err(reason) = validate_stream_endpoint(&self.config, &rotated) {
-            return Err(client.invalid_renew_response(&reason));
-        }
+        // The signed leaf, not the response's unsigned `not_after`, is the
+        // authority for both acceptance and the next renewal deadline. The
+        // shared reconnectability gate also normalizes the cached field to the
+        // signed value before this identity reaches persistence or scheduling.
+        let (validated, _endpoint) =
+            crate::validate_reconnectable_credential_async(&self.config, rotated)
+                .await
+                .map_err(|error| client.invalid_renew_response(error.to_string()))?;
+        rotated = validated;
+        // Channel construction happens in the reconnect loop. It must remain
+        // retryable host state rather than deciding whether the cloud-committed
+        // credential is adopted here.
         // The cloud has already pinned the new public key: even if
         // persistence fails, the rotated identity must be used in memory
         // (the old key can no longer renew). Persistence logs the failure;
         // the next successful renewal re-attempts the write.
-        let Some(persisted) = self
-            .persist_identity_preserving_attachment(rotated, "renewed identity")
+        let Some(rotated) = self
+            .persist_identity_preserving_attachment(
+                &expected_identifier,
+                rotated,
+                "renewed identity",
+            )
             .await
         else {
             self.identity = None;
             return Ok(());
         };
-        rotated = persisted;
         tracing::info!(
             "Cloud Connect: identity renewed for {} (identity and encryption keypairs rotated, valid until {})",
             rotated.identifier,
@@ -403,22 +466,46 @@ impl ClientDriver {
     /// Persist a full credential update while retaining the attachment most
     /// recently written by a command handler.
     async fn persist_identity_preserving_attachment(
-        &self,
+        &mut self,
+        expected_identifier: &str,
         identity: Identity,
         update: &'static str,
     ) -> Option<Identity> {
         let path = self.config.identity_path.clone();
         let config_dir = self.config.config_dir.clone();
         let fallback = identity.clone();
+        let expected_identifier = expected_identifier.to_string();
+        let expected_public_key_pem = self
+            .durable_public_key_pem
+            .clone()
+            .unwrap_or_else(|| fallback.public_key_pem.clone());
         let result = tokio::task::spawn_blocking(move || {
-            IdentityStore::store_credential_update(&config_dir, &path, &identity)
+            IdentityStore::store_credential_update(
+                &config_dir,
+                &path,
+                &expected_identifier,
+                &expected_public_key_pem,
+                &identity,
+            )
         })
         .await;
         match result {
-            Ok(Ok(Some(merged))) => Some(merged),
-            Ok(Ok(None)) => {
-                tracing::info!(
-                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; honoring removal instead of recreating it",
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Stored(merged))) => {
+                self.durable_public_key_pem = Some(merged.public_key_pem.clone());
+                Some(merged)
+            }
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Superseded(current))) => {
+                self.durable_public_key_pem = Some(current.public_key_pem.clone());
+                tracing::warn!(
+                    "Cloud Connect: skipped the stale {update} at {} because another enrollment or renewal published a newer credential generation; continuing with that durable identity",
+                    self.config.identity_path.display()
+                );
+                Some(current)
+            }
+            Ok(Ok(crate::identity::CredentialUpdateOutcome::Missing)) => {
+                self.durable_public_key_pem = None;
+                tracing::error!(
+                    "Cloud Connect: identity disappeared while the {update} was being persisted at {}; dropping the stale in-memory identity",
                     self.config.identity_path.display()
                 );
                 None
@@ -451,12 +538,13 @@ impl ClientDriver {
             );
         }
         self.identity = None;
+        self.durable_public_key_pem = None;
     }
 
     /// Delay until the next renewal attempt, or `None` when the identity
     /// carries no expiry and renewal is moot.
     fn next_renewal_delay(&self) -> Option<Duration> {
-        let not_after = self.identity.as_ref()?.not_after_unix?;
+        let not_after = self.identity.as_ref()?.effective_not_after_unix()?;
         let due_at = not_after.saturating_sub(self.config.renewal_lead.as_secs());
         let due_in = Duration::from_secs(due_at.saturating_sub(now_unix()));
         // After a transient failure, pace retries instead of spinning on a
@@ -757,6 +845,9 @@ impl ClientDriver {
     ) -> Option<ExitReason> {
         let command_id = msg.command_id;
         let Some(body) = msg.body else {
+            // Even an arm this build cannot decode proves that the control
+            // plane has this session.
+            self.note_session_acknowledged();
             // A control plane newer than this build dispatched a command whose
             // oneof arm prost does not know, which decodes to an absent body.
             // The envelope still carries the command_id, so answer with a NACK
@@ -783,6 +874,15 @@ impl ClientDriver {
         };
 
         let name = command_name(&body);
+        // An AttachApp is itself the metadata the completion report consumes.
+        // Record the session only after that command has durably completed so
+        // the acknowledgement cannot wake a report that reads the old
+        // attachment. Every other recognized message can acknowledge at once.
+        let acknowledge_after_dispatch =
+            matches!(&body, proto::control_message::Body::AttachApp(_));
+        if !acknowledge_after_dispatch {
+            self.note_session_acknowledged();
+        }
 
         match body {
             proto::control_message::Body::Ack(_) => {
@@ -900,6 +1000,10 @@ impl ClientDriver {
                 )
                 .await;
             }
+        }
+
+        if acknowledge_after_dispatch {
+            self.note_session_acknowledged();
         }
 
         None
@@ -1079,12 +1183,9 @@ impl ClientDriver {
     /// every referencing component with a missing-parameter error naming
     /// nothing.
     ///
-    /// A deployment applies by restart, so a successful apply usually ends with
-    /// this process exiting: the result is sent and flushed first, then the
-    /// runtime handle exits and the supervisor relaunches it on the persisted
-    /// spicepod. Sending the result first is what lets a caller see the
-    /// validation outcome at all — once the process is gone the stream is too,
-    /// so a result that has not been flushed by then is lost.
+    /// A deployment applies to the running instance: the handle answers with the
+    /// document the control plane reads, and this process keeps serving either
+    /// way. Nothing here ends or restarts it.
     ///
     /// `command_id` comes from the `ControlMessage` envelope, not from the
     /// command body — and it is part of the outer AAD, so an envelope cannot be
@@ -1131,8 +1232,8 @@ impl ClientDriver {
             })
             .await;
 
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
+        let document = match outcome {
+            Ok(document) => document,
             Err(err) => {
                 tracing::warn!(
                     command_id,
@@ -1147,22 +1248,7 @@ impl ClientDriver {
             "Spice Cloud Connect: applied the deployed Spicepod"
         );
 
-        send_ok_json(tx, command_id, &outcome.document).await;
-
-        if outcome.post_apply == PostApply::ExitToApply {
-            tracing::info!(
-                "Cloud Connect: the deployed spicepod is persisted; exiting so the supervisor restarts spiced on it"
-            );
-            flush_outbound(tx).await;
-            self.runtime.exit_to_apply().await;
-            // Reaching here means the handle did not exit. The spicepod stays
-            // persisted and takes effect on the next start, so say what state
-            // the instance is actually in rather than letting the control plane
-            // infer it from a deployment that never goes live.
-            tracing::error!(
-                "Cloud Connect: the runtime did not exit to apply the deployment; it is persisted but NOT live, and takes effect the next time spiced starts. Restart it via your process manager. See: https://spiceai.org/docs"
-            );
-        }
+        send_ok_json(tx, command_id, &document).await;
     }
 
     /// Open a delivered payload against this instance's keys.
@@ -1202,8 +1288,10 @@ impl ClientDriver {
         if crate::sealed_secrets::opened_with_current(&opened.inner_key_id, &keyring) {
             let mut updated = identity;
             if updated.retire_previous_enc_key() {
+                let expected_identifier = updated.identifier.clone();
                 self.identity = self
                     .persist_identity_preserving_attachment(
+                        &expected_identifier,
                         updated,
                         "previous encryption-key retirement",
                     )
@@ -1320,10 +1408,10 @@ impl ClientDriver {
         command_id: &str,
         live_identifier: &Arc<RwLock<String>>,
     ) -> bool {
-        // Clear identity and any retryable draft under the same cross-process
-        // enrollment transaction that promotion holds. The work runs on the
-        // blocking pool so the active control stream is not stalled by file
-        // I/O or lock acquisition.
+        // Clear the persisted secret cache, identity, and any retryable draft
+        // under the same cross-process enrollment transaction that promotion
+        // holds. The work runs on the blocking pool so the active control
+        // stream is not stalled by file I/O or lock acquisition.
         if let Err(err) = clear_identity_state(&self.config).await {
             tracing::warn!(
                 "Cloud Connect: failed to clear identity at {}: {err}; \
@@ -1343,9 +1431,21 @@ impl ClientDriver {
             return false;
         }
 
+        // Durable Cloud state is gone. Withdraw delivered values from the
+        // runtime store before acknowledging; already-loaded components keep
+        // their resolved configuration until the local operator restarts them.
+        self.runtime.clear_cloud_delivered_secrets().await;
+
         // Disk identity is gone — drop it from memory too and report success.
         self.identity = None;
+        self.durable_public_key_pem = None;
         live_identifier.write().await.clear();
+        if let Some(session_ack) = &self.session_ack {
+            // Withdraw before the command ACK can race the runtime's serving
+            // latch. From this point the identity is durably gone and must not
+            // be announced as connected even though the local servers remain.
+            session_ack.withdraw();
+        }
 
         send_ok_json(tx, command_id, &serde_json::json!({ "status": "removed" })).await;
         true
@@ -1388,7 +1488,7 @@ async fn sleep_or_never(delay: Option<Duration>) {
 /// `true` when the identity should be renewed now: within `lead` of its
 /// `not_after` (or already past it). An identity with no expiry never renews.
 fn renewal_due(identity: &Identity, lead: Duration) -> bool {
-    let Some(not_after) = identity.not_after_unix else {
+    let Some(not_after) = identity.effective_not_after_unix() else {
         return false;
     };
     now_unix().saturating_add(lead.as_secs()) >= not_after
@@ -1432,11 +1532,11 @@ fn server_trust<'a>(ca_bundle_pem: &'a str, dev_ca_pem: Option<&'a str>) -> Serv
     }
 }
 
-fn build_channel(
+fn build_endpoint(
     config: &CloudConnectConfig,
     endpoint_url: &str,
     identity: &Identity,
-) -> Result<Channel> {
+) -> Result<Endpoint> {
     let mut endpoint = Endpoint::from_shared(endpoint_url.to_string())
         .map_err(|source| Error::InvalidEndpoint {
             endpoint: endpoint_url.to_string(),
@@ -1475,9 +1575,10 @@ fn build_channel(
         endpoint = endpoint.tls_config(tls).context(TransportSnafu)?;
     }
 
-    Ok(endpoint.connect_lazy())
+    Ok(endpoint)
 }
 
+#[cfg(test)]
 pub(crate) fn effective_stream_endpoint(
     config: &CloudConnectConfig,
     identity: &Identity,
@@ -1492,6 +1593,7 @@ pub(crate) fn effective_stream_endpoint(
     Some(format!("{scheme}://{}", identity.gateway_addr))
 }
 
+#[cfg(test)]
 pub(crate) fn validate_stream_endpoint(
     config: &CloudConnectConfig,
     identity: &Identity,
@@ -1512,6 +1614,7 @@ pub(crate) fn validate_stream_endpoint(
         .map_err(|source| format!("the gateway endpoint {endpoint:?} is invalid: {source}"))
 }
 
+#[cfg(test)]
 fn validate_ca_bundle(
     description: &str,
     pem: &str,
@@ -1532,14 +1635,54 @@ fn validate_ca_bundle(
 
 async fn clear_identity_state(config: &CloudConnectConfig) -> std::result::Result<(), String> {
     let config_dir = config.config_dir.clone();
-    let identity_path = config.identity_path.clone();
+    let default_identity_path = config_dir.join(crate::config::IDENTITY_FILE);
+    let mutation = crate::MutationLock::acquire(&config_dir, "remove")
+        .await
+        .map_err(|source| format!("acquire the Cloud Connect mutation lock: {source}"))?;
+    let protected_config_dir = mutation
+        .descriptor_relative_config_dir()
+        .map_err(|source| format!("pin the locked Cloud Connect directory: {source}"))?;
+    let identity_path = if config.identity_path == default_identity_path {
+        protected_config_dir.join(crate::config::IDENTITY_FILE)
+    } else {
+        config.identity_path.clone()
+    };
+    let secret_cache_path = protected_config_dir.join(crate::secret_cache::SECRET_CACHE_FILE);
+    let connect_state_paths = [
+        protected_config_dir.join(CloudConnectConfig::CONNECT_OPERATION_FILE),
+        protected_config_dir.join(CloudConnectConfig::PROJECT_OPERATION_FILE),
+        protected_config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+    ];
     tokio::task::spawn_blocking(move || {
-        let transaction = EnrollmentTransactionLock::acquire(&config_dir)
+        // The blocking task owns the outer guard as well as the inner
+        // transaction. Cancelling its async caller therefore cannot let a CLI
+        // mutation or cache writer interleave before cleanup has finished.
+        let _mutation = mutation;
+        let transaction = EnrollmentTransactionLock::acquire(&protected_config_dir)
             .map_err(|source| format!("acquire the enrollment transaction: {source}"))?;
+        for path in &connect_state_paths {
+            crate::identity::reclaim_all_release_artifacts(
+                path,
+                crate::identity::ArtifactKinds::Connect,
+            )
+            .map_err(|source| {
+                format!(
+                    "clear interrupted Cloud Connect state writes beside {}: {source}",
+                    path.display()
+                )
+            })?;
+        }
+        crate::secret_cache::remove(&secret_cache_path)
+            .map_err(|source| format!("clear delivered-secret cache: {source}"))?;
+        for path in &connect_state_paths {
+            remove_durable_state_file(path).map_err(|source| {
+                format!("clear Cloud Connect state at {}: {source}", path.display())
+            })?;
+        }
         transaction
             .delete()
             .map_err(|source| format!("clear enrollment draft: {source}"))?;
-        IdentityStore::clear(&identity_path)
+        IdentityStore::clear_with_transaction(&identity_path, &transaction)
             .map_err(|source| format!("clear identity: {source}"))?;
         Ok(())
     })
@@ -1547,30 +1690,26 @@ async fn clear_identity_state(config: &CloudConnectConfig) -> std::result::Resul
     .map_err(|source| format!("identity cleanup task failed: {source}"))?
 }
 
-/// Wait for everything queued on the outbound channel to be handed to tonic,
-/// bounded by [`APPLY_FLUSH_BUDGET`].
-///
-/// Called before the process exits to apply a deployment. Full capacity means
-/// the transport took every queued frame — including the `CommandResult` just
-/// sent — which is as close to "it is on the wire" as a channel can report. The
-/// budget is what keeps a stalled gateway from holding up the deployment, which
-/// is already persisted and takes effect on the restart either way.
-async fn flush_outbound(tx: &mpsc::Sender<proto::ClientMessage>) {
-    let deadline = time::Instant::now() + APPLY_FLUSH_BUDGET;
-    while tx.capacity() < tx.max_capacity() {
-        if time::Instant::now() >= deadline {
-            tracing::warn!(
-                "Cloud Connect: the deployment result was still queued after {}; exiting anyway (the control plane reconciles the deployment from the version reported on reconnect)",
-                humanize(APPLY_FLUSH_BUDGET)
-            );
-            return;
+fn remove_durable_state_file(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => crate::identity::sync_parent_directory(path),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match crate::identity::sync_parent_directory(path) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(source),
+            }
         }
-        if tx.is_closed() {
-            // The stream is gone, so nothing more will be sent from this queue.
-            return;
-        }
-        time::sleep(APPLY_FLUSH_POLL).await;
+        Err(source) => Err(source),
     }
+}
+
+fn build_channel(
+    config: &CloudConnectConfig,
+    endpoint_url: &str,
+    identity: &Identity,
+) -> Result<Channel> {
+    build_endpoint(config, endpoint_url, identity).map(|endpoint| endpoint.connect_lazy())
 }
 
 fn build_hello(
@@ -1587,7 +1726,7 @@ fn build_hello(
         hostname: gethostname::gethostname().to_string_lossy().into_owned(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        fingerprint: fingerprint::compute(),
+        fingerprint: fingerprint::compute(&config.config_dir),
         public_ip_hint: String::new(),
         operator_version: String::new(),
         runtime_versions: std::collections::HashMap::new(),
@@ -1831,6 +1970,39 @@ fn renewal_rejection_revokes_identity(error: &enroll::Error) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn identity_cleanup_waits_for_the_instance_mutation_lock() {
+        let instance = tempfile::tempdir().expect("create instance directory");
+        let config_dir = instance.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        let config = CloudConnectConfig::from_env_at("test-runtime", config_dir.clone());
+        std::fs::write(&config.identity_path, b"identity material")
+            .expect("write identity fixture");
+
+        let held = crate::MutationLock::acquire(&config_dir, "cli-mutation")
+            .await
+            .expect("hold the instance mutation lock");
+        let mut cleanup = tokio::spawn(async move { clear_identity_state(&config).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut cleanup)
+                .await
+                .is_err(),
+            "remote cleanup must wait behind the same outer lock as CLI mutations"
+        );
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup proceeds when the CLI mutation releases the directory")
+            .expect("cleanup task completes")
+            .expect("cleanup succeeds");
+        assert!(
+            !config_dir.join(crate::config::IDENTITY_FILE).exists(),
+            "the identity is removed only after acquiring the outer lock"
+        );
+    }
+
     #[test]
     fn backoff_doubles_until_cap() {
         let mut d = MIN_BACKOFF;
@@ -1922,7 +2094,6 @@ mod tests {
             public_key_pem: current_key.public_key_pem(),
             ca_bundle_pem: String::new(),
             gateway_addr: "gateway.test:443".to_string(),
-            control_plane_endpoint: None,
             not_after_unix: Some(now_unix().saturating_add(60)),
             enc_private_key_pem: "old encryption private key".to_string(),
             enc_public_key_pem: "old encryption public key".to_string(),
@@ -1932,6 +2103,8 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
+            control_plane_endpoint: None,
         };
         current.ensure_cache_key();
         IdentityStore::store(&identity_path, &current).expect("store current identity");
@@ -1959,6 +2132,7 @@ mod tests {
             runtime,
             crate::shutdown::Shutdown::new(),
             Some(current.clone()),
+            None,
         );
 
         let error = driver
@@ -1978,6 +2152,159 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn a_renewal_after_a_failed_write_fences_against_the_last_durable_generation() {
+        let dir = tempfile::tempdir().expect("create identity directory");
+        let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+
+        let mut durable = identity_with_not_after(None);
+        durable.identifier = "inst_durable_fence".to_string();
+        durable.public_key_pem = "durable-key-a".to_string();
+        IdentityStore::store(&config.identity_path, &durable).expect("store durable generation A");
+
+        // Cloud committed B, but its local write failed: memory advanced while
+        // disk and the driver's durable fence remained at A.
+        let mut in_memory = durable.clone();
+        in_memory.public_key_pem = "cloud-committed-key-b".to_string();
+        let runtime: Arc<dyn RuntimeHandle> = Arc::new(crate::handlers::NoopRuntimeHandle);
+        let mut driver = ClientDriver::new(
+            config.clone(),
+            runtime,
+            crate::shutdown::Shutdown::new(),
+            Some(durable),
+            None,
+        );
+        driver.identity = Some(in_memory.clone());
+
+        let mut next = in_memory;
+        next.public_key_pem = "cloud-committed-key-c".to_string();
+        let stored = driver
+            .persist_identity_preserving_attachment("inst_durable_fence", next, "renewed identity")
+            .await
+            .expect("the next committed generation is persisted over its durable ancestor");
+
+        assert_eq!(stored.public_key_pem, "cloud-committed-key-c");
+        assert_eq!(
+            IdentityStore::load_optional(&config.identity_path)
+                .expect("load persisted generation C")
+                .expect("persisted generation C exists")
+                .public_key_pem,
+            "cloud-committed-key-c",
+            "the stale durable ancestor must not replace the cloud-committed credential in memory"
+        );
+        assert_eq!(
+            driver.durable_public_key_pem.as_deref(),
+            Some("cloud-committed-key-c")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_clears_the_durable_cache_and_live_secret_store_before_acknowledging() {
+        #[derive(Default)]
+        struct ClearingRuntime {
+            cleared: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeHandle for ClearingRuntime {
+            fn supports(&self, _capability: Capability) -> bool {
+                false
+            }
+
+            async fn clear_cloud_delivered_secrets(&self) {
+                self.cleared
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("create identity directory");
+        let config = CloudConnectConfig::from_env_at("test-runtime", dir.path().to_path_buf());
+        let identity = identity_with_not_after(None);
+        IdentityStore::store(&config.identity_path, &identity).expect("store identity");
+        let cache = config
+            .config_dir
+            .join(crate::secret_cache::SECRET_CACHE_FILE);
+        std::fs::write(&cache, b"encrypted cache").expect("write cache fixture");
+        let connect_state_paths = [
+            config
+                .config_dir
+                .join(CloudConnectConfig::CONNECT_OPERATION_FILE),
+            config
+                .config_dir
+                .join(CloudConnectConfig::PROJECT_OPERATION_FILE),
+            config
+                .config_dir
+                .join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+        ];
+        for (index, path) in connect_state_paths.iter().enumerate() {
+            std::fs::write(path, b"local connect state").expect("write connect state fixture");
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("connect state file name");
+            std::fs::write(
+                config
+                    .config_dir
+                    .join(format!(".{file_name}.{index}.candidate")),
+                b"interrupted connect state write",
+            )
+            .expect("write interrupted connect state fixture");
+        }
+
+        let runtime = Arc::new(ClearingRuntime::default());
+        let mut driver = ClientDriver::new(
+            config.clone(),
+            Arc::<ClearingRuntime>::clone(&runtime),
+            crate::shutdown::Shutdown::new(),
+            Some(identity),
+            None,
+        );
+        let live_identifier = Arc::new(RwLock::new("inst_test".to_string()));
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let removed = driver
+            .handle_remove(&tx, "remove-1", &live_identifier)
+            .await;
+        let acknowledgement = rx.recv().await.expect("receive Remove acknowledgement");
+        assert!(removed, "Remove failed: {acknowledgement:?}");
+        assert!(
+            !cache.exists(),
+            "Remove must durably clear the secret cache"
+        );
+        for (index, path) in connect_state_paths.iter().enumerate() {
+            assert!(
+                !path.exists(),
+                "Remove must durably clear {}",
+                path.display()
+            );
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("connect state file name");
+            assert!(
+                !config
+                    .config_dir
+                    .join(format!(".{file_name}.{index}.candidate"))
+                    .exists(),
+                "Remove must clear interrupted writes beside {}",
+                path.display()
+            );
+        }
+        assert!(
+            runtime.cleared.load(std::sync::atomic::Ordering::SeqCst),
+            "Remove must clear the live delivered-secret store before ACK"
+        );
+        assert!(driver.identity.is_none());
+        assert!(live_identifier.read().await.is_empty());
+        assert!(matches!(
+            acknowledgement.body,
+            Some(proto::client_message::Body::Result(proto::CommandResult {
+                code,
+                ..
+            })) if code == proto::ResultCode::Ok as i32
+        ));
+    }
+
     fn identity_with_not_after(not_after_unix: Option<u64>) -> Identity {
         Identity {
             identifier: "inst_test".to_string(),
@@ -1986,7 +2313,6 @@ mod tests {
             public_key_pem: String::new(),
             ca_bundle_pem: String::new(),
             gateway_addr: "gateway.test:443".to_string(),
-            control_plane_endpoint: None,
             not_after_unix,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
@@ -1996,7 +2322,25 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
+            control_plane_endpoint: None,
         }
+    }
+
+    fn identity_with_signed_expiry(
+        signed_validity: Duration,
+        cached_not_after_unix: u64,
+    ) -> Identity {
+        let key = rcgen::KeyPair::generate().expect("generate identity key");
+        let now = std::time::SystemTime::now();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("build identity certificate parameters");
+        params.not_before = (now - Duration::from_mins(1)).into();
+        params.not_after = (now + signed_validity).into();
+        let certificate = params.self_signed(&key).expect("sign identity certificate");
+        let mut identity = identity_with_not_after(Some(cached_not_after_unix));
+        identity.identity_cert_pem = certificate.pem();
+        identity
     }
 
     #[test]
@@ -2014,9 +2358,38 @@ mod tests {
         // Expires in 24h with a 12h lead: not yet due.
         let later = identity_with_not_after(Some(now_unix() + 24 * 60 * 60));
         assert!(!renewal_due(&later, lead));
-        // Already expired: due; the control plane decides whether to accept it.
+        // Already expired: due; the control plane decides whether it remains
+        // renewable.
         let expired = identity_with_not_after(Some(now_unix().saturating_sub(60)));
         assert!(renewal_due(&expired, lead));
+    }
+
+    #[test]
+    fn renewal_scheduling_uses_the_signed_expiry_over_the_unsigned_cache() {
+        let identity = identity_with_signed_expiry(
+            Duration::from_mins(1),
+            now_unix().saturating_add(Duration::from_hours(24).as_secs()),
+        );
+        let lead = Duration::from_hours(12);
+
+        assert!(
+            renewal_due(&identity, lead),
+            "the signed leaf is due even though the response cache claims another day"
+        );
+
+        let runtime: Arc<dyn RuntimeHandle> = Arc::new(crate::handlers::NoopRuntimeHandle);
+        let driver = ClientDriver::new(
+            CloudConnectConfig::from_env("test-runtime"),
+            runtime,
+            crate::shutdown::Shutdown::new(),
+            Some(identity),
+            None,
+        );
+        assert_eq!(
+            driver.next_renewal_delay(),
+            Some(Duration::ZERO),
+            "the live-stream timer must also use the signed leaf deadline"
+        );
     }
 
     #[test]

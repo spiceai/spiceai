@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::parameters::ConnectorContext;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -53,25 +54,25 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::component::dataset::DatasetSpec;
-use crate::dataconnector::{
+use crate::accelerated::RegisteredAcceleratedTable;
+use crate::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
-use crate::parameters::{ExposedParamLookup, Parameters};
 use app::App;
 use data_components::object::{
     metadata::{MetadataColumn, ObjectStoreMetadataTable},
     text::ObjectStoreTextTable,
 };
-use data_connector_api::accelerated::RegisteredAcceleratedTable;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ExposedParamLookup, Parameters};
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
     detect_file_extension_from_url_or_path, parse_file_extension_param,
 };
-use crate::dataconnector::DataConnectorError::SchemaMismatch;
-use crate::datafusion::builder::get_df_default_config;
+use crate::DataConnectorError::SchemaMismatch;
+use runtime_datafusion::session_config::get_df_default_config;
 use runtime_object_store::registry::default_runtime_env;
 
 /// Maximum number of files to scan when validating that the schema source path contains objects with the expected extension.
@@ -491,6 +492,19 @@ pub trait ListingTableConnector: DataConnector {
         None
     }
 
+    /// Whether a single-file dataset from this connector can be served through
+    /// the ETag/Version-ID cache in
+    /// [`S3SingleFileCached`](data_components::s3_single_file_cached::S3SingleFileCached),
+    /// which skips a re-fetch when the object is unchanged.
+    ///
+    /// Only object stores that return a strong per-object version identifier on
+    /// `HEAD` qualify; a store whose `ETag` changes on re-upload of identical
+    /// bytes, or which omits one, would serve stale data. Defaults to `false`,
+    /// so a connector opts in only after its store has been checked.
+    fn supports_single_file_version_cache(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any;
 
     /// Retrieves the object store URL for a given dataset.
@@ -507,6 +521,11 @@ pub trait ListingTableConnector: DataConnector {
     /// # Returns
     ///
     /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset's `from` (or the supplied `url`) is not a
+    /// URL this connector's object store can address.
     fn get_object_store_url(
         &self,
         dataset: &DatasetSpec,
@@ -526,13 +545,20 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
+    /// The object store this connector reads `dataset` from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset's URL cannot be resolved or the store
+    /// cannot be constructed from the connector's parameters (bad credentials,
+    /// unreachable endpoint).
     fn get_object_store(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn ObjectStore>>
     where
         Self: Display,
     {
         let store_url = self.get_object_store_url(dataset, None)?;
         let listing_store_url = ListingTableUrl::parse(store_url).boxed().context(
-            crate::dataconnector::UnableToConnectInternalSnafu {
+            crate::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -541,7 +567,7 @@ pub trait ListingTableConnector: DataConnector {
             .runtime_env()
             .object_store(&listing_store_url)
             .boxed()
-            .context(crate::dataconnector::UnableToConnectInternalSnafu {
+            .context(crate::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
             })
@@ -572,7 +598,7 @@ pub trait ListingTableConnector: DataConnector {
         let (_, extension) = self.get_file_format_and_extension(dataset).await?;
 
         let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
-            .context(crate::dataconnector::InvalidConfigurationSnafu {
+            .context(crate::InvalidConfigurationSnafu {
             dataconnector: format!("{self}"),
             message: format!(
                 "Invalid file extension ({extension}) for source ({})",
@@ -836,7 +862,7 @@ pub trait ListingTableConnector: DataConnector {
             },
             (Some(format), _) => Ok((None, format!(".{format}"))),
             (_, _) => Err(
-                    crate::dataconnector::DataConnectorError::InvalidConfiguration {
+                    crate::DataConnectorError::InvalidConfiguration {
                         dataconnector: format!("{self}"),
                         message: "The required 'file_format' parameter is missing. Ensure the parameter is provided, and try again.".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
@@ -849,6 +875,10 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`JsonFormat`] based on the provided [`Datasets`] parameters.
     ///
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `schema_infer_max_records` is present but not a number.
     fn get_jsonl_format(
         &self,
         dataset: &DatasetSpec,
@@ -863,7 +893,7 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
                         "JSONL parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
@@ -878,6 +908,11 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`SpiceJsonFormat`] based on the provided [`Datasets`] parameters.
     ///
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `schema_infer_max_records` is not a number, or
+    /// `json_format` is not one of the supported formats.
     fn get_json_format(
         &self,
         dataset: &DatasetSpec,
@@ -895,7 +930,7 @@ pub trait ListingTableConnector: DataConnector {
         if let ExposedParamLookup::Present(infer_max_rec_str) =
             params.get("schema_infer_max_records").expose()
         {
-            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            let schema_infer_max_rec = usize::from_str(infer_max_rec_str).boxed().context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
                         "JSON parameter 'schema_infer_max_records' must be an integer, not {infer_max_rec_str}"),
@@ -905,7 +940,7 @@ pub trait ListingTableConnector: DataConnector {
         }
 
         if let ExposedParamLookup::Present(json_format_str) = params.get("json_format").expose() {
-            let json_format = json_format_str.parse::<Format>().boxed().context(crate::dataconnector::InvalidConfigurationSnafu {
+            let json_format = json_format_str.parse::<Format>().boxed().context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!(
                         "Invalid JSON format: {json_format_str}, supported formats are: 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata', 'auto'"),
@@ -935,7 +970,7 @@ pub trait ListingTableConnector: DataConnector {
         // handles data extraction internally — json_pointer cannot be applied.
         if format.options().format == Format::Soda && format.options().json_pointer.is_some() {
             return Err(
-                crate::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                crate::DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: format!("{self}"),
                     connector_component: ConnectorComponent::from(dataset),
                     message: "'json_pointer' cannot be used with 'file_format: soda'. SODA format extracts data from the response automatically.".to_string(),
@@ -949,6 +984,11 @@ pub trait ListingTableConnector: DataConnector {
     /// Returns a [`CsvFormat`] based on the provided [`Datasets`] parameters, and choice of delimiter.
     ///
     /// Uses the appropriate parameters based on the [`DelimitedFormat`] provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the quote or escape parameter is not a single
+    /// character, or `schema_infer_max_records` is not a number.
     fn delimiter_separated_format(
         &self,
         params: &Parameters,
@@ -1011,7 +1051,7 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         build_table_parquet_options(self.get_app().as_ref()).map_err(|e| {
-            crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+            crate::DataConnectorError::UnableToConnectInternal {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
@@ -1046,7 +1086,7 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+        crate::DataConnectorError::UnableToConnectInternal {
             dataconnector: format!("{self}"),
             connector_component: ConnectorComponent::from(dataset),
             source: error.into(),
@@ -1083,7 +1123,7 @@ pub trait ListingTableConnector: DataConnector {
                 content_formatter,
                 metadata_columns,
             )
-            .context(crate::dataconnector::InvalidConfigurationSnafu {
+            .context(crate::InvalidConfigurationSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
@@ -1105,13 +1145,14 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
-        let table_path = ListingTableUrl::parse(url.clone()).boxed().context(
-            crate::dataconnector::InternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
-            },
-        )?;
+        let table_path =
+            ListingTableUrl::parse(url.clone())
+                .boxed()
+                .context(crate::InternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+                })?;
 
         let object_store = self.get_object_store(dataset)?;
 
@@ -1121,7 +1162,7 @@ pub trait ListingTableConnector: DataConnector {
             if let Some(url) = dataset.params.get("schema_source_path") {
                 let url = self.get_object_store_url(dataset, Some(url))?;
                 let schema_infer_url = ListingTableUrl::parse(&url).boxed().context(
-                    crate::dataconnector::UnableToGetSchemaInternalSnafu {
+                    crate::UnableToGetSchemaInternalSnafu {
                         dataconnector: format!("{self}"),
                         connector_component: ConnectorComponent::from(dataset),
                     },
@@ -1188,7 +1229,7 @@ pub trait ListingTableConnector: DataConnector {
                 DataFusionError::ObjectStore(object_store_error) => {
                     self.handle_object_store_error(dataset, *object_store_error)
                 }
-                e => crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                e => crate::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
                     connector_component: ConnectorComponent::from(dataset),
                     source: e.into(),
@@ -1258,7 +1299,7 @@ pub trait ListingTableConnector: DataConnector {
         // refreshing datasets still pick up new data.
         let table = ListingTable::try_new(config)
             .boxed()
-            .context(crate::dataconnector::InternalSnafu {
+            .context(crate::InternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
                 code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
@@ -1268,10 +1309,7 @@ pub trait ListingTableConnector: DataConnector {
         // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
         // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
         let table_arc = Arc::new(table);
-        let is_s3_connector = ListingTableConnector::as_any(self)
-            .downcast_ref::<crate::dataconnector::s3::S3>()
-            .is_some();
-        if is_s3_connector
+        if self.supports_single_file_version_cache()
             && refresh_skip_enabled(dataset)
             && !table_path.is_collection()
             && dataset.acceleration.is_some()
@@ -1283,7 +1321,7 @@ pub trait ListingTableConnector: DataConnector {
                 )
         {
             tracing::debug!(
-                "Enabled S3 single-file ETag/Version caching for {}",
+                "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
             return Ok(Arc::new(cached_table));
@@ -1309,6 +1347,13 @@ pub trait ListingTableConnector: DataConnector {
         }
     }
 
+    /// Drops partition columns from `schema` that the files already carry, so a
+    /// hive-partitioned dataset does not expose the same column twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a partition column collides with a file column of a
+    /// different type, which cannot be reconciled into one schema.
     fn deduplicate_partition_columns_expressed_in_file(
         &self,
         dataset: &DatasetSpec,
@@ -1378,6 +1423,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
@@ -1410,19 +1456,20 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             return Ok(());
         }
 
-        let listing_url = ListingTableUrl::parse(url).boxed().context(
-            crate::dataconnector::UnableToConnectInternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-            },
-        )?;
+        let listing_url =
+            ListingTableUrl::parse(url)
+                .boxed()
+                .context(crate::UnableToConnectInternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
 
         // Triggers SpiceObjectStoreRegistry::get_store, which builds an object
         // store from the URL fragment params (already secret-expanded by
         // ConnectorParamsBuilder when the connector was created) and registers
         // it on the runtime env keyed by the bare URL.
         runtime_env.object_store(&listing_url).boxed().context(
-            crate::dataconnector::UnableToConnectInternalSnafu {
+            crate::UnableToConnectInternalSnafu {
                 dataconnector: format!("{self}"),
                 connector_component: ConnectorComponent::from(dataset),
             },
@@ -1561,7 +1608,7 @@ fn resolve_file_compression_type(
 ) -> DataConnectorResult<FileCompressionType> {
     if let ExposedParamLookup::Present(compression) = params.get("file_compression_type").expose() {
         return compression.parse::<FileCompressionType>().boxed().context(
-            crate::dataconnector::InvalidConfigurationSnafu {
+            crate::InvalidConfigurationSnafu {
                 dataconnector: dataconnector.to_string(),
                 message: format!(
                     "Invalid file_compression_type: {compression}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"
@@ -1783,7 +1830,7 @@ fn to_listing_table_url(
     new_url.set_path(&format!("/{path}"));
 
     let sensitive_url = ListingTableUrl::parse(&new_url).boxed().context(
-        crate::dataconnector::UnableToGetSchemaInternalSnafu {
+        crate::UnableToGetSchemaInternalSnafu {
             dataconnector: dataconnector.to_string(),
             connector_component: ConnectorComponent::from(dataset),
         },
@@ -1827,6 +1874,11 @@ impl SensitiveListingTableUrl {
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
+///
+/// # Errors
+///
+/// Returns an error if `runtime.params.parquet_page_index` is not one of the
+/// accepted values, or a resulting option is rejected by `DataFusion`.
 pub fn build_table_parquet_options(
     app: Option<&Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
@@ -1890,9 +1942,9 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 
 #[cfg(test)]
 mod tests {
-    use crate::component::dataset::Dataset;
     use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
+    use datafusion::sql::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};
@@ -1902,10 +1954,9 @@ mod tests {
     use tokio::runtime::Handle;
     use url::Url;
 
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
-    use crate::dataconnector::{ConnectorParams, DataConnectorFactory};
-    use crate::parameters::ParameterSpec;
+    use crate::listing::LISTING_TABLE_PARAMETERS;
+    use crate::{ConnectorParams, DataConnectorFactory};
+    use runtime_parameters::ParameterSpec;
 
     use super::*;
 
@@ -1925,11 +1976,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = crate::dataconnector::NewDataConnectorResult> + Send>>
-        {
+            _context: &'a dyn ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = crate::NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async move {
                 let connector = Self {
                     params: params.parameters,
@@ -1967,7 +2018,7 @@ mod tests {
         ) -> DataConnectorResult<Url> {
             Url::parse("test")
                 .boxed()
-                .context(crate::dataconnector::InvalidConfigurationSnafu {
+                .context(crate::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     connector_component: ConnectorComponent::from(dataset),
                     message: "Invalid URL".to_string(),
@@ -1977,10 +2028,10 @@ mod tests {
 
     const TEST_PARAMETERS: &[ParameterSpec] = LISTING_TABLE_PARAMETERS;
 
-    async fn setup_connector(
+    fn setup_connector(
         path: String,
         params: HashMap<String, String>,
-    ) -> (TestConnector, Dataset) {
+    ) -> (TestConnector, DatasetSpec) {
         let connector = TestConnector {
             params: Parameters::new(
                 to_secret_map(params).into_iter().collect(),
@@ -1988,22 +2039,16 @@ mod tests {
                 TEST_PARAMETERS,
             ),
         };
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
 
-        let dataset = DatasetBuilder::try_new(path, "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
-
-        (connector, dataset)
+        (
+            connector,
+            DatasetSpec::new(path, TableReference::bare("test")),
+        )
     }
 
     #[tokio::test]
     async fn test_get_file_format_and_extension_require_file_format() {
-        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new()).await;
+        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new());
 
         match connector.get_file_format_and_extension(&dataset).await {
             Ok(_) => panic!("Unexpected success"),
@@ -2016,8 +2061,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_csv_extension() {
-        let (connector, dataset) =
-            setup_connector("test:test.csv".to_string(), HashMap::new()).await;
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2030,8 +2074,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_parquet_extension() {
-        let (connector, dataset) =
-            setup_connector("test:test.parquet".to_string(), HashMap::new()).await;
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2045,8 +2088,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_vortex_extension() {
-        let (connector, dataset) =
-            setup_connector("test:test.vortex".to_string(), HashMap::new()).await;
+        let (connector, dataset) = setup_connector("test:test.vortex".to_string(), HashMap::new());
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2062,7 +2104,7 @@ mod tests {
     async fn test_get_file_format_and_extension_auto_detects_vortex() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "auto".to_string());
-        let (connector, dataset) = setup_connector("test:test.vortex".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test.vortex".to_string(), params);
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2075,8 +2117,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_csv_gzip_extension() {
-        let (connector, dataset) =
-            setup_connector("test:test.csv.gz".to_string(), HashMap::new()).await;
+        let (connector, dataset) = setup_connector("test:test.csv.gz".to_string(), HashMap::new());
 
         if let Ok((Some(file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2094,7 +2135,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_file_format_and_extension_detect_jsonl_zstd_extension() {
         let (connector, dataset) =
-            setup_connector("test:test.ndjson.zst".to_string(), HashMap::new()).await;
+            setup_connector("test:test.ndjson.zst".to_string(), HashMap::new());
 
         if let Ok((Some(file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2113,7 +2154,7 @@ mod tests {
     async fn test_get_file_format_and_extension_detect_file_extension_param_compression() {
         let mut params = HashMap::new();
         params.insert("file_extension".to_string(), ".jsonl.gz".to_string());
-        let (connector, dataset) = setup_connector("test:test/".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
 
         if let Ok((Some(file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2133,7 +2174,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
         params.insert("file_compression_type".to_string(), "GZIP".to_string());
-        let (connector, dataset) = setup_connector("test:test/".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
 
         if let Ok((Some(file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2154,7 +2195,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
         params.insert("file_compression_type".to_string(), "GZIP".to_string());
-        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
 
         if let Ok((Some(file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2173,7 +2214,7 @@ mod tests {
     async fn test_get_file_format_and_extension_csv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
-        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2188,7 +2229,7 @@ mod tests {
     async fn test_get_file_format_and_extension_tsv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "tsv".to_string());
-        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2203,7 +2244,7 @@ mod tests {
     async fn test_get_file_format_and_extension_parquet_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "parquet".to_string());
-        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params).await;
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
 
         if let Ok((Some(_file_format), extension)) =
             connector.get_file_format_and_extension(&dataset).await
@@ -2302,14 +2343,7 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("file_old.parquet", 100, 100),
@@ -2339,14 +2373,7 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("file_old.csv.gz", 100, 100),
@@ -2738,18 +2765,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/prefix/".to_string(), "test")
-            .expect("to get dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .with_metadata(HashMap::from([(
-                MetadataColumn::Location(None).name().to_string(),
-                "enabled".to_string(),
-            )]))
-            .build()
-            .expect("to build dataset");
+        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::Location(None).name().to_string(),
+            "enabled".to_string(),
+        )]);
 
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
@@ -2777,14 +2797,7 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("file_old.parquet", 100, 100),
@@ -2817,14 +2830,7 @@ mod tests {
         let url = Url::parse("s3://bucket/").expect("to parse url");
         let table_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/", TableReference::bare("test"));
 
         // Empty store: no files at all at the path.
         let test_store = Arc::new(TestObjectStore::new(vec![])) as Arc<dyn ObjectStore>;
@@ -2855,14 +2861,7 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/schema/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("schema/file1.parquet", 100, 100),
@@ -2890,14 +2889,7 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/schema/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("schema/file1.csv", 100, 100),
@@ -2924,14 +2916,7 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/schema/", TableReference::bare("test"));
 
         let meta_files = vec![
             create_meta("schema/file1.csv", 100, 100),
@@ -2967,14 +2952,7 @@ mod tests {
         let url = Url::parse("s3://bucket/schema/").expect("to parse url");
         let schema_source_path = ListingTableUrl::parse(url.clone()).expect("to parse url");
         let ctx = SessionContext::new();
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let dataset = DatasetBuilder::try_new("s3://bucket/schema/".to_string(), "test")
-            .expect("Failed to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("Failed to build dataset");
+        let dataset = DatasetSpec::new("s3://bucket/schema/", TableReference::bare("test"));
 
         // Create more files than SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT
         let meta_files: Vec<ObjectMeta> = (0..SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT + 100)

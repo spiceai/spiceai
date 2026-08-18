@@ -39,6 +39,7 @@ use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::dataconnector::sink::SINK_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -1940,9 +1941,10 @@ impl DataFusion {
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
+            let context = RuntimeConnectorContext::for_dataset(&deferred_registration.dataset);
             let read_provider = deferred_registration
                 .connector
-                .read_provider(&deferred_registration.dataset)
+                .read_provider(&context, &deferred_registration.dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
 
@@ -2211,8 +2213,9 @@ impl DataFusion {
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
         let registration = async {
+            let context = RuntimeConnectorContext::for_dataset(&pending_registration.dataset);
             let read_provider = sink_connector
-                .read_provider(&pending_registration.dataset)
+                .read_provider(&context, &pending_registration.dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
             let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -2614,7 +2617,7 @@ impl DataFusion {
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
@@ -3142,11 +3145,14 @@ impl DataFusion {
             let acceleration =
                 probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
 
-            let changes_stream = source.changes_stream(
-                Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
-                dataset,
-                acceleration,
-            );
+            let changes_stream = source
+                .changes_stream(
+                    &RuntimeConnectorContext::for_dataset(dataset),
+                    Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
+                    dataset,
+                    acceleration,
+                )
+                .await;
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -3564,13 +3570,25 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
+                // The same engine-specific override the normal creation path resolves,
+                // so the archive is in the format that engine's bootstrap consumes —
+                // a Cayenne snapshot without its per-dataset metastore slice becomes
+                // the store's current snapshot and cannot be restored.
+                let snapshot_engine_override = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                {
+                    Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                    None => None,
+                };
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset_name,
+                    dataset,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
-                    None,
+                    snapshot_engine_override,
                 )
                 .await;
             }
@@ -3809,7 +3827,10 @@ impl DataFusion {
                 let sink_connector = Arc::new(SinkConnector::new(Arc::clone(&plan.evolved_schema)))
                     as Arc<dyn DataConnector>;
                 let read_provider = sink_connector
-                    .read_provider(dataset.as_ref())
+                    .read_provider(
+                        &RuntimeConnectorContext::for_dataset(dataset),
+                        dataset.as_ref(),
+                    )
                     .await
                     .context(UnableToResolveTableProviderSnafu)?;
                 let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -4250,7 +4271,7 @@ impl DataFusion {
         let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {

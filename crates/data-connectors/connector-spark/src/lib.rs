@@ -26,12 +26,13 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
-use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
@@ -112,10 +113,11 @@ impl DataConnectorFactory for SparkFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
@@ -196,6 +198,7 @@ impl DataConnector for Spark {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
@@ -210,10 +213,10 @@ impl DataConnector for Spark {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_spark as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_spark_connector,
     SPARK_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

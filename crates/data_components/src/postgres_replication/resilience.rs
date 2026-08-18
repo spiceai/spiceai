@@ -121,24 +121,32 @@ fn jitter(d: Duration) -> Duration {
 /// Classify a `pgwire_replication::PgWireError` as transient (worth
 /// reconnecting) or fatal (propagate to the user).
 ///
-/// We look at the *error path* rather than specific variants, since
-/// pgwire-replication may add variants over time. The heuristic: anything
-/// that looks like an IO / connection / EOF error is transient; authentication,
-/// protocol, and decoding errors are not. A slot that can no longer supply changes
-/// is neither — see [`is_slot_unusable`], which this defers to first.
+/// Anything that looks like an IO / connection / EOF error,
+/// or a connection-lifecycle / server-shutdown SQLSTATE is transient; authentication,
+/// protocol, internal, worker task panics, or decoding errors are fatal. A slot that
+/// can no longer supply changes is neither — see [`is_slot_unusable`], which this
+/// defers to first.
 #[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
-    // A slot that can no longer supply changes refuses every attempt identically,
-    // so it is never worth retrying — and it has to be excluded here rather than
-    // just ordered around at each call site, because its message trips the generic
-    // markers below: `PostgreSQL` 18's idle-invalidation detail names
-    // `idle_replication_slot_timeout`, and "timeout" is a transient marker. Left in,
-    // that reads as a network blip and reconnects against a slot that will never
-    // accept another `START_REPLICATION`, forever.
+    // A slot that can no longer supply changes refuses every attempt identically, so
+    // it is never worth retrying — and it has to be excluded here rather than ordered
+    // around at each call site, because its message trips the markers below:
+    // `PostgreSQL` 18's idle-invalidation detail names
+    // `idle_replication_slot_timeout`, and "timeout" is one of them. Left in, that
+    // reads as a network blip and reconnects against a slot that will never accept
+    // another `START_REPLICATION`, forever.
     if is_slot_unusable(err) {
         return false;
     }
-    is_transient_by_display(&err.to_string())
+    match err {
+        pgwire_replication::PgWireError::Io(_) => true,
+        pgwire_replication::PgWireError::Server(msg)
+        | pgwire_replication::PgWireError::Tls(msg) => is_transient_by_display(msg),
+        pgwire_replication::PgWireError::Auth(_)
+        | pgwire_replication::PgWireError::Protocol(_)
+        | pgwire_replication::PgWireError::Internal(_)
+        | pgwire_replication::PgWireError::Task(_) => false,
+    }
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
@@ -147,15 +155,19 @@ pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
     if err.is_closed() {
         return true;
     }
-    // Postgres SQLSTATE classes: 08xxx = connection exception (transient),
-    // 57P0x = admin shutdown / cannot-connect-now (transient).
+    // Postgres SQLSTATE classes: 08xxx = connection exception (transient, excluding 08P01 protocol_violation),
+    // 57P0x = admin shutdown / cannot-connect-now (transient: 57P01, 57P02, 57P03).
     if let Some(db_err) = err.as_db_error() {
         let code = db_err.code().code();
-        if code.starts_with("08") || code == "57P01" || code == "57P02" || code == "57P03" {
+        if (code.starts_with("08") && code != "08P01")
+            || code == "57P01"
+            || code == "57P02"
+            || code == "57P03"
+        {
             return true;
         }
         // Anything else from the server is a structured error (permission,
-        // syntax, constraint). Don't retry those.
+        // syntax, constraint, database dropped 57P04, protocol violation 08P01). Don't retry those.
         return false;
     }
     is_transient_by_display(&err.to_string())
@@ -212,6 +224,7 @@ fn is_transient_by_display(msg: &str) -> bool {
         "unexpected eof",
         "unexpected end of file",
         "early eof",
+        "eof while reading",
         "temporarily unavailable",
         "timed out",
         "timeout",
@@ -236,26 +249,40 @@ fn is_transient_by_display(msg: &str) -> bool {
         "sqlstate 53300",
         "max_wal_senders",
         "too many connections",
-        // SQLSTATE 57P01 (admin_shutdown): "terminating connection due to
-        // administrator command". An orderly server restart raises it, and so
-        // does `PostgreSQL` killing the walsender that holds a slot it is
-        // invalidating ("terminating process N to release replication slot").
-        // Reconnecting is right in both cases: a restarted server resumes the
-        // stream, and a released slot surfaces its invalidation on the next
-        // `START_REPLICATION`, where `is_slot_unusable` can act on it. The
-        // tokio-postgres classifier already treats 57P01 as transient by code;
-        // this is the same judgement for the replication client, which only
-        // exposes the rendered message.
+        // SQLSTATE 57P01/57P02/57P03 (operator_intervention): admin shutdown, crash shutdown,
+        // cannot connect now. Note that 57P04 (database_dropped) is fatal and excluded below.
         //
-        // Reconnecting rather than ending the stream does make a pre-existing race
-        // reachable: a dataset joining while the slot is invalidated recreates it
+        // `PostgreSQL` also kills the walsender holding a slot it is invalidating
+        // ("terminating process N to release replication slot"), so an invalidation
+        // reaches this classifier as 57P01 *before* it reaches `is_slot_unusable`.
+        // Reconnecting is what lets the next `START_REPLICATION` report the refusal
+        // so `shared::recover_unusable_slot` can replace the slot; classifying it
+        // fatal instead ended the dataset. It also makes a pre-existing race
+        // reachable — a dataset joining while the slot is invalidated recreates it
         // through `slot::ensure_slot`, and members already streaming are not told
-        // that their recorded positions no longer reach the replacement (#13229).
-        // The previous fatal classification masked that by killing the stream first.
+        // their recorded positions no longer reach the replacement (#13229).
         "sqlstate 57p01",
-        "terminating connection due to administrator command",
+        "sqlstate 57p02",
+        "sqlstate 57p03",
+        "admin shutdown",
+        "administrator command",
+        "crash shutdown",
+        "cannot connect now",
+        // SQLSTATE 08xxx (connection_exception): connection does not exist,
+        // connection failure, sqlclient unable to establish sqlconnection, etc.
+        // Note that 08P01 (protocol_violation) is excluded below.
+        "sqlstate 08",
     ];
+
     let lower = msg.to_ascii_lowercase();
+
+    // Explicit fatal exclusions:
+    // - SQLSTATE 08P01 is protocol_violation (fatal)
+    // - SQLSTATE 57P04 is database_dropped (fatal)
+    if lower.contains("08p01") || lower.contains("57p04") {
+        return false;
+    }
+
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
@@ -442,13 +469,44 @@ mod tests {
         assert!(is_transient_by_display("Connection reset by peer"));
         assert!(is_transient_by_display("broken pipe"));
         assert!(is_transient_by_display("unexpected EOF"));
+        assert!(is_transient_by_display(
+            "EOF while reading backend message header"
+        ));
+        assert!(is_transient_by_display("EOF while reading backend message"));
         assert!(is_transient_by_display("operation timed out"));
+        assert!(is_transient_by_display(
+            "server error: terminating connection due to administrator command (SQLSTATE 57P01)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is shutting down (SQLSTATE 57P01)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is shutting down (SQLSTATE 57P02)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is in recovery mode (SQLSTATE 57P03)"
+        ));
+        assert!(is_transient_by_display(
+            "the database system is starting up (SQLSTATE 57P03)"
+        ));
+        assert!(is_transient_by_display(
+            "connection exception (SQLSTATE 08006)"
+        ));
+        assert!(!is_transient_by_display(
+            "protocol violation (SQLSTATE 08P01)"
+        ));
         assert!(!is_transient_by_display("syntax error at or near"));
         assert!(!is_transient_by_display(
             "permission denied for table users"
         ));
         assert!(!is_transient_by_display(
             "replication slot \"foo\" does not exist"
+        ));
+        assert!(!is_transient_by_display(
+            "database \"db\" has been dropped (SQLSTATE 57P04)"
+        ));
+        assert!(!is_transient_by_display(
+            "could not seek to end of file (SQLSTATE XX000)"
         ));
     }
 
@@ -467,6 +525,72 @@ mod tests {
         .await;
         assert_eq!(result, Ok("success"));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn io_and_eof_errors_are_transient() {
+        // All pgwire IO errors are transient regardless of description
+        let eof_header =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message header",
+            )));
+        assert!(is_transient_pgwire(&eof_header));
+
+        let eof_payload =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message payload",
+            )));
+        assert!(is_transient_pgwire(&eof_payload));
+
+        let eof_message =
+            pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF while reading backend message",
+            )));
+        assert!(is_transient_pgwire(&eof_message));
+
+        let reset = pgwire_replication::PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer",
+        )));
+        assert!(is_transient_pgwire(&reset));
+
+        let task_err = pgwire_replication::PgWireError::Task("worker task dropped".to_string());
+        assert!(!is_transient_pgwire(&task_err));
+
+        let tls_timeout = pgwire_replication::PgWireError::Tls("handshake timed out".to_string());
+        assert!(is_transient_pgwire(&tls_timeout));
+
+        let server_shutdown = pgwire_replication::PgWireError::Server(
+            "terminating connection due to administrator command (SQLSTATE 57P01)".to_string(),
+        );
+        assert!(is_transient_pgwire(&server_shutdown));
+
+        let server_proto_violation = pgwire_replication::PgWireError::Server(
+            "protocol violation (SQLSTATE 08P01)".to_string(),
+        );
+        assert!(!is_transient_pgwire(&server_proto_violation));
+
+        let server_dropped = pgwire_replication::PgWireError::Server(
+            "database \"test\" has been dropped (SQLSTATE 57P04)".to_string(),
+        );
+        assert!(!is_transient_pgwire(&server_dropped));
+
+        let auth_err =
+            pgwire_replication::PgWireError::Auth("password authentication failed".to_string());
+        assert!(!is_transient_pgwire(&auth_err));
+
+        // Protocol & internal errors must never be transient, even if their message contains EOF markers
+        let proto_err = pgwire_replication::PgWireError::Protocol(
+            "unexpected end of file while decoding a tuple".to_string(),
+        );
+        assert!(!is_transient_pgwire(&proto_err));
+
+        let internal_err =
+            pgwire_replication::PgWireError::Internal("unexpected eof in parser".to_string());
+        assert!(!is_transient_pgwire(&internal_err));
     }
 
     #[tokio::test]
