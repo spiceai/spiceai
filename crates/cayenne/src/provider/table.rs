@@ -34169,7 +34169,7 @@ mod tests {
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
             Some(CachedPkIndex::Bloom(bloom)) => {
-                let bloom_bytes = bloom.bits.len() * 8;
+                let bloom_bytes = bloom.size_bytes();
                 assert!(
                     bloom_bytes <= budget_bytes / 4,
                     "conversion bloom must be right-sized, got {bloom_bytes} bytes for a {budget_bytes}-byte budget"
@@ -46881,7 +46881,7 @@ mod tests {
             deserialize_pk_bloom_sidecar(&bytes).expect("sidecar roundtrips");
 
         assert_eq!(snapshot_id, "snap-abc-123");
-        assert_eq!(restored.bit_mask, bloom.bit_mask);
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
         assert_eq!(restored.inserted_keys, bloom.inserted_keys);
         for key in &keys {
             assert!(
