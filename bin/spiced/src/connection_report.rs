@@ -59,18 +59,24 @@ impl CompletionReport {
             |org| terminal_text(org).into_owned(),
         );
 
-        match session.app_name.as_deref() {
-            Some(app) => Self {
-                headline: format!(
-                    "Spice Cloud Connect: connected to {org} / {}",
-                    terminal_text(app)
-                ),
+        // `app_id` is the attachment; the name only labels it, and an
+        // attachment can arrive without one. So the name falls back the way
+        // `org` does, rather than an instance that holds a project being told it
+        // has none and offered a link to create the one it already has.
+        if session.app_id.is_some() {
+            let app = session
+                .app_name
+                .as_deref()
+                .map_or(Cow::Borrowed("attached project"), terminal_text);
+            Self {
+                headline: format!("Spice Cloud Connect: connected to {org} / {app}"),
                 link: session
                     .monitor_url
                     .as_deref()
                     .map(|url| format!("Monitor: {url}")),
-            },
-            None => Self {
+            }
+        } else {
+            Self {
                 headline: format!(
                     "Spice Cloud Connect: connected to {org} — not yet attached to a project"
                 ),
@@ -78,7 +84,7 @@ impl CompletionReport {
                     .new_project_url
                     .as_deref()
                     .map(|url| format!("Create one: {url}")),
-            },
+            }
         }
     }
 
@@ -189,13 +195,17 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn session(app_name: Option<&str>) -> AcknowledgedSession {
+    /// `app_id` is what makes the instance attached; `app_name` only labels the
+    /// attachment, and the two are supplied separately because the control plane
+    /// can deliver the first without the second.
+    fn session(app_id: Option<&str>, app_name: Option<&str>) -> AcknowledgedSession {
         AcknowledgedSession {
             identifier: "inst_abc".to_string(),
             // No identity on disk: `refreshed` then falls back to this
             // snapshot, which is what these cases are about.
             identity_path: std::path::PathBuf::from("/nonexistent/identity.json"),
             org_name: Some("acme".to_string()),
+            app_id: app_id.map(str::to_string),
             app_name: app_name.map(str::to_string),
             monitor_url: Some("https://spice.ai/acme/edge/monitor".to_string()),
             new_project_url: Some("https://spice.ai/acme/new?instance=inst_abc".to_string()),
@@ -204,7 +214,7 @@ mod tests {
 
     #[test]
     fn an_attached_instance_is_reported_with_its_project_and_monitor_page() {
-        let report = CompletionReport::of(&session(Some("edge")));
+        let report = CompletionReport::of(&session(Some("14034"), Some("edge")));
         assert_eq!(
             report.headline,
             "Spice Cloud Connect: connected to acme / edge"
@@ -217,7 +227,7 @@ mod tests {
 
     #[test]
     fn a_detached_instance_is_sent_to_create_a_project() {
-        let report = CompletionReport::of(&session(None));
+        let report = CompletionReport::of(&session(None, None));
         assert_eq!(
             report.headline,
             "Spice Cloud Connect: connected to acme — not yet attached to a project"
@@ -236,9 +246,34 @@ mod tests {
         );
     }
 
+    /// An attachment the control plane delivered without its display metadata.
+    /// The instance holds a project, so reporting it as unattached — and
+    /// offering to create the project it already has — is the failure this
+    /// guards. `monitor_url` is absent here because it arrives with the name it
+    /// is missing.
+    #[test]
+    fn an_attachment_the_cloud_named_nothing_for_is_still_reported_as_attached() {
+        let mut unlabelled = session(Some("14034"), None);
+        unlabelled.monitor_url = None;
+        let report = CompletionReport::of(&unlabelled);
+
+        assert_eq!(
+            report.headline,
+            "Spice Cloud Connect: connected to acme / attached project"
+        );
+        assert!(
+            !report.headline.contains("not yet attached"),
+            "an instance holding a project must never be told it has none: {}",
+            report.headline
+        );
+        // No monitor page was supplied, and the create-a-project link is for an
+        // instance without one — so there is nothing honest to offer.
+        assert_eq!(report.link, None);
+    }
+
     #[test]
     fn control_plane_names_cannot_inject_terminal_lines_or_escapes() {
-        let mut acknowledged = session(Some("edge\n\u{1b}[31m"));
+        let mut acknowledged = session(Some("14034"), Some("edge\n\u{1b}[31m"));
         acknowledged.org_name = Some("acme\radmin".to_string());
         let report = CompletionReport::of(&acknowledged);
 
@@ -253,18 +288,18 @@ mod tests {
 
     #[test]
     fn a_destination_is_never_invented_when_the_cloud_supplied_none() {
-        let mut detached = session(None);
+        let mut detached = session(None, None);
         detached.new_project_url = None;
         assert!(CompletionReport::of(&detached).link.is_none());
 
-        let mut attached = session(Some("edge"));
+        let mut attached = session(Some("14034"), Some("edge"));
         attached.monitor_url = None;
         assert!(CompletionReport::of(&attached).link.is_none());
     }
 
     #[test]
     fn an_instance_whose_org_was_never_named_is_still_identified() {
-        let mut anonymous = session(None);
+        let mut anonymous = session(None, None);
         anonymous.org_name = None;
         assert_eq!(
             CompletionReport::of(&anonymous).headline,
@@ -296,19 +331,19 @@ mod tests {
 
         match order {
             Order::AcknowledgedThenServing => {
-                ack.record(session(Some("edge")));
+                ack.record(session(Some("14034"), Some("edge")));
                 tokio::task::yield_now().await;
                 serving.cancel();
             }
             Order::ServingThenAcknowledged => {
                 serving.cancel();
                 tokio::task::yield_now().await;
-                ack.record(session(Some("edge")));
+                ack.record(session(Some("14034"), Some("edge")));
             }
             // Each half alone is not a completion: the process goes down with
             // one of the two facts never established.
             Order::AcknowledgedOnly => {
-                ack.record(session(Some("edge")));
+                ack.record(session(Some("14034"), Some("edge")));
                 tokio::task::yield_now().await;
                 shutdown.cancel();
             }
@@ -354,7 +389,7 @@ mod tests {
         let ack = SessionAck::new();
         let serving = CancellationToken::new();
         let withdrawn = CancellationToken::new();
-        ack.record(session(Some("edge")));
+        ack.record(session(Some("14034"), Some("edge")));
         serving.cancel();
         withdrawn.cancel();
 

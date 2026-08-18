@@ -2431,8 +2431,21 @@ async fn authenticated_enrollment_carries_the_session_and_no_key() {
     // The server side of the exclusivity contract: a hand-crafted request
     // carrying BOTH a login authorization and a token is rejected before
     // anything is consumed. (The typed client cannot even represent it.)
-    let both = reqwest::Client::new()
-        .post(format!("http://{}/v1/cloud-connect/enroll", harness.cloud_addr))
+    // The mock serves TLS, so the raw request has to as well, trusting the
+    // harness CA the way the typed client does.
+    let mut raw = reqwest::Client::builder();
+    for certificate in reqwest::Certificate::from_pem_bundle(harness.ca.ca_cert_pem.as_bytes())
+        .expect("the harness CA is a PEM bundle")
+    {
+        raw = raw.add_root_certificate(certificate);
+    }
+    let both = raw
+        .build()
+        .expect("build a client trusting the harness CA")
+        .post(format!(
+            "https://{}/v1/cloud-connect/enroll",
+            harness.cloud_addr
+        ))
         .header("Idempotency-Key", "op-carrying-both-authorities")
         .bearer_auth(SESSION_BEARER)
         .header("X-Org-Name", ORG_NAME)
@@ -3060,6 +3073,10 @@ async fn heartbeat_and_telemetry_cadence() {
                 // This handle cannot report status, so it must leave the phase
                 // unspecified rather than inventing an "online".
                 && h.phase == proto::RuntimePhase::Unspecified as i32
+                // Nor does it have a restart-state source of truth, so it
+                // claims nothing: absent on the wire, not a present-but-empty
+                // set, which the control plane would read as "nothing pending".
+                && h.standalone_runtime.is_none()
         });
         let tel_ok = c.telemetry.iter().any(|t| {
             t.identifier == ASSIGNED_ID
