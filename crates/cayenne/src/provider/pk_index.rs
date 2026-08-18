@@ -421,15 +421,6 @@ pub(crate) fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
 /// checks before trusting a blob's bits.
 const PK_BLOOM_NUM_HASHES: u32 = 7;
 
-/// Discriminant for a version-3 (split-block) serialized filter, in the field
-/// version 2 uses for `bit_mask`.
-///
-/// Chosen so it can never be a valid v2 `bit_mask`, which is always `2^k - 1`
-/// for a power-of-two bit count: this value has zeros interleaved through it, so
-/// a v2 reader's `num_bits == bit_mask + 1` check rejects a v3 blob
-/// deterministically instead of merely probably.
-const PK_BLOOM_V3_MAGIC: u64 = 0x4350_4b46_5633_0001;
-
 /// Seeded FNV-1a-64. Dependency-free and adequate for a Bloom filter; two
 /// independent seeds feed the Kirsch–Mitzenmacher double-hashing scheme below.
 fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
@@ -750,6 +741,7 @@ impl PkBloom {
     }
 
     /// The frame version this filter serializes as.
+    #[cfg(test)]
     pub(crate) fn frame_version(&self) -> u32 {
         frame_of(&self.repr).0
     }
@@ -772,7 +764,9 @@ impl PkBloom {
         // replaces.
         let hash = hash_index::hash_key_bytes_oneshot(key);
         let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
-        let low = hash as u32;
+        // The low half, deliberately: the high half already chose the block, so
+        // the lanes draw on bits the block selection did not consume.
+        let low = u32::try_from(hash & u64::from(u32::MAX)).unwrap_or(0);
         let mut masks = [0u32; 8];
         for (mask, salt) in masks.iter_mut().zip(SPLIT_BLOCK_SALT) {
             // Top five bits of the product pick one of the lane's 32 bits.
@@ -2446,14 +2440,6 @@ mod tests {
             return false;
         };
         Some(num_bits) == bit_mask.checked_add(1) && num_bits.is_power_of_two()
-    }
-
-    fn sample_bloom() -> PkBloom {
-        let mut bloom = PkBloom::with_expected_keys(100, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
-        for n in 0..100u64 {
-            bloom.insert(&key(n));
-        }
-        bloom
     }
 
     /// A filter in the pre-frame SCATTERED shape, which nothing writes any more
