@@ -9131,19 +9131,37 @@ impl CayenneTableProvider {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
                 blooms.push(bloom);
             } else {
-                // A live cold file without a usable bloom (legacy row, over
-                // the per-file cap, or corrupt) means the union would omit
-                // that file's keys. Missing a cold key would let an upsert
+                // A live cold file without a usable bloom means the union would
+                // omit that file's keys. Missing a cold key would let an upsert
                 // false-negative and double-count, so fall back to the exact
                 // cold scan for the whole table. Nothing to publish and nothing
                 // to pair: the exact fold reads the manifest under the rebuild's
                 // own fence.
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    file = f.file_url.as_str(),
-                    "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
-                );
+                //
+                // The two ways to get here are not equally normal, so they do
+                // not share a level. Having no bloom at all is routine — a row
+                // written before per-file blooms existed, or a file over the
+                // per-file cap. Having bloom bytes this build declines to read
+                // is not: the frame is corrupt, or its format version or probe
+                // function is not this binary's, and the table pays the exact
+                // cold scan on every rebuild until those files are re-promoted.
+                // That is the conservative outcome, but it is a standing cost
+                // nobody would find at DEBUG.
+                if f.pk_bloom.is_some() {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        file = f.file_url.as_str(),
+                        "Cold-tier file's PK bloom is unreadable by this build (corrupt, or a different bloom format or probe function); keyset rebuild falls back to the exact cold scan until the file is re-promoted"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        file = f.file_url.as_str(),
+                        "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
+                    );
+                }
                 self.store_cold_pk_existence(None);
                 return Ok(ColdKeysetPlan {
                     source: ColdKeysetSource::Scan,
