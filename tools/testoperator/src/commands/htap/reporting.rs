@@ -498,6 +498,20 @@ const CAYENNE_OPERATION_SERIES: &[(&str, &str, OperationPath)] = &[
         "cayenne_mem_tier_reserve_refused_total",
         OperationPath::Write,
     ),
+    // Paired with inline_tombstone_writes by design: the telemetry exists to make
+    // the tombstone-vs-rewrite ratio observable, and a rewrite is the O(corpus)
+    // branch. Reporting the cheap side alone would show a run that fell back to
+    // more rewrites as having done less work.
+    (
+        "inline_rewrite_fallbacks",
+        "cayenne_inline_rewrite_fallbacks_total",
+        OperationPath::Write,
+    ),
+    (
+        "inline_fallbacks",
+        "cayenne_inline_fallback_total",
+        OperationPath::Write,
+    ),
     (
         "inline_cache_full_rebuilds",
         "cayenne_inline_cache_full_rebuilds_total",
@@ -1367,6 +1381,8 @@ mod tests {
             ("write_phases", OperationPath::Write),
             ("inline_tombstone_writes", OperationPath::Write),
             ("mem_tier_reserve_refused", OperationPath::Write),
+            ("inline_rewrite_fallbacks", OperationPath::Write),
+            ("inline_fallbacks", OperationPath::Write),
             ("inline_cache_full_rebuilds", OperationPath::Read),
             ("inline_cache_delta_populates", OperationPath::Read),
         ] {
@@ -1375,6 +1391,21 @@ mod tests {
                 .find(|(name, ..)| *name == label)
                 .map(|(_, _, path)| *path);
             assert_eq!(found, Some(expected), "{label} is on the wrong path");
+        }
+    }
+
+    /// The tombstone-vs-rewrite ratio is only readable if both halves are reported;
+    /// the rewrite is the O(corpus) branch, so reporting the cheap side alone would
+    /// show a run that fell back to more rewrites as having done less work.
+    #[test]
+    fn both_halves_of_the_tombstone_rewrite_ratio_are_reported() {
+        for label in ["inline_tombstone_writes", "inline_rewrite_fallbacks"] {
+            assert!(
+                CAYENNE_OPERATION_SERIES
+                    .iter()
+                    .any(|(name, ..)| *name == label),
+                "{label} missing: the ratio needs both halves"
+            );
         }
     }
 
