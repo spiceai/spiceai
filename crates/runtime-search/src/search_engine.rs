@@ -26,8 +26,8 @@ use crate::error::{
     AdditionalColumnNotFoundSnafu, CannotSearchDatasetSnafu, DataFusionSnafu, Error,
     FormattingSnafu, Result, SearchPipelineSnafu,
 };
-use snafu::ensure;
 use crate::table_provider_explorer::TableProviderExplorer;
+use snafu::ensure;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
@@ -424,11 +424,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         additional_columns: &[Column],
     ) -> Result<()> {
         for tbl in tables {
-            let table_provider = self.df.get_table(tbl).await.ok_or_else(|| {
-                Error::DataSourcesNotFound {
-                    data_source: vec![tbl.clone()],
-                }
-            })?;
+            let table_provider =
+                self.df
+                    .get_table(tbl)
+                    .await
+                    .ok_or_else(|| Error::DataSourcesNotFound {
+                        data_source: vec![tbl.clone()],
+                    })?;
 
             if explicit_datasets_requested {
                 ensure!(
@@ -441,14 +443,13 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
 
             let schema = table_provider.schema();
             for col in additional_columns {
-                let col_applies =
-                    col.relation.as_ref().is_none_or(|rel| {
-                        tbl.clone()
+                let col_applies = col.relation.as_ref().is_none_or(|rel| {
+                    tbl.clone()
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        == rel
+                            .clone()
                             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                            == rel
-                                .clone()
-                                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                    });
+                });
 
                 if col_applies {
                     ensure!(
