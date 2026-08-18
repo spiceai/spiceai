@@ -765,7 +765,12 @@ impl PkBloom {
     /// split-block layout. Fixed length and branch-free so it vectorises.
     #[inline]
     fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
-        let hash = twox_hash::XxHash3_64::oneshot(key);
+        // The crate's existing one-shot XXH3-64, the same primitive the WAL
+        // checksum and the frame fingerprint use. One-shot rather than the
+        // streaming `Hasher`: for a 16-byte key the streaming path's setup
+        // costs more than the hash, and more than the two FNV passes it
+        // replaces.
+        let hash = hash_index::hash_key_bytes_oneshot(key);
         let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
         let low = hash as u32;
         let mut masks = [0u32; 8];

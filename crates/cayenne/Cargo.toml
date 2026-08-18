@@ -52,7 +52,6 @@ telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
-twox-hash = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
