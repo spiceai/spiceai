@@ -45,7 +45,7 @@ pub(crate) mod write_util;
 #[cfg(feature = "llms")]
 pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;
-pub use vector_table::{VectorIndexJoin, VectorScanTableProvider};
+pub use vector_table::VectorScanTableProvider;
 
 #[cfg(feature = "text_search")]
 use crate::generation::text_search::index::FullTextDatabaseIndex;

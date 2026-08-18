@@ -3079,10 +3079,8 @@ mod tests {
         let vector_scan: Arc<dyn TableProvider> =
             Arc::new(search::index::VectorScanTableProvider {
                 table_provider: indexed_mem_table(),
-                indexes: vec![search::index::VectorIndexJoin {
-                    vector_index_list: Arc::new(plan),
-                    primary_key: vec![],
-                }],
+                primary_key: vec![],
+                index_list_plans: vec![Arc::new(plan)],
             })
             .into_table();
 
