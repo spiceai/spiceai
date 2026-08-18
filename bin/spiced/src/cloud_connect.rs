@@ -1911,6 +1911,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
         )
     }
 
+    /// Always `Some`: this handle holds the pending set, so an empty answer
+    /// means nothing is pending rather than nothing known.
+    ///
+    /// Read from the same place [`SpicedRuntimeHandle::status`] reads it, so the
+    /// heartbeat and the status document cannot report different sets.
+    async fn restart_required(&self) -> Option<Vec<String>> {
+        Some(self.pending.read().restart_required())
+    }
+
     async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
         let Some(reader) = &self.metrics else {
             return Ok(None);
@@ -4502,14 +4511,19 @@ tools:
     }
 
     /// What is pending is what `GetStatus` reports, so a caller that asked
-    /// after the deploy reads the same answer as one that watched it.
+    /// after the deploy reads the same answer as one that watched it — and the
+    /// heartbeat carries that same set, from the same source, so a caller
+    /// watching only the heartbeat is not told something else.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_reports_what_the_last_deployment_left_pending() {
+    async fn status_and_heartbeat_report_what_the_last_deployment_left_pending() {
         let dir = scratch_dir("status-pending");
         let handle = handle_serving(&dir, SERVING).await;
 
         let status = handle.status().await.expect("status is reported");
         assert_eq!(status.detail["restart_required"], serde_json::json!([]));
+        // Present and empty, never absent: this handle holds the pending set,
+        // so an empty answer means nothing is pending, not nothing known.
+        assert_eq!(handle.restart_required().await, Some(Vec::new()));
 
         let deployed = format!("{SERVING}runtime:\n  dataset_load_parallelism: 2\n");
         handle
@@ -4521,6 +4535,10 @@ tools:
         assert_eq!(
             status.detail["restart_required"],
             serde_json::json!(["runtime"])
+        );
+        assert_eq!(
+            handle.restart_required().await,
+            Some(vec!["runtime".to_string()])
         );
 
         let _ = std::fs::remove_dir_all(&dir);

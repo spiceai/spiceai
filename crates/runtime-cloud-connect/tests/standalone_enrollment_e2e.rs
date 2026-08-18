@@ -3060,6 +3060,10 @@ async fn heartbeat_and_telemetry_cadence() {
                 // This handle cannot report status, so it must leave the phase
                 // unspecified rather than inventing an "online".
                 && h.phase == proto::RuntimePhase::Unspecified as i32
+                // Nor does it have a restart-state source of truth, so it
+                // claims nothing: absent on the wire, not a present-but-empty
+                // set, which the control plane would read as "nothing pending".
+                && h.standalone_runtime.is_none()
         });
         let tel_ok = c.telemetry.iter().any(|t| {
             t.identifier == ASSIGNED_ID
