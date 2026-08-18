@@ -803,6 +803,7 @@ impl DataConnector for MongoDB {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         let mongo_sys = changes::resolve_checkpoint_store(context, dataset).await;
         Some(changes::build_changes_stream(

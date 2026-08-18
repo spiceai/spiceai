@@ -19,22 +19,15 @@ limitations under the License.
 //! Two distinct use cases share this command:
 //!
 //! 1. **Cloud Connect enrollment** (remote management of `spiced` from
-//!    Spice Cloud). On a host logged in with `spice login`, no code is
-//!    needed — the CLI mints one and redeems it in the same command:
-//!
-//!    ```text
-//!    sudo spice connect --install
-//!    ```
-//!
-//!    On a host with no login, the operator passes a code minted in the
+//!    Spice Cloud). This foundation accepts a one-shot key created in the
 //!    Spice Cloud portal:
 //!
 //!    ```text
-//!    spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
+//!    spice connect spice-enroll-abcdefghijklmnopqrstuvwxyz012345
 //!    ```
 //!
-//!    The command **enrolls and exits**: it stages the code, installs the
-//!    runtime if missing, completes the HTTPS enroll (identity issued and
+//!    The command **enrolls and exits**: it installs the runtime if missing,
+//!    completes the HTTPS enroll (identity issued and
 //!    persisted, registry row created), prints the next steps, and returns.
 //!    It starts `spiced` only when `--install` asks for a persistent
 //!    service. `status`/`remove` inspect and clear the local state.
@@ -44,7 +37,6 @@ limitations under the License.
 //!    deprecation notice and behaves like `spice add <pod>` with Spice.ai
 //!    Cloud authentication headers.
 
-mod mint;
 mod service;
 
 use std::path::{Path, PathBuf};
@@ -53,10 +45,13 @@ use crate::commands::add::{AddArgs, execute_add_or_connect};
 use crate::context::RuntimeContext;
 use crate::error::{Error, Result};
 use clap::{Args, Subcommand};
-use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE};
+use runtime_cloud_connect::config::{CloudConnectConfig, IDENTITY_FILE};
+use runtime_cloud_connect::enrollment_key::looks_like_enrollment_key;
+use secrecy::{ExposeSecret as _, SecretString};
 
-/// File (relative to the config dir) holding a `--endpoint` override so later
-/// `spiced` starts reach the same control plane the enroll did.
+/// Legacy file (relative to the config dir) holding an endpoint override.
+/// Fresh enrollment stores its canonical control-plane binding in the identity;
+/// this path remains only for compatibility and cleanup.
 const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
 
 /// Arguments for the `spice connect` command.
@@ -65,24 +60,17 @@ const CLOUD_ENDPOINT_FILE: &str = "cloud-endpoint";
     about = "Enroll this host with Spice Cloud (or add a cloud-hosted Spicepod)",
     long_about = r#"`spice connect` enrolls this host with Spice Cloud and exits.
 
-  spice connect                           Enroll using the `spice login`
-                                          credential on this host: the CLI
-                                          mints a single-use adoption code and
-                                          redeems it in the same command, so
-                                          there is nothing to copy from the
-                                          portal. The code is never displayed
-                                          and never written to disk.
-  spice connect SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX
-                                          Enroll with an adoption code from the
+  spice connect spice-enroll-<32 base64url characters>
+                                          Enroll with a one-shot key from the
                                           Spice Cloud portal, for hosts with no
                                           login: the identity is issued and
                                           stored locally, the instance appears
                                           in the portal registry, and the
                                           command exits.
-  sudo spice connect --install            Enroll (if needed) and install
+  sudo spice connect --install            For a previously enrolled directory,
+                                          install
                                           `spiced --cloud-connect` as a
-                                          persistent system service — systemd
-                                          on Linux, a launchd daemon on macOS.
+                                          persistent systemd service on Linux.
                                           Re-run to upgrade in place: latest
                                           binary, rewritten service definition,
                                           service restarted, staged identity
@@ -108,25 +96,18 @@ per-instance state lives under `<dir>/.spice`, so multiple instances on one
 host enroll independently. `SPICE_CONFIG_DIR` overrides the derived location
 entirely and wins over `--dir`.
 
-`--install` requires root, and either Linux with systemd or macOS with
-launchd. Containers use the env-var flow (`SPICE_CONNECT_ADOPT_CODE` plus
-`spiced --cloud-connect`) under the container runtime's restart policy; Windows
-enrolls and runs under the user's own supervisor.
-
-ENVIRONMENT
-  SPICE_CONNECT_ADOPT_CODE                Adoption code, for hosts with no CLI.
-  SPICE_CONNECT_ADOPT_APP_NAME            Mirrors --app-name.
-  SPICE_CONNECT_ADOPT_CREATE              Mirrors --create.
-  SPICE_CONNECT_ADOPT_REGION              Mirrors --region.
+`--install` requires root and Linux with systemd. Containers use
+`spiced --token <enrollment-key>` for unattended enrollment under the
+container runtime's restart policy. This layer does not provide service
+lifecycle management on macOS or Windows.
 
 DEPRECATED POD-ADD BEHAVIOR:
   spice connect <org>/<pod>               Deprecated; use `spice add <org>/<pod>`.
 
 EXAMPLES
   sudo spice connect --install
-  spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F
-  spice connect SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F --dir /opt/edge-1
-  spice connect --region on-prem-syd --app-name edge-fleet
+  spice connect spice-enroll-abcdefghijklmnopqrstuvwxyz012345
+  spice connect spice-enroll-abcdefghijklmnopqrstuvwxyz012345 --dir /opt/edge-1
   spice connect status
   sudo spice connect remove
 
@@ -139,13 +120,13 @@ pub struct ConnectArgs {
     #[command(subcommand)]
     pub command: Option<ConnectCommand>,
 
-    /// First positional argument: either a Spice Cloud adoption code
-    /// (`SPICE-ADOPT-...`) or a Spicepod path (`<org>/<pod>`). Omitted on a
-    /// host logged in with `spice login`, which mints its own code.
+    /// First positional argument: either a Spice Cloud enrollment key
+    /// (`spice-enroll-...`) or a Spicepod path (`<org>/<pod>`). Omit it only
+    /// to inspect/install an already-enrolled directory in this layer.
     #[arg(value_name = "TARGET")]
-    pub target: Option<String>,
+    pub target: Option<ConnectTarget>,
 
-    /// Override the Spice Cloud enroll endpoint the adoption code is
+    /// Override the Spice Cloud enroll endpoint the enrollment authority is
     /// presented to. Defaults to `https://api.spice.ai`. Also
     /// configurable via `SPICE_CLOUD_ENDPOINT`. The gateway (stream)
     /// address is issued by the enroll response, not configured here.
@@ -153,21 +134,12 @@ pub struct ConnectArgs {
     pub endpoint: Option<String>,
 
     /// The instance directory: per-instance Cloud Connect state (the
-    /// identity and staged adoption code) lives under `<dir>/.spice`.
+    /// identity and retry-safe enrollment draft) lives under `<dir>/.spice`.
     /// Defaults to the current directory; resolved to an absolute path at
     /// enroll time. `SPICE_CONFIG_DIR` overrides the derived `.spice`
     /// location entirely. Applies to enrollment, `status`, and `remove`.
     #[arg(long, value_name = "PATH", global = true)]
     pub dir: Option<PathBuf>,
-
-    /// Which Spice Cloud org to enroll into, when the `spice login`
-    /// credential on this host belongs to several. Sent to the adoption-code
-    /// mint as an assertion — the org comes from the token, so naming an org
-    /// the login does not belong to is an error rather than a silent mint into
-    /// a different one. Ignored when an explicit adoption code is given: a
-    /// code already carries its own org scope.
-    #[arg(long, value_name = "NAME")]
-    pub org: Option<String>,
 
     /// Where this instance runs, e.g. `us-west-2` or `on-prem-syd`. A
     /// customer-declared label, not a probed fact.
@@ -186,25 +158,9 @@ pub struct ConnectArgs {
     #[arg(long, value_name = "REGION")]
     pub region: Option<String>,
 
-    /// Attach the instance to the existing Spice Cloud app of this name at
-    /// enroll. Fails (without consuming the code) when no such app exists —
-    /// pass --create to create it. Also configurable via
-    /// `SPICE_CONNECT_ADOPT_APP_NAME`. Omitted: the instance enrolls
-    /// unattached and is attached later in the portal.
-    #[arg(long, value_name = "NAME")]
-    pub app_name: Option<String>,
-
-    /// With --app-name: create the app when it does not exist, then attach
-    /// the instance to it. Never creates silently — an absent app without
-    /// this flag is an error. Also configurable via
-    /// `SPICE_CONNECT_ADOPT_CREATE`.
-    #[arg(long, requires = "app_name")]
-    pub create: bool,
-
     /// Install and start `spiced --cloud-connect` as a persistent system
     /// service running from the instance directory, so the instance survives
-    /// reboots and closed terminals. Requires root, and either Linux with
-    /// systemd or macOS with launchd.
+    /// reboots and closed terminals. Requires Linux with systemd and root.
     /// Combinable with a code, or run on its own after a prior enroll.
     /// Re-running is the idempotent in-place upgrade path.
     #[arg(long, global = true)]
@@ -225,6 +181,32 @@ pub struct ConnectArgs {
     /// the Spice.ai Cloud data region.
     #[arg(skip)]
     pub cloud_region: Option<String>,
+}
+
+/// A positional connect target. It may be a deprecated Spicepod path, but it
+/// may also be a one-shot enrollment authority, so its storage is zeroizing
+/// and its `Debug` representation never exposes the value.
+#[derive(Clone)]
+pub struct ConnectTarget(SecretString);
+
+impl ConnectTarget {
+    fn expose(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl std::str::FromStr for ConnectTarget {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(SecretString::from(value.to_string())))
+    }
+}
+
+impl std::fmt::Debug for ConnectTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConnectTarget([REDACTED])")
+    }
 }
 
 /// Cloud-connect subcommands.
@@ -258,16 +240,13 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
         };
     }
 
-    // A region typo must be caught before anything is staged or minted: the
-    // cloud rejects it too (it validates before consuming the code), but
-    // failing here keeps the diagnosis local and the code unspent.
+    // A region typo must be caught before any authority is presented: the
+    // cloud rejects it too, but failing here keeps the diagnosis local and a
+    // one-shot key unspent.
     let region = validate_region(args.region.as_deref())?;
 
     let enroll = EnrollOptions {
-        app_name: args.app_name,
-        create: args.create,
         region,
-        org: args.org,
         install: args.install,
         endpoint: args.endpoint,
     };
@@ -275,20 +254,14 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     // Rejected on the adoption branches only. The deprecated pod-add
     // fallthrough below is a Spice.ai Cloud fetch, where `--cloud-region` has
     // always been meaningful, so refusing it there would be a regression.
-    let Some(target) = args.target.as_deref() else {
+    let Some(target) = args.target.as_ref().map(ConnectTarget::expose) else {
         reject_cloud_region(args.cloud_region.as_deref())?;
         return connect_without_code(ctx, &config_dir, enroll).await;
     };
 
-    if runtime_cloud_connect::is_valid_adoption_code(target) {
+    if let Ok(key) = runtime_cloud_connect::EnrollmentKey::parse(target) {
         reject_cloud_region(args.cloud_region.as_deref())?;
-        return enroll_instance(
-            ctx,
-            Credential::Code(target.to_string()),
-            &config_dir,
-            enroll,
-        )
-        .await;
+        return enroll_instance(ctx, key, &config_dir, enroll).await;
     }
 
     // An input that clearly looks like an adoption code but fails validation
@@ -296,13 +269,13 @@ pub async fn execute(ctx: &RuntimeContext, args: ConnectArgs) -> Result<()> {
     // produces a misleading cloud-Spicepod error and may fire a cloud pod-add
     // request for what was plainly meant to be an adoption code, so reject it
     // explicitly instead of falling through to the pod-add path.
-    if looks_like_adoption_code(target) {
+    if looks_like_enrollment_key(target) {
         return Err(Error::InvalidArgument {
-            message: format!(
-                "'{target}' looks like a Spice Cloud adoption code but is malformed. \
-                 Expected SPICE-ADOPT-XXXXX-XXXXX-XXXXX-XXXXX (each segment is 5 uppercase \
-                 letters or digits). Copy the code from your Spice Cloud portal and retry."
-            ),
+            message:
+                "The supplied value looks like a Spice Cloud enrollment key but is malformed. \
+                 Expected spice-enroll- followed by exactly 32 base64url characters. \
+                 Copy a fresh key from your Spice Cloud portal and retry."
+                    .to_string(),
         });
     }
 
@@ -372,44 +345,17 @@ fn validate_region(region: Option<&str>) -> Result<Option<String>> {
 
 /// The enrollment options gathered from flags, distinct from the credential.
 struct EnrollOptions {
-    app_name: Option<String>,
-    create: bool,
     region: Option<String>,
-    org: Option<String>,
     install: bool,
     endpoint: Option<String>,
 }
 
-/// How this enrollment is authenticated.
-enum Credential {
-    /// An adoption code the operator supplied — staged on disk so an
-    /// interrupted enroll can be resumed by a later `spiced` start.
-    Code(String),
-    /// A code the CLI minted from the `spice login` credential. **Never
-    /// staged**: it lives for one enroll, and writing it down would put a live
-    /// org credential on the host for no benefit.
-    Minted(String),
-}
-
-impl Credential {
-    fn code(&self) -> &str {
-        match self {
-            Self::Code(code) | Self::Minted(code) => code,
-        }
-    }
-
-    /// `true` when the code may be written to the config dir.
-    fn is_stageable(&self) -> bool {
-        matches!(self, Self::Code(_))
-    }
-}
-
-/// `spice connect` with no adoption code.
+/// `spice connect` with no enrollment key.
 ///
-/// An already-enrolled directory is never re-enrolled: that would mint a second
-/// registry row for a host that already has one. So this resolves in order:
-/// an existing identity (install and/or report), then a staged code (finish the
-/// interrupted enroll), then the `spice login` credential (mint and enroll).
+/// An already-enrolled directory is never re-enrolled: that could create a second
+/// registry row for a host that already has one. The authenticated interactive
+/// setup flow is deliberately owned by the later interactive layer in this
+/// stack; this foundation accepts only the one-shot positional authority.
 async fn connect_without_code(
     ctx: &RuntimeContext,
     config_dir: &Path,
@@ -426,34 +372,10 @@ async fn connect_without_code(
         return print_status(config_dir, enroll.endpoint.as_deref()).await;
     }
 
-    if let Some(staged) = read_staged_code(config_dir)? {
-        println!(
-            "Resuming the enrollment staged at {}.",
-            config_dir.display()
-        );
-        return enroll_instance(ctx, Credential::Code(staged), config_dir, enroll).await;
-    }
-
-    let minted = mint::mint_adoption_code(enroll.org.as_deref()).await?;
-    let mut enroll = enroll;
-    // The mint resolved the org authoritatively from the token; prefer it over
-    // whatever was asserted so the summary reports what actually happened.
-    if minted.org.is_some() {
-        enroll.org = minted.org;
-    }
-    enroll_instance(ctx, Credential::Minted(minted.code), config_dir, enroll).await
-}
-
-/// Read a staged pending adoption code, if one is present and non-empty.
-fn read_staged_code(config_dir: &Path) -> Result<Option<String>> {
-    let path = config_dir.join(PENDING_ADOPT_CODE_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let staged = std::fs::read_to_string(&path).map_err(|e| Error::CloudConnectIo {
-        message: format!("read staged adoption code {}: {e}", path.display()),
-    })?;
-    Ok(Some(staged.trim().to_string()).filter(|code| !code.is_empty()))
+    Err(Error::InvalidArgument {
+        message: "Interactive `spice connect` setup is introduced by the interactive workflow layer. In this foundation layer, supply a one-shot `spice-enroll-…` key or use `spiced --token <enrollment-key>` for unattended enrollment."
+            .to_string(),
+    })
 }
 
 /// Enroll this host with Spice Cloud and exit.
@@ -461,12 +383,11 @@ fn read_staged_code(config_dir: &Path) -> Result<Option<String>> {
 /// Sequence: preflight the service install (so a host that cannot be installed
 /// on fails with the code unspent), stage the code when it is stageable,
 /// install the runtime if missing, complete the HTTPS enroll (identity issued
-/// and persisted, registry row created cloud-side, app attached and region
-/// recorded when requested), optionally install the service, and print the next
-/// steps.
+/// and persisted, registry row created cloud-side, and region recorded when
+/// requested), optionally install the service, and print the next steps.
 async fn enroll_instance(
     ctx: &RuntimeContext,
-    credential: Credential,
+    token: runtime_cloud_connect::EnrollmentKey,
     config_dir: &Path,
     enroll: EnrollOptions,
 ) -> Result<()> {
@@ -479,50 +400,6 @@ async fn enroll_instance(
     std::fs::create_dir_all(config_dir).map_err(|e| Error::CloudConnectIo {
         message: format!("create config dir {}: {e}", config_dir.display()),
     })?;
-
-    let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
-    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
-
-    // If the user did NOT pass `--endpoint`, remove any previous override
-    // so the next `spiced` start doesn't silently re-use a stale endpoint
-    // from an earlier connect. A `remove` also clears this file, but
-    // re-staging without `--endpoint` is the more common case.
-    if enroll.endpoint.is_none()
-        && let Err(e) = std::fs::remove_file(&endpoint_path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(Error::CloudConnectIo {
-            message: format!(
-                "remove stale endpoint override {}: {e}",
-                endpoint_path.display()
-            ),
-        });
-    }
-
-    if credential.is_stageable() {
-        atomic_write_0600(&pending_path, credential.code().as_bytes()).map_err(|e| {
-            Error::CloudConnectIo {
-                message: format!("write adoption code: {e}"),
-            }
-        })?;
-    }
-
-    // Write the endpoint override BEFORE printing success. If the override
-    // can't be persisted, roll the staged code back so adoption can't
-    // proceed against the wrong control plane on the next `spiced` start.
-    if let Some(ref ep) = enroll.endpoint
-        && let Err(e) = atomic_write_0600(&endpoint_path, ep.as_bytes())
-    {
-        // Best-effort rollback of the staged code; surface the
-        // original endpoint-write failure to the caller.
-        let _ = std::fs::remove_file(&pending_path);
-        return Err(Error::CloudConnectIo {
-            message: format!(
-                "write endpoint override {}: {e} (adoption code not staged)",
-                endpoint_path.display()
-            ),
-        });
-    }
 
     println!("Enrolling this host with Spice Cloud...");
 
@@ -547,59 +424,36 @@ async fn enroll_instance(
         .runtime_version()
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
     let mut config = CloudConnectConfig::from_env_at(runtime_version, config_dir.to_path_buf());
-    // The credential resolved above wins over any env/staged state that
-    // `from_env_at` picked up.
-    config.adoption_code = Some(credential.code().to_string());
-    // Only point at the staged file when there is one: a minted code is never
-    // written to disk, and naming a path here would make the enroll delete
-    // whatever happens to be staged for a different code.
-    config.pending_adopt_code_path = credential.is_stageable().then(|| pending_path.clone());
     if let Some(ref ep) = enroll.endpoint {
         // The explicit flag wins over `SPICE_CLOUD_ENDPOINT` for this
-        // process; the `cloud-endpoint` file written above covers later
-        // `spiced` starts.
+        // process. A successful fresh enrollment persists the canonical
+        // control-plane binding in the identity used by later starts.
         config.enroll_endpoint = ep.clone();
-    }
-    // Flags win over the SPICE_CONNECT_ADOPT_* env vars `from_env_at`
-    // picked up.
-    if enroll.app_name.is_some() {
-        config.adopt_app_name = enroll.app_name.clone();
-    }
-    if enroll.create {
-        config.adopt_create_app = true;
     }
     if enroll.region.is_some() {
         config.instance_region = enroll.region.clone();
     }
 
-    let retry_hint = if credential.is_stageable() {
-        "re-run `spice connect <code>`"
-    } else {
-        // A minted code is spent with this process, so the retry is another
-        // mint — i.e. the same bare command.
-        "re-run `spice connect`"
-    };
-
-    let outcome = match runtime_cloud_connect::enroll::enroll_now(&config).await {
+    let retry_hint = "re-run `spice connect <spice-enroll-key>`";
+    let outcome = runtime_cloud_connect::enroll_now_with_token(
+        &config,
+        token.expose_secret(),
+        None,
+        runtime_cloud_connect::RetryPolicy::INTERACTIVE,
+    )
+    .await;
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) if err.is_credential_rejection() => {
-            // The cloud rejected the code itself (invalid or consumed);
-            // `enroll_now` already discarded the staged copy.
             return Err(Error::CloudConnectEnroll {
                 message: format!(
-                    "{err}. Mint a new adoption code in the Spice Cloud portal and re-run `spice connect <code>`."
+                    "{err}. Obtain a fresh enrollment key in the Spice Cloud portal and re-run `spice connect <spice-enroll-key>`."
                 ),
             });
         }
         Err(err) if err.is_authoritative_rejection() => {
-            // Rejected for a reason other than the code — an expired code,
-            // or app-attachment validation (no such app, attach conflict,
-            // app limit). The code was NOT consumed and stays staged.
             return Err(Error::CloudConnectEnroll {
-                message: format!(
-                    "{err}. The adoption code was not consumed — fix the reported problem \
-                     (e.g. correct --app-name, or pass --create to create the app) and {retry_hint}."
-                ),
+                message: format!("{err}. Fix the reported problem and {retry_hint}."),
             });
         }
         Err(err @ runtime_cloud_connect::enroll::EnrollNowError::Persist { .. }) => {
@@ -610,42 +464,55 @@ async fn enroll_instance(
             });
         }
         Err(err) => {
-            // Transient (transport / 5xx / a clock-skew-rejected TLS
-            // handshake): the code was NOT consumed.
-            let resume = if credential.is_stageable() {
-                format!(
-                    " or start `spiced --cloud-connect` to keep retrying in the background (the code stays staged at {})",
-                    pending_path.display()
-                )
-            } else {
-                String::new()
-            };
             return Err(Error::CloudConnectEnroll {
-                message: format!(
-                    "{err}. The adoption code was not consumed — {retry_hint} to retry{resume}."
-                ),
+                message: format!("{err}. {retry_hint} to retry."),
             });
         }
     };
 
-    let registration = &outcome.registration;
+    let (identity, metadata) = match outcome {
+        runtime_cloud_connect::EnrollNowOutcome::AlreadyEnrolled { identity } => (identity, None),
+        runtime_cloud_connect::EnrollNowOutcome::Enrolled { identity, metadata } => {
+            (identity, Some(metadata))
+        }
+    };
+    // The canonical identity now carries the control-plane binding. A legacy
+    // endpoint file is removed only after a fresh enrollment has committed;
+    // an existing identity short-circuit leaves every byte of its local state
+    // untouched, including a self-hosted binding used by older runtimes.
+    if metadata.is_some() {
+        let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
+        if let Err(error) = std::fs::remove_file(&endpoint_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "The enrolled identity is durable, but the legacy endpoint override at {} could not be removed: {error}",
+                endpoint_path.display()
+            );
+        }
+    }
     println!("Enrolled with Spice Cloud.");
-    // Prefer the org the cloud reported over the one that was asserted.
-    if let Some(org) = registration.org.as_ref().or(enroll.org.as_ref()) {
+    // Display only the organization reported by the issuing control plane.
+    if let Some(org) = metadata
+        .as_ref()
+        .map(|metadata| &metadata.organization.name)
+        .filter(|org| !org.is_empty())
+    {
         println!("  org:         {org}");
     }
-    println!("  instance id: {}", outcome.identity.identifier);
+    println!("  instance id: {}", identity.identifier);
     println!("  identity:    {}", config.identity_path.display());
-    if !outcome.identity.gateway_addr.is_empty() {
-        println!("  gateway:     {}", outcome.identity.gateway_addr);
+    if !identity.gateway_addr.is_empty() {
+        println!("  gateway:     {}", identity.gateway_addr);
     }
-    if let Some(region) = registration.region.as_ref().or(enroll.region.as_ref()) {
+    if let Some(region) = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.region.as_ref())
+        .or(enroll.region.as_ref())
+    {
         println!("  region:      {region}");
     }
-    match registration.app_name {
-        Some(ref app) => println!("  app:         {app}"),
-        None => println!("  app:         unattached — attach to an app in the Spice Cloud portal"),
-    }
+    println!("  app:         unattached — attach to an app in the Spice Cloud portal");
     println!();
 
     if enroll.install {
@@ -663,9 +530,7 @@ async fn enroll_instance(
     }
 
     println!("Nothing is running yet. Choose how this instance runs:");
-    println!(
-        "  sudo spice connect --install   Install a persistent service (Linux/systemd, macOS/launchd)"
-    );
+    println!("  sudo spice connect --install   Install a persistent service (Linux/systemd)");
     println!("  spiced --cloud-connect         Run it in the foreground from this directory");
     println!("The instance shows as connected in the Spice Cloud portal once the runtime is up.");
 
@@ -738,7 +603,7 @@ fn instance_dir_for(config_dir: &Path) -> PathBuf {
 
 async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
     let identity_path = config_dir.join(IDENTITY_FILE);
-    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
+    let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
 
     let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
         .map_err(|e| Error::CloudConnectIo {
@@ -770,23 +635,13 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    if pending_path.exists() {
-        let preview =
-            std::fs::read_to_string(&pending_path).map_err(|e| Error::CloudConnectIo {
-                message: format!("read pending code: {e}"),
-            })?;
-        let preview = preview.trim();
+    if draft_path.exists() {
         println!("Spice Cloud Connect: pending enrollment");
-        println!("  pending code at: {}", pending_path.display());
-        let mask = mask_code(preview);
-        println!("  code (masked):   {mask}");
+        println!("  enrollment draft: {}", draft_path.display());
         println!(
-            "  re-run `spice connect <code>` to enroll with {}, or start `spiced --cloud-connect` to enroll in the background.",
-            resolved_endpoint(config_dir, endpoint)
+            "  present a fresh enrollment key to resume this retry-safe operation, or run `spice connect remove --yes` to abandon it"
         );
         print_service_for_dir(config_dir);
-        // A staged-but-unenrolled instance is the other state a wrong clock
-        // explains: the enroll keeps failing on certificate validity.
         report_clock_skew(&resolved_endpoint(config_dir, endpoint)).await;
         return Ok(());
     }
@@ -812,15 +667,15 @@ async fn print_status(config_dir: &Path, endpoint: Option<&str>) -> Result<()> {
         println!();
         println!(
             "Run `spice connect status --dir <directory>` to inspect one of them, or \
-             `spice connect` here to enroll this directory as a new instance."
+             present a fresh enrollment key with `spice connect <spice-enroll-key>` here."
         );
         return Ok(());
     }
 
     println!("Spice Cloud Connect: not connected");
     println!(
-        "Run `spice connect` on a host logged in with `spice login`, or \
-         `spice connect <SPICE-ADOPT-...>` with a code from your Spice Cloud portal."
+        "Run `spice connect <spice-enroll-key>` with a fresh key from your Spice Cloud portal, \
+         or use `spiced --token <enrollment-key>` for unattended enrollment."
     );
     Ok(())
 }
@@ -906,24 +761,37 @@ async fn remove_identity(
     endpoint: Option<&str>,
     assume_yes: bool,
 ) -> Result<()> {
+    // Inventory and cleanup are one enrollment transaction. An enrollment may
+    // already be promoting its identity when removal starts; acquiring this
+    // boundary first makes removal observe and clear that winner instead of
+    // sampling an old draft-only state and returning with a new identity.
+    let enrollment_transaction = std::sync::Arc::new(
+        runtime_cloud_connect::EnrollmentTransactionLock::try_acquire_async(config_dir)
+            .await
+            .map_err(|e| Error::CloudConnectIo {
+                message: format!("acquire the enrollment transaction before removal: {e}"),
+            })?,
+    );
     let identity_path = config_dir.join(IDENTITY_FILE);
-    let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
+    let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
     let endpoint_path = config_dir.join(CLOUD_ENDPOINT_FILE);
     let cache_path = config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
     let instance_dir = instance_dir_for(config_dir);
 
-    let identity = runtime_cloud_connect::identity::IdentityStore::load_optional(&identity_path)
-        .map_err(|e| Error::CloudConnectIo {
-            message: format!("load identity: {e}"),
-        })?;
+    let identity =
+        runtime_cloud_connect::identity::IdentityStore::load_optional_async(identity_path.clone())
+            .await
+            .map_err(|e| Error::CloudConnectIo {
+                message: format!("load identity: {e}"),
+            })?;
     let installed = service::find_for_dir(&instance_dir);
 
     let had_identity = identity.is_some();
-    let had_pending = pending_path.exists();
+    let had_draft = draft_path.exists();
     let had_endpoint = endpoint_path.exists();
     let had_cache = cache_path.exists();
 
-    if !had_identity && !had_pending && !had_endpoint && !had_cache && installed.is_none() {
+    if !had_identity && !had_draft && !had_endpoint && !had_cache && installed.is_none() {
         println!("Spice Cloud Connect: nothing to remove.");
         return Ok(());
     }
@@ -939,6 +807,9 @@ async fn remove_identity(
         println!("  directory: {}", instance_dir.display());
         if had_identity {
             println!("  identity:  {} (deleted)", identity_path.display());
+        }
+        if had_draft {
+            println!("  draft:     {} (deleted)", draft_path.display());
         }
         if had_cache {
             println!(
@@ -990,21 +861,22 @@ async fn remove_identity(
 
     if had_identity {
         // Clearing this also destroys the cache key, which is only in this file.
-        runtime_cloud_connect::identity::IdentityStore::clear(&identity_path).map_err(|e| {
-            Error::CloudConnectIo {
+        runtime_cloud_connect::identity::IdentityStore::clear_async(&identity_path)
+            .await
+            .map_err(|e| Error::CloudConnectIo {
                 message: format!("clear identity: {e}"),
-            }
-        })?;
+            })?;
     }
 
-    if had_pending
-        && let Err(e) = std::fs::remove_file(&pending_path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(Error::CloudConnectIo {
-            message: format!("remove pending code: {e}"),
-        });
+    if had_draft {
+        enrollment_transaction
+            .delete_draft_async()
+            .await
+            .map_err(|e| Error::CloudConnectIo {
+                message: format!("remove enrollment draft: {e}"),
+            })?;
     }
+
     // Also clear any `cloud-endpoint` override so a later
     // `spice connect <code>` without `--endpoint` doesn't silently keep
     // using the stale endpoint.
@@ -1018,7 +890,7 @@ async fn remove_identity(
     }
 
     println!(
-        "Spice Cloud Connect identity cleared. Run `spice connect` to re-adopt this directory."
+        "Spice Cloud Connect identity cleared. Present a fresh enrollment key with `spice connect <spice-enroll-key>` to enroll this directory again."
     );
 
     // Surfaced last so the exit status still reports it: the local state is
@@ -1125,141 +997,37 @@ fn resolved_endpoint(config_dir: &Path, explicit: Option<&str>) -> String {
     runtime_cloud_connect::config::DEFAULT_ENDPOINT.to_string()
 }
 
-/// Returns `true` if `target` is shaped like a Spice Cloud adoption code —
-/// i.e. it starts with the `SPICE-ADOPT` prefix — regardless of whether it
-/// passes full validation. Used to distinguish a malformed adoption code from
-/// a genuine Spicepod path. Matches the `SPICE`/`ADOPT` prefix segments
-/// checked by [`runtime_cloud_connect::is_valid_adoption_code`].
-fn looks_like_adoption_code(target: &str) -> bool {
-    target == "SPICE-ADOPT" || target.starts_with("SPICE-ADOPT-")
-}
-
-fn mask_code(code: &str) -> String {
-    // Grouped form (`SPICE-ADOPT-XXXXX-XXXXX-...`): mask the interior segments,
-    // keeping the `SPICE-ADOPT` prefix and the final segment for recognition.
-    if code.contains('-') {
-        let mut parts = code.split('-').collect::<Vec<_>>();
-        let len = parts.len();
-        if len < 3 {
-            return code.to_string();
-        }
-        for part in parts.iter_mut().take(len - 1).skip(2) {
-            *part = "****";
-        }
-        return parts.join("-");
-    }
-    // Dash-less token (the raw 64-hex code the portal mints today): a single-use
-    // secret, so mask the middle by characters rather than printing it whole.
-    // Short strings have nothing meaningful to hide and are left as-is.
-    mask_opaque_token(code)
-}
-
-/// Mask an opaque single-use token, keeping a short prefix and suffix for
-/// recognition and replacing the middle with `****`. Tokens short enough that
-/// masking would reveal most of them are returned unchanged.
-fn mask_opaque_token(token: &str) -> String {
-    const KEEP: usize = 4;
-    let chars: Vec<char> = token.chars().collect();
-    if chars.len() <= KEEP * 2 {
-        return token.to_string();
-    }
-    let prefix: String = chars[..KEEP].iter().collect();
-    let suffix: String = chars[chars.len() - KEEP..].iter().collect();
-    format!("{prefix}****{suffix}")
-}
-
-#[cfg(unix)]
-fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("pending-adopt-code");
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-
-    // `OpenOptions::mode` only applies when the file is *created*. A stale
-    // `.<file>.tmp` from a previous crashed run with broader permissions
-    // would otherwise be reused, then renamed into place exposing the
-    // adoption code or endpoint override under those wider permissions.
-    // Remove any stale temp first, refuse to reuse an existing inode via
-    // `create_new`, and explicitly re-assert `0o600` before writing.
-    if let Err(err) = std::fs::remove_file(&tmp)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(err);
-    }
-
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-#[cfg(not(unix))]
-fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mask_code_keeps_prefix_and_suffix() {
-        assert_eq!(
-            mask_code("SPICE-ADOPT-AAAA-BBBB-CCCC"),
-            "SPICE-ADOPT-****-****-CCCC"
-        );
+    fn connect_target_debug_never_exposes_an_enrollment_authority() {
+        let authority = "spice-enroll-abcdefghijklmnopqrstuvwxyz012345";
+        let target: ConnectTarget = authority.parse().expect("infallible parse");
+        let debug = format!("{target:?}");
+        assert_eq!(debug, "ConnectTarget([REDACTED])");
+        assert!(!debug.contains(authority));
     }
 
     #[test]
-    fn mask_code_short_codes_unchanged() {
-        assert_eq!(mask_code("SHORT"), "SHORT");
-        assert_eq!(mask_code("FOO-BAR"), "FOO-BAR");
-    }
-
-    #[test]
-    fn mask_code_masks_raw_hex_token() {
-        // The cloud portal mints randomBytes(32).toString('hex') — a 64-char
-        // dash-less single-use secret. `spice connect status` must NOT print it
-        // whole: mask the middle, keeping only a short prefix/suffix.
-        let code = "9f500bdec2f2dcf06e50f255d6d8291603e9b10f5abf500a5de5ad6d2069837d";
-        let masked = mask_code(code);
-        assert_eq!(masked, "9f50****837d");
-        assert!(
-            !masked.contains("bdec2f2"),
-            "the interior of the adoption code must not be shown: {masked}"
-        );
-    }
-
-    #[test]
-    fn looks_like_adoption_code_matches_prefix() {
-        // Well-formed and malformed adoption codes both look like codes.
-        assert!(looks_like_adoption_code(
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
+    fn enrollment_key_near_misses_stay_on_the_redacted_path() {
+        assert!(looks_like_enrollment_key(
+            "spice-enroll-abcdefghijklmnopqrstuvwxyz012345"
         ));
-        assert!(looks_like_adoption_code("SPICE-ADOPT-AAA-BBBB"));
-        assert!(looks_like_adoption_code("SPICE-ADOPT-aaaa-BBBB"));
-        assert!(looks_like_adoption_code("SPICE-ADOPT"));
+        let secret = "A".repeat(32);
+        assert!(looks_like_enrollment_key(&format!("SPICE-ENROLL-{secret}")));
+        assert!(looks_like_enrollment_key(&format!("spcie-enroll-{secret}")));
+        assert!(looks_like_enrollment_key(&format!(
+            "prefix/spice-enroll-{secret}"
+        )));
     }
 
     #[test]
-    fn looks_like_adoption_code_rejects_pod_paths() {
-        assert!(!looks_like_adoption_code("spiceai/quickstart"));
-        assert!(!looks_like_adoption_code("org/pod"));
-        assert!(!looks_like_adoption_code("SPICE-CONNECT-AAAA-BBBB"));
-        assert!(!looks_like_adoption_code("spice-adopt-aaaa-bbbb"));
+    fn looks_like_enrollment_key_rejects_pod_paths() {
+        assert!(!looks_like_enrollment_key("spiceai/quickstart"));
+        assert!(!looks_like_enrollment_key("org/pod"));
+        assert!(!looks_like_enrollment_key("ordinary-local-path"));
     }
 
     #[test]
@@ -1316,20 +1084,6 @@ mod tests {
     }
 
     #[test]
-    fn minted_codes_are_never_staged() {
-        // A staged code is a live org credential on disk. An operator-supplied
-        // code is already on the host and staging it enables resume; a minted
-        // one exists for a single enroll and must not be written down.
-        assert!(Credential::Code("SPICE-ADOPT-AAAAA-BBBBB".to_string()).is_stageable());
-        assert!(!Credential::Minted("SPICE-ADOPT-AAAAA-BBBBB".to_string()).is_stageable());
-        // Both still present the same code to the enroll request.
-        assert_eq!(
-            Credential::Minted("SPICE-ADOPT-AAAAA-BBBBB".to_string()).code(),
-            "SPICE-ADOPT-AAAAA-BBBBB"
-        );
-    }
-
-    #[test]
     fn resolved_endpoint_prefers_the_explicit_flag() {
         let dir = std::env::temp_dir().join(format!("spice-connect-ep-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1381,34 +1135,5 @@ mod tests {
             Some("us-west-2-prod-aws-data"),
             "the CLI validates charset only — the cloud stores the label verbatim"
         );
-    }
-
-    #[test]
-    fn read_staged_code_treats_a_blank_file_as_absent() {
-        let dir = std::env::temp_dir().join(format!("spice-connect-staged-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-
-        assert_eq!(read_staged_code(&dir).expect("no file"), None);
-
-        std::fs::write(dir.join(PENDING_ADOPT_CODE_FILE), "  \n").expect("write blank");
-        assert_eq!(
-            read_staged_code(&dir).expect("blank file"),
-            None,
-            "a blank staged file is not a credential"
-        );
-
-        std::fs::write(
-            dir.join(PENDING_ADOPT_CODE_FILE),
-            "SPICE-ADOPT-AAAAA-BBBBB\n",
-        )
-        .expect("write code");
-        assert_eq!(
-            read_staged_code(&dir).expect("staged code").as_deref(),
-            Some("SPICE-ADOPT-AAAAA-BBBBB"),
-            "the trailing newline a shell adds must be trimmed"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

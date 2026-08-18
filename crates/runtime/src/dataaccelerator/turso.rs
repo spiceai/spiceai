@@ -41,6 +41,7 @@ limitations under the License.
 //! connector** (for source datasets), where remote access patterns are the primary use case
 //! and local acceleration is not the goal.
 
+use super::resolved_refresh_mode;
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
@@ -671,6 +672,7 @@ impl DataAccelerator for TursoAccelerator {
                         AccelerationEngine::Turso,
                         Arc::new(arrow_schema::Schema::empty()),
                         None,
+                        resolved_refresh_mode(source, acceleration),
                     )
                     .await;
 
@@ -705,6 +707,7 @@ impl DataAccelerator for TursoAccelerator {
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                 AccelerationEngine::Turso,
                 None,
+                resolved_refresh_mode(source, acceleration),
             )
             .await;
 

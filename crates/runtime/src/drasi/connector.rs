@@ -18,7 +18,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
@@ -154,10 +154,11 @@ impl DataConnector for DrasiConnector {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.with_forwarded_stream(
             self.inner_connector
-                .changes_stream(context, federated_table, dataset)
+                .changes_stream(context, federated_table, dataset, acceleration)
                 .await,
         )
     }

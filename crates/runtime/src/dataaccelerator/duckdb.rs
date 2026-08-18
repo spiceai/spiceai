@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::resolved_refresh_mode;
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
@@ -782,6 +783,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
                         None,
+                        resolved_refresh_mode(source, acceleration),
                     )
                     .await;
 
@@ -801,6 +803,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
                 None,
+                resolved_refresh_mode(source, acceleration),
             )
             .await;
 

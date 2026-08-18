@@ -234,6 +234,19 @@ runtime-async = "foundation"
 # Interface crate: the accelerator (runtime side) satisfies CheckpointStore; a
 # connector only calls it, so it lives low (foundation) below both.
 runtime-checkpoint-api = "foundation"
+# The model-provider contracts, one per capability. Split because their dependency
+# sets are nearly disjoint (see docs/dev/crate_layering.md, "How finely to split a
+# family"): a reranker vendor is a small HTTP client and has no business waiting on
+# `cache`/`chunking`/`hf-hub`, which only the embedding contract needs.
+#
+# `chat-api` and `rerank-api` are foundation: their whole closure is external crates
+# plus `spicepod`. Keeping them there is the constraint — a contract that grows a
+# shared-utility dependency has stopped being a thin interface, and the guard says so.
+# `embed-api` is assigned explicitly rather than left to `default_tier`, so that
+# changing the default can never silently relocate it away from `cache`/`hf-hub`.
+chat-api = "foundation"
+embed-api = "shared-utility"
+rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
 spice-table = "foundation"

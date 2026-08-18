@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
@@ -33,7 +34,7 @@ use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataaccelerator::swappable::SwappableTableProvider;
-use crate::dataaccelerator::{self, BootstrapStatus};
+use crate::dataaccelerator::{self, BootstrapStatus, resolved_refresh_mode};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -141,6 +142,7 @@ pub use runtime_datafusion::composed_catalog;
 // through these aliases, but they belong to `runtime-datafusion`. Crate-visible
 // so a crate outside the runtime has to depend on `runtime-datafusion` directly
 // rather than route through here.
+#[cfg(any(feature = "duckdb", test))]
 pub(crate) use runtime_datafusion::dialect;
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
@@ -3133,11 +3135,21 @@ impl DataFusion {
                 },
             );
 
+            // Observed before the stream exists, so the CDC writer — the only
+            // writer on this path — cannot have touched the acceleration yet.
+            // A source that cannot place an acceleration's contents has to
+            // assume they may be hiding rows deleted at the source; this is how
+            // it recognizes a load that starts from nothing instead. See
+            // `AccelerationContents`.
+            let acceleration =
+                probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+
             let changes_stream = source
                 .changes_stream(
                     &RuntimeConnectorContext::for_dataset(dataset),
                     Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
                     dataset,
+                    acceleration,
                 )
                 .await;
 
@@ -3214,10 +3226,10 @@ impl DataFusion {
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
 
         // The engine rewrites some incoming types at table creation because its storage
-        // format cannot hold them (Cayenne/Vortex keeps every timestamp at microsecond
-        // precision, DuckDB does the same for TIMESTAMPTZ). The refresh sink compares the
-        // incoming schema against the accelerated one, so without these rules it reports
-        // the engine's own type as the acceleration lagging the source.
+        // format cannot hold them (DuckDB stores every TIMESTAMPTZ at microsecond
+        // precision, Cayenne/Vortex has no half-precision float). The refresh sink
+        // compares the incoming schema against the accelerated one, so without these
+        // rules it reports the engine's own type as the acceleration lagging the source.
         let engine_type_rewrites = self
             .accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
@@ -3558,13 +3570,26 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
+                // The same engine-specific override the normal creation path resolves,
+                // so the archive is in the format that engine's bootstrap consumes —
+                // a Cayenne snapshot without its per-dataset metastore slice becomes
+                // the store's current snapshot and cannot be restored.
+                let snapshot_engine_override = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                {
+                    Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                    None => None,
+                };
                 data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration_settings,
                     &dataset_name,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
-                    None,
+                    snapshot_engine_override,
+                    resolved_refresh_mode(dataset, acceleration_settings),
                 )
                 .await;
             }

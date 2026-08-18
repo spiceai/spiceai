@@ -71,7 +71,7 @@ impl DataConnectorFactory for NFSFactory {
     fn create<'a>(
         &'a self,
         params: ConnectorParams,
-        context: &'a dyn ConnectorContext,
+        _context: &'a dyn ConnectorContext,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let nfs = NFS {

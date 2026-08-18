@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
 use linkme::distributed_slice;
 use runtime_component::ComponentInitialization;
@@ -89,13 +89,13 @@ pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
 ///
 /// # Example (simple form)
 ///
-/// ```
+/// ```text
 /// register_data_connector!("file", FileFactory);
 /// ```
 ///
 /// # Example (explicit form)
 ///
-/// ```
+/// ```text
 /// register_data_connector!(
 ///     register_file_connector,
 ///     FILE_CONNECTOR_REGISTRATION,
@@ -262,11 +262,23 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// long-lived stream from pinning the runtime: a checkpoint store holds a
     /// connection pool and no runtime, so a stream holding one cannot close the
     /// loop.
+    ///
+    /// `acceleration` reports what the accelerator already holds, so a source
+    /// that must otherwise assume the worst about contents it cannot place — see
+    /// [`AccelerationContents`] — can tell an acceleration that is starting from
+    /// nothing apart from one that may be carrying rows the source has since
+    /// deleted. Sources that place their position by other means may ignore it.
+    ///
+    /// Wrappers must forward this argument unchanged. Substituting
+    /// [`AccelerationContents::Unknown`] is safe but costs the inner connector
+    /// the distinction, which for `PostgreSQL` means re-reading the whole table
+    /// on a first load.
     async fn changes_stream(
         &self,
         _context: &dyn ConnectorContext,
         _federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         None
     }

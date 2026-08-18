@@ -19,8 +19,8 @@ use crate::provider::DynamoDBTableProvider;
 use crate::stream::StreamError as DynamoDBStreamError;
 use async_trait::async_trait;
 use data_components::cdc::{
-    ChangeEnvelope, ChangesStream, CommitChange, CommitError, InitialSnapshotMode,
-    InvalidCheckpointBehavior, NoOpCommitter,
+    AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    InitialSnapshotMode, InvalidCheckpointBehavior, NoOpCommitter,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
@@ -472,6 +472,7 @@ impl DataConnector for DynamoDB {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 

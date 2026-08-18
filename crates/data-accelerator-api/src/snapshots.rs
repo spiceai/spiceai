@@ -26,7 +26,7 @@ limitations under the License.
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
-use runtime_acceleration::acceleration::Acceleration;
+use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
@@ -36,14 +36,42 @@ use snafu::Snafu;
 
 use crate::{AcceleratorEngineRegistry, acceleration_file_path};
 
+/// Whether `mode: file_create` still permits bootstrapping from a snapshot.
+///
+/// `file_create` snapshots the outgoing acceleration and deletes it so the next refresh
+/// rebuilds from the source. Bootstrapping straight back from that snapshot would undo
+/// the delete, so a refresh that replays everything must not bootstrap. A refresh that
+/// does *not* replay from the beginning still needs it, or rows nothing can re-send are
+/// gone.
+///
+/// `refresh_mode` arrives resolved: resolving it consults the connector, which this
+/// crate cannot reach. Erring toward keeping the bootstrap costs `file_create` some of
+/// its effect on a CDC dataset; erring the other way destroys rows nothing can re-send.
+fn mode_allows_snapshot_bootstrap(acceleration: &Acceleration, refresh_mode: RefreshMode) -> bool {
+    if acceleration.mode != Mode::FileCreate {
+        return true;
+    }
+
+    !matches!(refresh_mode, RefreshMode::Full | RefreshMode::Caching)
+}
+
 pub async fn download_snapshot_if_needed(
     acceleration: &Acceleration,
     source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
+    refresh_mode: RefreshMode,
 ) -> BootstrapStatus {
     if !acceleration.snapshot_behavior.bootstrap_enabled() {
+        return BootstrapStatus::none();
+    }
+
+    if !mode_allows_snapshot_bootstrap(acceleration, refresh_mode) {
+        tracing::info!(
+            "Acceleration mode is 'file_create' for dataset {}, skipping snapshot bootstrap so the next refresh rebuilds the acceleration from the source",
+            source.name()
+        );
         return BootstrapStatus::none();
     }
 
@@ -116,8 +144,36 @@ pub async fn snapshot_before_recreate(
     engine: AccelerationEngine,
     schema: Arc<arrow_schema::Schema>,
     engine_override: Option<Arc<dyn SnapshotEngine>>,
+    refresh_mode: RefreshMode,
 ) {
     if !acceleration.snapshot_behavior.create_enabled() {
+        return;
+    }
+
+    // `refresh_mode: snapshot` is a read-only consumer of the snapshot store, so it must
+    // never publish. Its local acceleration is a copy of a snapshot someone else owns,
+    // and creating one makes the uploaded bytes the store's `current-snapshot-id`: a
+    // replica lagging behind would publish its stale copy under a higher id and roll
+    // every other reader back onto it.
+    if refresh_mode == RefreshMode::Snapshot {
+        tracing::debug!(
+            dataset = %dataset_name,
+            "refresh_mode: snapshot consumes snapshots without publishing them; skipping pre-recreation snapshot"
+        );
+        return;
+    }
+
+    // A Cayenne bootstrap needs the per-dataset metastore slice that only
+    // `CayenneSnapshotEngine` writes, and creating a snapshot makes whatever it uploads
+    // the store's `current-snapshot-id`. Publishing a default-engine archive (a raw
+    // `cayenne.db`, no slice) would replace a restorable current snapshot with one
+    // nothing can load, which is worse than keeping no backup of this wipe. The caller
+    // still recreates the acceleration either way.
+    if engine == AccelerationEngine::Cayenne && engine_override.is_none() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot: this dataset's Cayenne metastore catalog is unavailable, and an archive without its metastore slice could not be restored"
+        );
         return;
     }
 

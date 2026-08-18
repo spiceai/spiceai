@@ -78,6 +78,7 @@ serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
+zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
@@ -96,8 +97,14 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 util = { path = "../../crates/util"}
 
+# Vortex ships on non-Windows targets only (matching `runtime`'s gate on
+# Cayenne), so the startup parallelism declaration is gated the same way.
+[target.'cfg(not(windows))'.dependencies]
+vortex-utils.workspace = true
+
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["x509-parser"] }
 # Builds the `RequestContext` the trace-span test needs; `spiced` itself only
 # ever sees one through `runtime`.
 runtime-request-context = { path = "../../crates/runtime-request-context" }

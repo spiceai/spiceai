@@ -15,7 +15,7 @@ limitations under the License.
 */
 use crate::dataconnector::ConnectorContext;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 use search::index::chunking::ChunkedSearchIndex;
@@ -217,11 +217,12 @@ impl DataConnector for FullTextConnector {
         context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
         let stream = self
             .inner_connector
-            .changes_stream(context, below, dataset)
+            .changes_stream(context, below, dataset, acceleration)
             .await?;
         Some(Self::maintaining(stream, indexes))
     }
