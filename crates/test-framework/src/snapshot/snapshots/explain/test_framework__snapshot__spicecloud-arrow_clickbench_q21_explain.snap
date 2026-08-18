@@ -17,6 +17,6 @@ description: "Query: clickbench_q21"
 |               |         FilterExec: URL@0 LIKE %google%, projection=[]                    |
 |               |           SchemaCastScanExec                                              |
 |               |             BytesProcessedExec                                            |
-|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>] |
+|               |               DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                                                                           |
 +---------------+---------------------------------------------------------------------------+

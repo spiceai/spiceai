@@ -13,10 +13,10 @@ description: "Query: clickbench_q34"
 |               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]              |
 |               |     ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as c]                        |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))] |
-|               |         RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16           |
+|               |         RepartitionExec: partitioning=Hash([URL@0], 32), input_partitions=32           |
 |               |           AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]      |
 |               |             SchemaCastScanExec                                                         |
 |               |               BytesProcessedExec                                                       |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[<redacted>]            |
+|               |                 DataSourceExec: partitions=32, partition_sizes=[<redacted>]            |
 |               |                                                                                        |
 +---------------+----------------------------------------------------------------------------------------+

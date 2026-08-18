@@ -17,6 +17,6 @@ description: "Query: clickbench_q2"
 |               |         FilterExec: AdvEngineID@0 != 0, projection=[]                     |
 |               |           SchemaCastScanExec                                              |
 |               |             BytesProcessedExec                                            |
-|               |               DataSourceExec: partitions=16, partition_sizes=[<redacted>] |
+|               |               DataSourceExec: partitions=32, partition_sizes=[<redacted>] |
 |               |                                                                           |
 +---------------+---------------------------------------------------------------------------+
