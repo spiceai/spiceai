@@ -656,10 +656,17 @@ mod tests {
         );
     }
 
-    /// A batch with no conflicts must come through byte-for-byte, in order.
+    /// A batch with no conflicts must keep every row, values intact — nothing
+    /// dropped and nothing rewritten just for passing through the deduplicator.
+    ///
+    /// Row *order* is deliberately not asserted, and `rows_of` sorts so it
+    /// cannot be: deduplication runs the batch through a `DataFusion` frame
+    /// (`distinct`, then a window function for last-write-wins), and neither
+    /// preserves input order. Ordering is not part of this node's contract, so
+    /// a test asserting it would be pinning an accident.
     #[tokio::test]
-    async fn a_conflict_free_batch_is_passed_through_unchanged() {
-        let input = source(&[vec![batch(&[(1, "a"), (2, "b"), (3, "c")])]]);
+    async fn a_conflict_free_batch_keeps_every_row() {
+        let input = source(&[vec![batch(&[(3, "c"), (1, "a"), (2, "b")])]]);
         let dedup = Arc::new(UpsertDedupExec::new(
             input,
             pk_constraints(),

@@ -62,8 +62,8 @@ use iceberg::{Catalog, Error as IcebergError};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-/// The columns an equality delete *may* key on, as `(field IDs, column indices)`
-/// in schema order. See [`equality_delete_key`] for the key actually used.
+/// The columns an equality delete keys on, as `(field IDs, column indices)` in
+/// schema order.
 ///
 /// Iceberg equality deletes match rows *by value*, so a column whose equality is
 /// not well defined cannot take part. Floating point is excluded (`NaN` is not
@@ -100,43 +100,6 @@ fn equality_delete_columns(schema: &ArrowSchema) -> (Vec<i32>, Vec<usize>) {
     }
 
     (equality_ids, projection_indices)
-}
-
-/// The key an equality delete actually writes, as `(field IDs, column indices)`.
-///
-/// When the table declares identifier fields, those *are* the row identity, so
-/// keying on them deletes exactly the rows the predicate matched. Keying on
-/// every eligible column instead looks stricter but is not: two rows that agree
-/// on all eligible columns are indistinguishable to the delete file, so a
-/// `DELETE` separating them only by a float or nested column — neither of which
-/// can take part (see [`equality_delete_columns`]) — removes both.
-///
-/// Falls back to the full eligible set when the table declares no identity, or
-/// when an identifier field is itself ineligible: a partial identity is not an
-/// identity, and narrowing to it would widen what the delete matches.
-fn equality_delete_key(
-    schema: &ArrowSchema,
-    identifier_field_ids: &std::collections::HashSet<i32>,
-) -> (Vec<i32>, Vec<usize>) {
-    let (eligible_ids, eligible_indices) = equality_delete_columns(schema);
-
-    if identifier_field_ids.is_empty() {
-        return (eligible_ids, eligible_indices);
-    }
-    if !identifier_field_ids
-        .iter()
-        .all(|id| eligible_ids.contains(id))
-    {
-        return (eligible_ids, eligible_indices);
-    }
-
-    let (ids, indices): (Vec<i32>, Vec<usize>) = eligible_ids
-        .iter()
-        .zip(eligible_indices.iter())
-        .filter(|(id, _)| identifier_field_ids.contains(*id))
-        .map(|(id, idx)| (*id, *idx))
-        .unzip();
-    (ids, indices)
 }
 
 fn to_df_error(e: IcebergError) -> DataFusionError {
@@ -520,10 +483,7 @@ impl IcebergDeletionProvider {
         let iceberg_schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(iceberg_schema).map_err(to_df_error)?);
 
-        let identifier_field_ids: std::collections::HashSet<i32> =
-            iceberg_schema.identifier_field_ids().collect();
-        let (equality_ids, projection_indices) =
-            equality_delete_key(&arrow_schema, &identifier_field_ids);
+        let (equality_ids, projection_indices) = equality_delete_columns(&arrow_schema);
 
         // An equality delete file with no key columns imposes no condition, so
         // it would match every row: a `DELETE ... WHERE` would empty the table.
@@ -614,7 +574,7 @@ impl IcebergDeletionProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{equality_delete_columns, equality_delete_key};
+    use super::equality_delete_columns;
     use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -736,86 +696,6 @@ mod tests {
         let (ids, indices) = equality_delete_columns(&schema);
         assert!(ids.is_empty());
         assert!(indices.is_empty());
-    }
-
-    fn ids(values: &[i32]) -> std::collections::HashSet<i32> {
-        values.iter().copied().collect()
-    }
-
-    /// Identifier fields are the table's declared row identity, so an equality
-    /// delete keyed on them removes exactly the identified rows — and stays
-    /// immune to two rows differing only in an excluded float column.
-    #[test]
-    fn a_declared_identity_becomes_the_delete_key() {
-        let schema = ArrowSchema::new(vec![
-            field("id", DataType::Int64, Some("1")),
-            field("name", DataType::Utf8, Some("2")),
-            field("score", DataType::Float64, Some("3")),
-        ]);
-
-        let (key_ids, key_indices) = equality_delete_key(&schema, &ids(&[1]));
-        assert_eq!(key_ids, vec![1]);
-        assert_eq!(key_indices, vec![0]);
-    }
-
-    #[test]
-    fn a_composite_identity_keeps_every_part_in_schema_order() {
-        let schema = ArrowSchema::new(vec![
-            field("tenant", DataType::Int32, Some("7")),
-            field("payload", DataType::Utf8, Some("8")),
-            field("id", DataType::Int64, Some("9")),
-        ]);
-
-        let (key_ids, key_indices) = equality_delete_key(&schema, &ids(&[9, 7]));
-        assert_eq!(key_ids, vec![7, 9]);
-        assert_eq!(key_indices, vec![0, 2]);
-    }
-
-    /// No declared identity means no better key is available, so the full
-    /// eligible set stands — narrowing arbitrarily would widen what matches.
-    #[test]
-    fn without_a_declared_identity_the_full_eligible_set_is_the_key() {
-        let schema = ArrowSchema::new(vec![
-            field("id", DataType::Int64, Some("1")),
-            field("name", DataType::Utf8, Some("2")),
-        ]);
-
-        assert_eq!(
-            equality_delete_key(&schema, &ids(&[])),
-            equality_delete_columns(&schema)
-        );
-    }
-
-    /// A partial identity is not an identity. If any identifier field cannot
-    /// take part in an equality delete, keying on the rest would match rows the
-    /// predicate never selected.
-    #[test]
-    fn an_identity_with_an_ineligible_field_falls_back_to_the_full_set() {
-        let schema = ArrowSchema::new(vec![
-            field("id", DataType::Int64, Some("1")),
-            field("ratio", DataType::Float64, Some("2")),
-            field("name", DataType::Utf8, Some("3")),
-        ]);
-
-        // Field 2 is a float, so it is never eligible; the identity is unusable.
-        assert_eq!(
-            equality_delete_key(&schema, &ids(&[1, 2])),
-            equality_delete_columns(&schema)
-        );
-    }
-
-    /// An identifier field that carries no Parquet field ID is equally unusable.
-    #[test]
-    fn an_identity_naming_an_unknown_field_falls_back_to_the_full_set() {
-        let schema = ArrowSchema::new(vec![
-            field("id", DataType::Int64, Some("1")),
-            field("name", DataType::Utf8, Some("2")),
-        ]);
-
-        assert_eq!(
-            equality_delete_key(&schema, &ids(&[99])),
-            equality_delete_columns(&schema)
-        );
     }
 
     #[test]
