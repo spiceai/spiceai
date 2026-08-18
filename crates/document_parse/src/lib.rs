@@ -57,22 +57,12 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// Process-global and shared by every `Runtime` in the process — including,
-// in the integration test binary, many `Runtime`s built and torn down
-// concurrently. Every registered `DocumentParserFactory` today (`DocxParserFactory`,
-// `PdfParserFactory`, `PptxParserFactory`, `XlsxParserFactory`) is a
-// zero-field struct, so entries are safe to leave registered for the life of
-// the process; there is no `unregister_all()` and `Runtime::shutdown()` must
-// not add one. If a factory is ever added that owns a live resource (a
-// cached connection pool, like `DuckDBTableProviderFactory.instances`),
-// clearing this map on one `Runtime`'s shutdown would drop that resource out
-// from under every other `Runtime` still using it — give that factory type
-// its own scoped registry, instance-scoped like `AcceleratorEngineRegistry`,
-// instead.
 static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DocumentParserFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// [`DocumentParserFactory`] added here should not hold live resources (e.g. cached connections pools). 
+// If a factory is ever added that owns a live resource, must reimplement a `unregister_all`. 
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
