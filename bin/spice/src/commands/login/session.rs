@@ -203,7 +203,7 @@ pub(super) struct BrowserLogin {
 
 impl BrowserLogin {
     pub(super) fn new() -> Self {
-        Self::at(super::get_spice_base_url())
+        Self::at(super::spice_base_url())
     }
 
     /// A flow against an explicit base URL. Tests point this at a mock server;

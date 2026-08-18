@@ -69,7 +69,29 @@ impl CayenneMemoryAccount {
 
     /// Account the resident bytes of the PK keyset (exact keyset or bloom).
     pub(crate) fn set_keyset_bytes(&self, bytes: usize) {
-        self.keyset_bytes.store(bytes, Ordering::Relaxed);
+        let previous = self.keyset_bytes.swap(bytes, Ordering::Relaxed);
+        // Keep this table's share of the process-global keyset ceiling in step,
+        // as a delta. Residency is recomputed and republished here on every
+        // change, so one place can hold the fleet figure honest.
+        if bytes > previous {
+            let growth = (bytes - previous) as u64;
+            // Record it even if it does not fit: the clamp in
+            // `effective_pk_keyset_budget` is what prevents growth, and once the
+            // bytes EXIST, hiding them would let siblings over-commit against
+            // headroom that is not there.
+            //
+            // This is a publication, not an admission — the caller already grew.
+            // Two tables can read the same headroom, both grow into it, and the
+            // second land here with nothing left, so the aggregate can exceed
+            // the ceiling by what was in flight between the two. See
+            // `try_reserve_keyset_bytes` for why that is the intended trade and
+            // what bounds the overshoot.
+            if !super::pk_keyset_budget::try_reserve_keyset_bytes(growth) {
+                super::pk_keyset_budget::force_reserve_keyset_bytes(growth);
+            }
+        } else if previous > bytes {
+            super::pk_keyset_budget::release_keyset_bytes((previous - bytes) as u64);
+        }
         self.resize_to_total();
     }
 
@@ -93,6 +115,23 @@ impl CayenneMemoryAccount {
     #[must_use]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.lock().size()
+    }
+}
+
+impl Drop for CayenneMemoryAccount {
+    /// Return this table's share of the process-global keyset ceiling.
+    ///
+    /// Without this a dropped table's share is never released, so a pod that
+    /// creates and drops tables — a re-registration, a schema evolution, a test
+    /// harness building providers in a loop — walks the fleet budget down until
+    /// every surviving table is refused and falls back to a bloom, with no
+    /// memory actually in use. The `MemoryReservation` beside it already frees
+    /// itself on drop; this gives the fleet budget the same property.
+    fn drop(&mut self) {
+        let held = self.keyset_bytes.load(Ordering::Relaxed);
+        if held > 0 {
+            super::pk_keyset_budget::release_keyset_bytes(held as u64);
+        }
     }
 }
 

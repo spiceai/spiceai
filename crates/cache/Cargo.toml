@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+arrow_tools = { path = "../arrow_tools" }
 async-compression = { version = "0.4", features = [
     "tokio",
     "zstd",

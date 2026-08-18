@@ -51,6 +51,7 @@ use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_component::dataset::OnSchemaChange;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_component::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
@@ -388,6 +389,10 @@ impl CdcInsertPlanCache {
 struct ApplyContext<'a> {
     refresh_sql: Option<&'a str>,
     dataset_name: &'a TableReference,
+    /// The dataset's refresh configuration, needed to rebuild the accelerator
+    /// through the full-refresh path when the source reports its change history
+    /// is gone (see [`RefreshTask::rebuild_from_source`]).
+    refresh: &'a Arc<RwLock<Refresh>>,
     /// Prebuilt per-dataset metric labels reused by hot record sites in the apply loop
     /// (see [`DatasetMetricLabels`]).
     metric_labels: &'a DatasetMetricLabels,
@@ -619,7 +624,7 @@ const SCHEMA_EVOLUTION_WARNING_KEY_LIMIT: usize = 1024;
 static SCHEMA_EVOLUTION_WARNING_KEYS: std::sync::LazyLock<parking_lot::Mutex<BoundedWarningKeys>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
 
-fn schema_evolution_first_warn(key: String) -> bool {
+pub(crate) fn schema_evolution_first_warn(key: String) -> bool {
     SCHEMA_EVOLUTION_WARNING_KEYS
         .lock()
         .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
@@ -669,13 +674,26 @@ fn cdc_schema_evolution_for(dataset_name: &TableReference) -> Option<Arc<CdcSche
 /// Fast path: the CDC data struct matches the accelerator schema by name and
 /// type in order. Nullability is ignored — the CDC `data` struct is built
 /// nullable-everywhere by design (DELETE old-tuples carry nulls).
-fn cdc_data_schema_matches(target: &SchemaRef, incoming: &SchemaRef) -> bool {
+/// Whether the accelerated table already stores exactly what this CDC batch carries.
+///
+/// A field whose types differ is re-tested under the engine's own creation-time rewrites
+/// (`engine_type_rewrites`): the accelerated table holds the rewritten type, so a
+/// difference the engine itself imposes is a match, not a schema change. Only the
+/// differing fields are rewritten, and only one `DataType` at a time.
+fn cdc_data_schema_matches(
+    target: &SchemaRef,
+    incoming: &SchemaRef,
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
+) -> bool {
     target.fields().len() == incoming.fields().len()
-        && target
-            .fields()
-            .iter()
-            .zip(incoming.fields())
-            .all(|(t, i)| t.name() == i.name() && t.data_type() == i.data_type())
+        && target.fields().iter().zip(incoming.fields()).all(|(t, i)| {
+            t.name() == i.name()
+                && (t.data_type() == i.data_type()
+                    || arrow_tools::type_rewrite::rewrite_data_type(
+                        i.data_type(),
+                        engine_type_rewrites,
+                    ) == *t.data_type())
+        })
 }
 
 /// Re-tighten the nullable-everywhere CDC data struct to the accelerator's
@@ -1277,6 +1295,7 @@ impl RefreshTask {
                             let mut context = ApplyContext {
                                 refresh_sql: sql.as_deref(),
                                 dataset_name: &dataset_name,
+                                refresh: &refresh,
                                 metric_labels: &metric_labels,
                                 caching: caching.as_ref(),
                                 ready_sender: ready_sender.as_ref(),
@@ -1529,6 +1548,7 @@ impl RefreshTask {
             let mut apply_context = ApplyContext {
                 refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
+                refresh: &refresh,
                 metric_labels: &metric_labels,
                 caching: caching.as_ref(),
                 ready_sender: ready_sender.as_ref(),
@@ -1587,6 +1607,7 @@ impl RefreshTask {
                 let mut context = ApplyContext {
                     refresh_sql: sql.as_deref(),
                     dataset_name: &dataset_name,
+                    refresh: &refresh,
                     metric_labels: &metric_labels,
                     caching: caching.as_ref(),
                     ready_sender: ready_sender.as_ref(),
@@ -1810,6 +1831,55 @@ impl RefreshTask {
             .await;
     }
 
+    /// Re-read the source into the accelerator as one atomic replacement, in
+    /// answer to [`cdc::ChangeEnvelope::history_unavailable`]. Returns `false`
+    /// when the rebuild failed and the stream must stop.
+    ///
+    /// This is deliberately the ordinary `refresh_mode: full` path — one
+    /// `RefreshTask::run` with the mode overridden to
+    /// [`RefreshMode::Full`] — so the replacement is the same atomic
+    /// overwrite (`InsertOp::Overwrite`) a full refresh performs, and readers
+    /// keep seeing the pre-rebuild table until it swaps. Clearing the table and
+    /// letting the change stream refill it would be visible to queries as an
+    /// empty, then partially-filled, table.
+    ///
+    /// The changes that follow this rebuild may predate the re-read, since the
+    /// source resumes from wherever its log still starts. That is safe: the log
+    /// is ordered and complete from that point, so replaying it converges on the
+    /// source's current state — transiently stale, exactly like ordinary CDC
+    /// catch-up lag. What could *not* converge, and is what this exists to fix,
+    /// is a row deleted at the source while the history was gone: no change row
+    /// for it will ever arrive, so only re-reading the table removes it.
+    async fn rebuild_from_source(&self, context: &ApplyContext<'_>) -> bool {
+        let mut refresh = context.refresh.read().await.clone();
+        refresh.mode = RefreshMode::Full;
+
+        tracing::warn!(
+            "Dataset {}: the source can no longer supply the changes needed to continue, so the acceleration is being rebuilt from the source. This re-reads the table.",
+            context.dataset_name,
+        );
+
+        if let Err(e) = self.run(refresh).await {
+            let error_message = format!(
+                "Failed to rebuild the acceleration for {} from the source after its change history became unavailable: {e}",
+                context.dataset_name,
+            );
+            tracing::error!("{error_message}");
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return false;
+        }
+
+        tracing::info!(
+            "Dataset {}: rebuilt the acceleration from the source; resuming change streaming.",
+            context.dataset_name,
+        );
+        true
+    }
+
     async fn run_finalize_side_effects(
         &self,
         context: &mut ApplyContext<'_>,
@@ -1822,7 +1892,9 @@ impl RefreshTask {
 
         if let Some(cache_provider_ref) = context.caching
             && let Some(cache_provider) = cache_provider_ref.upgrade()
-            && let Err(e) = cache_provider.invalidate_for_table(context.dataset_name.clone())
+            && let Err(e) = cache_provider
+                .invalidate_for_table(context.dataset_name.clone())
+                .await
             && !self.runtime_status.is_shutdown()
         {
             tracing::error!(
@@ -1899,6 +1971,14 @@ impl RefreshTask {
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
 
+        // Read before the heartbeat retain below, for the same reason `any_ready`
+        // is: the signal rides a zero-row, no-op-committer envelope (see
+        // `cdc::build_history_unavailable_envelope`), so the retain would
+        // otherwise strip it and the rebuild would never happen.
+        let history_unavailable = envelopes
+            .iter()
+            .any(cdc::ChangeEnvelope::history_unavailable);
+
         // Strip zero-row readiness heartbeats from the write/durability path
         // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
         // heartbeat roughly every second on a caught-up source; the heartbeat's
@@ -1916,6 +1996,15 @@ impl RefreshTask {
         // envelope persisting the initial resume token) are not heartbeats
         // under that predicate and keep durability-then-commit ordering.
         envelopes.retain(|env| !env.is_no_op_heartbeat());
+
+        // The source has lost the history that explains what changed while it was
+        // away, so nothing in this burst — or after it — can be applied on top of
+        // the accelerator's current contents. Re-read the source into the
+        // accelerator as one atomic replacement first; the changes that follow
+        // then converge on top of it (see `rebuild_from_source`).
+        if history_unavailable && !self.rebuild_from_source(context).await {
+            return false;
+        }
 
         // Readiness-only run: every envelope was a heartbeat. Honor the ready
         // flag and stop — there is nothing to write and nothing to commit, so
@@ -1962,14 +2051,14 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.metric_labels, "decode", decode_start);
 
-        // Readiness was already folded into `any_ready` before the heartbeat
-        // retain, so the per-envelope flag is spent here.
+        // Readiness and the history-unavailable signal were both folded in before
+        // the heartbeat retain, so their per-envelope flags are spent here.
         let (committers, batches): (
             Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
             Vec<ChangeBatch>,
         ) = parts
             .into_iter()
-            .map(|(committer, batch, _is_ready)| (committer, batch))
+            .map(|(committer, batch, _is_ready, _history_unavailable)| (committer, batch))
             .unzip();
 
         // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
@@ -2163,8 +2252,9 @@ impl RefreshTask {
                     && !current_finalize_pending
                     && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
-                    && let Err(e) =
-                        cache_provider.invalidate_for_table(context.dataset_name.clone())
+                    && let Err(e) = cache_provider
+                        .invalidate_for_table(context.dataset_name.clone())
+                        .await
                     && !self.runtime_status.is_shutdown()
                 {
                     tracing::error!(
@@ -2561,9 +2651,33 @@ impl RefreshTask {
             return Ok(());
         }
         let target_schema = self.accelerator.schema();
-        if cdc_data_schema_matches(&target_schema, incoming_data_schema) {
+        // The accelerated table holds the engine's own creation-time rewrite by
+        // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
+        // comparison has to be made against what the engine would store from this input.
+        // Without it the classifier reads that permanent rewrite as `Incompatible` drift
+        // on every CDC batch, and `on_schema_change: fail` stops replication for a schema
+        // that never changed.
+        //
+        // The match test is rule-aware rather than rebuilding the schema up front: this
+        // runs per upsert sub-batch and almost always matches, and rewriting one
+        // `DataType` for the few columns that differ is cheaper than allocating a whole
+        // `Schema` that is then discarded.
+        if cdc_data_schema_matches(
+            &target_schema,
+            incoming_data_schema,
+            self.engine_type_rewrites,
+        ) {
             return Ok(());
         }
+        let normalized_incoming: SchemaRef = if self.engine_type_rewrites.is_empty() {
+            Arc::clone(incoming_data_schema)
+        } else {
+            Arc::new(arrow_tools::type_rewrite::apply_rules(
+                incoming_data_schema,
+                self.engine_type_rewrites,
+            ))
+        };
+        let incoming_data_schema = &normalized_incoming;
         let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
         let ctx = EvolutionContext {
             constraint_columns: &evolution.constraint_columns,
@@ -4699,6 +4813,99 @@ mod tests {
         .build()
     }
 
+    /// Regression test for #13014, CDC leg. `DuckDB` stores every timezone-aware
+    /// timestamp at microsecond precision, so a Postgres `timestamptz` CDC stream
+    /// arrives as `Timestamp(ns, "UTC")` against a `Timestamp(us, "UTC")` accelerated
+    /// table forever. `classify` reads that as `Incompatible`, so before the engine's
+    /// own rewrites were consulted here, `on_schema_change: fail` rejected the first
+    /// batch and stopped replication for a schema that never changed.
+    #[tokio::test]
+    async fn cdc_schema_evolution_accepts_an_engine_required_timestamp_rewrite() {
+        use crate::accelerated::refresh_task::RefreshTaskBuilder;
+        use crate::federated::FederatedTable;
+        use arrow::datatypes::TimeUnit;
+        use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+        /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds.
+        /// Spelled out rather than imported because the `DuckDB` accelerator sits
+        /// above this crate.
+        static DUCKDB_LIKE_RULES: arrow_tools::type_rewrite::TypeRewriteRules =
+            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
+
+        let stored = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let incoming = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+
+        let build = |name: &str, rules: arrow_tools::type_rewrite::TypeRewriteRules| {
+            let accelerator: Arc<dyn TableProvider> = Arc::new(
+                MemTable::try_new(Arc::clone(&stored), vec![vec![]])
+                    .expect("mem table should be created"),
+            );
+            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            install_cdc_schema_evolution(
+                &dataset,
+                CdcSchemaEvolution {
+                    policy: OnSchemaChange::Fail,
+                    constraint_columns: vec![],
+                },
+            );
+            let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+            RefreshTaskBuilder::new(
+                runtime_status::RuntimeStatus::new(),
+                dataset,
+                federated,
+                None,
+                accelerator,
+                tokio::runtime::Handle::current(),
+                Arc::new(tokio::sync::Mutex::new(())),
+            )
+            .with_engine_type_rewrites(rules)
+            .build()
+        };
+
+        let task = build("cdc_engine_rewrite_accepted", DUCKDB_LIKE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
+            "an engine-required rewrite is not a schema change and must not fail the write",
+        );
+
+        // The upgrade case for #13018. A Cayenne table created before the engine
+        // preserved timestamp units stores microseconds; Cayenne now creates such a
+        // column as nanoseconds, but this table's stored type does not change. Its
+        // rules must still explain that, or upgrading stops replication on the first
+        // batch of an unchanged Postgres `timestamptz` stream. `classify` cannot save
+        // it: nanosecond is excluded as a widening target because rescaling to ns
+        // overflows i64 past ~2262, so us -> ns is `Incompatible`, not `Widening`.
+        let task = build("cdc_legacy_microsecond_table", CAYENNE_TYPE_REWRITE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming)
+            .await
+            .expect("a pre-existing microsecond Cayenne table must keep replicating after upgrade");
+
+        // Neuter: with no engine rules the same pair is classified as incompatible and
+        // `on_schema_change: fail` rejects it - so the pass above is the rules working,
+        // not a comparison that never saw a difference.
+        let task = build("cdc_engine_rewrite_rejected", &[]);
+        let Err(e) = task.maybe_evolve_schema_for_cdc(&incoming).await else {
+            panic!("expected `on_schema_change: fail` to reject the unnormalized ns -> us change")
+        };
+        assert!(
+            e.to_string().contains("incompatible schema change"),
+            "unexpected error: {e}"
+        );
+    }
+
     #[tokio::test]
     async fn test_write_change_upsert_returns_data_written() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -6257,8 +6464,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
@@ -6505,8 +6717,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,
@@ -6564,8 +6781,13 @@ mod tests {
         let mut pending_commit = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        // Only consulted when a source reports its history is unavailable, which
+        // these cases never do; the default carries `RefreshMode::Full`, which is
+        // what a rebuild would override it to anyway.
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
         let mut context = ApplyContext {
             refresh_sql: None,
+            refresh: &refresh,
             dataset_name: &dataset_name,
             metric_labels: &metric_labels,
             caching: None,

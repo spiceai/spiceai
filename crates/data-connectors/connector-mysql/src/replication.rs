@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `mysql_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Validate the dataset's PK/upsert configuration up front.
 //!   - Provide the [`PositionStore`] implementation over the accelerator's
 //!     `spice_sys_mysql_binlog` sidecar table.
@@ -36,18 +36,16 @@ use data_components::mysql_replication::{
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     StoreError, derive_server_id, process_nonce, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use mysql_async::{Opts, OptsBuilder, SslOpts};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime::dataaccelerator::spice_sys::{
-    OpenOption,
-    mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogSys},
-};
-use runtime::federated::FederatedTable;
-use runtime::parameters::Parameters;
+use runtime_checkpoint_api::mysql_binlog::{MySqlBinlogCheckpoint, MySqlBinlogStore};
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, ObserveMetricCallback};
+use runtime_parameters::Parameters;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -55,10 +53,47 @@ const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 
+/// The binlog-position store for `dataset`.
+///
+/// File-accelerated datasets persist their position in the accelerator sidecar;
+/// everything else re-bootstraps on each start, as does a dataset whose sidecar
+/// cannot be opened.
+///
+/// Resolved *before* the stream is built, so the generator holds only the store. A
+/// store holds a connection pool and no runtime, so a long-lived stream that holds
+/// one cannot pin the runtime.
+pub async fn resolve_position_store(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+) -> Arc<dyn PositionStore> {
+    if !dataset.is_file_accelerated() {
+        tracing::info!(
+            dataset = %dataset.name,
+            "dataset is not file-accelerated; the binlog position will not be persisted \
+             across restarts and the stream will re-bootstrap on every start"
+        );
+        return Arc::new(NoopPositionStore);
+    }
+
+    match context.mysql_binlog_store(dataset).await {
+        Ok(sys) => Arc::new(SidecarPositionStore { sys }),
+        Err(e) => {
+            tracing::error!(
+                dataset = %dataset.name,
+                error = %e,
+                "failed to initialize the binlog-position sidecar; the position will \
+                 not be persisted and the stream will re-bootstrap on every restart"
+            );
+            Arc::new(NoopPositionStore)
+        }
+    }
+}
+
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    dataset: &DatasetSpec,
+    position_store: Arc<dyn PositionStore>,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
@@ -130,19 +165,17 @@ pub fn build_changes_stream(
         .unwrap_or_default();
     let engine_supports_upsert = !matches!(
         engine,
-        runtime::component::dataset::acceleration::Engine::Arrow
-            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+        runtime_component::dataset::acceleration::Engine::Arrow
+            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
     let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
         a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
                 a.on_conflict.get(pk),
-                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
-
-    let dataset = dataset.clone();
 
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
@@ -198,31 +231,7 @@ pub fn build_changes_stream(
             Err(StreamError::External(msg))?;
         }
 
-        // File-accelerated datasets persist their binlog position in the
-        // accelerator sidecar; everything else re-bootstraps on each start.
-        let position_store: Arc<dyn PositionStore> = if dataset.is_file_accelerated() {
-            match MySqlBinlogSys::try_new(&dataset, OpenOption::CreateIfNotExists).await {
-                Ok(sys) => Arc::new(SidecarPositionStore { sys }),
-                Err(e) => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        error = %e,
-                        "failed to initialize the binlog-position sidecar; the position will \
-                         not be persisted and the stream will re-bootstrap on every restart"
-                    );
-                    Arc::new(NoopPositionStore)
-                }
-            }
-        } else {
-            tracing::info!(
-                dataset = %dataset_name,
-                "dataset is not file-accelerated; the binlog position will not be persisted \
-                 across restarts and the stream will re-bootstrap on every start"
-            );
-            Arc::new(NoopPositionStore)
-        };
-
-        let schema_json = match MySqlBinlogSys::serialize_schema(&schema) {
+        let schema_json = match arrow_tools::schema::schema_to_json(&schema) {
             Ok(json) => Some(json),
             Err(e) => {
                 tracing::warn!(
@@ -255,15 +264,14 @@ pub fn build_changes_stream(
 
 /// [`PositionStore`] over the accelerator's `spice_sys_mysql_binlog` sidecar.
 struct SidecarPositionStore {
-    sys: MySqlBinlogSys,
+    sys: Arc<dyn MySqlBinlogStore>,
 }
 
 #[async_trait]
 impl PositionStore for SidecarPositionStore {
     async fn load(&self) -> Result<Option<PersistedPosition>, StoreError> {
-        // `MySqlBinlogSys::get` swallows read errors into `None`, matching the
-        // MongoDB sidecar: an unreadable checkpoint re-bootstraps rather than
-        // wedging the dataset.
+        // The store reports a read failure as `None`, matching the MongoDB sidecar: an
+        // unreadable checkpoint re-bootstraps rather than wedging the dataset.
         let Some(cp) = self.sys.get().await else {
             return Ok(None);
         };

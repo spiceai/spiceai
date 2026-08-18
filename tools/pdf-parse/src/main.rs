@@ -224,7 +224,8 @@ fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> 
     let start = Instant::now();
     let (content, actual_format, note) = match format {
         OutputFormat::Text => {
-            let text = pdf_inspector::extract_text_mem(raw).context(PdfInspectorSnafu)?;
+            let text =
+                pdf_inspector::extractor::extract_text_mem(raw).context(PdfInspectorSnafu)?;
             (text, OutputFormat::Text, None)
         }
         OutputFormat::Markdown => {
@@ -235,7 +236,8 @@ fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> 
                 // The full pipeline did not produce markdown (e.g. a scanned
                 // page needing OCR); fall back to plain text so the run is
                 // still comparable rather than empty.
-                let text = pdf_inspector::extract_text_mem(raw).context(PdfInspectorSnafu)?;
+                let text = pdf_inspector::extractor::extract_text_mem(raw)
+                    .context(PdfInspectorSnafu)?;
                 (
                     text,
                     OutputFormat::Text,

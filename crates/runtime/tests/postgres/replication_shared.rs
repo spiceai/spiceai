@@ -36,9 +36,10 @@ use std::time::Duration;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
+use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
@@ -77,12 +78,18 @@ fn shared_params(port: u16) -> ReplicationParams {
         initial_snapshot: true,
         snapshot_on_resume: false,
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        // Short enough that the idle carry-forward is exercised within a test rather
+        // than waited on; the production default is coarse on purpose.
+        watermark_flush_interval: Duration::from_secs(1),
         ready_lag: Duration::from_secs(2),
     }
 }
@@ -109,7 +116,105 @@ fn independent_input(port: u16, table: &str) -> ReplicationStreamInput {
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     }
+}
+
+/// An [`AppliedLsnStore`] held in memory, for exercising the watermark paths in
+/// this suite.
+///
+/// The default `NoopAppliedLsnStore` reports that it records nothing, which
+/// makes a missing watermark uninformative by design — so with it, none of the
+/// gap detection below can be reached. This records positions like the real
+/// sidecar does, and survives across `start_replication_stream` calls in one
+/// test so a "restart" can read what the previous stream wrote.
+#[derive(Default)]
+struct InMemoryAppliedLsnStore {
+    recorded: std::sync::Mutex<Option<AppliedLsn>>,
+    /// Successful writes, so a test can assert on how *often* a position is
+    /// recorded and not only on its value.
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+impl InMemoryAppliedLsnStore {
+    fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A store that already holds `lsn`, for modelling an acceleration whose
+    /// recorded position is *behind* where the slot has got to — a dataset
+    /// re-added after its reservation lapsed, or one whose last acknowledgement
+    /// never reached its local record.
+    fn seeded(lsn: u64) -> Arc<Self> {
+        let store = Self::default();
+        *store.recorded.lock().expect("watermark mutex") = Some(AppliedLsn { lsn });
+        Arc::new(store)
+    }
+
+    fn recorded_lsn(&self) -> Option<u64> {
+        self.recorded
+            .lock()
+            .expect("watermark mutex")
+            .map(|applied| applied.lsn)
+    }
+
+    fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for InMemoryAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .recorded
+            .lock()
+            .expect("watermark mutex")
+            .map_or(RecordedPosition::Absent, RecordedPosition::At))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self.recorded.lock().expect("watermark mutex") = Some(applied);
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self.recorded.lock().expect("watermark mutex") = None;
+        Ok(())
+    }
+}
+
+/// [`input_for`] with a watermark store that actually records, so the gap
+/// decision is reachable. Pass the same store across two streams to model a
+/// restart against acceleration files that survived.
+fn input_with_watermark<S: AppliedLsnStore + 'static>(
+    port: u16,
+    table: &str,
+    store: &Arc<S>,
+) -> ReplicationStreamInput {
+    let mut input = input_for(port, table);
+    input.applied_lsn_store = Arc::clone(store) as Arc<dyn AppliedLsnStore>;
+    input
+}
+
+/// [`input_with_watermark`] carrying what the runtime observed the accelerator to
+/// hold, which is what tells a first load apart from one that may be carrying
+/// rows the source has since deleted.
+fn input_with_contents<S: AppliedLsnStore + 'static>(
+    port: u16,
+    table: &str,
+    store: &Arc<S>,
+    acceleration: AccelerationContents,
+) -> ReplicationStreamInput {
+    let mut input = input_with_watermark(port, table, store);
+    input.params.acceleration = acceleration;
+    input
 }
 
 fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationStreamInput {
@@ -122,6 +227,7 @@ fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationSt
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     }
 }
 
@@ -1056,6 +1162,11 @@ async fn shared_and_independent_slots_coexist() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Postgres `pg_lsn` text form of a numeric LSN, for comparisons in SQL.
+fn lsn_text(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
 /// Whether the slot has acknowledged everything up to `lsn` — the point past
 /// which Postgres is free to recycle that WAL. Returns the verdict and the
 /// slot's current `confirmed_flush_lsn` for the assertion message.
@@ -1071,6 +1182,721 @@ async fn slot_acked_past(
         )
         .await?;
     Ok((row.get(0), row.get(1)))
+}
+
+/// Regression for #11896: a durable acceleration whose CDC bootstrap was lost to
+/// a crash before it became durable must be re-loaded, not resumed over.
+///
+/// The reported failure was that the slot's *existence* suppressed the
+/// re-bootstrap: after a hard kill before the mem-tier seal, the acceleration was
+/// empty, the slot was already there, `need_snapshot` was therefore false, and no
+/// pass ever reconciled against the source — so the rows were gone permanently.
+///
+/// A crash before the seal is reproducible without killing anything: durability
+/// is what gates the acknowledgement, so an unsealed bootstrap is exactly a
+/// bootstrap whose envelopes were never committed. Dropping the stream without
+/// committing leaves the same state a `SIGKILL` would — the slot exists, nothing
+/// was acknowledged, and no position was recorded.
+///
+/// The acceleration must then be re-loaded (a fresh snapshot) or asked to rebuild.
+/// Resuming is the failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "lost_bootstrap", &[(1, "alice"), (2, "bob")]).await?;
+
+    // --- 1. First start: nothing has been recorded for this durable acceleration,
+    // so it is asked to load from the source rather than resume. Nothing is
+    // committed — the acknowledgement is what durability gates, so this leaves the
+    // state a crash before the seal leaves behind. ---
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_watermark(port, "lost_bootstrap", &store));
+    let opening = next_envelope(&mut first, "first envelope before the crash").await?;
+    anyhow::ensure!(
+        opening.history_unavailable(),
+        "a durable acceleration with nothing recorded must be asked to load from the source"
+    );
+    drop(opening); // never committed — nothing became durable, nothing was recorded
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The slot survives the crash, which is what used to suppress the re-load.
+    assert_eq!(slot_count(&source).await?, 1, "the slot must persist");
+    anyhow::ensure!(
+        store.recorded_lsn().is_none(),
+        "nothing may have been recorded: the acknowledgement that records a position is gated on \
+         the durability this test is simulating the loss of"
+    );
+
+    // --- 2. Restart against the same (durable, now empty) acceleration. It must
+    // be re-loaded rather than resumed. ---
+    let mut restarted =
+        start_replication_stream(input_with_watermark(port, "lost_bootstrap", &store));
+    let envelope = next_envelope(&mut restarted, "first envelope after the restart").await?;
+    let reloaded = envelope.history_unavailable() || num_rows(&envelope) == 2;
+    anyhow::ensure!(
+        reloaded,
+        "a durable acceleration whose load was lost before it became durable was neither \
+         re-snapshotted nor asked to rebuild — its rows are gone permanently (#11896). The slot's \
+         existence must not suppress the re-load. First envelope carried {} row(s), \
+         history_unavailable={}",
+        num_rows(&envelope),
+        envelope.history_unavailable()
+    );
+    envelope.commit().await?;
+
+    drop(restarted);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// A durable acceleration holding no rows must load through the ordinary snapshot
+/// bootstrap, not a rebuild.
+///
+/// Nothing has been recorded for it, and a missing watermark is normally treated
+/// as evidence of a gap, because it cannot be told apart from one whose write
+/// failed. Emptiness settles that: an acceleration with no rows has nothing that
+/// could be stale and no deletion it could be missing, so there is nothing for a
+/// rebuild to repair. Every durable CDC acceleration starts here exactly once, so
+/// getting this wrong routes every first load through a full re-read of the
+/// source (#13118).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_bootstraps_rather_than_rebuilding() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "fresh_empty", &[(1, "alice"), (2, "bob")]).await?;
+
+    // A durable acceleration (the store records positions) that has recorded
+    // nothing, observed to hold no rows — the state every first load is in.
+    let store = InMemoryAppliedLsnStore::shared();
+    let input = input_with_contents(port, "fresh_empty", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut stream = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut stream, "first envelope of a fresh acceleration").await?;
+    anyhow::ensure!(
+        !envelope.history_unavailable(),
+        "an acceleration observed to hold no rows was asked to rebuild from the source. There is \
+         nothing in it that could be stale, so the rebuild repairs nothing and only re-reads the \
+         whole table on what is the first load of every durable CDC acceleration (#13118)"
+    );
+    anyhow::ensure!(
+        num_rows(&envelope) == 2,
+        "the snapshot bootstrap must deliver the source rows; first envelope carried {} row(s)",
+        num_rows(&envelope)
+    );
+    assert_eq!(
+        ids_of(&envelope),
+        vec![1, 2],
+        "the bootstrap must carry the rows present at the source"
+    );
+    envelope.commit().await?;
+
+    // `history_unavailable` being clear only says no rebuild was requested. The
+    // snapshot bootstrap counts the rows it delivers and the rebuild path runs no
+    // snapshot at all, so this is what tells "bootstrapped" apart from "loaded by
+    // some other means".
+    anyhow::ensure!(
+        metrics.bootstrap_rows_total() > 0,
+        "no rows were delivered by the snapshot bootstrap, so the acceleration was not loaded \
+         through it"
+    );
+
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// An empty acceleration must still be **loaded** when no snapshot is going to
+/// run, which means rebuilding it.
+///
+/// Emptiness says only that there is nothing stale to repair. It does not load
+/// the table. When the slot already exists and its publication already carries
+/// this table, none of `need_snapshot`'s conditions hold, so no snapshot runs —
+/// and if the rebuild is skipped too, the member resumes from the slot's
+/// position and every row committed before it is missing from the acceleration
+/// permanently. That is silent, unrecoverable data loss: no change event for
+/// those rows will ever be replayed.
+///
+/// Reached by starting a stream (creating the slot and publication), dropping
+/// it, and rejoining against a *fresh* acceleration — the shape of a deleted or
+/// relocated accelerator directory under a slot that outlived it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slot_outlived", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and puts the table in the publication, and
+    // commits so the slot holds a real position.
+    let first_store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "slot_outlived",
+        &first_store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // Rows committed while nothing is streaming. A resume from the slot position
+    // would carry these, but never the two rows that predate the slot.
+    source
+        .execute(
+            "INSERT INTO public.slot_outlived (id, name) VALUES ($1, 'carol')",
+            &[&3_i32],
+        )
+        .await?;
+
+    // Rejoin with a brand-new acceleration: empty, nothing recorded, against the
+    // surviving slot and publication. No snapshot can run in this state.
+    let store = InMemoryAppliedLsnStore::shared();
+    let input = input_with_contents(port, "slot_outlived", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope =
+        next_envelope(&mut rejoined, "first envelope after the slot outlived it").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an empty acceleration was neither rebuilt nor snapshotted when it rejoined a slot that \
+         outlived it, so it resumed from the slot position and the rows committed before that \
+         position are gone for good. Emptiness means there is nothing stale to repair — it does \
+         not mean something else will load the table"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
+/// an acceleration that holds rows it cannot place must still be rebuilt.
+///
+/// This is the case the rebuild exists for. Rows are present, no position says
+/// what they are current as of, and a row deleted at the source while the
+/// acceleration was away produces no change row — appending a snapshot over the
+/// top would upsert every surviving row and leave the deleted one behind
+/// forever. Only re-reading the table removes it.
+///
+/// A probe that could not answer must land here too: not knowing whether rows are
+/// present is not the same as knowing there are none, and only the latter is
+/// proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unplaceable_acceleration_still_rebuilds() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "unplaceable", &[(1, "alice")]).await?;
+
+    for (contents, described) in [
+        (AccelerationContents::NonEmpty, "observed to hold rows"),
+        (AccelerationContents::Unknown, "could not be read"),
+    ] {
+        let store = InMemoryAppliedLsnStore::shared();
+        let input = input_with_contents(port, "unplaceable", &store, contents);
+        let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+        let mut stream = start_replication_stream(input);
+        let envelope =
+            next_envelope(&mut stream, "first envelope of an unplaceable acceleration").await?;
+        anyhow::ensure!(
+            envelope.history_unavailable(),
+            "an acceleration whose contents {described}, with no recorded position, was resumed \
+             rather than rebuilt. A row deleted at the source while it was away produces no \
+             change row, so nothing but a re-read of the table would ever remove it (#12922)"
+        );
+        envelope.commit().await?;
+        anyhow::ensure!(
+            metrics.bootstrap_rows_total() == 0,
+            "the rebuild replaces the acceleration's contents, so no snapshot may also be \
+             appended over them"
+        );
+
+        drop(stream);
+        wait_for_walsender_count(&source, 0).await?;
+    }
+
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// An applied-position store whose writes are slow, for showing that the commit path
+/// does not wait on them.
+#[derive(Default)]
+struct SlowAppliedLsnStore {
+    recorded: std::sync::Mutex<Option<AppliedLsn>>,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowAppliedLsnStore {
+    const DELAY: Duration = Duration::from_millis(250);
+
+    fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for SlowAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .recorded
+            .lock()
+            .expect("watermark mutex")
+            .map_or(RecordedPosition::Absent, RecordedPosition::At))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::sleep(Self::DELAY).await;
+        *self.recorded.lock().expect("watermark mutex") = Some(applied);
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        *self.recorded.lock().expect("watermark mutex") = None;
+        Ok(())
+    }
+
+    fn records_positions(&self) -> bool {
+        true
+    }
+}
+
+/// Committing publishes a position and returns; only the applied-position writer
+/// touches the store. So a store that is slow to write must not make commits slow —
+/// if it did, every dataset on a shared slot would apply changes at the speed of its
+/// accelerator's bookkeeping writes.
+///
+/// The delay is fixed because store latency is the thing under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_position_store_does_not_slow_the_commit_path() -> Result<(), anyhow::Error> {
+    const COMMITS: usize = 8;
+
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slow_store", &[(1, "one")]).await?;
+
+    let store = SlowAppliedLsnStore::shared();
+    let mut member = start_replication_stream(input_with_watermark(port, "slow_store", &store));
+    next_envelope(&mut member, "bootstrap")
+        .await?
+        .commit()
+        .await?;
+
+    let mut committed = 0_usize;
+    let mut spent_committing = Duration::ZERO;
+    for id in 0..COMMITS {
+        source
+            .execute(
+                "INSERT INTO public.slow_store (id, name) VALUES ($1, 'row')",
+                &[&i32::try_from(id + 10).expect("id fits")],
+            )
+            .await?;
+        if let Ok(envelope) = next_envelope(&mut member, "change").await {
+            let started = std::time::Instant::now();
+            envelope.commit().await?;
+            spent_committing += started.elapsed();
+            committed += 1;
+        }
+    }
+    anyhow::ensure!(
+        committed > 0,
+        "no change was committed, so nothing about the commit path was measured"
+    );
+
+    let serialized = SlowAppliedLsnStore::DELAY * u32::try_from(committed).expect("fits");
+    eprintln!(
+        "commit path: {spent_committing:?} across {committed} commit(s); \
+         waiting for each {:?} store write would have cost {serialized:?}; \
+         store writes so far: {}",
+        SlowAppliedLsnStore::DELAY,
+        store.saves()
+    );
+    anyhow::ensure!(
+        spent_committing * 2 < serialized,
+        "commits are waiting on the applied-position store: {spent_committing:?} across \
+         {committed} commit(s), against {serialized:?} if each had waited for its write. \
+         Publishing the position must not put store I/O on the commit path"
+    );
+
+    drop(member);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The counterpart to the rebuild tests: a dataset that simply restarts must
+/// **resume**, not rebuild. Without this, a rule that classifies gaps too eagerly
+/// passes every rebuild test while re-reading the whole table on every restart.
+///
+/// The case that makes this easy to get wrong is a *quiet* table. The slot's
+/// acknowledgement is advanced for an idle member by the pump's keepalive crediting,
+/// which routes no envelope and therefore records no watermark — so the slot's
+/// `confirmed_flush_lsn` legitimately drifts ahead of the last position the
+/// acceleration recorded as applied. That drift is not a gap: crediting only covers
+/// WAL that contained no changes for this table. Treating it as one would rebuild a
+/// healthy acceleration on every restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_dataset_resumes_across_a_restart_rather_than_rebuilding()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "quiet", &[(1, "one")]).await?;
+
+    // --- 1. Bootstrap and commit, so a position is recorded, then let the table go
+    // quiet while a second table's traffic keeps the slot acknowledging forward. ---
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut quiet = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    next_envelope(&mut quiet, "bootstrap quiet")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut quiet, "quiet readiness")
+        .await?
+        .commit()
+        .await?;
+    let recorded = store
+        .recorded_lsn()
+        .ok_or_else(|| anyhow::anyhow!("the member must record a position while attached"))?;
+
+    // Drive the slot's acknowledgement past the quiet table's recorded position using
+    // WAL that contains nothing for it. This is the benign drift the rule must not
+    // mistake for a gap; the test asserts it was actually reached.
+    let flush_every = input_for(port, "quiet").params.watermark_flush_interval;
+    let drift_started = std::time::Instant::now();
+    create_table(&source, "noisy", &[(1, "n1")]).await?;
+    // The busy member records its position through its own commits. Counting its
+    // writes against its commits is what shows they are coalesced by the single
+    // writer rather than issued one per commit.
+    let noisy_store = InMemoryAppliedLsnStore::shared();
+    let mut noisy = start_replication_stream(input_with_watermark(port, "noisy", &noisy_store));
+    next_envelope(&mut noisy, "bootstrap noisy")
+        .await?
+        .commit()
+        .await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut drifted = false;
+    let mut churn_id = 100;
+    let mut noisy_commits = 0_usize;
+    while std::time::Instant::now() < deadline {
+        churn_id += 1;
+        source
+            .execute(
+                "INSERT INTO public.noisy (id, name) VALUES ($1, 'churn')",
+                &[&churn_id],
+            )
+            .await?;
+        if let Ok(envelope) = next_envelope(&mut noisy, "noisy churn").await {
+            envelope.commit().await?;
+            noisy_commits += 1;
+        }
+        if let Ok(envelope) = next_envelope(&mut quiet, "quiet heartbeat").await {
+            envelope.commit().await?;
+        }
+        let (past, _) = slot_acked_past(&source, &lsn_text(recorded)).await?;
+        if past {
+            drifted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::ensure!(
+        drifted,
+        "the test could not reach the state it exists to cover: the slot never acknowledged past \
+         the quiet table's recorded position, so no drift was constructed"
+    );
+
+    // --- 2. Restart the quiet dataset against the position it recorded. The slot is
+    // acknowledged past it, but only over WAL that held nothing for this table. ---
+    drop(quiet);
+    drop(noisy);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // The carry-forward has to have actually run — otherwise this test would also
+    // pass on a build that simply never rebuilds — and it has to be paced by
+    // `watermark_flush_interval` rather than firing on every keepalive. The quiet
+    // table sees no changes, so every save past its boundary envelope is a
+    // carry-forward.
+    let saves = store.saves();
+    let elapsed_ticks = drift_started.elapsed().as_secs_f64() / flush_every.as_secs_f64();
+    anyhow::ensure!(
+        saves > 1,
+        "the quiet table's recorded position was never carried forward ({saves} write(s) total), \
+         so this test would pass for the wrong reason"
+    );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "counter is small; the comparison is a loose bound"
+    )]
+    let saves_f = saves as f64;
+    // Integration-test worker logs are dropped, so print the measurements.
+    let noisy_saves = noisy_store.saves();
+    eprintln!(
+        "quiet-member position writes: {saves} over {elapsed_ticks:.1} flush interval(s) of {flush_every:?}"
+    );
+    eprintln!("busy-member position writes: {noisy_saves} for {noisy_commits} commit(s)");
+    anyhow::ensure!(
+        saves_f <= elapsed_ticks + 3.0,
+        "the recorded position is being written far more often than once per flush interval \
+         ({saves} writes over {elapsed_ticks:.1} intervals), which would put avoidable I/O on \
+         every idle member of every shared slot"
+    );
+
+    let mut restarted = start_replication_stream(input_with_watermark(port, "quiet", &store));
+    let envelope = next_envelope(&mut restarted, "first envelope after the restart").await?;
+    anyhow::ensure!(
+        !envelope.history_unavailable(),
+        "a quiet dataset was asked to rebuild after an ordinary restart. The slot's acknowledgement \
+         drifting ahead of the recorded position through idle crediting is not a gap, and treating \
+         it as one re-reads the whole table on every restart"
+    );
+    envelope.commit().await?;
+
+    drop(restarted);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Regression for #11289 variant 2: a dataset removed from the Spicepod, whose
+/// table stays in the publication, must not silently miss the changes committed
+/// while it was gone once the slot's hold on its behalf lapses.
+///
+/// Reproducing this needs both halves of the protection to be absent, which is
+/// why a simpler construction does not work:
+///
+///   * **A real restart.** A merely detached member keeps its `AckSlot`, and
+///     `flush_lsn` is the minimum over *all* members including held ones — so its
+///     frozen floor pins the slot and nothing can ack past it. Every stream has
+///     to go away so the source, and its `AckTable`, are discarded.
+///   * **A lapsed reservation.** On the next attach the slot reserves the floor
+///     for every published table with no member, which protects the absent one
+///     until the grace expires. `unclaimed_reservation_grace` is shortened here
+///     because the behavior after expiry is otherwise unreachable in under five
+///     minutes.
+///
+/// Once both are gone the surviving member's traffic carries the slot's
+/// acknowledgement past the absent table's change. Rejoining must then either
+/// deliver that change or ask for a rebuild — what it must never do is resume
+/// into live traffic as if nothing were missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_changes()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "lapsed_mate", &[(1, "mate1")]).await?;
+    create_table(&source, "lapsed_absent", &[(1, "absent1")]).await?;
+
+    // Shorten the hold so expiry is reachable. It is read from the params of
+    // whichever member opens the slot, so both members carry it.
+    let brief_grace = Duration::from_secs(2);
+    let short_grace = |mut input: ReplicationStreamInput| {
+        input.params.unclaimed_reservation_grace = brief_grace;
+        input
+    };
+
+    // --- 1. Both tables join, establishing publication membership, slot history,
+    // and a recorded position for the table that is about to disappear. ---
+    let absent_store = InMemoryAppliedLsnStore::shared();
+    let mut mate = start_replication_stream(short_grace(input_for(port, "lapsed_mate")));
+    next_envelope(&mut mate, "bootstrap mate")
+        .await?
+        .commit()
+        .await?;
+
+    let mut absent = start_replication_stream(short_grace(input_with_watermark(
+        port,
+        "lapsed_absent",
+        &absent_store,
+    )));
+    next_envelope(&mut absent, "bootstrap absent")
+        .await?
+        .commit()
+        .await?;
+    wait_for_ready(&mut absent, "absent readiness")
+        .await?
+        .commit()
+        .await?;
+    let recorded = absent_store
+        .recorded_lsn()
+        .ok_or_else(|| anyhow::anyhow!("the member must record a position while attached"))?;
+
+    // --- 2. A restart: every stream goes away, so the pump exits and the source
+    // (with its AckTable and every held floor) is discarded. The slot and the
+    // publication both persist, which is what makes this a restart. ---
+    drop(mate);
+    drop(absent);
+    wait_for_walsender_count(&source, 0).await?;
+    assert_eq!(slot_count(&source).await?, 1, "the slot must persist");
+
+    // --- 3. The absent table changes while nothing is consuming it. ---
+    source
+        .simple_query("INSERT INTO public.lapsed_absent VALUES (2, 'missed-while-removed')")
+        .await?;
+    let missed_lsn: String = source
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?
+        .get(0);
+
+    // --- 4. Only the surviving dataset comes back. Its attach reserves the floor
+    // for the absent table; after the grace lapses, its own traffic carries the
+    // slot's acknowledgement past the missed change. ---
+    let mut mate = start_replication_stream(short_grace(input_for(port, "lapsed_mate")));
+
+    // Committing the mate's envelopes — including its idle heartbeats — is what
+    // carries the slot's acknowledgement forward; the reservation for the absent
+    // table has to lapse first, which is why the grace is shortened above.
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut acked_past = false;
+    let mut churn_id = 100;
+    while std::time::Instant::now() < deadline {
+        churn_id += 1;
+        source
+            .execute(
+                "INSERT INTO public.lapsed_mate (id, name) VALUES ($1, 'mate-churn')",
+                &[&churn_id],
+            )
+            .await?;
+        if let Ok(envelope) = next_envelope(&mut mate, "mate churn").await {
+            envelope.commit().await?;
+        }
+        let (past, _) = slot_acked_past(&source, &missed_lsn).await?;
+        if past {
+            acked_past = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::ensure!(
+        acked_past,
+        "the test could not reach the state it exists to cover: the slot never acknowledged past \
+         the absent table's change, so the reservation never lapsed"
+    );
+
+    // --- 5. Releasing the hold also drops the table from the publication, which
+    // on its own would send a returning dataset through the initial-snapshot path
+    // (`table_added = true`) and recover it for a reason that has nothing to do
+    // with its recorded position. Put the table back with no member attached, so
+    // the re-add sees `table_added = false` and recovery has to come from the
+    // recorded position — either replaying from it, or reporting that the history
+    // it needs is gone.
+    source
+        .simple_query(&format!(
+            "ALTER PUBLICATION {PUBLICATION} ADD TABLE public.lapsed_absent"
+        ))
+        .await
+        .ok();
+
+    // --- 6. The dataset is re-added, carrying the position it recorded before it
+    // left. Either outcome is correct; resuming into live traffic is not. ---
+    let mut re_added = start_replication_stream(short_grace(input_with_watermark(
+        port,
+        "lapsed_absent",
+        &InMemoryAppliedLsnStore::seeded(recorded),
+    )));
+    // Idle heartbeats carry no rows and are not an answer either way, so commit
+    // past them and wait for one of the two acceptable outcomes: the missed change
+    // replayed, or a report that the history needed to replay it is gone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut recovered = false;
+    while std::time::Instant::now() < deadline {
+        let envelope = next_envelope(&mut re_added, "re-added dataset envelope").await?;
+        recovered = envelope.history_unavailable() || ids_of(&envelope).contains(&2);
+        envelope.commit().await?;
+        if recovered {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        recovered,
+        "a dataset re-added after its reservation lapsed neither received the change committed \
+         while it was gone (id=2) nor asked to be rebuilt — it resumed as if nothing were missing \
+         (#11289)"
+    );
+
+    drop(mate);
+    drop(re_added);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
 }
 
 /// Regression for #12609: on a shared slot that is *resuming* — every member

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::refresh_task::probe_acceleration_contents;
 use crate::accelerated::snapshots::SnapshotRefreshState;
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
@@ -38,6 +39,7 @@ use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::dataconnector::sink::SINK_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -57,6 +59,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -133,8 +136,13 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-pub use runtime_datafusion::dialect;
-pub use runtime_datafusion::error;
+// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
+// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
+// so a crate outside the runtime has to depend on `runtime-datafusion` directly
+// rather than route through here.
+#[cfg(any(feature = "duckdb", test))]
+pub(crate) use runtime_datafusion::dialect;
+pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
@@ -144,7 +152,7 @@ pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub use runtime_datafusion::refresh_sql;
+pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
 pub use runtime_table::table_provider_with_spicepod_metadata;
@@ -808,6 +816,12 @@ pub struct DataFusion {
     /// plan instead of re-running `EXPLAIN ANALYZE`. Default (unset) behaves
     /// as `TaskHistoryCapturedPlan::None`.
     plan_capture: OnceLock<query::plan_capture::PlanCaptureConfig>,
+    /// Drasi forwarders for the runtime's own tables, from `runtime.drasi`.
+    /// Installed before anything can write, ahead of the tables themselves —
+    /// the forwarders resolve a table's key lazily from the constraints handed
+    /// to them at write time, so the tables need not exist yet. Absent when
+    /// unconfigured.
+    pub(crate) drasi_forwarders: OnceLock<Arc<crate::drasi::internal::InternalForwarders>>,
 
     /// Signalled after each completed streaming write; the cluster executor
     /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
@@ -1068,6 +1082,19 @@ impl DataFusion {
     #[must_use]
     pub(crate) fn plan_capture_config(&self) -> Option<&query::plan_capture::PlanCaptureConfig> {
         self.plan_capture.get()
+    }
+
+    /// Install the Drasi forwarders for the runtime's own tables. Idempotent-
+    /// tolerant: a second call is ignored with a warning.
+    pub(crate) fn set_drasi_forwarders(
+        &self,
+        forwarders: Arc<crate::drasi::internal::InternalForwarders>,
+    ) {
+        if self.drasi_forwarders.set(forwarders).is_err() {
+            tracing::warn!(
+                "Drasi forwarders already set on DataFusion; ignoring duplicate set_drasi_forwarders"
+            );
+        }
     }
 
     pub async fn get_table(
@@ -1652,6 +1679,26 @@ impl DataFusion {
         // for it. `mem_tier_budget_bytes` is `None` when no configured table can
         // reach the tier (and for a non-Cayenne deployment): nothing to bound, so
         // nothing is installed and no tuning warning is emitted.
+        // Aggregate ceiling on the PK keyset caches. Each table derives its own
+        // from `pk_keyset_cache_mb` — ~1/32 of memory, clamped 256 MiB–8 GiB —
+        // with no view of its siblings, so a seven-table CDC pod on a 96 GiB host
+        // grants 21 GiB in total that no single table can ever exceed. Measured
+        // at SF-1000: ~14.5 GiB resident in keysets and not one over-budget
+        // event, because every table was correctly inside its own limit.
+        //
+        // 1/16 of the coordinated total, the same order as one table's own
+        // ceiling: generous enough that a single-table pod is unaffected (it
+        // clamps to its own figure anyway) while a fleet shares one bound
+        // instead of multiplying it. Over the ceiling a table degrades to its
+        // bloom, which is the fallback an over-budget table already takes.
+        let pk_keyset_budget_bytes = self.total_memory / 16;
+        cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
+        tracing::info!(
+            pk_keyset_budget_bytes,
+            total_memory = self.total_memory,
+            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+        );
+
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             // Mirror mem-tier `used` into the query MemoryPool so operators and
@@ -1894,9 +1941,10 @@ impl DataFusion {
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
+            let context = RuntimeConnectorContext::for_dataset(&deferred_registration.dataset);
             let read_provider = deferred_registration
                 .connector
-                .read_provider(&deferred_registration.dataset)
+                .read_provider(&context, &deferred_registration.dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
 
@@ -2165,8 +2213,9 @@ impl DataFusion {
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
         let registration = async {
+            let context = RuntimeConnectorContext::for_dataset(&pending_registration.dataset);
             let read_provider = sink_connector
-                .read_provider(&pending_registration.dataset)
+                .read_provider(&context, &pending_registration.dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
             let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -2272,13 +2321,33 @@ impl DataFusion {
                 })?;
         }
 
+        // Queue the committed write for Drasi, when `runtime.drasi` names this
+        // table. After the write, so Drasi only sees rows the runtime kept; and
+        // a queue rather than an await, so a Drasi outage cannot stall the
+        // writer or fail a write a caller would then retry and duplicate.
+        if let Some(forwarders) = self.drasi_forwarders.get() {
+            forwarders
+                .forward(
+                    table_reference,
+                    &update_type,
+                    table_provider.constraints(),
+                    &update_schema,
+                    &update_data,
+                )
+                .await;
+        }
+
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
         // - results cache may otherwise replay pre-write answers
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after write: {e}"
             );
@@ -2397,7 +2466,11 @@ impl DataFusion {
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
@@ -2544,7 +2617,7 @@ impl DataFusion {
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
@@ -3063,7 +3136,23 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            // Observed before the stream exists, so the CDC writer — the only
+            // writer on this path — cannot have touched the acceleration yet.
+            // A source that cannot place an acceleration's contents has to
+            // assume they may be hiding rows deleted at the source; this is how
+            // it recognizes a load that starts from nothing instead. See
+            // `AccelerationContents`.
+            let acceleration =
+                probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+
+            let changes_stream = source
+                .changes_stream(
+                    &RuntimeConnectorContext::for_dataset(dataset),
+                    Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
+                    dataset,
+                    acceleration,
+                )
+                .await;
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -3136,6 +3225,20 @@ impl DataFusion {
         #[cfg(windows)]
         let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
+
+        // The engine rewrites some incoming types at table creation because its storage
+        // format cannot hold them (DuckDB stores every TIMESTAMPTZ at microsecond
+        // precision, Cayenne/Vortex has no half-precision float). The refresh sink
+        // compares the incoming schema against the accelerated one, so without these
+        // rules it reports the engine's own type as the acceleration lagging the source.
+        let engine_type_rewrites = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(&[], |accel| {
+                accel.type_rewrite_rules()
+            });
+        accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)
@@ -3467,13 +3570,25 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
+                // The same engine-specific override the normal creation path resolves,
+                // so the archive is in the format that engine's bootstrap consumes —
+                // a Cayenne snapshot without its per-dataset metastore slice becomes
+                // the store's current snapshot and cannot be restored.
+                let snapshot_engine_override = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                {
+                    Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                    None => None,
+                };
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset_name,
+                    dataset,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
-                    None,
+                    snapshot_engine_override,
                 )
                 .await;
             }
@@ -3712,7 +3827,10 @@ impl DataFusion {
                 let sink_connector = Arc::new(SinkConnector::new(Arc::clone(&plan.evolved_schema)))
                     as Arc<dyn DataConnector>;
                 let read_provider = sink_connector
-                    .read_provider(dataset.as_ref())
+                    .read_provider(
+                        &RuntimeConnectorContext::for_dataset(dataset),
+                        dataset.as_ref(),
+                    )
                     .await
                     .context(UnableToResolveTableProviderSnafu)?;
                 let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -4153,7 +4271,7 @@ impl DataFusion {
         let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
@@ -5786,6 +5904,7 @@ mod tests {
                     check_availability: crate::component::dataset::CheckAvailability::Disabled,
                     check_availability_interval: None,
                     on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                    drasi: None,
                 },
                 app: Arc::new(app::App::default()),
                 runtime: Arc::new(runtime),

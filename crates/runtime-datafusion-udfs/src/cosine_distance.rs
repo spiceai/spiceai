@@ -28,6 +28,16 @@ limitations under the License.
 //! Both paths return `(1 - cosine_similarity) / 2` ∈ `[0, 1]` (0 = identical,
 //! 1 = opposite). Zero-magnitude vectors have undefined cosine direction; both
 //! paths treat them as orthogonal and return 0.5.
+//!
+//! A vector carrying `NaN` or an infinity has no distance at all, and both
+//! paths above return NULL for it. That matters for ranking: `_score` is
+//! `1 - distance`, so any fabricated distance for a failed embedding competes
+//! with real matches, and NULL is what keeps it out of the results.
+//!
+//! The NULL applies to these kernels only. `cosine_distance` is allowed to
+//! federate, where it unparses to the engine's own function (`DuckDB`'s
+//! `array_cosine_distance`) and that engine decides what a non-finite input
+//! scores — see #13088.
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Float64Builder, GenericListArray, LargeListArray, ListArray,
@@ -181,7 +191,9 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
         // divide by 2 to map into the standard [0, 1] distance range.
         // Zero-magnitude vectors have an undefined direction; simsimd treats the
         // dot product as zero (orthogonal), yielding distance 0.5.
-        (FixedSizeList(_, _), FixedSizeList(_, _)) => compute_fsl_f32_cosine(args),
+        (FixedSizeList(_, _), FixedSizeList(_, _)) => {
+            compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)
+        }
         (List(_), List(_)) => general_cosine_distance::<i32>(args),
         (LargeList(_), LargeList(_)) => general_cosine_distance::<i64>(args),
         (array_type1, array_type2) => {
@@ -190,35 +202,6 @@ pub(crate) fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<Array
             )
         }
     }
-}
-
-/// Compute cosine distance for `FixedSizeList<Float32>` with a non-finite safety guard.
-fn compute_fsl_f32_cosine(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
-    let result = compute_fsl_f32(args, Kernel::Cosine, |v| v / 2.0)?;
-    let float64 = result
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("compute_fsl_f32 should return Float64Array".to_string())
-        })?;
-
-    // Safety net: convert any non-finite output to NULL to prevent NaN from
-    // sorting ahead of real scores in `ORDER BY _score DESC`.
-    let mut builder = arrow::array::Float64Builder::with_capacity(float64.len());
-    for i in 0..float64.len() {
-        if float64.is_null(i) {
-            builder.append_null();
-        } else {
-            let v = float64.value(i);
-            if v.is_finite() {
-                builder.append_value(v);
-            } else {
-                builder.append_null();
-            }
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 fn general_cosine_distance<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
@@ -293,7 +276,7 @@ fn general_cosine_distance_f64<O: OffsetSizeTrait>(
             return exec_err!("Both arrays must have the same length");
         }
 
-        builder.append_value(cosine_distance_f64(
+        builder.append_option(cosine_distance_f64(
             &raw1[start1..end1],
             &raw2[start2..end2],
         ));
@@ -340,7 +323,7 @@ fn general_cosine_distance_f32<O: OffsetSizeTrait>(
             return exec_err!("Both arrays must have the same length");
         }
 
-        builder.append_value(cosine_distance_f32(
+        builder.append_option(cosine_distance_f32(
             &raw1[start1..end1],
             &raw2[start2..end2],
         ));
@@ -408,7 +391,7 @@ fn compute_cosine_distance(
         if f1.len() != f2.len() {
             return exec_err!("Both arrays must have the same length");
         }
-        return Ok(Some(cosine_distance_f64(f1.values(), f2.values())));
+        return Ok(cosine_distance_f64(f1.values(), f2.values()));
     }
 
     // Float32: same, promote while accumulating.
@@ -420,7 +403,7 @@ fn compute_cosine_distance(
         if f1.len() != f2.len() {
             return exec_err!("Both arrays must have the same length");
         }
-        return Ok(Some(cosine_distance_f32(f1.values(), f2.values())));
+        return Ok(cosine_distance_f32(f1.values(), f2.values()));
     }
 
     let float_vals1 = convert_to_f64_array(&value1)?;
@@ -430,18 +413,20 @@ fn compute_cosine_distance(
         return exec_err!("Both arrays must have the same length");
     }
 
-    Ok(Some(cosine_distance_f64(
+    Ok(cosine_distance_f64(
         float_vals1.values(),
         float_vals2.values(),
-    )))
+    ))
 }
 
 /// Computes the cosine distance between two equal-length f64 vectors.
 ///
-/// Zero-magnitude vectors have no defined direction; they are treated as
-/// orthogonal (cosine similarity = 0), returning distance `0.5`, consistent
-/// with the SIMD path.
-fn cosine_distance_f64(x: &[f64], y: &[f64]) -> f64 {
+/// Returns `None` when the distance is undefined — an input carrying `NaN` or
+/// an infinity, or an accumulation that overflows — so the caller can emit
+/// NULL instead of a fabricated score. A zero-magnitude vector is *defined*
+/// input with no direction; it is treated as orthogonal and yields `0.5`,
+/// matching the SIMD path.
+fn cosine_distance_f64(x: &[f64], y: &[f64]) -> Option<f64> {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
     let mut sum_squares: f64 = 0.0;
@@ -452,22 +437,11 @@ fn cosine_distance_f64(x: &[f64], y: &[f64]) -> f64 {
         sum_squares += a * b;
     }
 
-    let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
-
-    // Zero-magnitude vectors produce NaN (0/0); treat as zero similarity
-    // (orthogonal) so behavior matches the SIMD path → distance 0.5.
-    let similarity = if similarity.is_finite() {
-        similarity
-    } else {
-        0.0
-    };
-
-    // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
-    (1.0 - similarity) / 2.0
+    cosine_distance_from_accumulators(x_length, y_length, sum_squares)
 }
 
 /// Float32 variant of [`cosine_distance_f64`]; accumulates in f64.
-fn cosine_distance_f32(x: &[f32], y: &[f32]) -> f64 {
+fn cosine_distance_f32(x: &[f32], y: &[f32]) -> Option<f64> {
     let mut x_length: f64 = 0.0;
     let mut y_length: f64 = 0.0;
     let mut sum_squares: f64 = 0.0;
@@ -480,18 +454,43 @@ fn cosine_distance_f32(x: &[f32], y: &[f32]) -> f64 {
         sum_squares += a * b;
     }
 
+    cosine_distance_from_accumulators(x_length, y_length, sum_squares)
+}
+
+/// Shared tail of the scalar cosine kernels: turn the three accumulators into a
+/// distance in `[0, 1]`, or `None` when the result is not defined.
+fn cosine_distance_from_accumulators(
+    x_length: f64,
+    y_length: f64,
+    sum_squares: f64,
+) -> Option<f64> {
+    // Screening the accumulators covers every non-finite element without a
+    // branch per element: squaring sends `NaN` and either infinity into the
+    // matching length, so a poisoned vector cannot present a finite one. It
+    // must come *before* the zero-magnitude branch below — a `NaN` vector
+    // measured against a zero vector would otherwise be answered 0.5 on the
+    // strength of the zero side alone.
+    if !x_length.is_finite() || !y_length.is_finite() || !sum_squares.is_finite() {
+        return None;
+    }
+
+    // A zero-magnitude vector has no direction; both paths call it orthogonal.
+    if x_length == 0.0 || y_length == 0.0 {
+        return Some(0.5);
+    }
+
     let similarity = sum_squares / (x_length.sqrt() * y_length.sqrt());
-    let similarity = if similarity.is_finite() {
-        similarity
-    } else {
-        0.0
-    };
-    (1.0 - similarity) / 2.0
+    if !similarity.is_finite() {
+        return None;
+    }
+
+    // Convert cosine similarity [-1.0, 1.0] to cosine distance [0.0, 1.0]
+    Some((1.0 - similarity) / 2.0)
 }
 
 /// Thin wrapper kept for unit tests that construct `Float64Array`s directly.
 #[cfg(test)]
-fn cosine_distance(x: &Float64Array, y: &Float64Array) -> f64 {
+fn cosine_distance(x: &Float64Array, y: &Float64Array) -> Option<f64> {
     cosine_distance_f64(x.values(), y.values())
 }
 
@@ -531,38 +530,35 @@ mod tests {
     use arrow_schema::Field;
 
     use super::{CosineDistance, compute_cosine_distance, cosine_distance, cosine_distance_inner};
-    use crate::vector_simd::testing::fsl_f32;
+    use crate::vector_simd::testing::{fsl_f32, list_f32};
     use arrow::array::AsArray;
     use arrow::datatypes::Float64Type;
     use arrow_schema::DataType;
     use datafusion::logical_expr::ScalarUDFImpl;
 
+    /// Evaluates the scalar kernel and asserts the pair has a defined distance.
+    fn defined_distance(x: &[f64], y: &[f64]) -> f64 {
+        cosine_distance(
+            &Float64Array::from(x.to_vec()),
+            &Float64Array::from(y.to_vec()),
+        )
+        .expect("finite inputs must yield a defined distance")
+    }
+
     #[test]
     fn test_cosine_distance() {
         // Identical vectors -> similarity 1 -> distance 0.
-        assert!(
-            cosine_distance(
-                &Float64Array::from(vec![1.0, 2.0, 3.0]),
-                &Float64Array::from(vec![1.0, 2.0, 3.0]),
-            )
-            .abs()
-                < f64::EPSILON
-        );
+        assert!(defined_distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]).abs() < f64::EPSILON);
 
         // Opposite vectors -> similarity -1 -> distance 1.
         assert!(
-            (cosine_distance(
-                &Float64Array::from(vec![1.0, 2.0, 3.0]),
-                &Float64Array::from(vec![-1.0, -2.0, -3.0]),
-            ) - 1.0)
-                .abs()
-                < f64::EPSILON
+            (defined_distance(&[1.0, 2.0, 3.0], &[-1.0, -2.0, -3.0]) - 1.0).abs() < f64::EPSILON
         );
 
         // Arbitrary vectors stay within the normalized [0, 1] range.
-        assert!((0.0..=1.0).contains(&cosine_distance(
-            &Float64Array::from(vec![1000.0, 2000.0, 30.0]),
-            &Float64Array::from(vec![-42.0, 123.0, -3.0]),
+        assert!((0.0..=1.0).contains(&defined_distance(
+            &[1000.0, 2000.0, 30.0],
+            &[-42.0, 123.0, -3.0]
         )));
     }
 
@@ -571,18 +567,9 @@ mod tests {
         // Zero-magnitude vectors are treated as orthogonal → distance 0.5,
         // consistent with the SIMD path.
         let half = |d: f64| (d - 0.5).abs() < 1e-10;
-        assert!(half(cosine_distance(
-            &Float64Array::from(vec![0.0, 0.0, 0.0]),
-            &Float64Array::from(vec![1.0, 2.0, 3.0]),
-        )));
-        assert!(half(cosine_distance(
-            &Float64Array::from(vec![1.0, 2.0, 3.0]),
-            &Float64Array::from(vec![0.0, 0.0, 0.0]),
-        )));
-        assert!(half(cosine_distance(
-            &Float64Array::from(vec![0.0, 0.0]),
-            &Float64Array::from(vec![0.0, 0.0]),
-        )));
+        assert!(half(defined_distance(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0])));
+        assert!(half(defined_distance(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0])));
+        assert!(half(defined_distance(&[0.0, 0.0], &[0.0, 0.0])));
     }
 
     #[test]
@@ -673,6 +660,134 @@ mod tests {
             !out.is_null(0) && (out.value(0) - 0.5).abs() < 1e-5,
             "expected 0.5 for zero-magnitude vector, got {}",
             out.value(0)
+        );
+    }
+
+    // --- non-finite input tests (regression test for #11263) ---
+
+    #[test]
+    fn non_finite_input_is_null_on_every_dispatch_path() {
+        // A vector carrying NaN or infinity has no defined cosine distance. Both
+        // dispatch paths must report that the same way, otherwise the answer
+        // depends on whether the column is a FixedSizeList or a List.
+        for probe in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let fsl = cosine_distance_inner(&[
+                fsl_f32(&[&[probe, 2.0, 3.0]]) as ArrayRef,
+                fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef,
+            ])
+            .expect("fsl path evaluates");
+            let fsl = fsl.as_primitive::<Float64Type>();
+
+            let list = cosine_distance_inner(&[
+                list_f32::<i32>(&[&[probe, 2.0, 3.0]]),
+                list_f32::<i32>(&[&[1.0_f32, 2.0, 3.0]]),
+            ])
+            .expect("list path evaluates");
+            let list = list.as_primitive::<Float64Type>();
+
+            assert!(
+                fsl.is_null(0),
+                "FixedSizeList path must return NULL for {probe} input, got {}",
+                fsl.value(0)
+            );
+            assert!(
+                list.is_null(0),
+                "List path must return NULL for {probe} input, got {} — it disagrees with the \
+                 FixedSizeList path, so the same query answers differently per column type",
+                list.value(0)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_magnitude_stays_orthogonal_on_every_dispatch_path() {
+        // A zero vector is finite and well-defined input; both paths keep
+        // treating it as orthogonal (0.5). This is what separates it from the
+        // non-finite case above, which is undefined rather than orthogonal.
+        let fsl = cosine_distance_inner(&[
+            fsl_f32(&[&[0.0_f32, 0.0, 0.0]]) as ArrayRef,
+            fsl_f32(&[&[1.0_f32, 2.0, 3.0]]) as ArrayRef,
+        ])
+        .expect("fsl path evaluates");
+        let fsl = fsl.as_primitive::<Float64Type>();
+
+        let list = cosine_distance_inner(&[
+            list_f32::<i32>(&[&[0.0_f32, 0.0, 0.0]]),
+            list_f32::<i32>(&[&[1.0_f32, 2.0, 3.0]]),
+        ])
+        .expect("list path evaluates");
+        let list = list.as_primitive::<Float64Type>();
+
+        assert!(
+            !fsl.is_null(0) && (fsl.value(0) - 0.5).abs() < 1e-5,
+            "FixedSizeList path: expected 0.5 for a zero vector"
+        );
+        assert!(
+            !list.is_null(0) && (list.value(0) - 0.5).abs() < 1e-5,
+            "List path: expected 0.5 for a zero vector, got {}",
+            list.value(0)
+        );
+    }
+
+    #[test]
+    fn non_finite_measured_against_a_zero_vector_is_still_null() {
+        // Pins the ordering rule in `cosine_distance_from_accumulators`: the
+        // zero-magnitude short-circuit must not answer for a poisoned vector.
+        let fsl = cosine_distance_inner(&[
+            fsl_f32(&[&[f32::NAN, 2.0, 3.0]]) as ArrayRef,
+            fsl_f32(&[&[0.0_f32, 0.0, 0.0]]) as ArrayRef,
+        ])
+        .expect("fsl path evaluates");
+        assert!(
+            fsl.as_primitive::<Float64Type>().is_null(0),
+            "FixedSizeList path: NaN vs a zero vector must be NULL"
+        );
+
+        let list = cosine_distance_inner(&[
+            list_f32::<i32>(&[&[f32::NAN, 2.0, 3.0]]),
+            list_f32::<i32>(&[&[0.0_f32, 0.0, 0.0]]),
+        ])
+        .expect("list path evaluates");
+        let list = list.as_primitive::<Float64Type>();
+        assert!(
+            list.is_null(0),
+            "List path: NaN vs a zero vector must be NULL, got {}",
+            list.value(0)
+        );
+
+        // Both argument orders, since only one accumulator is poisoned.
+        let swapped = cosine_distance_inner(&[
+            list_f32::<i32>(&[&[0.0_f32, 0.0, 0.0]]),
+            list_f32::<i32>(&[&[f32::NAN, 2.0, 3.0]]),
+        ])
+        .expect("list path evaluates");
+        assert!(
+            swapped.as_primitive::<Float64Type>().is_null(0),
+            "List path: a zero vector vs NaN must be NULL too"
+        );
+    }
+
+    #[test]
+    fn non_finite_input_is_null_for_large_list_and_f64() {
+        // The LargeList dispatch and the Float64 element path share the same
+        // kernels; neither may reintroduce a fabricated score.
+        let out = cosine_distance_inner(&[
+            list_f32::<i64>(&[&[f32::NAN, 2.0, 3.0]]),
+            list_f32::<i64>(&[&[1.0_f32, 2.0, 3.0]]),
+        ])
+        .expect("large list path evaluates");
+        assert!(
+            out.as_primitive::<Float64Type>().is_null(0),
+            "LargeList path must return NULL for NaN input"
+        );
+
+        // Float64 elements reach `compute_cosine_distance`'s zero-copy arm.
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN, 2.0, 3.0]));
+        let ok: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+        let result = compute_cosine_distance(Some(nan), Some(ok)).expect("evaluates");
+        assert!(
+            result.is_none(),
+            "Float64 element path must return NULL for NaN input, got {result:?}"
         );
     }
 

@@ -7,6 +7,12 @@ expression: resp?
     "id": 361,
     "answer": "The number of ways is \\( 18 \\times 17 \\times 16 = \\boxed{4896} \\).",
     "array_length(text_search(qs, Utf8(\"second\")).answer_embedding)": 64,
-    "trunc(text_search(qs, Utf8(\"second\"))._score,Int64(3))": 5.064
+    "trunc(text_search(qs, Utf8(\"second\"))._score,Int64(3))": 4.683
+  },
+  {
+    "id": 9,
+    "answer": "The statement \"T minus 50 seconds\" indicates that there are $\\boxed{50 \\text{ seconds}}$ remaining until lift-off.",
+    "array_length(text_search(qs, Utf8(\"second\")).answer_embedding)": 64,
+    "trunc(text_search(qs, Utf8(\"second\"))._score,Int64(3))": 4.321
   }
 ]

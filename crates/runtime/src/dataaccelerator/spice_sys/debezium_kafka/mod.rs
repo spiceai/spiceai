@@ -196,3 +196,54 @@ impl DebeziumKafkaSys {
         }
     }
 }
+
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::debezium::DebeziumCheckpointStore for DebeziumKafkaSys {
+    async fn get(
+        &self,
+    ) -> std::result::Result<
+        Option<runtime_checkpoint_api::debezium::DebeziumCheckpoint>,
+        runtime_checkpoint_api::CheckpointError,
+    > {
+        let Some(metadata) = DebeziumKafkaSys::get(self).await? else {
+            return Ok(None);
+        };
+        // The change-event field descriptors are the connector's own type, so they cross
+        // the seam as the JSON the sidecar already round-trips.
+        let schema_fields_json =
+            serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
+        Ok(Some(runtime_checkpoint_api::debezium::DebeziumCheckpoint {
+            consumer_group_id: metadata.consumer_group_id,
+            topic: metadata.topic,
+            primary_keys: metadata.primary_keys,
+            schema_fields_json,
+            offsets: metadata.offsets,
+        }))
+    }
+
+    async fn upsert(
+        &self,
+        checkpoint: &runtime_checkpoint_api::debezium::DebeziumCheckpoint,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        let metadata = DebeziumKafkaMetadata {
+            consumer_group_id: checkpoint.consumer_group_id.clone(),
+            topic: checkpoint.topic.clone(),
+            primary_keys: checkpoint.primary_keys.clone(),
+            schema_fields: serde_json::from_str(&checkpoint.schema_fields_json)
+                .map_err(Error::external)?,
+            offsets: checkpoint.offsets.clone(),
+        };
+        DebeziumKafkaSys::upsert(self, &metadata)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        DebeziumKafkaSys::upsert_offsets(self, offsets)
+            .await
+            .map_err(Into::into)
+    }
+}

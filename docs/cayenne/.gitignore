@@ -4,3 +4,6 @@
 Cayenne.pdf
 cayenne.html
 waterfall_ls.pdf
+
+# Diagram renderer (see package.json); install with `npm ci`.
+node_modules/

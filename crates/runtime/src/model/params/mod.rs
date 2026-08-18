@@ -39,7 +39,7 @@ pub mod xai;
 
 use std::sync::LazyLock;
 
-pub use crate::parameters::ParameterSpec;
+pub(crate) use crate::parameters::ParameterSpec;
 use spicepod::component::model::ModelSource;
 
 macro_rules! source_specs {

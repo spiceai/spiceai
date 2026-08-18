@@ -1120,17 +1120,23 @@ impl CayenneCatalog {
         Ok(rows.into_iter().next().unwrap_or(0))
     }
 
-    /// Reconcile the datalake (cold tier) fields of a reopened table's stored
-    /// `VortexConfig` with the currently configured options.
+    /// Reconcile a reopened table's stored `VortexConfig` with the currently
+    /// configured options, for the fields that describe how the table is RUN
+    /// rather than how its data is written: the datalake (cold tier) settings
+    /// and the scan concurrency.
     ///
-    /// The cold fields are deliberately excluded from [`configuration_matches`]
-    /// (toggling the tier never recreates the table), and the provider runs
-    /// with the STORED config — so a spicepod change must be persisted here to
-    /// take effect on reopen. One change is rejected instead of persisted:
-    /// moving (or unsetting) the location while cold files exist, because the
-    /// cold manifest's absolute file URLs point at the old location and the
-    /// next promotion's replace-all would strand them.
-    async fn reconcile_cold_tier_config(
+    /// These are deliberately excluded from [`configuration_matches`] (changing
+    /// them never recreates the table), and the provider runs with the STORED
+    /// config — so a spicepod change must be persisted here to take effect on
+    /// reopen. Without that, `cayenne_scan_concurrency` would be inert on every
+    /// table that already exists, which is exactly when an operator reaches for
+    /// it: lowering it under memory pressure would silently keep the old value.
+    ///
+    /// One change is rejected instead of persisted: moving (or unsetting) the
+    /// cold location while cold files exist, because the cold manifest's
+    /// absolute file URLs point at the old location and the next promotion's
+    /// replace-all would strand them.
+    async fn reconcile_runtime_only_config(
         &self,
         stored: &mut TableMetadata,
         options: &CreateTableOptions,
@@ -1158,7 +1164,8 @@ impl CayenneCatalog {
 
         let stored_vc = &stored.vortex_config;
         let new_vc = &options.vortex_config;
-        let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
+        let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
+            || stored_vc.cold_tier_location != new_vc.cold_tier_location
             || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
@@ -1166,9 +1173,11 @@ impl CayenneCatalog {
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
                 != new_vc.cold_tier_background_interval_ms;
-        if !cold_fields_differ {
+        if !runtime_fields_differ {
             return Ok(());
         }
+
+        stored.vortex_config.scan_concurrency = new_vc.scan_concurrency;
 
         stored
             .vortex_config
@@ -1188,7 +1197,7 @@ impl CayenneCatalog {
         let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to serialize updated datalake configuration for table {}.",
+                    "Failed to serialize updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
@@ -1205,14 +1214,14 @@ impl CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to persist updated datalake configuration for table {}.",
+                    "Failed to persist updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
             })?;
         tracing::debug!(
             table = stored.table_name.as_str(),
-            "Reconciled datalake configuration from spicepod params on table reopen"
+            "Reconciled runtime configuration from spicepod params on table reopen"
         );
         Ok(())
     }
@@ -1236,7 +1245,7 @@ impl CayenneCatalog {
                 // state. Rejects a location change while cold files exist;
                 // persists any other cold-field change.
                 if configuration_matches_ignoring_schema(&stored_metadata, options) {
-                    self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                    self.reconcile_runtime_only_config(&mut stored_metadata, options)
                         .await?;
                 }
 

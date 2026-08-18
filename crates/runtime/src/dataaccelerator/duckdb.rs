@@ -673,6 +673,10 @@ impl DataAccelerator for DuckDBAccelerator {
         "duckdb"
     }
 
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
+        DUCKDB_TYPE_REWRITE_RULES
+    }
+
     fn valid_file_extensions(&self) -> Vec<&'static str> {
         vec!["db", "ddb", "duckdb"]
     }
@@ -738,7 +742,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 if file_path.exists() {
                     snapshot_before_recreate(
                         acceleration,
-                        &source.name().to_string(),
+                        source,
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
                             &path,
                         )),

@@ -96,6 +96,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod pk_keyset_budget;
 pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
@@ -116,8 +117,9 @@ pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{
-    begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
-    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+    begin_compaction_shutdown, compaction_budget, compaction_budget_permits,
+    drain_compaction_tasks, in_flight_compaction_tasks, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle,
 };
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
@@ -130,6 +132,10 @@ pub use mem_tier_budget::{
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_keyset_budget::{
+    force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
+    release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
+};
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;

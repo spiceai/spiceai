@@ -203,7 +203,9 @@ mod tests {
         MongoCheckpointMetadata {
             resume_token_json: r#"{"_data":"82650000000000000001"}"#.to_string(),
             cluster_time_ts: Some(1_700_000_000),
-            schema_json: Some(MongoSys::serialize_schema(&schema).expect("schema serializes")),
+            schema_json: Some(
+                arrow_tools::schema::schema_to_json(&schema).expect("schema serializes"),
+            ),
             updated_at: None,
         }
     }

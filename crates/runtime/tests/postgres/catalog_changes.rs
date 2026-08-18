@@ -204,6 +204,34 @@ async fn slot_active(port: usize, slot_name: &str) -> Result<Option<bool>, anyho
     Ok(status.map(|s| s.active))
 }
 
+/// The slot's `confirmed_flush_lsn`, as the source sees it.
+///
+/// This advances only when Spice acknowledges a change, which is the same call
+/// that attempts the local applied-LSN watermark write. It is therefore evidence
+/// that the write was *reached*, not that it succeeded — the acknowledgement
+/// proceeds even if the sidecar write fails, which is only logged. Convergence
+/// after the restart is what actually proves the watermark behaved; this exists
+/// so the test stops racing durability before shutting down.
+async fn slot_confirmed_flush(
+    port: usize,
+    slot_name: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let row = conn
+        .conn
+        .query_opt(
+            "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots \
+             WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await?;
+    Ok(row.and_then(|row| row.get::<_, Option<String>>(0)))
+}
+
 /// Lower the source's `wal_sender_timeout` so the catalog's bounded
 /// slot-in-use wait (sized from it) stays short in the fail-loud test. Applied
 /// via `ALTER SYSTEM` + reload, so it takes effect for walsenders started after.
@@ -1287,6 +1315,189 @@ async fn test_catalog_acceleration_reuses_slot_across_restart() -> Result<(), an
                 delivered,
                 "change made during downtime (orders id=3) was not delivered after restart via the reused slot: got {:?}",
                 query_string(&rt, &offline_row_sql).await
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A durable acceleration whose replication slot is gone must be **rebuilt from
+/// the source**, not topped up from a snapshot appended over what it still
+/// holds.
+///
+/// This is the correctness case behind #12018 §1, and it fails without the
+/// rebuild: the accelerated table keeps rows the source deleted, forever, in
+/// every query. A snapshot bootstrap emits only `Create` rows, so appending it
+/// over the survivors reinstates the ones that are still there and never
+/// revisits the ones that are not — and with the slot gone, no `DELETE` change
+/// event for them exists to replay.
+///
+/// The sequence is the one an operator actually hits: a slot dropped while Spice
+/// is down (by hand, by `idle_replication_slot_timeout`, or by exhausted WAL
+/// retention), with the source mutated in the meantime.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_durable_acceleration_is_rebuilt_when_its_slot_is_gone() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,info,runtime::catalogconnector=debug,runtime_table=debug",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+
+            seed_tables(port).await?;
+
+            let expected_slot = catalog_slot_name(CATALOG_NAME);
+            let data_dir = tempfile::tempdir()?;
+
+            let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
+            wait_for_table_ready(&rt, "orders", "bootstrap before shutdown").await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let conn = pool
+                .connect_direct()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            // Drive one change through the live stream before shutting down.
+            //
+            // Exercises the ordinary watermark path: the position is recorded by
+            // the commit that acknowledges a WAL change, which is the only point
+            // at which the acked data is known durable. The snapshot boundary
+            // records one too, so this is not the only thing standing between the
+            // restart and a usable watermark — it is the steady-state path, and
+            // it also gives the restart a position strictly newer than the
+            // bootstrap's.
+            conn.conn
+                .simple_query("INSERT INTO orders (id, customer) VALUES (3, 'carol-live');")
+                .await?;
+            let live_sql =
+                format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 3");
+            let streamed = wait_until_true(Duration::from_mins(2), || {
+                let rt = Arc::clone(&rt);
+                let sql = live_sql.clone();
+                async move { query_string(&rt, &sql).await.as_deref() == Some("carol-live") }
+            })
+            .await;
+            anyhow::ensure!(
+                streamed,
+                "the live change (orders id=3) never arrived, so no watermark was recorded: got {:?}",
+                query_string(&rt, &live_sql).await
+            );
+
+            // The change being *queryable* is not the same as it being
+            // acknowledged: under an in-memory CDC tier the acknowledgement is
+            // deferred behind a durability checkpoint, and the watermark is
+            // written by that same acknowledgement. Wait for the source to see
+            // the ack, so the restart below is genuinely testing a recorded
+            // watermark rather than an unwritten one.
+            let acked = wait_until_true(Duration::from_mins(2), || {
+                let slot = expected_slot.clone();
+                async move {
+                    matches!(slot_confirmed_flush(port, &slot).await, Ok(Some(lsn)) if lsn != "0/0")
+                }
+            })
+            .await;
+            anyhow::ensure!(
+                acked,
+                "the source never saw an acknowledgement for slot '{expected_slot}', so no \
+                 applied-LSN watermark was recorded: confirmed_flush_lsn={:?}",
+                slot_confirmed_flush(port, &expected_slot).await?
+            );
+
+            rt.shutdown().await;
+            drop(rt);
+
+            // Wait for the walsender to exit so the slot can actually be dropped,
+            // then remove it: the source can no longer supply what happens next.
+            let freed = wait_until_true(Duration::from_secs(90), || {
+                let slot = expected_slot.clone();
+                async move { matches!(slot_active(port, &slot).await, Ok(Some(false))) }
+            })
+            .await;
+            anyhow::ensure!(
+                freed,
+                "slot '{expected_slot}' never became inactive after shutdown"
+            );
+            conn.conn
+                .simple_query(&format!("SELECT pg_drop_replication_slot('{expected_slot}')"))
+                .await?;
+
+            // Mutate the source with no slot to record it: one row deleted, one
+            // added. The deletion is the whole point — it is unrecoverable from
+            // WAL and only a re-read of the table can remove it.
+            conn.conn
+                .simple_query(
+                    "DELETE FROM orders WHERE id = 1; \
+                     INSERT INTO orders (id, customer) VALUES (4, 'dave-offline');",
+                )
+                .await?;
+
+            // Restart against the SAME acceleration files: the rows from before
+            // are still on disk, which is what makes an appended snapshot wrong.
+            let rt = start_runtime(durable_accelerated_pg_catalog(port, data_dir.path())).await?;
+            wait_for_table_ready(&rt, "orders", "after the slot was dropped").await?;
+
+            // The acceleration must converge on the source exactly: the deleted
+            // row gone, the offline insert present, and the earlier rows intact.
+            let deleted_sql =
+                format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 1");
+            let converged = wait_until_true(Duration::from_mins(3), || {
+                let rt = Arc::clone(&rt);
+                let deleted = deleted_sql.clone();
+                let added = format!(
+                    "SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 4"
+                );
+                async move {
+                    query_string(&rt, &deleted).await.is_none()
+                        && query_string(&rt, &added).await.as_deref() == Some("dave-offline")
+                }
+            })
+            .await;
+            if !converged {
+                // Report only what actually diverged. Printing both reads
+                // unconditionally makes a passing check look like a second
+                // failure and hides which half is broken.
+                let mut problems = Vec::new();
+                if let Some(surviving) = query_string(&rt, &deleted_sql).await {
+                    problems.push(format!(
+                        "row id=1 was deleted at the source but still reads {surviving:?} — the \
+                         rebuild did not replace the acceleration's contents"
+                    ));
+                }
+                let added_sql =
+                    format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 4");
+                let added = query_string(&rt, &added_sql).await;
+                if added.as_deref() != Some("dave-offline") {
+                    problems.push(format!(
+                        "row id=4 was inserted at the source while no slot recorded it, but reads \
+                         {added:?} instead of \"dave-offline\""
+                    ));
+                }
+                anyhow::bail!(
+                    "the acceleration did not converge on the source after its slot was dropped: {}",
+                    problems.join("; ")
+                );
+            }
+
+            // Streaming resumes on the rebuilt table rather than stopping at it.
+            conn.conn
+                .simple_query("INSERT INTO orders (id, customer) VALUES (5, 'erin-after');")
+                .await?;
+            let after_sql =
+                format!("SELECT customer FROM {CATALOG_NAME}.public.orders WHERE id = 5");
+            let resumed = wait_until_true(Duration::from_mins(2), || {
+                let rt = Arc::clone(&rt);
+                let sql = after_sql.clone();
+                async move { query_string(&rt, &sql).await.as_deref() == Some("erin-after") }
+            })
+            .await;
+            anyhow::ensure!(
+                resumed,
+                "changes after the rebuild were not streamed: got {:?}",
+                query_string(&rt, &after_sql).await
             );
 
             Ok(())
