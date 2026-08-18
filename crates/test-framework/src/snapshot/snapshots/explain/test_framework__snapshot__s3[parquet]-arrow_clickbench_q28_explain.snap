@@ -16,11 +16,11 @@ description: "Query: clickbench_q28"
 |               |     ProjectionExec: expr=[CounterID@0 as CounterID, avg(length(hits.URL))@1 as l, count(Int64(1))@2 as c]                   |
 |               |       FilterExec: count(Int64(1))@2 > 100000                                                                                |
 |               |         AggregateExec: mode=FinalPartitioned, gby=[CounterID@0 as CounterID], aggr=[avg(length(hits.URL)), count(Int64(1))] |
-|               |           RepartitionExec: partitioning=Hash([CounterID@0], 16), input_partitions=16                                        |
+|               |           RepartitionExec: partitioning=Hash([CounterID@0], 32), input_partitions=32                                        |
 |               |             AggregateExec: mode=Partial, gby=[CounterID@0 as CounterID], aggr=[avg(length(hits.URL)), count(Int64(1))]      |
 |               |               FilterExec: URL@1 !=                                                                                          |
 |               |                 SchemaCastScanExec                                                                                          |
 |               |                   BytesProcessedExec                                                                                        |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                             |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                             |
 |               |                                                                                                                             |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------+
