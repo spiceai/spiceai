@@ -18,6 +18,7 @@ const TASK_HISTORY_SINK_REMOTE_TABLE: &str = "runtime.task_history";
 const TASK_HISTORY_SINK_TABLE: &str = "scp.task_history";
 const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 5;
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -303,13 +304,14 @@ async fn get_spiceai_table_provider(
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    let data_connector = create_new_connector("spice.ai", params)
+    let context = RuntimeConnectorContext::for_dataset(&dataset);
+    let data_connector = create_new_connector("spice.ai", params, &context)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&context, &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateCloudTableProviderSnafu)?;

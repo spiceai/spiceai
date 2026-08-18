@@ -37,13 +37,11 @@ use tei_core::{
     TextEmbeddingsError,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
-    tokenization::{EncodingInput, Tokenization},
+    tokenization::EncodingInput,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str, position_offset,
-};
+use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -153,20 +151,8 @@ impl TeiEmbed {
     ) -> Result<Self> {
         // Reads config.json / the sentence-transformers config and parses
         // tokenizer.json on a blocking thread (see `load_tokenization`).
-        let (tokenizer, config, max_input_length) =
+        let (tokenizer, config, token) =
             load_tokenization(root, max_seq_length_overwrite).await?;
-
-        // `position_offset` is a pure function of the config.
-        let position_offset = position_offset(&config);
-
-        let token = Tokenization::new(
-            1,
-            tokenizer.clone(),
-            max_input_length,
-            position_offset,
-            None,
-            None,
-        );
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174

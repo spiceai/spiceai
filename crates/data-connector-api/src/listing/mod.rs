@@ -17,7 +17,7 @@ limitations under the License.
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use url::{Url, form_urlencoded};
 
-use crate::parameters::{ParameterSpec, Parameters};
+use runtime_parameters::{ParameterSpec, Parameters};
 
 mod connector;
 mod infer;
@@ -80,25 +80,28 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParsedFileExtension {
-    pub(crate) file_extension: String,
-    pub(crate) format_extension: Option<String>,
-    pub(crate) compression: Option<FileCompressionType>,
+pub struct ParsedFileExtension {
+    pub file_extension: String,
+    pub format_extension: Option<String>,
+    pub compression: Option<FileCompressionType>,
 }
 
-pub(crate) fn parse_file_extension_param(value: &str) -> Option<ParsedFileExtension> {
+#[must_use]
+pub fn parse_file_extension_param(value: &str) -> Option<ParsedFileExtension> {
     let extension = value.trim().trim_start_matches('.');
     parse_extension_components(&extension.split('.').collect::<Vec<_>>(), false)
 }
 
-pub(crate) fn detect_file_extension_from_url_or_path(value: &str) -> Option<ParsedFileExtension> {
+#[must_use]
+pub fn detect_file_extension_from_url_or_path(value: &str) -> Option<ParsedFileExtension> {
     Url::parse(value)
         .ok()
         .and_then(|url| detect_file_extension_from_path(url.path()))
         .or_else(|| detect_file_extension_from_path(value))
 }
 
-pub(crate) fn detect_file_extension_from_path(path: &str) -> Option<ParsedFileExtension> {
+#[must_use]
+pub fn detect_file_extension_from_path(path: &str) -> Option<ParsedFileExtension> {
     let path = path
         .split(['?', '#'])
         .next()
@@ -204,8 +207,8 @@ pub fn build_fragments(params: &Parameters, keys: Vec<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parameters::ParameterSpec;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime_parameters::ParameterSpec;
     use std::collections::HashMap;
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[

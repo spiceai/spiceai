@@ -34,7 +34,7 @@ use std::{
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
     download::{ST_CONFIG_NAMES, download_artifacts},
-    tokenization::EncodingInput,
+    tokenization::{EncodingInput, Tokenization},
 };
 
 use tempfile::tempdir;
@@ -71,30 +71,32 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
-/// Runs the synchronous tokenization load — reading `config.json`, the
-/// sentence-transformers config, and parsing `tokenizer.json` — on a blocking
-/// thread. For a large tokenizer the parse alone can exceed the runtime's
-/// per-task latency budget, so keeping it off the Tokio worker thread prevents
-/// it from stalling other tasks (and `/health`) during model registration.
+/// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
+/// `Infer` pipeline from a directory of model artifacts. Shared by
+/// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
+/// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
+/// otherwise duplicate this setup.
 ///
-/// Returns the parsed tokenizer, the model config, and the resolved
-/// `max_input_length`. `position_offset` is a pure function of the config and is
-/// recomputed cheaply by the caller on the async side.
+/// Runs the synchronous load — reading `config.json`, the sentence-transformers
+/// config, and parsing `tokenizer.json` — on a blocking thread. For a large
+/// tokenizer the parse alone can exceed the runtime's per-task latency budget,
+/// so keeping it off the Tokio worker thread prevents it from stalling other
+/// tasks (and `/health`) during model registration.
 pub(crate) async fn load_tokenization(
-    model_root: &Path,
+    root: &Path,
     max_seq_length_overwrite: Option<usize>,
-) -> Result<(Tokenizer, ModelConfig, usize)> {
-    let model_root = model_root.to_path_buf();
+) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
+    let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let tokenizer = load_tokenizer(&model_root)?;
-        let config = load_config(&model_root)?;
+        let tokenizer = load_tokenizer(&root)?;
+        let config = load_config(&root)?;
         let position_offset = position_offset(&config);
 
         let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
             max_seq_length
         } else {
             // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
-            match max_seq_length_from_st_config(&model_root) {
+            match max_seq_length_from_st_config(&root) {
                 Ok(max_seq_length_opt) => {
                     max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
                 }
@@ -105,7 +107,16 @@ pub(crate) async fn load_tokenization(
             }
         };
 
-        Ok((tokenizer, config, max_input_length))
+        let token = Tokenization::new(
+            1,
+            tokenizer.clone(),
+            max_input_length,
+            position_offset,
+            None,
+            None,
+        );
+
+        Ok((tokenizer, config, token))
     })
     .await
     .boxed()

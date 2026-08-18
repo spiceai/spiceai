@@ -17,6 +17,7 @@ limitations under the License.
 //! The Iceberg Data Connector is a thin layer over the Iceberg Catalog Connector.
 //! It takes the same parameters as the Catalog Connector.
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
@@ -81,10 +82,11 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let iceberg = IcebergDataConnector {
                 params: params.parameters,
@@ -355,6 +357,7 @@ impl DataConnector for IcebergDataConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let parts = self.create_iceberg_table_parts(dataset).await?;
@@ -372,6 +375,7 @@ impl DataConnector for IcebergDataConnector {
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Create the table parts which include catalog + identity for delete support
@@ -399,4 +403,4 @@ impl DataConnector for IcebergDataConnector {
     }
 }
 
-register_data_connector!("iceberg", IcebergDataConnectorFactory);
+data_connector_api::register_data_connector!("iceberg", IcebergDataConnectorFactory);

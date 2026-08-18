@@ -67,6 +67,29 @@ pub enum Error {
         "Failed to build HTTP client for reranker '{model}' — standard timeout/TLS defaults are unavailable."
     ))]
     HttpClientCreationFailed { model: String },
+
+    #[snafu(display(
+        "Failed to load local reranker model '{model}': {source}. Check the model id/path and that the artifacts (config.json, tokenizer.json, weights) are present. See: https://spiceai.org/docs/components/rerankers"
+    ))]
+    LocalModelLoadFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned no score for a document. This usually means the model is not a cross-encoder/classifier reranker."
+    ))]
+    EmptyPrediction { model: String },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned {actual} scores for a document (expected exactly 1). This usually means the model is a multi-class classifier rather than a single-class cross-encoder/classifier reranker."
+    ))]
+    UnexpectedScoreCount { model: String, actual: usize },
+
+    #[snafu(display(
+        "Reranker model '{model}' returned a non-finite score for a document. This usually means the model's classification head produced an invalid (NaN/Inf) logit."
+    ))]
+    NonFiniteScore { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
