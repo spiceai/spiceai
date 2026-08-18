@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+data-connector-api = { path = "../data-connector-api" }
 datafusion.workspace = true
 reqwest.workspace = true
 runtime = { path = "../runtime" }

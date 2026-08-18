@@ -25,6 +25,7 @@ description = "GraphQL data connector for Spice.ai runtime"
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data-http-rate-control = { path = "../../data-http-rate-control" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
@@ -35,7 +36,6 @@ linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
 reqwest.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-metrics = { path = "../../runtime-metrics" }
 runtime-parameters = { path = "../../runtime-parameters" }
@@ -51,6 +51,7 @@ url.workspace = true
 util = { path = "../../util", features = ["datafusion"] }
 
 [dev-dependencies]
+runtime = { path = "../../runtime" }
 app = { path = "../../app" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 tokio.workspace = true

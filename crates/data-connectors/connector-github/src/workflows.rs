@@ -61,7 +61,7 @@ impl WorkflowsTableProvider {
         owner: &str,
         repo: &str,
         dataset: &DatasetSpec,
-    ) -> runtime::dataconnector::DataConnectorResult<Self> {
+    ) -> data_connector_api::DataConnectorResult<Self> {
         let fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),

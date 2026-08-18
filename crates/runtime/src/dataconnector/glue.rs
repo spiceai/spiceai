@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -125,6 +126,7 @@ impl GlueDataConnector {
 
     async fn create_table_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.parse_path(false, None).map_err(|e| {
@@ -202,6 +204,7 @@ impl GlueDataConnector {
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
                 create_s3_provider(
+                    context,
                     input_format,
                     dataset.clone(),
                     self.params.clone(),
@@ -260,12 +263,13 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let app = params.app();
+            let app = Some(context.app());
             let glue = GlueDataConnector::new(params.parameters, app, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
@@ -288,18 +292,20 @@ impl DataConnector for GlueDataConnector {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        self.create_table_provider(dataset).await
+        self.create_table_provider(context, dataset).await
     }
 
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
-        Some(self.create_table_provider(dataset).await)
+        Some(self.create_table_provider(context, dataset).await)
     }
 }
 
@@ -489,6 +495,7 @@ async fn create_iceberg_provider(
 }
 
 async fn create_s3_provider(
+    context: &dyn ConnectorContext,
     input_format: InputFormat,
     mut dataset: DatasetSpec,
     mut params: Parameters,
@@ -551,7 +558,7 @@ async fn create_s3_provider(
 
     dataset.from = from;
 
-    s3.read_provider(&dataset).await
+    s3.read_provider(context, &dataset).await
 }
 
 fn ensure_s3_trailing_slash(s3_location: &str) -> String {

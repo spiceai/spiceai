@@ -88,14 +88,12 @@ impl Validator for GcsAuthValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::parameters::{ParameterSpec, Parameters};
-    use app::AppBuilder;
+    use crate::ConnectorComponent;
+    use datafusion::sql::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime_component::dataset::DatasetSpec;
+    use runtime_parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
-    use std::sync::Arc;
     use tokio::runtime::Handle;
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[
@@ -105,20 +103,14 @@ mod tests {
         ParameterSpec::component("application_default_credentials").is_boolean(),
     ];
 
-    async fn create_mock_connector_component() -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let spice_runtime = RuntimeBuilder::new().build().await;
-
-        let dataset = DatasetBuilder::try_new("gs://bucket/path".to_string(), "test_dataset")
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
+    fn mock_connector_component() -> ConnectorComponent {
+        ConnectorComponent::from(&DatasetSpec::new(
+            "gs://bucket/path",
+            TableReference::bare("test_dataset"),
+        ))
     }
 
-    async fn create_test_params(params: HashMap<String, String>) -> ConnectorParams {
+    fn create_test_params(params: HashMap<String, String>) -> ConnectorParams {
         ConnectorParams {
             parameters: Parameters::new(
                 to_secret_map(params).into_iter().collect(),
@@ -126,8 +118,7 @@ mod tests {
                 TEST_PARAMETERS,
             ),
             unsupported_type_action: None,
-            component: create_mock_connector_component().await,
-            context: None,
+            component: mock_connector_component(),
             io_runtime: Handle::current(),
         }
     }
@@ -143,8 +134,7 @@ mod tests {
                 ("skip_signature".to_string(), "true".to_string()),
             ]
             .into(),
-        )
-        .await;
+        );
         let validator = GcsAuthValidator;
         assert!(matches!(
             validator.validate(&mut params).await,
@@ -160,8 +150,7 @@ mod tests {
                 "/path/to/key.json".to_string(),
             )]
             .into(),
-        )
-        .await;
+        );
         let validator = GcsAuthValidator;
         validator
             .validate(&mut params)
@@ -171,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_auth_method_ok() {
-        let mut params = create_test_params(HashMap::new()).await;
+        let mut params = create_test_params(HashMap::new());
         let validator = GcsAuthValidator;
         validator
             .validate(&mut params)

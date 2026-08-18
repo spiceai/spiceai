@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::parameters::{ParamLookup, Parameters};
 use aws_config::ConfigLoader;
 use aws_sdk_credential_bridge::{
     initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
     initiate_config_default_auth,
 };
+use runtime_parameters::{ParamLookup, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -110,7 +110,7 @@ pub enum Error {
     InvalidIamRoleSource { key: String, iam_source: String },
 }
 
-pub(crate) struct S3EndpointValidator;
+pub struct S3EndpointValidator;
 
 #[async_trait]
 impl Validator for S3EndpointValidator {
@@ -139,7 +139,7 @@ impl Validator for S3EndpointValidator {
     }
 }
 
-pub(crate) struct RegionValidator;
+pub struct RegionValidator;
 
 #[async_trait]
 impl Validator for RegionValidator {
@@ -172,7 +172,7 @@ impl Validator for RegionValidator {
     }
 }
 
-pub(crate) struct AuthValidator;
+pub struct AuthValidator;
 
 #[async_trait]
 impl Validator for AuthValidator {
@@ -224,6 +224,11 @@ impl Validator for AuthValidator {
 /// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
 ///
 /// Return [`ConfigLoader`] to allow further customisation.
+///
+/// # Errors
+///
+/// Returns an error if the configured credentials are incomplete or inconsistent
+/// — a key without a secret, or an unusable IAM role source.
 pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
@@ -274,8 +279,14 @@ pub async fn initiate_config_with_credentials(
 /// Return [`ConfigLoader`] to allow further customisation.
 ///
 /// A generic AWS auth helper (parameterized by `provider_name`), used by AWS
-/// connector crates such as `connector-dynamodb`; kept in `runtime` alongside the
-/// other connector-support parameter helpers rather than gated to any one connector.
+/// connector crates such as `connector-dynamodb` as well as the runtime's own
+/// in-body S3/Glue/Iceberg connectors, so it lives with the connector contract
+/// rather than inside any one connector.
+///
+/// # Errors
+///
+/// Returns an error if the configured auth method is unsupported, or if its
+/// required parameters are missing or inconsistent.
 #[expect(clippy::too_many_arguments)]
 pub async fn initiate_config_with_auth_method(
     provider_name: &'static str,
