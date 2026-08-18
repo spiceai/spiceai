@@ -3077,6 +3077,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                 slot = %slot_name,
                 "all members detached; shutting down shared replication stream"
             );
+            // Same release as a runtime shutdown. This source is finished and about
+            // to leave the registry, so nothing later can do it: without this, a
+            // slot whose acceleration does not survive a restart keeps retaining WAL
+            // on the source from the moment its dataset is removed, which is exactly
+            // what the lifetime message promises it will not do.
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         // Joins that happened before this (re)connect are picked up by it.
@@ -3199,6 +3205,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     slot = %slot_name,
                     "all members detached; shutting down shared replication stream"
                 );
+                // Drop the connection first: `PostgreSQL` refuses to drop a slot an
+                // active walsender still holds, and this exit is the one that still
+                // has one open.
+                drop(client);
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             source.release_unclaimed_reservations(params.unclaimed_reservation_grace);
@@ -3621,6 +3632,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         member.sender.close();
     }
     finish_pump(&source);
+    // A slot left behind by a source that died is the mystery slot this is all meant
+    // to prevent, so release it on this path too. The connection is already gone —
+    // it lived inside the reconnect loop.
+    drop_slot_if_ephemeral(&source).await;
 }
 
 /// Validate a (re)decoded Relation against its subscribed dataset and (re)build
