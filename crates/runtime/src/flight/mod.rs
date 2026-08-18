@@ -121,6 +121,12 @@ impl Service {
     }
 }
 
+/// The handler each RPC delegates to records its own `flight_requests` /
+/// `flight_request_duration_ms` sample, so the sample carries a `command` label
+/// and, where the response is a stream, spans the drain rather than the setup.
+/// Starting a timer here as well would double every sample, so don't.
+/// `list_flights` and `poll_flight_info` are the exceptions — they are
+/// unimplemented, have no handler to delegate to, and record here.
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
@@ -135,7 +141,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let _start = track_flight_request("do_handshake", None).await;
         let response = handshake::handle(
             request.metadata(),
             self.basic_auth.as_ref(),
@@ -173,7 +178,6 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let _start = track_flight_request("get_schema", None).await;
         get_schema::handle(request).await
     }
 
@@ -181,7 +185,6 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let _start = track_flight_request("do_get", None).await;
         let response = Box::pin(do_get::handle(request)).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -190,7 +193,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let _start = track_flight_request("do_put", None).await;
         let response = do_put::handle(request).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -199,7 +201,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        let _start = track_flight_request("do_exchange", None).await;
         let response = do_exchange::handle(self, request).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -208,7 +209,6 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let _start = track_flight_request("do_action", None).await;
         let response = Box::pin(actions::do_action(request)).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -217,7 +217,6 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let _start = track_flight_request("list_actions", None).await;
         let response = actions::list().await;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }

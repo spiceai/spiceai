@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
-use crate::component::dataset::{Dataset, DatasetSpec};
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
     TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_IDENTITY_PARAM_NAMES, TLS_CLIENT_KEY,
@@ -87,6 +88,9 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
+    /// Spicepod name, which keys the persisted shared-rate-controller state. Captured at
+    /// construction because it is not part of a dataset's configuration spec.
+    app_name: Arc<str>,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
@@ -201,7 +205,7 @@ impl Https {
 
     fn ensure_rate_control_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         let rate_control = http_rate_control::resolve_config(
             &self.params,
@@ -251,7 +255,7 @@ struct HttpProviderParams {
 impl Https {
     fn resolve_http_provider_params(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<HttpProviderParams> {
         let file_format = self
             .params
@@ -528,7 +532,7 @@ impl Https {
     }
 
     fn apply_allowed_paths(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         provider: data_components::http::provider::HttpTableProvider,
         allowed_paths: Vec<String>,
     ) -> DataConnectorResult<data_components::http::provider::HttpTableProvider> {
@@ -604,7 +608,7 @@ impl Https {
 
     fn map_client_identity_config_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: &ClientIdentityConfigError,
     ) -> DataConnectorError {
         match error {
@@ -638,7 +642,7 @@ impl Https {
 
     fn ensure_client_identity_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !self.client_identity_params_are_configured() {
             return Ok(());
@@ -667,7 +671,7 @@ impl Https {
     /// there skips `resolve_oauth2_auth`'s validation as well.
     fn ensure_auth_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !any_oauth_param_set(&self.params) {
             return Ok(());
@@ -693,7 +697,7 @@ impl Https {
     /// `OAuth2` params this only warns: the header list is used for far more
     /// than authentication, so rejecting it would fail datasets that load and
     /// serve correctly today.
-    fn warn_ignored_http_headers(&self, dataset: &Dataset) {
+    fn warn_ignored_http_headers(&self, dataset: &DatasetSpec) {
         if param_is_set(&self.params, "http_headers") {
             tracing::warn!(
                 "Dataset {}: '{}' is not applied to structured HTTP file datasets, which are served by the listing connector. The headers are ignored; use a dynamic JSON HTTP API dataset if the endpoint requires them.",
@@ -705,7 +709,7 @@ impl Https {
 
     fn resolve_client_identity_config(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
         let client_certificate_path = self
             .params
@@ -743,7 +747,7 @@ impl Https {
 
     async fn resolve_client_identity(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<Identity>> {
         let Some(config) = self.resolve_client_identity_config(dataset)? else {
             return Ok(None);
@@ -804,7 +808,7 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -897,7 +901,7 @@ impl Https {
     /// inconsistent for the selected grant.
     fn resolve_oauth2_auth(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<(OAuth2Config, OAuthGrant)>> {
         // Local grant discriminant, resolved before the grant-specific
         // credentials are validated.
@@ -1057,7 +1061,7 @@ impl Https {
     /// `Authorization` (which carries `Bearer <token>`); `auth_header_name`
     /// overrides it (e.g. `X-Shopify-Access-Token`, which carries the bare
     /// token).
-    fn resolve_token_header(&self, dataset: &Dataset) -> DataConnectorResult<TokenHeader> {
+    fn resolve_token_header(&self, dataset: &DatasetSpec) -> DataConnectorResult<TokenHeader> {
         let name = self
             .params
             .get("auth_header_name")
@@ -1087,7 +1091,7 @@ impl Https {
     /// configuration issues; transport, 5xx, 408/429 (transient), and parse
     /// errors are connection-level.
     fn map_auth_error(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         err: data_components::http::auth::Error,
     ) -> DataConnectorError {
         use data_components::http::auth::Error as AuthErr;
@@ -1118,7 +1122,7 @@ impl Https {
     /// Create HTTP table provider for JSON API endpoints
     async fn create_http_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
@@ -1289,7 +1293,7 @@ impl Https {
             .reserve_shared_rate_controller_for_component(
                 &base_url,
                 &rate_control,
-                dataset.app.name.as_str(),
+                self.app_name.as_ref(),
                 &ConnectorComponent::from(dataset),
                 "https",
             )
@@ -1423,7 +1427,7 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
 /// the historical behavior). Nullability is the declared `nullable:`,
 /// defaulting to `true`.
 fn build_json_nest_schema(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     nesting: &HttpJsonNesting,
 ) -> Result<arrow_schema::SchemaRef, crate::component::dataset::declared_type::ParseTypeError> {
     use crate::component::dataset::declared_type::parse_declared_type;
@@ -1463,7 +1467,7 @@ fn build_json_nest_schema(
 /// inference.
 fn static_schema_for_https_dataset(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<arrow_schema::SchemaRef> {
     if !params_indicate_dynamic_api(params) {
         return None;
@@ -1487,7 +1491,7 @@ fn static_schema_for_https_dataset(
 ///
 /// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
-fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
+fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<HttpJsonNesting>> {
     let marked_columns: Vec<&Column> = dataset
         .columns
         .iter()
@@ -1589,7 +1593,8 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
@@ -1600,7 +1605,7 @@ impl DataConnector for Https {
             // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
-            return listing_connector.read_provider(dataset).await;
+            return listing_connector.read_provider(context, dataset).await;
         }
 
         // Validate acceleration mode for HTTP connector (JSON API endpoints only)
@@ -1637,7 +1642,7 @@ impl DataConnector for Https {
         )))
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
@@ -1773,20 +1778,22 @@ impl DataConnectorFactory for HttpsFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
-            let rate_control_registry = params
-                .http_rate_control_registry()
-                .unwrap_or_else(http_rate_control::global_registry);
+            let app = context.app();
+            let runtime_rate_control_params = Some(app.runtime.params.clone());
+            let app_name: Arc<str> = Arc::from(app.name.as_str());
+            let rate_control_registry = context.http_rate_control_registry();
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
                         let connector = Https {
                             params: params.parameters.clone(),
+                            app_name: Arc::clone(&app_name),
                             runtime_rate_control_params: runtime_rate_control_params.clone(),
                             rate_control_registry: Arc::clone(&rate_control_registry),
                             metrics: Arc::new(HttpRateControlMetrics::default()),
@@ -1807,6 +1814,7 @@ impl DataConnectorFactory for HttpsFactory {
 
             Ok(Arc::new(Https {
                 params: params.parameters,
+                app_name,
                 runtime_rate_control_params,
                 rate_control_registry,
                 metrics,
@@ -1841,7 +1849,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn static_schema(
         &self,
         params: &ConnectorParams,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<arrow_schema::SchemaRef> {
         static_schema_for_https_dataset(&params.parameters, dataset)
     }
@@ -1884,7 +1892,7 @@ impl ListingTableConnector for HttpListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -1940,13 +1948,13 @@ impl ListingTableConnector for HttpListingConnector {
     }
 }
 
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_http_connector,
     REGISTER_HTTP_CONNECTOR,
     "http",
     HttpsFactory
 );
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_https_connector,
     REGISTER_HTTPS_CONNECTOR,
     "https",
@@ -1956,8 +1964,10 @@ register_data_connector!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
     use crate::secrets::Secrets;
     use app::AppBuilder;
@@ -2002,6 +2012,7 @@ mod tests {
         .expect("test connector parameters should be valid");
 
         Https {
+            app_name: Arc::from("test_app"),
             params,
             runtime_rate_control_params: if runtime_params.is_empty() {
                 None
@@ -2132,7 +2143,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("full refresh without refresh_sql should be rejected");
 
@@ -2153,7 +2164,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("append mode should continue to provider validation");
 
@@ -2414,7 +2425,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         )
         .await;
 
-        let Err(error) = connector.read_provider(&dataset).await else {
+        let Err(error) = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+        else {
             panic!("structured HTTP file datasets should reject HTTP rate-control defaults");
         };
 
@@ -2494,7 +2508,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("caching mode should continue to provider validation");
 
@@ -2507,7 +2521,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured formats should bypass JSON refresh_sql validation");
 
@@ -2525,7 +2539,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured HTTP file datasets should reject mTLS client identity params");
 
@@ -2573,7 +2587,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .await;
 
             let error = connector
-                .read_provider(&dataset)
+                .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
                 .await
                 .expect_err("structured HTTP file datasets should reject OAuth2 params");
 
@@ -2625,7 +2639,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         // without a refresh token — proof the auth config was validated rather
         // than dropped.
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("OAuth2 config without a refresh token should fail validation");
         assert!(

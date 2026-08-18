@@ -26,13 +26,14 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::elasticsearch::query_table::ElasticsearchQueryTable;
 use data_components::elasticsearch::schema::mapping_to_schema;
-use datafusion::datasource::TableProvider;
-use elasticsearch::{Client, Elasticsearch};
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
+use elasticsearch::{Client, Elasticsearch};
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -85,10 +86,11 @@ impl DataConnectorFactory for ElasticsearchFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let endpoint = params
                 .parameters
@@ -180,7 +182,8 @@ impl DataConnector for ElasticsearchConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let index_name = dataset.path().to_string();
 
@@ -212,10 +215,10 @@ impl DataConnector for ElasticsearchConnector {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_elasticsearch as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_elasticsearch_connector,
     ELASTICSEARCH_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

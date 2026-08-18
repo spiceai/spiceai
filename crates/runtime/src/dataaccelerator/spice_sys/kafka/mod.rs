@@ -32,7 +32,7 @@ limitations under the License.
 //!     PRIMARY KEY (`dataset_name`, `topic`, `partition_id`),
 //! );
 
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 
 use super::{
     AccelerationConnection, Error, Result, acceleration_connection, offsets::OffsetSchemaState,
@@ -223,11 +223,56 @@ impl KafkaSys {
     }
 
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        serde_json::to_string(schema).map_err(Error::external)
+        arrow_tools::schema::schema_to_json(schema).map_err(Error::external)
     }
 
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
-        let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
-        Ok(Arc::new(schema))
+        arrow_tools::schema::schema_from_json(schema_json).map_err(Error::external)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::kafka::KafkaCheckpointStore for KafkaSys {
+    async fn get(
+        &self,
+    ) -> std::result::Result<
+        Option<runtime_checkpoint_api::kafka::KafkaCheckpoint>,
+        runtime_checkpoint_api::CheckpointError,
+    > {
+        let Some(metadata) = KafkaSys::get(self).await? else {
+            return Ok(None);
+        };
+        // The engine layer parses the stored `schema_json` into an Arrow schema; the
+        // seam hands back the JSON form, so re-encode it here. The round trip is
+        // lossless (same serde impl both ways) and only runs once per dataset load.
+        let schema_json = Self::serialize_schema(&metadata.schema)?;
+        Ok(Some(runtime_checkpoint_api::kafka::KafkaCheckpoint {
+            consumer_group_id: metadata.consumer_group_id,
+            topic: metadata.topic,
+            schema_json,
+            offsets: metadata.offsets,
+        }))
+    }
+
+    async fn upsert(
+        &self,
+        checkpoint: &runtime_checkpoint_api::kafka::KafkaCheckpoint,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        let metadata = KafkaMetadata {
+            consumer_group_id: checkpoint.consumer_group_id.clone(),
+            topic: checkpoint.topic.clone(),
+            schema: Self::deserialize_schema(&checkpoint.schema_json)?,
+            offsets: checkpoint.offsets.clone(),
+        };
+        KafkaSys::upsert(self, &metadata).await.map_err(Into::into)
+    }
+
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        KafkaSys::upsert_offsets(self, offsets)
+            .await
+            .map_err(Into::into)
     }
 }

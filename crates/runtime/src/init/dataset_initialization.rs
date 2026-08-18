@@ -41,6 +41,7 @@ limitations under the License.
 //! is the deferred path: a placeholder is registered up-front and the
 //! real provider is materialized on first reference.
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -264,7 +265,8 @@ impl DatasetInitialization {
                     });
                 }
 
-                let federated_provider = match connector.read_provider(&dataset).await {
+                let context = RuntimeConnectorContext::for_dataset(&dataset);
+                let federated_provider = match connector.read_provider(&context, &dataset).await {
                     Ok(provider) => provider,
                     Err(e) => {
                         return Err(report_deferred_failure(
@@ -361,6 +363,8 @@ fn arrow_schemas_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
+    use crate::component::dataset::DatasetSpec;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -370,7 +374,6 @@ mod tests {
     use datafusion::datasource::TableProvider;
 
     use super::{DatasetInitialization, LazyConnectorBuilder};
-    use crate::component::dataset::Dataset;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::BootstrapStatus;
     use crate::dataconnector::{
@@ -424,7 +427,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             if self.fail_read {
                 return Err(DataConnectorError::UnableToGetReadProvider {

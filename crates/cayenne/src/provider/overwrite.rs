@@ -637,11 +637,7 @@ mod tests {
     //! successful query, which is why this is a correctness test and not a
     //! performance one.
 
-    #![expect(
-        clippy::expect_used,
-        reason = "Test-only code: failures should surface as panics with context."
-    )]
-
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
@@ -974,6 +970,108 @@ mod tests {
 
         prepared.finish().await.expect("finish");
         assert_eq!(scan_ids(provider).await, big);
+    }
+
+    #[tokio::test]
+    async fn committed_overwrite_invalidates_retired_segments_after_cleanup() {
+        let (_tmp, _catalog, tables) = setup(1).await;
+        let provider = &tables[0];
+        let old: Vec<i64> = (0..2_000).collect();
+        overwrite(provider, &old).await;
+        assert_eq!(scan_ids(provider).await, old);
+
+        let old_cache_entries = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the file-backed test enables the segment cache");
+        assert!(
+            old_cache_entries > 0,
+            "the old snapshot scan must populate the cache"
+        );
+        let old_snapshot = provider.get_current_snapshot_id();
+
+        let rollback_rows: Vec<i64> = (2_000..4_000).collect();
+        let rolled_back = provider
+            .begin_overwrite(id_stream(&rollback_rows), 1)
+            .await
+            .expect("begin rolled-back overwrite");
+        rolled_back.rollback().await.expect("rollback overwrite");
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(old_cache_entries),
+            "rolling back an unpublished overwrite must not invalidate live inputs"
+        );
+
+        let new: Vec<i64> = (4_000..6_000).collect();
+        let prepared = provider
+            .begin_overwrite(id_stream(&new), 1)
+            .await
+            .expect("begin committed overwrite");
+        prepared.apply_owned_txn().await.expect("commit overwrite");
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(old_cache_entries),
+            "the catalog commit alone must not invalidate a snapshot an in-flight scan can still use"
+        );
+
+        prepared.finish().await.expect("publish overwrite");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain post-overwrite maintenance");
+        assert_eq!(scan_ids(provider).await, new);
+        let entries_before_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_before_cleanup > old_cache_entries,
+            "scanning the replacement must cache live segments alongside the retired snapshot"
+        );
+
+        let current_snapshot = provider.get_current_snapshot_id();
+        provider
+            .cleanup_old_snapshots_with_protected_now_for_test(
+                &current_snapshot,
+                HashSet::from([old_snapshot]),
+            )
+            .await
+            .expect("protected cleanup pass");
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(entries_before_cleanup),
+            "protected overwrite inputs must remain cached"
+        );
+        provider
+            .cleanup_old_snapshots_with_protected_now_for_test(&current_snapshot, HashSet::new())
+            .await
+            .expect("cleanup committed retired snapshots after protection is released");
+        let entries_after_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
+            "cleanup must remove retired entries while preserving the replacement snapshot cache"
+        );
     }
 
     /// Repeated inline overwrites must not grow the metastore WAL without bound.

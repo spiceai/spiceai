@@ -201,6 +201,7 @@ pub trait CacheMetrics: Send + Sync {
         Self::record_item_count(0);
         Self::record_size(0);
         Self::record_max_size(0);
+        Self::update_hit_ratio(0, 0);
         Self::publish_counters_at_zero();
     }
 
