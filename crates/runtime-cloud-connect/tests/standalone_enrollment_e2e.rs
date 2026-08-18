@@ -2431,8 +2431,21 @@ async fn authenticated_enrollment_carries_the_session_and_no_key() {
     // The server side of the exclusivity contract: a hand-crafted request
     // carrying BOTH a login authorization and a token is rejected before
     // anything is consumed. (The typed client cannot even represent it.)
-    let both = reqwest::Client::new()
-        .post(format!("http://{}/v1/cloud-connect/enroll", harness.cloud_addr))
+    // The mock serves TLS, so the raw request has to as well, trusting the
+    // harness CA the way the typed client does.
+    let mut raw = reqwest::Client::builder();
+    for certificate in reqwest::Certificate::from_pem_bundle(harness.ca.ca_cert_pem.as_bytes())
+        .expect("the harness CA is a PEM bundle")
+    {
+        raw = raw.add_root_certificate(certificate);
+    }
+    let both = raw
+        .build()
+        .expect("build a client trusting the harness CA")
+        .post(format!(
+            "https://{}/v1/cloud-connect/enroll",
+            harness.cloud_addr
+        ))
         .header("Idempotency-Key", "op-carrying-both-authorities")
         .bearer_auth(SESSION_BEARER)
         .header("X-Org-Name", ORG_NAME)
