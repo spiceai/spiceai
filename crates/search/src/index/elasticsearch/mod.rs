@@ -121,6 +121,13 @@ pub struct ElasticsearchIndex {
 
     /// External index maintenance to run around full/append writes.
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
+
+    /// The filter-pushdown schema, derived from the real Elasticsearch mapping (not the Arrow
+    /// schema) once, when the index is constructed. Fetching the real mapping requires an async
+    /// ES call, which `query_table_provider` (synchronous) cannot make — so this is populated
+    /// eagerly at construction time instead of lazily inside `query_table_provider`. See
+    /// `runtime::embeddings::index::elasticsearch::try_from_table`.
+    pub filter_schema: EsFilterSchema,
 }
 
 /// Optional Elasticsearch maintenance to run around full/append table-sink writes.
@@ -308,6 +315,13 @@ impl ElasticsearchIndexWriteMaintenance {
 /// metadata column (e.g. via `metadata: { vectors: non-filterable }` on the column in the
 /// Spicepod config); that explicit opt-out must be honored even though the column is also the
 /// primary key.
+///
+/// Production code now gets `filter_schema` pre-built from the real Elasticsearch mapping (see
+/// `filter_schema` on [`ElasticsearchIndex`]/[`ElasticsearchTextIndex`]) instead of deriving it
+/// from the Arrow schema here, so this is only exercised by tests that reconstruct the
+/// mapping-free schema `query_table_provider` used to build inline, to keep asserting the same
+/// filterable/non-filterable semantics.
+#[cfg(test)]
 fn filterable_primary_key_names(
     primary_key: &[Field],
     metadata_columns: &MetadataColumns,
@@ -341,14 +355,6 @@ impl SearchIndex for ElasticsearchIndex {
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
         let schema = self.query_result_schema();
-        // Only Elasticsearch-indexed columns (primary keys + user-declared `filterable` metadata)
-        // may be pre-filtered; everything else stays a DataFusion filter above the scan. A
-        // primary-key column is otherwise always filterable, but an explicit `NonFilterable`
-        // declaration in `metadata_columns` is honored even for it.
-        let mut filterable =
-            filterable_primary_key_names(&self.primary_key, &self.metadata_columns);
-        filterable.extend(self.metadata_columns.filterable_names());
-        let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchKnnTable {
             client: Arc::clone(&self.client),
             index: self.es_index.clone(),
@@ -359,7 +365,7 @@ impl SearchIndex for ElasticsearchIndex {
             source_schema: Arc::clone(&self.source_schema),
             query_text: Some(query.to_string()),
             embedder: Some(Arc::new(EmbedQueryAdapter(Arc::clone(&self.compute_query)))),
-            filter_schema,
+            filter_schema: self.filter_schema.clone(),
         });
 
         Ok(
@@ -639,6 +645,12 @@ pub struct ElasticsearchTextIndex {
 
     /// External index maintenance to run around full/append writes.
     pub write_maintenance: Arc<ElasticsearchIndexWriteMaintenance>,
+
+    /// The filter-pushdown schema, derived from the real Elasticsearch mapping (not the Arrow
+    /// schema) once, when the index is constructed — the same reasoning as
+    /// [`ElasticsearchIndex`]'s field of the same name: fetching the real mapping requires an
+    /// async ES call that `query_table_provider` (synchronous) cannot make.
+    pub filter_schema: EsFilterSchema,
 }
 
 impl ElasticsearchTextIndex {
@@ -728,16 +740,6 @@ impl SearchIndex for ElasticsearchTextIndex {
         ));
         let schema = Arc::new(Schema::new(result_fields));
 
-        // The text index indexes the primary key, the analyzed search fields, and any
-        // user-declared filterable metadata columns (mapped `index: true`, mirroring the
-        // vector-index path) as safe exact-value pre-filter targets. A primary-key column is
-        // otherwise always filterable, but an explicit `NonFilterable` declaration in
-        // `metadata_columns` is honored even for it.
-        let mut filterable =
-            filterable_primary_key_names(&self.primary_key, &self.metadata_columns);
-        filterable.extend(self.metadata_columns.filterable_names());
-        let filter_schema = EsFilterSchema::from_spice_managed(&self.source_schema, &filterable);
-
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchTextSearchTable {
             client: Arc::clone(&self.client),
             index: self.es_index.clone(),
@@ -746,7 +748,7 @@ impl SearchIndex for ElasticsearchTextIndex {
             limit: 10_000,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
-            filter_schema,
+            filter_schema: self.filter_schema.clone(),
         });
 
         Ok(
@@ -981,6 +983,21 @@ mod write_maintenance_tests {
         ElasticsearchIndexWriteMaintenance::new(opts)
     }
 
+    /// Reconstructs the mapping-free filter schema `query_table_provider` used to build inline
+    /// before `filter_schema` became a pre-built field sourced from the real Elasticsearch
+    /// mapping. Used only by tests that have no real mapping to fetch, so they can keep asserting
+    /// the same filterable/non-filterable semantics against a schema that mirrors the old
+    /// production logic.
+    fn spice_managed_filter_schema(
+        primary_key: &[Field],
+        metadata_columns: &MetadataColumns,
+        source_schema: &Schema,
+    ) -> EsFilterSchema {
+        let mut filterable = filterable_primary_key_names(primary_key, metadata_columns);
+        filterable.extend(metadata_columns.filterable_names());
+        EsFilterSchema::from_spice_managed(source_schema, &filterable)
+    }
+
     /// `on_write_start` with no options configured is a pure no-op: no ES calls.
     #[tokio::test]
     async fn write_start_no_options_is_noop() {
@@ -1201,21 +1218,26 @@ mod write_maintenance_tests {
             ))),
         ]
         .into();
+        let primary_key = vec![Field::new("id", DataType::Int64, false)];
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new("category", DataType::Int64, true),
+            Field::new("description", DataType::Utf8, true),
+        ]));
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
         let index = ElasticsearchTextIndex {
             client: Arc::new(MockElasticsearch::default()),
             es_index: "test-index".to_string(),
             search_column_name: "body".to_string(),
             search_fields: vec!["body".to_string()],
-            primary_key: vec![Field::new("id", DataType::Int64, false)],
-            source_schema: Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("body", DataType::Utf8, true),
-                Field::new("category", DataType::Int64, true),
-                Field::new("description", DataType::Utf8, true),
-            ])),
+            primary_key,
+            source_schema,
             metadata_columns,
             batch_write_rows: 1000,
             write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            filter_schema,
         };
 
         let plan = index
@@ -1269,19 +1291,24 @@ mod write_maintenance_tests {
             Field::new("id", DataType::Int64, false),
         ))]
         .into();
+        let primary_key = vec![Field::new("id", DataType::Int64, false)];
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
         let index = ElasticsearchTextIndex {
             client: Arc::new(MockElasticsearch::default()),
             es_index: "test-index".to_string(),
             search_column_name: "body".to_string(),
             search_fields: vec!["body".to_string()],
-            primary_key: vec![Field::new("id", DataType::Int64, false)],
-            source_schema: Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("body", DataType::Utf8, true),
-            ])),
+            primary_key,
+            source_schema,
             metadata_columns,
             batch_write_rows: 1000,
             write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
+            filter_schema,
         };
 
         let plan = index
@@ -1372,6 +1399,9 @@ mod write_maintenance_tests {
             ),
         ]));
 
+        let filter_schema =
+            spice_managed_filter_schema(&primary_key, &metadata_columns, &source_schema);
+
         ElasticsearchIndex {
             client: Arc::new(MockElasticsearch::default()),
             es_index: "test-index".to_string(),
@@ -1385,6 +1415,7 @@ mod write_maintenance_tests {
             source_schema,
             metadata_columns,
             batch_write_rows: 1000,
+            filter_schema,
             write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
         }
     }

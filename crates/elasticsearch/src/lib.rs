@@ -118,6 +118,12 @@ pub struct FieldMapping {
     /// when the mapping declares no `doc_values` parameter.
     #[serde(default)]
     pub doc_values: Option<bool>,
+    /// The `normalizer` applied to a `keyword`-family field before indexing (e.g. lowercasing).
+    /// Elasticsearch compares normalized indexed terms while SQL compares the raw `_source`
+    /// value, and normalization is not order-preserving, so a configured normalizer makes range
+    /// pushdown against this field unsafe — see `EsFieldType::supports_range`.
+    #[serde(default)]
+    pub normalizer: Option<String>,
 }
 
 /// A search request body sent to `POST /<index>/_search`.

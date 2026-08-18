@@ -108,6 +108,14 @@ fn collect_mapping_fields(
         } else {
             (mapping.index, mapping.doc_values)
         };
+        // `normalizer` is read from the same target field as `keyword_ignore_above` above — the
+        // keyword sibling for `text`, or the field itself for `keyword`/`wildcard`/
+        // `constant_keyword` — since that is the field the pushdown will actually query.
+        let has_normalizer = if is_keyword_family {
+            mapping.normalizer.is_some()
+        } else {
+            keyword_sibling.is_some_and(|(_, sub_mapping)| sub_mapping.normalizer.is_some())
+        };
         fields.insert(
             full_name,
             EsMappingField {
@@ -117,6 +125,7 @@ fn collect_mapping_fields(
                 has_null_value,
                 indexed: indexed.unwrap_or(true),
                 has_doc_values: has_doc_values.unwrap_or(true),
+                has_normalizer,
             },
         );
     }
@@ -354,6 +363,76 @@ mod tests {
         );
         assert_eq!(
             classify_filter(&filter_schema, &col("unsorted").eq(lit(5_i64))),
+            TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn filter_schema_disables_range_on_normalized_keyword_but_not_equality() {
+        use datafusion::logical_expr::{TableProviderFilterPushDown, expr::Between};
+        use datafusion::prelude::{col, lit};
+        use elasticsearch_datafusion_filter::classify_filter;
+
+        // A lowercase normalizer indexes "Z" before "a" even though the raw `_source` values
+        // compare the other way, so a range boundary against this field is not a safe superset.
+        let mut title_fields = HashMap::new();
+        title_fields.insert(
+            "keyword".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                normalizer: Some("lowercase".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "code".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                normalizer: Some("lowercase".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "title".to_string(),
+            FieldMapping {
+                field_type: Some("text".to_string()),
+                fields: Some(title_fields),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+
+        for column in ["code", "title"] {
+            assert_eq!(
+                classify_filter(&filter_schema, &col(column).gt(lit("a"))),
+                TableProviderFilterPushDown::Unsupported,
+                "range on a normalized {column} field must be unsupported"
+            );
+            assert_eq!(
+                classify_filter(
+                    &filter_schema,
+                    &datafusion::logical_expr::Expr::Between(Between::new(
+                        Box::new(col(column)),
+                        false,
+                        Box::new(lit("a")),
+                        Box::new(lit("z")),
+                    ))
+                ),
+                TableProviderFilterPushDown::Unsupported,
+                "BETWEEN on a normalized {column} field must be unsupported"
+            );
+        }
+
+        // Equality is unaffected by a normalizer: applied identically to the indexed value and
+        // the query term, it preserves membership even though it doesn't preserve ordering.
+        assert_eq!(
+            classify_filter(&filter_schema, &col("code").eq(lit("abc"))),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            classify_filter(&filter_schema, &col("title").eq(lit("abc"))),
             TableProviderFilterPushDown::Inexact
         );
     }

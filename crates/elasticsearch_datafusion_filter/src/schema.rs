@@ -61,7 +61,19 @@ pub enum EsFieldType {
     /// over-length equality/`IN` literals and never push `prefix`. `None` means the mapping was
     /// read directly and declares no `ignore_above` (verified unbounded), *except* when
     /// constructed without real mapping data (e.g. in tests), where it just means "not modeled".
-    Keyword { ignore_above: Option<usize> },
+    ///
+    /// `has_normalizer` is `true` when the mapping configures a `normalizer` on this field.
+    /// Elasticsearch compares normalized indexed terms while SQL compares the raw `_source`
+    /// value; a normalizer is not order-preserving (e.g. a lowercase normalizer makes indexed
+    /// `"z"` sort before `"a"` even though the raw values compare the other way), so a `range`
+    /// clause is not provably a superset — see [`Self::supports_range`]. Equality/`IN`/prefix are
+    /// unaffected: a deterministic normalizer applied identically to the indexed value and the
+    /// query term preserves membership and prefix relationships even though it does not preserve
+    /// ordering.
+    Keyword {
+        ignore_above: Option<usize>,
+        has_normalizer: bool,
+    },
     /// An analyzed `text` field carrying a non-analyzed `keyword` sub-field (the mapping Spice
     /// writes for string columns, e.g. `col.keyword`). Equality/prefix are pushed against the
     /// sub-field but marked inexact: analysis/collation can differ, so `DataFusion` re-checks.
@@ -72,9 +84,13 @@ pub enum EsFieldType {
     /// reject literals over the threshold (equality/`IN`) and never push `prefix` at all (an
     /// unseen longer matching value could always exist). `None` means the limit is not known —
     /// callers must not use it as evidence the field is unbounded (see `from_mapping`).
+    ///
+    /// `has_normalizer` carries the same range-pushdown hazard documented on
+    /// [`Self::Keyword`], for the `keyword` sub-field.
     TextWithKeyword {
         keyword_subfield: String,
         ignore_above: Option<usize>,
+        has_normalizer: bool,
     },
 }
 
@@ -106,17 +122,27 @@ impl EsFieldType {
     /// Whether a `range`/`BETWEEN` predicate is expressible against this field type at all.
     /// `false` for [`EsFieldType::Boolean`] (nonsensical), [`EsFieldType::QuantizedFloat`]
     /// (quantization can make a boundary comparison exclude a true SQL match — see the variant's
-    /// docs — so there is no safe superset to push), and a [`EsFieldType::Keyword`]/
-    /// [`EsFieldType::TextWithKeyword`] with `ignore_above` set: a document whose value exceeds
+    /// docs — so there is no safe superset to push), a [`EsFieldType::Keyword`]/
+    /// [`EsFieldType::TextWithKeyword`] with `ignore_above` set (a document whose value exceeds
     /// that length has no entry in the field at all, so no boundary comparison — regardless of
     /// where the query literal falls — can be trusted not to exclude a row that truly satisfies
-    /// the SQL predicate. Same subset hazard [`Self::supports_prefix`] guards against.
+    /// the SQL predicate; same subset hazard [`Self::supports_prefix`] guards against), and a
+    /// `Keyword`/`TextWithKeyword` with a `normalizer` configured: normalization is not
+    /// order-preserving, so the indexed term order can disagree with the raw `_source` order SQL
+    /// compares, making a range boundary unsafe regardless of `ignore_above`.
     #[must_use]
     pub fn supports_range(&self) -> bool {
         match self {
             EsFieldType::Boolean | EsFieldType::QuantizedFloat => false,
-            EsFieldType::Keyword { ignore_above }
-            | EsFieldType::TextWithKeyword { ignore_above, .. } => ignore_above.is_none(),
+            EsFieldType::Keyword {
+                ignore_above,
+                has_normalizer,
+            }
+            | EsFieldType::TextWithKeyword {
+                ignore_above,
+                has_normalizer,
+                ..
+            } => ignore_above.is_none() && !has_normalizer,
             EsFieldType::Integer | EsFieldType::Float => true,
         }
     }
@@ -125,10 +151,14 @@ impl EsFieldType {
     /// whenever `ignore_above` is `Some`: an unseen value longer than the threshold could still
     /// match the prefix while having no entry in the index at all, and no length check on the
     /// prefix literal itself can rule that out.
+    ///
+    /// A configured `normalizer` does not affect this: applied identically to the indexed value
+    /// and the query term, it preserves prefix relationships even though it doesn't preserve
+    /// ordering — unlike [`Self::supports_range`], this is unaffected by `has_normalizer`.
     #[must_use]
     pub fn supports_prefix(&self) -> bool {
         match self {
-            EsFieldType::Keyword { ignore_above }
+            EsFieldType::Keyword { ignore_above, .. }
             | EsFieldType::TextWithKeyword { ignore_above, .. } => ignore_above.is_none(),
             _ => false,
         }
@@ -142,7 +172,7 @@ impl EsFieldType {
     pub fn accepts_value_length(&self, value: &serde_json::Value) -> bool {
         let ignore_above = match self {
             EsFieldType::TextWithKeyword { ignore_above, .. }
-            | EsFieldType::Keyword { ignore_above } => *ignore_above,
+            | EsFieldType::Keyword { ignore_above, .. } => *ignore_above,
             _ => None,
         };
         match ignore_above {
@@ -291,9 +321,12 @@ impl EsFilterSchema {
                 field.data_type(),
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
             ) {
+                // Spice's own write path never configures a `normalizer` on the `.keyword`
+                // sub-field it attaches to managed string columns.
                 EsFieldType::TextWithKeyword {
                     keyword_subfield: "keyword".to_string(),
                     ignore_above: Some(SPICE_MANAGED_KEYWORD_IGNORE_ABOVE),
+                    has_normalizer: false,
                 }
             } else {
                 continue;
@@ -319,6 +352,10 @@ impl EsFilterSchema {
 /// representation (so this crate does not need to depend on one) — just the `type` and, for a
 /// `text` field, the name of any keyword-typed multi-field sibling.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent Elasticsearch mapping property (null_value/index/doc_values/normalizer presence), not a state machine — they can be set in any combination"
+)]
 pub struct EsMappingField {
     /// The Elasticsearch field `type` (e.g. `"keyword"`, `"text"`, `"long"`, `"boolean"`).
     pub field_type: String,
@@ -343,6 +380,12 @@ pub struct EsMappingField {
     /// `range`/`BETWEEN` clause against it is not safe to issue. Elasticsearch defaults this to
     /// `true` when the mapping declares no `doc_values` parameter.
     pub has_doc_values: bool,
+    /// Whether a `normalizer` is configured on whichever field the pushdown will actually query
+    /// for an exact-value predicate — the keyword sibling for `text`, or the field itself for
+    /// `keyword`/`wildcard`/`constant_keyword` — same target as `keyword_ignore_above` above.
+    /// `true` makes range/`BETWEEN` pushdown against the field unsafe (see
+    /// [`EsFieldType::supports_range`]); equality/`IN`/prefix are unaffected.
+    pub has_normalizer: bool,
 }
 
 impl EsFilterSchema {
@@ -375,12 +418,14 @@ impl EsFilterSchema {
                 "half_float" | "scaled_float" => Some(EsFieldType::QuantizedFloat),
                 "keyword" | "wildcard" | "constant_keyword" => Some(EsFieldType::Keyword {
                     ignore_above: info.keyword_ignore_above,
+                    has_normalizer: info.has_normalizer,
                 }),
                 "text" | "match_only_text" => {
                     info.keyword_subfield.clone().map(|keyword_subfield| {
                         EsFieldType::TextWithKeyword {
                             keyword_subfield,
                             ignore_above: info.keyword_ignore_above,
+                            has_normalizer: info.has_normalizer,
                         }
                     })
                 }

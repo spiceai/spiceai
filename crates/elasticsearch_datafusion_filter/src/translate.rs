@@ -494,12 +494,19 @@ mod tests {
             .with_field("score", EsFieldType::Float)
             .with_field("weight", EsFieldType::QuantizedFloat)
             .with_field("active", EsFieldType::Boolean)
-            .with_field("status", EsFieldType::Keyword { ignore_above: None })
+            .with_field(
+                "status",
+                EsFieldType::Keyword {
+                    ignore_above: None,
+                    has_normalizer: false,
+                },
+            )
             .with_field(
                 "title",
                 EsFieldType::TextWithKeyword {
                     keyword_subfield: "keyword".to_string(),
                     ignore_above: Some(8),
+                    has_normalizer: false,
                 },
             )
     }
@@ -660,6 +667,7 @@ mod tests {
             has_null_value: true,
             indexed: true,
             has_doc_values: true,
+            has_normalizer: false,
         };
         let schema = EsFilterSchema::from_mapping([("code", &info)]);
         assert_eq!(
@@ -724,6 +732,87 @@ mod tests {
         let expr = col("title").gt(lit("abc"));
         assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
         assert_eq!(translate_filter(&schema(), &expr), None);
+    }
+
+    /// A schema with a `normalizer` configured on both a bare `keyword` field and a `text` field's
+    /// `keyword` sub-field, mirroring an externally-managed mapping with e.g. a `lowercase`
+    /// normalizer.
+    fn normalizer_schema() -> EsFilterSchema {
+        EsFilterSchema::new()
+            .with_field(
+                "code",
+                EsFieldType::Keyword {
+                    ignore_above: None,
+                    has_normalizer: true,
+                },
+            )
+            .with_field(
+                "name",
+                EsFieldType::TextWithKeyword {
+                    keyword_subfield: "keyword".to_string(),
+                    ignore_above: None,
+                    has_normalizer: true,
+                },
+            )
+    }
+
+    /// Normalization is not order-preserving (e.g. a lowercase normalizer indexes `"Z"` before
+    /// `"a"` even though the raw `_source` values compare the other way around), so a range/
+    /// `BETWEEN` clause against a normalized `keyword`-family field is not provably a superset of
+    /// the SQL predicate and must not be pushed — but equality and `IN`, which only need the
+    /// normalizer to be deterministic (not order-preserving), are unaffected.
+    #[test]
+    fn normalizer_disables_range_but_not_equality_or_in() {
+        let schema = normalizer_schema();
+
+        for column in ["code", "name"] {
+            assert_eq!(
+                classify_filter(&schema, &col(column).gt(lit("a"))),
+                TableProviderFilterPushDown::Unsupported,
+                "range on a normalized {column} field must be unsupported"
+            );
+            assert_eq!(
+                classify_filter(
+                    &schema,
+                    &Expr::Between(datafusion::logical_expr::expr::Between::new(
+                        Box::new(col(column)),
+                        false,
+                        Box::new(lit("a")),
+                        Box::new(lit("z")),
+                    ))
+                ),
+                TableProviderFilterPushDown::Unsupported,
+                "BETWEEN on a normalized {column} field must be unsupported"
+            );
+        }
+
+        // Equality still pushes as `Exact` for the bare keyword field (a normalizer applied
+        // identically to the indexed value and the query term preserves membership).
+        assert_eq!(
+            classify_filter(&schema, &col("code").eq(lit("abc"))),
+            TableProviderFilterPushDown::Exact
+        );
+        assert_eq!(
+            classify_filter(
+                &schema,
+                &col("code").in_list(vec![lit("a"), lit("b")], false)
+            ),
+            TableProviderFilterPushDown::Exact
+        );
+
+        // Equality/IN against the text-with-keyword field stay `Inexact`, same as without a
+        // normalizer — analysis/collation differences already require a `DataFusion` re-check.
+        assert_eq!(
+            classify_filter(&schema, &col("name").eq(lit("abc"))),
+            TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(
+            classify_filter(
+                &schema,
+                &col("name").in_list(vec![lit("a"), lit("b")], false)
+            ),
+            TableProviderFilterPushDown::Inexact
+        );
     }
 
     #[test]

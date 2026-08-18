@@ -428,6 +428,18 @@ pub(crate) async fn build_elasticsearch_text_index(
     )
     .await?;
 
+    // `ensure_index_with_text_mapping` is best-effort for a pre-existing incompatible index (it
+    // logs a warning and continues on a `put_mapping` failure), so the mapping it just applied
+    // may not match what Spice asked for. Read the real mapping back so the filter-pushdown
+    // schema reflects what Elasticsearch actually indexed, not what Spice assumed — the index was
+    // just confirmed to exist, so a `get_mapping` failure here is a real error worth surfacing,
+    // not one to mask with a fallback.
+    let filter_schema = crate::embeddings::index::elasticsearch::fetch_filter_schema(
+        client.as_ref(),
+        &fts_params.es_index,
+    )
+    .await?;
+
     // Create a single ElasticsearchTextIndex covering all FTS columns so that one _bulk
     // write per batch indexes every column as fields of the same ES document.
     // search_column_name is set to the first field as a fallback for single-column
@@ -449,6 +461,7 @@ pub(crate) async fn build_elasticsearch_text_index(
         metadata_columns,
         batch_write_rows: fts_params.params.batch_write_rows,
         write_maintenance: Arc::clone(&write_maintenance),
+        filter_schema,
     }))
 }
 

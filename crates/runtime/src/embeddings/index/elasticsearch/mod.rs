@@ -239,6 +239,15 @@ pub async fn try_from_table(
     )
     .await?;
 
+    // `ensure_index_with_mapping` is best-effort for a pre-existing incompatible index (it logs a
+    // warning and continues on a `put_mapping` failure), so the mapping it just applied may not
+    // match what Spice asked for. Read the real mapping back so the filter-pushdown schema
+    // reflects what Elasticsearch actually indexed, not what Spice assumed — pushing a filter
+    // against a field that isn't actually filterable the way we expect would silently drop
+    // matching rows. The index was just confirmed to exist, so a `get_mapping` failure here is a
+    // real error worth surfacing, not one to mask with a fallback.
+    let filter_schema = fetch_filter_schema(client.as_ref(), &es_index).await?;
+
     Ok(ElasticsearchIndex {
         client,
         es_index,
@@ -253,7 +262,37 @@ pub async fn try_from_table(
         metadata_columns,
         batch_write_rows,
         write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::new(write_options)),
+        filter_schema,
     })
+}
+
+/// Fetch the real Elasticsearch mapping for `es_index` and derive an [`EsFilterSchema`] from it,
+/// using the field's actual `type`, `index`, `doc_values`, `null_value`, `ignore_above`, and
+/// keyword-sibling info — the same machinery the externally-managed SQL connector path uses (see
+/// [`data_components::elasticsearch::schema::mapping_to_filter_schema`]) — rather than assuming
+/// the mapping came out the way Spice requested.
+pub(crate) async fn fetch_filter_schema(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+) -> Result<elasticsearch_datafusion_filter::EsFilterSchema, Box<dyn std::error::Error + Send + Sync>>
+{
+    let mapping_response = client
+        .get_mapping(es_index)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    // ES keys the response by resolved concrete index name (which can differ from `es_index`,
+    // e.g. an alias), so take the single mapping by value rather than indexing by `es_index`.
+    let properties = mapping_response
+        .into_values()
+        .next()
+        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::from(format!(
+                "Failed to prepare Elasticsearch index '{es_index}': the mapping response contained no index entry."
+            ))
+        })?
+        .mappings
+        .properties;
+    Ok(data_components::elasticsearch::schema::mapping_to_filter_schema(&properties))
 }
 
 /// Default number of rows per Elasticsearch `_bulk` request.
