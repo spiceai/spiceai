@@ -534,15 +534,24 @@ fn probe_fingerprint_of(mut sample: PkBloom) -> u64 {
         sample.insert(key);
     }
     let mut folded = Vec::new();
-    folded.extend_from_slice(&PK_BLOOM_NUM_HASHES.to_le_bytes());
     match &sample.repr {
         PkBloomRepr::Scattered { bits, bit_mask } => {
+            // Exactly the bytes the pre-frame fold produced, in that order:
+            // `LEGACY_PK_BLOOM_PROBE_FINGERPRINT` pins this value, and every
+            // unframed bloom on disk is validated against it.
+            folded.extend_from_slice(&PK_BLOOM_NUM_HASHES.to_le_bytes());
             folded.extend_from_slice(&bit_mask.to_le_bytes());
             for word in bits {
                 folded.extend_from_slice(&word.to_le_bytes());
             }
         }
         PkBloomRepr::SplitBlock { blocks, block_mask } => {
+            // This layout's OWN probe count -- one bit per lane. Folding the
+            // scattered `PK_BLOOM_NUM_HASHES` here would tie the two together,
+            // so retuning the scattered probe count would invalidate every
+            // persisted split-block filter whose probes had not changed.
+            let lanes = u32::try_from(SPLIT_BLOCK_SALT.len()).unwrap_or(0);
+            folded.extend_from_slice(&lanes.to_le_bytes());
             folded.extend_from_slice(&block_mask.to_le_bytes());
             for block in blocks {
                 for lane in block {
@@ -1853,12 +1862,11 @@ pub(crate) enum PkExistenceRef<'a> {
 mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
-        ColdPkExistence, LEGACY_PK_BLOOM_PROBE_FINGERPRINT, PK_BLOOM_FRAME_VERSION_SCATTERED,
-        PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK, PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION,
-        PkBloom, PkBloomRepr, PkDigestSet, PkKeysetInsertOutcome, RowLocation,
-        SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex, approx_pk_keyset_entry_bytes,
-        deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar, pk_digest,
-        serialize_pk_blooms_sidecar, shard_of_pk,
+        ColdPkExistence, LEGACY_PK_BLOOM_PROBE_FINGERPRINT, PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK,
+        PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, PkBloom, PkBloomRepr, PkDigestSet,
+        PkKeysetInsertOutcome, RowLocation, SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex,
+        approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar,
+        pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
     };
 
     /// Degrading after a mid-batch stop must not lose the rest of the batch.
@@ -2255,7 +2263,10 @@ mod tests {
                     inserted_keys: 0,
                 }
             } else {
-                PkBloom::with_num_bits_pow2(1 << 16)
+                // Explicitly scattered: the general constructor builds
+                // split-block now, so this arm would otherwise test the same
+                // layout twice and cover nothing.
+                PkBloom::scattered_with_num_bits_pow2(1 << 16)
             };
             let keys: Vec<[u8; 16]> = (0..2_000u128).map(u128::to_le_bytes).collect();
             for key in &keys {
@@ -2276,8 +2287,34 @@ mod tests {
         }
     }
 
-    /// Rounding up is what buys the accuracy; rounding down is what version 2
-    /// does. Pinned as a property of the sizing rule.
+    /// `with_expected_keys` must round the bit count UP.
+    ///
+    /// Asserted on the constructor's own output, not on two hand-sized filters:
+    /// a test that only shows "more bits means fewer false positives" stays
+    /// green if the round-up is deleted, which makes it no test of this change.
+    #[test]
+    fn with_expected_keys_rounds_the_bit_count_up() {
+        // 100K keys asks for 1,000,000 bits. Rounding down takes 2^19 and gives
+        // 5.24 bits/key; rounding up takes 2^20 and gives the ~10 the caller
+        // asked for.
+        let filter = PkBloom::with_expected_keys(100_000, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        assert_eq!(
+            filter.size_bytes() * 8,
+            1 << 20,
+            "asked for 10 bits/key and must not receive 5.24"
+        );
+
+        // The ceiling still wins: never round up past what the caller allows.
+        let capped = PkBloom::with_expected_keys(100_000, 64 * 1024);
+        assert!(
+            capped.size_bytes() <= 64 * 1024,
+            "rounding up must not breach max_bytes, got {}",
+            capped.size_bytes()
+        );
+    }
+
+    /// And the accuracy that sizing buys, measured against the round-down the
+    /// pre-frame constructor performed.
     #[test]
     fn round_up_sizing_beats_round_down_at_the_same_request() {
         // Scattered keys, as a hashed composite key is in practice.
@@ -2515,7 +2552,7 @@ mod tests {
     #[test]
     fn pk_bloom_rejects_an_unknown_frame_version() {
         let mut bytes = scattered_sample_bloom().to_bytes();
-        bytes[4..8].copy_from_slice(&(PK_BLOOM_FRAME_VERSION_SCATTERED + 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK + 1).to_le_bytes());
         assert!(
             PkBloom::from_bytes(&bytes).is_none(),
             "a future frame version must fall back, not be parsed as this one"
