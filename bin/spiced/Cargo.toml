@@ -80,6 +80,7 @@ serde_json = { workspace = true }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
+zeroize = "1.8"
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
@@ -100,6 +101,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
+rcgen = { version = "0.14", features = ["x509-parser"] }
 # Builds the `RequestContext` the trace-span test needs; `spiced` itself only
 # ever sees one through `runtime`.
 runtime-request-context = { path = "../../crates/runtime-request-context" }

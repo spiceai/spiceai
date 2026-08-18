@@ -17,7 +17,7 @@ limitations under the License.
 //! Bootstrap glue for Spice Cloud Connect inside `spiced`.
 //!
 //! Wires the spice-cloud-connect client into the runtime so that a
-//! standalone `spiced` can be discovered, adopted, and managed by a
+//! standalone `spiced` can be discovered, enrolled, and managed by a
 //! Spice Cloud control plane.
 //!
 //! ## Opt-in semantics
@@ -25,17 +25,16 @@ limitations under the License.
 //! `CloudConnect` is **disabled by default**. It activates only if one of
 //! the following is true at boot:
 //!
-//! 1. The `--cloud-connect` flag was passed.
-//! 2. `$SPICE_CONFIG_DIR/identity.json` exists.
-//! 3. `SPICE_CONNECT_ADOPT_CODE` env var is set.
-//! 4. `$SPICE_CONFIG_DIR/pending-adopt-code` file exists.
+//! 1. `--token <enrollment-key>` was passed — [`bootstrap_enrollment`]
+//!    then enrolls this instance *before the runtime is built or any
+//!    listener binds*, so the durable identity exists by the time anything
+//!    else here runs.
+//! 2. `$SPICE_CONFIG_DIR/identity.json` exists (a previously enrolled
+//!    instance) — reconnection is automatic, with no flag.
 //!
-//! If none of the above is true, this module never opens a connection.
-//! `--cloud-connect` forces the client on but cannot conjure a credential:
-//! with no identity and no code it logs an actionable warning and the
-//! runtime continues unmanaged. Conversely its absence keeps the
-//! signal-based activation, so instances enrolled before the flag existed
-//! keep connecting after an upgrade.
+//! If neither is true, this module never opens a connection. An existing
+//! identity always wins over a supplied `--token`: the key is not redeemed
+//! and nothing about it is persisted.
 //!
 //! ## How a deployment applies
 //!
@@ -79,7 +78,7 @@ use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
 use runtime::status::ComponentStatus;
 use runtime_cloud_connect::config::{
-    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE, PENDING_ADOPT_CODE_FILE,
+    CLOUD_MANAGED_SPICEPOD_FILE, CloudConnectConfig, IDENTITY_FILE,
 };
 use runtime_cloud_connect::handlers::{
     ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, QueryOutcome, RuntimeHandle,
@@ -87,7 +86,10 @@ use runtime_cloud_connect::handlers::{
 };
 use runtime_cloud_connect::identity::CacheKey;
 use runtime_cloud_connect::supervisor::Supervisor;
-use runtime_cloud_connect::{CloudConnect, identity::IdentityStore};
+use runtime_cloud_connect::{
+    CloudConnect,
+    identity::{AppAttachment, AttachmentState, IdentityStore},
+};
 use runtime_secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
 use telemetry::metrics_reader::MetricsReader;
 
@@ -108,30 +110,26 @@ const DEFAULT_LOG_TAIL_LINES: usize = 500;
 const DEPLOYMENT_DRAIN_BUDGET: Duration = Duration::from_mins(2);
 
 /// Cheap probe for whether Spice Cloud Connect is configured for this
-/// instance, using the same signals as [`maybe_start`]: the explicit
-/// `--cloud-connect` flag, an on-disk identity, a staged pending adoption
-/// code, or the `SPICE_CONNECT_ADOPT_CODE` env var.
+/// instance, using the same signals as [`maybe_start`]: a `--token`
+/// enrollment bootstrap in progress, or an on-disk identity.
 ///
 /// Called from `init_tracing` (before [`maybe_start`]) to decide whether to
 /// install the log-capture layer. It runs in the same process — hence the
 /// same working directory — as [`maybe_start`], so both resolve the config
 /// directory identically. This is a lightweight existence check; it does not
-/// read or validate the files (that happens in `maybe_start`).
-pub(crate) fn is_configured(cloud_connect_flag: bool) -> bool {
-    if cloud_connect_flag {
+/// read or validate the file (that happens in `maybe_start`).
+pub(crate) fn is_configured(token_supplied: bool) -> bool {
+    if token_supplied {
         return true;
     }
-    let config_dir = CloudConnectConfig::default_config_dir();
-    config_dir.join(IDENTITY_FILE).exists()
-        || config_dir.join(PENDING_ADOPT_CODE_FILE).exists()
-        || std::env::var_os(runtime_cloud_connect::config::ADOPT_CODE_ENV)
-            .is_some_and(|v| !v.is_empty())
+    CloudConnectConfig::default_config_dir()
+        .join(IDENTITY_FILE)
+        .exists()
 }
 
-/// Read the optional `cloud-endpoint` override file written by
-/// `spice connect <code> --endpoint <url>`. This overrides the cloud
-/// **enroll** endpoint (state plane); the gateway (stream) address comes
-/// from the enroll response.
+/// Read the optional instance-local `cloud-endpoint` override file. This
+/// overrides the cloud **enroll** endpoint (state plane); the gateway (stream)
+/// address comes from the enroll response.
 fn read_endpoint_override(config_dir: &Path) -> Option<String> {
     let path = config_dir.join("cloud-endpoint");
     std::fs::read_to_string(path)
@@ -149,6 +147,81 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
         config.enroll_endpoint = override_endpoint;
     }
     config
+}
+
+/// Why a `--token` bootstrap could not produce a durable identity. Every
+/// message is safe to print: none can contain the enrollment key.
+#[derive(Debug, snafu::Snafu)]
+pub enum BootstrapEnrollmentError {
+    #[snafu(display("Failed to enroll this instance with Spice Cloud: {source}"))]
+    Enroll {
+        source: runtime_cloud_connect::EnrollNowError,
+    },
+}
+
+/// Redeem a `--token` enrollment key: the pre-runtime Cloud Connect
+/// bootstrap.
+///
+/// Called from `main` **before the runtime is built, any listener binds, or
+/// readiness can be reported** — a failed enrollment therefore leaves the
+/// process with no port bound and nothing an orchestrator could route
+/// traffic to. Retryable failures are retried for up to the headless
+/// ten-minute budget while the process stays unready; terminal failures
+/// return an error the caller exits `1` on.
+///
+/// No-op without `--token`. An existing valid identity wins: the key is not
+/// redeemed, nothing about it is persisted, and the runtime reconnects from
+/// the identity as it would have without the flag.
+///
+/// # Errors
+///
+/// Returns [`BootstrapEnrollmentError`] when the key or region is malformed
+/// (checked locally, never echoed) or when [`enroll_now`] fails terminally
+/// or exhausts its retry budget.
+pub async fn bootstrap_enrollment(args: &mut crate::Args) -> Result<(), BootstrapEnrollmentError> {
+    use runtime_cloud_connect::{EnrollNowOutcome, RetryPolicy};
+
+    let Some(raw_key) = args.token.take() else {
+        return Ok(());
+    };
+
+    let mut config = build_config(env!("CARGO_PKG_VERSION"));
+    config.instance_region = args.region.clone();
+    let outcome = runtime_cloud_connect::enroll_now_with_token(
+        &config,
+        raw_key.expose_secret(),
+        None,
+        RetryPolicy::HEADLESS,
+    )
+    .await
+    .map_err(|source| BootstrapEnrollmentError::Enroll { source })?;
+    drop(raw_key);
+
+    match outcome {
+        EnrollNowOutcome::AlreadyEnrolled { identity } => {
+            tracing::info!(
+                "Spice Cloud Connect: this instance is already enrolled as {} (identity at {}); \
+                 the supplied enrollment key was NOT redeemed and can be used elsewhere or revoked",
+                identity.identifier,
+                config.identity_path.display()
+            );
+        }
+        EnrollNowOutcome::Enrolled {
+            identity: _,
+            metadata,
+        } => {
+            tracing::info!(
+                "Spice Cloud Connect: enrollment succeeded (identity stored at {})",
+                config.identity_path.display()
+            );
+            if metadata.new_project_url.is_some() {
+                tracing::info!(
+                    "Spice Cloud Connect: this instance is not yet attached to a project. Open Spice Cloud to create one"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The spicepod a deployment persisted, and the deployment it belongs to.
@@ -176,9 +249,9 @@ pub struct CloudManagedSpicepodReadError {
 /// Reads files only — no control-plane round trip — so an instance whose
 /// gateway is unreachable still comes up on its deployed configuration.
 pub async fn cloud_managed_spicepod(
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> std::result::Result<Option<CloudManagedSpicepod>, CloudManagedSpicepodReadError> {
-    if !is_configured(cloud_connect_flag) {
+    if !is_configured(token_supplied) {
         return Ok(None);
     }
     let config_dir = CloudConnectConfig::default_config_dir();
@@ -223,9 +296,9 @@ pub struct DeliveredSecretsState {
 pub async fn restore_delivered_secrets(
     runtime_version: &str,
     runtime: &Arc<Runtime>,
-    cloud_connect_flag: bool,
+    token_supplied: bool,
 ) -> Option<DeliveredSecretsState> {
-    if !is_configured(cloud_connect_flag) {
+    if !is_configured(token_supplied) {
         return None;
     }
     let config = build_config(runtime_version);
@@ -243,14 +316,14 @@ pub async fn restore_delivered_secrets(
     Some(DeliveredSecretsState { store })
 }
 
-/// Start the Cloud Connect client if any of the opt-in conditions are
-/// met. The returned `Option<CloudConnect>` is `None` when `CloudConnect`
-/// is disabled — which is the default for vanilla OSS installs.
+/// Start the Cloud Connect client when this instance holds an enrolled
+/// identity. The returned `Option<CloudConnect>` is `None` when
+/// `CloudConnect` is disabled — which is the default for vanilla OSS
+/// installs.
 ///
-/// `cloud_connect_flag` is the explicit `--cloud-connect` opt-in: it forces
-/// the client on, but with no identity and no adoption code there is
-/// nothing to connect with — that case logs an actionable warning (instead
-/// of the silent debug skip) and the runtime continues unmanaged.
+/// Activation is identity-driven and needs no flag: a `--token` bootstrap
+/// persisted the identity before the runtime was built ([`bootstrap_enrollment`]),
+/// and a previously enrolled instance reconnects from the identity alone.
 ///
 /// `running_deployment` is the cloud-managed spicepod the runtime actually
 /// loaded, or `None` when it is serving something else (a local spicepod, or a
@@ -264,7 +337,6 @@ pub async fn restore_delivered_secrets(
 pub async fn maybe_start(
     runtime_version: &str,
     runtime: Arc<Runtime>,
-    cloud_connect_flag: bool,
     delivered_secrets: Option<DeliveredSecretsState>,
     running_deployment: Option<CloudManagedSpicepod>,
     metrics: Option<MetricsReader>,
@@ -272,11 +344,10 @@ pub async fn maybe_start(
 ) -> Option<CloudConnect> {
     let config = build_config(runtime_version);
 
-    // Quick sanity probe — if no identity AND no adoption code, skip.
-    // Surface a load/parse error (corrupt or unreadable identity.json)
-    // rather than silently treating it as "not adopted", so a broken
-    // identity file is visible to the operator instead of quietly
-    // disabling Cloud Connect.
+    // Quick sanity probe — no identity means disabled. Surface a load/parse
+    // error (corrupt or unreadable identity.json) rather than silently
+    // treating it as "not enrolled", so a broken identity file is visible
+    // to the operator instead of quietly disabling Cloud Connect.
     let mut persisted_app_id = None;
     let has_identity = match IdentityStore::load_optional(&config.identity_path) {
         Ok(opt) => {
@@ -288,34 +359,23 @@ pub async fn maybe_start(
         Err(err) => {
             tracing::warn!(
                 "Spice Cloud Connect: could not read identity at {}: {err}; \
-                 treating as not-adopted — fix or remove the file to re-adopt",
+                 treating as not-enrolled — fix or remove the file to re-enroll",
                 config.identity_path.display()
             );
             false
         }
     };
-    if !has_identity && config.adoption_code.is_none() {
-        if cloud_connect_flag {
-            tracing::warn!(
-                "Spice Cloud Connect: --cloud-connect was passed but no identity exists at {} and no adoption code is available; \
-                 the runtime is NOT connected to Spice Cloud. Run `spice connect <code>` with a code from the Spice Cloud portal, \
-                 or set {} and restart. See: https://spiceai.org/docs",
-                config.identity_path.display(),
-                runtime_cloud_connect::config::ADOPT_CODE_ENV
-            );
-        } else {
-            tracing::debug!(
-                "Spice Cloud Connect: disabled (no identity at {} and no adoption code)",
-                config.identity_path.display()
-            );
-        }
+    if !has_identity {
+        tracing::debug!(
+            "Spice Cloud Connect: disabled (no identity at {})",
+            config.identity_path.display()
+        );
         return None;
     }
 
     tracing::info!(
-        "Spice Cloud Connect: enabled, enroll_endpoint={} mode={}",
+        "Spice Cloud Connect: enabled, enroll_endpoint={}",
         config.enroll_endpoint,
-        if has_identity { "identity" } else { "adopt" }
     );
 
     // Hand the runtime handle the log-capture ring buffer (installed by
@@ -370,12 +430,14 @@ pub async fn maybe_start(
     // The cache key is read from the identity on each write, not captured here:
     // an instance enrolling in this very process has no identity yet.
     let identity_path = config.identity_path.clone();
+    let config_dir = config.config_dir.clone();
     let handle: Arc<dyn RuntimeHandle> =
         Arc::new(SpicedRuntimeHandle::new(SpicedRuntimeHandleParts {
             runtime,
             logs,
             delivered_secrets: delivered_store,
             identity_path,
+            config_dir,
             running_deployment,
             supervisor,
             metrics,
@@ -723,6 +785,9 @@ struct SpicedRuntimeHandle {
     /// unwritable on a first boot, which is precisely the case the cache exists
     /// for.
     identity_path: std::path::PathBuf,
+    /// Canonical directory whose enrollment transaction protects identity
+    /// updates, even when `identity_path` is configured elsewhere.
+    config_dir: std::path::PathBuf,
     /// The deployment this process is serving, replaced by a hot apply so the
     /// next one is diffed against what the process serves now rather than what
     /// it booted on.
@@ -771,6 +836,7 @@ struct SpicedRuntimeHandleParts {
     logs: Option<LogRingBuffer>,
     delivered_secrets: Arc<CloudDeliveredSecretStore>,
     identity_path: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
     running_deployment: Option<CloudManagedSpicepod>,
     supervisor: Supervisor,
     metrics: Option<MetricsReader>,
@@ -785,6 +851,7 @@ impl SpicedRuntimeHandle {
             logs,
             delivered_secrets,
             identity_path,
+            config_dir,
             running_deployment,
             supervisor,
             metrics,
@@ -797,6 +864,7 @@ impl SpicedRuntimeHandle {
             logs,
             delivered_secrets,
             identity_path,
+            config_dir,
             live: RwLock::new(live),
             persisted: RwLock::new(None),
             runtime_overrides,
@@ -817,9 +885,12 @@ impl SpicedRuntimeHandle {
     /// restart, and failing the deploy over that would be the wrong trade.
     async fn persist_app_id(&self, app_id: &str) {
         let path = self.identity_path.clone();
+        let config_dir = self.config_dir.clone();
         let app_id = app_id.to_string();
-        let result =
-            tokio::task::spawn_blocking(move || IdentityStore::store_app_id(&path, &app_id)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            IdentityStore::store_app_id(&config_dir, &path, &app_id)
+        })
+        .await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(err)) => err.to_string(),
@@ -831,11 +902,19 @@ impl SpicedRuntimeHandle {
         );
     }
 
-    async fn persist_attachment(&self, app_id: Option<&str>) -> Result<(), CommandError> {
+    /// Persist the attachment tuple and return the attachment state now on
+    /// disk — which is what the command result reports, since absence
+    /// preserves (a detach keeps the org) and echoing the command instead
+    /// would misreport the instance.
+    async fn persist_attachment(
+        &self,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<AttachmentState, CommandError> {
         let path = self.identity_path.clone();
-        let app_id = app_id.map(str::to_string);
-        let result = tokio::task::spawn_blocking(move || {
-            IdentityStore::set_app_id(&path, app_id.as_deref())
+        let config_dir = self.config_dir.clone();
+        let attachment = attachment.cloned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            IdentityStore::set_attachment(&config_dir, &path, attachment.as_ref())
         })
         .await
         .map_err(|error| {
@@ -847,12 +926,11 @@ impl SpicedRuntimeHandle {
                 self.identity_path.display()
             ))
         })?;
-        if !result {
-            return Err(CommandError::failed(
+        persisted.ok_or_else(|| {
+            CommandError::failed(
                 "Failed to save the cloud app attachment because the Cloud Connect identity is missing. Reconnect the instance and retry.",
-            ));
-        }
-        Ok(())
+            )
+        })
     }
 
     /// The local delivered-secrets cache key, read fresh from `identity.json`.
@@ -1459,10 +1537,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
             .map_err(|err| CommandError::internal(err.to_string()))
     }
 
-    async fn attach_app(&self, app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
-        self.persist_attachment(app_id).await?;
-        *self.app_id.write() = app_id.map(str::to_string);
-        Ok(serde_json::json!({ "app_id": app_id }))
+    async fn attach_app(
+        &self,
+        attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
+        let persisted = self.persist_attachment(attachment).await?;
+        (*self.app_id.write()).clone_from(&persisted.app_id);
+        // The result reports the persisted state, not the command: the two
+        // differ where absence preserves (a detach keeps the stored org).
+        Ok(serde_json::json!(persisted))
     }
 
     /// Execute an `ExecuteQuery` against the in-process runtime.
@@ -2570,6 +2653,7 @@ views:
             logs: None,
             delivered_secrets: Arc::new(CloudDeliveredSecretStore::new()),
             identity_path: dir.join(IDENTITY_FILE),
+            config_dir: dir.to_path_buf(),
             running_deployment: Some(CloudManagedSpicepod {
                 path,
                 spicepod_yaml: live.to_string(),
@@ -2600,7 +2684,7 @@ views:
     /// Give the instance an identity carrying a cache key, which is what makes
     /// the delivered-secrets cache writable — without one the cache is skipped
     /// and a test asserting on it would pass for the wrong reason.
-    fn enrol_with_a_cache_key(identity_path: &Path) {
+    fn enroll_with_a_cache_key(identity_path: &Path) {
         let mock_pem = "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".to_string();
         let mut identity = runtime_cloud_connect::identity::Identity {
             identifier: "inst_test".to_string(),
@@ -2611,8 +2695,12 @@ views:
                 .to_string(),
             ca_bundle_pem: String::new(),
             gateway_addr: "gateway.test.spice.ai:443".to_string(),
+            control_plane_endpoint: None,
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem: mock_pem,
             enc_public_key_pem: "-----BEGIN PUBLIC KEY-----\nMOCKENC\n-----END PUBLIC KEY-----\n"
                 .to_string(),
@@ -2954,7 +3042,7 @@ views:
     async fn a_malformed_deployment_leaves_the_cached_secrets_alone() {
         let dir = scratch_dir("malformed-cache");
         let handle = handle_serving(&dir, SERVING).await;
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
 
         handle
             .apply_spicepod(SpicepodDeployment {
@@ -3004,7 +3092,7 @@ views:
         handle
             .delivered_secrets
             .replace(delivered("api_key", b"value-one"));
-        enrol_with_a_cache_key(&dir.join(IDENTITY_FILE));
+        enroll_with_a_cache_key(&dir.join(IDENTITY_FILE));
         assert!(cached_secrets(&dir).is_none(), "nothing is cached yet");
 
         let outcome = handle

@@ -3783,6 +3783,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "rand 0.10.1",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+]
+
+[[package]]
 name = "chbench-driver"
 version = "2.2.0-unstable"
 dependencies = [
@@ -7792,6 +7809,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "cache",
+ "chunking",
+ "hf-hub",
+ "runtime-rate-control",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11557,10 +11589,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "cache",
+ "chat-api",
  "chunking",
  "cudarc 0.19.8",
  "dotenv 2.2.0-unstable",
  "either",
+ "embed-api",
  "futures",
  "google-genai",
  "governor",
@@ -11577,6 +11611,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
+ "rerank-api",
  "rstest 0.26.1",
  "runtime-rate-control",
  "schemars 1.2.1",
@@ -16655,6 +16690,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rerank-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "snafu",
+]
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17283,8 +17326,10 @@ dependencies = [
  "chrono",
  "cloud-connect-crypto",
  "dirs",
+ "fs4",
  "gethostname",
  "getrandom 0.3.4",
+ "libc",
  "pem",
  "prost",
  "prost-types",
@@ -17296,13 +17341,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
+ "spice-cloud-client",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid 1.23.2",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 
@@ -19498,6 +19547,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-cloud-connect",
  "rustyline",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",
@@ -19648,6 +19698,7 @@ dependencies = [
  "parking_lot",
  "podswatcher",
  "prometheus",
+ "rcgen",
  "repl",
  "reqwest 0.13.4",
  "runtime",
@@ -19675,6 +19726,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "yaml",
+ "zeroize",
 ]
 
 [[package]]
@@ -25251,3 +25303,8 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "datafusion-federation"
+version = "0.4.2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=eba20fd9f539b8c1bb993e29373b2a644d3bcea8#eba20fd9f539b8c1bb993e29373b2a644d3bcea8"
