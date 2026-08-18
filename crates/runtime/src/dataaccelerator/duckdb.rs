@@ -709,15 +709,19 @@ impl DataAccelerator for DuckDBAccelerator {
         _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        let duckdb_file =
-            self.duckdb_file_path(source)
-                .map_err(|source| CheckpointError::Store {
-                    source: Box::new(source),
-                })?;
-        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
-            return Err(CheckpointError::Store {
-                source: format!("DuckDB file does not exist at {duckdb_file}").into(),
-            });
+        if source.is_file_accelerated() {
+            let duckdb_file =
+                self.duckdb_file_path(source)
+                    .map_err(|source| CheckpointError::Store {
+                        source: Box::new(source),
+                    })?;
+            if open_option == OpenOption::OpenExisting
+                && !std::path::Path::new(&duckdb_file).exists()
+            {
+                return Err(CheckpointError::Store {
+                    source: format!("DuckDB file does not exist at {duckdb_file}").into(),
+                });
+            }
         }
 
         let pool = self
@@ -2045,7 +2049,10 @@ mod tests {
 
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+    use crate::dataaccelerator::{
+        AcceleratorEngineRegistry, DataAccelerator, duckdb::DuckDBAccelerator,
+    };
+    use runtime_acceleration::sidecar::OpenOption;
 
     fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2708,6 +2715,33 @@ mod tests {
 
         // cleanup
         std::fs::remove_file(&path).expect("file should be removed");
+    }
+
+    #[tokio::test]
+    async fn duckdb_memory_sidecar_does_not_require_a_file() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let mut dataset =
+            DatasetBuilder::try_new("duckdb_memory_sidecar".to_string(), "duckdb_memory_sidecar")
+                .expect("to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("to build dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::DuckDB,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        DuckDBAccelerator::new()
+            .sidecar(
+                &dataset,
+                Arc::new(AcceleratorEngineRegistry::new()),
+                OpenOption::OpenExisting,
+            )
+            .await
+            .expect("memory-mode sidecar should use the shared in-memory pool");
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.

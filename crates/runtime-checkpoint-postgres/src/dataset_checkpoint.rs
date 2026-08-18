@@ -101,7 +101,7 @@ impl PostgresDatasetCheckpointer {
         let conn = pool.connect_direct().await.map_err(store_error)?;
 
         let query = format!(
-            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1 LIMIT 1"
         );
         let stmt = conn.conn.prepare(&query).await.map_err(store_error)?;
         let rows = conn
