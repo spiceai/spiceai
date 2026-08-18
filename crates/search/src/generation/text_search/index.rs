@@ -34,7 +34,9 @@ use tantivy::schema::{
     TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
-use tantivy_datafusion_filter::{array_to_terms, is_tokenized, set_document_values, text_tokenizer};
+use tantivy_datafusion_filter::{
+    array_to_terms, is_tokenized, set_document_values, text_tokenizer,
+};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
