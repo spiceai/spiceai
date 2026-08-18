@@ -50,7 +50,9 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
+use crate::dataaccelerator::{
+    FilePathError, resolved_refresh_mode, snapshots::download_snapshot_if_needed,
+};
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
@@ -883,29 +885,6 @@ fn refresh_write_profile_for(
     resolved_refresh_mode: RefreshMode,
 ) -> RefreshWriteProfile {
     RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
-}
-
-/// The refresh mode a source actually runs with, applying the connector's fill-in
-/// for an unset `refresh_mode`.
-///
-/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
-/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
-/// `None` for a genuine `debezium:`/`cdc:` stream. Mapping the source's connector
-/// name through [`crate::builder::unset_refresh_mode_for_connector`] — the same table
-/// the runtime builder classifies the pod with — recovers it.
-///
-/// A source with no connector (a view, an Iceberg DDL table) has no default to apply
-/// and falls back to `full`, which is what those paths resolve an unset mode to.
-fn resolved_refresh_mode(
-    source: &dyn AccelerationSource,
-    acceleration: &Acceleration,
-) -> RefreshMode {
-    acceleration.refresh_mode.unwrap_or_else(|| {
-        source.connector_name().map_or(
-            RefreshMode::Full,
-            crate::builder::unset_refresh_mode_for_connector,
-        )
-    })
 }
 
 fn refresh_write_profile(
@@ -3278,18 +3257,20 @@ impl DataAccelerator for CayenneAccelerator {
                 );
                 super::snapshots::snapshot_before_recreate(
                     acceleration,
-                    &source.name().to_string(),
+                    source,
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
-                    // For pre-recreate snapshots we don't have a constructed
-                    // catalog handy (the metastore directory may even be in
-                    // a transient state). Pass None and accept the default
-                    // engine; the resulting snapshot will use the legacy
-                    // archive-cayenne.db path. This is acceptable because
-                    // pre-recreate snapshots are best-effort backups, not
-                    // refresh_mode: snapshot sources.
-                    None,
+                    // The outgoing snapshot becomes the store's current snapshot, so
+                    // it has to be one a Cayenne bootstrap can consume:
+                    // `CayenneSnapshotEngine::finalize_directory_snapshot` requires the
+                    // per-dataset metastore slice, and the default engine archives a
+                    // raw `cayenne.db` without one. This exports the slice while the
+                    // dataset's table metadata is still in the catalog — the drop below
+                    // removes it. If the catalog is unavailable this resolves to `None`
+                    // and `snapshot_before_recreate` skips the snapshot rather than
+                    // publish an archive nothing can restore.
+                    self.snapshot_engine_for_source(source).await,
                 )
                 .await;
 
