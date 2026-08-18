@@ -27,6 +27,10 @@ use data_components::federation::create_spice_federated_table_provider;
 use data_components::inferred_schema::{
     InferredColumnStats, InferredIndex, InferredSchema, InferredSortColumn,
 };
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
@@ -37,10 +41,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
@@ -67,10 +67,6 @@ pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
     params: Parameters,
-    /// Retained so the replication stream can resolve the applied-LSN watermark store
-    /// over the dataset's accelerator. `None` only in unit tests, which build params
-    /// without a runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -239,10 +235,11 @@ impl DataConnectorFactory for PostgresFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let mut param_map = params.parameters.to_secret_map();
 
@@ -262,7 +259,7 @@ impl DataConnectorFactory for PostgresFactory {
             if let ConnectorComponent::Dataset(dataset) = &params.component {
                 let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
                     acceleration.refresh_mode
-                        == Some(runtime::component::dataset::acceleration::RefreshMode::Changes)
+                        == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
                 });
                 if is_changes_mode {
                     // The injected spec defaults are indistinguishable from
@@ -297,7 +294,6 @@ impl DataConnectorFactory for PostgresFactory {
                         factory,
                         pool,
                         params: params_for_replication,
-                        context: params.context.clone(),
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
@@ -985,6 +981,7 @@ impl DataConnector for Postgres {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
@@ -1035,6 +1032,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
@@ -1081,20 +1079,24 @@ impl DataConnector for Postgres {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
         acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
-        Some(replication::build_changes_stream(
-            &self.params,
-            dataset,
-            self.context.clone(),
-            federated_table,
-            Arc::clone(&self.replication_metrics),
-            acceleration,
-        ))
+        Some(
+            replication::build_changes_stream(
+                &self.params,
+                dataset,
+                context,
+                federated_table,
+                Arc::clone(&self.replication_metrics),
+                acceleration,
+            )
+            .await,
+        )
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
@@ -1697,10 +1699,10 @@ mod inferred_schema_tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_postgres_connector,
     POSTGRES_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

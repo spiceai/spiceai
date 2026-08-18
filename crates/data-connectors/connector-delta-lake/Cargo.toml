@@ -9,11 +9,11 @@ description = "Delta Lake data connector for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["delta_lake"] }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
@@ -23,6 +23,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 
 [lints]

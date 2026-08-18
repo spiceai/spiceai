@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::error::format_datafusion_error;
 use arrow::datatypes::DataType;
 use datafusion::{
     datasource::listing::ListingTableUrl, error::DataFusionError, execution::SessionState,
@@ -24,6 +23,7 @@ use itertools::Itertools;
 use object_store::path::{DELIMITER, Path};
 use object_store::{ObjectMeta, ObjectStore};
 use snafu::prelude::*;
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -145,6 +145,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!()

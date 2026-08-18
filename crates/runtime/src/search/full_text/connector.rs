@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::dataconnector::ConnectorContext;
 use async_trait::async_trait;
 use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
@@ -45,15 +46,16 @@ impl FullTextConnector {
         Self { inner_connector }
     }
 
+    /// The pieces a change/append stream needs from an indexed table: the indexes
+    /// to maintain, and the federated table *below* the index layer that the
+    /// inner connector should stream from.
+    ///
+    /// Split out from the streaming itself because `changes_stream` is `async`
+    /// while `append_stream` is not; both peel the same layer.
     #[expect(clippy::needless_pass_by_value)]
-    fn with_indexed_stream<F>(
-        &self,
+    fn indexed_stream_inputs(
         federated_table: Arc<dyn FederatedTableProvider>,
-        f: F,
-    ) -> Option<ChangesStream>
-    where
-        F: Fn(&Arc<dyn DataConnector>, Arc<dyn FederatedTableProvider>) -> Option<ChangesStream>,
-    {
+    ) -> Option<(Arc<Indexes>, Arc<dyn FederatedTableProvider>)> {
         let table_provider = federated_table.try_table_provider_sync()?;
         let indexed_table = spice_table::nodes(table_provider.as_ref(), LayerWalk::Index)
             .find(|node| !node.indexes().is_empty())?;
@@ -75,15 +77,15 @@ impl FullTextConnector {
             mark_full_text_cdc_attached(index.as_any());
         }
 
-        let indexes = Indexes::new(all_indexes);
-        let ft = Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
+        let below = Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
+        Some((Indexes::new(all_indexes), below))
+    }
 
-        let stream = f(&self.inner_connector, ft)?;
-        Some(
-            stream
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
-                .boxed(),
-        )
+    /// Maintains `indexes` from every envelope the source stream emits.
+    fn maintaining(stream: ChangesStream, indexes: Arc<Indexes>) -> ChangesStream {
+        stream
+            .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
+            .boxed()
     }
 }
 
@@ -114,9 +116,10 @@ impl DataConnector for FullTextConnector {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let inner = self.inner_connector.read_provider(dataset).await?;
+        let inner = self.inner_connector.read_provider(context, dataset).await?;
         add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
             .map(|idx| idx as Arc<dyn TableProvider>)
             .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -129,9 +132,14 @@ impl DataConnector for FullTextConnector {
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        match self.inner_connector.read_write_provider(dataset).await {
+        match self
+            .inner_connector
+            .read_write_provider(context, dataset)
+            .await
+        {
             Some(Ok(inner)) => Some(
                 add_full_text_search_to_table(&inner, &dataset.columns, &dataset.name)
                     .map(|idx| idx as Arc<dyn TableProvider>)
@@ -204,15 +212,19 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
         acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        self.with_indexed_stream(federated_table, |inner, ft| {
-            inner.changes_stream(ft, dataset, acceleration)
-        })
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
+        let stream = self
+            .inner_connector
+            .changes_stream(context, below, dataset, acceleration)
+            .await?;
+        Some(Self::maintaining(stream, indexes))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -223,7 +235,9 @@ impl DataConnector for FullTextConnector {
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
     ) -> Option<ChangesStream> {
-        self.with_indexed_stream(federated_table, |inner, ft| inner.append_stream(ft))
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
+        let stream = self.inner_connector.append_stream(below)?;
+        Some(Self::maintaining(stream, indexes))
     }
 
     fn initialization_for_dataset(

@@ -4231,6 +4231,7 @@ name = "connector-abfs"
 version = "2.2.0-unstable"
 dependencies = [
  "app",
+ "data-connector-api",
  "linkme",
  "object_store 0.13.2",
  "runtime",
@@ -4254,6 +4255,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "blake3",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4281,6 +4283,7 @@ dependencies = [
  "chrono",
  "chrono-tz 0.8.6",
  "clickhouse-rs",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4306,6 +4309,7 @@ dependencies = [
  "async-trait",
  "azure_core 0.31.0",
  "azure_data_cosmos",
+ "data-connector-api",
  "datafusion",
  "datafusion-table-providers",
  "futures",
@@ -4329,6 +4333,7 @@ dependencies = [
  "app",
  "async-trait",
  "aws-sdk-credential-bridge",
+ "data-connector-api",
  "data-http-rate-control",
  "data_components",
  "datafusion",
@@ -4358,6 +4363,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "linkme",
@@ -4379,6 +4385,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "arrow",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-federation",
@@ -4399,6 +4406,7 @@ name = "connector-duckdb"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4417,6 +4425,7 @@ name = "connector-ducklake"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4475,6 +4484,7 @@ name = "connector-elasticsearch"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "elasticsearch",
@@ -4495,6 +4505,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "flight_client",
@@ -4511,6 +4522,7 @@ dependencies = [
 name = "connector-ftp"
 version = "2.2.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "paste",
  "runtime",
@@ -4526,6 +4538,7 @@ name = "connector-gcs"
 version = "2.2.0-unstable"
 dependencies = [
  "app",
+ "data-connector-api",
  "linkme",
  "object_store 0.13.2",
  "runtime",
@@ -4545,6 +4558,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "dashmap",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "git2",
@@ -4577,6 +4591,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "connector-graphql",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "futures",
@@ -4609,6 +4624,7 @@ dependencies = [
 name = "connector-glue"
 version = "2.2.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "runtime",
 ]
@@ -4620,6 +4636,7 @@ dependencies = [
  "app",
  "arrow",
  "async-trait",
+ "data-connector-api",
  "data-http-rate-control",
  "data_components",
  "datafusion",
@@ -4655,6 +4672,7 @@ dependencies = [
  "async-trait",
  "charset",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "imap",
@@ -4737,6 +4755,7 @@ name = "connector-mssql"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "linkme",
@@ -4783,9 +4802,9 @@ dependencies = [
 name = "connector-nfs"
 version = "1.11.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "paste",
- "runtime",
  "runtime-component",
  "runtime-parameters",
  "snafu",
@@ -4801,6 +4820,7 @@ dependencies = [
  "arrow-odbc",
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4828,6 +4848,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "linkme",
@@ -4886,6 +4907,7 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4905,6 +4927,7 @@ dependencies = [
 name = "connector-sftp"
 version = "2.2.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "paste",
  "runtime",
@@ -4926,6 +4949,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "document_parse",
@@ -4955,6 +4979,7 @@ dependencies = [
 name = "connector-smb"
 version = "2.2.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "paste",
  "runtime",
@@ -4970,6 +4995,7 @@ name = "connector-snowflake"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "datafusion-table-providers",
@@ -4990,6 +5016,7 @@ name = "connector-spark"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "data_components",
  "datafusion",
  "linkme",
@@ -5004,6 +5031,7 @@ dependencies = [
 name = "connector-spiceai"
 version = "2.2.0-unstable"
 dependencies = [
+ "data-connector-api",
  "linkme",
  "runtime",
 ]
@@ -6069,14 +6097,55 @@ dependencies = [
 name = "data-connector-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
  "async-trait",
+ "aws-config",
+ "aws-sdk-credential-bridge",
+ "chrono",
+ "data-connector-types",
+ "data-http-rate-control",
  "data_components",
+ "dataformat-json",
  "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-table-providers",
+ "document_parse",
+ "futures",
  "globset",
+ "itertools 0.14.0",
+ "linkme",
+ "object_store 0.13.2",
+ "paste",
+ "reqwest 0.13.4",
+ "runtime-checkpoint-api",
  "runtime-component",
+ "runtime-datafusion",
+ "runtime-metrics",
+ "runtime-object-store",
+ "runtime-parameters",
  "serde_json",
  "snafu",
+ "tempfile",
+ "token_provider",
  "tokio",
+ "tonic",
+ "tracing",
+ "url",
+ "util",
+ "vortex-datafusion",
+]
+
+[[package]]
+name = "data-connector-types"
+version = "2.2.0-unstable"
+dependencies = [
+ "globset",
+ "runtime-component",
+ "snafu",
 ]
 
 [[package]]
@@ -6089,7 +6158,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 name = "data-http-rate-control"
 version = "2.2.0-unstable"
 dependencies = [
- "data-connector-api",
+ "data-connector-types",
  "data_components",
  "fundu",
  "governor",
@@ -19533,6 +19602,7 @@ name = "spice-cloud"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-connector-api",
  "datafusion",
  "reqwest 0.13.4",
  "runtime",
@@ -19753,6 +19823,7 @@ dependencies = [
  "connector-snowflake",
  "connector-spark",
  "connector-spiceai",
+ "data-connector-api",
  "regex",
  "runtime",
  "runtime-parameters",
