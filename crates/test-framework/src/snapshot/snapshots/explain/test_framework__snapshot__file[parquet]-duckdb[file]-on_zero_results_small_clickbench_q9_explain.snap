@@ -14,16 +14,16 @@ description: "Query: clickbench_q9"
 |               |   CoalescePartitionsExec                                                                                    |
 |               |     ProjectionExec: expr=[RegionID@0 as RegionID, count(alias1)@1 as u]                                     |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]              |
-|               |         RepartitionExec: partitioning=Hash([RegionID@0], 16), input_partitions=16                           |
+|               |         RepartitionExec: partitioning=Hash([RegionID@0], 32), input_partitions=32                           |
 |               |           AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID], aggr=[count(alias1)]                   |
 |               |             AggregateExec: mode=FinalPartitioned, gby=[RegionID@0 as RegionID, alias1@1 as alias1], aggr=[] |
-|               |               RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 16), input_partitions=16           |
+|               |               RepartitionExec: partitioning=Hash([RegionID@0, alias1@1], 32), input_partitions=32           |
 |               |                 AggregateExec: mode=Partial, gby=[RegionID@0 as RegionID, UserID@1 as alias1], aggr=[]      |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                     |
+|               |                   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                     |
 |               |                     SchemaCastScanExec                                                                      |
 |               |                       FallbackOnZeroResultsScanExec                                                         |
 |               |                         CoalescePartitionsExec                                                              |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1             |
+|               |                           RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1             |
 |               |                             BytesProcessedExec                                                              |
 |               |                               DuckSqlExec sql= SELECT "RegionID", "UserID" FROM "hits"                      |
 |               |                                                                                                             |
