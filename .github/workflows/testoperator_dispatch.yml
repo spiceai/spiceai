@@ -163,12 +163,16 @@ jobs:
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
           shopt -s globstar nullglob
+          failed=0
           for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
             case "$file" in
               *dynamodb-arrow.yaml|*dynamodb-duckdb\[file\].yaml|*federated/dynamodb.yaml) continue ;;
             esac
-            testoperator dispatch "$file" --workflow bench
+            if ! testoperator dispatch "$file" --workflow bench; then
+              failed=1
+            fi
           done
+          exit "$failed"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
