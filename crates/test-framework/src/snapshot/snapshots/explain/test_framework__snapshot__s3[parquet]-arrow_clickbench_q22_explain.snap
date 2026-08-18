@@ -14,11 +14,11 @@ description: "Query: clickbench_q22"
 |               |   SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]                                               |
 |               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, min(hits.URL)@1 as min(hits.URL), count(Int64(1))@2 as c]     |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))] |
-|               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                   |
+|               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 32), input_partitions=32                                   |
 |               |           AggregateExec: mode=Partial, gby=[SearchPhrase@1 as SearchPhrase], aggr=[min(hits.URL), count(Int64(1))]      |
 |               |             FilterExec: URL@0 LIKE %google% AND SearchPhrase@1 !=                                                       |
 |               |               SchemaCastScanExec                                                                                        |
 |               |                 BytesProcessedExec                                                                                      |
-|               |                   DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                           |
+|               |                   DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                           |
 |               |                                                                                                                         |
 +---------------+-------------------------------------------------------------------------------------------------------------------------+

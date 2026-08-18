@@ -16,6 +16,6 @@ description: "Query: clickbench_q27"
 |               |       FilterExec: SearchPhrase@1 != , projection=[SearchPhrase@1, EventTime@0]                                                             |
 |               |         SchemaCastScanExec                                                                                                                 |
 |               |           BytesProcessedExec                                                                                                               |
-|               |             DataSourceExec: partitions=16, partition_sizes=[<redacted>]                                                                    |
+|               |             DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                                                    |
 |               |                                                                                                                                            |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------+
