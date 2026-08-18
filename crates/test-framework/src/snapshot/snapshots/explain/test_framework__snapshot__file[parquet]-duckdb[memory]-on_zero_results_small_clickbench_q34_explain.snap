@@ -13,13 +13,13 @@ description: "Query: clickbench_q34"
 |               |   CoalescePartitionsExec                                                                  |
 |               |     ProjectionExec: expr=[URL@0 as URL, count(Int64(1))@1 as c]                           |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[URL@0 as URL], aggr=[count(Int64(1))]    |
-|               |         RepartitionExec: partitioning=Hash([URL@0], 16), input_partitions=16              |
+|               |         RepartitionExec: partitioning=Hash([URL@0], 32), input_partitions=32              |
 |               |           AggregateExec: mode=Partial, gby=[URL@0 as URL], aggr=[count(Int64(1))]         |
-|               |             RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1         |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1         |
 |               |               SchemaCastScanExec                                                          |
 |               |                 FallbackOnZeroResultsScanExec                                             |
 |               |                   CoalescePartitionsExec                                                  |
-|               |                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
+|               |                     RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1 |
 |               |                       BytesProcessedExec                                                  |
 |               |                         DuckSqlExec sql= SELECT "URL" FROM "hits"                         |
 |               |                                                                                           |
