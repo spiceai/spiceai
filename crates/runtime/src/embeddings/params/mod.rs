@@ -177,26 +177,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn google_params_allow_missing_api_key_for_vertex_ai() {
-        // `api_key` is optional at the parse level so Vertex AI mode (which authenticates via
-        // a service account instead) can omit it. The "one of `google_api_key` or a Vertex AI
-        // auth method is required" check happens in `llms::google::auth::build_client`, not here
-        // — see its `missing_api_key_is_reported` / `vertex_requires_project_and_location` tests.
+    async fn google_params_allow_missing_project_at_parse_time() {
+        // `project`/`location`/auth-method fields are all optional at the parse level; the
+        // "required" checks happen in `llms::google::auth::build_client`, not here — see its
+        // `vertex_requires_project_and_location` / `vertex_requires_exactly_one_auth_method`
+        // tests.
         let typed = google::GoogleEmbeddingParams::try_from_params(
             "embedding test",
             params(&[]),
             &empty_secrets(),
         )
         .await
-        .expect("google params should parse without api_key");
-        assert!(typed.api_key.is_none());
+        .expect("google params should parse with nothing set");
+        assert!(typed.project.is_none());
     }
 
     #[tokio::test]
     async fn google_params_accept_runtime_dimensions() {
         let typed = google::GoogleEmbeddingParams::try_from_params(
             "embedding test",
-            params(&[("google_api_key", "key"), ("dimensions", "768")]),
+            params(&[("dimensions", "768")]),
             &empty_secrets(),
         )
         .await

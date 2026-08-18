@@ -339,8 +339,6 @@ async fn google(
     };
 
     let client = llms::google::auth::build_client(
-        params.api.unwrap_or_default(),
-        params.api_key.as_ref(),
         llms::google::auth::VertexAuthParams {
             project: params.project.as_deref(),
             location: params.location.as_deref(),
