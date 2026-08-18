@@ -28,6 +28,9 @@ limitations under the License.
 //!     that a reconnect is likely to fix.
 //!   * `Backoff` is an exponential-backoff helper with ±20% jitter, capped at
 //!     a configurable max delay. Reset on every successful use.
+//!   * `is_slot_unusable` picks out the failures that are neither: a slot the
+//!     server will never stream from again, recovered by replacing the slot
+//!     rather than by retrying or by ending the dataset.
 //!   * `retry_async` runs an async closure with `Backoff`, classifying errors
 //!     via a caller-supplied predicate.
 
@@ -121,9 +124,20 @@ fn jitter(d: Duration) -> Duration {
 /// We look at the *error path* rather than specific variants, since
 /// pgwire-replication may add variants over time. The heuristic: anything
 /// that looks like an IO / connection / EOF error is transient; authentication,
-/// protocol, slot-not-found, or decoding errors are fatal.
+/// protocol, and decoding errors are not. A slot that can no longer supply changes
+/// is neither — see [`is_slot_unusable`], which this defers to first.
 #[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
+    // A slot that can no longer supply changes refuses every attempt identically,
+    // so it is never worth retrying — and it has to be excluded here rather than
+    // just ordered around at each call site, because its message trips the generic
+    // markers below: `PostgreSQL` 18's idle-invalidation detail names
+    // `idle_replication_slot_timeout`, and "timeout" is a transient marker. Left in,
+    // that reads as a network blip and reconnects against a slot that will never
+    // accept another `START_REPLICATION`, forever.
+    if is_slot_unusable(err) {
+        return false;
+    }
     is_transient_by_display(&err.to_string())
 }
 
@@ -145,6 +159,46 @@ pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
         return false;
     }
     is_transient_by_display(&err.to_string())
+}
+
+/// `PostgreSQL`'s message when `START_REPLICATION` names a slot the server has
+/// invalidated, whatever invalidated it (exhausted `max_slot_wal_keep_size`, or
+/// the `PostgreSQL` 18 idle timeout).
+///
+/// Matched on the message rather than its SQLSTATE. 55000
+/// (`object_not_in_prerequisite_state`) is overloaded — slot *creation* returns
+/// the same code when `wal_level` is not `logical`, which is a configuration
+/// error and must not be answered by replacing a slot. The message is the part
+/// that identifies the situation, and it has been stable since the invalidation
+/// machinery was introduced.
+const SLOT_NO_LONGER_STREAMABLE: &str = "can no longer get changes from replication slot";
+/// `PostgreSQL`'s message when the slot is simply gone — an operator ran
+/// `pg_drop_replication_slot`, or a failover left the replica without it.
+///
+/// Both halves are required. `does not exist` on its own also describes a missing
+/// *publication*, which needs its own fix and must never be answered by dropping
+/// and recreating a slot.
+const SLOT_DOES_NOT_EXIST: (&str, &str) = ("replication slot", "does not exist");
+
+/// Whether the named slot can no longer supply changes and has to be replaced.
+///
+/// A third classification, distinct from both others: reconnecting cannot help
+/// (every attempt hits the same refusal), but this is not the dataset's end
+/// either — the slot can be replaced and the accelerations on it rebuilt from the
+/// source. See `shared::recover_unusable_slot`.
+///
+/// Covers the two ways a slot stops being usable while Spice is running, because
+/// they have one remedy between them: the server invalidated it (its WAL is gone),
+/// or it is no longer there at all. What distinguishes them is only what to tell
+/// the operator afterwards, which the replacement path logs from the catalog.
+#[must_use]
+pub fn is_slot_unusable(err: &pgwire_replication::PgWireError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains(SLOT_NO_LONGER_STREAMABLE) {
+        return true;
+    }
+    let (subject, state) = SLOT_DOES_NOT_EXIST;
+    msg.contains(subject) && msg.contains(state)
 }
 
 /// Shared string-heuristic fallback used by both classifiers.
@@ -182,6 +236,18 @@ fn is_transient_by_display(msg: &str) -> bool {
         "sqlstate 53300",
         "max_wal_senders",
         "too many connections",
+        // SQLSTATE 57P01 (admin_shutdown): "terminating connection due to
+        // administrator command". An orderly server restart raises it, and so
+        // does `PostgreSQL` killing the walsender that holds a slot it is
+        // invalidating ("terminating process N to release replication slot").
+        // Reconnecting is right in both cases: a restarted server resumes the
+        // stream, and a released slot surfaces its invalidation on the next
+        // `START_REPLICATION`, where `is_slot_unusable` can act on it. The
+        // tokio-postgres classifier already treats 57P01 as transient by code;
+        // this is the same judgement for the replication client, which only
+        // exposes the rendered message.
+        "sqlstate 57p01",
+        "terminating connection due to administrator command",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
@@ -257,6 +323,91 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_dropped_slot_is_replaceable_but_a_missing_publication_is_not() {
+        // An operator running `pg_drop_replication_slot` is the same situation as
+        // an invalidation and has the same remedy.
+        assert!(is_slot_unusable(&pgwire_replication::PgWireError::Server(
+            "replication slot \"spice_x\" does not exist (SQLSTATE 42704)".to_string()
+        )));
+        // A missing publication shares the "does not exist" wording and must not
+        // be answered by dropping and recreating the operator's slot.
+        assert!(!is_slot_unusable(&pgwire_replication::PgWireError::Server(
+            "publication \"spice_pub\" does not exist (SQLSTATE 42704)".to_string()
+        )));
+        // Neither is worth a retry: both refuse every attempt identically.
+        assert!(!is_transient_pgwire(
+            &pgwire_replication::PgWireError::Server(
+                "replication slot \"spice_x\" does not exist (SQLSTATE 42704)".to_string()
+            )
+        ));
+    }
+
+    #[test]
+    fn an_invalidated_slot_is_recognised_but_is_not_transient() {
+        // Every invalidation cause reaches the client as the same message, which
+        // is what this keys on; the detail line is what differs.
+        for detail in [
+            "This slot has been invalidated because it exceeded the maximum reserved size.",
+            "This slot has been invalidated because it was inactive for longer than the amount of time specified by \"idle_replication_slot_timeout\".",
+        ] {
+            let err = pgwire_replication::PgWireError::Server(format!(
+                "can no longer get changes from replication slot \"spice_x\" (SQLSTATE 55000) — {detail}"
+            ));
+            assert!(is_slot_unusable(&err), "must be recognised: {detail}");
+            assert!(
+                !is_transient_pgwire(&err),
+                "an invalidated slot must never be retried against: {detail}"
+            );
+        }
+    }
+
+    /// The invalidation detail `PostgreSQL` 18 attaches names
+    /// `idle_replication_slot_timeout`, and "timeout" is one of the transient
+    /// markers. The classifier has to exclude an unusable slot explicitly for that
+    /// reason; without it this message reads as a network blip and the stream
+    /// reconnects against a slot that will never accept it again.
+    #[test]
+    fn an_idle_invalidation_is_not_mistaken_for_a_timeout() {
+        let err = pgwire_replication::PgWireError::Server(
+            "can no longer get changes from replication slot \"spice_x\" (SQLSTATE 55000) — This slot has been invalidated because it was inactive for longer than the amount of time specified by \"idle_replication_slot_timeout\"."
+                .to_string(),
+        );
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("timeout"),
+            "the premise of this test: the message contains a transient marker"
+        );
+        assert!(!is_transient_pgwire(&err));
+    }
+
+    #[test]
+    fn wal_level_misconfiguration_shares_the_sqlstate_but_is_not_an_invalidation() {
+        // Slot creation returns 55000 when `wal_level` is not `logical`. Keying
+        // recovery on the code alone would answer a configuration error by
+        // dropping and recreating the operator's slot.
+        let err = pgwire_replication::PgWireError::Server(
+            "logical decoding requires wal_level >= logical (SQLSTATE 55000)".to_string(),
+        );
+        assert!(!is_slot_unusable(&err));
+    }
+
+    #[test]
+    fn a_walsender_killed_to_release_a_slot_reconnects() {
+        // PostgreSQL SIGTERMs the walsender holding a slot it is invalidating, so
+        // the invalidation is first seen as an admin shutdown on the *recv* path.
+        // Classifying that as fatal would end the stream before the reconnect
+        // could observe the invalidation and recover from it.
+        for msg in [
+            "server error: terminating connection due to administrator command (SQLSTATE 57P01)",
+            "server error: terminating connection due to administrator command",
+        ] {
+            assert!(
+                is_transient_pgwire(&pgwire_replication::PgWireError::Server(msg.to_string())),
+                "must reconnect: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

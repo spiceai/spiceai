@@ -1261,6 +1261,178 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
     Ok(())
 }
 
+/// Take the slot away from a *running* stream, the way an operator does.
+///
+/// The pump reconnects on its own, so the drop has to win a race against it: a
+/// slot an active walsender holds cannot be dropped (SQLSTATE 55006), and the
+/// walsender comes back after each eviction. Evict, try to drop, repeat until the
+/// drop lands — polling the actual condition rather than sleeping in the hope the
+/// pump is between attempts.
+async fn drop_slot_underneath_a_running_stream(
+    source: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_error = None;
+    while std::time::Instant::now() < deadline {
+        source
+            .execute(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND active_pid IS NOT NULL",
+                &[&slot],
+            )
+            .await?;
+        match source
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // Already gone, which is the state this is trying to reach.
+            Err(error) if error.code() == Some(&SqlState::UNDEFINED_OBJECT) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(anyhow::anyhow!(
+        "could not take slot {slot} away from the running stream. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+/// A replication slot lost while Spice is *running* must be recovered without a
+/// restart.
+///
+/// Recovery for a slot that is missing or invalidated at *startup* already
+/// existed, but it was only reachable through setup. Mid-stream,
+/// `START_REPLICATION` fails permanently, that error was classified fatal, and the
+/// stream stopped — the runtime stays healthy, so nothing necessarily restarts it,
+/// and the dataset was down until an operator noticed.
+///
+/// The source deletes a row while the slot is gone, so the recovery is exercised
+/// against the case that makes it a correctness fix and not only an availability
+/// one: that deletion has no change event left to replay, and an acceleration that
+/// merely resumed would keep the deleted row in every later query.
+///
+/// What this suite asserts is that the *request* to rebuild reaches the consumer,
+/// once, on a stream that was never restarted — there is no accelerator here to
+/// converge. The rebuild's own correctness (a streaming `InsertOp::Overwrite`
+/// rather than an upsert over survivors) is the same path a startup rebuild takes
+/// and is covered where that path is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slot_lost_live", &[(1, "alice"), (2, "bob")]).await?;
+
+    // A durable acceleration observed to be empty, so the first load is an ordinary
+    // snapshot bootstrap and any later rebuild is unambiguously this recovery.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut stream = start_replication_stream(input_with_contents(
+        port,
+        "slot_lost_live",
+        &store,
+        AccelerationContents::Empty,
+    ));
+
+    let bootstrap = next_envelope(&mut stream, "the initial snapshot").await?;
+    anyhow::ensure!(
+        !bootstrap.history_unavailable(),
+        "the first load must be a snapshot bootstrap, so a rebuild later in this test can only \
+         be the slot recovery"
+    );
+    assert_eq!(ids_of(&bootstrap), vec![1, 2], "the snapshot's rows");
+    bootstrap.commit().await?;
+
+    // Stream one live change, so a position is recorded and the acceleration has a
+    // watermark for the lost slot to become unreachable from.
+    source
+        .execute("INSERT INTO public.slot_lost_live VALUES (3, 'carol')", &[])
+        .await?;
+    expect_single_change(&mut stream, "the pre-loss insert", "Insert", 3).await?;
+    // The recorded position is what the replacement slot will be unable to reach,
+    // so the loss has to happen after one exists. Written by a background task
+    // after the commit above proved durable, so poll for it rather than assuming
+    // the commit was enough.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while store.recorded_lsn().is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "no position was ever recorded, so there is no watermark for the replacement slot to \
+             be unable to reach and this test would pass for the wrong reason"
+        );
+        let envelope = next_envelope(&mut stream, "an envelope carrying a position").await?;
+        envelope.commit().await?;
+    }
+
+    // --- Lose the slot, and delete a row while it is gone. ---
+    drop_slot_underneath_a_running_stream(&source, SLOT).await?;
+    source
+        .execute("DELETE FROM public.slot_lost_live WHERE id = 1", &[])
+        .await?;
+
+    // The same stream — never restarted — must be asked to rebuild.
+    let mut rebuild_requests = 0;
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    while rebuild_requests == 0 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the stream never recovered from losing its replication slot. Losing the slot must not \
+             end the dataset: the slot can be replaced and the acceleration rebuilt from the \
+             source, without a restart"
+        );
+        let envelope = next_envelope(&mut stream, "the rebuild request").await?;
+        if envelope.history_unavailable() {
+            rebuild_requests += 1;
+            anyhow::ensure!(
+                num_rows(&envelope) == 0,
+                "the rebuild request is a signal, not data: the consumer replaces the \
+                 acceleration's contents itself, so carrying rows here would append to what it is \
+                 about to replace. Carried {} row(s)",
+                num_rows(&envelope)
+            );
+        }
+        envelope.commit().await?;
+    }
+
+    // A replacement slot exists, and exactly one: recovery must not leave the dead
+    // slot behind, nor accumulate a slot per attempt.
+    assert_eq!(
+        slot_count(&source).await?,
+        1,
+        "recovery must leave exactly one slot behind"
+    );
+
+    // Streaming continues on the replacement, which is the half that used to need a
+    // restart. This also proves the rebuild was requested *once*: a second request
+    // would arrive ahead of this insert, and the assertion below reads the next
+    // change envelope rather than skipping to one that matches.
+    source
+        .execute("INSERT INTO public.slot_lost_live VALUES (4, 'dave')", &[])
+        .await?;
+    let resumed = next_change_envelope(&mut stream, "an insert after the recovery").await?;
+    anyhow::ensure!(
+        !resumed.history_unavailable(),
+        "the acceleration must be asked to rebuild once per lost slot, not once per reconnect \
+         attempt — a rebuild loop re-reads the whole source table on a cycle"
+    );
+    assert_eq!(ops_of(&resumed), vec!["Insert".to_string()]);
+    assert_eq!(ids_of(&resumed), vec![4]);
+    resumed.commit().await?;
+
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
 /// A durable acceleration holding no rows must load through the ordinary snapshot
 /// bootstrap, not a rebuild.
 ///
