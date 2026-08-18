@@ -555,6 +555,17 @@ struct AckSlot {
     /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
     /// used), so it adds no false sharing.
     recorded: AtomicU64,
+    /// Whether a mid-stream rebuild request is outstanding for this member.
+    ///
+    /// [`SNAPSHOTTING`] is the *hold*, and two independent things take it: a
+    /// member's initial snapshot, and a rebuild requested after the slot was
+    /// replaced. One bit cannot say who holds it, so the snapshot's completion hook
+    /// would release a hold the rebuild still needs — and a member released early
+    /// is credited to the WAL head by [`AckTable::credit_idle`] and then *recorded*
+    /// there by [`publish_idle_positions`], for contents its rebuild has not
+    /// delivered. This distinguishes the two: while it is set, only the rebuild's
+    /// own completion may release the hold.
+    rebuild_pending: AtomicBool,
     /// Highest position *proven durable and eligible to record*, published by
     /// whichever producer established it — an envelope commit, a snapshot/rebuild
     /// boundary, or the idle carry-forward sweep — and drained by the single
@@ -577,6 +588,7 @@ impl AckSlot {
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -591,6 +603,7 @@ impl AckSlot {
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -725,6 +738,39 @@ impl AckTable {
     /// that reconnect.
     fn snapshot_finished(&self, key: &MemberKey) {
         if let Some(slot) = write_lock(&self.members).get(key) {
+            // A rebuild requested after the slot was replaced holds the same bit,
+            // and its contents are not in the acceleration until *it* commits. A
+            // member whose initial snapshot finishes in that window must stay held:
+            // releasing here would let the next connect promote it, `credit_idle`
+            // carry its floor to the WAL head, and `publish_idle_positions` record
+            // a position for rows the rebuild has not delivered. See
+            // [`AckSlot::rebuild_pending`].
+            if slot.rebuild_pending.load(Ordering::Acquire) {
+                return;
+            }
+            slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
+        }
+    }
+
+    /// Take the rebuild's hold on `key`, so only [`Self::rebuild_finished`] can
+    /// release it. Idempotent, and safe on a member that is already holding for its
+    /// initial snapshot — that snapshot's completion then becomes a no-op.
+    fn mark_rebuild_pending(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(true, Ordering::Release);
+        }
+    }
+
+    /// Release the hold taken by [`Self::mark_rebuild_pending`], once the consumer
+    /// has committed the rebuild and its contents are durable.
+    ///
+    /// Clears the marker *before* the hold, so a concurrent `snapshot_finished`
+    /// either sees the marker and defers (this call then does the release) or sees
+    /// it clear and releases a hold this call has already given up. Neither order
+    /// leaves the member held with nothing left to release it.
+    fn rebuild_finished(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(false, Ordering::Release);
             slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
         }
     }
@@ -1068,7 +1114,7 @@ impl CommitChange for SnapshotWatermarkCommitter {
         // After the position is published, so a member that becomes routable cannot
         // be credited before the position covering its rebuild exists.
         if let Some((source, member_key)) = &self.live_flip {
-            source.ack.snapshot_finished(member_key);
+            source.ack.rebuild_finished(member_key);
             source.restart_requested.store(true, Ordering::Release);
         }
         crate::cdc::log_committer_progress(
@@ -2633,12 +2679,15 @@ async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn
         // envelope does not count as in flight — so a member left streaming would be
         // credited, and then recorded, past contents its rebuild had not delivered.
         source.ack.register(&member_key, true);
+        // Claim the hold as the rebuild's, so the member's own initial-snapshot
+        // completion cannot release it out from under the rebuild.
+        source.ack.mark_rebuild_pending(&member_key);
         let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
         if member.sender.send_control(envelope).await.is_some() {
             // The consumer is gone, so there is no acceleration left to rebuild.
             // Detaching freezes its floor, which the caller's `reseat_held_floors`
             // then moves to the replacement — it has no history left to be owed.
-            source.ack.snapshot_finished(&member_key);
+            source.ack.rebuild_finished(&member_key);
             source.detach_member(
                 &member_key,
                 "receiver gone while replacing an unusable replication slot",
@@ -4268,6 +4317,61 @@ mod tests {
             generated_columns: vec![],
             publication_tables: tables.iter().map(|t| key(t)).collect(),
         }
+    }
+
+    /// A member can be mid-initial-snapshot when the slot is replaced, and then two
+    /// independent things hold it: its snapshot, and its rebuild. They share one
+    /// [`SNAPSHOTTING`] bit, so whichever finishes first would release the other's
+    /// hold — and a member released before its rebuild commits is credited to the
+    /// WAL head by `credit_idle` and then recorded there by
+    /// `publish_idle_positions`, for rows the rebuild has not delivered.
+    #[test]
+    fn a_snapshot_finishing_does_not_release_a_pending_rebuilds_hold() {
+        let ack = AckTable::default();
+        let member = key("orders");
+
+        // The member joins and starts its initial snapshot: held.
+        ack.register(&member, true);
+        assert!(!ack.is_streaming(&member));
+
+        // The slot is replaced mid-snapshot, so the member is also asked to rebuild.
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        // Its snapshot completes. That must NOT release the hold, because the
+        // rebuild's contents are not in the acceleration yet.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            !ack.is_streaming(&member),
+            "the snapshot's completion released the rebuild's hold: the member is routable and \
+             creditable while the rows its rebuild will deliver are still in its mailbox"
+        );
+
+        // Only the rebuild's own commit releases it.
+        ack.rebuild_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            ack.is_streaming(&member),
+            "a committed rebuild must release the hold, or the member never streams again"
+        );
+    }
+
+    /// The reverse order has to work too: nothing may leave a member held with no
+    /// remaining path to release it.
+    #[test]
+    fn a_rebuild_finishing_first_still_lets_the_member_stream() {
+        let ack = AckTable::default();
+        let member = key("orders");
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        ack.rebuild_finished(&member);
+        // A late snapshot hook now finds no rebuild pending and releases a hold that
+        // is already given up — a no-op, not a re-hold.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(ack.is_streaming(&member));
     }
 
     /// Every replacement costs a full re-read of every table on the slot, so the
