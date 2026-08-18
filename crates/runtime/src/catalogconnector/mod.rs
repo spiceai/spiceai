@@ -438,6 +438,7 @@ pub async fn get_catalog_provider(
     }
 
     let provider = RefreshingCatalogProvider::new(
+        catalog.name.clone(),
         Arc::clone(&connector)
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
