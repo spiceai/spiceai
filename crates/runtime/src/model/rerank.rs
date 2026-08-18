@@ -19,6 +19,8 @@ limitations under the License.
 //! into a runtime [`llms::rerank::Rerank`] instance. Mirrors
 //! [`crate::model::embed::try_to_embedding`] but targets the reranker trait.
 
+#[cfg(feature = "models")]
+use llms::rerank::TeiRerank;
 use llms::rerank::{CohereReranker, HttpReranker, JinaReranker, Rerank, VoyageReranker};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::{ExposeSecret, SecretString};
@@ -53,6 +55,18 @@ pub enum Error {
         name: String,
         source: llms::rerank::Error,
     },
+
+    #[snafu(display("Reranker '{name}' has an invalid `params.{param_key}`: {reason}"))]
+    InvalidParam {
+        name: String,
+        param_key: String,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "Reranker '{name}' uses a local model source (`{from}`), but this build was compiled without the `models` feature. Rebuild with `models` enabled or use a remote reranker (cohere:, voyage:, jina:, http://)."
+    ))]
+    LocalRerankerNotEnabled { name: String, from: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -158,9 +172,96 @@ pub async fn try_to_rerank_model(
             }
             Arc::new(h)
         }
+        #[cfg(feature = "models")]
+        RerankerPrefix::HuggingFace => {
+            // `get_model_id` joins any pinned revision onto the repo id as
+            // `org/model:revision`; recover the two halves before the repo id
+            // reaches the Hub (same convention as embeddings/models).
+            let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&model_id);
+            let hf_token = extract_secret(&params, "hf_token");
+            let max_seq_length = parse_max_seq_length(&component.name, &params)?;
+            let truncation = parse_truncation(&component.name, &params)?;
+            let r = TeiRerank::from_hf(
+                component.name.clone(),
+                repo_id,
+                revision,
+                hf_token.as_deref(),
+                max_seq_length,
+                truncation,
+            )
+            .await
+            .context(BuildFailedSnafu {
+                name: component.name.clone(),
+            })?;
+            Arc::new(r)
+        }
+        #[cfg(feature = "models")]
+        RerankerPrefix::File => {
+            let max_seq_length = parse_max_seq_length(&component.name, &params)?;
+            let truncation = parse_truncation(&component.name, &params)?;
+            let r = TeiRerank::from_dir(
+                component.name.clone(),
+                std::path::Path::new(&model_id),
+                max_seq_length,
+                truncation,
+            )
+            .await
+            .context(BuildFailedSnafu {
+                name: component.name.clone(),
+            })?;
+            Arc::new(r)
+        }
+        #[cfg(not(feature = "models"))]
+        RerankerPrefix::HuggingFace | RerankerPrefix::File => {
+            return Err(Error::LocalRerankerNotEnabled {
+                name: component.name.clone(),
+                from: component.from.clone(),
+            });
+        }
     };
 
     Ok(reranker)
+}
+
+/// Parse the optional `max_seq_length` param (inputs longer than the model's
+/// max are otherwise handled per `truncate`).
+#[cfg(feature = "models")]
+fn parse_max_seq_length(
+    name: &str,
+    params: &HashMap<String, SecretString>,
+) -> Result<Option<usize>> {
+    extract_secret(params, "max_seq_length")
+        .map(|s| {
+            s.parse::<usize>().map_err(|e| Error::InvalidParam {
+                name: name.to_string(),
+                param_key: "max_seq_length".to_string(),
+                reason: format!("expected a non-negative integer, got '{s}': {e}"),
+            })
+        })
+        .transpose()
+}
+
+/// Parse the optional `truncate` param controlling how over-long `(query,
+/// document)` pairs are handled: `none` (reject — default), `end` (keep the
+/// start), or `start` (keep the end).
+#[cfg(feature = "models")]
+fn parse_truncation(
+    name: &str,
+    params: &HashMap<String, SecretString>,
+) -> Result<Option<tokenizers::TruncationDirection>> {
+    match extract_secret(params, "truncate") {
+        None => Ok(None),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "none" => Ok(None),
+            "end" => Ok(Some(tokenizers::TruncationDirection::Right)),
+            "start" => Ok(Some(tokenizers::TruncationDirection::Left)),
+            other => Err(Error::InvalidParam {
+                name: name.to_string(),
+                param_key: "truncate".to_string(),
+                reason: format!("must be one of: none, end, start. Found '{other}'"),
+            }),
+        },
+    }
 }
 
 fn extract_secret(params: &HashMap<String, SecretString>, key: &str) -> Option<String> {
