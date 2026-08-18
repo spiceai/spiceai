@@ -17,6 +17,6 @@ description: "Query: clickbench_q25"
 |               |         SchemaCastScanExec                                                                                                                                                              |
 |               |           CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                                                                                             |
 |               |             BytesProcessedExec                                                                                                                                                          |
-|               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[EventTime, SearchPhrase], file_type=vortex, predicate: SearchPhrase@39 !=  AND DynamicFilter [ empty ] |
+|               |               DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[EventTime, SearchPhrase], file_type=vortex, predicate: SearchPhrase@39 !=  AND DynamicFilter [ empty ] |
 |               |                                                                                                                                                                                         |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

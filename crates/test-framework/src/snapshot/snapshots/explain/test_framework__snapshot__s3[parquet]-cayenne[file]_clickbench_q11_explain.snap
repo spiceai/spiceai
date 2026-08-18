@@ -15,14 +15,14 @@ description: "Query: clickbench_q11"
 |               |   SortExec: TopK(fetch=10), expr=[u@1 DESC], preserve_partitioning=[true]                                                                                                  |
 |               |     ProjectionExec: expr=[MobilePhoneModel@0 as MobilePhoneModel, count(alias1)@1 as u]                                                                                    |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[MobilePhoneModel@0 as MobilePhoneModel], aggr=[count(alias1)]                                                             |
-|               |         RepartitionExec: partitioning=Hash([MobilePhoneModel@0], 16), input_partitions=16                                                                                  |
+|               |         RepartitionExec: partitioning=Hash([MobilePhoneModel@0], 32), input_partitions=32                                                                                  |
 |               |           AggregateExec: mode=Partial, gby=[MobilePhoneModel@0 as MobilePhoneModel], aggr=[count(alias1)]                                                                  |
 |               |             AggregateExec: mode=FinalPartitioned, gby=[MobilePhoneModel@0 as MobilePhoneModel, alias1@1 as alias1], aggr=[]                                                |
-|               |               RepartitionExec: partitioning=Hash([MobilePhoneModel@0, alias1@1], 16), input_partitions=16                                                                  |
+|               |               RepartitionExec: partitioning=Hash([MobilePhoneModel@0, alias1@1], 32), input_partitions=32                                                                  |
 |               |                 AggregateExec: mode=Partial, gby=[MobilePhoneModel@1 as MobilePhoneModel, UserID@0 as alias1], aggr=[]                                                     |
 |               |                   SchemaCastScanExec                                                                                                                                       |
 |               |                     CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                                                                      |
 |               |                       BytesProcessedExec                                                                                                                                   |
-|               |                         DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[UserID, MobilePhoneModel], file_type=vortex, predicate: MobilePhoneModel@34 !=  |
+|               |                         DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[UserID, MobilePhoneModel], file_type=vortex, predicate: MobilePhoneModel@34 !=  |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
