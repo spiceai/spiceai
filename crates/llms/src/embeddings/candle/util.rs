@@ -71,6 +71,47 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Runs the synchronous tokenization load — reading `config.json`, the
+/// sentence-transformers config, and parsing `tokenizer.json` — on a blocking
+/// thread. For a large tokenizer the parse alone can exceed the runtime's
+/// per-task latency budget, so keeping it off the Tokio worker thread prevents
+/// it from stalling other tasks (and `/health`) during model registration.
+///
+/// Returns the parsed tokenizer, the model config, and the resolved
+/// `max_input_length`. `position_offset` is a pure function of the config and is
+/// recomputed cheaply by the caller on the async side.
+pub(crate) async fn load_tokenization(
+    model_root: &Path,
+    max_seq_length_overwrite: Option<usize>,
+) -> Result<(Tokenizer, ModelConfig, usize)> {
+    let model_root = model_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let tokenizer = load_tokenizer(&model_root)?;
+        let config = load_config(&model_root)?;
+        let position_offset = position_offset(&config);
+
+        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+            max_seq_length
+        } else {
+            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
+            match max_seq_length_from_st_config(&model_root) {
+                Ok(max_seq_length_opt) => {
+                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                    config.max_position_embeddings - position_offset
+                }
+            }
+        };
+
+        Ok((tokenizer, config, max_input_length))
+    })
+    .await
+    .boxed()
+    .context(FailedToInstantiateEmbeddingModelSnafu)?
+}
+
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
     // Position IDs offset. Used for Roberta and camembert.
     if config.model_type == "xlm-roberta"
@@ -263,6 +304,17 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
     }
 
     Ok(temp_dir)
+}
+
+/// Async wrapper around [`link_files_into_tmp_dir`] that runs the synchronous
+/// hard-linking filesystem I/O on a blocking thread, so it never stalls a Tokio
+/// worker thread (and `/health`) during model registration.
+#[expect(clippy::implicit_hasher)]
+pub async fn link_files_into_tmp_dir_blocking(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
+    tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
+        .await
+        .boxed()
+        .context(FailedToInstantiateEmbeddingModelSnafu)?
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
