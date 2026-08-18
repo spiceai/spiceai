@@ -720,6 +720,8 @@ impl CpuBudget {
                 self.dedicated_runtime_worker_threads(),
             ),
             ("target_partitions", self.target_partitions()),
+            ("scan_split_concurrency", self.scan_split_concurrency()),
+            ("vortex_parallelism", self.vortex_parallelism()),
             ("max_concurrent_queries", self.max_concurrent_queries()),
             ("cayenne_encode_permits", self.cayenne_encode_permits()),
             (
@@ -987,6 +989,38 @@ impl CpuBudget {
     /// is unset.
     #[must_use]
     pub const fn target_partitions(&self) -> usize {
+        self.cores
+    }
+
+    /// Ceiling on the splits ONE Vortex file scan decodes concurrently when the
+    /// count is derived rather than configured (`scan_concurrency: auto`).
+    ///
+    /// The derivation divides the query fan-out across the files a scan plans, so
+    /// a table held in few files concentrates the whole fan-out inside a single
+    /// file scan. That fan-out follows [`Self::target_partitions`] only while it
+    /// is unset — an explicit `runtime.query.target_partitions` above the
+    /// entitlement would otherwise carry straight into the number of decodes a
+    /// single scan runs at once. Past the entitlement those decodes cannot run in
+    /// parallel anyway; they only add resident decoded batches, which the scan
+    /// charges to the query memory pool. So the derived count stops here.
+    ///
+    /// An explicit per-table `scan_concurrency` is an operator override and is NOT
+    /// clamped, matching how every other explicitly-set knob outranks its derived
+    /// default.
+    #[must_use]
+    pub const fn scan_split_concurrency(&self) -> usize {
+        self.cores
+    }
+
+    /// The parallelism spiced declares to Vortex at startup
+    /// (`vortex_utils::parallelism::set_available_parallelism`).
+    ///
+    /// Vortex sizes its remaining concurrency defaults — encode fan-out and
+    /// per-worker scan lookahead — from that declaration; undeclared, it reads
+    /// the machine's core count instead of the entitlement. This is a default
+    /// Vortex derives fan-outs from, not an enforced ceiling.
+    #[must_use]
+    pub const fn vortex_parallelism(&self) -> usize {
         self.cores
     }
 

@@ -23,8 +23,8 @@ use std::task::Poll;
 
 use crate::file_format::{Format, SpiceJsonDecoder};
 use crate::{
-    ArrayToNdjson, JsonPointerReader, SodaReader, is_soda_response, nest_struct_schema,
-    peek_first_non_ws_byte,
+    ArrayToNdjson, JsonPointerReader, SodaReader, body_opens_a_json_array, is_soda_response,
+    nest_struct_schema,
 };
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
@@ -334,9 +334,7 @@ impl FileOpener for SpiceJsonOpener {
                         Format::Array => true,
                         Format::Jsonl | Format::Object => false,
                         Format::Soda => unreachable!("handled above"),
-                        Format::Auto | Format::Json => {
-                            peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
-                        }
+                        Format::Auto | Format::Json => body_opens_a_json_array(&mut buf_reader)?,
                     };
 
                     let stream = if is_array {
@@ -455,7 +453,7 @@ impl FileOpener for SpiceJsonOpener {
                             Format::Jsonl | Format::Object => false,
                             Format::Soda => unreachable!("handled above"),
                             Format::Auto | Format::Json => {
-                                peek_first_non_ws_byte(&mut buf_reader).is_ok_and(|b| b == b'[')
+                                body_opens_a_json_array(&mut buf_reader)?
                             }
                         };
 

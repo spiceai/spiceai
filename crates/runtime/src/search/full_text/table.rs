@@ -89,11 +89,24 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields = columns
             .iter()
             .filter_map(|c| {
-                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
-                    Some(c.name.clone())
-                } else {
-                    None
+                // Both metadata kinds are only about vector-search's own metadata filter;
+                // either one still means the column should be projectable and, per its
+                // tantivy type, filterable through the FTS index too.
+                c.as_vector_metadata()?;
+                let (_, field) = schema.column_with_name(&c.name)?;
+                if !FullTextDatabaseIndex::is_field_type_supported(field.data_type()) {
+                    // e.g. `Date32`/`Date64`/`Timestamp`: a valid `Filterable` metadata type for
+                    // other index backends (Elasticsearch), but not yet representable in the
+                    // local FTS schema. Skip it here rather than fail index construction.
+                    tracing::warn!(
+                        "Column {} on table {} has vector-search metadata but its type ({}) is not supported by the full text search index; it will not be filterable there",
+                        c.name,
+                        tbl,
+                        field.data_type()
+                    );
+                    return None;
                 }
+                Some(c.name.clone())
             })
             .collect::<Vec<_>>();
         derived_store_fields.as_slice()

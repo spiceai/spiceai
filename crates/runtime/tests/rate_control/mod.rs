@@ -25,10 +25,11 @@ limitations under the License.
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
 use app::{App, AppBuilder};
+use data_connector_api::ConnectorComponent;
+use data_http_rate_control::HttpRateControlConfig;
 use runtime::{
     Runtime,
     component::dataset::{Dataset, builder::DatasetBuilder},
-    dataconnector::{ConnectorComponent, http_rate_control::HttpRateControlConfig},
 };
 use spicepod::component::runtime::{Runtime as SpicepodRuntime, SourceRateControl};
 use url::Url;

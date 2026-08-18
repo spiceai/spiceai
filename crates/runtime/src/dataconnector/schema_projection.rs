@@ -22,6 +22,7 @@ limitations under the License.
 //! The tests stay on this side because building a `DatasetSpec` by hand is a
 //! 20-plus-field literal, while `DatasetBuilder` is right here.
 
+#[cfg(any(feature = "debezium", test))]
 pub use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
 
 #[cfg(test)]

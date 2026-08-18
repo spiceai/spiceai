@@ -82,6 +82,7 @@ rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }

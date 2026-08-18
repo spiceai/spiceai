@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::Runtime;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{
+use app::App;
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
     object_store_timeout_message,
 };
-use runtime::dataconnector::parameters::{
+use data_connector_api::parameters::{
     Validator,
     azure::{
         AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator, AzureSasTokenNormalizer,
     },
 };
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
@@ -48,7 +49,7 @@ const ABFS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/abf
 static VALIDATORS: LazyLock<
     Vec<
         Box<
-            dyn Validator<Error = runtime::dataconnector::parameters::azure::Error>
+            dyn Validator<Error = data_connector_api::parameters::azure::Error>
                 + Send
                 + Sync
                 + 'static,
@@ -97,7 +98,7 @@ pub enum Error {
 
 pub struct AzureBlobFS {
     params: Parameters,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
     tokio_io_runtime: Handle,
 }
 
@@ -213,10 +214,11 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         // Validate versioning parameter early
         if let Some(versioning) = params.parameters.get("versioning").expose().ok()
             && !matches!(versioning, "enabled" | "disabled")
@@ -235,10 +237,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 validator.validate(&mut params).await?;
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = Some(context.app());
             let azure = AzureBlobFS {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(azure) as Arc<dyn DataConnector>)
@@ -283,7 +285,7 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -291,7 +293,7 @@ impl ListingTableConnector for AzureBlobFS {
         let mut azure_url =
             Url::parse(url)
                 .boxed()
-                .context(runtime::dataconnector::InvalidConfigurationSnafu {
+                .context(data_connector_api::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -333,13 +335,13 @@ impl ListingTableConnector for AzureBlobFS {
         Ok(azure_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
@@ -422,10 +424,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     AzureBlobFSFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_abfs as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_abfs_connector,
     ABFS_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,
@@ -438,6 +440,7 @@ mod tests {
     use app::AppBuilder;
     use object_store::client::{HttpError, HttpErrorKind};
     use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime_secrets::Secrets;
     use tokio::sync::RwLock;
@@ -445,7 +448,7 @@ mod tests {
     fn create_test_connector(params: Parameters) -> AzureBlobFS {
         AzureBlobFS {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: Handle::current(),
         }
     }

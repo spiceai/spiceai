@@ -14,54 +14,52 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The runtime side of the connector-parameter contract: the concrete
+//! [`ConnectorContext`] over a component's app + runtime handles, and the
+//! builder that resolves a component's spicepod `params` into
+//! [`ConnectorParams`]. The contract itself lives in `data-connector-api`,
+//! below `runtime`, so a connector can name it without the orchestrator.
+
 use std::sync::Arc;
 
 use app::App;
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+pub(crate) use data_connector_api::parameters::{ConnectorContext, ConnectorParams, Validator};
+use data_http_rate_control::HttpRateControlRegistry;
+use datafusion::execution::context::SessionContext;
 use datafusion_table_providers::UnsupportedTypeAction;
+use runtime_checkpoint_api::{
+    BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+};
+use runtime_component::dataset::DatasetSpec;
+use token_provider::registry::TokenProviderRegistry;
 use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{
     Runtime,
     catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY,
     component::{catalog::Catalog, dataset::Dataset},
+    dataaccelerator::spice_sys,
     parameters::Parameters,
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
-use super::{
-    ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR,
-};
+use super::{ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError};
+use crate::dataconnector::ODBC_DATACONNECTOR;
 
-// `pub` (not `pub(crate)`): the AWS config helper is used by extracted AWS
-// connector crates (e.g. connector-dynamodb) as well as in-tree ones (glue).
-pub mod aws;
-pub mod azure;
-pub mod gcs;
-
-#[async_trait]
-pub trait Validator {
-    type Error;
-
-    /// Parameters may be changed while validating.
-    async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Self::Error>;
-}
-
-/// The runtime capabilities a data connector may reach for while it is being
-/// built, behind a handle so [`ConnectorParams`] does not name them directly.
-/// A connector's *configuration* travels separately, as the
-/// [`ConnectorComponent`] spec.
-pub trait ConnectorContext: Send + Sync {
-    /// The loaded app, for the runtime-level configuration a connector consults
-    /// (e.g. `runtime.params`).
-    fn app(&self) -> Arc<App>;
-
-    /// The live runtime, for connectors that register object stores or reach
-    /// runtime-wide registries during construction.
-    fn runtime(&self) -> Arc<Runtime>;
-}
+// The AWS parameter validators moved down with the contract; the runtime's own
+// in-body connectors (s3, glue, iceberg) still name them. Crate-visible so
+// nothing outside can reacquire the path through here.
+pub(crate) use data_connector_api::parameters::aws;
 
 /// [`ConnectorContext`] over the app + runtime handles a component carries.
+///
+/// Built at each call site that hands a connector a context, and dropped when
+/// that call returns. The runtime is therefore held **strongly** with no cycle
+/// risk: a connector only ever sees `&dyn ConnectorContext`, so nothing it owns
+/// can outlive the call and point back at the runtime.
 pub struct RuntimeConnectorContext {
     app: Arc<App>,
     runtime: Arc<Runtime>,
@@ -72,47 +70,96 @@ impl RuntimeConnectorContext {
     pub fn new(app: Arc<App>, runtime: Arc<Runtime>) -> Self {
         Self { app, runtime }
     }
+
+    /// The context for a connector serving `dataset`.
+    #[must_use]
+    pub fn for_dataset(dataset: &Dataset) -> Self {
+        Self::new(dataset.app(), dataset.runtime())
+    }
+
+    /// The context for a catalog connector serving `catalog`.
+    #[must_use]
+    pub fn for_catalog(catalog: &Catalog) -> Self {
+        Self::new(catalog.app(), catalog.runtime())
+    }
+
+    /// Rebind a configuration spec to the app + runtime handles held here.
+    ///
+    /// Resolving a dataset to its accelerator needs the engine registry and the secrets,
+    /// which hang off the runtime. Rebinding keeps those on this side of the connector
+    /// boundary, so the contract can name a spec while the resolution still has
+    /// everything it needs.
+    fn bind(&self, dataset: &DatasetSpec) -> Dataset {
+        Dataset {
+            spec: dataset.clone(),
+            app: Arc::clone(&self.app),
+            runtime: Arc::clone(&self.runtime),
+        }
+    }
 }
 
+#[async_trait]
 impl ConnectorContext for RuntimeConnectorContext {
     fn app(&self) -> Arc<App> {
         Arc::clone(&self.app)
     }
 
-    fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
-    }
-}
-
-#[derive(Clone)]
-pub struct ConnectorParams {
-    pub parameters: Parameters,
-    pub unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub component: ConnectorComponent,
-    /// `None` only where no runtime is attached — connector unit tests that
-    /// build params directly.
-    pub context: Option<Arc<dyn ConnectorContext>>,
-    pub io_runtime: Handle,
-}
-
-impl ConnectorParams {
-    /// The loaded app, if a runtime is attached.
-    #[must_use]
-    pub fn app(&self) -> Option<Arc<App>> {
-        self.context.as_ref().map(|ctx| ctx.app())
+    fn http_rate_control_registry(&self) -> Arc<HttpRateControlRegistry> {
+        self.runtime.http_rate_control_registry()
     }
 
-    /// The live runtime, if one is attached.
-    #[must_use]
-    pub fn runtime(&self) -> Option<Arc<Runtime>> {
-        self.context.as_ref().map(|ctx| ctx.runtime())
+    fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
+        self.runtime.token_provider_registry()
+    }
+
+    fn datafusion_session_context(&self) -> Arc<SessionContext> {
+        Arc::clone(&self.runtime.datafusion().ctx)
+    }
+
+    async fn accelerated_checkpoint_schema(&self, dataset: &DatasetSpec) -> Option<SchemaRef> {
+        super::sink::accelerated_checkpoint_schema(&self.bind(dataset)).await
+    }
+
+    async fn blob_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+        table_name: &'static str,
+    ) -> Option<Arc<dyn BlobCheckpointStore>> {
+        spice_sys::checkpoint_store(&self.bind(dataset), table_name).await
+    }
+
+    async fn kafka_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
+        spice_sys::kafka_checkpoint_store(&self.bind(dataset)).await
+    }
+
+    async fn debezium_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        spice_sys::debezium_checkpoint_store(&self.bind(dataset)).await
+    }
+
+    async fn mysql_binlog_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
+        spice_sys::mysql_binlog_store(&self.bind(dataset)).await
+    }
+
+    async fn mongo_checkpoint_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
+        spice_sys::mongo_checkpoint_store(&self.bind(dataset)).await
     }
 }
 
 pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl ConnectorParamsBuilder {
@@ -122,10 +169,6 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component: ConnectorComponent::from(dataset),
-            context: Some(Arc::new(RuntimeConnectorContext::new(
-                dataset.app(),
-                dataset.runtime(),
-            ))),
         }
     }
 
@@ -135,10 +178,6 @@ impl ConnectorParamsBuilder {
         Self {
             connector,
             component: ConnectorComponent::from(catalog),
-            context: Some(Arc::new(RuntimeConnectorContext::new(
-                catalog.app(),
-                catalog.runtime(),
-            ))),
         }
     }
 
@@ -213,7 +252,6 @@ impl ConnectorParamsBuilder {
             parameters,
             unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component,
-            context: self.context,
             io_runtime,
         })
     }

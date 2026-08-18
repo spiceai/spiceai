@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
+#![recursion_limit = "256"]
 
 use std::collections::HashMap;
 use std::env;
@@ -108,14 +109,16 @@ use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
-use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
+use runtime_cloud_connect::SessionAck;
+use runtime_secrets::ExposeSecret;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
@@ -125,8 +128,14 @@ use yaml::Value;
 const TELEMETRY_DISABLED_SETTING_IGNORED_MESSAGE: &str = "Usage telemetry is anonymous and aggregated. In Spice.ai Open Source, setting runtime.telemetry.enabled: false in a Spicepod or passing --telemetry-enabled=false does not disable anonymous usage telemetry. To remove anonymous telemetry from an Open Source build, build from source without the anonymous_telemetry feature, or consider using Spice.ai Enterprise. Learn more at https://docs.spice.ai/docs/enterprise";
 
 mod cloud_connect;
+pub use cloud_connect::{
+    BootstrapEnrollmentError, bootstrap_enrollment as cloud_connect_bootstrap,
+};
+mod connection_report;
 pub mod crash_handler;
 mod log_capture;
+mod runtime_lock;
+pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
@@ -356,14 +365,39 @@ pub struct Args {
     #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     pub pods_watcher_enabled: bool,
 
-    /// Connect this runtime to Spice Cloud for remote management (Cloud
-    /// Connect). Requires an enrolled identity or an adoption code (run
-    /// `spice connect <code>`, or set `SPICE_CONNECT_ADOPT_CODE`). When
-    /// omitted, the client still activates if such adoption state exists —
-    /// so already-enrolled instances keep connecting across upgrades — and a
-    /// `spiced` with no adoption state never connects to the cloud.
-    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
-    pub cloud_connect: bool,
+    /// One-time Spice Cloud enrollment key (`spice-enroll-…`) for Cloud
+    /// Connect. When set, spiced enrolls this instance with Spice Cloud
+    /// BEFORE the runtime is built or any listener binds — the process
+    /// stays unready until the enrolled identity is durable on disk — then
+    /// discards the key and starts normally. If a valid identity already
+    /// exists in this instance's `.spice` directory, it wins and the key is
+    /// NOT redeemed. Without this flag, an existing identity alone
+    /// reconnects the instance; a `spiced` with no identity never connects
+    /// to the cloud. The value is visible to same-host process listings for
+    /// the full lifetime of the enrollment process (the operating system retains
+    /// its original argv even after this field is dropped); it is single-use,
+    /// short-lived, and never written by spiced to any file. Container and
+    /// pod deployments should be recreated without this flag immediately
+    /// after the runtime becomes ready.
+    #[arg(
+        long,
+        value_name = "ENROLLMENT_KEY",
+        conflicts_with = "repl",
+        help_heading = "Spice Cloud Connect"
+    )]
+    pub token: Option<EnrollmentKeyArg>,
+
+    /// Optional host-location label recorded on the instance at enrollment
+    /// (for example `us-west-2` or `on-prem-syd`): 2-64 lowercase letters,
+    /// digits, or hyphens. Only meaningful with `--token`; omitting it
+    /// leaves any previously recorded region unchanged.
+    #[arg(
+        long,
+        value_name = "REGION",
+        requires = "token",
+        help_heading = "Spice Cloud Connect"
+    )]
+    pub region: Option<String>,
 
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
@@ -391,8 +425,56 @@ pub struct Args {
     #[arg(long, value_name = "CORES")]
     pub cpu_cores: Option<String>,
 
+    /// Write the console log to bounded, rotating files in this directory
+    /// instead of relying on the supervisor to store it.
+    ///
+    /// Set by `spice connect service install` on a supervisor that owns no log
+    /// store of its own — launchd writes whatever a job prints to the files its
+    /// definition names and never bounds them, so the runtime bounds its own
+    /// output instead. The policy is fixed
+    /// (`runtime_cloud_connect::service_log`) because `spice connect service
+    /// logs` reads these files back against the same constants.
+    ///
+    /// Hidden: this is the service installer's interface to the runtime, not an
+    /// operator's. `spice connect service logs` is how the files are read.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub service_log_dir: Option<PathBuf>,
+
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
+}
+
+/// The raw `--token` argument: an unvalidated enrollment-key candidate.
+///
+/// Deliberately accepts any string at parse time (`FromStr` is infallible)
+/// so clap never rejects — and therefore never **echoes** — a malformed
+/// secret in its own error output. Validation happens in the Cloud Connect
+/// bootstrap through the canonical `spice-enroll-` parser, whose errors
+/// never reproduce the value. `Debug` is redacted so the key cannot leak
+/// through argument logging, error chains, traces, or panic reports.
+#[derive(Clone)]
+pub struct EnrollmentKeyArg(zeroize::Zeroizing<String>);
+
+impl EnrollmentKeyArg {
+    /// The raw candidate value, handed only to the canonical parser.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for EnrollmentKeyArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Ok(Self(zeroize::Zeroizing::new(raw.to_string())))
+    }
+}
+
+impl std::fmt::Debug for EnrollmentKeyArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EnrollmentKeyArg([REDACTED])")
+    }
 }
 
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
@@ -496,10 +578,14 @@ pub struct AppBundle {
     running_deployment: Option<cloud_connect::CloudManagedSpicepod>,
     /// Deferred because `build_app` runs before tracing is initialized.
     deployment_note: Option<DeploymentNote>,
+    /// The validated durable identity snapshot loaded before the runtime is
+    /// built. Every Cloud Connect facility consumes this exact decision.
+    cloud_connect_identity: Option<runtime_cloud_connect::ReconnectableIdentity>,
 }
 
 /// Resolve the CPU entitlement from all three configuration surfaces plus host
-/// detection, log it, and install it as the process-wide budget.
+/// detection, install it as the process-wide budget, and log the budget in
+/// effect.
 ///
 /// Must run before any thread pool, `DataFusion` session, or accelerator is
 /// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
@@ -528,11 +614,36 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     );
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
-    budget.log_summary();
     if let Err(err) = budget.install() {
         tracing::warn!("{err}");
     }
+    // Log the budget in effect, not the resolved candidate: when the install
+    // lost to an earlier one, the summary and the Vortex declaration below must
+    // still report the same numbers.
+    cpu_budget::cpu_budget().log_summary();
+    #[cfg(not(windows))]
+    declare_vortex_parallelism();
     Ok(())
+}
+
+/// Declare the effective CPU entitlement to Vortex, so its host-derived
+/// concurrency defaults (encode fan-out, per-worker scan lookahead) size
+/// against the budget rather than the machine's core count.
+///
+/// Reads [`cpu_budget::cpu_budget`] so it declares whatever is actually in
+/// effect. The declaration is first-write-wins on the Vortex side: a call
+/// arriving after anything read the parallelism fails, and the warning names
+/// the value that stayed in effect.
+#[cfg(not(windows))]
+fn declare_vortex_parallelism() {
+    let Some(cores) = std::num::NonZeroUsize::new(cpu_budget::cpu_budget().vortex_parallelism())
+    else {
+        // `CpuBudget::cores` is documented as at least 1.
+        return;
+    };
+    if let Err(err) = vortex_utils::parallelism::set_available_parallelism(cores) {
+        tracing::warn!("Failed to declare the CPU entitlement to Vortex: {err}");
+    }
 }
 
 pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
@@ -552,7 +663,9 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         spicepod_load_error,
         running_deployment,
         deployment_note,
+        cloud_connect_identity,
     } = app_bundle;
+    let cloud_connect_configured = cloud_connect_identity.is_some();
     // Deferred until tracing exists, and appended to below — everything about
     // which configuration this start is serving belongs in one place in the log.
     let mut deployment_notes: Vec<DeploymentNote> = deployment_note.into_iter().collect();
@@ -660,9 +773,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // them under delta temporality.
     //
     // Created here because readers are fixed when the meter provider is built,
-    // which happens well before Cloud Connect starts — so the decision is made
-    // from the same cheap on-disk/flag probe that gates log capture.
-    let cloud_connect_metrics = if cloud_connect::is_configured(args.cloud_connect) {
+    // which happens well before Cloud Connect starts. The durable identity was
+    // already loaded and validated while building the app, and that same
+    // decision gates log capture.
+    let cloud_connect_metrics = if cloud_connect_configured {
         Some(runtime::metrics_reader::MetricsReader::new_cumulative())
     } else {
         None
@@ -707,11 +821,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
-        if running_deployment.is_some() {
+        if cloud_connect_configured {
             // The watcher reconciles the *local* spicepod into the running app.
-            // On an instance serving a deployment that would swap the deployed
-            // configuration out from under it, leaving the runtime serving
-            // something the control plane never sent.
+            // On any managed instance—including one still waiting for its first
+            // deployment—that could later swap Cloud state out from under the
+            // control plane while it continues reporting the deployment.
             deployment_notes.push(DeploymentNote::PodsWatcherDeclined);
         } else {
             let pods_watcher = PodsWatcher::new(spicepod_path.clone());
@@ -731,7 +845,8 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             "SPICED_LOG",
             app.as_ref().and_then(|a| a.runtime.output_level),
         ),
-        args.cloud_connect,
+        cloud_connect_configured,
+        args.service_log_dir.as_deref(),
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
@@ -744,9 +859,15 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Log spicepod load error now that tracing is initialized
     if let Some(err) = spicepod_load_error {
-        tracing::warn!(
-            "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided.\n{err}"
-        );
+        if awaiting_deployed_spicepod(cloud_connect_configured, &err) {
+            tracing::info!(
+                "Spice Cloud Connect: no local spicepod.yaml — this instance is waiting for an app to be deployed from Spice Cloud, and loads its components as soon as one arrives."
+            );
+        } else {
+            tracing::warn!(
+                "Starting in pods watcher mode without a valid spicepod.yaml. The runtime will load components once a valid spicepod.yaml is provided: {err}"
+            );
+        }
     }
     // Same reason: `build_app` chooses between the deployed spicepod and the
     // local one before tracing exists, and which one won is the first thing an
@@ -852,8 +973,8 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         .filter(|c| c.enabled);
 
     // Cloud Connect counts: its reader only produces data once it is attached to
-    // the meter provider built below, and `spiced --cloud-connect` alone sets
-    // none of the other three signals.
+    // the meter provider built below, and an enrolled instance alone sets none
+    // of the other three signals.
     let needs_metrics = prometheus_registry.is_some()
         || otel_config.is_some()
         || metrics_reader.is_some()
@@ -862,7 +983,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            runtime::secrets::get_params_with_secrets(rt.secrets(), &config.headers)
+            runtime_secrets::get_params_with_secrets(rt.secrets(), &config.headers)
                 .await
                 .into_iter()
                 .map(|(key, value)| (key, value.expose_secret().to_string()))
@@ -998,6 +1119,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     if needs_metrics {
         rt.init_cache_metrics();
+        rt.init_component_metrics();
     }
 
     let cloned_rt = Arc::clone(&rt);
@@ -1050,30 +1172,51 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
     // Captured before `args` is moved into the server task below.
-    let cloud_connect_flag = args.cloud_connect;
     let runtime_overrides = args.set_runtime.clone();
 
-    let server_thread = tokio::spawn(async move {
-        Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
+    // Cancelled when this process may no longer report itself as connected:
+    // shutdown (it is a child of the runtime's shutdown token, so a cancelled
+    // parent cancels it) or the server task ending, whichever comes first.
+    let serving_ended = rt.status().shutdown_token();
+
+    let server_thread = tokio::spawn({
+        let serving_ended = serving_ended.clone();
+        async move {
+            let result =
+                Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await;
+            // Whatever the outcome — a bind that failed, or a clean
+            // termination — the servers are not running after this point.
+            serving_ended.cancel();
+            result
+        }
     });
 
     // Restore control-plane-delivered secrets from the local cache and register
     // their store BEFORE loading components. Component initialization is what
     // resolves `${ secrets:… }`, so a store installed after this point would
-    // arrive too late for every component that referenced one — and a
-    // deployment that delivers secrets applies by restarting, so that is the
-    // path they arrive by. Local files only, no control-plane round trip, so
-    // this neither blocks nor fails when the gateway is unreachable.
-    let delivered_secrets = cloud_connect::restore_delivered_secrets(
-        env!("CARGO_PKG_VERSION"),
-        &rt,
-        cloud_connect_flag,
-    )
-    .await;
+    // arrive too late for every component that referenced one — and a value a
+    // deployment rotates reaches the components holding the old one only by
+    // loading them again, which is this path. Local files only, no
+    // control-plane round trip, so this neither blocks nor fails when the
+    // gateway is unreachable.
+    let delivered_secrets =
+        cloud_connect::restore_delivered_secrets(&rt, cloud_connect_identity.as_ref()).await;
 
-    // Spice Cloud Connect. Default off — only activates on the explicit
-    // `--cloud-connect` flag, or when an identity is on disk or an adoption
-    // code is available. Failures here are non-fatal: spiced keeps running.
+    // The connection report's two latches. The connection half is filled by the
+    // control client on the first message Spice Cloud sends back; the serving
+    // half below, once the initial component load has settled and the server
+    // task is still alive. Whichever arrives last releases the
+    // report, and `serving_ended` withdraws it if the servers stop first.
+    let session_ack = cloud_connect_configured.then(|| Arc::new(SessionAck::new()));
+    let serving = CancellationToken::new();
+    if let Some(ack) = &session_ack {
+        connection_report::spawn(Arc::clone(ack), serving.clone(), serving_ended.clone());
+    }
+
+    // Spice Cloud Connect. Default off — activates only from the validated
+    // durable identity snapshot loaded before the runtime was built (which a
+    // successful `--token` bootstrap creates). Failures here are non-fatal:
+    // spiced keeps running.
     //
     // Started BEFORE `load_components()` so the control plane holds a session
     // while components initialize. The load has no deadline — a dataset whose
@@ -1082,23 +1225,38 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // satisfy lock out the very deployment that would fix it, with no way back
     // short of an operator editing files on the host. Commands are answered
     // during the load and `GetStatus` reports the runtime as progressing until
-    // it finishes; an `ApplySpicepod` abandons the load and restarts onto the
-    // configuration it just persisted.
+    // it finishes; an `ApplySpicepod` waits for the load, under a bound of its
+    // own, so it reconciles against a fully-registered app.
     let cloud_connect_handle = cloud_connect::maybe_start(
-        env!("CARGO_PKG_VERSION"),
         Arc::clone(&rt),
-        cloud_connect_flag,
+        cloud_connect_identity,
         delivered_secrets,
         running_deployment,
         cloud_connect_metrics,
         runtime_overrides,
+        session_ack,
     )
     .await;
 
     tokio::select! {
-        () = Arc::clone(&rt).load_components() => {},
+        () = Arc::clone(&rt).load_components() => {
+            // The initial load has settled — every component the app declares
+            // has been registered and had its first load attempt. This, rather
+            // than `RuntimeStatus::is_ready`, is what says a *Cloud Connect*
+            // instance is serving: a freshly enrolled one has no components at
+            // all until its first deployment lands, and readiness over an empty
+            // component set is never reported.
+            if serving_ended.is_cancelled() {
+                tracing::debug!("Runtime servers ended before startup completed");
+            } else {
+                serving.cancel();
+            }
+        },
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
+        },
+        () = serving_ended.cancelled() => {
+            tracing::debug!("Runtime servers ended before component initialization completed");
         },
     }
 
@@ -1123,24 +1281,36 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
 /// Whether a failed local spicepod load should be tolerated by starting on an
 /// empty spicepod instead of exiting.
-fn tolerates_missing_spicepod(args: &Args, error: &app::Error) -> bool {
-    tolerates_missing_spicepod_when_configured(
-        args,
-        error,
-        cloud_connect::is_configured(args.cloud_connect),
-    )
+fn tolerates_missing_spicepod(args: &Args, error: &app::Error, cloud_managed_state: bool) -> bool {
+    tolerates_missing_spicepod_when_cloud_managed(args, error, cloud_managed_state)
 }
 
-/// Pure policy behind [`tolerates_missing_spicepod`]. Keeping the configuration
-/// signal separate makes the implicit activation paths (an enrolled identity,
-/// pending adoption code, or adoption-code environment variable) testable
-/// without mutating process-global environment state.
-fn tolerates_missing_spicepod_when_configured(
+/// Pure policy behind [`tolerates_missing_spicepod`]. Configuration provenance
+/// is deliberately separate from credential activation: an unusable identity
+/// still means the instance has no local Spicepod, while it enables no Cloud
+/// Connect facility.
+fn tolerates_missing_spicepod_when_cloud_managed(
     args: &Args,
     error: &app::Error,
-    cloud_connect_configured: bool,
+    cloud_managed_state: bool,
 ) -> bool {
-    cloud_connect_configured && args.spicepod.is_none() && error.is_spicepod_missing()
+    cloud_managed_state && args.spicepod.is_none() && error.is_spicepod_missing()
+}
+
+/// Whether an absent local spicepod is the expected state of this start rather
+/// than something to warn about.
+///
+/// A Cloud-connected instance's app arrives by deployment, and the deployment is
+/// what writes the file — so an empty instance directory is where a freshly
+/// connected runtime is *supposed* to be while it waits. Reporting the local-only
+/// "run spice init" guidance there describes a failure that is not happening and
+/// sends operators looking for a broken configuration.
+///
+/// Everything else keeps the warning: a spicepod that exists but does not parse
+/// is a real defect, and a missing one with no Cloud Connect identity means
+/// nothing will ever arrive to fill it.
+fn awaiting_deployed_spicepod(cloud_connect_configured: bool, error: &app::Error) -> bool {
+    cloud_connect_configured && error.is_spicepod_missing()
 }
 
 /// What `build_app` decided about which spicepod this start serves, logged once
@@ -1206,6 +1376,10 @@ impl DeploymentNote {
 /// persisted rather than the instance directory's `spicepod.yaml` — see the
 /// cloud-managed branch below.
 pub async fn build_app(args: &Args) -> Result<AppBundle> {
+    let cloud_connect_startup = cloud_connect::load_startup_state().await;
+    let cloud_connect_config_dir = cloud_connect_startup.config_dir().to_path_buf();
+    let cloud_managed_state = cloud_connect_startup.identity_observed();
+    let cloud_connect_identity = cloud_connect_startup.into_identity();
     // Check for explicit executor role OR implicit executor role (scheduler_address set without explicit role)
     let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
         || (args.runtime.cluster.role.is_none()
@@ -1233,6 +1407,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                 spicepod_load_error: None,
                 running_deployment: None,
                 deployment_note: None,
+                cloud_connect_identity,
             });
         }
         tracing::info!(
@@ -1243,6 +1418,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             spicepod_load_error: None,
             running_deployment: None,
             deployment_note: None,
+            cloud_connect_identity,
         });
     }
 
@@ -1251,13 +1427,14 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     // file, so reading anything else here would drop every deployment on the
     // floor at the moment it was meant to take effect.
     let mut deployment_note = None;
-    let cloud_managed_spicepod = cloud_connect::cloud_managed_spicepod(args.cloud_connect)
-        .await
-        .map_err(
-            |cloud_connect::CloudManagedSpicepodReadError { path, source }| {
-                Error::UnableToReadCloudManagedSpicepod { path, source }
-            },
-        )?;
+    let cloud_managed_spicepod =
+        cloud_connect::cloud_managed_spicepod(&cloud_connect_config_dir, cloud_managed_state)
+            .await
+            .map_err(
+                |cloud_connect::CloudManagedSpicepodReadError { path, source }| {
+                    Error::UnableToReadCloudManagedSpicepod { path, source }
+                },
+            )?;
     if let Some(deployed) = cloud_managed_spicepod {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
@@ -1269,6 +1446,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                         path: deployed.path.clone(),
                     }),
                     running_deployment: Some(deployed),
+                    cloud_connect_identity,
                 });
             }
             Err(e) => {
@@ -1300,7 +1478,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         Err(e) => {
             // In pods watcher mode, allow runtime to start without a valid spicepod
             // It will load the spicepod when it becomes available
-            if args.pods_watcher_enabled && args.spicepod.is_none() {
+            if args.pods_watcher_enabled && args.spicepod.is_none() && !cloud_managed_state {
                 spicepod_load_error = Some(e);
                 None
             // `take()` cannot lose a note here: the `Loaded` case returned
@@ -1319,7 +1497,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                     local_error: e.to_string(),
                 });
                 None
-            } else if tolerates_missing_spicepod(args, &e) {
+            } else if tolerates_missing_spicepod(args, &e, cloud_managed_state) {
                 // A cloud-managed instance that has connected but not yet
                 // received a deployment has no spicepod anywhere: none was
                 // deployed, and `spice connect` writes nothing to the instance
@@ -1344,6 +1522,7 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         spicepod_load_error,
         running_deployment: None,
         deployment_note,
+        cloud_connect_identity,
     })
 }
 
@@ -1452,14 +1631,7 @@ fn init_metrics(
 
     // Case 1: Prometheus scrape
     if let Some(registry) = registry {
-        let prometheus_exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry)
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()?;
-        provider_builder = provider_builder.with_reader(prometheus_exporter);
+        provider_builder = provider_builder.with_reader(runtime::prometheus_reader(registry)?);
 
         let spice_metrics_exporter =
             OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
@@ -1752,6 +1924,9 @@ mod tests {
         ));
     }
 
+    /// A canonically-shaped (but fake) enrollment key for parser tests.
+    const TEST_ENROLLMENT_KEY: &str = "spice-enroll-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
     /// The load failure a directory with no `spicepod.yaml` produces — what a
     /// freshly connected instance hits on startup.
     async fn missing_spicepod_error(dir: &std::path::Path) -> app::Error {
@@ -1765,8 +1940,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let error = missing_spicepod_error(dir.path()).await;
 
-        let args = Args::parse_from(["spiced", "--cloud-connect"]);
-        assert!(tolerates_missing_spicepod(&args, &error));
+        let args = Args::parse_from(["spiced", "--token", TEST_ENROLLMENT_KEY]);
+        assert!(tolerates_missing_spicepod(&args, &error, true));
     }
 
     #[tokio::test]
@@ -1775,7 +1950,7 @@ mod tests {
         let error = missing_spicepod_error(dir.path()).await;
 
         let args = Args::parse_from(["spiced"]);
-        assert!(tolerates_missing_spicepod_when_configured(
+        assert!(tolerates_missing_spicepod_when_cloud_managed(
             &args, &error, true
         ));
     }
@@ -1786,7 +1961,7 @@ mod tests {
         let error = missing_spicepod_error(dir.path()).await;
 
         let args = Args::parse_from(["spiced"]);
-        assert!(!tolerates_missing_spicepod(&args, &error));
+        assert!(!tolerates_missing_spicepod(&args, &error, false));
     }
 
     #[tokio::test]
@@ -1799,11 +1974,12 @@ mod tests {
 
         let args = Args::parse_from([
             std::ffi::OsStr::new("spiced"),
-            std::ffi::OsStr::new("--cloud-connect"),
+            std::ffi::OsStr::new("--token"),
+            std::ffi::OsStr::new(TEST_ENROLLMENT_KEY),
             path.as_os_str(),
         ]);
         assert_eq!(args.spicepod.as_deref(), Some(path.as_path()));
-        assert!(!tolerates_missing_spicepod(&args, &error));
+        assert!(!tolerates_missing_spicepod(&args, &error, true));
     }
 
     /// A spicepod that exists but does not parse must not be swallowed as
@@ -1820,8 +1996,101 @@ mod tests {
             .await
             .expect_err("a malformed spicepod.yaml must fail to load");
 
-        let args = Args::parse_from(["spiced", "--cloud-connect"]);
-        assert!(!tolerates_missing_spicepod(&args, &error));
+        let args = Args::parse_from(["spiced", "--token", TEST_ENROLLMENT_KEY]);
+        assert!(!tolerates_missing_spicepod(&args, &error, true));
+    }
+
+    /// A connected instance with no spicepod yet is waiting for a deployment, so
+    /// the local-only failure guidance must not be reported for it.
+    #[tokio::test]
+    async fn a_connected_instance_awaiting_its_app_is_not_a_warning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let error = missing_spicepod_error(dir.path()).await;
+
+        assert!(awaiting_deployed_spicepod(true, &error));
+    }
+
+    /// The warning survives where it is still true: a missing spicepod with no
+    /// Cloud Connect identity waiting to fill it, and a spicepod that exists but
+    /// does not parse.
+    #[tokio::test]
+    async fn an_unexplained_or_malformed_spicepod_still_warns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = missing_spicepod_error(dir.path()).await;
+        assert!(!awaiting_deployed_spicepod(false, &missing));
+
+        let malformed_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            malformed_dir.path().join("spicepod.yaml"),
+            "version: v1\nkind: Spicepod\nname: broken\ndatasets: 'not a list'\n",
+        )
+        .expect("write spicepod.yaml");
+        let malformed = AppBuilder::build_from_path(malformed_dir.path())
+            .await
+            .expect_err("a malformed spicepod.yaml must fail to load");
+        assert!(!awaiting_deployed_spicepod(true, &malformed));
+    }
+
+    /// `Debug` over the parsed arguments must never reproduce the `--token`
+    /// value: argument structs get logged, panic reports format them, and a
+    /// one-time bearer secret must not be one `{args:?}` away from a log line.
+    #[test]
+    fn parsed_args_debug_never_prints_the_enrollment_key() {
+        let args = Args::parse_from(["spiced", "--token", TEST_ENROLLMENT_KEY]);
+        let debug = format!("{args:?}");
+        assert!(
+            !debug.contains(TEST_ENROLLMENT_KEY),
+            "Debug leaked the enrollment key: {debug}"
+        );
+        assert!(
+            !debug.contains(&"A".repeat(32)),
+            "Debug leaked the enrollment key secret: {debug}"
+        );
+        assert!(debug.contains("REDACTED"));
+    }
+
+    /// The raw argument survives clap parsing verbatim (validation happens
+    /// later, in the bootstrap, where errors never echo the value).
+    #[test]
+    fn token_arg_round_trips_any_value() {
+        let mut args = Args::parse_from(["spiced", "--token", "not-a-real-key"]);
+        assert_eq!(
+            args.token.as_ref().map(EnrollmentKeyArg::expose_secret),
+            Some("not-a-real-key")
+        );
+        let token = args.token.take().expect("token is present");
+        assert!(
+            args.token.is_none(),
+            "the bootstrap must be able to remove the raw argument before runtime startup"
+        );
+        assert_eq!(token.expose_secret(), "not-a-real-key");
+    }
+
+    #[test]
+    fn token_arg_conflicts_with_repl_without_echoing_the_key() {
+        let err = Args::try_parse_from(["spiced", "--repl", "--token", TEST_ENROLLMENT_KEY])
+            .expect_err("--token must not be accepted when the runtime bootstrap is bypassed");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(
+            !err.to_string().contains(TEST_ENROLLMENT_KEY),
+            "clap conflict output must not reproduce the enrollment key"
+        );
+    }
+
+    #[test]
+    fn region_requires_token() {
+        let err = Args::try_parse_from(["spiced", "--region", "us-west-2"])
+            .expect_err("--region without --token must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let args = Args::parse_from([
+            "spiced",
+            "--token",
+            TEST_ENROLLMENT_KEY,
+            "--region",
+            "us-west-2",
+        ]);
+        assert_eq!(args.region.as_deref(), Some("us-west-2"));
     }
 
     #[test]

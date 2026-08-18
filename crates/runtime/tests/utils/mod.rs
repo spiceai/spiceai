@@ -133,7 +133,7 @@ pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Durati
 }
 
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
-    let mut secrets = runtime::secrets::Secrets::new();
+    let mut secrets = runtime_secrets::Secrets::new();
     // Will automatically load `env` as the default
     secrets
         .load_from(&[])

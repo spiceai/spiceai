@@ -49,6 +49,7 @@ pub(crate) async fn build_heartbeat(
         active_models,
         active_spicepods: 0,
         runtime_versions: std::collections::HashMap::new(),
+        standalone_runtime: None,
     }
 }
 
@@ -127,6 +128,10 @@ mod tests {
         assert_eq!(hb.sequence, 42);
         // A handle that cannot report status must not claim a phase.
         assert_eq!(hb.phase, proto::RuntimePhase::Unspecified as i32);
+        // A runtime with no restart-state source of truth reports no
+        // standalone detail — absent, never a present-but-empty placeholder,
+        // since the control plane reads those as different states.
+        assert_eq!(hb.standalone_runtime, None);
     }
 
     #[tokio::test]
@@ -141,6 +146,8 @@ mod tests {
             fn supports(&self, capability: Capability) -> bool {
                 capability == Capability::GetStatus
             }
+            // This status-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
             async fn status(&self) -> Result<StatusReport, CommandError> {
                 Ok(StatusReport::new(RuntimePhase::Ready, "all ready"))
             }

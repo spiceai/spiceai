@@ -19,6 +19,10 @@ limitations under the License.
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
+// Re-exported so callers configuring a `VortexConfig` (the runtime's Cayenne
+// accelerator) name the mode through this module alongside the other config
+// enums, rather than reaching into `vortex-datafusion` for one type.
+pub use vortex_datafusion::ScanConcurrency;
 
 /// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
 pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
@@ -741,6 +745,31 @@ impl StorageClass {
     }
 }
 
+/// Serializes [`ScanConcurrency`] through its own `Display`/`FromStr` pair.
+///
+/// The type is owned by `vortex-datafusion`, which carries no serde dependency, so
+/// the string form is produced here rather than derived there. Going through the
+/// enum's own parser keeps one definition of what `auto`/`off`/`<n>` mean — a
+/// second mapping here would be free to drift from the one the scan honors.
+mod scan_concurrency_serde {
+    use super::ScanConcurrency;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &ScanConcurrency,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ScanConcurrency, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -757,6 +786,16 @@ pub struct VortexConfig {
     ///
     /// Passed through to `vortex-datafusion` as the per-format segment cache size.
     pub segment_cache_mb: usize,
+    /// How many splits a single Vortex file scan decodes concurrently.
+    ///
+    /// `auto` (the default) derives it from `DataFusion` target partitions and the
+    /// planned file count; `off` forces serial decoding; an explicit count pins it.
+    /// Raising it trades resident decode memory for scan throughput — the scan
+    /// memory accounting charges the query pool for every concurrent split, so a
+    /// wide fan-out over a small pool surfaces as a refused query rather than an
+    /// over-committed host.
+    #[serde(default, with = "scan_concurrency_serde")]
+    pub scan_concurrency: ScanConcurrency,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
@@ -1465,6 +1504,9 @@ impl Default for VortexConfig {
         Self {
             footer_cache_mb: None,
             segment_cache_mb: 256,
+            // Derive intra-file decode concurrency from target partitions and the
+            // planned file count.
+            scan_concurrency: ScanConcurrency::default(),
             // Balanced file size for scan throughput and write amplification
             target_vortex_file_size_mb: 256,
             // No sort columns by default
@@ -1541,7 +1583,37 @@ impl Default for VortexConfig {
     reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
 )]
 mod tests {
-    use super::{PkConflictDetection, VortexConfig};
+    use super::{PkConflictDetection, ScanConcurrency, VortexConfig};
+
+    /// `scan_concurrency` must survive a metastore round trip, and a config
+    /// written before the field existed must still load.
+    ///
+    /// The mode is serialized through the enum's own string form because
+    /// `vortex-datafusion` carries no serde derive. A stored table's config is
+    /// deserialized on every open, so a format that only round-trips one way
+    /// would fail the table, not just the setting.
+    #[test]
+    fn scan_concurrency_round_trips_and_tolerates_configs_written_without_it() {
+        for mode in [
+            ScanConcurrency::Auto,
+            ScanConcurrency::Off,
+            ScanConcurrency::Explicit(4),
+        ] {
+            let config = VortexConfig {
+                scan_concurrency: mode,
+                ..Default::default()
+            };
+            let encoded = serde_json::to_string(&config).expect("config should serialize");
+            let decoded: VortexConfig =
+                serde_json::from_str(&encoded).expect("config should deserialize");
+            assert_eq!(decoded.scan_concurrency, mode);
+        }
+
+        // A config persisted before this field existed carries no key for it.
+        let legacy: VortexConfig =
+            serde_json::from_str("{}").expect("a config without the field should deserialize");
+        assert_eq!(legacy.scan_concurrency, ScanConcurrency::Auto);
+    }
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {

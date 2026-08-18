@@ -36,12 +36,17 @@ limitations under the License.
 //! forwarding. What it buys is that the accelerated-table crate compiles without
 //! the `DataConnector` trait, and therefore without `runtime`.
 //!
-//! When `DataConnector` itself moves below `runtime` (plan step 5.4 — it needs
-//! `&Dataset` retyped to `&DatasetSpec` across 8 of its 16 methods and 45
-//! implementors, and its two accelerated-table hooks split into a runtime-side
-//! extension trait), this trait either collapses into a plain `DataConnector`
-//! bound or stays on as the narrower interface at the point of use. Either way
-//! the runtime-side adapter goes away, and nothing here has to change first.
+//! `data-connector-api` now carries the same inversion pointing the other way:
+//! `FederatedTableProvider` is what a *connector* needs of a federated table, and
+//! this crate satisfies it for [`FederatedTable`](crate::federated::FederatedTable).
+//!
+//! When `DataConnector` itself moves below `runtime`, this trait either collapses
+//! into a plain `DataConnector` bound or stays on as the narrower interface at the
+//! point of use. Either way the runtime-side adapter goes away, and nothing here
+//! has to change first. What still blocks that move is the three methods handing
+//! back a provider — `read_provider`, `read_write_provider` and `changes_stream` —
+//! which take the bound `Dataset` because a connector may reach the accelerator's
+//! `spice_sys` state (the CDC checkpoint stores) through it.
 
 use std::sync::Arc;
 

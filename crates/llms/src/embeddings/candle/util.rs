@@ -34,7 +34,7 @@ use std::{
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
     download::{ST_CONFIG_NAMES, download_artifacts},
-    tokenization::EncodingInput,
+    tokenization::{EncodingInput, Tokenization},
 };
 
 use tempfile::tempdir;
@@ -69,6 +69,45 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     tracing::trace!("Model config parsed: {:?}", config);
 
     Ok(config)
+}
+
+/// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
+/// `Infer` pipeline from a directory of model artifacts. Shared by
+/// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
+/// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
+/// otherwise duplicate this setup.
+pub(crate) fn load_tokenization(
+    root: &Path,
+    max_seq_length_overwrite: Option<usize>,
+) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
+    let tokenizer = load_tokenizer(root)?;
+    let config = load_config(root)?;
+    let position_offset = position_offset(&config);
+
+    let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+        max_seq_length
+    } else {
+        match max_seq_length_from_st_config(root) {
+            Ok(max_seq_length_opt) => {
+                max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                config.max_position_embeddings - position_offset
+            }
+        }
+    };
+
+    let token = Tokenization::new(
+        1,
+        tokenizer.clone(),
+        max_input_length,
+        position_offset,
+        None,
+        None,
+    );
+
+    Ok((tokenizer, config, token))
 }
 
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
@@ -185,9 +224,17 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(Arc::clone(&api_repo))
-        .await
-        .context(FailedWithHFApiSnafu)?;
+    // Fallback to `pytorch_model.bin` if no safetensors.
+    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
+    if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
+        tracing::warn!(
+            "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
+        );
+        api_repo
+            .get("pytorch_model.bin")
+            .await
+            .context(FailedWithHFApiSnafu)?;
+    }
 
     Ok(root_dir)
 }

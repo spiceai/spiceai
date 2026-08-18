@@ -29,6 +29,10 @@ use arrow::error::ArrowError;
 use async_trait::async_trait;
 use data_accelerator_api::{BootstrapStatus, get_primary_keys_from_constraints};
 use data_components::cdc::ChangesStream;
+use data_connector_api::accelerated::{
+    AcceleratorSetup, RefreshRequestError, RefreshRequester, RegisteredAcceleratedTable,
+    TableGoneSnafu,
+};
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -419,6 +423,8 @@ pub struct Builder {
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     acceleration_layout: Option<runtime_acceleration::snapshot::AccelerationLayout>,
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
@@ -473,6 +479,7 @@ impl Builder {
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
@@ -724,6 +731,16 @@ impl Builder {
         self
     }
 
+    /// Declare the acceleration engine's own type rewrites, so the refresh sink can
+    /// tell an engine-imposed type from a stale acceleration schema.
+    pub fn engine_type_rewrites(
+        &mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> &mut Self {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector`, `Refresher` and `CachingAccelerationScanExec`.
     pub fn accelerator_write_mutex(
@@ -939,6 +956,7 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+        refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
         let (refresh_handle, refresh_trigger) =
@@ -1511,6 +1529,44 @@ impl Drop for AcceleratedTable {
         for handler in self.handlers.drain(..) {
             handler.abort();
         }
+    }
+}
+
+impl AcceleratorSetup for Builder {
+    fn accelerator(&self) -> Arc<dyn TableProvider> {
+        self.get_accelerator()
+    }
+
+    fn set_accelerator(&mut self, accelerator: Arc<dyn TableProvider>) {
+        Builder::set_accelerator(self, accelerator);
+    }
+}
+
+impl RegisteredAcceleratedTable for AcceleratedTable {
+    fn refresh_requester(&self) -> Option<Arc<dyn RefreshRequester>> {
+        self.refresh_trigger()
+            .cloned()
+            .map(|trigger| Arc::new(RefreshTrigger { trigger }) as Arc<dyn RefreshRequester>)
+    }
+
+    fn attach_task(&mut self, task: JoinHandle<()>) {
+        self.handlers.push(task);
+    }
+}
+
+/// [`RefreshRequester`] over an accelerated table's refresh-trigger channel.
+///
+/// A request carries no overrides: the connector-side callers ask for the
+/// dataset's configured refresh, not a modified one.
+#[derive(Debug)]
+struct RefreshTrigger {
+    trigger: mpsc::Sender<Option<RefreshOverrides>>,
+}
+
+#[async_trait]
+impl RefreshRequester for RefreshTrigger {
+    async fn request_refresh(&self) -> Result<(), RefreshRequestError> {
+        self.trigger.send(None).await.ok().context(TableGoneSnafu)
     }
 }
 
