@@ -10,6 +10,7 @@ description = "Git data connector for Spice.ai runtime"
 arrow.workspace = true
 async-trait.workspace = true
 dashmap = "6.1"
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 git2.workspace = true
@@ -21,7 +22,6 @@ runtime-parameters = { path = "../../runtime-parameters" }
 tempfile.workspace = true
 url.workspace = true
 reqwest.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
@@ -29,6 +29,9 @@ secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

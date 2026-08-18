@@ -37,7 +37,6 @@ linkme.workspace = true
 mysql_async.workspace = true
 opentelemetry.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["mysql"] }
 runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
@@ -51,6 +50,9 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

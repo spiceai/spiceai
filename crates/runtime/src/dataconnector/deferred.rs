@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, sync::Arc};
 
 use super::DataConnector;
@@ -62,6 +63,7 @@ impl DataConnector for DeferredConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
@@ -69,6 +71,7 @@ impl DataConnector for DeferredConnector {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         None
@@ -104,8 +107,9 @@ impl DataConnector for DeferredConnector {
         self.inner.supports_durable_write_back_delivery()
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         _federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         _dataset: &DatasetSpec,
         _acceleration: data_components::cdc::AccelerationContents,

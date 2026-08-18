@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     future::Future,
@@ -913,7 +914,10 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+        {
             Ok(provider) => {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
@@ -1259,12 +1263,15 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
-            UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .build()
-        })?;
+        let read_table = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+            .map_err(|_| {
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .build()
+            })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -1417,14 +1424,19 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector =
-            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
-                dc.context(UnableToInitializeDataConnectorSnafu {})?
-            } else {
-                // Only reachable if the connector is deregistered between the check above and
-                // this lookup; report the same error rather than a second, blunter one.
-                return Err(unknown_data_connector(source).await);
-            };
+        let mut data_connector = if let Some(dc) = dataconnector::create_new_connector(
+            source,
+            params,
+            &RuntimeConnectorContext::for_dataset(&ds),
+        )
+        .await
+        {
+            dc.context(UnableToInitializeDataConnectorSnafu {})?
+        } else {
+            // Only reachable if the connector is deregistered between the check above and
+            // this lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_data_connector(source).await);
+        };
 
         // Innermost of the stream decorators, so the properties Drasi receives
         // are the source table's own columns. Wrapping outside the embedding
@@ -1452,7 +1464,6 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
-                Arc::downgrade(&self.datafusion()),
             ));
         }
 
@@ -2209,10 +2220,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             let creates = Arc::clone(&self.creates);
             Box::pin(async move {
                 creates.fetch_add(1, Ordering::SeqCst);
@@ -2250,6 +2262,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
@@ -2375,10 +2388,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
         }
 
@@ -2402,6 +2416,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -2432,10 +2447,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
 

@@ -35,7 +35,6 @@ datafusion-table-providers = { workspace = true, features = ["postgres", "postgr
 fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
@@ -50,6 +49,9 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

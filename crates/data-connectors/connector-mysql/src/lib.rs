@@ -18,6 +18,10 @@ use async_trait::async_trait;
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
@@ -28,10 +32,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
-};
 use runtime_api_types::v1::ComponentType;
 use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
@@ -69,10 +69,6 @@ pub struct MySQL {
     /// Connector params retained for the replication path, which opens its
     /// own dedicated connections outside the pool.
     params: Parameters,
-    /// Retained so the replication path can resolve the binlog-position store over
-    /// the dataset's accelerator. `None` only in unit tests, which build params
-    /// without a runtime attached.
-    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics: Arc<ReplicationMetricsCollector>,
 }
 
@@ -213,10 +209,11 @@ impl DataConnectorFactory for MySQLFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let pool_min = params
                 .parameters
@@ -301,7 +298,7 @@ impl DataConnectorFactory for MySQLFactory {
             if let ConnectorComponent::Dataset(dataset) = &params.component {
                 let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
                     acceleration.refresh_mode
-                        == Some(runtime::component::dataset::acceleration::RefreshMode::Changes)
+                        == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
                 });
                 if is_changes_mode {
                     // The injected spec defaults are indistinguishable from
@@ -369,7 +366,6 @@ impl DataConnectorFactory for MySQLFactory {
                 mysql_factory,
                 pool,
                 params: params_for_replication,
-                context: params.context.clone(),
                 replication_metrics: ReplicationMetricsCollector::new(),
             }) as Arc<dyn DataConnector>)
         })
@@ -566,6 +562,7 @@ impl DataConnector for MySQL {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
@@ -615,16 +612,18 @@ impl DataConnector for MySQL {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
         dataset: &DatasetSpec,
         _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
+        let position_store = replication::resolve_position_store(context, dataset).await;
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
-            self.context.clone(),
+            position_store,
             federated_table,
             Arc::clone(&self.replication_metrics),
         ))
@@ -868,10 +867,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     MySQLFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_mysql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_mysql_connector,
     MYSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

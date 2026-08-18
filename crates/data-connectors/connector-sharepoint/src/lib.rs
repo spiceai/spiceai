@@ -26,7 +26,7 @@ limitations under the License.
 //!
 //! - **Object-store tabular / blob**: `from: sharepoint://me/Documents/...`.
 //!   Delegates to [`SharepointListingConnector`] which implements
-//!   [`runtime::dataconnector::listing::ListingTableConnector`]. DataFusion's
+//!   [`data_connector_api::listing::ListingTableConnector`]. DataFusion's
 //!   `ListingTable` provides `SELECT`, `INSERT INTO`, `COPY TO`, `COPY FROM`
 //!   for CSV/JSON/Parquet; binary formats (PDF, PPTX, etc.) go through the
 //!   `ObjectStore` as raw bytes. Writes create new versions by default —
@@ -49,18 +49,19 @@ use crate::sharepoint::table::SharepointTableProvider;
 use crate::sharepoint::url::DriveRef;
 use app::App;
 use async_trait::async_trait;
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
+};
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use document_parse::DocumentParser;
 use graph_rs_sdk::GraphClient;
-use runtime::dataconnector::listing::{
-    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
-};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
@@ -711,14 +712,15 @@ impl DataConnectorFactory for SharepointFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let app = params.app();
-            let session_context = params.datafusion_session_context();
+            let app = Some(context.app());
+            let session_context = Some(context.datafusion_session_context());
             let connector =
                 Sharepoint::new(params.parameters, io_runtime, app, session_context).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
@@ -742,12 +744,13 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
             return self
                 .listing_connector(dataset)?
-                .read_provider(dataset)
+                .read_provider(context, dataset)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -768,6 +771,7 @@ impl DataConnector for Sharepoint {
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !Self::uses_object_store(dataset) {
@@ -777,7 +781,7 @@ impl DataConnector for Sharepoint {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
         };
-        Some(connector.read_provider(dataset).await)
+        Some(connector.read_provider(context, dataset).await)
     }
 
     async fn metadata_provider(
@@ -1055,10 +1059,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_sharepoint as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_sharepoint_connector,
     SHAREPOINT_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

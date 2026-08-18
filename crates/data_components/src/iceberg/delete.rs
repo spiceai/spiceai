@@ -217,7 +217,7 @@ impl ExecutionPlan for IcebergDeleteExec {
             // Set up the equality delete writer
             let file_io = table.file_io().clone();
             let location_generator =
-                DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_df_error)?;
+                DefaultLocationGenerator::new(table.metadata()).map_err(to_df_error)?;
             let file_name_generator = DefaultFileNameGenerator::new(
                 Uuid::now_v7().to_string(),
                 Some("eq-del".to_string()),
