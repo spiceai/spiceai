@@ -430,8 +430,7 @@ impl VectorScanTableProvider {
                     .iter()
                     .filter(|f| {
                         let refs = f.column_refs();
-                        refs.iter()
-                            .any(|col| !self.primary_key.contains(&col.name))
+                        refs.iter().any(|col| !self.primary_key.contains(&col.name))
                             && refs.iter().all(|col| {
                                 available_columns.contains(col.name.as_str())
                                     || this_index_columns.contains(&col.name)
