@@ -3817,6 +3817,15 @@ impl DataAccelerator for CayenneAccelerator {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
 
+        // A schema rebuild reaches this without going through `init`, so the
+        // open-time check is not on this path's stack. Refuse before touching
+        // the catalog: an overlapping metastore is a configuration the whole
+        // rebuild must reject, not just the delete below — opening the nested
+        // path as a catalog would fail confusingly (or worse, mutate it) first.
+        if path_buf.exists() {
+            Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
+        }
+
         // Metadata first, and its failures are fatal. The caller treats a
         // successful drop as licence to clear the dataset checkpoint and
         // recreate, so a drop that removed the files and then failed to remove
@@ -3837,10 +3846,6 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         if path_buf.exists() {
-            // A schema rebuild reaches this without going through `init`, so the
-            // open-time check is not on this path's stack.
-            Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
-
             tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
             tracing::info!(
                 "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
