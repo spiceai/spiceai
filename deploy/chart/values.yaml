@@ -6,6 +6,17 @@ image:
   tag: latest-models # 2.2.0-unstable
 replicaCount: 1
 
+# Update strategy for the Deployment (used when stateful.enabled is false).
+# Defaults to the Kubernetes RollingUpdate strategy when unset.
+# Example — fully terminate the old pod before starting the new one
+# (e.g. for single-replica deployments with file-based acceleration):
+# strategy:
+#   type: Recreate
+
+# Update strategy for the StatefulSet (used when stateful.enabled is true).
+# updateStrategy:
+#   type: RollingUpdate
+
 service:
   # type can be null, ClusterIP, NodePort, or LoadBalancer
   type: null
