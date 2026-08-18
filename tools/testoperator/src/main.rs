@@ -22,7 +22,9 @@ mod commands;
 mod health;
 mod metrics;
 mod pg_stats;
+mod probe;
 mod spiced_metrics;
+mod stats;
 mod system_adapter;
 
 use args::{
@@ -111,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
             commands::schema::run(&args).await?;
         }
         Commands::Run(TestCommands::Htap(args)) => {
+            // The HTAP run is the long-lived one an external harness watches
+            // (it seeds the source, then drives load for hours), so it is the
+            // command whose phases `/v1/ready` reports. Started before the run
+            // so `/health` answers from the first second, and never fatal: a
+            // port clash must not cost a benchmark.
+            probe::serve(&args.test_args.common.health_listen).await;
             commands::htap::run(&args).await?;
         }
         Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {

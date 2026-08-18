@@ -1,9 +1,11 @@
 #!/usr/bin/expect -f
 
+source [file join [file dirname [info script]] repl_helpers.exp]
+
 # Runtime response timeout
 set timeout 30
 
-spawn spice chat
+spawn spice chat {*}[repl_endpoint_args]
 
 proc verify_datasets_access {} {
     global timeout
@@ -12,7 +14,7 @@ proc verify_datasets_access {} {
     set gh_issues_available 0
     set catalog_page_available 0
 
-    send "What datasets you have access to\r"
+    repl_send "What datasets you have access to\r"
 
     expect {
         -re "(?i)taxi_trips|taxi trips" {
@@ -36,6 +38,9 @@ proc verify_datasets_access {} {
         "chat> " {
             # end of model response
         }
+        eof {
+            repl_died "Waiting for the list of datasets"
+        }
         timeout {
             send_user "Timeout waiting for expected response\n"
             exit 1
@@ -53,7 +58,7 @@ proc verify_datasets_access {} {
 proc verify_num_issues {} {
     global timeout
 
-    send "How many issues stored in database?\r"
+    repl_send "How many issues stored in database?\r"
 
     expect {
         " ERROR " {
@@ -64,6 +69,9 @@ proc verify_num_issues {} {
         }
         "chat> " {
             # end of model response
+        }
+        eof {
+            repl_died "Waiting for the issue count"
         }
         timeout {
             send_user "Timeout waiting for expected response\n"
@@ -80,7 +88,7 @@ proc verify_catalog_page {} {
     set original_timeout $timeout
     set timeout 60
 
-    send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
+    repl_send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
         " ERROR " {
@@ -91,6 +99,9 @@ proc verify_catalog_page {} {
         }
         "chat> " {
             # end of model response
+        }
+        eof {
+            repl_died "Waiting for the catalog page deals"
         }
         timeout {
             send_user "Timeout waiting for expected response\n"
@@ -103,7 +114,18 @@ proc verify_catalog_page {} {
     send_user "Model returned expected response\n"
 }
 
-expect "chat>"
+expect {
+    "chat>" {
+        # runtime is ready for input
+    }
+    eof {
+        repl_died "Waiting for the initial chat prompt"
+    }
+    timeout {
+        send_user "Timeout waiting for initial chat prompt\n"
+        exit 1
+    }
+}
 
 verify_datasets_access
 sleep 1
@@ -113,7 +135,10 @@ sleep 1
 
 verify_catalog_page
 
+# Every verification passed, so the REPL must still be sitting at its prompt.
+repl_assert_running "Checking the chat REPL is still running"
+
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

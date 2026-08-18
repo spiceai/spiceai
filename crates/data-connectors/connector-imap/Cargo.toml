@@ -7,14 +7,20 @@ license-file.workspace = true
 description = "IMAP data connector for Spice.ai runtime"
 
 [dependencies]
+arrow.workspace = true
 async-trait.workspace = true
-data_components = { path = "../../data_components", features = ["imap"] }
+charset.workspace = true
+chrono.workspace = true
+data_components = { path = "../../data_components" }
 datafusion.workspace = true
 imap.workspace = true
+mailparse.workspace = true
 linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 snafu.workspace = true
 

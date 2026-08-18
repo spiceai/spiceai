@@ -1,0 +1,57 @@
+---
+name: Workflow YAML Check
+
+# A workflow GitHub cannot parse is silently disabled — it reports no jobs, its
+# triggers and path filters are never evaluated, and it is not a required check.
+# This gate turns that into a PR failure instead. See #12181.
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/scripts/check_workflow_yaml.py'
+      - '.github/scripts/test_check_workflow_yaml.py'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/scripts/check_workflow_yaml.py'
+      - '.github/scripts/test_check_workflow_yaml.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-workflow-yaml:
+    name: Validate GitHub Actions definitions
+    # GitHub-hosted on purpose: this is a sub-second check and must not queue
+    # behind the saturated self-hosted pool.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Run tests
+        run: python .github/scripts/test_check_workflow_yaml.py -v
+
+      - name: Validate GitHub Actions definitions
+        run: python .github/scripts/check_workflow_yaml.py

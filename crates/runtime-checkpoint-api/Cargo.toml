@@ -1,0 +1,20 @@
+[package]
+name = "runtime-checkpoint-api"
+description = "CDC checkpoint/offset store interface: the per-dataset checkpoint shapes the accelerator implements and data-source connectors call."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+# Only for the derives on the shape structs, which are part of their existing public
+# API. No shape is itself persisted as serde output — every one is stored as columns.
+serde.workspace = true
+snafu.workspace = true
+
+[lints]
+workspace = true

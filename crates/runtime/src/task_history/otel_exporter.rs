@@ -33,7 +33,7 @@ use spicepod::component::runtime::{
 
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 
-use super::TaskSpan;
+use super::{TaskSpan, correlation::TRACE_JOIN_ANCHOR};
 
 /// Label key used to identify plan capture spans in OpenTelemetry traces.
 /// This is used to override the default behavior of `captured_output` processing to ensure that
@@ -221,10 +221,6 @@ impl TaskHistoryExporter {
         span_id.len() == 16 && span_id.chars().all(|c| c.is_ascii_hexdigit())
     }
 
-    fn is_valid_traceid(trace_id: &Arc<str>) -> bool {
-        trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
-    }
-
     /// Captures query plans for spans that meet the threshold.
     ///
     /// Only used for `TaskHistoryCapturedPlan::Explain` (plan-only, no body
@@ -344,11 +340,18 @@ impl TaskHistoryExporter {
         }
         let trace_id: Arc<str> = span.span_context.trace_id().to_string().into();
         let span_id: Arc<str> = span.span_context.span_id().to_string().into();
-        let parent_span_id: Option<Arc<str>> = if span.parent_span_id == SpanId::INVALID {
-            None
-        } else {
-            Some(span.parent_span_id.to_string().into())
-        };
+        // A task that joined a trace whose id was handed to the client by an
+        // earlier RPC is anchored on `TRACE_JOIN_ANCHOR`, which names no task.
+        // Reporting it as the parent would point the column at a row that is
+        // never written, and `spice trace` — which roots its tree on a null
+        // parent — would not show the query at all. Such a task *is* the trace
+        // root as far as this table is concerned.
+        let parent_span_id: Option<Arc<str>> =
+            if span.parent_span_id == SpanId::INVALID || span.parent_span_id == TRACE_JOIN_ANCHOR {
+                None
+            } else {
+                Some(span.parent_span_id.to_string().into())
+            };
         let task: Arc<str> = extract_attr!(span, "task_override").unwrap_or(span.name.into());
         let input: Arc<str> = Self::process_context_payload(
             &self.captured_context,
@@ -362,19 +365,23 @@ impl TaskHistoryExporter {
                 ),
         );
 
-        let trace_id_override: Option<Arc<str>> = extract_attr!(span, "trace_id")
-            .and_then(|trace_id| if Self::is_valid_traceid(&trace_id) {
-                Some(trace_id)
-            } else {
-                tracing::warn!("User provided 'trace_id'='{}' is invalid. Must be a 32 character hex string.", Arc::clone(&trace_id));
-                None
+        // Validated the same way the header that supplies it is, so one id is
+        // not accepted at the door and rejected here (or vice versa).
+        let trace_id_override: Option<Arc<str>> =
+            extract_attr!(span, "trace_id").and_then(|trace_id: Arc<str>| {
+                let normalized = runtime_request_context::normalize_trace_id(&trace_id);
+                if normalized.is_none() {
+                    tracing::warn!("User provided 'trace_id'='{trace_id}' is invalid. Expected 32 hexadecimal characters, not all zero.");
+                }
+                normalized
             });
 
-        let distributed_parent_id: Option<Arc<str>> = extract_attr!(span, "parent_id")
-            .and_then(|parent_id| if Self::is_valid_span_id(&parent_id) {
-                Some(parent_id)
-            } else {
-                tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 32 character hex string.", Arc::clone(&trace_id));
+        let distributed_parent_id: Option<Arc<str>> =
+            extract_attr!(span, "parent_id").and_then(|parent_id: Arc<str>| {
+                if Self::is_valid_span_id(&parent_id) {
+                    return Some(parent_id);
+                }
+                tracing::warn!("User provided 'parent_id'='{parent_id}' is an invalid span id. Expected 16 hexadecimal characters.");
                 None
             });
 

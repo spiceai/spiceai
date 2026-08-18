@@ -96,6 +96,8 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
+pub(crate) mod pk_keyset_budget;
+pub(crate) mod predicate_stats;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod scan;
@@ -103,6 +105,7 @@ pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
+pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
 pub(crate) mod tuning;
@@ -114,25 +117,32 @@ pub(crate) mod zorder;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{
-    begin_compaction_shutdown, drain_compaction_tasks, in_flight_compaction_tasks,
-    reset_compaction_shutdown, set_compaction_runtime_env, set_compaction_runtime_handle,
+    begin_compaction_shutdown, compaction_budget, compaction_budget_permits,
+    drain_compaction_tasks, in_flight_compaction_tasks, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle,
 };
 pub use context::CayenneContext;
 pub use mem_tier::SlotAdvancer;
 pub use mem_tier_budget::{
-    global_mem_tier_total, global_mem_tier_used, set_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    clear_global_mem_tier_pool_account, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, release_bytes as release_global_mem_tier_bytes,
+    set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    try_reserve_bytes as try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_keyset_budget::{
+    force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
+    release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
+};
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder,
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
     PreparedAppendSnapshotPublish,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
@@ -1457,6 +1467,173 @@ mod tests {
             query_count(
                 &ctx,
                 "SELECT COUNT(*) FROM evolution_restart WHERE v > 2147483647"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// The inline-corpus half of the restart-evolution contract: rows small
+    /// enough to live in `cayenne_inlined_data` must scan correctly under a
+    /// schema widened while the provider was closed.
+    ///
+    /// `evolve_schema_live` flushes the corpus before its own swap, but the
+    /// open-time evolution in `try_widening_schema_evolution` commits the evolved
+    /// schema straight to the metastore, leaving a corpus a width behind for the
+    /// next provider to read. Without the decode-time adaptation the scan resolves
+    /// live-schema column indices against the narrower stored batch and fails with
+    /// `project index N out of bounds`.
+    #[tokio::test]
+    async fn schema_evolution_restart_scans_inlined_rows_under_widened_schema() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_inlined.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Inlining left at its defaults (1,024 rows / 1 MiB / 4 MiB), so this
+        // handful of rows is admitted to the corpus instead of a Vortex file —
+        // the contrast with `schema_evolution_restart_scans_old_files_under_widened_schema`,
+        // which zeroes the caps to force the file path.
+        let table_name = "evolution_restart_inlined";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider");
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![10_i32, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+
+        // Guard the premise: if these rows ever stop being inlined this test would
+        // silently degrade into a duplicate of the file-backed case above.
+        assert!(
+            !catalog
+                .get_inlined_data(&table_metadata.table_id)
+                .await
+                .expect("to read inlined data")
+                .is_empty(),
+            "rows under the default inline caps must land in the inline corpus"
+        );
+        drop(provider);
+
+        // Restart-time engine evolution: widen `v` Int32 -> Int64 and append a
+        // nullable `tag` column, exactly as `try_widening_schema_evolution` commits
+        // it at open — the corpus is NOT rewritten.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        catalog
+            .update_table_schema(&table_metadata.table_id, &plan.evolved_schema)
+            .await
+            .expect("to update table schema");
+
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+
+        // The whole corpus is served, not zero rows and not an error.
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart_inlined").await,
+            5
+        );
+        // Added column over pre-evolution inlined rows (null-fill).
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE tag IS NULL"
+            )
+            .await,
+            5
+        );
+        // Widened column under an Int64 predicate over Int32-encoded inlined rows.
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE v > 25"
+            )
+            .await,
+            3
+        );
+        // A projection that reaches the ADDED column is the index the unadapted
+        // batch could not resolve.
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM (SELECT id, v, name, tag FROM evolution_restart_inlined)"
+            )
+            .await,
+            5
+        );
+
+        // Post-evolution write lands at the widened width alongside the adapted corpus.
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&plan.evolved_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![6_i64])),
+                Arc::new(Int64Array::from(vec![5_000_000_000_i64])),
+                Arc::new(StringArray::from(vec!["f"])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("to build widened batch");
+        insert_batch(&provider, new_batch).await;
+
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart_inlined").await,
+            6
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE tag = 'x'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart_inlined WHERE v > 2147483647"
             )
             .await,
             1

@@ -14,739 +14,191 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Drive the `COM_BINLOG_DUMP` stream and emit one
-//! [`crate::cdc::ChangeEnvelope`] per committed source transaction.
+//! Shared binlog-dump primitives used by the multiplexed pump in
+//! [`super::shared`], which is the sole `MySQL` CDC streaming engine.
+//!
+//! `MySQL`'s `COM_BINLOG_DUMP`/`COM_BINLOG_DUMP_GTID` is server-wide with no
+//! server-side table filter, so every `refresh_mode: changes` dataset on a
+//! connection is coalesced onto one dump ([`super::shared`]); this module holds
+//! the pieces that pump needs and owns no stream loop of its own:
+//!
+//!   - [`open_binlog_stream`] to start a dump at a file+offset resume or, when
+//!     the source is `gtid_mode = ON`, GTID auto-positioning from an executed
+//!     set (failover-safe),
+//!   - [`buffer_rows_event`] to decode a rows event into a [`TransactionBuffer`],
+//!   - [`readiness_heartbeat`] / [`record_watermark`] / [`commit_ts_ms`] for
+//!     lag-based readiness and freshness metrics,
+//!   - [`adopt_current_layout`] + [`compute_pk_source_indexes`] for compatible
+//!     mid-stream `ALTER` adoption, and [`layout_event_mismatch`] to check an
+//!     adopted layout against the row images it will actually decode,
+//!   - [`classify_query`] / [`classify_statement`] for the transaction and DDL
+//!     boundaries in the event stream.
 //!
 //! # Ack model
 //!
-//! Postgres replication acks by advancing a *server-side* slot cursor; `MySQL`
-//! has no such cursor, so the ack is Spice's own persisted [`BinlogPosition`]:
-//!
-//!   - each envelope's committer records its transaction's end position in a
-//!     shared [`AckState`] (in-memory, cheap — run by the runtime after the
-//!     batch is durably applied),
-//!   - the stream folds those acks (plus safe idle advances past
-//!     foreign-table traffic, mirroring the Postgres keepalive advance) into
-//!     a monotonic `resume` position,
-//!   - and persists `resume` to the [`super::PositionStore`] every
-//!     `checkpoint_interval`.
-//!
-//! A crash therefore replays at most `checkpoint_interval` of already-applied
-//! changes, which the accelerator's PK upsert absorbs idempotently
-//! (at-least-once, the same contract as the Postgres snapshot/WAL boundary).
+//! `MySQL` keeps no server-side cursor, so the ack is Spice's own persisted
+//! [`BinlogPosition`] (plus an executed [`super::GtidSet`] when GTID-positioning),
+//! held per member and folded into the shared dump's resume by [`super::shared`].
+//! A crash replays at most `checkpoint_interval` of already-applied changes,
+//! which the accelerator's PK upsert absorbs idempotently (at-least-once).
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use arrow::datatypes::SchemaRef;
-use async_stream::try_stream;
-use async_trait::async_trait;
-use futures::{Stream, StreamExt};
-use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
+use bitvec::slice::BitSlice;
+use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
+use mysql_async::binlog::value::BinlogValue;
+use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
+use mysql_common::io::ParseBuf;
 
 use super::config::{BinlogPosition, ReplicationParams};
+use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
-use super::rows::{TransactionBuffer, build_change_batch, normalize_binlog_value, truncate_change};
+use super::rows::{TransactionBuffer, normalize_binlog_value};
 use super::setup::TableLayout;
-use super::{CheckpointMeta, Error, PersistedPosition, PositionStore, Result};
-use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
-
-pub(super) struct BinlogStreamInput {
-    pub params: ReplicationParams,
-    pub layout: TableLayout,
-    /// Position to start (or resume) streaming from.
-    pub start: BinlogPosition,
-    pub schema: SchemaRef,
-    /// Dataset-declared primary key column names.
-    pub primary_keys: Vec<String>,
-    /// Dataset field index → source row-image index.
-    pub column_map: Vec<usize>,
-    pub database: String,
-    pub table: String,
-    pub dataset_name: String,
-    pub position_store: Arc<dyn PositionStore>,
-    /// Versioned checkpoint meta ([`super::CheckpointMeta`] JSON) persisted
-    /// alongside each position — dataset schema + source-layout fingerprint
-    /// for drift detection on resume.
-    pub schema_json: Option<String>,
-    pub metrics: Arc<MetricsCollector>,
-}
-
-/// Highest transaction-end position whose envelope committer has run.
-/// Shared between the stream (reader) and every emitted envelope's
-/// committer (writers).
-#[derive(Default)]
-struct AckState {
-    committed: Mutex<Option<BinlogPosition>>,
-}
-
-impl AckState {
-    fn advance(&self, to: &BinlogPosition) {
-        let mut committed = self
-            .committed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match committed.as_ref() {
-            Some(current) if current >= to => {}
-            _ => *committed = Some(to.clone()),
-        }
-    }
-
-    fn committed(&self) -> Option<BinlogPosition> {
-        self.committed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
-/// `CommitChange` impl that advances the shared ack position. Persistence to
-/// the sidecar happens on the stream's periodic checkpoint, so commits stay
-/// as cheap as the Postgres LSN bump.
-struct PositionCommitter {
-    ack: Arc<AckState>,
-    position: BinlogPosition,
-}
-
-#[async_trait]
-impl CommitChange for PositionCommitter {
-    async fn commit(&self) -> std::result::Result<(), CommitError> {
-        self.ack.advance(&self.position);
-        Ok(())
-    }
-
-    /// Deferring only delays the in-memory ack (and thus the persisted
-    /// checkpoint). A crash before the deferred commit re-streams the
-    /// un-acked tail from the older persisted position — at-least-once via
-    /// the idempotent PK upsert. Safe to defer.
-    fn supports_deferral(&self) -> bool {
-        true
-    }
-}
-
-/// Whether the resume position may advance to `candidate` (the end of the
-/// event just processed): only when no transaction is buffering and every
-/// previously emitted envelope has been committed. Mirrors the Postgres
-/// `advance_if_fully_acked` guard — never ack past rows the runtime hasn't
-/// durably applied.
-fn may_safely_advance(
-    txn_pending: bool,
-    last_emitted: Option<&BinlogPosition>,
-    committed: Option<&BinlogPosition>,
-) -> bool {
-    if txn_pending {
-        return false;
-    }
-    match (last_emitted, committed) {
-        (None, _) => true,
-        (Some(emitted), Some(committed)) => committed >= emitted,
-        (Some(_), None) => false,
-    }
-}
-
-fn advance_max(target: &mut BinlogPosition, candidate: BinlogPosition) {
-    if candidate > *target {
-        *target = candidate;
-    }
-}
-
-pub(super) fn start_binlog_stream(input: BinlogStreamInput) -> ChangesStream {
-    Box::pin(binlog_change_stream(input))
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "single state machine over the binlog event loop; splitting it would \
-              scatter the per-connection state across helpers with 10+ arguments"
-)]
-fn binlog_change_stream(
-    input: BinlogStreamInput,
-) -> impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<> {
-    let BinlogStreamInput {
-        params,
-        layout,
-        start,
-        schema,
-        primary_keys,
-        column_map,
-        database,
-        table,
-        dataset_name,
-        position_store,
-        schema_json,
-        metrics,
-    } = input;
-
-    let pk_source_indexes = compute_pk_source_indexes(&schema, &primary_keys, &column_map);
-
-    try_stream! {
-        // The source table layout can be re-adopted mid-stream after a
-        // compatible ALTER TABLE (see the DDL handling below), so the
-        // positional mappings are mutable stream state.
-        let mut layout = layout;
-        let mut column_map = column_map;
-        let mut pk_source_indexes = pk_source_indexes;
-        let shutdown_epoch = crate::cdc::shutdown_epoch();
-        let ack = Arc::new(AckState::default());
-        // Monotonic resume/ack position: what we reconnect from and persist.
-        let mut resume = start.clone();
-        let mut checkpointer = Checkpointer {
-            store: position_store,
-            schema_json,
-            pending_adopt: None,
-            dataset_name: dataset_name.clone(),
-            metrics: Arc::clone(&metrics),
-            last_persisted: start,
-        };
-        let mut last_persist_at = Instant::now();
-        let mut last_emitted: Option<BinlogPosition> = None;
-        // Lazily-opened side connection for the periodic source-head poll
-        // (`SHOW BINARY LOG STATUS`) behind the lag metrics; dropped and
-        // reopened on error, never load-bearing for replication itself.
-        let mut side_conn: Option<Conn> = None;
-        let mut backoff = super::resilience::StreamBackoff::default_for_stream();
-        let mut reconnect_attempts: u32 = 0;
-
-        'reconnect: loop {
-            if crate::cdc::shutdown_epoch() != shutdown_epoch {
-                checkpointer.persist(&ack, &mut resume).await;
-                tracing::info!(dataset = %dataset_name, "runtime shutdown; released binlog connection");
-                break 'reconnect;
-            }
-
-            // Fold any acks that landed while we were disconnected.
-            if let Some(committed) = ack.committed() {
-                advance_max(&mut resume, committed);
-            }
-
-            let mut stream = match open_binlog_stream(&params, &resume, &dataset_name).await {
-                Ok(stream) => {
-                    backoff.reset();
-                    if reconnect_attempts > 0 {
-                        tracing::info!(
-                            dataset = %dataset_name,
-                            attempts = reconnect_attempts,
-                            position = %resume,
-                            "binlog connection resumed"
-                        );
-                        reconnect_attempts = 0;
-                    }
-                    stream
-                }
-                Err(e) if super::resilience::is_purged_position_error(&e) => {
-                    Err(purged_position_error(&resume, &dataset_name))?;
-                    unreachable!();
-                }
-                Err(e) if super::resilience::is_transient_mysql(&e) => {
-                    metrics.inc_reconnect();
-                    reconnect_attempts = reconnect_attempts.saturating_add(1);
-                    log_transient_reconnect(
-                        reconnect_attempts, &dataset_name, &e.to_string(),
-                        backoff.next_delay().as_millis(),
-                    );
-                    backoff.wait().await;
-                    continue 'reconnect;
-                }
-                Err(e) => {
-                    Err(StreamError::External(format!(
-                        "fatal mysql binlog connect failed for {dataset_name}: {e}"
-                    )))?;
-                    unreachable!();
-                }
-            };
-
-            // Per-connection state. A fresh connection re-sends the rotate +
-            // table-map events, so nothing carries over — except the decode
-            // layout, which lives across reconnects. If we adopted mid-stream
-            // but resume is still before that boundary, restore the pre-adopt
-            // layout so replayed pre-DDL row images keep the matching map.
-            if let Some(pre) = checkpointer.restore_pre_adopt_if_needed(&resume) {
-                tracing::info!(
-                    dataset = %dataset_name,
-                    position = %resume,
-                    "restoring pre-adopt source layout for reconnect before schema-change boundary"
-                );
-                layout = pre.layout.clone();
-                column_map = pre.column_map.clone();
-                pk_source_indexes = pre.pk_source_indexes.clone();
-            }
-            let mut current_file = resume.file.clone();
-            let mut txn: Option<TransactionBuffer> = None;
-
-            'recv: loop {
-                if crate::cdc::shutdown_epoch() != shutdown_epoch {
-                    // Release the dump thread now rather than at process
-                    // exit; the shutdown drain phase can take tens of
-                    // seconds. Checked per event and per idle tick, so the
-                    // bound is one checkpoint interval on a quiet source.
-                    if let Err(e) = stream.close().await {
-                        tracing::debug!(dataset = %dataset_name, error = %e, "binlog stream close during shutdown");
-                    }
-                    checkpointer.persist(&ack, &mut resume).await;
-                    tracing::info!(dataset = %dataset_name, "runtime shutdown; released binlog connection");
-                    break 'reconnect;
-                }
-
-                // Bound the wait so idle checkpointing (and shutdown checks)
-                // never depend on the server actually honoring the heartbeat
-                // request — a quiet source with no heartbeats must still
-                // persist acked positions every interval.
-                let next_event =
-                    match tokio::time::timeout(params.checkpoint_interval, stream.next()).await {
-                        Ok(item) => item,
-                        Err(_idle) => {
-                            checkpointer.persist(&ack, &mut resume).await;
-                            poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
-                                .await;
-                            last_persist_at = Instant::now();
-                            continue 'recv;
-                        }
-                    };
-                let Some(event) = next_event else {
-                    // Server closed the dump cleanly — treat as transient.
-                    metrics.inc_recv_error();
-                    metrics.inc_reconnect();
-                    reconnect_attempts = reconnect_attempts.saturating_add(1);
-                    log_transient_reconnect(
-                        reconnect_attempts, &dataset_name,
-                        "server closed the binlog stream",
-                        backoff.next_delay().as_millis(),
-                    );
-                    break 'recv;
-                };
-                let event = match event {
-                    Ok(event) => event,
-                    Err(e) if super::resilience::is_purged_position_error(&e) => {
-                        Err(purged_position_error(&resume, &dataset_name))?;
-                        unreachable!();
-                    }
-                    Err(e) if super::resilience::is_transient_mysql(&e) => {
-                        metrics.inc_recv_error();
-                        metrics.inc_reconnect();
-                        reconnect_attempts = reconnect_attempts.saturating_add(1);
-                        log_transient_reconnect(
-                            reconnect_attempts, &dataset_name, &e.to_string(),
-                            backoff.next_delay().as_millis(),
-                        );
-                        break 'recv;
-                    }
-                    Err(e) => {
-                        metrics.inc_recv_error();
-                        Err(StreamError::External(format!(
-                            "mysql binlog recv failed for {dataset_name}: {e}"
-                        )))?;
-                        unreachable!();
-                    }
-                };
-
-                let header = event.header();
-                let event_end_pos = u64::from(header.log_pos());
-                let event_timestamp = header.timestamp();
-                // A rotate event's header offset refers to the file being
-                // left, while `current_file` flips to the new file below —
-                // pairing them in the generic safe-advance would fabricate a
-                // position that doesn't exist. Rotates advance explicitly in
-                // their own arm instead.
-                let is_rotate = matches!(
-                    header.event_type(),
-                    Ok(mysql_async::binlog::EventType::ROTATE_EVENT)
-                );
-
-                let data = match event.read_data() {
-                    Ok(data) => data,
-                    Err(e) => {
-                        metrics.inc_decode_error();
-                        Err(StreamError::External(format!(
-                            "mysql binlog event decode failed for {dataset_name}: {e}"
-                        )))?;
-                        unreachable!();
-                    }
-                };
-
-                // One ack read per event: committers run concurrently
-                // downstream, so this is a snapshot — staleness only defers a
-                // safe-advance to the next event. Both commit protocols set
-                // `pending_commit`; the shared block after the match handles it.
-                let committed = ack.committed();
-                let mut pending_commit: Option<BinlogPosition> = None;
-
-                match data {
-                    Some(EventData::RotateEvent(rotate)) => {
-                        let name = rotate.name().into_owned();
-                        if !rotate.is_fake()
-                            && may_safely_advance(txn.is_some(), last_emitted.as_ref(), committed.as_ref())
-                        {
-                            advance_max(&mut resume, BinlogPosition::new(name.clone(), rotate.position()));
-                        }
-                        current_file = name;
-                    }
-                    Some(EventData::TableMapEvent(tme)) => {
-                        if table_map_matches(&tme, &database, &table)
-                            && tme.columns_count() != layout.columns.len() as u64
-                        {
-                            // The table was altered by a statement this stream
-                            // didn't witness (or couldn't parse). Try to adopt
-                            // the current source layout — see the ALTER TABLE
-                            // handling below for the tolerance contract.
-                            let boundary =
-                                BinlogPosition::new(current_file.clone(), event_end_pos);
-                            // Reconnect replay: if we already recorded this
-                            // boundary, apply that epoch — do NOT re-fetch
-                            // today's information_schema (may be a later epoch).
-                            if let Some(known) = checkpointer.layout_for_replay_boundary(&boundary) {
-                                layout = known.layout.clone();
-                                column_map = known.column_map.clone();
-                                pk_source_indexes = known.pk_source_indexes.clone();
-                            } else {
-                            match adopt_current_layout(
-                                &params, &database, &table, &schema, &layout, &primary_keys,
-                                &dataset_name,
-                            ).await {
-                                Ok(adopted)
-                                    if adopted.layout.columns.len() as u64
-                                        == tme.columns_count() =>
-                                {
-                                    // Defer durable fingerprint update until
-                                    // resume crosses this event — see
-                                    // `Checkpointer::note_adopted_layout`. Keep
-                                    // the pre-adopt layout so a reconnect that
-                                    // reopens before the boundary can restore it.
-                                    let pre_adopt = AdoptedLayout {
-                                        layout: layout.clone(),
-                                        column_map: column_map.clone(),
-                                        pk_source_indexes: pk_source_indexes.clone(),
-                                    };
-                                    checkpointer.note_adopted_layout(
-                                        &adopted,
-                                        pre_adopt,
-                                        &boundary,
-                                    );
-                                    layout = adopted.layout;
-                                    column_map = adopted.column_map;
-                                    pk_source_indexes = adopted.pk_source_indexes;
-                                }
-                                outcome => {
-                                    // Do NOT persist the resume position past a
-                                    // fatal schema boundary: advancing the
-                                    // durable cursor would leave a restart
-                                    // decoding remaining historical row images
-                                    // with the current layout (silent column
-                                    // scramble). Leave the last good checkpoint
-                                    // in place so rebootstrap / operator fix
-                                    // can recover from a known-safe position.
-                                    metrics.inc_schema_mismatch_error();
-                                    let reason = match outcome {
-                                        Ok(adopted) => format!(
-                                            "the current source layout has {} columns but this \
-                                             event was recorded against {} — the stream is \
-                                             replaying history from before a schema change",
-                                            adopted.layout.columns.len(),
-                                            tme.columns_count()
-                                        ),
-                                        Err(e) => e.to_string(),
-                                    };
-                                    Err(StreamError::External(format!(
-                                        "mysql binlog for {dataset_name}: source table \
-                                         {database}.{table} changed shape ({} columns on the \
-                                         event, {} validated) and the new layout cannot be \
-                                         adopted: {reason}. Re-bootstrap by setting \
-                                         `mysql_replication_invalid_position_behavior: rebootstrap`.",
-                                        tme.columns_count(),
-                                        layout.columns.len()
-                                    )))?;
-                                    unreachable!();
-                                }
-                            }
-                            }
-                        }
-                    }
-                    Some(EventData::RowsEvent(rows_data)) => {
-                        if let Some(tme) = stream
-                            .get_tme(rows_data.table_id())
-                            .filter(|tme| table_map_matches(tme, &database, &table))
-                        {
-                            let buffer = txn.get_or_insert_with(TransactionBuffer::new);
-                            if let Err(e) = buffer_rows_event(
-                                &rows_data, tme, &layout, &pk_source_indexes, buffer, &metrics,
-                            ) {
-                                metrics.inc_decode_error();
-                                Err(StreamError::External(format!(
-                                    "mysql binlog row decode failed for {dataset_name}: {e}"
-                                )))?;
-                                unreachable!();
-                            }
-                        }
-                    }
-                    Some(EventData::XidEvent(_)) => {
-                        pending_commit = Some(BinlogPosition::new(current_file.clone(), event_end_pos));
-                    }
-                    Some(EventData::QueryEvent(query)) => {
-                        let statement = query.query();
-                        let default_db = query.schema();
-                        match classify_query(&statement) {
-                            QueryKind::Begin => {
-                                txn = Some(TransactionBuffer::new());
-                            }
-                            QueryKind::Commit => {
-                                // Non-InnoDB tables commit via a plain COMMIT
-                                // query instead of an Xid event.
-                                pending_commit = Some(BinlogPosition::new(current_file.clone(), event_end_pos));
-                            }
-                            QueryKind::Xa => {
-                                // XA transactions commit via `XA COMMIT`, which
-                                // this stream does not track — changes made to
-                                // the subscribed table inside one would be
-                                // dropped. Loud and per-statement rather than
-                                // silent data loss.
-                                if txn.as_ref().is_some_and(|t| !t.is_empty()) {
-                                    Err(StreamError::External(format!(
-                                        "mysql binlog for {dataset_name}: XA transaction touched \
-                                         {database}.{table} ({statement}). XA (two-phase) \
-                                         transactions are not supported by `refresh_mode: changes` \
-                                         — use regular transactions for this table."
-                                    )))?;
-                                    unreachable!();
-                                }
-                                tracing::warn!(
-                                    dataset = %dataset_name,
-                                    statement = %statement,
-                                    "XA transaction statement observed on the binlog; XA \
-                                     transactions are not supported and their changes to other \
-                                     tables are ignored"
-                                );
-                            }
-                            QueryKind::Statement => {
-                                match classify_statement(&statement, &default_db, &database, &table) {
-                                    Some(StatementKind::Truncate) => {
-                                        // TRUNCATE is DDL: auto-committed, never
-                                        // inside a row transaction.
-                                        metrics.inc_truncate();
-                                        metrics.inc_transaction();
-                                        record_watermark(&metrics, event_timestamp);
-                                        let commit_pos = BinlogPosition::new(current_file.clone(), event_end_pos);
-                                        let batch = build_change_batch(&schema, &primary_keys, &column_map, &[truncate_change()])
-                                            .map_err(|e| StreamError::External(format!(
-                                                "change batch build failed for {dataset_name}: {e}"
-                                            )))?
-                                            .with_source_commit_ts_ms(commit_ts_ms(event_timestamp));
-                                        tracing::info!(
-                                            dataset = %dataset_name,
-                                            "TRUNCATE from mysql binlog queued for accelerator"
-                                        );
-                                        let envelope = ChangeEnvelope::new(
-                                            Box::new(PositionCommitter { ack: Arc::clone(&ack), position: commit_pos.clone() }),
-                                            batch,
-                                            false,
-                                        );
-                                        last_emitted = Some(commit_pos);
-                                        yield envelope;
-                                    }
-                                    // ALTER TABLE: re-fetch the source layout and keep
-                                    // streaming when every dataset column still maps —
-                                    // the same tolerance the Postgres connector's block
-                                    // mode has for compatible relation changes. Columns
-                                    // the source gained are not replicated (warned, in
-                                    // `adopt_current_layout`); a dropped or retyped
-                                    // dataset column is fatal below.
-                                    Some(StatementKind::SchemaChange("ALTER TABLE")) => {
-                                        let boundary = BinlogPosition::new(
-                                            current_file.clone(),
-                                            event_end_pos,
-                                        );
-                                        // Reconnect replay of a known boundary:
-                                        // apply the pending epoch, do not
-                                        // re-fetch today's information_schema.
-                                        if let Some(known) =
-                                            checkpointer.layout_for_replay_boundary(&boundary)
-                                        {
-                                            layout = known.layout.clone();
-                                            column_map = known.column_map.clone();
-                                            pk_source_indexes = known.pk_source_indexes.clone();
-                                        } else {
-                                        match adopt_current_layout(
-                                            &params, &database, &table, &schema, &layout,
-                                            &primary_keys, &dataset_name,
-                                        ).await {
-                                            Ok(adopted) => {
-                                                let pre_adopt = AdoptedLayout {
-                                                    layout: layout.clone(),
-                                                    column_map: column_map.clone(),
-                                                    pk_source_indexes: pk_source_indexes.clone(),
-                                                };
-                                                checkpointer.note_adopted_layout(
-                                                    &adopted,
-                                                    pre_adopt,
-                                                    &boundary,
-                                                );
-                                                layout = adopted.layout;
-                                                column_map = adopted.column_map;
-                                                pk_source_indexes = adopted.pk_source_indexes;
-                                            }
-                                            Err(e) => {
-                                                // Do NOT persist past a fatal ALTER —
-                                                // see the TableMap mismatch path.
-                                                metrics.inc_schema_mismatch_error();
-                                                Err(StreamError::External(format!(
-                                                    "mysql binlog for {dataset_name}: ALTER TABLE on source table \
-                                                     {database}.{table} (statement: {statement}) cannot be adopted \
-                                                     mid-stream: {e}. Update the dataset schema to match the new \
-                                                     table definition, or re-bootstrap by setting \
-                                                     `mysql_replication_invalid_position_behavior: rebootstrap`."
-                                                )))?;
-                                                unreachable!();
-                                            }
-                                        }
-                                        }
-                                    }
-                                    Some(StatementKind::SchemaChange(verb)) => {
-                                        // Do NOT persist past DROP/RENAME — see
-                                        // the TableMap mismatch path.
-                                        metrics.inc_schema_mismatch_error();
-                                        Err(StreamError::External(format!(
-                                            "mysql binlog for {dataset_name}: {verb} detected on source table \
-                                             {database}.{table} (statement: {statement}). The subscribed table \
-                                             no longer exists under this name — fix the source (or the dataset) \
-                                             and re-bootstrap by setting \
-                                             `mysql_replication_invalid_position_behavior: rebootstrap`."
-                                        )))?;
-                                        unreachable!();
-                                    }
-                                    None => {}
-                                }
-                                // An auto-committed statement closes the GTID
-                                // transaction group it arrived in; drop the
-                                // (necessarily empty — row changes never
-                                // arrive as statements under ROW format)
-                                // buffer so the safe-advance isn't wedged.
-                                if txn.as_ref().is_some_and(TransactionBuffer::is_empty) {
-                                    txn = None;
-                                }
-                            }
-                        }
-                    }
-                    // A GTID event opens a transaction *group* ahead of its
-                    // BEGIN/statement — start buffering here so the
-                    // safe-advance can't checkpoint between the GTID and its
-                    // transaction.
-                    Some(EventData::GtidEvent(_) | EventData::AnonymousGtidEvent(_)) => {
-                        txn = Some(TransactionBuffer::new());
-                    }
-                    // Heartbeats (and any other event) fall through to the
-                    // safe-advance below, mirroring the Postgres KeepAlive
-                    // handling.
-                    Some(_) | None => {}
-                }
-
-                // Shared commit handling for both commit protocols (InnoDB
-                // Xid event, non-InnoDB COMMIT query): emit the buffered
-                // transaction, or fold an empty/foreign one into the
-                // safe-advance.
-                if let Some(commit_pos) = pending_commit {
-                    if let Some(envelope) = commit_transaction(
-                        &mut txn, &commit_pos, event_timestamp, &schema, &primary_keys,
-                        &column_map, &ack, &metrics, &dataset_name,
-                    )? {
-                        last_emitted = Some(commit_pos);
-                        yield envelope;
-                    } else if may_safely_advance(false, last_emitted.as_ref(), committed.as_ref()) {
-                        advance_max(&mut resume, commit_pos);
-                    }
-                }
-
-                // Safe idle advance: with no transaction buffering and every
-                // emitted envelope committed, everything up to this event's
-                // end is either applied or irrelevant to this dataset.
-                if !is_rotate
-                    && event_end_pos >= MIN_VALID_EVENT_POS
-                    && may_safely_advance(txn.is_some(), last_emitted.as_ref(), committed.as_ref())
-                {
-                    // Same-file fast path: skip allocating a position per
-                    // pass-through event.
-                    if resume.file == current_file {
-                        resume.pos = resume.pos.max(event_end_pos);
-                    } else {
-                        advance_max(&mut resume, BinlogPosition::new(current_file.clone(), event_end_pos));
-                    }
-                } else if let Some(committed) = committed {
-                    advance_max(&mut resume, committed);
-                }
-
-                // Flush when the checkpoint interval elapses, or as soon as a
-                // pending layout-adopt fingerprint becomes eligible (resume
-                // crossed the DDL/TableMap boundary). The latter must not wait
-                // for the interval — a crash with the old fingerprint still
-                // durable is fine (forces rebootstrap); a crash with the *new*
-                // fingerprint at a pre-boundary position is not.
-                let flush_adopt = checkpointer.pending_adopt_ready(&resume);
-                if flush_adopt || last_persist_at.elapsed() >= params.checkpoint_interval {
-                    checkpointer.persist(&ack, &mut resume).await;
-                    if !flush_adopt {
-                        poll_source_head(&mut side_conn, &params, &resume, &metrics, &dataset_name)
-                            .await;
-                    }
-                    last_persist_at = Instant::now();
-                }
-            } // 'recv
-
-            // Inner loop broke on a transient error: back off, then let the
-            // outer loop reconnect from the resume position.
-            backoff.wait().await;
-        } // 'reconnect
-    }
-}
+use super::{Error, Result};
+use crate::cdc::{ChangeEnvelope, StreamError, build_heartbeat_envelope};
 
 /// Binlog events start at offset 4 (after the magic header); positions below
 /// that (fake rotates and heartbeats report 0) are not resumable.
-const MIN_VALID_EVENT_POS: u64 = 4;
+pub(super) const MIN_VALID_EVENT_POS: u64 = 4;
 
-async fn open_binlog_stream(
-    params: &ReplicationParams,
-    resume: &BinlogPosition,
-    dataset_name: &str,
-) -> std::result::Result<BinlogStream, mysql_async::Error> {
-    let mut conn = Conn::new(params.opts.clone()).await?;
+/// Floor, in seconds, for how long the source will hold unread dump data before
+/// aborting the connection. Applied to the dump session because the server
+/// default is 60s.
+///
+/// The dump is one-way once started, so the server never waits for us to say
+/// anything — `net_write_timeout` fires purely on data we have not read. Every
+/// `refresh_mode: changes` dataset on a connection shares one dump, and the
+/// pump must-delivers each envelope into a bounded per-dataset channel, so a
+/// single dataset whose apply loop stalls (an in-memory-tier spill, for
+/// instance) stops the socket being drained for all of them. At the default the
+/// source then aborts the dump and every member resumes from its last acked
+/// position while already far behind, which deepens lag and invites the next
+/// abort.
+///
+/// 180s clears the worst apply cycle observed on CH-benCHmark SF1000 (~100s)
+/// with ~1.8x margin. This is empirical headroom, not a bound: the apply tail
+/// is not provably bounded (`cdc_max_coalesced_envelopes`/`_bytes` bound the
+/// burst, not how long a spill takes), so a genuinely wedged apply still
+/// reaches the timeout — it stays visible as the member send stall warning and
+/// its `replication_member_send_stalled_seconds_total` counter.
+///
+/// A floor rather than an assignment: an operator who already raised
+/// `net_write_timeout` past this — the manual workaround for exactly this
+/// symptom — must not have it lowered by connecting a newer runtime, so the
+/// statement takes the greater of their value and this one.
+const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
 
+/// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
+struct PreDumpStatement {
+    sql: String,
+    /// What the user loses if the server rejects this statement, when that is
+    /// worth saying. The heartbeat spellings are deliberately tried in pairs
+    /// and one of them is unknown on any given server version, so those carry
+    /// nothing and a rejection stays at debug.
+    rejection_warning: Option<&'static str>,
+}
+
+/// The session setup a dump connection needs, in the order it is issued.
+///
+/// Split out from [`open_binlog_stream`] so the statements — in particular
+/// which of them address a *user* variable versus a *system* one — are
+/// assertable without a `MySQL` server.
+fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStatement> {
     // Ask the source to send heartbeat events while idle so the stream can
     // detect dead connections and advance its checkpoint. Half the
     // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
     // the interval. The session variable is in nanoseconds; MySQL 8.4
     // renamed the replica-facing vocabulary, so set both spellings (unknown
     // user variables are inert).
-    let heartbeat_nanos = (params.checkpoint_interval / 2)
+    let heartbeat_nanos = (checkpoint_interval / 2)
         .max(Duration::from_millis(500))
         .as_nanos()
         .min(u128::from(u64::MAX));
     // Two separate statements: if a server rejects one spelling, the other
     // must still take effect (a combined statement fails atomically).
-    for var in ["master_heartbeat_period", "source_heartbeat_period"] {
-        if let Err(e) = mysql_async::prelude::Queryable::query_drop(
-            &mut conn,
-            format!("SET @{var} = {heartbeat_nanos}"),
-        )
-        .await
-        {
-            tracing::debug!(dataset = %dataset_name, error = %e, "failed to set @{var}");
+    let mut statements: Vec<PreDumpStatement> =
+        ["master_heartbeat_period", "source_heartbeat_period"]
+            .into_iter()
+            .map(|var| PreDumpStatement {
+                sql: format!("SET @{var} = {heartbeat_nanos}"),
+                rejection_warning: None,
+            })
+            .collect();
+    // `net_write_timeout` is a system variable, so it needs the `SESSION`
+    // form — the `SET @net_write_timeout` spelling the heartbeats use would
+    // define an unrelated user variable and leave the server default in place.
+    // `GREATEST` against the inherited value keeps this a floor in one
+    // statement, with no round-trip to read the current setting first.
+    statements.push(PreDumpStatement {
+        sql: format!(
+            "SET SESSION net_write_timeout = \
+             CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
+        ),
+        rejection_warning: Some(
+            "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
+        ),
+    });
+    statements
+}
+
+pub(super) async fn open_binlog_stream(
+    params: &ReplicationParams,
+    resume: &BinlogPosition,
+    dataset_name: &str,
+    use_gtid: bool,
+    gtid: &GtidSet,
+) -> std::result::Result<BinlogStream, mysql_async::Error> {
+    let mut conn = Conn::new(params.opts.clone()).await?;
+
+    for PreDumpStatement {
+        sql,
+        rejection_warning,
+    } in pre_dump_session_statements(params.checkpoint_interval)
+    {
+        if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
+            match rejection_warning {
+                Some(consequence) => {
+                    tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for dataset {dataset_name}: {consequence}");
+                }
+                None => {
+                    tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+                }
+            }
         }
     }
 
-    let pos_u32 = u32::try_from(resume.pos).unwrap_or(u32::MAX);
-    conn.get_binlog_stream(
-        BinlogStreamRequest::new(params.server_id)
-            .with_filename(resume.file.as_bytes())
-            .with_pos(u64::from(pos_u32)),
-    )
-    .await
-}
-
-fn table_map_matches(tme: &TableMapEvent<'_>, database: &str, table: &str) -> bool {
-    tme.database_name() == database && tme.table_name() == table
+    if use_gtid {
+        // GTID auto-positioning: the server computes the start point from the
+        // executed set (everything NOT in it is sent), so no filename/offset is
+        // needed. This is what survives a failover — the set is
+        // server-independent. An executed set that can't be represented on the
+        // wire fails loudly rather than silently under-reporting.
+        let gtid_set = gtid
+            .to_sids()
+            .map_err(|e| mysql_async::Error::Other(e.into()))?;
+        conn.get_binlog_stream(
+            BinlogStreamRequest::new(params.server_id)
+                .with_gtid()
+                .with_gtid_set(gtid_set),
+        )
+        .await
+    } else {
+        let pos_u32 = u32::try_from(resume.pos).unwrap_or(u32::MAX);
+        conn.get_binlog_stream(
+            BinlogStreamRequest::new(params.server_id)
+                .with_filename(resume.file.as_bytes())
+                .with_pos(u64::from(pos_u32)),
+        )
+        .await
+    }
 }
 
 /// Decode a rows event for the subscribed table into the transaction buffer.
-fn buffer_rows_event(
+pub fn buffer_rows_event(
     rows_data: &RowsEventData<'_>,
     tme: &TableMapEvent<'_>,
     layout: &TableLayout,
@@ -802,6 +254,173 @@ fn buffer_rows_event(
     Ok(())
 }
 
+/// Per-table row-image decoder prepared from a `TableMapEvent`.
+///
+/// It stores the column types, per-column metadata, and signedness needed to
+/// parse row values without rebuilding that metadata for every row image.
+/// Values still route through [`normalize_binlog_value`], so this path keeps
+/// the same value normalization as [`buffer_rows_event`].
+///
+/// `pub` (not `pub(super)`) so `benches/mysql_binlog_replay.rs` can exercise
+/// this exact decoder against the walk.
+pub struct TableMapRowDecoder {
+    /// Per source column: (binlog type, owned column metadata, unsigned).
+    cols: Vec<(ColumnType, Vec<u8>, bool)>,
+}
+
+impl TableMapRowDecoder {
+    /// Build from the route's `TableMapEvent`. Fails when the optional
+    /// metadata does not parse or a column type is absent; callers can fall
+    /// back to the [`buffer_rows_event`] walk for the same table map.
+    pub fn try_new(tme: &TableMapEvent<'_>) -> Result<Self> {
+        let decode_err = |message: String| Error::Decode { message };
+        let extractor = OptionalMetaExtractor::new(tme.iter_optional_meta())
+            .map_err(|e| decode_err(format!("table-map optional metadata: {e}")))?;
+        let mut signedness = extractor.iter_signedness();
+        let n = usize::try_from(tme.columns_count())
+            .map_err(|_| decode_err("column count exceeds usize".to_string()))?;
+        let mut cols = Vec::with_capacity(n);
+        for i in 0..n {
+            let ty = tme
+                .get_column_type(i)
+                .map_err(|e| decode_err(format!("column #{i} type: {e}")))?
+                .ok_or_else(|| decode_err(format!("column #{i} type missing")))?;
+            let meta = tme.get_column_metadata(i).unwrap_or(&[]).to_vec();
+            let unsigned = ty
+                .is_numeric_type()
+                .then(|| signedness.next())
+                .flatten()
+                .unwrap_or_default();
+            cols.push((ty, meta, unsigned));
+        }
+        Ok(Self { cols })
+    }
+
+    /// Decode one row image off `buf`. Spice requires `binlog_row_image = FULL`
+    /// (enforced the same way the walk does: a missing column is a decode
+    /// error), so `included` must cover every column.
+    fn decode_image<'a>(
+        &'a self,
+        buf: &mut ParseBuf<'a>,
+        included: &BitSlice<u8>,
+        layout: &TableLayout,
+    ) -> Result<Vec<Value>> {
+        let num_included = included.count_ones();
+        if num_included != self.cols.len() {
+            return Err(Error::Decode {
+                message: format!(
+                    "row image carries {num_included} of {} columns. Spice requires \
+                     `binlog_row_image = FULL` — a writer session overrode it.",
+                    self.cols.len()
+                ),
+            });
+        }
+        let bitmap_bytes = num_included.div_ceil(8);
+        let bitmap_buf: &[u8] = buf.parse(bitmap_bytes).map_err(|e| Error::Decode {
+            message: format!("row null bitmap: {e}"),
+        })?;
+        let null_bitmap: &BitSlice<u8> = BitSlice::from_slice(bitmap_buf);
+        let mut out = Vec::with_capacity(self.cols.len());
+        for (idx, (ty, meta, unsigned)) in self.cols.iter().enumerate() {
+            let column = layout.columns.get(idx).ok_or_else(|| Error::Decode {
+                message: format!(
+                    "row image has more columns than the validated layout ({})",
+                    layout.columns.len()
+                ),
+            })?;
+            let value: BinlogValue<'_> =
+                if null_bitmap.get(idx).as_deref().copied().unwrap_or_default() {
+                    BinlogValue::Value(Value::NULL)
+                } else {
+                    buf.parse((*ty, meta.as_slice(), *unsigned, false))
+                        .map_err(|e| Error::Decode {
+                            message: format!("column #{idx} (`{}`) value parse: {e}", column.name),
+                        })?
+                };
+            out.push(normalize_binlog_value(column, value)?);
+        }
+        Ok(out)
+    }
+}
+
+/// [`buffer_rows_event`] on the fast decode path: same op classification,
+/// buffering, and metrics, with the per-row images parsed by the cached
+/// [`TableMapRowDecoder`] instead of `mysql_common`'s per-image metadata rebuild.
+pub fn buffer_rows_event_fast(
+    rows_data: &RowsEventData<'_>,
+    decoder: &TableMapRowDecoder,
+    layout: &TableLayout,
+    pk_source_indexes: &[usize],
+    buffer: &mut TransactionBuffer,
+    metrics: &MetricsCollector,
+) -> Result<()> {
+    enum FastOp {
+        Insert,
+        Update,
+        Delete,
+    }
+    if layout.columns.len() != decoder.cols.len() {
+        return Err(Error::Decode {
+            message: format!(
+                "row image has {} columns but the validated layout has {} — the source \
+                 table was altered. Restart the dataset to re-validate the schema.",
+                decoder.cols.len(),
+                layout.columns.len()
+            ),
+        });
+    }
+    let op = match rows_data {
+        RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_) => FastOp::Insert,
+        RowsEventData::UpdateRowsEvent(_) | RowsEventData::UpdateRowsEventV1(_) => FastOp::Update,
+        RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => FastOp::Delete,
+        RowsEventData::PartialUpdateRowsEvent(_) => {
+            return Err(Error::Decode {
+                message: "partial-JSON row images are not supported. Set \
+                          `binlog_row_value_options = ''` on the source server."
+                    .to_string(),
+            });
+        }
+    };
+    let before_cols = rows_data.columns_before_image();
+    let after_cols = rows_data.columns_after_image();
+    let mut buf = ParseBuf(rows_data.rows_data());
+    while !buf.0.is_empty() {
+        let before = before_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        let after = after_cols
+            .map(|included| decoder.decode_image(&mut buf, included, layout))
+            .transpose()?;
+        match op {
+            FastOp::Insert => {
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "write event is missing its after row image".to_string(),
+                })?;
+                buffer.push_insert(after);
+                metrics.inc_insert();
+            }
+            FastOp::Update => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its before row image".to_string(),
+                })?;
+                let after = after.ok_or_else(|| Error::Decode {
+                    message: "update event is missing its after row image".to_string(),
+                })?;
+                buffer.push_update(pk_source_indexes, before, after);
+                metrics.inc_update();
+            }
+            FastOp::Delete => {
+                let before = before.ok_or_else(|| Error::Decode {
+                    message: "delete event is missing its before row image".to_string(),
+                })?;
+                buffer.push_delete(before);
+                metrics.inc_delete();
+            }
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "used as a function pointer in map_err; taking by reference would require a closure at every call site"
@@ -844,52 +463,37 @@ fn binlog_row_to_values(mut row: BinlogRow, layout: &TableLayout) -> Result<Vec<
         .collect()
 }
 
-/// Finish the buffered transaction: build the change batch and wrap it in an
-/// envelope whose committer acks `commit_pos`. Returns `None` for an empty
-/// (foreign-table or no-op) transaction.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "commit sites pass the stream's live state; bundling into a struct would \
-              just relocate the argument list"
-)]
-fn commit_transaction(
-    txn: &mut Option<TransactionBuffer>,
-    commit_pos: &BinlogPosition,
-    event_timestamp: u32,
+/// Build an idle readiness heartbeat: a zero-row envelope stamped with a
+/// source-attested clock (`source_now_ms`), flagged Ready when that clock is
+/// within `ready_lag` of now. Emitted only when the stream has caught up to the
+/// source head, so it never marks a still-behind dataset Ready.
+pub(super) fn readiness_heartbeat(
     schema: &SchemaRef,
-    primary_keys: &[String],
-    column_map: &[usize],
-    ack: &Arc<AckState>,
-    metrics: &MetricsCollector,
+    source_now_ms: i64,
+    ready_lag: Duration,
     dataset_name: &str,
-) -> std::result::Result<Option<ChangeEnvelope>, StreamError> {
-    metrics.inc_transaction();
-    record_watermark(metrics, event_timestamp);
-
-    let Some(buffer) = txn.take() else {
-        return Ok(None);
-    };
-    if buffer.is_empty() {
-        return Ok(None);
-    }
-
-    let batch = build_change_batch(schema, primary_keys, column_map, &buffer.changes)
-        .map_err(|e| {
-            StreamError::External(format!("change batch build failed for {dataset_name}: {e}"))
-        })?
-        .with_source_commit_ts_ms(commit_ts_ms(event_timestamp));
-
-    Ok(Some(ChangeEnvelope::new(
-        Box::new(PositionCommitter {
-            ack: Arc::clone(ack),
-            position: commit_pos.clone(),
-        }),
-        batch,
-        false,
-    )))
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let is_ready = crate::cdc::source_commit_within_ready_lag(Some(source_now_ms), ready_lag);
+    // Log the idle heartbeat so lag-based readiness can be verified from the logs
+    // (target spice_cdc::heartbeat). Covers both call sites of this helper.
+    let lag_ms = crate::cdc::replication_lag_ms(Some(source_now_ms));
+    tracing::debug!(
+        target: "spice_cdc::heartbeat",
+        connector = "mysql",
+        dataset = %dataset_name,
+        source_commit_ts_ms = source_now_ms,
+        is_dataset_ready = is_ready,
+        lag_ms = ?lag_ms,
+        "CDC idle heartbeat emitted"
+    );
+    build_heartbeat_envelope(schema, Some(source_now_ms), is_ready).map_err(|e| {
+        StreamError::External(format!(
+            "heartbeat envelope build failed for {dataset_name}: {e}"
+        ))
+    })
 }
 
-fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
+pub(super) fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
     if event_timestamp > 0 {
         metrics.record_commit_watermark(
             SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(event_timestamp)),
@@ -897,329 +501,14 @@ fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
     }
 }
 
-fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
+pub(super) fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
     (event_timestamp > 0).then(|| i64::from(event_timestamp) * 1000)
-}
-
-/// One schema-change boundary and the layout that applies to events at/after it.
-#[derive(Clone)]
-struct LayoutEpoch {
-    /// End position of the ALTER / `TableMap` that introduced this layout.
-    boundary: BinlogPosition,
-    layout: AdoptedLayout,
-    fingerprint: String,
-}
-
-/// A mid-stream layout adopt (or chain of adopts) whose fingerprint must not
-/// become durable until resume has crossed the relevant schema-change event.
-///
-/// Pairing a post-adopt fingerprint with a pre-boundary position would let a
-/// crash/restart decode historical row images with the new ordinal map.
-///
-/// The in-memory decode layout is swapped immediately (same-connection events
-/// after the DDL already use the new `TableMap`). On an in-process reconnect
-/// that reopens from a still-pre-boundary `resume`, the layout that was in
-/// force at that position is restored from [`Self::epochs`] /
-/// [`Self::pre_adopt`].
-struct PendingLayoutAdopt {
-    /// Layout in force before the first pending epoch — restored when
-    /// `resume` is still before `epochs[0].boundary`.
-    pre_adopt: AdoptedLayout,
-    /// Ordered schema-change epochs (ascending boundary). The layout for a
-    /// resume position `R` is the last epoch with `boundary <= R`, or
-    /// `pre_adopt` if `R` is before the first boundary.
-    epochs: Vec<LayoutEpoch>,
-}
-
-impl PendingLayoutAdopt {
-    fn earliest_boundary(&self) -> Option<&BinlogPosition> {
-        self.epochs.first().map(|epoch| &epoch.boundary)
-    }
-
-    fn latest_boundary(&self) -> Option<&BinlogPosition> {
-        self.epochs.last().map(|epoch| &epoch.boundary)
-    }
-
-    /// Layout that was in force at `resume` (for reconnect restore).
-    fn layout_at(&self, resume: &BinlogPosition) -> &AdoptedLayout {
-        let mut current = &self.pre_adopt;
-        for epoch in &self.epochs {
-            if resume < &epoch.boundary {
-                break;
-            }
-            current = &epoch.layout;
-        }
-        current
-    }
-
-    /// Fingerprint that matches `resume` (for durable checkpoint meta).
-    fn fingerprint_at(&self, resume: &BinlogPosition) -> Option<&str> {
-        let mut fingerprint: Option<&str> = None;
-        for epoch in &self.epochs {
-            if resume < &epoch.boundary {
-                break;
-            }
-            fingerprint = Some(epoch.fingerprint.as_str());
-        }
-        fingerprint
-    }
-}
-
-/// Owns the durable half of the ack pipeline: folds committer acks into the
-/// resume position and writes it to the position store when it advanced.
-struct Checkpointer {
-    store: Arc<dyn PositionStore>,
-    /// Versioned [`CheckpointMeta`] JSON (dataset schema + source-layout
-    /// fingerprint). The fingerprint is updated from [`Self::pending_adopt`]
-    /// only once resume has crossed the schema-change boundary.
-    schema_json: Option<String>,
-    /// Compatible mid-stream adopt(s) waiting for resume to pass their
-    /// boundaries before the matching fingerprint is written to the sidecar.
-    pending_adopt: Option<PendingLayoutAdopt>,
-    dataset_name: String,
-    metrics: Arc<MetricsCollector>,
-    last_persisted: BinlogPosition,
-}
-
-impl Checkpointer {
-    /// Record a compatible mid-stream layout adopt.
-    ///
-    /// The durable sidecar keeps fingerprints that match the resume position
-    /// until [`Self::persist`] sees resume past each epoch boundary. The
-    /// caller swaps the in-memory decode layout immediately; reconnect
-    /// restore uses [`Self::restore_pre_adopt_if_needed`].
-    ///
-    /// Multiple adopts before resume crosses the first boundary append epochs
-    /// while preserving the original `pre_adopt`. Epochs are kept in boundary
-    /// order; a boundary already present is left unchanged (reconnect replay
-    /// must not overwrite with a later `information_schema` fetch), and a
-    /// boundary behind the latest known epoch is ignored (use
-    /// [`Self::layout_for_replay_boundary`] instead).
-    fn note_adopted_layout(
-        &mut self,
-        adopted: &AdoptedLayout,
-        pre_adopt: AdoptedLayout,
-        boundary: &BinlogPosition,
-    ) {
-        let epoch = LayoutEpoch {
-            boundary: boundary.clone(),
-            layout: adopted.clone(),
-            fingerprint: adopted.layout.fingerprint(),
-        };
-        match self.pending_adopt.as_mut() {
-            Some(pending) => {
-                if pending
-                    .epochs
-                    .iter()
-                    .any(|existing| &existing.boundary == boundary)
-                {
-                    // Already known (reconnect replay). Leave the recorded
-                    // epoch alone — a re-fetched information_schema layout
-                    // may be a later epoch and must not overwrite.
-                } else if pending
-                    .latest_boundary()
-                    .is_some_and(|latest| boundary < latest)
-                {
-                    tracing::debug!(
-                        dataset = %self.dataset_name,
-                        boundary = %boundary,
-                        "ignoring layout adopt behind an already-pending later schema-change boundary"
-                    );
-                } else {
-                    pending.epochs.push(epoch);
-                }
-            }
-            None => {
-                self.pending_adopt = Some(PendingLayoutAdopt {
-                    pre_adopt,
-                    epochs: vec![epoch],
-                });
-            }
-        }
-    }
-
-    /// Layout to use when replaying a schema-change at `boundary` while a
-    /// pending chain already exists.
-    ///
-    /// Exact boundary hits return that epoch. Boundaries behind the latest
-    /// pending epoch (e.g. reconnect replaying ALTER@A1 when only `TableMap`@T1
-    /// and ALTER@A2 were recorded) must NOT trigger a fresh
-    /// `information_schema` fetch — that returns today's later layout. Use
-    /// [`PendingLayoutAdopt::layout_at`] instead.
-    fn layout_for_replay_boundary(&self, boundary: &BinlogPosition) -> Option<&AdoptedLayout> {
-        let pending = self.pending_adopt.as_ref()?;
-        if let Some(exact) = pending
-            .epochs
-            .iter()
-            .find(|epoch| &epoch.boundary == boundary)
-        {
-            return Some(&exact.layout);
-        }
-        let latest = pending.latest_boundary()?;
-        (boundary < latest).then(|| pending.layout_at(boundary))
-    }
-
-    /// On reconnect, restore the decode layout that was in force at `resume`
-    /// whenever a pending adopt chain still has epochs ahead of (or at) that
-    /// position's required map. Returns `Some` when the live layout should be
-    /// replaced.
-    ///
-    /// Always restores when there is a pending chain and resume is before the
-    /// latest boundary — including the case where resume sits between two
-    /// epochs (needs the intermediate layout, not the latest live one).
-    fn restore_pre_adopt_if_needed(&self, resume: &BinlogPosition) -> Option<&AdoptedLayout> {
-        let pending = self.pending_adopt.as_ref()?;
-        let latest = pending.latest_boundary()?;
-        // If resume is already past every pending boundary, the live layout
-        // (latest adopt) is correct and durable flush will clear the chain.
-        if resume >= latest {
-            return None;
-        }
-        Some(pending.layout_at(resume))
-    }
-
-    /// Whether any pending epoch's fingerprint is eligible to become durable
-    /// (`resume` has crossed at least the earliest boundary).
-    fn pending_adopt_ready(&self, resume: &BinlogPosition) -> bool {
-        self.pending_adopt
-            .as_ref()
-            .and_then(PendingLayoutAdopt::earliest_boundary)
-            .is_some_and(|boundary| resume >= boundary)
-    }
-
-    /// Fold fingerprints for every epoch whose boundary is at or behind
-    /// `resume` into `schema_json`, dropping those epochs. Clears the pending
-    /// chain entirely once resume has crossed the latest boundary.
-    ///
-    /// Crossed epochs promote `pre_adopt` to the latest crossed layout so a
-    /// reconnect between remaining boundaries restores the intermediate map
-    /// (not the original pre-first-adopt layout). The pending chain is only
-    /// mutated after the durable meta update succeeds — a failed refresh must
-    /// not lose the crossed fingerprint.
-    ///
-    /// Returns `true` when the durable meta was updated.
-    fn apply_pending_adopt_if_ready(&mut self, resume: &BinlogPosition) -> bool {
-        let Some(pending) = self.pending_adopt.as_ref() else {
-            return false;
-        };
-        let Some(fingerprint) = pending.fingerprint_at(resume).map(str::to_string) else {
-            return false;
-        };
-
-        // Latest crossed epoch becomes the new `pre_adopt` baseline for any
-        // epochs that remain after this apply.
-        let mut promoted_pre_adopt = pending.pre_adopt.clone();
-        for epoch in &pending.epochs {
-            if resume < &epoch.boundary {
-                break;
-            }
-            promoted_pre_adopt = epoch.layout.clone();
-        }
-        let remaining_epochs: Vec<LayoutEpoch> = pending
-            .epochs
-            .iter()
-            .filter(|epoch| resume < &epoch.boundary)
-            .cloned()
-            .collect();
-
-        let Some(json) = self.schema_json.as_deref() else {
-            // No durable meta to refresh. Still advance/clear the in-memory
-            // chain once resume has crossed so `pending_adopt_ready` cannot
-            // stay true forever and skip source-head polls. Restart will
-            // refuse `MissingCheckpointMeta` anyway.
-            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
-            return false;
-        };
-        let Ok(Some(mut meta)) = CheckpointMeta::parse(json) else {
-            // Corrupt / unsupported meta — same as missing: clear the chain
-            // once crossed rather than wedging the event loop.
-            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
-            return false;
-        };
-        if meta.source_layout_fingerprint == fingerprint {
-            // Fingerprint already durable — still advance the in-memory chain
-            // so reconnect restore stays consistent with resume.
-            self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
-            return false;
-        }
-        meta.source_layout_fingerprint = fingerprint;
-        match meta.to_schema_json() {
-            Ok(updated) => {
-                self.schema_json = Some(updated);
-                self.advance_or_clear_pending(promoted_pre_adopt, remaining_epochs);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    error = %e,
-                    "failed to refresh checkpoint layout fingerprint after mid-stream adopt"
-                );
-                false
-            }
-        }
-    }
-
-    fn advance_or_clear_pending(
-        &mut self,
-        promoted_pre_adopt: AdoptedLayout,
-        remaining_epochs: Vec<LayoutEpoch>,
-    ) {
-        if remaining_epochs.is_empty() {
-            self.pending_adopt = None;
-        } else if let Some(pending) = self.pending_adopt.as_mut() {
-            pending.pre_adopt = promoted_pre_adopt;
-            pending.epochs = remaining_epochs;
-        }
-    }
-
-    /// Persist the resume position (after folding in the latest ack) when it
-    /// advanced, or when a pending layout-adopt fingerprint became eligible.
-    /// Sidecar failures are logged and counted, not fatal — the position
-    /// re-persists on the next interval, and a crash in between only widens
-    /// the idempotent replay window.
-    ///
-    /// Callers must not invoke this on a fatal schema-mismatch path: advancing
-    /// the durable cursor past an un-adoptable DDL / `TableMap` boundary would
-    /// leave a restart decoding historical row images with the current layout.
-    async fn persist(&mut self, ack: &AckState, resume: &mut BinlogPosition) {
-        if let Some(committed) = ack.committed() {
-            advance_max(resume, committed);
-        }
-        let fingerprint_updated = self.apply_pending_adopt_if_ready(resume);
-        if *resume <= self.last_persisted && !fingerprint_updated {
-            return;
-        }
-        let persisted = PersistedPosition {
-            position: resume.clone(),
-            schema_json: self.schema_json.clone(),
-        };
-        match self.store.save(&persisted).await {
-            Ok(()) => {
-                self.metrics.inc_checkpoint_persist();
-                self.metrics
-                    .set_committed_position(resume.file_ordinal().unwrap_or(0), resume.pos);
-                if *resume >= self.last_persisted {
-                    self.last_persisted = resume.clone();
-                }
-            }
-            Err(e) => {
-                self.metrics.inc_checkpoint_persist_error();
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    position = %resume,
-                    error = %e,
-                    "failed to persist binlog position; will retry on the next checkpoint interval"
-                );
-            }
-        }
-    }
 }
 
 /// Source row-image indexes of the declared primary keys, for PK-change
 /// detection on UPDATE. `column_map` is dataset-field-indexed, so PK names
 /// map through the dataset schema.
-fn compute_pk_source_indexes(
+pub(super) fn compute_pk_source_indexes(
     schema: &SchemaRef,
     primary_keys: &[String],
     column_map: &[usize],
@@ -1238,10 +527,10 @@ fn compute_pk_source_indexes(
 
 /// The re-validated positional mappings adopted after a source DDL.
 #[derive(Clone)]
-struct AdoptedLayout {
-    layout: TableLayout,
-    column_map: Vec<usize>,
-    pk_source_indexes: Vec<usize>,
+pub(super) struct AdoptedLayout {
+    pub(super) layout: TableLayout,
+    pub(super) column_map: Vec<usize>,
+    pub(super) pk_source_indexes: Vec<usize>,
 }
 
 /// Re-fetch the source table's layout and reconcile it against the dataset
@@ -1250,7 +539,7 @@ struct AdoptedLayout {
 /// dataset doesn't declare (including ones a DDL just added) are not
 /// replicated; newly-appeared ones are warned about, mirroring the Postgres
 /// connector's block-mode behavior for compatible relation changes.
-async fn adopt_current_layout(
+pub(super) async fn adopt_current_layout(
     params: &ReplicationParams,
     database: &str,
     table: &str,
@@ -1298,60 +587,168 @@ async fn adopt_current_layout(
     })
 }
 
-/// Poll the source's binlog head over a lazily-maintained side connection
-/// and publish the head/lag metrics. Best-effort: any failure drops the
-/// connection (reopened on the next tick) and never disturbs replication.
-async fn poll_source_head(
-    side_conn: &mut Option<Conn>,
-    params: &ReplicationParams,
-    resume: &BinlogPosition,
-    metrics: &MetricsCollector,
-    dataset_name: &str,
-) {
-    let conn = match side_conn {
-        Some(conn) => conn,
-        None => match Conn::new(params.opts.clone()).await {
-            Ok(conn) => side_conn.insert(conn),
-            Err(e) => {
-                tracing::debug!(
-                    dataset = %dataset_name,
-                    error = %e,
-                    "failed to open the source-head polling connection; lag metrics deferred"
-                );
-                return;
-            }
-        },
-    };
-    match super::setup::fetch_head_position(conn).await {
-        Ok(head) => {
-            // Byte lag is exact only within one binlog file; across files
-            // the metric goes absent rather than guessing.
-            let lag_bytes = (head.file == resume.file).then(|| head.pos.saturating_sub(resume.pos));
-            metrics.set_source_head(head.file_ordinal().unwrap_or(0), head.pos, lag_bytes);
+/// A coarse binlog column-type class, used to compare a layout fetched from
+/// `information_schema` against the column types a `TableMap` event carries.
+///
+/// Deliberately coarse: families whose wire type depends on the server version
+/// or the column's charset/metadata are collapsed into one class (or left
+/// unmapped entirely) so that a class *disagreement* is always a real
+/// disagreement. See [`source_type_class`] for what is intentionally omitted —
+/// this comparison gates every decode, so a false positive would break a
+/// healthy stream, which is strictly worse than the rare scramble it detects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BinlogTypeClass {
+    Int8,
+    Int16,
+    Int24,
+    Int32,
+    Int64,
+    Float,
+    Double,
+    Decimal,
+    Date,
+    Year,
+    Bit,
+    Json,
+    Geometry,
+    /// `CHAR` / `VARCHAR` / `BINARY` / `VARBINARY` / `ENUM` / `SET`. One class
+    /// because the wire type within this family depends on charset and on the
+    /// `MYSQL_TYPE_STRING` metadata that encodes the real type.
+    StringLike,
+}
+
+/// Classify an `information_schema.COLUMNS.COLUMN_TYPE` string, or `None` when
+/// the binlog wire type is not pinned by the declared type alone.
+///
+/// Unmapped on purpose: `DATETIME` / `TIMESTAMP` / `TIME` (`*2` variants since
+/// 5.6), `TEXT` / `BLOB` (all sent as `MYSQL_TYPE_BLOB`, distinguished only by
+/// a length byte in the metadata), and `REAL` (`REAL_AS_FLOAT` `sql_mode`).
+fn source_type_class(column_type: &str) -> Option<BinlogTypeClass> {
+    let base: String = column_type
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "tinyint" => Some(BinlogTypeClass::Int8),
+        "smallint" => Some(BinlogTypeClass::Int16),
+        "mediumint" => Some(BinlogTypeClass::Int24),
+        "int" | "integer" => Some(BinlogTypeClass::Int32),
+        "bigint" => Some(BinlogTypeClass::Int64),
+        "float" => Some(BinlogTypeClass::Float),
+        "double" => Some(BinlogTypeClass::Double),
+        "decimal" | "numeric" => Some(BinlogTypeClass::Decimal),
+        "date" => Some(BinlogTypeClass::Date),
+        "year" => Some(BinlogTypeClass::Year),
+        "bit" => Some(BinlogTypeClass::Bit),
+        "json" => Some(BinlogTypeClass::Json),
+        "geometry" | "point" | "linestring" | "polygon" | "multipoint" | "multilinestring"
+        | "multipolygon" | "geomcollection" | "geometrycollection" => {
+            Some(BinlogTypeClass::Geometry)
         }
-        Err(e) => {
-            tracing::debug!(
-                dataset = %dataset_name,
-                error = %e,
-                "source-head poll failed; dropping the polling connection"
-            );
-            *side_conn = None;
+        "char" | "varchar" | "binary" | "varbinary" | "enum" | "set" => {
+            Some(BinlogTypeClass::StringLike)
         }
+        _ => None,
     }
 }
 
-fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamError {
+/// Classify a `TableMap` column type, or `None` when it carries no usable
+/// signal (see [`source_type_class`] for the omissions this mirrors).
+fn event_type_class(column_type: ColumnType) -> Option<BinlogTypeClass> {
+    match column_type {
+        ColumnType::MYSQL_TYPE_TINY => Some(BinlogTypeClass::Int8),
+        ColumnType::MYSQL_TYPE_SHORT => Some(BinlogTypeClass::Int16),
+        ColumnType::MYSQL_TYPE_INT24 => Some(BinlogTypeClass::Int24),
+        ColumnType::MYSQL_TYPE_LONG => Some(BinlogTypeClass::Int32),
+        ColumnType::MYSQL_TYPE_LONGLONG => Some(BinlogTypeClass::Int64),
+        ColumnType::MYSQL_TYPE_FLOAT => Some(BinlogTypeClass::Float),
+        ColumnType::MYSQL_TYPE_DOUBLE => Some(BinlogTypeClass::Double),
+        ColumnType::MYSQL_TYPE_NEWDECIMAL | ColumnType::MYSQL_TYPE_DECIMAL => {
+            Some(BinlogTypeClass::Decimal)
+        }
+        ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => Some(BinlogTypeClass::Date),
+        ColumnType::MYSQL_TYPE_YEAR => Some(BinlogTypeClass::Year),
+        ColumnType::MYSQL_TYPE_BIT => Some(BinlogTypeClass::Bit),
+        ColumnType::MYSQL_TYPE_JSON => Some(BinlogTypeClass::Json),
+        ColumnType::MYSQL_TYPE_GEOMETRY => Some(BinlogTypeClass::Geometry),
+        ColumnType::MYSQL_TYPE_VARCHAR
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_STRING
+        | ColumnType::MYSQL_TYPE_ENUM
+        | ColumnType::MYSQL_TYPE_SET => Some(BinlogTypeClass::StringLike),
+        _ => None,
+    }
+}
+
+/// A column position where the in-memory layout disagrees with the row images
+/// the `TableMap` event describes.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct LayoutEventMismatch {
+    pub(super) ordinal: usize,
+    pub(super) column: String,
+    pub(super) source_type: String,
+}
+
+/// Check the layout that will decode this table's row images against the
+/// column types the `TableMap` event itself carries.
+///
+/// [`adopt_current_layout`] re-reads `information_schema`, which reports the
+/// table's shape *now* — not its shape at the event being decoded. Under
+/// replication lag the source can apply a second, same-column-count `ALTER`
+/// (a reorder or a rename swap) before Spice reaches the first one, so the
+/// adopted layout maps ordinals that the row images in flight do not use, and
+/// values land in the wrong columns with nothing to fail on. The `TableMap`
+/// event is the one description of the row image that travels *with* it, so it
+/// is the authority here.
+///
+/// Returns the first position whose class disagrees, or `None` when the layout
+/// is consistent with the event (including when nothing could be compared
+/// confidently).
+pub(super) fn layout_event_mismatch(
+    layout: &TableLayout,
+    tme: &TableMapEvent<'_>,
+) -> Option<LayoutEventMismatch> {
+    // `get_column_type` resolves the real type behind `MYSQL_TYPE_STRING`. An
+    // out-of-range index, or a type this server build encodes in a way the
+    // client doesn't recognize, yields nothing to compare — not a mismatch.
+    layout_mismatch_against(layout, |ordinal| {
+        tme.get_column_type(ordinal).ok().flatten()
+    })
+}
+
+/// [`layout_event_mismatch`] over any source of per-ordinal column types.
+fn layout_mismatch_against(
+    layout: &TableLayout,
+    event_type: impl Fn(usize) -> Option<ColumnType>,
+) -> Option<LayoutEventMismatch> {
+    layout
+        .columns
+        .iter()
+        .enumerate()
+        .find_map(|(ordinal, column)| {
+            let source_class = source_type_class(&column.column_type)?;
+            let event_class = event_type(ordinal).and_then(event_type_class)?;
+            (source_class != event_class).then(|| LayoutEventMismatch {
+                ordinal,
+                column: column.name.clone(),
+                source_type: column.column_type.clone(),
+            })
+        })
+}
+
+pub(super) fn purged_position_error(resume: &BinlogPosition, dataset_name: &str) -> StreamError {
     StreamError::External(format!(
         "mysql binlog for {dataset_name}: the source no longer has binlog position {resume} \
          (binary logs were purged). Restart the dataset with \
-         `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position \
+         `mysql_replication_invalid_checkpoint_behavior: restart` to drop the saved position \
          and re-snapshot the table, or increase `binlog_expire_logs_seconds` on the source."
     ))
 }
 
 /// See `postgres_replication::client` for the WARN→DEBUG demotion rationale:
 /// the first failure of an outage is loud, the rest keep log volume sublinear.
-fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
+pub(super) fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
     if attempt <= 1 {
         tracing::warn!(
             dataset = %dataset,
@@ -1371,7 +768,7 @@ fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms
     }
 }
 
-enum QueryKind {
+pub(super) enum QueryKind {
     Begin,
     Commit,
     /// `XA START|END|PREPARE|COMMIT|ROLLBACK ...` — two-phase transactions
@@ -1380,7 +777,7 @@ enum QueryKind {
     Statement,
 }
 
-fn classify_query(statement: &str) -> QueryKind {
+pub(super) fn classify_query(statement: &str) -> QueryKind {
     let trimmed = statement.trim();
     if trimmed.eq_ignore_ascii_case("BEGIN") {
         QueryKind::Begin
@@ -1397,7 +794,7 @@ fn classify_query(statement: &str) -> QueryKind {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum StatementKind {
+pub(super) enum StatementKind {
     Truncate,
     SchemaChange(&'static str),
 }
@@ -1415,7 +812,7 @@ enum StatementKind {
 /// for unqualified table references. Identifier comparison is
 /// case-insensitive (matching `MySQL`'s common `lower_case_table_names`
 /// deployments; a false positive requires two tables differing only in case).
-fn classify_statement(
+pub(super) fn classify_statement(
     statement: &str,
     default_db: &str,
     database: &str,
@@ -1616,497 +1013,321 @@ fn parse_table_ref(tokens: &[Token], idx: &mut usize) -> Option<(Option<String>,
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::mysql_replication::setup::SourceColumn;
 
-    #[test]
-    fn safe_advance_requires_drained_and_idle() {
-        let emitted = BinlogPosition::new("binlog.000001", 500);
-        let committed_behind = BinlogPosition::new("binlog.000001", 400);
-        let committed_caught_up = BinlogPosition::new("binlog.000001", 500);
+    /// `MySQL`'s documented default for `net_write_timeout`, which is what aborts
+    /// a dump whose socket the pump stopped draining (#12527).
+    const SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS: u32 = 60;
 
-        // Nothing emitted yet: free to advance.
-        assert!(may_safely_advance(false, None, None));
-        // Transaction buffering: never advance.
-        assert!(!may_safely_advance(true, None, None));
-        // Emitted but not committed: hold.
-        assert!(!may_safely_advance(false, Some(&emitted), None));
-        assert!(!may_safely_advance(
-            false,
-            Some(&emitted),
-            Some(&committed_behind)
-        ));
-        // Fully drained: advance.
-        assert!(may_safely_advance(
-            false,
-            Some(&emitted),
-            Some(&committed_caught_up)
-        ));
+    fn statement_setting<'a>(
+        statements: &'a [PreDumpStatement],
+        variable: &str,
+    ) -> Option<&'a str> {
+        statements
+            .iter()
+            .find(|statement| statement.sql.contains(variable))
+            .map(|statement| statement.sql.as_str())
+    }
+
+    /// The warning the statement setting `variable` carries, if it carries one.
+    fn statement_rejection_warning(
+        statements: &[PreDumpStatement],
+        variable: &str,
+    ) -> Option<&'static str> {
+        statements
+            .iter()
+            .find(|statement| statement.sql.contains(variable))
+            .and_then(|statement| statement.rejection_warning)
     }
 
     #[test]
-    fn ack_state_is_monotonic() {
-        let ack = AckState::default();
-        ack.advance(&BinlogPosition::new("binlog.000002", 100));
-        // A late-running committer for an earlier position must not regress.
-        ack.advance(&BinlogPosition::new("binlog.000001", 900));
+    fn the_dump_session_raises_net_write_timeout() {
+        // Regression test for #12527: without this the source aborts the shared
+        // dump 60s into one dataset's slow apply cycle, and every
+        // `refresh_mode: changes` dataset on the connection re-streams from its
+        // acked position while already behind.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("the dump session must raise net_write_timeout");
         assert_eq!(
-            ack.committed(),
-            Some(BinlogPosition::new("binlog.000002", 100))
+            sql,
+            format!(
+                "SET SESSION net_write_timeout = \
+                 CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
+            ),
+            "net_write_timeout is a SYSTEM variable: the `SET @net_write_timeout` spelling the \
+             heartbeats use would define an unrelated user variable and silently leave the \
+             server default in place"
         );
-    }
-
-    #[test]
-    fn pending_adopt_fingerprint_waits_for_boundary() {
-        use super::super::setup::SourceColumn;
-        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
-
-        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
-            name: name.to_string(),
-            column_type: ty.to_string(),
-            enum_variants: None,
-            set_variants: None,
-            is_primary_key: pk,
-        };
-        let old_layout = TableLayout {
-            columns: vec![col("id", "int", true), col("name", "varchar(255)", false)],
-        };
-        let new_layout = TableLayout {
-            columns: vec![col("name", "varchar(255)", false), col("id", "int", true)],
-        };
-        assert_ne!(old_layout.fingerprint(), new_layout.fingerprint());
-
-        let meta = CheckpointMeta {
-            version: CHECKPOINT_META_VERSION,
-            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
-            source_layout_fingerprint: old_layout.fingerprint(),
-        };
-        let schema_json = meta.to_schema_json().expect("serialize");
-        let boundary = BinlogPosition::new("binlog.000001", 500);
-        let mut checkpointer = Checkpointer {
-            store: Arc::new(super::super::NoopPositionStore),
-            schema_json: Some(schema_json),
-            pending_adopt: None,
-            dataset_name: "orders".to_string(),
-            metrics: MetricsCollector::new(),
-            last_persisted: BinlogPosition::new("binlog.000001", 100),
-        };
-
-        let pre_adopt = AdoptedLayout {
-            layout: old_layout.clone(),
-            column_map: vec![0, 1],
-            pk_source_indexes: vec![0],
-        };
-        let adopted = AdoptedLayout {
-            layout: new_layout.clone(),
-            column_map: vec![1, 0],
-            pk_source_indexes: vec![1],
-        };
-        checkpointer.note_adopted_layout(&adopted, pre_adopt, &boundary);
-
-        // Pre-boundary resume must not flip the durable fingerprint, and must
-        // expose the pre-adopt layout for reconnect restore.
-        let before = BinlogPosition::new("binlog.000001", 400);
-        assert!(!checkpointer.pending_adopt_ready(&before));
-        assert!(!checkpointer.apply_pending_adopt_if_ready(&before));
-        let restored = checkpointer
-            .restore_pre_adopt_if_needed(&before)
-            .expect("pre-boundary reconnect must restore pre-adopt layout");
-        assert_eq!(restored.layout.fingerprint(), old_layout.fingerprint());
-        let still_old = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
-            .expect("parse")
-            .expect("v2");
-        assert_eq!(
-            still_old.source_layout_fingerprint,
-            old_layout.fingerprint()
-        );
-        assert!(checkpointer.pending_adopt.is_some());
-
-        // At/after the boundary the new fingerprint becomes eligible and
-        // reconnect must NOT restore the pre-adopt layout.
-        assert!(checkpointer.pending_adopt_ready(&boundary));
         assert!(
-            checkpointer
-                .restore_pre_adopt_if_needed(&boundary)
-                .is_none()
+            !sql.contains("SET @net_write_timeout"),
+            "a user-variable spelling is inert for a system variable: {sql}"
         );
-        assert!(checkpointer.apply_pending_adopt_if_ready(&boundary));
-        let updated = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
-            .expect("parse")
-            .expect("v2");
-        assert_eq!(updated.source_layout_fingerprint, new_layout.fingerprint());
-        assert!(checkpointer.pending_adopt.is_none());
+        const {
+            assert!(
+                DUMP_NET_WRITE_TIMEOUT_SECS > SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS,
+                "raising the timeout to at most the server default would change nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dump_session_never_lowers_an_operators_higher_net_write_timeout() {
+        // Raising `net_write_timeout` on the source is the manual workaround for
+        // this symptom, so an operator who has already done it must not have it
+        // lowered by connecting a runtime carrying this fix. `GREATEST` against
+        // the session's inherited value makes the statement a floor; a bare
+        // assignment would clamp their setting down to ours.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("the dump session must raise net_write_timeout");
         assert!(
-            checkpointer
-                .restore_pre_adopt_if_needed(&boundary)
-                .is_none()
+            sql.contains("GREATEST(@@SESSION.net_write_timeout,"),
+            "the statement must take the greater of the inherited value and ours: {sql}"
         );
     }
 
     #[test]
-    fn pending_adopt_clears_when_schema_json_missing() {
-        use super::super::setup::SourceColumn;
-
-        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
-            name: name.to_string(),
-            column_type: ty.to_string(),
-            enum_variants: None,
-            set_variants: None,
-            is_primary_key: pk,
-        };
-        let old_layout = TableLayout {
-            columns: vec![col("id", "int", true), col("name", "varchar(255)", false)],
-        };
-        let new_layout = TableLayout {
-            columns: vec![col("name", "varchar(255)", false), col("id", "int", true)],
-        };
-        let boundary = BinlogPosition::new("binlog.000001", 500);
-        let mut checkpointer = Checkpointer {
-            store: Arc::new(super::super::NoopPositionStore),
-            schema_json: None,
-            pending_adopt: None,
-            dataset_name: "orders".to_string(),
-            metrics: MetricsCollector::new(),
-            last_persisted: BinlogPosition::new("binlog.000001", 100),
-        };
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: new_layout,
-                column_map: vec![1, 0],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: old_layout,
-                column_map: vec![0, 1],
-                pk_source_indexes: vec![0],
-            },
-            &boundary,
+    fn a_rejected_net_write_timeout_is_worth_a_warning() {
+        // The heartbeat spellings are tried in pairs and one is always unknown,
+        // so those must stay quiet; a rejected net_write_timeout leaves the
+        // reconnect cliff in place and is the one the user can act on.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        for statement in &statements {
+            assert_eq!(
+                statement.rejection_warning.is_some(),
+                statement.sql.contains("net_write_timeout"),
+                "unexpected error visibility for {}",
+                statement.sql
+            );
+        }
+        let warning = statement_rejection_warning(&statements, "net_write_timeout")
+            .expect("a rejected net_write_timeout must say what it costs");
+        assert!(
+            warning.contains("https://spiceai.org/docs/"),
+            "the warning must point at the fix: {warning}"
         );
-        assert!(checkpointer.pending_adopt_ready(&boundary));
-        // Without durable meta, apply must still clear the chain so the event
-        // loop does not skip source-head polls forever.
-        assert!(!checkpointer.apply_pending_adopt_if_ready(&boundary));
-        assert!(checkpointer.pending_adopt.is_none());
-        assert!(!checkpointer.pending_adopt_ready(&boundary));
     }
 
     #[test]
-    fn second_adopt_preserves_original_pre_adopt_for_reconnect() {
-        use super::super::setup::SourceColumn;
-        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
+    fn both_heartbeat_spellings_are_set_as_user_variables_in_nanoseconds() {
+        // Half the checkpoint interval, in nanoseconds, on both the pre-8.4 and
+        // 8.4 spellings — unchanged by the net_write_timeout addition.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        for var in ["master_heartbeat_period", "source_heartbeat_period"] {
+            assert_eq!(
+                statement_setting(&statements, var),
+                Some(format!("SET @{var} = 5000000000").as_str()),
+                "{var} must stay a user variable, in nanoseconds"
+            );
+        }
+    }
 
-        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
-            name: name.to_string(),
-            column_type: ty.to_string(),
-            enum_variants: None,
-            set_variants: None,
-            is_primary_key: pk,
-        };
-        let l0 = TableLayout {
-            columns: vec![col("id", "int", true), col("a", "int", false)],
-        };
-        let l1 = TableLayout {
-            columns: vec![col("a", "int", false), col("id", "int", true)],
-        };
-        let l2 = TableLayout {
-            columns: vec![
-                col("a", "int", false),
-                col("id", "int", true),
-                col("b", "int", false),
+    #[test]
+    fn a_tiny_checkpoint_interval_floors_the_heartbeat_at_500ms() {
+        // A sub-second interval would otherwise ask the source to heartbeat
+        // continuously.
+        let statements = pre_dump_session_statements(Duration::from_millis(100));
+        assert_eq!(
+            statement_setting(&statements, "master_heartbeat_period"),
+            Some("SET @master_heartbeat_period = 500000000")
+        );
+    }
+
+    /// A layout of `(name, COLUMN_TYPE)` columns in ordinal order.
+    fn layout_of(columns: &[(&str, &str)]) -> TableLayout {
+        TableLayout {
+            columns: columns
+                .iter()
+                .map(|(name, column_type)| SourceColumn {
+                    name: (*name).to_string(),
+                    column_type: (*column_type).to_string(),
+                    enum_variants: None,
+                    set_variants: None,
+                    is_primary_key: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn mismatch_against(
+        columns: &[(&str, &str)],
+        event: &[Option<ColumnType>],
+    ) -> Option<LayoutEventMismatch> {
+        layout_mismatch_against(&layout_of(columns), |ordinal| {
+            event.get(ordinal).copied().flatten()
+        })
+    }
+
+    #[test]
+    fn layout_agreeing_with_the_event_is_not_a_mismatch() {
+        assert_eq!(
+            mismatch_against(
+                &[("id", "int(11)"), ("name", "varchar(255)")],
+                &[
+                    Some(ColumnType::MYSQL_TYPE_LONG),
+                    Some(ColumnType::MYSQL_TYPE_VARCHAR),
+                ],
+            ),
+            None
+        );
+    }
+
+    /// The #11764 scramble: two same-column-count ALTERs land while replication
+    /// is behind, so the layout read for the first one is really the layout
+    /// after the second — here `(id int, name varchar)` reordered to
+    /// `(name varchar, id int)`. The row images in flight still use the old
+    /// order, so this must be caught rather than decoded.
+    #[test]
+    fn a_reorder_read_ahead_of_the_event_is_a_mismatch() {
+        let mismatch = mismatch_against(
+            &[("name", "varchar(255)"), ("id", "int(11)")],
+            &[
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_VARCHAR),
             ],
-        };
-
-        let meta = CheckpointMeta {
-            version: CHECKPOINT_META_VERSION,
-            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
-            source_layout_fingerprint: l0.fingerprint(),
-        };
-        let mut checkpointer = Checkpointer {
-            store: Arc::new(super::super::NoopPositionStore),
-            schema_json: Some(meta.to_schema_json().expect("serialize")),
-            pending_adopt: None,
-            dataset_name: "orders".to_string(),
-            metrics: MetricsCollector::new(),
-            last_persisted: BinlogPosition::new("binlog.000001", 100),
-        };
-
-        let ba = BinlogPosition::new("binlog.000001", 500);
-        let bb = BinlogPosition::new("binlog.000001", 800);
-        let adopted_a = AdoptedLayout {
-            layout: l1.clone(),
-            column_map: vec![1, 0],
-            pk_source_indexes: vec![1],
-        };
-        let pre_a = AdoptedLayout {
-            layout: l0.clone(),
-            column_map: vec![0, 1],
-            pk_source_indexes: vec![0],
-        };
-        checkpointer.note_adopted_layout(&adopted_a, pre_a, &ba);
-
-        // Second adopt while resume is still before BA — caller's "pre_adopt"
-        // is the intermediate L1 live layout; must NOT become the restore
-        // baseline for positions before BA.
-        let adopted_b = AdoptedLayout {
-            layout: l2.clone(),
-            column_map: vec![1, 0, 2],
-            pk_source_indexes: vec![1],
-        };
-        let pre_b_wrong = AdoptedLayout {
-            layout: l1.clone(),
-            column_map: vec![1, 0],
-            pk_source_indexes: vec![1],
-        };
-        checkpointer.note_adopted_layout(&adopted_b, pre_b_wrong, &bb);
-
-        let before_a = BinlogPosition::new("binlog.000001", 400);
-        let between = BinlogPosition::new("binlog.000001", 600);
-
-        let restored_before = checkpointer
-            .restore_pre_adopt_if_needed(&before_a)
-            .expect("before BA must restore L0");
-        assert_eq!(restored_before.layout.fingerprint(), l0.fingerprint());
-
-        let restored_between = checkpointer
-            .restore_pre_adopt_if_needed(&between)
-            .expect("between BA and BB must restore L1");
-        assert_eq!(restored_between.layout.fingerprint(), l1.fingerprint());
-
-        // Durable fingerprint must not advance past BA until resume crosses BA.
-        assert!(!checkpointer.apply_pending_adopt_if_ready(&before_a));
-        assert!(checkpointer.apply_pending_adopt_if_ready(&between));
-        let mid = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
-            .expect("parse")
-            .expect("v2");
-        assert_eq!(mid.source_layout_fingerprint, l1.fingerprint());
-        // L2 epoch still pending until resume crosses BB. After the partial
-        // apply, reconnect at `between` must restore L1 (promoted pre_adopt),
-        // not the original L0.
-        assert!(checkpointer.pending_adopt.is_some());
-        let restored_after_partial = checkpointer
-            .restore_pre_adopt_if_needed(&between)
-            .expect("after partial apply, between BA and BB must still restore L1");
-        assert_eq!(
-            restored_after_partial.layout.fingerprint(),
-            l1.fingerprint(),
-            "partial apply must promote pre_adopt to the latest crossed layout"
-        );
-        // Positions before BA are no longer in the pending chain's restore
-        // window once BA has been crossed — restore uses promoted L1 as the
-        // baseline, which is correct for any remaining pre-BB reconnect that
-        // somehow reopened earlier (safe: L1 matches post-A events; pre-A
-        // events are behind the durable resume floor).
-        assert!(checkpointer.apply_pending_adopt_if_ready(&bb));
-        let done = CheckpointMeta::parse(checkpointer.schema_json.as_deref().expect("meta"))
-            .expect("parse")
-            .expect("v2");
-        assert_eq!(done.source_layout_fingerprint, l2.fingerprint());
-        assert!(checkpointer.pending_adopt.is_none());
+        )
+        .expect("a reordered layout must not decode against the old row image");
+        assert_eq!(mismatch.ordinal, 0);
+        assert_eq!(mismatch.column, "name");
+        assert_eq!(mismatch.source_type, "varchar(255)");
     }
 
+    /// The first disagreeing position is reported, not a later one.
     #[test]
-    fn reconnect_replay_uses_known_boundary_not_later_epoch() {
-        use super::super::setup::SourceColumn;
-        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
-
-        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
-            name: name.to_string(),
-            column_type: ty.to_string(),
-            enum_variants: None,
-            set_variants: None,
-            is_primary_key: pk,
-        };
-        let l0 = TableLayout {
-            columns: vec![col("id", "int", true), col("a", "int", false)],
-        };
-        let l1 = TableLayout {
-            columns: vec![col("a", "int", false), col("id", "int", true)],
-        };
-        let l2 = TableLayout {
-            columns: vec![
-                col("a", "int", false),
-                col("id", "int", true),
-                col("b", "int", false),
+    fn the_reported_mismatch_is_the_first_disagreeing_column() {
+        let mismatch = mismatch_against(
+            &[("a", "int"), ("b", "bigint"), ("c", "int")],
+            &[
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_LONG),
+                Some(ColumnType::MYSQL_TYPE_LONG),
             ],
-        };
+        )
+        .expect("bigint at position 1 disagrees with a 4-byte int");
+        assert_eq!(mismatch.ordinal, 1);
+        assert_eq!(mismatch.column, "b");
+    }
 
-        let meta = CheckpointMeta {
-            version: CHECKPOINT_META_VERSION,
-            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
-            source_layout_fingerprint: l0.fingerprint(),
-        };
-        let mut checkpointer = Checkpointer {
-            store: Arc::new(super::super::NoopPositionStore),
-            schema_json: Some(meta.to_schema_json().expect("serialize")),
-            pending_adopt: None,
-            dataset_name: "orders".to_string(),
-            metrics: MetricsCollector::new(),
-            last_persisted: BinlogPosition::new("binlog.000001", 100),
-        };
+    /// Widths within the integer family are distinct classes — a swap between
+    /// two integer columns of different widths still scrambles values.
+    #[test]
+    fn integer_widths_are_distinguished() {
+        for (declared, event) in [
+            ("tinyint(4)", ColumnType::MYSQL_TYPE_SHORT),
+            ("smallint(6)", ColumnType::MYSQL_TYPE_INT24),
+            ("mediumint(9)", ColumnType::MYSQL_TYPE_LONG),
+            ("bigint(20)", ColumnType::MYSQL_TYPE_LONG),
+        ] {
+            assert!(
+                mismatch_against(&[("n", declared)], &[Some(event)]).is_some(),
+                "{declared} must not be accepted against {event:?}"
+            );
+        }
+    }
 
-        let ba = BinlogPosition::new("binlog.000001", 500);
-        let bb = BinlogPosition::new("binlog.000001", 800);
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: l1.clone(),
-                column_map: vec![1, 0],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: l0.clone(),
-                column_map: vec![0, 1],
-                pk_source_indexes: vec![0],
-            },
-            &ba,
-        );
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: l2.clone(),
-                column_map: vec![1, 0, 2],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: l1.clone(),
-                column_map: vec![1, 0],
-                pk_source_indexes: vec![1],
-            },
-            &bb,
-        );
-
-        // Reconnect before BA restores L0; replaying ALTER@BA must apply the
-        // known L1 epoch — not today's L2 from information_schema.
-        let before_a = BinlogPosition::new("binlog.000001", 400);
-        let restored = checkpointer
-            .restore_pre_adopt_if_needed(&before_a)
-            .expect("restore L0");
-        assert_eq!(restored.layout.fingerprint(), l0.fingerprint());
-
-        let known = checkpointer
-            .layout_for_replay_boundary(&ba)
-            .expect("BA must be a known pending epoch");
+    /// A column the event says nothing usable about is skipped, not flagged —
+    /// the check only ever fails on a disagreement it is sure of.
+    #[test]
+    fn an_unreadable_event_type_is_skipped() {
         assert_eq!(
-            known.layout.fingerprint(),
-            l1.fingerprint(),
-            "reconnect replay of BA must use L1, not a later information_schema fetch"
+            mismatch_against(&[("id", "int(11)")], &[None]),
+            None,
+            "no event type to compare against is not a mismatch"
         );
-
-        // A spurious re-note of BA with today's L2 must not corrupt the chain.
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: l2,
-                column_map: vec![1, 0, 2],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: l0,
-                column_map: vec![0, 1],
-                pk_source_indexes: vec![0],
-            },
-            &ba,
-        );
-        let still = checkpointer
-            .layout_for_replay_boundary(&ba)
-            .expect("BA still known");
         assert_eq!(
-            still.layout.fingerprint(),
-            l1.fingerprint(),
-            "re-noting a known boundary must not overwrite with a later information_schema layout"
+            mismatch_against(&[("id", "int(11)")], &[]),
+            None,
+            "an out-of-range ordinal is not a mismatch"
+        );
+    }
+
+    /// Types whose wire encoding depends on the server version or the column's
+    /// charset are deliberately unmapped, so they can never produce a false
+    /// positive on a healthy stream. Guards the conservatism of the mapping.
+    #[test]
+    fn version_dependent_types_are_not_compared() {
+        for declared in [
+            "datetime(6)",
+            "timestamp",
+            "time(3)",
+            "text",
+            "longblob",
+            "tinytext",
+            "real",
+        ] {
+            assert_eq!(
+                source_type_class(declared),
+                None,
+                "{declared} must stay unmapped: its wire type is not pinned by the declared type"
+            );
+            // ...and therefore never reports a mismatch, whatever the event says.
+            assert_eq!(
+                mismatch_against(&[("c", declared)], &[Some(ColumnType::MYSQL_TYPE_LONG)]),
+                None
+            );
+        }
+    }
+
+    /// `CHAR`/`VARCHAR`/`BINARY`/`ENUM`/`SET` share one class: which wire type
+    /// the server picks within the family depends on charset and metadata, so
+    /// distinguishing them would fail healthy streams.
+    #[test]
+    fn the_string_family_is_one_class() {
+        for declared in [
+            "char(8)",
+            "varchar(64)",
+            "binary(16)",
+            "varbinary(16)",
+            "enum('a','b')",
+            "set('a','b')",
+        ] {
+            for event in [
+                ColumnType::MYSQL_TYPE_STRING,
+                ColumnType::MYSQL_TYPE_VARCHAR,
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                ColumnType::MYSQL_TYPE_ENUM,
+                ColumnType::MYSQL_TYPE_SET,
+            ] {
+                assert_eq!(
+                    mismatch_against(&[("c", declared)], &[Some(event)]),
+                    None,
+                    "{declared} vs {event:?} must not be reported"
+                );
+            }
+        }
+        // But a string column against a numeric event still is a mismatch.
+        assert!(
+            mismatch_against(
+                &[("c", "varchar(64)")],
+                &[Some(ColumnType::MYSQL_TYPE_LONG)]
+            )
+            .is_some()
         );
     }
 
     #[test]
-    fn behind_latest_unknown_boundary_uses_layout_at_not_fresh_fetch() {
-        use super::super::setup::SourceColumn;
-        use super::super::{CHECKPOINT_META_VERSION, CheckpointMeta};
-
-        let col = |name: &str, ty: &str, pk: bool| SourceColumn {
-            name: name.to_string(),
-            column_type: ty.to_string(),
-            enum_variants: None,
-            set_variants: None,
-            is_primary_key: pk,
-        };
-        let l0 = TableLayout {
-            columns: vec![col("id", "int", true), col("a", "int", false)],
-        };
-        let l1 = TableLayout {
-            columns: vec![col("a", "int", false), col("id", "int", true)],
-        };
-        let l2 = TableLayout {
-            columns: vec![
-                col("a", "int", false),
-                col("id", "int", true),
-                col("b", "int", false),
-            ],
-        };
-
-        let meta = CheckpointMeta {
-            version: CHECKPOINT_META_VERSION,
-            dataset_schema_json: r#"{"fields":[]}"#.to_string(),
-            source_layout_fingerprint: l0.fingerprint(),
-        };
-        let mut checkpointer = Checkpointer {
-            store: Arc::new(super::super::NoopPositionStore),
-            schema_json: Some(meta.to_schema_json().expect("serialize")),
-            pending_adopt: None,
-            dataset_name: "orders".to_string(),
-            metrics: MetricsCollector::new(),
-            last_persisted: BinlogPosition::new("binlog.000001", 100),
-        };
-
-        // First change recorded only via TableMap@T1; second via ALTER@A2.
-        let t1 = BinlogPosition::new("binlog.000001", 500);
-        let a2 = BinlogPosition::new("binlog.000001", 800);
-        let a1 = BinlogPosition::new("binlog.000001", 450); // ALTER that caused T1; ≠ T1
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: l1.clone(),
-                column_map: vec![1, 0],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: l0.clone(),
-                column_map: vec![0, 1],
-                pk_source_indexes: vec![0],
-            },
-            &t1,
-        );
-        checkpointer.note_adopted_layout(
-            &AdoptedLayout {
-                layout: l2,
-                column_map: vec![1, 0, 2],
-                pk_source_indexes: vec![1],
-            },
-            AdoptedLayout {
-                layout: l1.clone(),
-                column_map: vec![1, 0],
-                pk_source_indexes: vec![1],
-            },
-            &a2,
-        );
-
-        // A1 is behind latest but not an exact known boundary. Replay must use
-        // layout_at(A1)=L0 (A1 < T1), never a fresh L2 fetch.
-        let replay = checkpointer
-            .layout_for_replay_boundary(&a1)
-            .expect("behind-latest must resolve via layout_at");
+    fn source_types_are_parsed_from_their_base_name() {
         assert_eq!(
-            replay.layout.fingerprint(),
-            l0.fingerprint(),
-            "ALTER@A1 before TableMap@T1 must keep L0 until T1, not jump to L2"
+            source_type_class("int(10) unsigned zerofill"),
+            Some(BinlogTypeClass::Int32)
         );
-
-        // Between T1 and A2, an unknown boundary must resolve to L1.
-        let between = BinlogPosition::new("binlog.000001", 600);
-        let mid = checkpointer
-            .layout_for_replay_boundary(&between)
-            .expect("between T1 and A2");
-        assert_eq!(mid.layout.fingerprint(), l1.fingerprint());
-
-        // Exact T1 still works.
-        let at_t1 = checkpointer
-            .layout_for_replay_boundary(&t1)
-            .expect("exact T1");
-        assert_eq!(at_t1.layout.fingerprint(), l1.fingerprint());
+        assert_eq!(
+            source_type_class("DECIMAL(10,2)"),
+            Some(BinlogTypeClass::Decimal)
+        );
+        assert_eq!(
+            source_type_class("numeric(5,0)"),
+            Some(BinlogTypeClass::Decimal)
+        );
+        assert_eq!(
+            source_type_class("bigint unsigned"),
+            Some(BinlogTypeClass::Int64)
+        );
+        assert_eq!(source_type_class(""), None);
     }
 
     #[test]

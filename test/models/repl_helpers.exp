@@ -1,0 +1,100 @@
+# Shared helpers for the expect scripts that drive an interactive Spice REPL
+# (`spice chat`, `spice search`) over a pty.
+#
+# expect treats a spawned process going away as an ordinary end of input: when an
+# `expect` block has no `eof` pattern, the eof ends the block without running any
+# body, so the script continues as if the pattern had matched and reports success
+# for a response that never arrived. The dead process then only surfaces at the
+# next `send`, as "spawn id expN not open" — naming a line in the script instead
+# of the exit status of the process that died. See #12057.
+#
+# Every `expect` block in these scripts therefore needs an `eof` branch calling
+# `repl_died`, and every `send` goes through `repl_send`.
+
+# Renders text passed to `repl_send` for a diagnostic message.
+proc repl_render {text} {
+    return [string map [list "\r" "" "\x03" "<Ctrl-C>"] $text]
+}
+
+# Describes how the spawned process terminated, reaping it in the process.
+proc repl_termination_description {} {
+    if {[catch {wait} status]} {
+        return "could not be waited for ($status)"
+    }
+
+    # `wait` returns {pid spawn_id os_error_flag value}, where a non-zero
+    # os_error_flag makes `value` an errno message rather than an exit status,
+    # optionally followed by {CHILDKILLED signal description}.
+    if {[lindex $status 2] != 0} {
+        return "could not be reaped: [lindex $status 3]"
+    }
+
+    set signal [lrange $status 4 end]
+    if {[llength $signal] > 0} {
+        return "was terminated abnormally: $signal"
+    }
+
+    return "exited with status [lindex $status 3]"
+}
+
+# Reports a spawned process that is no longer running, then fails the script.
+# `context` says what the script was doing when it noticed.
+proc repl_died {context {detail ""}} {
+    send_user "\n$context: the spawned process is no longer running.\n"
+
+    if {$detail ne ""} {
+        send_user "expect reported: $detail\n"
+    }
+
+    # Read anything the process printed on its way out — with `log_user` on that
+    # output is echoed as it arrives, and it is usually the only record of why
+    # the process left. The connection is already closed once an `expect` block
+    # has matched eof, which makes this a no-op.
+    catch {
+        set timeout 5
+        expect {
+            eof {}
+            timeout {}
+        }
+    }
+
+    send_user "Spawned process [repl_termination_description].\n"
+    exit 1
+}
+
+# `send`, reporting a process that has already gone away instead of raising
+# "spawn id expN not open".
+proc repl_send {text} {
+    if {[catch {send -- $text} send_error]} {
+        repl_died "Sending \"[repl_render $text]\"" $send_error
+    }
+}
+
+# The arguments that point a REPL at this job's runtime, or none at all.
+#
+# In CI each job binds its runtime to its own port, because the self-hosted
+# pools run several runner instances on one host and spiced's default 8090
+# cannot be shared (#12419). SPICE_HTTP_ENDPOINT carries that port. When it is
+# unset — running one of these scripts by hand against a local runtime — the
+# REPL keeps its own default, so nothing has to be set to reproduce a CI run.
+proc repl_endpoint_args {} {
+    if {[info exists ::env(SPICE_HTTP_ENDPOINT)] && $::env(SPICE_HTTP_ENDPOINT) ne ""} {
+        return [list --endpoint $::env(SPICE_HTTP_ENDPOINT)]
+    }
+
+    return [list]
+}
+
+# Fails the script if the spawned process has exited. Writing to the pty of an
+# exited process succeeds silently, so a REPL that crashes while sitting idle at
+# its prompt is invisible to `repl_send` alone; reading finds the eof. Output
+# already buffered stays available to the next `expect`.
+proc repl_assert_running {context} {
+    set timeout 1
+    expect {
+        eof {
+            repl_died $context
+        }
+        timeout {}
+    }
+}

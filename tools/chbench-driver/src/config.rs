@@ -139,6 +139,13 @@ impl MysqlSourceConfig {
             .user(Some(self.user.clone()))
             .pass(Some(self.pass.clone()))
             .db_name(Some(self.db.clone()))
+            // The OLTP workload prepares 40+ distinct statements per terminal
+            // connection (ten s_dist_XX SELECT variants, eleven order_line
+            // INSERT arities, plus each transaction's fixed set). mysql_async
+            // caches prepared statements per connection with an LRU capacity of
+            // 32 by default, so the workload constantly evicts and re-prepares
+            // statements — an extra PREPARE round trip per evicted statement.
+            .stmt_cache_size(256)
             .into()
     }
 }

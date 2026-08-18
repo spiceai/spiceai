@@ -23,13 +23,17 @@ limitations under the License.
 //!
 //! The picker buckets files by size into tiers — small, mid, large — and emits
 //! a [`CompactionCandidate`] when the smallest non-empty tier has enough files
-//! whose combined size is worth a rewrite. The current runner (in
-//! [`crate::provider::table`]) uses that candidate as an eligibility and
-//! observability signal, then atomically rewrites the entire current snapshot.
-//! The rewrite goes through `write_to_snapshot`, which honors `target_partitions`
-//! and the configured target file size, so a pass typically produces one or a
-//! small number of consolidated Vortex files rather than guaranteeing exactly
-//! one.
+//! whose combined size is worth a rewrite. The warm-tier runner (in
+//! [`crate::provider::table`]) rewrites **only** `candidate.paths` for
+//! key-delete / append-only tables with no protected snapshots, and carries
+//! unpicked settled files into the new snapshot via hardlink (local FS) or copy
+//! (S3 / cross-device) — warm subset compaction. Position-delete tables, tables
+//! with configured `sort_columns`, and tables carrying protected snapshots (which
+//! the rewrite has to fold) still full-rewrite the current snapshot. The rewrite
+//! goes through
+//! `write_to_snapshot`, which honors `target_partitions` and the configured
+//! target file size, so a pass typically produces one or a small number of
+//! consolidated Vortex files for the picked tier.
 //!
 //! The module also owns [`BackgroundCompactor`], a per-table tokio task that
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
@@ -63,6 +67,25 @@ use tokio::task::JoinHandle;
 /// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
 /// on the ambient runtime, preserving prior behavior.
 static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Process-wide budget bounding how many Cayenne interval background
+/// compactions run at once. Every table in the process draws on it, however it
+/// was created.
+///
+/// Two engines open Cayenne tables — the accelerator, and `CREATE TABLE …
+/// PARTITIONED BY` — and a catalog-level table has no narrower owner to charge
+/// than the process itself. One budget for both is what holds total compaction
+/// concurrency at the CPU budget regardless of the mix: a budget per engine
+/// would let a process running both oversubscribe the writer pool by a factor
+/// of two, and a budget per table would fan out without any ceiling at all.
+///
+/// Sized like the other Cayenne maintenance budgets, from
+/// [`compaction_budget_permits`]. Post-write compaction
+/// (`schedule_post_write_compaction`) is scheduled independently and does not
+/// draw on this.
+static COMPACTION_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(compaction_budget_permits())));
+
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);
@@ -146,6 +169,20 @@ pub(crate) fn try_track_compaction_pass() -> Option<CompactionPassGuard<'static>
     } else {
         Some(guard)
     }
+}
+
+/// The process-wide compaction budget every Cayenne table's interval
+/// background compactor draws on. See [`COMPACTION_BUDGET`].
+#[must_use]
+pub fn compaction_budget() -> Arc<Semaphore> {
+    Arc::clone(&COMPACTION_BUDGET)
+}
+
+/// Permits in the process-wide compaction budget — its ceiling, which the
+/// semaphore itself cannot report (it only exposes *available* permits).
+#[must_use]
+pub fn compaction_budget_permits() -> usize {
+    cpu_budget::cpu_budget().cayenne_compaction_permits()
 }
 
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.
@@ -323,8 +360,11 @@ pub(crate) struct CompactionPickerConfig {
     /// Minimum number of files in a tier required to consider compaction.
     pub trigger_files: usize,
     /// Maximum number of file paths retained in the candidate for tracing and
-    /// selection. The current runner still rewrites the whole snapshot once a
-    /// candidate is found.
+    /// selection. When the candidate is a proper subset of the current snapshot
+    /// (key-delete, no protected snapshots, no sort columns),
+    /// `compact_current_snapshot_small_files` rewrites only those paths and
+    /// hard-links the rest; otherwise the runner falls back to a full-snapshot
+    /// rewrite.
     pub max_files_per_pick: usize,
     /// Tier thresholds derived from `target_vortex_file_size_mb`.
     pub tiers: CompactionTiers,

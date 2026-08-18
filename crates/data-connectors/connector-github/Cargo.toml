@@ -21,12 +21,14 @@ license-file.workspace = true
 description = "GitHub data connector for Spice.ai runtime"
 
 [dependencies]
+linkme.workspace = true
 app = { path = "../../app" }
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow_tools = { path = "../../arrow_tools" }
 async-trait.workspace = true
 chrono.workspace = true
+connector-graphql = { path = "../connector-graphql" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 futures.workspace = true
@@ -36,15 +38,20 @@ graphql-parser.workspace = true
 http.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
+runtime-parameters = { path = "../../runtime-parameters" }
 util = { path = "../../util" }
 runtime-rate-control = { path = "../../runtime-rate-control" }
 secrecy.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+zip = "8.3.0"
 
 [dev-dependencies]
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }

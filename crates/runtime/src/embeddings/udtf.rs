@@ -71,9 +71,7 @@ use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::{
-    datafusion::DataFusion, model::EmbeddingModelStore, search::util::find_concrete_table_provider,
-};
+use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
 
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_search::{
@@ -90,7 +88,7 @@ use {
 };
 
 #[cfg(feature = "elasticsearch")]
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
@@ -413,6 +411,19 @@ impl VectorSearchTableFunc {
             );
         }
 
+        // Compound (writethrough) vector indexes: an in-memory warm index paired with a
+        // vector engine index. Registered instead of the engine's concrete index, so
+        // this arm is what discovers a warm-wrapped engine index.
+        if let Some((compound_indexes, _)) =
+            find_index_in_table_provider::<search::index::compound::CompoundVectorIndex>(tbl)
+        {
+            vector_indexes.extend(
+                compound_indexes
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+            );
+        }
+
         if vector_indexes.is_empty() {
             return Ok(None);
         }
@@ -465,23 +476,26 @@ impl VectorSearchTableFunc {
         // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
         // HashJoinExec key types match on both sides of the join.
         #[cfg(feature = "elasticsearch")]
-        let tbl: &Arc<dyn TableProvider> =
-            if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
-                let source_for_normalize = if let Some(acc) =
-                    find_concrete_table_provider::<AcceleratedTable>(tbl)
-                    && let Some(fed) = acc.get_federated_table_ref().try_table_provider_sync_ref()
-                {
-                    federated_tbl_storage = Arc::clone(fed);
-                    &federated_tbl_storage
-                } else {
-                    tbl
-                };
-                normalized_tbl_storage =
-                    es_index.normalize_source_table(Arc::clone(source_for_normalize))?;
-                &normalized_tbl_storage
+        let tbl: &Arc<dyn TableProvider> = if let Some(es_index) =
+            vector_index.as_any().downcast_ref::<ElasticsearchIndex>()
+        {
+            let source_for_normalize = if let Some(acc) = spice_table::find_layer::<AcceleratedTable>(
+                tbl.as_ref(),
+                spice_table::LayerWalk::Read,
+            ) && let Some(fed) =
+                acc.get_federated_table_ref().try_table_provider_sync_ref()
+            {
+                federated_tbl_storage = Arc::clone(fed);
+                &federated_tbl_storage
             } else {
                 tbl
             };
+            normalized_tbl_storage =
+                es_index.normalize_source_table(Arc::clone(source_for_normalize))?;
+            &normalized_tbl_storage
+        } else {
+            tbl
+        };
 
         Ok(Some(Arc::new(
             SearchQueryProvider::try_from_index(
@@ -532,13 +546,16 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         }
 
         // If an embedding column is defined, fallback to JIT or.
-        let embedding_table_provider =
-            find_concrete_table_provider::<EmbeddingTable>(&table_provider).ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "Table '{}' does not have an embedding index.",
-                    args.tbl.clone()
-                ))
-            })?;
+        let embedding_table_provider = spice_table::find_layer::<EmbeddingTable>(
+            table_provider.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Table '{}' does not have an embedding index.",
+                args.tbl.clone()
+            ))
+        })?;
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
         // Both chunked-scalar and multi-vector (list-typed) columns use
@@ -854,6 +871,11 @@ impl TableProvider for VectorSearchUDTFProvider {
         {
             base_expr.push(ident(embedding_col_name.clone()));
         }
+
+        // Rows with NULL embeddings cannot participate in vector search. Exclude
+        // them before scoring and limiting so a caller's outer `ORDER BY _score
+        // DESC` cannot promote NULL scores ahead of real matches.
+        scan = scan.filter(ident(embedding_col_name.clone()).is_not_null())?;
 
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity

@@ -133,7 +133,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
 /// On Unix systems, this listens for SIGTERM and SIGINT and forwards them
 /// to the child process so it can perform graceful shutdown.
 #[cfg(unix)]
-async fn run_with_signal_forwarding(
+pub(crate) async fn run_with_signal_forwarding(
     child: &mut tokio::process::Child,
 ) -> Result<std::process::ExitStatus> {
     use nix::sys::signal::{Signal, kill};
@@ -169,7 +169,7 @@ async fn run_with_signal_forwarding(
 /// Windows handles Ctrl+C differently and typically propagates it to child processes
 /// in the same console automatically.
 #[cfg(not(unix))]
-async fn run_with_signal_forwarding(
+pub(crate) async fn run_with_signal_forwarding(
     child: &mut tokio::process::Child,
 ) -> Result<std::process::ExitStatus> {
     child.wait().await.context(RuntimeExecutionSnafu)

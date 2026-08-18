@@ -31,28 +31,25 @@ limitations under the License.
 
 pub mod binlog;
 pub mod bootstrap;
+pub mod changes;
 pub mod config;
+pub mod gtid;
 pub mod metrics;
 pub mod resilience;
 pub mod rows;
 pub mod setup;
+pub mod shared;
 
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
 use snafu::Snafu;
 
-use crate::cdc::{
-    ChangeEnvelope, ChangesStream, CommitChange, CommitError, NoOpCommitter, StreamError,
-    build_ready_signal_envelope,
-};
+use crate::cdc::{ChangeEnvelope, ChangesStream, NoOpCommitter, StreamError};
 
-pub use config::{
-    BinlogPosition, InvalidPositionBehavior, ReplicationParams, SnapshotMode, derive_server_id,
-    process_nonce,
-};
+pub use config::{BinlogPosition, CursorType, ReplicationParams, derive_server_id, process_nonce};
+pub use gtid::GtidSet;
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 
 #[derive(Debug, Snafu)]
@@ -64,6 +61,17 @@ pub enum Error {
     SetupQuery {
         context: String,
         source: mysql_async::Error,
+    },
+
+    #[snafu(display(
+        "MySQL account {account} is missing privileges required for change data capture: \
+         {missing}. Grant them with: \
+         GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO {grant_target};"
+    ))]
+    MissingPrivileges {
+        account: String,
+        grant_target: String,
+        missing: String,
     },
 
     #[snafu(display(
@@ -125,6 +133,54 @@ pub enum Error {
 
     #[snafu(display("{message}"))]
     StalePosition { message: String },
+
+    #[snafu(display(
+        "Table {database}.{table} is already replicated by another dataset on the same MySQL \
+         connection ({connection}). `refresh_mode: changes` datasets on one connection share a \
+         single binlog dump, so a source table can back at most one dataset — remove the \
+         duplicate dataset."
+    ))]
+    SharedTableAlreadySubscribed {
+        database: String,
+        table: String,
+        connection: String,
+    },
+
+    #[snafu(display(
+        "Shared MySQL binlog connection ({connection}) is unavailable (its dump connection is \
+         shutting down). Retry — a fresh shared connection will be established."
+    ))]
+    SharedSourceUnavailable { connection: String },
+
+    #[snafu(display("Failed to parse MySQL GTID set: {message}"))]
+    GtidParse { message: String },
+
+    #[snafu(display(
+        "Cannot resume MySQL replication for {dataset} ({database}.{table}): this dataset was \
+         bootstrapped with GTID auto-positioning, but the source server no longer reports \
+         `gtid_mode = ON` (it may have been reconfigured, or this is a different server without \
+         GTIDs). Resuming by file+offset instead would silently start from a server-local \
+         position that does not correspond to the applied GTID set. Either restore \
+         `gtid_mode = ON` on the source (or repoint at a GTID-capable server) to resume via GTID, \
+         or drop the accelerator's persisted state (its `spice_sys_mysql_binlog` row) to \
+         re-bootstrap from scratch. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    GtidResumeUnavailable {
+        dataset: String,
+        database: String,
+        table: String,
+    },
+
+    #[snafu(display(
+        "MySQL replication for {dataset}: this dataset is positioning by GTID, but the source \
+         emitted an anonymous transaction (no GTID). This means the source's `gtid_mode` is not \
+         fully ON (e.g. ON_PERMISSIVE), so the applied GTID set cannot describe every \
+         transaction. Set `gtid_mode = ON` on the source, or drop the accelerator's persisted \
+         state to re-bootstrap by file+offset. \
+         See: https://spiceai.org/docs/components/data-connectors/mysql"
+    ))]
+    AnonymousTransactionUnderGtid { dataset: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -145,6 +201,16 @@ pub type StoreError = Box<dyn std::error::Error + Send + Sync>;
 pub struct PersistedPosition {
     pub position: BinlogPosition,
     pub schema_json: Option<String>,
+    /// Serialized executed [`GtidSet`] (`uuid:range` text) when positioning by
+    /// GTID; may be empty (`gtid_mode = ON` but no transactions applied yet).
+    /// `None` for file+offset positioning. This is the failover-safe resume
+    /// identity: unlike `position` it is server-independent, so a checkpoint
+    /// written against one primary resumes against a promoted replica via
+    /// `COM_BINLOG_DUMP_GTID`.
+    pub gtid_set: Option<String>,
+    /// The checkpoint's cursor type, stored explicitly rather than inferred
+    /// from `gtid_set` (an empty GTID set must still resume as GTID; see [`CursorType`])
+    pub cursor_type: CursorType,
 }
 
 /// Version tag for [`CheckpointMeta`] serialized into `schema_json`.
@@ -158,7 +224,8 @@ pub const CHECKPOINT_META_VERSION: u32 = 2;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CheckpointMeta {
     pub version: u32,
-    /// Serialized dataset Arrow schema (same bytes `MySqlBinlogSys::serialize_schema` produces).
+    /// Serialized dataset Arrow schema (the encoding `arrow_tools::schema::schema_to_json`
+    /// produces).
     pub dataset_schema_json: String,
     /// [`setup::TableLayout::fingerprint`] of the source table at checkpoint time.
     pub source_layout_fingerprint: String,
@@ -416,302 +483,15 @@ pub struct ReplicationStreamInput {
 /// snapshot/WAL boundary.
 #[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
-    Box::pin(
-        stream::once(async move { start_inner(input).await }).flat_map(|result| match result {
-            Ok(stream) => stream,
-            Err(e) => stream::once(async move { Err(stream_error(&e)) }).boxed(),
-        }),
-    )
-}
-
-async fn start_inner(input: ReplicationStreamInput) -> Result<ChangesStream> {
-    let ReplicationStreamInput {
-        dataset_name,
-        params,
-        schema,
-        primary_keys,
-        database,
-        table,
-        position_store,
-        schema_json,
-        metrics,
-    } = input;
-
-    // 1. Validate the server + discover the positional table layout.
-    let mut conn = setup::connect(&params).await?;
-    setup::validate_server(&mut conn).await?;
-    let layout = setup::fetch_table_layout(&mut conn, &database, &table).await?;
-    let column_map = layout.column_map(&schema, &database, &table)?;
-
-    // Every declared PK must exist on the source; warn when it diverges from
-    // the source PRIMARY KEY (legal — full row images let any column route
-    // deletes — but usually a misconfiguration).
-    for pk in &primary_keys {
-        if !layout.columns.iter().any(|c| c.name == *pk) {
-            return SchemaMismatchSnafu {
-                message: format!(
-                    "declared primary_key `{pk}` not found on source table {database}.{table}"
-                ),
-            }
-            .fail();
-        }
-    }
-    let source_pks = layout.primary_key_columns();
-    if !source_pks.is_empty()
-        && primary_keys.iter().map(String::as_str).collect::<Vec<_>>() != source_pks
-    {
-        tracing::warn!(
-            dataset = %dataset_name,
-            declared = ?primary_keys,
-            source = ?source_pks,
-            "dataset primary_key differs from the source table's PRIMARY KEY; \
-             UPDATE/DELETE events are routed by the declared key"
-        );
-    }
-
-    // 2. Load the persisted position and pick the start path.
-    //
-    // Binlog row images are positional. Resuming against a different source
-    // ordinal layout (or dataset schema) would decode historical events with
-    // the *current* name→index map and silently scramble columns whenever
-    // types still convert. Refuse that case — error or rebootstrap per
-    // `invalid_position_behavior`.
-    let persisted = position_store
-        .load()
-        .await
-        .map_err(|e| Error::PositionStoreAccess {
-            message: e.to_string(),
-        })?;
-
-    let layout_fingerprint = layout.fingerprint();
-    let checkpoint_schema_json = encode_checkpoint_schema_json(schema_json.as_deref(), &layout);
-
-    let resume_position = match persisted {
-        Some(persisted) if params.snapshot_mode == SnapshotMode::Always => {
-            tracing::info!(
-                dataset = %dataset_name,
-                position = %persisted.position,
-                "`snapshot_mode: always`: running the initial snapshot despite a persisted \
-                 binlog position"
-            );
-            None
-        }
-        Some(persisted) => {
-            if let Err(drift) = check_resume_compatibility(
-                persisted.schema_json.as_deref(),
-                schema_json.as_deref(),
-                &layout_fingerprint,
-            ) {
-                match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
-                        return StalePositionSnafu {
-                            message: format!(
-                                "cannot resume mysql binlog for {dataset_name} from {}: {drift}. Replaying historical row images against the current source layout would mis-map columns. Set `mysql_replication_invalid_position_behavior: rebootstrap` to drop the saved position and re-snapshot the table.",
-                                persisted.position
-                            ),
-                        }
-                        .fail();
-                    }
-                    InvalidPositionBehavior::Rebootstrap => {
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            position = %persisted.position,
-                            drift = %drift,
-                            "persisted binlog checkpoint is incompatible with the current source layout / dataset schema; rebootstrap behavior enabled, falling back to a fresh snapshot"
-                        );
-                        if let Err(e) = position_store.clear().await {
-                            tracing::warn!(
-                                dataset = %dataset_name,
-                                error = %e,
-                                "failed to clear the incompatible binlog position; the subsequent bootstrap will overwrite it"
-                            );
-                        }
-                        None
-                    }
-                }
-            } else if setup::binlog_file_exists(&mut conn, &persisted.position.file).await? {
-                Some(persisted.position)
-            } else {
-                match params.invalid_position_behavior {
-                    InvalidPositionBehavior::Error => {
-                        return StalePositionSnafu {
-                            message: format!(
-                                "persisted binlog position {} is no longer on the server \
-                                 (binary logs were purged). Set \
-                                 `mysql_replication_invalid_position_behavior: rebootstrap` to \
-                                 drop the saved position and re-snapshot the table, or increase \
-                                 `binlog_expire_logs_seconds` on the source.",
-                                persisted.position
-                            ),
-                        }
-                        .fail();
-                    }
-                    InvalidPositionBehavior::Rebootstrap => {
-                        tracing::warn!(
-                            dataset = %dataset_name,
-                            position = %persisted.position,
-                            "persisted binlog position was purged from the source; rebootstrap \
-                             behavior enabled, falling back to a fresh snapshot"
-                        );
-                        if let Err(e) = position_store.clear().await {
-                            tracing::warn!(
-                                dataset = %dataset_name,
-                                error = %e,
-                                "failed to clear the stale binlog position; the subsequent \
-                                 bootstrap will overwrite it"
-                            );
-                        }
-                        None
-                    }
-                }
-            }
-        }
-        None => None,
-    };
-
-    // 3. Assemble the per-path prelude, then hand everything to one binlog
-    //    stream:
-    //      - resume:      ready signal; stream from the persisted position.
-    //      - no snapshot: persist head + ready signal; stream from the head.
-    //      - snapshot:    truncate barrier → snapshot rows → ready signal
-    //                     carrying the head-position commit; stream from the
-    //                     captured head.
-    let (start, prelude): (BinlogPosition, ChangesStream) = if let Some(position) = resume_position
-    {
-        // Resume: no snapshot. Signal readiness immediately — on a quiet
-        // source the first binlog event may be arbitrarily far away.
-        if let Err(e) = conn.disconnect().await {
-            tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
-        }
-        tracing::info!(
-            dataset = %dataset_name,
-            position = %position,
-            "mysql replication: resuming binlog stream from persisted position; skipping snapshot"
-        );
-        metrics.mark_bootstrap_complete();
-        let ready = ready_envelope(&schema)?;
-        (position, Box::pin(stream::once(async move { Ok(ready) })))
-    } else {
-        // Cold start: capture the binlog head BEFORE any snapshot so the
-        // overlap replays idempotently.
-        let head = setup::fetch_head_position(&mut conn).await?;
-        // Seed snapshot progress from the source's approximate row count
-        // (`information_schema.TABLES`) so operators get a progress signal;
-        // best-effort — absence just leaves the metric unset.
-        if params.snapshot_mode != SnapshotMode::Never {
-            match setup::fetch_approx_row_count(&mut conn, &database, &table).await {
-                Ok(Some(expected)) => metrics.set_bootstrap_rows_expected(expected),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(dataset = %dataset_name, error = %e, "row-count estimate");
-                }
-            }
-        }
-        if let Err(e) = conn.disconnect().await {
-            tracing::debug!(dataset = %dataset_name, error = %e, "setup connection disconnect");
-        }
-
-        if params.snapshot_mode == SnapshotMode::Never {
-            tracing::info!(
-                dataset = %dataset_name,
-                position = %head,
-                "mysql replication: `snapshot_mode: never` — streaming changes from the \
-                 current binlog head without snapshotting existing rows"
-            );
-            metrics.mark_bootstrap_complete();
-            // Persist the start position up front: with no snapshot there is
-            // no bootstrap barrier to piggy-back on, and resuming from `head`
-            // after a restart is exactly the no-snapshot contract.
-            let initial = PersistedPosition {
-                position: head.clone(),
-                schema_json: checkpoint_schema_json.clone(),
-            };
-            if let Err(e) = position_store.save(&initial).await {
-                tracing::warn!(
-                    dataset = %dataset_name,
-                    error = %e,
-                    "failed to persist the initial binlog position; a restart before the first \
-                     checkpoint will re-attach at the then-current head"
-                );
-            }
-            let ready = ready_envelope(&schema)?;
-            (head, Box::pin(stream::once(async move { Ok(ready) })))
-        } else {
-            // Lead with a TRUNCATE envelope so a re-bootstrap over a
-            // persistent accelerator clears rows deleted on the source while
-            // no position was held (no-op on an empty accelerator).
-            let truncate = truncate_envelope(&schema, &primary_keys, &column_map)?;
-
-            let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
-                params: params.clone(),
-                layout: layout.clone(),
-                schema: Arc::clone(&schema),
-                primary_keys: primary_keys.clone(),
-                column_map: column_map.clone(),
-                database: database.clone(),
-                table: table.clone(),
-                dataset_name: dataset_name.clone(),
-                metrics: Arc::clone(&metrics),
-            });
-
-            // The captured head position commits piggy-backed on the
-            // ready-signal envelope, after the runtime has durably applied
-            // the whole snapshot. A crash before then leaves the sidecar
-            // empty, so the next start re-bootstraps from scratch.
-            let (_, ready_batch, is_ready) =
-                ready_envelope(&schema)?
-                    .into_parts()
-                    .map_err(|e| Error::BuildReadySignal {
-                        message: e.to_string(),
-                    })?;
-            let ready = ChangeEnvelope::from_parts(
-                Box::new(InitialPositionCommitter {
-                    store: Arc::clone(&position_store),
-                    position: PersistedPosition {
-                        position: head.clone(),
-                        schema_json: checkpoint_schema_json.clone(),
-                    },
-                }),
-                ready_batch,
-                is_ready,
-            );
-
-            (
-                head,
-                Box::pin(
-                    stream::once(async move { Ok(truncate) })
-                        .chain(snapshot)
-                        .chain(stream::once(async move { Ok(ready) })),
-                ),
-            )
-        }
-    };
-
-    let binlog = binlog::start_binlog_stream(binlog::BinlogStreamInput {
-        params,
-        layout,
-        start,
-        schema,
-        primary_keys,
-        column_map,
-        database,
-        table,
-        dataset_name,
-        position_store,
-        // Persist the versioned checkpoint meta (dataset schema + source
-        // layout fingerprint), not the bare Arrow schema — resume needs both.
-        schema_json: checkpoint_schema_json,
-        metrics,
-    });
-
-    Ok(Box::pin(prelude.chain(binlog)))
-}
-
-/// Empty ready-signal envelope (no-op committer).
-fn ready_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope> {
-    build_ready_signal_envelope(schema).map_err(|e| Error::SchemaMismatch {
-        message: e.to_string(),
-    })
+    // `MySQL`'s binlog dump is server-wide with no server-side table filter, so a
+    // dedicated per-dataset connection would just duplicate the whole stream for
+    // no benefit. Every `refresh_mode: changes` dataset is therefore coalesced
+    // onto one shared dump per connection identity ([`shared`]) — no opt-in, no
+    // group label. A single dataset is simply a shared source with one member.
+    // (A future per-dataset opt-out would not resurrect a second engine; it
+    // would give that dataset a unique [`shared::SourceKey`] so it coalesces with
+    // nothing — see the note there.)
+    shared::subscribe(input)
 }
 
 /// A single-row `op="t"` envelope with a no-op committer, emitted ahead of a
@@ -724,24 +504,6 @@ fn truncate_envelope(
     let batch =
         rows::build_change_batch(schema, primary_keys, column_map, &[rows::truncate_change()])?;
     Ok(ChangeEnvelope::new(Box::new(NoOpCommitter), batch, false))
-}
-
-/// Commits the bootstrap's captured head position to the sidecar. Runs after
-/// the runtime has durably applied every snapshot envelope — the barrier
-/// between the bootstrap and live phases.
-struct InitialPositionCommitter {
-    store: Arc<dyn PositionStore>,
-    position: PersistedPosition,
-}
-
-#[async_trait]
-impl CommitChange for InitialPositionCommitter {
-    async fn commit(&self) -> std::result::Result<(), CommitError> {
-        self.store
-            .save(&self.position)
-            .await
-            .map_err(|source| CommitError::UnableToCommitChange { source })
-    }
 }
 
 fn stream_error(err: &Error) -> StreamError {

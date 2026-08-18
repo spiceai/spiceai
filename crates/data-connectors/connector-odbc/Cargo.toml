@@ -23,15 +23,29 @@ license-file.workspace = true
 description = "ODBC data connector for Spice.ai runtime"
 
 [dependencies]
+arrow.workspace = true
+arrow-odbc.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
-data_components = { path = "../../data_components", features = ["odbc"] }
-db_connection_pool = { path = "../../db_connection_pool", features = ["odbc"] }
+data_components = { path = "../../data_components", features = ["federation"] }
+datafusion-table-providers.workspace = true
+dyn-clone = "1.0.17"
+futures.workspace = true
 linkme.workspace = true
+odbc-api.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
+secrecy.workspace = true
+sha2.workspace = true
 snafu.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+tokio-util.workspace = true
 tracing.workspace = true
+util.workspace = true
 
 [features]
 default = []

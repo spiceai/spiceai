@@ -24,9 +24,7 @@ use snafu::{ResultExt, prelude::*};
 
 use runtime::{
     Runtime,
-    accelerated_table::{
-        AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh,
-    },
+    accelerated::{AcceleratedTable, AcceleratedTableBuilderError, Retention, refresh::Refresh},
     component::{
         access::AccessMode,
         dataset::{
@@ -39,11 +37,11 @@ use runtime::{
     dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
-    federated_table::FederatedTable,
-    secrets::{ExposeSecret, Secrets},
+    federated::FederatedTable,
     spice_metrics::get_metrics_table_reference,
     status,
 };
+use runtime_secrets::{ExposeSecret, Secrets};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -132,8 +130,7 @@ impl SpiceExtension {
     }
 
     async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
-        let secret = runtime.secrets();
-        let secret = secret.read().await;
+        let secret = Secrets::snapshot(&runtime.secrets()).await;
         let api_key = secret
             .get_secret("spiceai_api_key")
             .await
@@ -208,7 +205,7 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .register_table_as_writable_and_with_schema(metrics_table_reference, table)
+            .register_table_as_writable_and_with_schema(metrics_table_reference, table.into_table())
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
@@ -330,7 +327,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+    let params = ConnectorParamsBuilder::for_dataset(name.into(), &dataset)
         .build(secrets, io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;

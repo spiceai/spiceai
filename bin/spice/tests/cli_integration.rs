@@ -275,6 +275,59 @@ mod login {
             .assert()
             .failure();
     }
+
+    /// Standalone `spice login --key` keeps its credential-store behavior: the
+    /// key lands in the working directory's `.env`, owner-readable only, with
+    /// the same success line as always.
+    #[test]
+    fn test_login_with_key_writes_env_credentials() {
+        let temp_dir = TempDir::new().expect("temp dir should be creatable");
+
+        let mut cmd = spice_cmd();
+        cmd.current_dir(temp_dir.path())
+            .args(["login", "--key", "sk_test_abc123"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Successfully logged in to Spice.ai with API key",
+            ));
+
+        let env_path = temp_dir.path().join(".env");
+        let contents = fs::read_to_string(&env_path).expect(".env should be written");
+        assert!(
+            contents.contains("SPICE_SPICEAI_API_KEY=sk_test_abc123"),
+            "the key must be stored under its credential variable: {contents}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&env_path)
+                .expect(".env metadata should be readable")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "the credential file must stay owner-only"
+            );
+        }
+    }
+
+    /// Provider regression guard: the `SharePoint` and ABFS logins keep their
+    /// OAuth device-code flows and vocabulary — their help still asks for the
+    /// Azure AD tenant/client pair rather than anything session-based.
+    #[test]
+    fn test_provider_device_flow_help_unchanged() {
+        for provider in ["sharepoint", "abfs"] {
+            let mut cmd = spice_cmd();
+            cmd.args(["login", provider, "--help"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("--tenant-id"))
+                .stdout(predicate::str::contains("--client-id"));
+        }
+    }
 }
 
 // ============================================================================
@@ -719,125 +772,6 @@ mod add {
         );
     }
 }
-
-// ============================================================================
-// Connect Command Tests
-// ============================================================================
-
-mod connect {
-    use super::*;
-
-    #[test]
-    fn test_connect_help() {
-        let mut cmd = spice_cmd();
-        cmd.arg("connect")
-            .arg("--help")
-            .assert()
-            .success()
-            // Spice Cloud Connect adoption flow (new) — still mentions
-            // the legacy pod-add behavior in the long help.
-            .stdout(predicate::str::contains("SPICE-ADOPT"))
-            .stdout(predicate::str::contains("Spice Cloud"))
-            .stdout(predicate::str::contains("status"))
-            .stdout(predicate::str::contains("forget"));
-    }
-
-    /// `spice connect <CODE>` should stage the code at
-    /// `$SPICE_CONFIG_DIR/pending-adopt-code` and the subsequent
-    /// `spice connect status` should report pending adoption.
-    #[test]
-    fn test_connect_stage_code_and_status() {
-        let dir = TempDir::new().expect("create temp config dir");
-        let config_dir = dir.path();
-
-        // Stage the code.
-        let mut cmd = spice_cmd();
-        cmd.env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("Adoption code stored"));
-
-        let pending = config_dir.join("pending-adopt-code");
-        assert!(pending.exists(), "pending-adopt-code should be created");
-        let content = fs::read_to_string(&pending).expect("read pending-adopt-code");
-        assert_eq!(content, "SPICE-ADOPT-AAAA-BBBB");
-
-        // Status should report pending adoption.
-        let mut cmd = spice_cmd();
-        cmd.env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("status")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("pending adoption"))
-            .stdout(predicate::str::contains("SPICE-ADOPT"));
-    }
-
-    /// A malformed adoption code (right prefix, wrong shape) should be
-    /// rejected as an invalid argument rather than falling through to the
-    /// legacy pod-add path and emitting a misleading cloud-Spicepod error.
-    #[test]
-    fn test_connect_malformed_adoption_code_is_rejected() {
-        let dir = TempDir::new().expect("create temp config dir");
-        let config_dir = dir.path();
-        spice_cmd()
-            .env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("SPICE-ADOPT-AAA-BBBB")
-            .assert()
-            .failure();
-
-        // It must not have been staged as a pending code or treated as a pod:
-        // rejecting early means the pending file is never written.
-        assert!(
-            !config_dir.join("pending-adopt-code").exists(),
-            "malformed code must not be staged"
-        );
-    }
-
-    /// `spice connect forget` with no prior state should be a no-op.
-    #[test]
-    fn test_connect_forget_when_nothing_to_clear() {
-        let dir = TempDir::new().expect("create temp config dir");
-        let mut cmd = spice_cmd();
-        cmd.env("SPICE_CONFIG_DIR", dir.path())
-            .arg("connect")
-            .arg("forget")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("nothing to forget"));
-    }
-
-    /// `spice connect forget` after `spice connect <CODE>` should clear
-    /// the pending file.
-    #[test]
-    fn test_connect_forget_clears_pending_code() {
-        let dir = TempDir::new().expect("create temp config dir");
-        let config_dir = dir.path();
-        spice_cmd()
-            .env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("SPICE-ADOPT-AAAA-BBBB")
-            .assert()
-            .success();
-        assert!(config_dir.join("pending-adopt-code").exists());
-
-        spice_cmd()
-            .env("SPICE_CONFIG_DIR", config_dir)
-            .arg("connect")
-            .arg("forget")
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("identity cleared"));
-        assert!(!config_dir.join("pending-adopt-code").exists());
-    }
-}
-
-// ============================================================================
-// Acceleration Command Tests
-// ============================================================================
 
 mod acceleration {
     use super::*;
@@ -1579,5 +1513,188 @@ mod env_vars {
             .arg("--help")
             .assert()
             .success();
+    }
+}
+
+// ============================================================================
+// Cloud Connect Foundation Tests
+// ============================================================================
+
+#[cfg(unix)]
+mod cloud_connect_foundation {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose,
+    };
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const ENROLLMENT_KEY: &str = "spice-enroll-abcdefghijklmnopqrstuvwxyz012345";
+
+    fn install_fake_spiced(home: &std::path::Path) {
+        let bin_dir = home.join(".spice/bin");
+        fs::create_dir_all(&bin_dir).expect("create fake runtime directory");
+        let spiced = bin_dir.join("spiced");
+        fs::write(
+            &spiced,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'spiced v0.0.0-test'; exit 0; fi\ntouch \"$(dirname \"$0\")/spiced-ran\"\n",
+        )
+        .expect("write fake spiced");
+        fs::set_permissions(&spiced, fs::Permissions::from_mode(0o755))
+            .expect("make fake spiced executable");
+    }
+
+    fn spawn_enroll_endpoint() -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind enroll endpoint");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("endpoint address")
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept enrollment request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).expect("read enrollment request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(headers_end) = text.find("\r\n\r\n") {
+                    let content_length = text[..headers_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    if request.len() >= headers_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8(request).expect("request is UTF-8");
+            let (_, request_body) = request.split_once("\r\n\r\n").expect("request has headers");
+            let request_json: serde_json::Value =
+                serde_json::from_str(request_body).expect("request body is JSON");
+
+            let ca_key = KeyPair::generate().expect("generate enrollment CA key");
+            let mut ca_parameters = CertificateParams::default();
+            ca_parameters
+                .distinguished_name
+                .push(DnType::CommonName, "CLI integration enrollment CA");
+            ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_parameters.key_usages = vec![
+                KeyUsagePurpose::KeyCertSign,
+                KeyUsagePurpose::DigitalSignature,
+            ];
+            let ca_certificate = ca_parameters
+                .self_signed(&ca_key)
+                .expect("self-sign enrollment CA");
+            let issuer = Issuer::new(ca_parameters, ca_key);
+            let identity_certificate = CertificateSigningRequestParams::from_pem(
+                request_json["csr_pem"]
+                    .as_str()
+                    .expect("enrollment request carries a CSR"),
+            )
+            .expect("parse enrollment CSR")
+            .signed_by(&issuer)
+            .expect("sign enrollment CSR")
+            .pem();
+            let response_body = serde_json::json!({
+                "instance_id": "inst_cli_foundation",
+                "identity_cert_pem": identity_certificate,
+                "ca_bundle_pem": ca_certificate.pem(),
+                "gateway_addr": "127.0.0.1:443",
+                "not_after": "2099-01-01T00:00:00Z",
+                "organization": {"id": 7, "name": "cli-test-org"},
+                "portal": {"new_project_url": "https://spice.ai/orgs/cli-test-org/projects/new"}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .expect("write enrollment response");
+            request_json
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn connect_enrolls_the_requested_directory_and_exits_without_starting_spiced() {
+        let instance = TempDir::new().expect("create instance directory");
+        let cwd = TempDir::new().expect("create unrelated working directory");
+        let home = TempDir::new().expect("create isolated home");
+        install_fake_spiced(home.path());
+        let (endpoint, server) = spawn_enroll_endpoint();
+
+        let output = spice_cmd()
+            .env("HOME", home.path())
+            .env_remove("SPICE_CONFIG_DIR")
+            .env_remove("SPICE_CLOUD_ENDPOINT")
+            .current_dir(cwd.path())
+            .arg("connect")
+            .arg(ENROLLMENT_KEY)
+            .arg("--dir")
+            .arg(instance.path())
+            .arg("--endpoint")
+            .arg(&endpoint)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Enrolled with Spice Cloud"))
+            .stdout(predicate::str::contains(ENROLLMENT_KEY).not())
+            .stderr(predicate::str::contains(ENROLLMENT_KEY).not())
+            .get_output()
+            .clone();
+        assert!(output.status.success());
+        let request = server.join().expect("enrollment server finishes");
+        assert_eq!(request["token"], ENROLLMENT_KEY);
+
+        let config_dir = instance.path().join(".spice");
+        let identity: serde_json::Value = serde_json::from_slice(
+            &fs::read(config_dir.join("identity.json")).expect("read durable identity"),
+        )
+        .expect("identity is JSON");
+        assert_eq!(identity["identifier"], "inst_cli_foundation");
+        assert_eq!(identity["control_plane_endpoint"], endpoint);
+        assert!(
+            !home.path().join(".spice/bin/spiced-ran").exists(),
+            "foundation enrollment exits without launching the runtime"
+        );
+        assert!(
+            !cwd.path().join(".spice").exists(),
+            "--dir keeps state out of the current working directory"
+        );
+
+        spice_cmd()
+            .env_remove("SPICE_CONFIG_DIR")
+            .current_dir(cwd.path())
+            .arg("connect")
+            .arg("status")
+            .arg("--dir")
+            .arg(instance.path())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("inst_cli_foundation"));
+    }
+
+    #[test]
+    fn malformed_enrollment_authority_is_not_echoed() {
+        let secret = "abcdefghijklmnopqrstuvwxyz012345";
+        let malformed = format!("spice-enroll-{secret}!");
+        spice_cmd()
+            .arg("connect")
+            .arg(&malformed)
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains(secret).not())
+            .stderr(predicate::str::contains(secret).not());
     }
 }

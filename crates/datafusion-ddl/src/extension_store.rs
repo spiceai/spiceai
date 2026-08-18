@@ -256,11 +256,12 @@ fn parse_time_format(value: &str) -> DFResult<SpicepodTimeFormat> {
         "timestamptz" => Ok(SpicepodTimeFormat::Timestamptz),
         "unix_seconds" | "unixseconds" => Ok(SpicepodTimeFormat::UnixSeconds),
         "unix_millis" | "unixmillis" => Ok(SpicepodTimeFormat::UnixMillis),
+        "unix_nanos" | "unixnanos" => Ok(SpicepodTimeFormat::UnixNanos),
         "iso8601" => Ok(SpicepodTimeFormat::ISO8601),
         "date" => Ok(SpicepodTimeFormat::Date),
         _ => Err(DataFusionError::Plan(format!(
             "Invalid value for 'dataset.time_format': '{value}'. \
-             Expected 'timestamp', 'timestamptz', 'unix_seconds', 'unix_millis', 'ISO8601', or 'date'."
+             Expected 'timestamp', 'timestamptz', 'unix_seconds', 'unix_millis', 'unix_nanos', 'ISO8601', or 'date'."
         ))),
     }
 }
@@ -352,6 +353,9 @@ mod tests {
             ("timestamp", SpicepodTimeFormat::Timestamp),
             ("timestamptz", SpicepodTimeFormat::Timestamptz),
             ("unix_seconds", SpicepodTimeFormat::UnixSeconds),
+            ("unix_millis", SpicepodTimeFormat::UnixMillis),
+            ("unix_nanos", SpicepodTimeFormat::UnixNanos),
+            ("unixnanos", SpicepodTimeFormat::UnixNanos),
             ("iso8601", SpicepodTimeFormat::ISO8601),
         ] {
             let opts = vec![("dataset.time_format".to_string(), input.to_string())];

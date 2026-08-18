@@ -32,7 +32,7 @@ limitations under the License.
 //! ## Coherence (knobs working together)
 //!
 //! * **CPU.** The aggregate Vortex encode concurrency across *all* tables is
-//!   bounded by a process-global semaphore sized to the host core count (see
+//!   bounded by a process-global semaphore sized to the CPU budget (see
 //!   [`crate::dataaccelerator::cayenne`] startup wiring and
 //!   `cayenne::provider::write_budget`). Per-table `write_concurrency` is then a
 //!   request against that shared budget rather than an independent core grab, so
@@ -134,7 +134,8 @@ impl MemTierCaps {
 ///
 /// All are cheap to read and container-aware where the OS exposes it:
 /// [`crate::resource_monitor::get_total_memory`] honors cgroup v1/v2 memory
-/// limits, and `std::thread::available_parallelism` honors CPU quotas on Linux.
+/// limits, and the core count comes from [`cpu_budget::cpu_budget`], which
+/// honors a cgroup CPU quota, a Kubernetes CPU request, and `runtime.cpu.cores`.
 /// Construct via [`HardwareProfile::detect`] in production or
 /// [`HardwareProfile::new`] in tests.
 ///
@@ -205,7 +206,7 @@ impl HardwareProfile {
         data_path: &str,
         metastore_path: &str,
     ) -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         let total_mem_bytes = crate::resource_monitor::get_total_memory();
         // The two storage classifications, the two calibration probes (cloud-agnostic,
         // memoized per volume — the only storage signal for a memory-tier table that
@@ -323,8 +324,12 @@ impl HardwareProfile {
         usize::try_from(hardware_ceiling).unwrap_or(256)
     }
 
-    /// Size (in MB) of the in-memory Vortex decompressed-segment cache, which
-    /// accelerates repeated scans (the OLAP side of an HTAP workload).
+    /// Size (in MB) of the in-memory Vortex segment cache, which accelerates
+    /// repeated scans (the OLAP side of an HTAP workload) by holding segments as
+    /// they are stored — serialized, still in Vortex's compressed encodings — so a
+    /// hit skips the read, not the decode. Canonicalizing those encodings into
+    /// flat Arrow happens downstream and is charged to the query memory pool
+    /// separately, so the two never account for the same bytes.
     ///
     /// Scales up on memory-rich hosts (~1/128 of RAM) but never below the
     /// historical 256 MiB default, so no host regresses on the query path, and
@@ -340,9 +345,10 @@ impl HardwareProfile {
     }
 
     /// Storage-aware target Vortex file size (MB), or `None` to keep the engine
-    /// default (256 MB). Smaller files reduce write amplification on EBS-class
-    /// network storage; larger files improve scan throughput on RAM-backed
-    /// mounts. `LocalSsd`/`Unknown` keep the engine default.
+    /// default (256 MB). Only a RAM-backed mount moves it: a tmpfs file competes
+    /// with the process for the same memory, so 64 MB bounds what one in-flight
+    /// file holds. `Ebs` pins 256 rather than deferring, since the size feeds both
+    /// file rolling and the size-tiered compaction picker on network storage.
     #[must_use]
     pub fn target_file_size_mb_override(&self) -> Option<usize> {
         match self.data_storage {
@@ -529,6 +535,47 @@ impl WorkloadProfile {
     }
 }
 
+/// The `cayenne_tuning` mode: how the knobs this module derives get their values.
+///
+/// [`Self::Adaptive`] is selected only by an explicit `adaptive`. Unset, `auto`,
+/// and anything unrecognized are all [`Self::Auto`], so no other signal — and no
+/// typo — can land a table in the closed loop. Shared by the accelerator and the
+/// catalog connector, which accept the same parameter and must agree on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TuningMode {
+    /// Derive the knobs statically from the detected environment and, where
+    /// available, the inferred schema. No closed loop.
+    #[default]
+    Auto,
+    /// The static derivation as a warm start, plus the per-table closed-feedback
+    /// controller that moves the knobs within the derived bounds (preview).
+    Adaptive,
+}
+
+impl TuningMode {
+    /// Resolve a raw parameter value, ignoring case and surrounding whitespace.
+    ///
+    /// Returns the mode and whether the value was unrecognized, so a caller can
+    /// warn once about a typo while still running on the safe default rather than
+    /// failing the dataset over a tuning hint.
+    #[must_use]
+    pub(crate) fn parse(raw: Option<&str>) -> (Self, bool) {
+        let Some(mode) = raw.map(str::trim) else {
+            return (Self::Auto, false);
+        };
+        if mode.eq_ignore_ascii_case("adaptive") {
+            (Self::Adaptive, false)
+        } else {
+            (Self::Auto, !mode.eq_ignore_ascii_case("auto"))
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_adaptive(self) -> bool {
+        matches!(self, Self::Adaptive)
+    }
+}
+
 /// A numeric `cayenne_*` knob's value as configured by the operator, after
 /// honoring the literal `auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +679,26 @@ mod tests {
 
     fn profile(cores: usize, mem: u64, storage: ResolvedAccelerationStorage) -> HardwareProfile {
         HardwareProfile::new(cores, mem, storage, storage)
+    }
+
+    // ---- TuningMode -------------------------------------------------------
+
+    #[test]
+    fn only_an_explicit_adaptive_value_enables_the_closed_loop() {
+        // Unset and `auto` are the same answer, and neither is flagged invalid.
+        assert_eq!(TuningMode::parse(None), (TuningMode::Auto, false));
+        assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, false));
+        // `adaptive` matches case-insensitively, ignoring surrounding whitespace.
+        assert_eq!(
+            TuningMode::parse(Some("  Adaptive ")),
+            (TuningMode::Adaptive, false)
+        );
+        // An unrecognized value is reported, and can NEVER enable adaptive.
+        assert_eq!(
+            TuningMode::parse(Some("nonsense")),
+            (TuningMode::Auto, true)
+        );
+        assert!(!TuningMode::default().is_adaptive());
     }
 
     // ---- read_knob / auto_or_* --------------------------------------------

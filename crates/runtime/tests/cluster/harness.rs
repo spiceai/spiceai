@@ -169,6 +169,33 @@ impl ClusterHarness {
             .await
     }
 
+    /// Per-executor partition counts for `table`, read from the scheduler's
+    /// authoritative accelerations partition store. Keyed by executor id; the
+    /// value is how many of the table's partitions that executor owns.
+    ///
+    /// Returns an empty map if the scheduler has no executor registry or has no
+    /// cached partition metadata for the table yet.
+    #[must_use]
+    pub fn partition_owner_counts(&self, table: &str) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        let Some(registry) = self.executor_registry.as_ref() else {
+            return counts;
+        };
+        let table_ref = datafusion::sql::TableReference::parse_str(table);
+        let Some(metadata) = registry
+            .accelerations_partition_store()
+            .get_cached_table_metadata(&table_ref)
+        else {
+            return counts;
+        };
+        for partition in &metadata.partitions {
+            for executor in &partition.assigned_executors {
+                *counts.entry(executor.clone()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     /// Block until exactly `expected` executors are registered with the scheduler,
     /// or return an error after `timeout`.
     ///
@@ -184,7 +211,7 @@ impl ClusterHarness {
             sleep(Duration::from_millis(200)).await;
             let count = self
                 .executor_manager
-                .get_executor_state()
+                .get_executors_state()
                 .await
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?
                 .len();

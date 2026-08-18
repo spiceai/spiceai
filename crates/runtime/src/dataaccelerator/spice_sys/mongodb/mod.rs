@@ -33,9 +33,6 @@ limitations under the License.
 //! );
 //! ```
 
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use serde::{Deserialize, Serialize};
-
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 
@@ -59,34 +56,12 @@ mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct MongoCheckpointMetadata {
-    /// Canonical extended JSON of the most recent `ResumeToken`'s raw BSON.
-    pub resume_token_json: String,
-    /// Optional cluster operation time (seconds since epoch) used as the
-    /// `startAtOperationTime` fallback when the resume token is past the
-    /// oplog window.
-    #[serde(default)]
-    pub cluster_time_ts: Option<i64>,
-    /// Optional serialized Arrow schema snapshot for detecting drift between
-    /// runs.
-    #[serde(default)]
-    pub schema_json: Option<String>,
-    /// When the row was last updated. Populated by the database layer on read.
-    #[serde(default)]
-    pub updated_at: Option<std::time::SystemTime>,
-}
+// The checkpoint's shape is the connector-facing contract, so it lives in
+// `runtime-checkpoint-api` below both sides. The engine modules here name it through
+// this path.
+pub use runtime_checkpoint_api::mongodb::MongoCheckpointMetadata;
 
 pub struct MongoSys {
-    #[cfg_attr(
-        not(any(
-            feature = "sqlite",
-            feature = "duckdb",
-            feature = "postgres-accel",
-            feature = "turso"
-        )),
-        expect(dead_code)
-    )]
     pub dataset_name: String,
     acceleration_connection: AccelerationConnection,
 }
@@ -101,10 +76,24 @@ impl MongoSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(clippy::unused_async)
+    )]
     pub async fn get(&self) -> Option<MongoCheckpointMetadata> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking_opt(move || Self::get_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -119,10 +108,24 @@ impl MongoSys {
                 feature = "postgres-accel",
                 feature = "turso"
             )))]
-            _ => None,
+            _ => {
+                // Referenced so the field is never dead code when no accelerator backend is
+                // compiled in (backends read it to key the sidecar row by dataset).
+                let _ = &self.dataset_name;
+                None
+            }
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(clippy::unused_async)
+    )]
     pub async fn upsert(
         &self,
         #[cfg_attr(
@@ -138,7 +141,15 @@ impl MongoSys {
     ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let metadata = metadata.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &pool, &metadata)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -157,10 +168,24 @@ impl MongoSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(clippy::unused_async)
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -178,15 +203,22 @@ impl MongoSys {
             _ => Err(Error::NoAccelerationConnection),
         }
     }
+}
 
-    /// Serialize an Arrow schema to a JSON string for `schema_json` storage.
-    pub fn serialize_schema(schema: &SchemaRef) -> Result<String> {
-        serde_json::to_string(schema).map_err(Error::external)
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::mongodb::MongoCheckpointStore for MongoSys {
+    async fn get(&self) -> Option<MongoCheckpointMetadata> {
+        MongoSys::get(self).await
     }
 
-    /// Deserialize an Arrow schema from a `schema_json` string.
-    pub fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
-        let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
-        Ok(std::sync::Arc::new(schema))
+    async fn upsert(
+        &self,
+        metadata: &MongoCheckpointMetadata,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MongoSys::upsert(self, metadata).await.map_err(Into::into)
+    }
+
+    async fn delete(&self) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MongoSys::delete(self).await.map_err(Into::into)
     }
 }

@@ -23,19 +23,16 @@ use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use runtime_datafusion_index::{Index, IndexedTableProvider};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use search::{generation::util::get_primary_keys, index::duckdb::DuckDBVectorIndex};
 use snafu::prelude::*;
+use spice_table::{Index, IndexLayer, SpiceTable};
 use spicepod::{param::Params, semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
 use tokio::sync::RwLock;
 
-use crate::{
-    model::EmbeddingModelStore,
-    parameters::{ParameterSpec, Parameters},
-};
-
-use search::index::duckdb::{DuckDBDistanceMetric, DuckDBHnswOptions};
+use crate::model::EmbeddingModelStore;
+use runtime_parameters_typed::TypedParams as _;
+use runtime_search::store_params::duckdb::DuckDbVectorParams;
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -80,37 +77,7 @@ pub enum Error {
         "Failed to configure primary key for dataset {dataset}: column '{column}' does not exist in the dataset schema."
     ))]
     PrimaryKeyColumnMissing { dataset: String, column: String },
-
-    #[snafu(display("Invalid distance metric '{metric}': {reason}"))]
-    InvalidDistanceMetric { metric: String, reason: String },
-
-    #[snafu(display("Invalid value for DuckDB vector parameter '{key}': '{value}': {source}"))]
-    InvalidParameter {
-        key: String,
-        value: String,
-        source: std::num::ParseIntError,
-    },
 }
-
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("distance_metric")
-        .description(
-            "Vector similarity metric for DuckDB VSS. One of: cosine | l2 | inner_product.",
-        )
-        .one_of(&["cosine", "l2", "inner_product"]),
-    ParameterSpec::component("metric")
-        .description("Alias for distance_metric. One of: cosine | l2 | inner_product."),
-    ParameterSpec::component("hnsw_m")
-        .description("DuckDB VSS HNSW graph parameter m (links per node)."),
-    ParameterSpec::component("hnsw_ef_construction")
-        .description("DuckDB VSS HNSW build parameter ef_construction."),
-    ParameterSpec::component("hnsw_ef_search")
-        .description("DuckDB VSS query-time ef_search setting."),
-    ParameterSpec::component("partition_by")
-        .description("Not yet supported for the DuckDB vector engine."),
-    ParameterSpec::component("spill_writes")
-        .description("Not supported for the DuckDB vector engine."),
-];
 
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn try_from_table(
@@ -148,10 +115,10 @@ pub(crate) async fn try_from_table(
     }
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
-    if partition_by_configured(&params, vector_store_config) {
+    if params.partition_by_configured(vector_store_config) {
         return PartitionByNotSupportedSnafu.fail();
     }
-    if spill_writes_enabled(&params) {
+    if params.spill_writes_enabled() {
         return SpillWritesNotSupportedSnafu.fail();
     }
 
@@ -186,7 +153,7 @@ pub(crate) async fn try_from_table(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let hnsw = parse_hnsw_options(&params)?;
+    let hnsw = params.hnsw_options();
 
     Ok(DuckDBVectorIndex::new(
         column,
@@ -217,12 +184,16 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
     // in the TableDefinition configuration.
     table_definition.add_ignored_index_prefix("__spice_vss_");
 
-    let mut provider =
-        if let Some(indexed) = accelerator_provider.downcast_ref::<IndexedTableProvider>() {
-            indexed.clone()
-        } else {
-            IndexedTableProvider::new(Arc::clone(&accelerator_provider))
-        };
+    // Reuse an index layer already at the top of the accelerator's stack so the
+    // vector indexes join the ones already registered, rather than stacking a
+    // second layer that discovery would have to find separately.
+    let (mut provider, below) = match accelerator_provider.downcast_ref::<SpiceTable>() {
+        Some(table) if !table.indexes().is_empty() => (
+            IndexLayer::with_indexes(table.indexes().to_vec()),
+            Arc::clone(table.below()),
+        ),
+        _ => (IndexLayer::new(), Arc::clone(&accelerator_provider)),
+    };
 
     for (column, config) in embedding_columns {
         let vector_index = try_from_table(
@@ -253,7 +224,7 @@ pub(crate) async fn wrap_accelerator_with_duckdb_vector_indexes(
         provider = provider.add_index(Arc::new(vector_index) as Arc<dyn Index>);
     }
 
-    Ok(Arc::new(provider))
+    Ok(SpiceTable::over(Arc::new(provider), below) as Arc<dyn TableProvider>)
 }
 
 #[must_use]
@@ -296,11 +267,14 @@ fn normalized_duckdb_vector_param_name(key: &str) -> Option<&'static str> {
 fn duckdb_writer_context(
     provider: &Arc<dyn TableProvider>,
 ) -> Option<(Arc<DuckDbConnectionPool>, Arc<TableDefinition>)> {
-    if let Some(indexed) = provider.downcast_ref::<IndexedTableProvider>() {
-        return duckdb_writer_context(&indexed.underlying);
+    if let Some(layered) = provider.downcast_ref::<SpiceTable>() {
+        return duckdb_writer_context(layered.below());
     }
 
-    if let Some(poly) = provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+        provider.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         let writer = poly.writer();
         return duckdb_writer_context(&writer);
     }
@@ -325,58 +299,10 @@ fn schema_with_embedding_column(schema: SchemaRef, column: &str, dims: i32) -> S
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-fn parse_hnsw_options(params: &Parameters) -> Result<DuckDBHnswOptions> {
-    let mut options = DuckDBHnswOptions::default();
-
-    if let Some(metric) = string_from_params(params, "distance_metric")
-        .or_else(|| string_from_params(params, "metric"))
-    {
-        options.metric = DuckDBDistanceMetric::try_from(metric).map_err(|reason| {
-            Error::InvalidDistanceMetric {
-                metric: metric.to_string(),
-                reason,
-            }
-        })?;
-    }
-
-    options.hnsw_m = parse_u32_param(params, "hnsw_m")?;
-    options.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?;
-    options.hnsw_ef_search = parse_u32_param(params, "hnsw_ef_search")?;
-
-    Ok(options)
-}
-
-fn partition_by_configured(params: &Parameters, vector_store_config: &VectorStore) -> bool {
-    string_from_params(params, "partition_by").is_some()
-        || !vector_store_config.partition_by.is_empty()
-}
-
-fn spill_writes_enabled(params: &Parameters) -> bool {
-    string_from_params(params, "spill_writes")
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-}
-
-fn parse_u32_param(params: &Parameters, key: &str) -> Result<Option<u32>> {
-    let Some(s) = string_from_params(params, key) else {
-        return Ok(None);
-    };
-    s.parse::<u32>()
-        .map(Some)
-        .map_err(|source| Error::InvalidParameter {
-            key: key.to_string(),
-            value: s.to_string(),
-            source,
-        })
-}
-
-fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
-    p.get(key).expose().ok()
-}
-
 async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Parameters> {
+) -> Result<DuckDbVectorParams> {
     let params = vector_store_config
         .params
         .as_ref()
@@ -385,95 +311,15 @@ async fn get_store_params(
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
 
-    Parameters::try_new(
-        "DuckDB vector store",
-        params_with_secrets.into_iter().collect(),
-        "duckdb",
-        Arc::clone(&secrets),
-        PARAMETERS,
-    )
-    .await
-    .context(GetStoreParamsSnafu)
+    DuckDbVectorParams::try_from_params("DuckDB vector store", params_with_secrets, &secrets)
+        .await
+        .boxed()
+        .context(GetStoreParamsSnafu)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
-
-    async fn duckdb_params(values: &[(&str, &str)]) -> Parameters {
-        Parameters::try_new(
-            "DuckDB vector store",
-            values
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
-                .collect(),
-            "duckdb",
-            Arc::new(RwLock::new(Secrets::default())),
-            PARAMETERS,
-        )
-        .await
-        .expect("DuckDB vector parameters should be valid")
-    }
-
-    #[tokio::test]
-    async fn parse_hnsw_options_accepts_aliases() {
-        let params = duckdb_params(&[
-            ("duckdb_metric", "ip"),
-            ("duckdb_hnsw_m", "16"),
-            ("duckdb_hnsw_ef_construction", "64"),
-            ("duckdb_hnsw_ef_search", "20"),
-        ])
-        .await;
-
-        let options = parse_hnsw_options(&params).expect("HNSW options should parse");
-
-        assert_eq!(options.metric, DuckDBDistanceMetric::InnerProduct);
-        assert_eq!(options.hnsw_m, Some(16));
-        assert_eq!(options.hnsw_ef_construction, Some(64));
-        assert_eq!(options.hnsw_ef_search, Some(20));
-    }
-
-    #[tokio::test]
-    async fn parse_hnsw_options_prefers_canonical_names() {
-        let params = duckdb_params(&[
-            ("duckdb_distance_metric", "l2"),
-            ("duckdb_metric", "inner_product"),
-            ("duckdb_hnsw_m", "32"),
-            ("duckdb_hnsw_ef_construction", "128"),
-            ("duckdb_hnsw_ef_search", "40"),
-        ])
-        .await;
-
-        let options = parse_hnsw_options(&params).expect("HNSW options should parse");
-
-        assert_eq!(options.metric, DuckDBDistanceMetric::L2);
-        assert_eq!(options.hnsw_m, Some(32));
-        assert_eq!(options.hnsw_ef_construction, Some(128));
-        assert_eq!(options.hnsw_ef_search, Some(40));
-    }
-
-    #[tokio::test]
-    async fn parse_hnsw_options_rejects_invalid_numeric_values() {
-        let params = duckdb_params(&[("duckdb_hnsw_m", "large")]).await;
-        let err = parse_hnsw_options(&params).expect_err("invalid hnsw_m should be rejected");
-        assert!(
-            err.to_string()
-                .contains("Invalid value for DuckDB vector parameter 'hnsw_m'")
-        );
-    }
-
-    #[tokio::test]
-    async fn unsupported_options_are_detected() {
-        let params = duckdb_params(&[
-            ("duckdb_partition_by", "bucket(10, id)"),
-            ("duckdb_spill_writes", "yes"),
-        ])
-        .await;
-
-        assert!(partition_by_configured(&params, &VectorStore::default()));
-        assert!(spill_writes_enabled(&params));
-    }
 
     #[test]
     fn vector_store_from_embedding_params_keeps_hnsw_params() {

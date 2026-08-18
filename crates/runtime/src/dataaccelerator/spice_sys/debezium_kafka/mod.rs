@@ -41,6 +41,10 @@ use crate::{
     dataconnector::debezium::DebeziumKafkaMetadata,
 };
 use data_components::kafka::KafkaOffset;
+use std::sync::Arc;
+
+#[cfg(feature = "duckdb")]
+use super::retry_on_write_conflict;
 
 const DEBEZIUM_KAFKA_TABLE_NAME: &str = "spice_sys_debezium_kafka";
 const DEBEZIUM_KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_debezium_kafka_offsets";
@@ -57,7 +61,22 @@ mod turso;
 pub struct DebeziumKafkaSys {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
-    schema_ensured: OffsetSchemaState,
+    schema_ensured: Arc<OffsetSchemaState>,
+    /// Serializes this instance's own `DuckDB` sidecar writes.
+    ///
+    /// `DuckDB` resolves concurrent writes to one row optimistically — the loser
+    /// gets `Conflict on update!` instead of waiting — and the sidecar writers hold
+    /// the pool's write gate with `read()`, so they do not exclude each other. Two
+    /// commits for the same dataset therefore conflict rather than queue. Before the
+    /// writes moved to the blocking pool, the async worker serialized them by
+    /// accident; this keeps that ordering on purpose, so a burst of commits for one
+    /// dataset still resolves to the max offset instead of failing.
+    ///
+    /// Scoped to one instance: writers for different datasets key on distinct rows
+    /// and do not conflict. `retry_on_write_conflict` still covers contention this
+    /// lock cannot see.
+    #[cfg(feature = "duckdb")]
+    duckdb_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DebeziumKafkaSys {
@@ -67,14 +86,24 @@ impl DebeziumKafkaSys {
             dataset_name: dataset.name.to_string(),
             acceleration_connection: acceleration_connection(dataset, registry, open_option)
                 .await?,
-            schema_ensured: OffsetSchemaState::default(),
+            schema_ensured: Arc::default(),
+            #[cfg(feature = "duckdb")]
+            duckdb_write_lock: Arc::default(),
         })
     }
 
     pub(crate) async fn get(&self) -> Result<Option<DebeziumKafkaMetadata>> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                super::spawn_duckdb_blocking(move || {
+                    Self::get_duckdb(&dataset_name, &schema_ensured, &pool)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -96,7 +125,17 @@ impl DebeziumKafkaSys {
     pub(crate) async fn upsert(&self, metadata: &DebeziumKafkaMetadata) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, metadata),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let metadata = metadata.clone();
+                let _serialized = self.duckdb_write_lock.lock().await;
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &schema_ensured, &pool, &metadata)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, metadata).await,
             #[cfg(feature = "sqlite")]
@@ -118,7 +157,23 @@ impl DebeziumKafkaSys {
     pub(crate) async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_offsets_duckdb(pool, offsets),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let schema_ensured = Arc::clone(&self.schema_ensured);
+                let offsets = offsets.to_vec();
+                let _serialized = self.duckdb_write_lock.lock().await;
+                retry_on_write_conflict(&dataset_name, || {
+                    let pool = Arc::clone(&pool);
+                    let dataset_name = dataset_name.clone();
+                    let schema_ensured = Arc::clone(&schema_ensured);
+                    let offsets = offsets.clone();
+                    super::spawn_duckdb_blocking(move || {
+                        Self::upsert_offsets_duckdb(&dataset_name, &schema_ensured, &pool, &offsets)
+                    })
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.upsert_offsets_postgres(pool, offsets).await
@@ -140,12 +195,55 @@ impl DebeziumKafkaSys {
             _ => Err(Error::NoAccelerationConnection),
         }
     }
+}
 
-    fn schema_needs_ensure(&self) -> bool {
-        self.schema_ensured.needs_ensure()
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::debezium::DebeziumCheckpointStore for DebeziumKafkaSys {
+    async fn get(
+        &self,
+    ) -> std::result::Result<
+        Option<runtime_checkpoint_api::debezium::DebeziumCheckpoint>,
+        runtime_checkpoint_api::CheckpointError,
+    > {
+        let Some(metadata) = DebeziumKafkaSys::get(self).await? else {
+            return Ok(None);
+        };
+        // The change-event field descriptors are the connector's own type, so they cross
+        // the seam as the JSON the sidecar already round-trips.
+        let schema_fields_json =
+            serde_json::to_string(&metadata.schema_fields).map_err(Error::external)?;
+        Ok(Some(runtime_checkpoint_api::debezium::DebeziumCheckpoint {
+            consumer_group_id: metadata.consumer_group_id,
+            topic: metadata.topic,
+            primary_keys: metadata.primary_keys,
+            schema_fields_json,
+            offsets: metadata.offsets,
+        }))
     }
 
-    fn mark_schema_ensured(&self) {
-        self.schema_ensured.mark_ensured();
+    async fn upsert(
+        &self,
+        checkpoint: &runtime_checkpoint_api::debezium::DebeziumCheckpoint,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        let metadata = DebeziumKafkaMetadata {
+            consumer_group_id: checkpoint.consumer_group_id.clone(),
+            topic: checkpoint.topic.clone(),
+            primary_keys: checkpoint.primary_keys.clone(),
+            schema_fields: serde_json::from_str(&checkpoint.schema_fields_json)
+                .map_err(Error::external)?,
+            offsets: checkpoint.offsets.clone(),
+        };
+        DebeziumKafkaSys::upsert(self, &metadata)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        DebeziumKafkaSys::upsert_offsets(self, offsets)
+            .await
+            .map_err(Into::into)
     }
 }

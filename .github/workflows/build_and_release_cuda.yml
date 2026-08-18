@@ -5,7 +5,18 @@ on:
     branches:
       - trunk
     paths:
+      # Every manifest that declares or forwards the CUDA/candle dependency
+      # surface this build compiles: `crates/llms/Cargo.toml` owns `mistralrs`,
+      # `tei_candle` and `cudarc` plus the `cuda`/`flash-attn`/`ring` features,
+      # and the model-contract crates beneath it can shift feature unification
+      # for that graph. Keep this list moving with the dependencies — when the
+      # local-inference stack is split into its own crate, this filter must name
+      # that crate's manifest, or it will still be here pointing at a file that
+      # no longer declares anything CUDA.
       - 'crates/llms/Cargo.toml'
+      - 'crates/chat-api/Cargo.toml'
+      - 'crates/embed-api/Cargo.toml'
+      - 'crates/rerank-api/Cargo.toml'
   push:
     tags:
       - v*
@@ -149,7 +160,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -196,7 +207,7 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -236,7 +247,7 @@ jobs:
 
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}

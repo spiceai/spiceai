@@ -30,6 +30,9 @@ datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["duckdb"] }
+runtime-component = { path = "../../runtime-component" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 duckdb = { workspace = true, features = [
 	"bundled",

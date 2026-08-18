@@ -1,0 +1,30 @@
+tests:
+  search:
+    - spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/hf[all-minilm-l6-v2]-arrow.yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/model2vec[potion-multilingual-128M]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/fiqa/model2vec[potion-multilingual-128M]-s3_vectors.yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: fiqa_retrieval
+      ready_wait: 1800

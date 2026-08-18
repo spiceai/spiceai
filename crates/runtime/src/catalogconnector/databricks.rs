@@ -20,11 +20,12 @@ use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
 use crate::component::ComponentInitialization;
-use crate::component::catalog::Catalog;
+use crate::component::catalog::{Catalog, table_selector};
 use crate::dataconnector::http_rate_control;
 use crate::dataconnector::parameters::ConnectorParams;
 use crate::token_providers::databricks::{
-    AuthCredentials, build_auth_credentials, get_m2m_token_provider, get_u2m_token_provider,
+    AUTH_MODE_DESCRIPTION, AUTH_MODES, AuthCredentials, build_auth_credentials,
+    get_m2m_token_provider, get_u2m_token_provider,
 };
 use async_trait::async_trait;
 use data_components::Read;
@@ -122,6 +123,12 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("rate_control_jitter_max")
         .description("Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
 
+    // Databricks authentication
+    ParameterSpec::component("auth_mode")
+        .description(AUTH_MODE_DESCRIPTION)
+        .one_of_ignore_ascii_case(AUTH_MODES)
+        .default("auto"),
+
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
     ParameterSpec::component("client_secret").secret().description("The client secret of the Databricks service principal."),
@@ -135,6 +142,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description(
+            "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
+        )
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
@@ -459,7 +471,7 @@ impl CatalogConnector for Databricks {
             client,
             CatalogId(catalog_id),
             table_creator,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         {
@@ -882,5 +894,47 @@ mod tests {
                 "parameter `{name}` is consumed by build_sql_warehouse_config but not declared in PARAMETERS; Parameters::try_new would strip it"
             );
         }
+    }
+
+    /// Temporary (STS) credentials only authenticate when the session token travels with
+    /// the key and secret, so `databricks_aws_session_token` has to survive into the
+    /// storage options handed to `DeltaTableFactory`.
+    #[tokio::test]
+    async fn test_aws_session_token_reaches_delta_storage_options() {
+        let parameters = Parameters::try_new(
+            "catalog databricks",
+            vec![
+                (
+                    "databricks_endpoint".to_string(),
+                    SecretString::from("dbc-abcd.cloud.databricks.com"),
+                ),
+                (
+                    "databricks_aws_access_key_id".to_string(),
+                    SecretString::from("ASIAEXAMPLE"),
+                ),
+                (
+                    "databricks_aws_secret_access_key".to_string(),
+                    SecretString::from("secret"),
+                ),
+                (
+                    "databricks_aws_session_token".to_string(),
+                    SecretString::from("FwoSessionToken"),
+                ),
+            ],
+            "databricks",
+            Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("temporary credential parameters should be accepted for databricks");
+
+        let storage_options = parameters.to_secret_map();
+        assert_eq!(
+            storage_options
+                .get("aws_session_token")
+                .map(ExposeSecret::expose_secret),
+            Some("FwoSessionToken"),
+            "session token must reach the Delta Lake storage options"
+        );
     }
 }

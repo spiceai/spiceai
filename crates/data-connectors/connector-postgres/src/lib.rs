@@ -37,14 +37,14 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_postgres_table_providers;
-use runtime::parameters::ParameterSpec;
+use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::deny_spice_functions_for_postgres_table_providers;
 use runtime_metrics::component::MetricsProvider;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
@@ -53,6 +53,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod connection;
 mod replication;
 
 #[derive(Debug, Snafu)]
@@ -65,7 +66,11 @@ pub enum Error {
 pub struct Postgres {
     factory: PostgresTableFactory,
     pool: Arc<PostgresConnectionPool>,
-    params: runtime::parameters::Parameters,
+    params: Parameters,
+    /// Retained so the replication stream can resolve the applied-LSN watermark store
+    /// over the dataset's accelerator. `None` only in unit tests, which build params
+    /// without a runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -97,9 +102,12 @@ const POSTGRES_DOCS: &str = "https://spiceai.org/docs/components/data-connectors
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
         .description(
-            "Full libpq-style connection string. Overrides other connection params if set.",
+            "Full libpq-style connection string (key=value or postgres:// URI). Overrides other connection params if set.",
         )
-        .examples(&["host=db.example.com port=5432 dbname=app user=ro sslmode=require"])
+        .examples(&[
+            "host=db.example.com port=5432 dbname=app user=ro sslmode=require",
+            "postgresql://ro@db.example.com:5432/app?sslmode=require",
+        ])
         .help_link(POSTGRES_DOCS)
         .secret(),
     ParameterSpec::component("user")
@@ -157,6 +165,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Must match [a-z0-9_]{1,63} (lowercase letters, digits, underscores only) and \
+         must not be the reserved name `pg_conflict_detection`. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
          one publication, with decoded changes routed per table. Each Spice replica \
@@ -170,22 +180,41 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
-            "Whether to take an initial snapshot of the table's existing rows on first \
-             connection, before streaming WAL changes. Default: true.",
+            "When `refresh_mode: changes` first loads the table's existing rows: 'auto' \
+             (default) snapshots a freshly-created replication slot and resumes an existing one \
+             without a snapshot (a non-persistent accelerator still re-snapshots on every start); \
+             'disabled' streams WAL changes only; 'always' snapshots on every start, including \
+             slot resume. The legacy booleans 'true'/'false' map to 'auto'/'disabled'. \
+             Default: auto.",
         )
-        .default("true"),
+        .default("auto"),
     ParameterSpec::component("replication_temporary_slot")
         .description(
-            "If true, create a temporary replication slot that is dropped when the \
-             Spice process disconnects. Default: false (durable slot).",
+            "Ignored. The replication slot is always durable. Remove this parameter.",
         )
-        .default("false"),
+        .deprecated(
+            "`pg_replication_temporary_slot` is ignored and the replication slot is always \
+             durable. A temporary slot belongs to the Postgres session that creates it, and the \
+             slot is created on the short-lived setup connection, so Postgres dropped it before \
+             START_REPLICATION could attach and the stream could never start. Remove the \
+             parameter; to stop an unused slot retaining WAL on the source, drop it with \
+             `SELECT pg_drop_replication_slot('<slot_name>')`. See: \
+             https://spiceai.org/docs/components/data-connectors/postgres",
+        ),
     ParameterSpec::component("replication_status_interval")
         .description(
             "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). \
              Default: 10s.",
         )
         .default("10s"),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its \
+             replication lag (now minus the newest applied commit's source time) \
+             falls below this. It stays not-ready while snapshotting or draining a \
+             backlog on resume, so it never serves stale data. Default: 2s.",
+        )
+        .default("2s"),
     ParameterSpec::component("replication_bootstrap_batch_size")
         .description(
             "Rows per emitted batch during the initial replication snapshot. \
@@ -195,9 +224,12 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("replication_member_channel_capacity")
         .description(
             "Shared-slot only: envelopes buffered per member table before the shared \
-             replication pump back-pressures. Too small a value lets one member's \
-             transient stall block the whole slot (head-of-line blocking). \
-             Default: 1024. Maximum: 1048576.",
+             replication pump back-pressures. Adjacent changes for one table coalesce \
+             into a single envelope, so this bounds the buffered envelope count rather \
+             than the source transaction count, and the pump blocks only once the \
+             buffer can neither coalesce nor admit another envelope. Too small a value \
+             lets one member's transient stall block the whole slot (head-of-line \
+             blocking). Default: 1024. Maximum: 1048576.",
         )
         .default("1024"),
 ];
@@ -265,6 +297,7 @@ impl DataConnectorFactory for PostgresFactory {
                         factory,
                         pool,
                         params: params_for_replication,
+                        context: params.context.clone(),
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
@@ -852,7 +885,7 @@ fn natural_order_sort_candidate(
 /// independently at debug level, so a partial gap may surface no info log.
 async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
     let (mut table_metadata, field_metadata) =
@@ -952,7 +985,7 @@ impl DataConnector for Postgres {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
             .factory
@@ -1002,7 +1035,7 @@ impl DataConnector for Postgres {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
         {
@@ -1050,17 +1083,17 @@ impl DataConnector for Postgres {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated_table::FederatedTable>,
-        dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
+        federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
+        dataset: &DatasetSpec,
+        acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
+            self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
+            acceleration,
         ))
     }
 
@@ -1663,3 +1696,13 @@ mod inferred_schema_tests {
         assert_eq!(unknown.normalize(Some(10_000)).distinct_count, None);
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_postgres as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_postgres_connector,
+    POSTGRES_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    PostgresFactory
+);

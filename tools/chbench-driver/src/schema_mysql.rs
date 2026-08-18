@@ -21,9 +21,12 @@ limitations under the License.
 //! dialect DDL. Postgres-WAL-specific replication cleanup has no `MySQL`
 //! equivalent and is omitted.
 
+use std::time::Instant;
+
 use mysql_async::prelude::Queryable;
 
 use crate::Result;
+use crate::watermark::{BenchTs, MUTATED_TABLES};
 
 /// Drop all CH-benCH tables.
 ///
@@ -37,6 +40,44 @@ use crate::Result;
 pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
     println!("  dropping {} tables", crate::schema::ALL_TABLES.len());
 
+    // Bound metadata-lock waits. A `DROP TABLE` blocked by another session holding
+    // a lock otherwise waits up to the server default `lock_wait_timeout`
+    // (31536000s ≈ 1 year), so a single stuck drop silently consumes the whole CI
+    // job budget. 60s makes a blocked drop fail fast with a clear
+    // "Lock wait timeout exceeded" error instead of hanging.
+    conn.query_drop("SET SESSION lock_wait_timeout = 60")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "set lock_wait_timeout".into(),
+            source,
+        })?;
+
+    // A prior run killed abruptly (e.g. the CI runner was terminated mid-run) can
+    // leave sessions still holding metadata locks on the tables we are about to
+    // drop, which is exactly what blocks the drop above. Terminate any other
+    // sessions before dropping. Without PROCESS/CONNECTION_ADMIN this account sees
+    // and can KILL only its own threads — precisely the CDC/loader connections a
+    // previous run may have leaked. Best-effort: a session may already be gone
+    // (killed/timed out) between the SELECT and the KILL, which is fine.
+    let stale: Vec<u64> = conn
+        .query("SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID()")
+        .await
+        .map_err(|source| crate::Error::MySql {
+            action: "list stale sessions".into(),
+            source,
+        })?;
+    if !stale.is_empty() {
+        println!(
+            "  terminating {} stale MySQL session(s) before drop",
+            stale.len()
+        );
+        for id in stale {
+            if let Err(e) = conn.query_drop(format!("KILL {id}")).await {
+                eprintln!("  KILL {id} skipped (session likely already gone): {e}");
+            }
+        }
+    }
+
     conn.query_drop("SET FOREIGN_KEY_CHECKS=0")
         .await
         .map_err(|source| crate::Error::MySql {
@@ -45,6 +86,7 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
         })?;
 
     for table in crate::schema::ALL_TABLES.iter().rev() {
+        let started = Instant::now();
         let sql = format!("DROP TABLE IF EXISTS {table}");
         conn.query_drop(&sql)
             .await
@@ -52,6 +94,12 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
                 action: format!("drop table {table}"),
                 source,
             })?;
+        // Per-table timing so a future hang is immediately attributable to the
+        // exact table (and therefore the lock) it stuck on.
+        println!(
+            "    dropped {table} ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     conn.query_drop("SET FOREIGN_KEY_CHECKS=1")
@@ -65,13 +113,13 @@ pub async fn drop_tables(conn: &mut mysql_async::Conn) -> Result<()> {
 }
 
 /// Create all 12 CH-benCH tables (9 TPC-C + 3 supplemental) and add the
-/// `_bench_ts` columns. Secondary indexes and triggers are created separately
-/// (see [`create_indexes`] and [`create_triggers`]) *after* the bulk load.
+/// `_bench_ts` columns. Secondary indexes are created separately
+/// ([`create_indexes`]) *after* the bulk load.
 ///
 /// # Errors
 ///
 /// Returns an error if any table or `_bench_ts` column cannot be created.
-pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
+pub async fn create_tables(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
     let ddl_statements: &[(&str, &str)] = &[
         (
             "warehouse",
@@ -263,11 +311,10 @@ pub async fn create_tables(conn: &mut mysql_async::Conn) -> Result<()> {
             })?;
     }
 
-    // Add the _bench_ts column (with default) to all mutated TPC-C tables so the
-    // seed rows are stamped by the column default. The BEFORE INSERT/UPDATE
-    // triggers are created *after* the load (see `create_triggers`) so they do
-    // not fire per-row during the bulk seed load.
-    add_bench_ts_columns(conn).await?;
+    // Add the _bench_ts column to all mutated TPC-C tables with a constant
+    // default of `load_ts`, so every seed row carries a known stamp and the
+    // initial watermarks need no scan (see `add_bench_ts_columns`).
+    add_bench_ts_columns(conn, load_ts).await?;
 
     Ok(())
 }
@@ -311,30 +358,19 @@ pub async fn create_indexes(conn: &mut mysql_async::Conn) -> Result<()> {
     Ok(())
 }
 
-/// Tables mutated by TPC-C transactions. `_bench_ts` is added only to these.
-/// `item`, `nation`, `region`, `supplier` are static reference tables.
-const MUTATED_TABLES: &[&str] = &[
-    "warehouse",
-    "district",
-    "customer",
-    "history",
-    "new_order",
-    "oorder",
-    "order_line",
-    "stock",
-];
-
-/// Add a `_bench_ts DATETIME(3)` column defaulting to `CURRENT_TIMESTAMP(3)` to
-/// all mutated TPC-C tables. The default stamps the seed rows; the per-row
-/// triggers for live mutations are created separately by [`create_triggers`]
-/// *after* the load.
-async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
+/// Add the `_bench_ts DATETIME(3)` column to all mutated TPC-C tables with a
+/// constant `load_ts` default, so every seed row carries a known stamp and the
+/// initial watermarks need no scan. Live statements always bind `_bench_ts`
+/// explicitly, so the default is never consulted after the load; a forgotten
+/// binding is caught by the watermark-equals-source e2e test.
+async fn add_bench_ts_columns(conn: &mut mysql_async::Conn, load_ts: BenchTs) -> Result<()> {
+    let default = load_ts.mysql_literal();
     for table in MUTATED_TABLES {
-        // Add column with default for seed data rows. Tables are freshly
-        // created by `create_tables`, so a plain ADD COLUMN is safe (MySQL
-        // has no reliable ADD COLUMN IF NOT EXISTS on older versions).
+        // Tables are freshly created by `create_tables`, so a plain ADD COLUMN
+        // is safe (MySQL has no reliable ADD COLUMN IF NOT EXISTS on older
+        // versions).
         let add_col = format!(
-            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"
+            "ALTER TABLE {table} ADD COLUMN _bench_ts DATETIME(3) NOT NULL DEFAULT {default}"
         );
         conn.query_drop(&add_col)
             .await
@@ -345,69 +381,7 @@ async fn add_bench_ts_columns(conn: &mut mysql_async::Conn) -> Result<()> {
     }
 
     println!(
-        "  added _bench_ts column to {} tables",
-        MUTATED_TABLES.len()
-    );
-    Ok(())
-}
-
-/// Create the `_bench_ts` `BEFORE INSERT` and `BEFORE UPDATE` triggers on all
-/// mutated TPC-C tables. Called *after* the bulk load so the triggers do not
-/// fire per-row during the seed load — the seed rows are already stamped by
-/// the column default (see [`add_bench_ts_columns`]).
-///
-/// `MySQL` cannot combine INSERT and UPDATE into a single trigger, so two
-/// triggers are created per table. `NOW(3)` provides millisecond wall-clock
-/// timing per row.
-///
-/// # Errors
-///
-/// Returns an error if any trigger cannot be created.
-pub async fn create_triggers(conn: &mut mysql_async::Conn) -> Result<()> {
-    for table in MUTATED_TABLES {
-        // Attach the INSERT trigger (idempotent via DROP IF EXISTS + CREATE).
-        let ins_trigger = format!("trg_bench_ts_ins_{table}");
-        let drop_ins = format!("DROP TRIGGER IF EXISTS {ins_trigger}");
-        conn.query_drop(&drop_ins)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("drop trigger {ins_trigger}"),
-                source,
-            })?;
-
-        let create_ins = format!(
-            "CREATE TRIGGER {ins_trigger} BEFORE INSERT ON {table} FOR EACH ROW SET NEW._bench_ts = NOW(3)"
-        );
-        conn.query_drop(&create_ins)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("create trigger {ins_trigger}"),
-                source,
-            })?;
-
-        // Attach the UPDATE trigger (idempotent via DROP IF EXISTS + CREATE).
-        let upd_trigger = format!("trg_bench_ts_upd_{table}");
-        let drop_upd = format!("DROP TRIGGER IF EXISTS {upd_trigger}");
-        conn.query_drop(&drop_upd)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("drop trigger {upd_trigger}"),
-                source,
-            })?;
-
-        let create_upd = format!(
-            "CREATE TRIGGER {upd_trigger} BEFORE UPDATE ON {table} FOR EACH ROW SET NEW._bench_ts = NOW(3)"
-        );
-        conn.query_drop(&create_upd)
-            .await
-            .map_err(|source| crate::Error::MySql {
-                action: format!("create trigger {upd_trigger}"),
-                source,
-            })?;
-    }
-
-    println!(
-        "  added _bench_ts triggers to {} tables",
+        "  added _bench_ts column to {} tables (seed default {default})",
         MUTATED_TABLES.len()
     );
     Ok(())

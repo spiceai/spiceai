@@ -21,7 +21,9 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
-use data_components::ducklake::{DuckLakeS3Params, build_ducklake_attach_sql};
+use data_components::ducklake::{
+    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::UnsupportedTypeAction;
@@ -29,12 +31,13 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, ParameterSpec,
+    DataConnectorFactory,
 };
-use runtime::datafusion::dialect::new_duckdb_dialect;
+use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -54,59 +57,6 @@ pub enum Error {
 
     #[snafu(display("Failed to get underlying DuckDB connection"))]
     FailedToGetDuckDbConnection,
-}
-
-fn configure_duckdb_httpfs(
-    conn: &duckdb::Connection,
-    s3: &DuckLakeS3Params,
-) -> Result<(), duckdb::Error> {
-    conn.execute("INSTALL httpfs", [])?;
-    conn.execute("LOAD httpfs", [])?;
-
-    let has_explicit_creds =
-        s3.access_key_id.is_some() || s3.endpoint.is_some() || s3.region.is_some();
-    if !has_explicit_creds {
-        return Ok(());
-    }
-
-    let region = s3.region.as_deref().unwrap_or("us-east-1");
-    let use_ssl = !s3.allow_http;
-
-    let mut secret_parts = vec![
-        "TYPE s3".to_string(),
-        format!("REGION '{}'", region.replace('\'', "''")),
-        format!("USE_SSL {use_ssl}"),
-    ];
-
-    if let Some(key_id) = &s3.access_key_id {
-        secret_parts.push("PROVIDER config".to_string());
-        secret_parts.push(format!("KEY_ID '{}'", key_id.replace('\'', "''")));
-        if let Some(secret) = &s3.secret_access_key {
-            secret_parts.push(format!("SECRET '{}'", secret.replace('\'', "''")));
-        } else {
-            tracing::warn!(
-                "DuckLake: 'aws_access_key_id' provided without 'aws_secret_access_key'. Both must be set for S3 authentication."
-            );
-        }
-    } else {
-        secret_parts.push("PROVIDER credential_chain".to_string());
-    }
-
-    if let Some(endpoint) = &s3.endpoint {
-        let endpoint = endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        secret_parts.push(format!("ENDPOINT '{}'", endpoint.replace('\'', "''")));
-        secret_parts.push("URL_STYLE 'path'".to_string());
-    }
-
-    let secret_sql = format!(
-        "CREATE OR REPLACE SECRET __ducklake_s3 ({})",
-        secret_parts.join(", ")
-    );
-    conn.execute(&secret_sql, [])?;
-
-    Ok(())
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -159,6 +109,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description("The AWS session token for S3 storage. Required with temporary (STS) credentials.")
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("Custom S3-compatible endpoint URL (e.g. for MinIO).")
@@ -261,6 +214,12 @@ fn create_ducklake_factory(
         secret_access_key: params
             .parameters
             .get("aws_secret_access_key")
+            .expose()
+            .ok()
+            .map(ToString::to_string),
+        session_token: params
+            .parameters
+            .get("aws_session_token")
             .expose()
             .ok()
             .map(ToString::to_string),
@@ -385,7 +344,7 @@ impl DataConnectorFactory for DuckLakeFactory {
 }
 
 impl DuckLake {
-    fn resolve_table_reference(&self, dataset: &Dataset) -> TableReference {
+    fn resolve_table_reference(&self, dataset: &DatasetSpec) -> TableReference {
         let path = dataset.path();
         if path.contains('.') {
             format!("{}.{path}", self.catalog_name).into()
@@ -403,7 +362,7 @@ impl DataConnector for DuckLake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
 
@@ -417,7 +376,7 @@ impl DataConnector for DuckLake {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);
 
@@ -447,4 +406,32 @@ pub const CONNECTOR_NAME: &str = "ducklake";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DuckLakeFactory::new_arc()
+}
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_ducklake as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_ducklake_connector,
+    DUCKLAKE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DuckLakeFactory
+);
+
+#[cfg(test)]
+mod tests {
+    use super::PARAMETERS;
+
+    /// The S3 secret built for `DuckDB` only carries `SESSION_TOKEN` when the parameter is
+    /// declared here — otherwise `Parameters::try_new` strips it and temporary (STS)
+    /// credentials fail with `InvalidAccessKeyId`.
+    #[test]
+    fn ducklake_parameters_include_aws_session_token() {
+        assert!(
+            PARAMETERS
+                .iter()
+                .any(|parameter| parameter.name == "aws_session_token"),
+            "missing DuckLake data connector parameter aws_session_token"
+        );
+    }
 }

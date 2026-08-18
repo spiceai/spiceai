@@ -789,6 +789,7 @@ pub enum QueryOverrides {
     Turso,
     BigQuery,
     ScyllaDB,
+    ChbenchSkipSlow, // heaviest CH-benCH analytical queries (q10, q18)
 }
 
 impl QueryOverrides {
@@ -1290,8 +1291,8 @@ pub fn get_tpcds_test_queries(
             if scale_factor.is_some_and(|sf| (sf - 100.0).abs() < f64::EPSILON) =>
         {
             remove_tpcds_query!(
-                queries,
-                78 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
+                queries, 78,
+                97 // SF100 Resources exhausted error https://github.com/spiceai/spiceai/issues/10965
             )
         }
         Some(_) | None => queries,
@@ -1355,6 +1356,10 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
     match overrides {
         // https://github.com/spiceai/spiceai/issues/11011
         Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
+        // q10 and q18 are the heaviest analytical queries; skip them where the
+        // run only needs the rest (e.g. large-SF sources where they dominate the
+        // gate/QPH wall-clock).
+        Some(QueryOverrides::ChbenchSkipSlow) => remove_chbench_query!(queries, 10, 18),
         Some(_) | None => queries,
     }
 }

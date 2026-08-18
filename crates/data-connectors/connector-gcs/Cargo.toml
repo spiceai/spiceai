@@ -7,11 +7,19 @@ license-file.workspace = true
 description = "Google Cloud Storage (GCS) data connector for Spice.ai runtime"
 
 [dependencies]
+app = { path = "../../app" }
+linkme.workspace = true
 object_store = { workspace = true }
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+runtime-secrets = { path = "../../runtime-secrets", default-features = false }
+secrecy.workspace = true
 
 [lints]
 workspace = true

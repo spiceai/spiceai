@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
 use crate::dataconnector::client_identity::{
@@ -33,12 +33,12 @@ use crate::dataconnector::listing::{
 use runtime_metrics::component::MetricsProvider;
 
 use data_components::http::auth::{
-    ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
+    ClientAuthMethod, HttpAuthenticator, OAuth2Auth, OAuth2Config, OAuthGrant, TokenHeader,
 };
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
 use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::semantic::Column;
@@ -87,6 +87,9 @@ fn parse_pagination_max_pages(value: &str) -> Option<usize> {
 #[derive(Debug)]
 pub struct Https {
     params: Parameters,
+    /// Spicepod name, which keys the persisted shared-rate-controller state. Captured at
+    /// construction because it is not part of a dataset's configuration spec.
+    app_name: Arc<str>,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
@@ -104,7 +107,7 @@ impl Https {
     fn shared_rate_control_metrics_for_dataset(
         rate_control_registry: &http_rate_control::HttpRateControlRegistry,
         rate_control_registry_arc: &Arc<http_rate_control::HttpRateControlRegistry>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         structured_format: bool,
     ) -> (
         Arc<HttpRateControlMetrics>,
@@ -134,7 +137,7 @@ impl Https {
 
     /// Determines if the dataset uses a structured file format (parquet, csv, json, etc.)
     /// that would be handled by `ListingTableConnector` rather than `HttpTableProvider`.
-    fn is_structured_format(&self, dataset: &Dataset) -> bool {
+    fn is_structured_format(&self, dataset: &DatasetSpec) -> bool {
         let file_format = self
             .params
             .get("file_format")
@@ -143,19 +146,7 @@ impl Https {
             .map_or_else(|| "auto".to_string(), str::to_ascii_lowercase);
 
         // Check if explicitly configured as a structured format
-        if matches!(
-            file_format.as_str(),
-            "parquet"
-                | "csv"
-                | "tsv"
-                | "arrow"
-                | "avro"
-                | "jsonl"
-                | "ndjson"
-                | "ldjson"
-                | "soda"
-                | "socrata"
-        ) {
+        if STRUCTURED_FILE_FORMATS.contains(&file_format.as_str()) {
             return true;
         }
 
@@ -213,7 +204,7 @@ impl Https {
 
     fn ensure_rate_control_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         let rate_control = http_rate_control::resolve_config(
             &self.params,
@@ -263,7 +254,7 @@ struct HttpProviderParams {
 impl Https {
     fn resolve_http_provider_params(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<HttpProviderParams> {
         let file_format = self
             .params
@@ -540,7 +531,7 @@ impl Https {
     }
 
     fn apply_allowed_paths(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         provider: data_components::http::provider::HttpTableProvider,
         allowed_paths: Vec<String>,
     ) -> DataConnectorResult<data_components::http::provider::HttpTableProvider> {
@@ -616,7 +607,7 @@ impl Https {
 
     fn map_client_identity_config_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: &ClientIdentityConfigError,
     ) -> DataConnectorError {
         match error {
@@ -650,7 +641,7 @@ impl Https {
 
     fn ensure_client_identity_supported_for_structured_dataset(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<()> {
         if !self.client_identity_params_are_configured() {
             return Ok(());
@@ -672,9 +663,52 @@ impl Https {
         })
     }
 
+    /// Reject `OAuth2` parameters on a dataset bound for the listing connector,
+    /// which builds a plain object-store HTTP client and cannot carry an access
+    /// token. These params exist only to authenticate, so a dataset that sets
+    /// them and then sends nothing is never what the user meant — and routing
+    /// there skips `resolve_oauth2_auth`'s validation as well.
+    fn ensure_auth_supported_for_structured_dataset(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<()> {
+        if !any_oauth_param_set(&self.params) {
+            return Ok(());
+        }
+
+        let params = OAUTH_PARAM_KEYS
+            .iter()
+            .filter(|&&name| param_is_set(&self.params, name))
+            .map(|&name| format!("'{}'", self.params.user_param(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "OAuth2 authentication parameters are not supported for structured HTTP file datasets that use the listing connector; requests would be sent unauthenticated. Remove {params}, or use a dynamic JSON HTTP API dataset."
+            ),
+        })
+    }
+
+    /// The listing connector cannot carry `http_headers` either. Unlike the
+    /// `OAuth2` params this only warns: the header list is used for far more
+    /// than authentication, so rejecting it would fail datasets that load and
+    /// serve correctly today.
+    fn warn_ignored_http_headers(&self, dataset: &DatasetSpec) {
+        if param_is_set(&self.params, "http_headers") {
+            tracing::warn!(
+                "Dataset {}: '{}' is not applied to structured HTTP file datasets, which are served by the listing connector. The headers are ignored; use a dynamic JSON HTTP API dataset if the endpoint requires them.",
+                dataset.name,
+                self.params.user_param("http_headers"),
+            );
+        }
+    }
+
     fn resolve_client_identity_config(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
         let client_certificate_path = self
             .params
@@ -712,7 +746,7 @@ impl Https {
 
     async fn resolve_client_identity(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Option<Identity>> {
         let Some(config) = self.resolve_client_identity_config(dataset)? else {
             return Ok(None);
@@ -773,7 +807,7 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -858,22 +892,37 @@ impl Https {
             })
     }
 
-    /// Parse `OAuth2` refresh-token parameters.
+    /// Parse `OAuth2` parameters into a config and grant.
     ///
-    /// Returns `Ok(None)` when no auth is configured. Returns an error when
-    /// the auth configuration is incomplete or inconsistent (e.g. a refresh
-    /// token without a token URL).
-    fn resolve_refresh_token_auth(
+    /// Supports the refresh-token grant (default, RFC 6749 §6) and the
+    /// client-credentials grant (RFC 6749 §4.4). Returns `Ok(None)` when no
+    /// auth is configured, and an error when the configuration is incomplete or
+    /// inconsistent for the selected grant.
+    fn resolve_oauth2_auth(
         &self,
-        dataset: &Dataset,
-    ) -> DataConnectorResult<Option<(RefreshTokenConfig, SecretString)>> {
+        dataset: &DatasetSpec,
+    ) -> DataConnectorResult<Option<(OAuth2Config, OAuthGrant)>> {
+        // Local grant discriminant, resolved before the grant-specific
+        // credentials are validated.
+        enum GrantKind {
+            RefreshToken,
+            ClientCredentials,
+        }
+
+        let invalid = |message: String| DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message,
+        };
+
         let token_url = self
             .params
             .get("auth_token_url")
             .expose()
             .ok()
             .map(str::trim)
-            .filter(|v| !v.is_empty());
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
 
         // Treat a blank/whitespace-only refresh token as unset — avoids failing
         // at the token endpoint with "invalid_grant" when the real problem is a
@@ -882,86 +931,156 @@ impl Https {
             .params
             .get("auth_refresh_token")
             .ok()
-            .filter(|s| !s.expose_secret().trim().is_empty());
+            .filter(|s| !s.expose_secret().trim().is_empty())
+            .cloned();
 
-        match (token_url, refresh_token) {
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "https".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "'{}' is set but '{}' is missing or empty. Provide a refresh token to use OAuth2 auth.",
-                    self.params.user_param("auth_token_url"),
-                    self.params.user_param("auth_refresh_token"),
-                ),
-            }),
-            (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: "https".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "'{}' is set but '{}' is missing. Provide the OAuth2 token endpoint URL.",
-                    self.params.user_param("auth_refresh_token"),
-                    self.params.user_param("auth_token_url"),
-                ),
-            }),
-            (Some(token_url), Some(refresh_token)) => {
-                let client_id = self
-                    .params
-                    .get("auth_client_id")
-                    .expose()
-                    .ok()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string);
-                let client_credential = self.params.get("auth_client_secret").ok().cloned();
+        let grant_type_param = self
+            .params
+            .get("auth_grant_type")
+            .expose()
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
 
-                if client_credential.is_some() && client_id.is_none() {
-                    return Err(DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: "https".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        message: format!(
-                            "'{}' is set but '{}' is missing.",
-                            self.params.user_param("auth_client_secret"),
-                            self.params.user_param("auth_client_id"),
-                        ),
-                    });
-                }
+        let client_id = self
+            .params
+            .get("auth_client_id")
+            .expose()
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        let client_secret = self.params.get("auth_client_secret").ok().cloned();
 
-                let scopes = self
-                    .params
-                    .get("auth_scopes")
-                    .expose()
-                    .ok()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string);
-
-                let client_auth = match self.params.get("auth_client_auth").expose().ok() {
-                    Some(v) => ClientAuthMethod::parse(v).map_err(|bad| {
-                        DataConnectorError::InvalidConfigurationNoSource {
-                            dataconnector: "https".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            message: format!(
-                                "'{}' must be 'basic' or 'body', got '{bad}'",
-                                self.params.user_param("auth_client_auth"),
-                            ),
-                        }
-                    })?,
-                    None => ClientAuthMethod::default(),
-                };
-
-                Ok(Some((
-                    RefreshTokenConfig {
-                        token_url: token_url.to_string(),
-                        client_id,
-                        client_secret: client_credential,
-                        scopes,
-                        client_auth,
-                    },
-                    refresh_token.clone(),
-                )))
-            }
+        // Nothing OAuth-related set at all: no auth to configure. Uses the same
+        // key list as the routing gate so any OAuth2 param (e.g. auth_header_name
+        // without auth_token_url) reaches the validation below rather than being
+        // silently ignored.
+        if !any_oauth_param_set(&self.params) {
+            return Ok(None);
         }
+
+        let Some(token_url) = token_url else {
+            return Err(invalid(format!(
+                "OAuth2 authentication requires '{}'. Provide the OAuth2 token endpoint URL.",
+                self.params.user_param("auth_token_url"),
+            )));
+        };
+
+        // Grant type defaults to the refresh-token grant for back-compat.
+        let grant_kind = match grant_type_param.as_deref() {
+            None | Some("refresh_token") => GrantKind::RefreshToken,
+            Some("client_credentials") => GrantKind::ClientCredentials,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "'{}' must be 'refresh_token' or 'client_credentials', got '{other}'.",
+                    self.params.user_param("auth_grant_type"),
+                )));
+            }
+        };
+
+        let scopes = self
+            .params
+            .get("auth_scopes")
+            .expose()
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        let client_auth = match self.params.get("auth_client_auth").expose().ok() {
+            Some(v) => ClientAuthMethod::parse(v).map_err(|bad| {
+                invalid(format!(
+                    "'{}' must be 'basic' or 'body', got '{bad}'",
+                    self.params.user_param("auth_client_auth"),
+                ))
+            })?,
+            None => ClientAuthMethod::default(),
+        };
+
+        let header = self.resolve_token_header(dataset)?;
+
+        let grant = match grant_kind {
+            GrantKind::RefreshToken => {
+                let Some(refresh_token) = refresh_token else {
+                    return Err(invalid(format!(
+                        "'{token_url_param}' is set but '{refresh_param}' is missing or empty. Provide a refresh token, or set '{grant_param}: client_credentials'.",
+                        token_url_param = self.params.user_param("auth_token_url"),
+                        refresh_param = self.params.user_param("auth_refresh_token"),
+                        grant_param = self.params.user_param("auth_grant_type"),
+                    )));
+                };
+                // Public clients may omit the secret, but a secret without an id
+                // is a misconfiguration.
+                if client_secret.is_some() && client_id.is_none() {
+                    return Err(invalid(format!(
+                        "'{}' is set but '{}' is missing.",
+                        self.params.user_param("auth_client_secret"),
+                        self.params.user_param("auth_client_id"),
+                    )));
+                }
+                OAuthGrant::RefreshToken(refresh_token)
+            }
+            GrantKind::ClientCredentials => {
+                if refresh_token.is_some() {
+                    return Err(invalid(format!(
+                        "'{refresh_param}' is set but the client_credentials grant issues no refresh token. Remove it, or set '{grant_param}: refresh_token'.",
+                        refresh_param = self.params.user_param("auth_refresh_token"),
+                        grant_param = self.params.user_param("auth_grant_type"),
+                    )));
+                }
+                // The client-credentials grant authenticates as the client, so
+                // both id and secret are required (RFC 6749 §4.4).
+                if client_id.is_none() || client_secret.is_none() {
+                    return Err(invalid(format!(
+                        "The client_credentials grant requires both '{}' and '{}'.",
+                        self.params.user_param("auth_client_id"),
+                        self.params.user_param("auth_client_secret"),
+                    )));
+                }
+                OAuthGrant::ClientCredentials
+            }
+        };
+
+        Ok(Some((
+            OAuth2Config {
+                token_url,
+                client_id,
+                client_secret,
+                scopes,
+                client_auth,
+                header,
+            },
+            grant,
+        )))
+    }
+
+    /// Resolve the header the access token is attached to. Defaults to
+    /// `Authorization` (which carries `Bearer <token>`); `auth_header_name`
+    /// overrides it (e.g. `X-Shopify-Access-Token`, which carries the bare
+    /// token).
+    fn resolve_token_header(&self, dataset: &DatasetSpec) -> DataConnectorResult<TokenHeader> {
+        let name = self
+            .params
+            .get("auth_header_name")
+            .expose()
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+
+        let Some(name) = name else {
+            return Ok(TokenHeader::default());
+        };
+
+        TokenHeader::new(name).map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Invalid OAuth2 auth header configuration ('{}'): {e}",
+                self.params.user_param("auth_header_name"),
+            ),
+        })
     }
 
     /// Classify a [`data_components::http::auth::Error`] as either an invalid-
@@ -971,7 +1090,7 @@ impl Https {
     /// configuration issues; transport, 5xx, 408/429 (transient), and parse
     /// errors are connection-level.
     fn map_auth_error(
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         err: data_components::http::auth::Error,
     ) -> DataConnectorError {
         use data_components::http::auth::Error as AuthErr;
@@ -1002,7 +1121,7 @@ impl Https {
     /// Create HTTP table provider for JSON API endpoints
     async fn create_http_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let base_url = Url::parse(dataset.from.as_str()).boxed().map_err(|e| {
             DataConnectorError::InvalidConfiguration {
@@ -1072,26 +1191,25 @@ impl Https {
             provider = provider.with_json_nesting(nesting, schema);
         }
 
-        if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
-            // Fail fast if the user also set an Authorization custom header:
-            // reqwest would append ours after theirs and send two Authorization
-            // values, which most servers will reject in non-obvious ways.
-            if provider
-                .custom_headers()
-                .contains_key(reqwest::header::AUTHORIZATION)
-            {
+        if let Some((auth_config, grant)) = self.resolve_oauth2_auth(dataset)? {
+            // Fail fast if the user also set a static custom header with the
+            // same name the OAuth token will occupy: reqwest would append ours
+            // after theirs and send two values, which most servers reject in
+            // non-obvious ways.
+            let auth_header = auth_config.header.name().clone();
+            if provider.custom_headers().contains_key(&auth_header) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "OAuth2 auth is configured (via '{}') but an 'Authorization' header is also set in '{}'. Remove one of them.",
-                        self.params.user_param("auth_refresh_token"),
+                        "OAuth2 auth is configured but a '{}' header is also set in '{}'. Remove one of them.",
+                        auth_header.as_str(),
                         self.params.user_param("http_headers"),
                     ),
                 });
             }
 
-            let auth = RefreshTokenAuth::try_new(auth_config, refresh_token)
+            let auth = OAuth2Auth::try_new(auth_config, grant)
                 .await
                 .map_err(|e| Self::map_auth_error(dataset, e))?;
             let auth: Arc<dyn HttpAuthenticator> = Arc::new(auth);
@@ -1171,7 +1289,13 @@ impl Https {
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
         let rate_controller = Arc::clone(&self.rate_control_registry)
-            .reserve_shared_rate_controller(&base_url, &rate_control, dataset, "https")
+            .reserve_shared_rate_controller_for_component(
+                &base_url,
+                &rate_control,
+                self.app_name.as_ref(),
+                &ConnectorComponent::from(dataset),
+                "https",
+            )
             .await?;
         self.metrics.set_config(&rate_controller.shared().config);
         self.metrics
@@ -1192,6 +1316,47 @@ impl Https {
 }
 
 /// Returns true if the supplied connector parameters indicate a
+/// User-facing `OAuth2` parameter names (before the connector `http_` prefix).
+/// Setting any of these signals the user intends `OAuth2` on a dynamic JSON API
+/// endpoint. Kept as one list so the routing gate ([`params_indicate_dynamic_api`]),
+/// the structured-dataset guard ([`Https::ensure_auth_supported_for_structured_dataset`])
+/// and the resolver ([`Https::resolve_oauth2_auth`]) can't drift — if they did,
+/// an `OAuth2` param without `auth_token_url` would route to the listing connector
+/// and its config would be silently ignored instead of failing validation.
+const OAUTH_PARAM_KEYS: &[&str] = &[
+    "auth_token_url",
+    "auth_refresh_token",
+    "auth_grant_type",
+    "auth_client_id",
+    "auth_client_secret",
+    "auth_scopes",
+    "auth_client_auth",
+    "auth_header_name",
+];
+
+/// File formats served by the listing connector rather than the dynamic JSON
+/// API provider. `vortex` is handled separately because it is only built on
+/// non-Windows targets, and `json` because it is structured only when no
+/// dynamic-API param is set.
+const STRUCTURED_FILE_FORMATS: &[&str] = &[
+    "parquet", "csv", "tsv", "arrow", "avro", "jsonl", "ndjson", "ldjson", "soda", "socrata",
+];
+
+/// Returns true if `name` is set to a non-empty value. Shared so the routing
+/// gate and the structured-dataset guard can't disagree about what "set" means.
+fn param_is_set(params: &Parameters, name: &str) -> bool {
+    params
+        .get(name)
+        .expose()
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Returns true if any `OAuth2` parameter is set to a non-empty value.
+fn any_oauth_param_set(params: &Parameters) -> bool {
+    OAUTH_PARAM_KEYS.iter().any(|key| param_is_set(params, key))
+}
+
 /// dynamic HTTP API endpoint (as opposed to a static file download).
 /// Mirrors `Https::has_dynamic_api_params`, which is the canonical
 /// runtime check; kept as a free function so the `HttpsFactory`
@@ -1239,11 +1404,18 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
         .iter()
         .any(|key| params.get(key).expose().ok().is_some());
 
+    // OAuth2 authentication is only wired into the dynamic JSON API provider
+    // (the listing connector cannot apply it). Any OAuth2 param means the user
+    // intends the JSON API path. This gate only covers the `json` file format;
+    // an explicitly structured format (csv, parquet, …) still routes to the
+    // listing connector, where `ensure_auth_supported_for_structured_dataset`
+    // rejects the config rather than dropping it silently.
     has_allowed_paths
         || has_query_filters
         || has_body_filters
         || has_header_filters
         || has_pagination
+        || any_oauth_param_set(params)
 }
 
 /// Build the schema for a JSON-nested HTTP table from the user's
@@ -1254,7 +1426,7 @@ fn params_indicate_dynamic_api(params: &Parameters) -> bool {
 /// the historical behavior). Nullability is the declared `nullable:`,
 /// defaulting to `true`.
 fn build_json_nest_schema(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     nesting: &HttpJsonNesting,
 ) -> Result<arrow_schema::SchemaRef, crate::component::dataset::declared_type::ParseTypeError> {
     use crate::component::dataset::declared_type::parse_declared_type;
@@ -1294,7 +1466,7 @@ fn build_json_nest_schema(
 /// inference.
 fn static_schema_for_https_dataset(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<arrow_schema::SchemaRef> {
     if !params_indicate_dynamic_api(params) {
         return None;
@@ -1318,7 +1490,7 @@ fn static_schema_for_https_dataset(
 ///
 /// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
-fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
+fn parse_http_json_nesting(dataset: &DatasetSpec) -> DataConnectorResult<Option<HttpJsonNesting>> {
     let marked_columns: Vec<&Column> = dataset
         .columns
         .iter()
@@ -1420,11 +1592,13 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
             self.ensure_client_identity_supported_for_structured_dataset(dataset)?;
+            self.ensure_auth_supported_for_structured_dataset(dataset)?;
+            self.warn_ignored_http_headers(dataset);
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -1466,7 +1640,7 @@ impl DataConnector for Https {
         )))
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         // Non-structured HTTP endpoints (using HttpTableProvider) are dynamic datasets
         // that require filters to work properly, so skip health monitoring for them.
         if self.is_structured_format(dataset) {
@@ -1517,7 +1691,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component(TLS_CLIENT_KEY).secret()
             .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
-            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
+            .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")
@@ -1571,13 +1745,18 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_page_size")
             .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
         ParameterSpec::runtime("auth_token_url")
-            .description("OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only."),
+            .description("OAuth2 token endpoint URL. Enables OAuth2: the connector acquires short-lived access tokens (refresh-token grant by default, or client_credentials via auth_grant_type) and attaches them to data requests ('Authorization: Bearer <token>' by default, or the bare token under a custom auth_header_name). Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject OAuth2 params."),
+        ParameterSpec::runtime("auth_grant_type")
+            .description("OAuth2 grant type: 'refresh_token' (default, RFC 6749 §6) or 'client_credentials' (RFC 6749 §4.4). client_credentials authenticates with client_id/client_secret and issues no refresh token, re-exchanging before expiry (e.g. Shopify Admin API).")
+            .one_of(&["refresh_token", "client_credentials"]),
         ParameterSpec::component("auth_refresh_token").secret()
-            .description("OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set."),
+            .description("OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set and auth_grant_type is 'refresh_token' (the default). Not used by the client_credentials grant."),
         ParameterSpec::component("auth_client_id").secret()
-            .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret."),
+            .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients and for the client_credentials grant; optional for public clients. Paired with http_auth_client_secret."),
         ParameterSpec::component("auth_client_secret").secret()
-            .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id."),
+            .description("OAuth2 client_secret presented to the token endpoint. Required for confidential clients and for the client_credentials grant; must be set together with http_auth_client_id."),
+        ParameterSpec::runtime("auth_header_name")
+            .description("HTTP header name that carries the access token. Default: 'Authorization', which sends 'Bearer <token>'. Any other header name (e.g. 'X-Shopify-Access-Token') sends the bare token instead."),
         ParameterSpec::runtime("auth_scopes")
             .description("Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional."),
         // Validation happens via `ClientAuthMethod::parse`, which is case-
@@ -1602,19 +1781,19 @@ impl DataConnectorFactory for HttpsFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
+            let app_name: Arc<str> = params
+                .app()
+                .map_or_else(|| Arc::from(""), |app| Arc::from(app.name.as_str()));
             let rate_control_registry = params
-                .runtime
-                .as_ref()
-                .map_or_else(http_rate_control::global_registry, |runtime| {
-                    runtime.http_rate_control_registry()
-                });
+                .http_rate_control_registry()
+                .unwrap_or_else(http_rate_control::global_registry);
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
                         let connector = Https {
                             params: params.parameters.clone(),
+                            app_name: Arc::clone(&app_name),
                             runtime_rate_control_params: runtime_rate_control_params.clone(),
                             rate_control_registry: Arc::clone(&rate_control_registry),
                             metrics: Arc::new(HttpRateControlMetrics::default()),
@@ -1635,6 +1814,7 @@ impl DataConnectorFactory for HttpsFactory {
 
             Ok(Arc::new(Https {
                 params: params.parameters,
+                app_name,
                 runtime_rate_control_params,
                 rate_control_registry,
                 metrics,
@@ -1669,7 +1849,7 @@ impl DataConnectorFactory for HttpsFactory {
     fn static_schema(
         &self,
         params: &ConnectorParams,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<arrow_schema::SchemaRef> {
         static_schema_for_https_dataset(&params.parameters, dataset)
     }
@@ -1712,7 +1892,7 @@ impl ListingTableConnector for HttpListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -1784,6 +1964,7 @@ register_data_connector!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::parameters::Parameters;
@@ -1830,6 +2011,7 @@ mod tests {
         .expect("test connector parameters should be valid");
 
         Https {
+            app_name: Arc::from("test_app"),
             params,
             runtime_rate_control_params: if runtime_params.is_empty() {
                 None
@@ -2380,6 +2562,113 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         }
     }
 
+    /// Regression test for #12315: a structured file format short-circuits
+    /// `is_structured_format` before the dynamic-API gate that
+    /// `any_oauth_param_set` feeds, so the dataset routed to the listing
+    /// connector and its `OAuth2` config was dropped without a word. Every
+    /// structured format takes that same short-circuit, so the guard is checked
+    /// against the whole list rather than one representative format.
+    #[tokio::test]
+    async fn test_http_structured_format_rejects_oauth_params() {
+        // `file_format` is explicit, so `is_structured_format` never inspects
+        // the URL and one dataset serves every format.
+        let dataset = test_dataset("https://example.com/data", RefreshMode::Full, None).await;
+
+        for file_format in STRUCTURED_FILE_FORMATS {
+            let connector = test_connector_with(&[
+                ("file_format", file_format),
+                ("auth_token_url", "https://example.com/oauth/token"),
+                ("auth_grant_type", "client_credentials"),
+            ])
+            .await;
+
+            let error = connector
+                .read_provider(&dataset)
+                .await
+                .expect_err("structured HTTP file datasets should reject OAuth2 params");
+
+            match error {
+                DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                    assert!(
+                        message.contains("OAuth2 authentication parameters are not supported"),
+                        "file_format {file_format}: expected unsupported OAuth2 params error, got: {message}"
+                    );
+                    assert!(
+                        message.contains("'auth_token_url'")
+                            && message.contains("'auth_grant_type'"),
+                        "file_format {file_format}: expected the configured OAuth2 params in the error, got: {message}"
+                    );
+                    assert!(
+                        !message.contains("auth_client_secret"),
+                        "file_format {file_format}: error should not mention unset OAuth2 params, got: {message}"
+                    );
+                    assert!(
+                        message.contains("dynamic JSON HTTP API dataset"),
+                        "file_format {file_format}: expected dynamic JSON guidance in error, got: {message}"
+                    );
+                }
+                other => panic!(
+                    "file_format {file_format}: expected InvalidConfigurationNoSource, got: {other}"
+                ),
+            }
+        }
+    }
+
+    /// The `json` arm already consulted the dynamic-API gate, so `OAuth2` params
+    /// route it to the JSON API provider. The new guard must not intercept it.
+    #[tokio::test]
+    async fn test_http_json_format_with_oauth_params_stays_on_the_api_path() {
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("auth_token_url", "https://example.com/oauth/token"),
+        ])
+        .await;
+        let dataset =
+            test_dataset("https://example.com/data.json", RefreshMode::Append, None).await;
+
+        assert!(
+            !connector.is_structured_format(&dataset),
+            "an OAuth2 param must route a JSON dataset to the dynamic API provider"
+        );
+
+        // Reaches `resolve_oauth2_auth`, which rejects the refresh-token grant
+        // without a refresh token — proof the auth config was validated rather
+        // than dropped.
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("OAuth2 config without a refresh token should fail validation");
+        assert!(
+            matches!(
+                &error,
+                DataConnectorError::InvalidConfigurationNoSource { message, .. }
+                    if message.contains("http_auth_refresh_token")
+            ),
+            "expected OAuth2 refresh-token validation error, got: {error}"
+        );
+    }
+
+    /// A structured dataset keeps loading when no `OAuth2` param is set — with or
+    /// without `http_headers`, which only warns because it is used for far more
+    /// than authentication.
+    #[tokio::test]
+    async fn test_http_structured_format_does_not_reject_non_oauth_params() {
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        for extra in [
+            &[][..],
+            &[("http_headers", "Authorization: Bearer token")][..],
+        ] {
+            let mut params = vec![("file_format", "csv")];
+            params.extend_from_slice(extra);
+            let connector = test_connector_with(&params).await;
+
+            connector
+                .ensure_auth_supported_for_structured_dataset(&dataset)
+                .expect("a structured dataset without OAuth2 params should pass the guard");
+        }
+    }
+
     #[tokio::test]
     async fn test_http_auto_structured_format_detects_compressed_url_extension() {
         let connector = test_connector(None).await;
@@ -2418,12 +2707,37 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn resolve_refresh_token_auth_returns_none_when_unset() {
+    async fn json_endpoint_with_oauth_routes_to_json_api_provider() {
+        // A JSON endpoint with OAuth2 configured must use the dynamic JSON API
+        // provider (where auth is wired), not the static listing connector —
+        // otherwise the configured auth would be silently ignored.
+        let connector = test_connector_with(&[
+            ("file_format", "json"),
+            ("auth_token_url", "https://example.com/oauth/token"),
+        ])
+        .await;
+        let dataset = test_dataset("https://api.example.com", RefreshMode::Append, None).await;
+
+        assert!(
+            !connector.is_structured_format(&dataset),
+            "a JSON endpoint with auth_token_url must route to the JSON API provider"
+        );
+
+        // Without any dynamic-API signal it stays on the listing path.
+        let listing = test_connector_with(&[("file_format", "json")]).await;
+        assert!(
+            listing.is_structured_format(&dataset),
+            "a plain JSON endpoint with no dynamic-API params stays on the listing path"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth2_auth_returns_none_when_unset() {
         let connector = test_connector(None).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let result = connector
-            .resolve_refresh_token_auth(&dataset)
+            .resolve_oauth2_auth(&dataset)
             .expect("no auth params should yield Ok(None)");
         assert!(
             result.is_none(),
@@ -2744,12 +3058,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
+    async fn resolve_oauth2_auth_rejects_refresh_token_without_url() {
         let connector = test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
-            .resolve_refresh_token_auth(&dataset)
+            .resolve_oauth2_auth(&dataset)
             .expect_err("refresh token without token URL should be rejected");
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
@@ -2757,23 +3071,19 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                     message.contains("auth_token_url"),
                     "expected error to mention auth_token_url, got: {message}"
                 );
-                assert!(
-                    message.contains("http_auth_refresh_token"),
-                    "error should reference the prefixed user-facing name, got: {message}"
-                );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
     }
 
     #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_url_without_refresh_token() {
+    async fn resolve_oauth2_auth_rejects_url_without_refresh_token() {
         let connector =
             test_connector_with(&[("auth_token_url", "https://example.com/oauth/token")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
-            .resolve_refresh_token_auth(&dataset)
+            .resolve_oauth2_auth(&dataset)
             .expect_err("token URL without refresh token should be rejected");
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
@@ -2787,7 +3097,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn resolve_refresh_token_auth_rejects_secret_without_client_id() {
+    async fn resolve_oauth2_auth_rejects_secret_without_client_id() {
         let connector = test_connector_with(&[
             ("auth_token_url", "https://example.com/oauth/token"),
             ("http_auth_refresh_token", "rt"),
@@ -2797,7 +3107,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
-            .resolve_refresh_token_auth(&dataset)
+            .resolve_oauth2_auth(&dataset)
             .expect_err("client_secret without client_id should be rejected");
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
@@ -2815,7 +3125,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     }
 
     #[tokio::test]
-    async fn resolve_refresh_token_auth_parses_full_config() {
+    async fn resolve_oauth2_auth_parses_full_refresh_token_config() {
         let connector = test_connector_with(&[
             ("auth_token_url", "https://example.com/oauth/token"),
             ("http_auth_refresh_token", "rt-seed"),
@@ -2827,8 +3137,8 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
-        let (config, _refresh_token) = connector
-            .resolve_refresh_token_auth(&dataset)
+        let (config, grant) = connector
+            .resolve_oauth2_auth(&dataset)
             .expect("full config should parse")
             .expect("expected Some(config) when auth params are set");
 
@@ -2837,6 +3147,118 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         assert!(config.client_secret.is_some());
         assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
         assert_eq!(config.client_auth, ClientAuthMethod::Body);
+        assert_eq!(config.header.name().as_str(), "authorization");
+        assert!(
+            matches!(grant, OAuthGrant::RefreshToken(_)),
+            "expected refresh-token grant by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth2_auth_parses_client_credentials_with_custom_header() {
+        // Shopify-style: client_credentials grant, token sent as a bare value in
+        // a custom header, no refresh token.
+        let connector = test_connector_with(&[
+            (
+                "auth_token_url",
+                "https://shop.example.com/admin/oauth/access_token",
+            ),
+            ("auth_grant_type", "client_credentials"),
+            ("http_auth_client_id", "shopify-cid"),
+            ("http_auth_client_secret", "shopify-secret"),
+            ("auth_client_auth", "body"),
+            ("auth_header_name", "X-Shopify-Access-Token"),
+        ])
+        .await;
+        let dataset = test_dataset("https://shop.example.com", RefreshMode::Append, None).await;
+
+        let (config, grant) = connector
+            .resolve_oauth2_auth(&dataset)
+            .expect("client_credentials config should parse")
+            .expect("expected Some(config)");
+
+        assert!(
+            matches!(grant, OAuthGrant::ClientCredentials),
+            "expected client-credentials grant"
+        );
+        assert_eq!(config.client_id.as_deref(), Some("shopify-cid"));
+        assert!(config.client_secret.is_some());
+        assert_eq!(config.header.name().as_str(), "x-shopify-access-token");
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth2_auth_client_credentials_requires_client_credentials() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("auth_grant_type", "client_credentials"),
+            ("http_auth_client_id", "cid-only"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_oauth2_auth(&dataset)
+            .expect_err("client_credentials without a secret should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("client_credentials")
+                        && message.contains("http_auth_client_secret"),
+                    "expected error to require client credentials, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth2_auth_client_credentials_rejects_refresh_token() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("auth_grant_type", "client_credentials"),
+            ("http_auth_client_id", "cid"),
+            ("http_auth_client_secret", "csec"),
+            ("http_auth_refresh_token", "stray-rt"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_oauth2_auth(&dataset)
+            .expect_err("a refresh token with client_credentials should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("http_auth_refresh_token"),
+                    "expected error to mention the stray refresh token, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_oauth2_auth_rejects_invalid_header_name() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("http_auth_refresh_token", "rt"),
+            ("auth_header_name", "Not A Valid Header"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_oauth2_auth(&dataset)
+            .expect_err("an invalid header name should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("auth_header_name"),
+                    "expected error to mention auth_header_name, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
     }
 
     fn column_with_marker(name: &str, marker: Value) -> Column {

@@ -41,15 +41,19 @@ use crate::{
     model::EmbeddingModelStore,
     parameters::{ParameterSpec, Parameters},
 };
+use runtime_parameters_typed::TypedParams as _;
+use runtime_search::store_params::s3::{S3DistanceMetric, S3VectorsParams};
 use runtime_secrets::{Secrets, get_params_with_secrets};
+use secrecy::ExposeSecret;
 mod client;
 mod metrics;
 use client::S3VectorsTelemetryMiddleware;
 mod retry_client;
 use retry_client::S3VectorsRetryMiddlewareBuilder;
 
-const DEFAULT_BATCH_WRITE_ROWS: usize = 100_000;
-
+/// Feeds the AWS credential resolver (`initiate_config_with_credentials`), which is shared
+/// with the Glue and Iceberg connectors and reads a [`Parameters`]. Type/enum validation,
+/// aliases, and typo warnings for the whole component live on [`S3VectorsParams`].
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bucket")
         .description("The S3 bucket name to use for the S3 Vectors index.")
@@ -132,32 +136,23 @@ pub async fn try_from_table(
         Arc::clone(model)
     };
 
-    let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
+    let (params, auth_params) = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
-    let batch_write_rows = string_from_params(&params, "batch_write_rows")
-        .and_then(|s| match s.parse::<usize>() {
-            Ok(val) => Some(val),
-            Err(e) => {
-                tracing::warn!("Invalid value for 's3_vectors_batch_write_rows': {s}. Error: {e}. Falling back to default: {DEFAULT_BATCH_WRITE_ROWS}");
-                None
-            },
-        })
-        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
-    let spill_writes = string_from_params(&params, "spill_writes")
-        .and_then(|s| match s.parse::<bool>() {
-            Ok(val) if partition_by.is_empty() => Some(val),
-            Ok(_) => {
-                tracing::warn!("Spill writes are not supported with partitioned S3 vector indexes. Ignoring 's3_vectors_spill_writes' setting.");
-                None
-            },
-            Err(e) => {
-                tracing::warn!("Invalid value for 's3_vectors_spill_writes': {s}. Error: {e}. Defaulting to false.");
-                None
-            },
-        });
+    let batch_write_rows = params.batch_write_rows;
+    let spill_writes = match params.spill_writes {
+        Some(value) if partition_by.is_empty() => Some(value),
+        Some(_) => {
+            tracing::warn!(
+                "Spill writes are not supported with partitioned S3 vector indexes. Ignoring 's3_vectors_spill_writes' setting."
+            );
+            None
+        }
+        None => None,
+    };
     let table = try_vector_table(
         metadata_columns.clone(),
-        params,
+        &params,
+        &auth_params,
         format!("{}-{}-{}", ds_name, column, config.model)
             .replace('_', "-")
             .as_str(),
@@ -199,34 +194,17 @@ async fn embedding_vector_size(
 #[expect(clippy::cast_possible_wrap)]
 async fn try_vector_table(
     columns: MetadataColumns,
-    params: Parameters,
+    params: &S3VectorsParams,
+    auth_params: &Parameters,
     default_s3_index_name: &str,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     model_name: &str,
 ) -> Result<S3VectorsTable, Box<dyn std::error::Error + Send + Sync>> {
-    let s3_vectors_arn = string_from_params(&params, "arn");
-    let s3_vectors_bucket = string_from_params(&params, "bucket");
-    let s3_vectors_index = string_from_params(&params, "index");
-    let client_timeout = string_from_params(&params, "client_timeout")
-        .map(fundu::parse_duration)
-        .transpose()
-        .map_err(|_| {
-            Box::from(format!(
-                "S3 vectors index configured with invalid 'client_timeout'= '{}'",
-                string_from_params(&params, "client_timeout").unwrap_or_default() // If missing, uses default ("").
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-    let index_poll_interval = string_from_params(&params, "index_poll_interval")
-        .map(fundu::parse_duration)
-        .transpose()
-        .map_err(|_| {
-            Box::from(format!(
-                "S3 vectors index configured with invalid 'index_poll_interval'= '{}'",
-                string_from_params(&params, "index_poll_interval").unwrap_or_default() // If missing, uses default ("").
-            )) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-
-    let id = match (s3_vectors_arn, s3_vectors_bucket, s3_vectors_index) {
+    let id = match (
+        params.arn.as_ref().map(ExposeSecret::expose_secret),
+        params.bucket.as_ref().map(ExposeSecret::expose_secret),
+        params.index.as_ref().map(ExposeSecret::expose_secret),
+    ) {
         (Some(_), Some(_), Some(_)) => Err("Cannot specify both 's3_vectors_arn' and 's3_vectors_bucket'.".to_string()),
         (Some(arn), None, None) => Ok(S3VectorIdentifier::IndexArn(arn.to_string())),
         (None, Some(bucket), Some(index)) => Ok(S3VectorIdentifier::Index {
@@ -253,12 +231,12 @@ async fn try_vector_table(
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
-        &params,
-        params.get("aws_iam_role_source").expose().ok(),
+        auth_params,
+        auth_params.get("aws_iam_role_source").expose().ok(),
     )
     .await?;
 
-    if let Some(dur) = client_timeout {
+    if let Some(dur) = params.client_timeout {
         config_bldr =
             config_bldr.timeout_config(TimeoutConfigBuilder::new().operation_timeout(dur).build());
     }
@@ -269,7 +247,7 @@ async fn try_vector_table(
     let base_client = Arc::new(Client::new(&config));
     let with_metrics_cache = Arc::new(S3VectorsTelemetryMiddleware::new(
         base_client,
-        index_poll_interval,
+        params.index_poll_interval,
     ));
     let s3_vector_client: Arc<dyn S3Vectors + Send + Sync> =
         Arc::new(S3VectorsRetryMiddlewareBuilder::new(with_metrics_cache).build());
@@ -292,7 +270,7 @@ async fn try_vector_table(
             })
             .collect::<Vec<_>>()
             .into(),
-        string_from_params(&params, "distance_metric"),
+        params.distance_metric.map(S3DistanceMetric::as_str),
     )
     .await?
     else {
@@ -303,18 +281,14 @@ async fn try_vector_table(
     Ok(vector_table)
 }
 
-// Attempt to get a certain string-value from the parameter.
-//
-// Returns `None` if the key does not exist
-fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
-    p.get(key).expose().ok()
-}
-
-/// Convert raw params configuration to parameters with secret support
+/// Convert raw params configuration to the typed [`S3VectorsParams`] plus the
+/// rawer [`Parameters`] that feeds the shared AWS auth resolver. Both parse the
+/// same secret-resolved map; the typed struct owns validation, the `Parameters`
+/// layer preserves the auth path's `.secret()` autoload behavior verbatim.
 async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(S3VectorsParams, Parameters), Box<dyn std::error::Error + Send + Sync>> {
     let params = vector_store_config
         .params
         .as_ref()
@@ -323,7 +297,14 @@ async fn get_store_params(
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
 
-    let params = Parameters::try_new(
+    let typed = S3VectorsParams::try_from_params(
+        "AWS S3 Vectors store",
+        params_with_secrets.clone(),
+        &secrets,
+    )
+    .await?;
+
+    let auth_params = Parameters::try_new(
         "AWS S3 Vectors store",
         params_with_secrets.into_iter().collect(),
         "s3_vectors",
@@ -332,7 +313,7 @@ async fn get_store_params(
     )
     .await?;
 
-    Ok(params)
+    Ok((typed, auth_params))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

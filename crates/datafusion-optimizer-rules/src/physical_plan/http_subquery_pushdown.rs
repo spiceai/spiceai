@@ -92,7 +92,10 @@ impl PhysicalOptimizerRule for HttpParamsPushdown {
     }
 
     fn schema_check(&self) -> bool {
-        false
+        // The rewrite replaces a semi-join with a node that reproduces the join's
+        // output schema, so hold it to that: a schema change here reaches the caller
+        // as a query result whose columns don't match the plan it asked for.
+        true
     }
 }
 
@@ -193,8 +196,52 @@ fn try_rewrite_hash_join(
         "HttpParamsPushdown: rewriting HashJoinExec for column '{col_name}' into HttpWithDeferredParamsExec"
     );
 
-    let exec = HttpWithDeferredParamsExec::new(http_side, build_side, col_name, build_col_index);
-    Ok(Transformed::yes(Arc::new(exec)))
+    let exec: Arc<dyn ExecutionPlan> = Arc::new(HttpWithDeferredParamsExec::new(
+        http_side,
+        build_side,
+        col_name,
+        build_col_index,
+    ));
+    let rewritten = reapply_join_projection(join_exec.projection.as_deref(), exec)?;
+    Ok(Transformed::yes(rewritten))
+}
+
+/// Reapply a projection that the physical optimizer embedded into the `HashJoinExec`.
+///
+/// A `HashJoinExec` can carry its own projection, and when it does its output schema
+/// is that projected schema rather than the full join schema. The rewritten node
+/// outputs the http side's columns unprojected, so the projection has to be restored
+/// above it — otherwise the rewrite widens (or reorders) the plan's output schema
+/// relative to the logical plan it was planned from.
+///
+/// For `LeftSemi`/`RightSemi` the join's unprojected output schema is exactly the
+/// http side's schema — `build_join_schema` keeps only the semi side's fields, and a
+/// semi join never forces a field nullable — so the projection indices address the
+/// rewritten node's columns directly.
+fn reapply_join_projection(
+    projection: Option<&[usize]>,
+    exec: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let Some(indices) = projection else {
+        return Ok(exec);
+    };
+
+    let schema = exec.schema();
+    let exprs = indices
+        .iter()
+        .map(|&idx| {
+            let field = schema.fields().get(idx).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "HttpParamsPushdown: join projection index {idx} is out of bounds for an HTTP side with {} column(s)",
+                    schema.fields().len()
+                ))
+            })?;
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), idx));
+            Ok((expr, field.name().clone()))
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+
+    Ok(Arc::new(ProjectionExec::try_new(exprs, exec)?))
 }
 
 /// If the `HashJoinExec` has an `HttpExec` on one side and the join key is an
@@ -572,7 +619,7 @@ async fn materialize_string_values(
 ) -> Result<Vec<String>, DataFusionError> {
     let batches = datafusion::physical_plan::collect(Arc::clone(plan), Arc::clone(context)).await?;
 
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut values = Vec::new();
     for (batch_index, batch) in batches.iter().enumerate() {
         if batch.num_columns() <= col_index {
@@ -598,7 +645,7 @@ async fn materialize_string_values(
             };
 
         for val in string_iter.flatten() {
-            if seen.insert(val.to_string()) {
+            if seen.insert(val) {
                 if values.len() >= MAX_MATERIALIZED_VALUES {
                     return Err(DataFusionError::Plan(format!(
                         "HttpWithDeferredParamsExec: subquery produced more than {MAX_MATERIALIZED_VALUES} unique values, aborting pushdown"
@@ -699,6 +746,25 @@ mod tests {
         right_idx: usize,
         join_type: JoinType,
     ) -> Arc<dyn ExecutionPlan> {
+        make_hash_join_projected(
+            left, right, left_col, left_idx, right_col, right_idx, join_type, None,
+        )
+    }
+
+    /// As [`make_hash_join`], but with `projection` embedded in the join — the shape
+    /// `ProjectionPushdown` produces when it pushes a projection into the join
+    /// instead of leaving a `ProjectionExec` above it.
+    #[expect(clippy::too_many_arguments)]
+    fn make_hash_join_projected(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        left_col: &str,
+        left_idx: usize,
+        right_col: &str,
+        right_idx: usize,
+        join_type: JoinType,
+        projection: Option<Vec<usize>>,
+    ) -> Arc<dyn ExecutionPlan> {
         let on: Vec<(
             Arc<dyn datafusion::physical_expr::PhysicalExpr>,
             Arc<dyn datafusion::physical_expr::PhysicalExpr>,
@@ -713,7 +779,7 @@ mod tests {
                 on,
                 None,
                 &join_type,
-                None,
+                projection,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
                 false,
@@ -725,6 +791,137 @@ mod tests {
     // -----------------------------------------------------------------------
     // Optimizer rule rewrite tests
     // -----------------------------------------------------------------------
+
+    /// The rewrite must reproduce the schema of the join it replaces, including a
+    /// projection the physical optimizer embedded into the join.
+    ///
+    /// `SELECT content FROM http_table WHERE request_path IN (SELECT …)` plans as a
+    /// `LeftSemi` join whose projection keeps only `content`, so the join's output
+    /// schema is narrower than the http side's. Without the projection restored, the
+    /// rewritten node emits all 8 http columns and the query fails with an internal
+    /// schema mismatch against its own logical plan.
+    ///
+    /// Regression test for #11009.
+    #[test]
+    fn test_embedded_join_projection_is_restored() {
+        let http = make_http_exec();
+        let build = make_memory_exec("request_path", &[Some("/users/pg")]);
+
+        // `content` is index 4 of the http base table schema.
+        let join = make_hash_join_projected(
+            http,
+            build,
+            "request_path",
+            0,
+            "request_path",
+            0,
+            JoinType::LeftSemi,
+            Some(vec![4]),
+        );
+
+        let expected_schema = join.schema();
+        assert_eq!(
+            expected_schema.fields().len(),
+            1,
+            "the join under test must project a single column"
+        );
+
+        let result = HttpParamsPushdown
+            .optimize(join, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        assert_eq!(
+            result.schema(),
+            expected_schema,
+            "rewrite changed the plan's output schema: got [{}]",
+            result
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // The deferred node is still what does the work, now under the projection.
+        assert!(
+            result
+                .children()
+                .first()
+                .is_some_and(|child| child.downcast_ref::<HttpWithDeferredParamsExec>().is_some()),
+            "expected HttpWithDeferredParamsExec beneath the restored projection, got {}",
+            result.name()
+        );
+    }
+
+    /// An embedded projection may also reorder columns. Restoring it by position is
+    /// what keeps the values under each output column correct — emitting the http
+    /// side's own order here would return `request_path` values in the `content`
+    /// column for any consumer that binds columns by index.
+    #[test]
+    fn test_embedded_join_projection_preserves_column_order() {
+        let http = make_http_exec();
+        let build = make_memory_exec("request_path", &[Some("/users/pg")]);
+
+        // Reversed relative to the http schema: content (4) before request_path (0).
+        let join = make_hash_join_projected(
+            http,
+            build,
+            "request_path",
+            0,
+            "request_path",
+            0,
+            JoinType::LeftSemi,
+            Some(vec![4, 0]),
+        );
+
+        let expected_schema = join.schema();
+        let result = HttpParamsPushdown
+            .optimize(join, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        assert_eq!(result.schema(), expected_schema);
+        assert_eq!(
+            result
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["content".to_string(), "request_path".to_string()]
+        );
+    }
+
+    /// A join with no embedded projection must be rewritten to the bare deferred
+    /// node — no projection wrapper, so `EXPLAIN` and downstream rules are unchanged.
+    #[test]
+    fn test_rewrite_without_join_projection_is_unwrapped() {
+        let http = make_http_exec();
+        let build = make_memory_exec("request_path", &[Some("/users/pg")]);
+
+        let join = make_hash_join(
+            http,
+            build,
+            "request_path",
+            0,
+            "request_path",
+            0,
+            JoinType::LeftSemi,
+        );
+        let expected_schema = join.schema();
+
+        let result = HttpParamsPushdown
+            .optimize(join, &ConfigOptions::new())
+            .expect("optimize should succeed");
+
+        assert!(
+            result
+                .downcast_ref::<HttpWithDeferredParamsExec>()
+                .is_some(),
+            "expected a bare HttpWithDeferredParamsExec, got {}",
+            result.name()
+        );
+        assert_eq!(result.schema(), expected_schema);
+    }
 
     #[test]
     fn test_left_semi_rewrite_produces_deferred_exec() {

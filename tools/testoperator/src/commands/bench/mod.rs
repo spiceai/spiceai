@@ -73,6 +73,7 @@ pub(crate) fn emit_acceleration_size_if_applicable(
 }
 
 pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
+    super::ensure_shared_client_connections(args, "bench")?;
     // Two SUT acquisition paths: when a system adapter is configured, delegate
     // setup() to it over JSON-RPC; otherwise spawn a local `spiced` as before.
     // The rest of the benchmark flow is identical apart from a few
@@ -308,8 +309,47 @@ const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
     "tpcds_q77", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
 ];
 
-/// Only snapshot the official TPCH and TPCDS queries, not the "simple" extensions as they don't return consistent results
+/// The `ClickBench` queries whose recorded rows are the same however the engine
+/// breaks ties, so they can be snapshotted.
+///
+/// `ClickBench` needs an allow-list where TPC-H and TPC-DS need a deny-list. Most of
+/// its set ranks by a metric with no unique tiebreaker (`ORDER BY COUNT(*) DESC
+/// LIMIT 10`), and q18 has no `ORDER BY` at all, so which rows reach the top N —
+/// and in what order — follows partitioning and aggregation order rather than the
+/// query. The snapshot keeps the first ten rows as returned, so those queries would
+/// record a plan detail rather than an answer.
+///
+/// `AVG` rules out two more. `avg` coerces its integer argument to `Float64` before
+/// aggregating — the plan for q4 is `avg(CAST(hits.UserID AS Float64))` — so the
+/// partial sums are floats combined in partition-completion order, and float
+/// addition is not associative. Repartitioning the scan moves the low bits, and the
+/// partition count follows the runner's cores, so q3 and q4 would record the shape
+/// of the machine that ran them.
+///
+/// What is left still answers the question a result snapshot is here to ask — did
+/// the table load, and do the aggregates over it come out right. Every query below
+/// returns one exactly-computed aggregate row, except q20 and q26, which project a
+/// column holding the same value in every row that could be selected.
+const SNAPSHOTTED_CLICKBENCH_QUERIES: &[&str] = &[
+    "clickbench_q1",  // COUNT(*)
+    "clickbench_q2",  // COUNT(*) with a filter
+    "clickbench_q5",  // COUNT(DISTINCT)
+    "clickbench_q6",  // COUNT(DISTINCT)
+    "clickbench_q7",  // MIN and MAX over a timestamp conversion
+    "clickbench_q20", // Projects only the literal the filter pins
+    "clickbench_q21", // COUNT(*) over a LIKE filter
+    "clickbench_q26", // Ordered by the only projected column
+    "clickbench_q30", // 90 integer SUMs
+];
+
+/// Only snapshot query sets whose recorded rows are reproducible: the official TPC-H
+/// and TPC-DS queries — not the "simple" extensions, which don't return consistent
+/// results — and the `ClickBench` queries listed in [`SNAPSHOTTED_CLICKBENCH_QUERIES`].
 fn snapshot_predicate(query_name: &str) -> bool {
+    if query_name.starts_with("clickbench_q") {
+        return SNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name);
+    }
+
     (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
         && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
 }
@@ -447,4 +487,49 @@ pub(crate) async fn prepare_chbench_source(
 
     println!("CH-benCHmark source is ready");
     Ok(driver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SNAPSHOTTED_CLICKBENCH_QUERIES, snapshot_predicate};
+
+    #[test]
+    fn snapshots_the_official_tpch_and_tpcds_queries() {
+        assert!(snapshot_predicate("tpch_q1"));
+        assert!(snapshot_predicate("tpcds_q1"));
+        // The "simple" extensions are not part of either spec.
+        assert!(!snapshot_predicate("tpch_simple_q4"));
+        // Deny-listed for an unspecified order between equal rows.
+        assert!(!snapshot_predicate("tpcds_q77"));
+    }
+
+    #[test]
+    fn snapshots_only_the_reproducible_clickbench_queries() {
+        for query in SNAPSHOTTED_CLICKBENCH_QUERIES {
+            assert!(snapshot_predicate(query), "{query} should be snapshotted");
+        }
+        // Ranks by a metric with no unique tiebreaker.
+        assert!(!snapshot_predicate("clickbench_q13"));
+        // No ORDER BY at all.
+        assert!(!snapshot_predicate("clickbench_q18"));
+        // Averages in Float64, so the low bits follow the partition count.
+        assert!(!snapshot_predicate("clickbench_q3"));
+        assert!(!snapshot_predicate("clickbench_q4"));
+    }
+
+    /// The allow-list matches whole names, so a listed query must not also enable
+    /// the queries it is a prefix of.
+    #[test]
+    fn clickbench_allow_list_matches_whole_query_names() {
+        assert!(snapshot_predicate("clickbench_q1"));
+        assert!(!snapshot_predicate("clickbench_q11"));
+        assert!(snapshot_predicate("clickbench_q2"));
+        assert!(!snapshot_predicate("clickbench_q22"));
+    }
+
+    #[test]
+    fn does_not_snapshot_other_query_sets() {
+        assert!(!snapshot_predicate("chbench_q1"));
+        assert!(!snapshot_predicate("scenario_q1"));
+    }
 }

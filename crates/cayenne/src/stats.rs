@@ -27,7 +27,7 @@ use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
 use vortex::VortexSessionDefault;
 use vortex::array::stats::StatsSet;
-use vortex::dtype::arrow::FromArrowType;
+use vortex::arrow::{FromArrowType, ToArrowDatum};
 use vortex::dtype::{DType, Nullability};
 use vortex::error::VortexResult;
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
@@ -116,7 +116,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
             // extension types. Round-trip through Arrow so DataFusion
             // `ScalarValue` gets the correct logical type (preserving time
             // unit / time zone).
-            let datum = Arc::<dyn arrow::array::Datum>::try_from(scalar).ok()?;
+            let datum = scalar.to_arrow_datum().ok()?;
             let (array, _is_scalar) = datum.get();
             ScalarValue::try_from_array(array, 0).ok()
         }

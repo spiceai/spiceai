@@ -20,6 +20,7 @@ mod json_nested_fields;
 mod view_hot_reload;
 
 mod deferred;
+mod trace_id;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -613,6 +614,194 @@ async fn test_http_json_api_dynamic() -> Result<(), String> {
                 )
                 .await?;
             }
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Mock of a Shopify-style API secured with the `OAuth2` client-credentials
+/// grant. `POST /oauth/token` validates `grant_type=client_credentials` plus
+/// client credentials (in the body) and returns an access token with **no**
+/// refresh token. `GET /data` returns rows only when the request carries
+/// `X-Shopify-Access-Token: <current-token>` and NO `Authorization` header.
+async fn start_oauth_cc_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Shared between the token endpoint (issues) and data endpoint (validates).
+    let issued_token: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let token_state = Arc::clone(&issued_token);
+    let data_state = Arc::clone(&issued_token);
+
+    let json_ct = [("content-type", "application/json")];
+
+    let app = Router::new()
+        .route(
+            "/oauth/token",
+            post(move |Form(form): Form<HashMap<String, String>>| {
+                let token_state = Arc::clone(&token_state);
+                async move {
+                    if form.get("grant_type").map(String::as_str) != Some("client_credentials") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            json_ct,
+                            r#"{"error":"unsupported_grant_type"}"#.to_string(),
+                        );
+                    }
+                    if form.get("client_id").map(String::as_str) != Some("demo-client-id")
+                        || form.get("client_secret").map(String::as_str)
+                            != Some("demo-client-secret")
+                    {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            json_ct,
+                            r#"{"error":"invalid_client"}"#.to_string(),
+                        );
+                    }
+                    let token = "shpat_integration_token".to_string();
+                    *token_state.lock().await = Some(token.clone());
+                    // Deliberately NO refresh_token, matching Shopify.
+                    let body = json!({
+                        "access_token": token,
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    })
+                    .to_string();
+                    (StatusCode::OK, json_ct, body)
+                }
+            }),
+        )
+        .route(
+            "/data",
+            get(move |headers: AxumHeaderMap| {
+                let data_state = Arc::clone(&data_state);
+                async move {
+                    // The custom-header auth must NOT also send Authorization.
+                    if headers.get("authorization").is_some() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            json_ct,
+                            r#"{"error":"unexpected_authorization_header"}"#.to_string(),
+                        );
+                    }
+                    let provided = headers
+                        .get("x-shopify-access-token")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    let current = data_state.lock().await.clone();
+                    if current.is_none() || provided != current {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            json_ct,
+                            r#"{"error":"invalid_token"}"#.to_string(),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        json_ct,
+                        r#"[{"id":1,"title":"Widget"},{"id":2,"title":"Gadget"}]"#.to_string(),
+                    )
+                }
+            }),
+        );
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    let addr = tcp_listener.local_addr().map_err(|e| e.to_string())?;
+    tokio::spawn(async move {
+        axum::serve(tcp_listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap_or_default();
+    });
+
+    Ok((tx, addr))
+}
+
+/// End-to-end: the HTTP connector performs an `OAuth2` **client-credentials**
+/// exchange (no refresh token) and attaches the issued token to data requests
+/// via a **custom header** (`X-Shopify-Access-Token`), not `Authorization:
+/// Bearer`. Exercises the full wired path — spicepod params -> resolver ->
+/// `HttpTableProvider` -> outgoing request — which unit tests can't cover.
+#[tokio::test]
+async fn test_http_oauth_client_credentials_custom_header() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_oauth_cc_server().await?;
+            tracing::debug!("OAuth client-credentials mock server started at {addr}");
+
+            // No `allowed_request_paths` — auth_token_url alone must route to
+            // the dynamic JSON API provider (the routing fix).
+            let mut dataset = Dataset::new(format!("http://{addr}/data"), "shopify_products");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                (
+                    "auth_token_url".to_string(),
+                    format!("http://{addr}/oauth/token"),
+                ),
+                (
+                    "auth_grant_type".to_string(),
+                    "client_credentials".to_string(),
+                ),
+                (
+                    "http_auth_client_id".to_string(),
+                    "demo-client-id".to_string(),
+                ),
+                (
+                    "http_auth_client_secret".to_string(),
+                    "demo-client-secret".to_string(),
+                ),
+                ("auth_client_auth".to_string(), "body".to_string()),
+                (
+                    "auth_header_name".to_string(),
+                    "X-Shopify-Access-Token".to_string(),
+                ),
+            ])));
+
+            let app = AppBuilder::new("http_oauth_cc_test")
+                .with_dataset(dataset)
+                .build();
+            let rt = load_runtime(app).await?;
+
+            let (_cache, batches) =
+                run_http_json_query(&rt, "SELECT content, response_status FROM shopify_products")
+                    .await?;
+
+            let value =
+                write_to_json_value(&batches).map_err(|e| format!("serialize batches: {e}"))?;
+            let rows = value
+                .as_array()
+                .ok_or_else(|| "expected an array of rows".to_string())?;
+            assert!(!rows.is_empty(), "expected at least one row from /data");
+            for row in rows {
+                // A 401 would still produce a row (with the error body); require
+                // 200 to prove the client-credentials token was accepted on the
+                // custom header.
+                assert_eq!(
+                    row.get("response_status").and_then(Value::as_u64),
+                    Some(200),
+                    "every data request must be authorized (200) via the custom header; row: {row}"
+                );
+            }
+            // The JSON array decomposes into one row per element; check the
+            // product data landed across the returned rows.
+            let all_content: String = rows
+                .iter()
+                .filter_map(|row| row.get("content").and_then(Value::as_str))
+                .collect();
+            assert!(
+                all_content.contains("Widget") && all_content.contains("Gadget"),
+                "expected product data in content, got: {all_content}"
+            );
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;

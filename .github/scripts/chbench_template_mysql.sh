@@ -1,36 +1,43 @@
 #!/usr/bin/env bash
 # Ensure the CH-benCH source DB `chbench` is ready WITHOUT re-seeding every run,
-# by keeping a pristine tablespace snapshot on the long-lived CI MySQL pod and
-# restoring from it with a fast local file copy. The physical file work is done
-# by the file-agent SIDECAR in the MySQL pod (chbench-mysql chart, sidecar.enabled);
-# this script only DRIVES it over the ordinary MySQL connection — it INSERTs a
-# command row into `chbench._file_cmd` and polls for completion. MySQL has no
-# server-side DB-clone primitive and the runner has no filesystem access to the
-# pod, so the sidecar (co-located, sharing the data volume) performs the
-# `FLUSH ... FOR EXPORT` + copy (snapshot) and `DISCARD`/copy/`IMPORT` (restore).
+# by keeping a pristine snapshot of the whole data dir on the long-lived CI MySQL
+# pod and restoring from it with a fast local file copy. The physical file work is
+# done by the SUPERVISOR in the MySQL pod (chbench-mysql chart): it runs mysqld as
+# a child and performs COLD, whole-data-dir snapshot/restore while mysqld is
+# cleanly stopped. This script only DRIVES it over the ordinary MySQL connection —
+# it INSERTs a command row into `chbench._filed_cmd` and polls for completion.
+# MySQL has no server-side DB-clone primitive and the runner has no filesystem
+# access to the pod, so the co-located supervisor (sharing the data volume) does
+# the copy; because it acts only on a stopped server, a reset can never corrupt
+# InnoDB (the failure mode of the earlier online tablespace-swap design).
 #
 # Only meaningful on the dedicated, persistent MySQL pod (xlarge runner): its
-# node-local data dir and the sidecar's cache both survive between runs (wiped
-# together only on pod restart). On an ephemeral per-run docker MySQL there is
-# no sidecar and nothing to cache, so the caller gates this step to the pod path
-# and the main run seeds normally.
+# node-local data dir and the supervisor's snapshot cache both survive between
+# runs (wiped together only on pod restart). On an ephemeral per-run docker MySQL
+# there is no supervisor and nothing to cache, so the caller gates this step to
+# the pod path and the main run seeds normally.
 #
-# Flow (mirrors chbench_template.sh, but the "copy" is the sidecar's job):
-#   fingerprint = sf=<N> driver=<chbench-driver tree hash> mysql<major>
-#   HIT  (sidecar reports a cached snapshot with a matching fingerprint):
-#        issue a `restore` command and wait. On restore failure, fall back to a
-#        full reseed so the run is never blocked by a bad cache.
+# Flow (mirrors chbench_template.sh, but the "copy" is the supervisor's job):
+#   fingerprint = sf<N>-driver<chbench-driver tree hash>-mysql<major>  (fs-safe)
+#   HIT  (supervisor's snapshot registry lists a matching fingerprint):
+#        issue a `restore` command and wait. NB: a restore RESTARTS mysqld, so the
+#        connection drops mid-command — we tolerate that while polling. On restore
+#        failure, fall back to a full reseed so the run is never blocked.
 #   MISS: seed once via `testoperator run htap --prepare-only`, then issue a
 #        `snapshot` command so the next run can HIT. `chbench` is already freshly
 #        seeded, so no restore is needed on a miss.
 # Either way `chbench` ends up seeded, so the caller runs with `--skip-prepare`.
+#
+# A restore resets the binlog (supervisor RESET MASTER); spiced is started fresh
+# by the subsequent testoperator run and re-establishes CDC from the current
+# position, so no extra downstream reset is needed here.
 #
 # Env (from the workflow step):
 #   SCALE_FACTOR (req), TERMINALS (opt), SPICEPOD_PATH (req), SPICED_BIN (req),
 #   CHBENCH_MYSQL_HOST/PORT/USER/PASS (req), CHBENCH_MYSQL_DB (opt, default
 #   chbench), TESTOP_PREFIX (opt), REPO_ROOT (default: $GITHUB_WORKSPACE) for the
 #   chbench-driver fingerprint, CMD_TIMEOUT_SECONDS (opt, default 3600) and
-#   SIDECAR_WAIT_SECONDS (opt, default 180) for the poll bounds.
+#   SUPERVISOR_WAIT_SECONDS (opt, default 180) for the poll bounds.
 set -euo pipefail
 
 SF="${SCALE_FACTOR:?}"
@@ -40,7 +47,8 @@ export MYSQL_PWD="${CHBENCH_MYSQL_PASS:-bench}"
 REPO_ROOT="${REPO_ROOT:-${GITHUB_WORKSPACE:-$PWD}}"
 TESTOP_PREFIX="${TESTOP_PREFIX:-}"
 CMD_TIMEOUT="${CMD_TIMEOUT_SECONDS:-3600}"
-SIDECAR_WAIT="${SIDECAR_WAIT_SECONDS:-180}"
+# Back-compat: accept the old SIDECAR_WAIT_SECONDS name if a caller still sets it.
+SUPERVISOR_WAIT="${SUPERVISOR_WAIT_SECONDS:-${SIDECAR_WAIT_SECONDS:-180}}"
 
 # The mysql client may not be preinstalled on the runner.
 if ! command -v mysql >/dev/null 2>&1; then
@@ -52,47 +60,60 @@ my() { mysql -h "$MYH" -P "$MYP" -u "$MYU" -D "$MYDB" -N -B -e "$1"; }
 
 mysqlmajor=$(my "SELECT SUBSTRING_INDEX(VERSION(), '.', 1)")
 driver=$(git -C "$REPO_ROOT" rev-parse "HEAD:tools/chbench-driver" 2>/dev/null || echo nogit)
-fp="sf=${SF} driver=${driver} mysql${mysqlmajor}"
+# Filesystem-safe fingerprint: the supervisor uses it verbatim as a cache dir name.
+fp="sf${SF}-driver${driver}-mysql${mysqlmajor}"
 echo "template fingerprint: $fp"
 
-# Wait for the sidecar to have created its control table (it does so shortly
-# after the pod starts). Absent after the bound => the sidecar isn't running.
+# SQL-escape a single-quoted literal.
+esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+
 table_exists() {
   local n
   n=$(my "SELECT COUNT(*) FROM information_schema.tables
-          WHERE table_schema='${MYDB}' AND table_name='$1'")
+          WHERE table_schema='${MYDB}' AND table_name='$1'" 2>/dev/null || echo 0)
   [ "${n:-0}" != "0" ]
 }
+
+# Wait for the supervisor to have created its control table (it does so shortly
+# after mysqld first becomes ready). Absent after the bound => it isn't running.
 wait_for_control_table() {
   local waited=0
-  until table_exists _file_cmd; do
-    if [ "$waited" -ge "$SIDECAR_WAIT" ]; then
-      echo "ERROR: chbench._file_cmd not present after ${SIDECAR_WAIT}s — is the MySQL pod's file-agent sidecar enabled (sidecar.enabled)?" >&2
+  until table_exists _filed_cmd; do
+    if [ "$waited" -ge "$SUPERVISOR_WAIT" ]; then
+      echo "ERROR: chbench._filed_cmd not present after ${SUPERVISOR_WAIT}s — is the MySQL pod running the chbench-mysql supervisor (chbench-mysql chart)?" >&2
       return 1
     fi
     sleep 3; waited=$((waited + 3))
   done
 }
 
-# SQL-escape a single-quoted literal.
-esc() { printf '%s' "$1" | sed "s/'/''/g"; }
+# A restore restarts mysqld, so generate a caller-side token and key the command
+# by it (the row briefly disappears across the restart; we recreate/poll by token).
+new_token() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  else echo "tok-$(date +%s)-${RANDOM}${RANDOM}"; fi
+}
 
-# Issue a command to the sidecar and wait for it to finish. Echoes the final
-# state ("done"/"error"/"timeout") on stdout; the sidecar's message goes to the
-# log. INSERT + LAST_INSERT_ID() run in one session so we get our own row's id.
+# Issue a command to the supervisor and wait for it to finish. Echoes the final
+# state ("done"/"error"/"timeout") on stdout; the supervisor's message goes to the
+# log. Tolerates the connection dropping mid-command (a restore bounces mysqld):
+# query failures and a briefly-absent row are treated as "still running".
 issue_and_wait() {
-  local cmd="$1" id state waited=0
-  id=$(my "INSERT INTO _file_cmd (cmd, fp) VALUES ('$(esc "$cmd")', '$(esc "$fp")'); SELECT LAST_INSERT_ID()")
-  echo "  issued $cmd command id=$id, waiting (timeout ${CMD_TIMEOUT}s)..." >&2
+  local cmd="$1" token state msg waited=0
+  token=$(new_token)
+  my "INSERT INTO _filed_cmd (token, cmd, fp) VALUES ('$(esc "$token")', '$(esc "$cmd")', '$(esc "$fp")')"
+  echo "  issued $cmd token=$token, waiting (timeout ${CMD_TIMEOUT}s)..." >&2
   while :; do
-    state=$(my "SELECT state FROM _file_cmd WHERE id=$id" || echo "")
+    # `|| echo ''` swallows connection errors while mysqld restarts for a restore.
+    state=$(my "SELECT state FROM _filed_cmd WHERE token='$(esc "$token")'" 2>/dev/null || echo "")
     case "$state" in
       done|error)
-        echo "  $cmd id=$id -> $state: $(my "SELECT COALESCE(msg,'') FROM _file_cmd WHERE id=$id" | tr '\n' ' ')" >&2
+        msg=$(my "SELECT COALESCE(msg,'') FROM _filed_cmd WHERE token='$(esc "$token")'" 2>/dev/null | tr '\n' ' ' || echo "")
+        echo "  $cmd token=$token -> $state: $msg" >&2
         echo "$state"; return 0 ;;
     esac
     if [ "$waited" -ge "$CMD_TIMEOUT" ]; then
-      echo "  $cmd id=$id -> timeout after ${CMD_TIMEOUT}s (last state '${state:-?}')" >&2
+      echo "  $cmd token=$token -> timeout after ${CMD_TIMEOUT}s (last state '${state:-?}')" >&2
       echo "timeout"; return 0
     fi
     sleep 2; waited=$((waited + 2))
@@ -122,14 +143,15 @@ do_miss() {
 
 wait_for_control_table
 
-# HIT if the sidecar reports a cached snapshot whose fingerprint matches.
-cached=""
-if table_exists _file_cache; then
-  cached=$(my "SELECT COALESCE(MAX(fp),'') FROM _file_cache WHERE k=1")
+# HIT if the supervisor's registry lists a snapshot with this fingerprint.
+hit=0
+if table_exists _filed_snapshots; then
+  n=$(my "SELECT COUNT(*) FROM _filed_snapshots WHERE fp='$(esc "$fp")'" 2>/dev/null || echo 0)
+  [ "${n:-0}" != "0" ] && hit=1
 fi
 
-if [ "$cached" = "$fp" ]; then
-  echo "template HIT for SF$SF -> restoring chbench from sidecar snapshot"
+if [ "$hit" = 1 ]; then
+  echo "template HIT for SF$SF -> restoring chbench from the supervisor snapshot"
   if [ "$(issue_and_wait restore)" = "done" ]; then
     echo "restore complete — run with --skip-prepare"
   else
@@ -137,7 +159,7 @@ if [ "$cached" = "$fp" ]; then
     do_miss
   fi
 else
-  [ -n "$cached" ] && echo "cached fingerprint '$cached' != '$fp' -> reseeding"
+  echo "no cached snapshot for '$fp' -> reseeding"
   do_miss
 fi
 

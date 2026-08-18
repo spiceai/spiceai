@@ -50,12 +50,14 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::{component::dataset::Dataset, federated_table::FederatedTable};
+use crate::component::dataset::DatasetSpec;
 use data_components::cdc::{
-    self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    self, AccelerationContents, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
+    CommitError,
 };
 use data_components::flight::{FlightFactory, FlightTable};
 use data_components::{Read, ReadWrite};
+use data_connector_api::federated::FederatedTableProvider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -469,7 +471,7 @@ fn configure_max_message_size(
     mut flight_client: FlightClient,
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
-    if let Some(app) = params.app.as_ref()
+    if let Some(app) = params.app()
         && let Some(flight) = app.runtime.flight.as_ref()
         && let Some(max_message_size) =
             flight
@@ -492,7 +494,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -534,7 +536,7 @@ impl DataConnector for SpiceAI {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
@@ -568,16 +570,17 @@ impl DataConnector for SpiceAI {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        _dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.append_stream(federated_table)
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(federated_table_provider_adaptor) = table_provider
@@ -619,7 +622,7 @@ impl SpiceAI {
     ///
     /// Spice AI datasets have the following format for `dataset.path()`:
     /// `<org>/<app>/datasets/<dataset_name>`.
-    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> Result<SpiceAIDatasetPath> {
+    fn spice_dataset_path<T: Borrow<DatasetSpec>>(dataset: T) -> Result<SpiceAIDatasetPath> {
         let dataset = dataset.borrow();
         let path = dataset.path();
         if is_flight_endpoint_path(path) {
@@ -736,9 +739,8 @@ mod tests {
         ConnectorParams {
             parameters,
             unsupported_type_action: None,
-            component: ConnectorComponent::Dataset(Arc::new(dataset)),
-            app: None,
-            runtime: None,
+            component: ConnectorComponent::from(&dataset),
+            context: None,
             io_runtime: Handle::current(),
         }
     }
@@ -863,7 +865,8 @@ mod tests {
                 .build()
                 .expect("Failed to build dataset");
 
-            let dataset_path = SpiceAI::spice_dataset_path(&dataset).expect("a valid dataset path");
+            let dataset_path =
+                SpiceAI::spice_dataset_path(&dataset.spec).expect("a valid dataset path");
             assert_eq!(dataset_path, expected, "Failed for input: {input}");
         }
     }
@@ -893,9 +896,9 @@ mod tests {
                 .build()
                 .expect("failed to build dataset");
 
-            crate::dataconnector::parameters::ConnectorParamsBuilder::new(
+            crate::dataconnector::parameters::ConnectorParamsBuilder::for_dataset(
                 dataset.source().into(),
-                ConnectorComponent::Dataset(Arc::new(dataset)),
+                &dataset,
             )
             .build(Arc::new(RwLock::new(Secrets::new())), Handle::current())
             .await

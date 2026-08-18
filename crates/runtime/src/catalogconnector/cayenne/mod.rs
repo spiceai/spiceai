@@ -21,7 +21,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::Parameters,
 };
 use async_trait::async_trait;
@@ -43,8 +45,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
     ),
     ParameterSpec::component("segment_cache_mb")
-        .description("Vortex segment cache size in MB. Default: 256.")
-        .default("256"),
+        .description("Ignored: the Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per catalog, so a per-catalog size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (in MB; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
     ParameterSpec::component("target_file_size_mb")
         .description("Target Vortex file size in MB. Default: 256.")
         .default("256"),
@@ -131,12 +132,21 @@ impl CayenneCatalogConnector {
             .ok()
             .map(ToOwned::to_owned);
 
+        // The segment cache is process-wide, so a per-catalog size has nothing to
+        // size. Report it the same way the per-dataset parameter is reported,
+        // rather than discarding it silently — a catalog that set `0` to disable
+        // caching would otherwise be given a cache with no indication why.
         let segment_cache_mb = self
             .params
             .get("segment_cache_mb")
             .expose()
             .ok()
             .and_then(|v| parse_num_param::<usize>(v, "segment_cache_mb"));
+        if self.params.get("segment_cache_mb").expose().ok().is_some() {
+            tracing::warn!(
+                "catalog.params.cayenne_segment_cache_mb is ignored. The Vortex segment cache is now a single budget shared by every Cayenne table instead of one cache per catalog. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/catalogs/cayenne"
+            );
+        }
         let target_file_size_mb = self
             .params
             .get("target_file_size_mb")
@@ -231,21 +241,16 @@ impl CayenneCatalogConnector {
         // path, the catalog path has no schema inference, so `adaptive` is seeded
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
-        let tuning_mode = self
-            .params
-            .get("tuning")
-            .expose()
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase());
-        if let Some(mode) = &tuning_mode
-            && mode != "auto"
-            && mode != "adaptive"
-        {
+        let raw_tuning = self.params.get("tuning").expose().ok();
+        let (tuning_mode, tuning_was_invalid) =
+            crate::dataaccelerator::cayenne::autotune::TuningMode::parse(raw_tuning);
+        if tuning_was_invalid {
             tracing::warn!(
-                "Invalid Cayenne catalog parameter `tuning` value `{mode}`; expected `auto` or `adaptive`, defaulting to `auto`."
+                "Invalid Cayenne catalog parameter `tuning` value `{}`; expected `auto` or `adaptive`, defaulting to `auto`.",
+                raw_tuning.unwrap_or_default().trim()
             );
         }
-        let dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+        let dynamic_tuning = tuning_mode.is_adaptive();
 
         // Seed the adaptive-tunable knobs from the host hardware profile (only
         // when adaptive is requested — `auto` keeps the engine defaults so the
@@ -283,8 +288,8 @@ impl CayenneCatalogConnector {
                 Some(caps.max_rows),
                 Some(caps.max_segments),
                 Some(caps.max_bytes),
-                // Seed write concurrency to the host core count so the controller's
-                // [1, cores] window is host-appropriate.
+                // Seed write concurrency to the CPU budget's core count so the
+                // controller's [1, cores] window matches the entitlement.
                 Some(hw.cores),
             )
         } else {
@@ -353,7 +358,7 @@ impl CatalogConnector for CayenneCatalogConnector {
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self.parse_provider_config().await;
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(provider_config, runtime_env)
+            CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),

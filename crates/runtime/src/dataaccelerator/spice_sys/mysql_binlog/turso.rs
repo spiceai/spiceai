@@ -19,6 +19,16 @@ use std::sync::Arc;
 use super::{Error, MYSQL_BINLOG_TABLE_NAME, MySqlBinlogCheckpoint, MySqlBinlogSys, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
 
+/// Idempotent migrations adding the columns that postdate the initial schema.
+/// Turso (`SQLite`) has no `IF NOT EXISTS` for `ADD COLUMN`, so callers ignore the
+/// duplicate-column error when a column already exists.
+fn migrate_columns() -> [String; 2] {
+    [
+        format!("ALTER TABLE {MYSQL_BINLOG_TABLE_NAME} ADD COLUMN gtid_executed TEXT"),
+        format!("ALTER TABLE {MYSQL_BINLOG_TABLE_NAME} ADD COLUMN cursor_type TEXT"),
+    ]
+}
+
 impl MySqlBinlogSys {
     pub(super) async fn upsert_turso(
         &self,
@@ -29,6 +39,8 @@ impl MySqlBinlogSys {
         let binlog_file = checkpoint.binlog_file.clone();
         let binlog_pos = Self::position_to_i64(checkpoint.binlog_pos);
         let schema_json = checkpoint.schema_json.clone();
+        let gtid_executed = checkpoint.gtid_executed.clone();
+        let cursor_type = checkpoint.cursor_type.clone();
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
@@ -40,6 +52,8 @@ impl MySqlBinlogSys {
                     binlog_file TEXT NOT NULL,
                     binlog_pos BIGINT NOT NULL,
                     schema_json TEXT,
+                    gtid_executed TEXT,
+                    cursor_type TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )"
@@ -47,23 +61,38 @@ impl MySqlBinlogSys {
             conn.execute(&create_table, ())
                 .await
                 .map_err(Error::external)?;
+            // Migrate tables created before these columns existed. No
+            // `IF NOT EXISTS` for ADD COLUMN in SQLite/Turso — a duplicate
+            // column (already migrated) errors and is ignored.
+            for migration in migrate_columns() {
+                let _ = conn.execute(&migration, ()).await;
+            }
         }
 
         let _schema_guard = pool.acquire_schema_read_lock().await;
         let upsert = format!(
             "INSERT INTO {MYSQL_BINLOG_TABLE_NAME}
-             (dataset_name, binlog_file, binlog_pos, schema_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             (dataset_name, binlog_file, binlog_pos, schema_json, gtid_executed, cursor_type, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT (dataset_name) DO UPDATE SET
                 binlog_file = ?2,
                 binlog_pos = ?3,
                 schema_json = ?4,
+                gtid_executed = ?5,
+                cursor_type = ?6,
                 updated_at = CURRENT_TIMESTAMP"
         );
 
         conn.execute(
             &upsert,
-            turso::params![dataset_name, binlog_file, binlog_pos, schema_json],
+            turso::params![
+                dataset_name,
+                binlog_file,
+                binlog_pos,
+                schema_json,
+                gtid_executed,
+                cursor_type
+            ],
         )
         .await
         .map_err(Error::external)?;
@@ -77,8 +106,16 @@ impl MySqlBinlogSys {
     ) -> Option<MySqlBinlogCheckpoint> {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.ok()?;
+        // Ensure the added columns exist so the SELECT doesn't fail on a table
+        // created before they were added. Idempotent; ignored otherwise.
+        {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
+            for migration in migrate_columns() {
+                let _ = conn.execute(&migration, ()).await;
+            }
+        }
         let query = format!(
-            "SELECT binlog_file, binlog_pos, schema_json, strftime('%s', updated_at) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
+            "SELECT binlog_file, binlog_pos, schema_json, gtid_executed, cursor_type, strftime('%s', updated_at) FROM {MYSQL_BINLOG_TABLE_NAME} WHERE dataset_name = ?"
         );
 
         let mut rows = conn
@@ -90,7 +127,9 @@ impl MySqlBinlogSys {
         let binlog_file = row.get::<String>(0).ok()?;
         let binlog_pos = row.get::<i64>(1).ok()?;
         let schema_json: Option<String> = row.get::<String>(2).ok();
-        let updated_at_epoch: Option<i64> = row.get::<i64>(3).ok();
+        let gtid_executed: Option<String> = row.get::<String>(3).ok();
+        let cursor_type: Option<String> = row.get::<String>(4).ok();
+        let updated_at_epoch: Option<i64> = row.get::<i64>(5).ok();
         let updated_at = updated_at_epoch.and_then(|epoch| {
             u64::try_from(epoch)
                 .ok()
@@ -101,6 +140,8 @@ impl MySqlBinlogSys {
             binlog_file,
             binlog_pos: Self::position_from_i64(binlog_pos),
             schema_json,
+            gtid_executed,
+            cursor_type,
             updated_at,
         })
     }

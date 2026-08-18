@@ -13,24 +13,29 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::graphql::{
-    self, builder::GraphQLClientBuilder, client::GraphQLClient,
-    provider::GraphQLTableProviderBuilder,
+//! GraphQL data connector for Spice.ai runtime.
+
+pub mod graphql;
+
+use crate::graphql::{
+    builder::GraphQLClientBuilder, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
+use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
-use datafusion::datasource::TableProvider;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::http_rate_control::{
+use data_http_rate_control as http_rate_control;
+use data_http_rate_control::{
     HttpRateControlMetricSource, HttpRateControlMetrics, HttpRateControlMetricsProvider,
 };
+use datafusion::datasource::TableProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult, default_spice_client, http_rate_control,
+    DataConnectorResult, NewDataConnectorResult, default_spice_client,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::MetricsProvider;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::{
     any::Any,
@@ -45,6 +50,9 @@ use url::Url;
 #[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
+    /// Spicepod name, which keys the persisted shared-rate-controller state. Captured at
+    /// construction because it is not part of a dataset's configuration spec.
+    app_name: Arc<str>,
     runtime_rate_control_params: Option<HashMap<String, String>>,
     rate_control_registry: Arc<http_rate_control::HttpRateControlRegistry>,
     metrics: Arc<HttpRateControlMetrics>,
@@ -106,14 +114,13 @@ impl DataConnectorFactory for GraphQLFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let runtime_rate_control_params =
-                params.app.as_ref().map(|app| app.runtime.params.clone());
+            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
+            let app_name: Arc<str> = params
+                .app()
+                .map_or_else(|| Arc::from(""), |app| Arc::from(app.name.as_str()));
             let rate_control_registry = params
-                .runtime
-                .as_ref()
-                .map_or_else(http_rate_control::global_registry, |runtime| {
-                    runtime.http_rate_control_registry()
-                });
+                .http_rate_control_registry()
+                .unwrap_or_else(http_rate_control::global_registry);
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     Url::parse(dataset.path()).map_or_else(
@@ -137,6 +144,7 @@ impl DataConnectorFactory for GraphQLFactory {
 
             let graphql = GraphQL {
                 params: params.parameters,
+                app_name,
                 runtime_rate_control_params,
                 rate_control_registry,
                 metrics,
@@ -159,7 +167,7 @@ impl DataConnectorFactory for GraphQLFactory {
 impl GraphQL {
     async fn get_client(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<(
         GraphQLClient,
         http_rate_control::SharedRateControllerReservation,
@@ -241,10 +249,10 @@ impl GraphQL {
                 source,
             })?;
 
-        let rate_control = http_rate_control::resolve_config(
+        let rate_control = http_rate_control::resolve_config_for_component(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
-            dataset,
+            &ConnectorComponent::from(dataset),
             "graphql",
         )?;
         let rate_limiter = self
@@ -254,7 +262,13 @@ impl GraphQL {
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
         let rate_controller = Arc::clone(&self.rate_control_registry)
-            .reserve_shared_rate_controller(&endpoint, &rate_control, dataset, "graphql")
+            .reserve_shared_rate_controller_for_component(
+                &endpoint,
+                &rate_control,
+                self.app_name.as_ref(),
+                &ConnectorComponent::from(dataset),
+                "graphql",
+            )
             .await?;
         self.metrics.set_config(&rate_controller.shared().config);
         self.metrics
@@ -296,7 +310,7 @@ impl DataConnector for GraphQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -363,8 +377,9 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 mod tests {
     use super::*;
     use runtime::Runtime;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
-    use runtime::secrets::Secrets;
+    use runtime_secrets::Secrets;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
@@ -425,6 +440,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_rate_control_dataset_params_parse_and_update_metrics() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[
                 ("max_concurrent_requests", "4"),
                 ("requests_per_second_limit", "2"),
@@ -463,6 +479,7 @@ mod tests {
             ),
         ]);
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[("max_concurrent_requests", "2")]).await,
             runtime_rate_control_params: Some(runtime_params),
             rate_control_registry: http_rate_control::global_registry(),
@@ -485,6 +502,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_rate_control_rejects_invalid_limits() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[("requests_per_second_limit", "0")]).await,
             runtime_rate_control_params: None,
             rate_control_registry: http_rate_control::global_registry(),
@@ -512,6 +530,7 @@ mod tests {
     #[tokio::test]
     async fn graphql_metrics_provider_can_be_suppressed_for_non_owner() {
         let graphql = GraphQL {
+            app_name: std::sync::Arc::from("test_app"),
             params: test_params(&[]).await,
             runtime_rate_control_params: None,
             rate_control_registry: http_rate_control::global_registry(),
@@ -523,3 +542,13 @@ mod tests {
         assert!(DataConnector::metrics_provider(&graphql).is_none());
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_graphql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_graphql_connector,
+    GRAPHQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GraphQLFactory
+);

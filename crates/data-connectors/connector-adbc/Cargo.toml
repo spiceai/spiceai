@@ -21,6 +21,7 @@ license-file.workspace = true
 description = "ADBC (Arrow Database Connectivity) data connector for Spice.ai runtime"
 
 [dependencies]
+linkme.workspace = true
 adbc_core.workspace = true
 adbc_driver_manager.workspace = true
 arrow.workspace = true
@@ -32,6 +33,8 @@ datafusion-table-providers = { workspace = true, features = ["adbc-federation"] 
 futures.workspace = true
 parking_lot.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 sha2.workspace = true
 snafu.workspace = true

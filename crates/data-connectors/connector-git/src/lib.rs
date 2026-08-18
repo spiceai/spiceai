@@ -15,22 +15,27 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use async_trait::async_trait;
-use data_components::git::{
+// Exported (as it was in data_components) so its public API items are treated as
+// exported API by clippy's avoid-breaking-exported-api, matching the original crate.
+pub mod git;
+
+use crate::git::{
     BackoffMethod, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES,
     DEFAULT_MAX_RETRIES, GitCredentials, GitResilienceConfig, GitTableConfig, GitTableProvider,
 };
+use async_trait::async_trait;
 use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -222,7 +227,7 @@ impl Git {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        let key = data_components::git::sanitize_repo_url(repo_url);
+        let key = crate::git::sanitize_repo_url(repo_url);
         let semaphore = shared_semaphore(&key, max_concurrent_requests);
         let disabled = shared_disabled_flag(&key);
 
@@ -238,7 +243,7 @@ impl Git {
 
     async fn create_table_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let component = ConnectorComponent::from(dataset);
@@ -252,7 +257,7 @@ impl Git {
 
         tracing::debug!(
             "Connecting to Git repository: {} (reference: {:?})",
-            data_components::git::sanitize_repo_url(&repo_url),
+            crate::git::sanitize_repo_url(&repo_url),
             reference
         );
 
@@ -348,7 +353,7 @@ impl DataConnector for Git {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
     }
@@ -558,3 +563,13 @@ pub const CONNECTOR_NAME: &str = "git";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GitFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_git as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_git_connector,
+    GIT_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GitFactory
+);

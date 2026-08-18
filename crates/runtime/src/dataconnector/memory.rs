@@ -21,7 +21,7 @@ use snafu::ResultExt;
 
 use std::{any::Any, pin::Pin, sync::Arc};
 
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use datafusion::datasource::TableProvider;
 use futures::Future;
 use runtime_tools::memory::MEMORY_TABLE_SCHEMA;
@@ -89,7 +89,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {
@@ -114,7 +114,7 @@ impl DataConnector for MemoryConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = dataset.path();
         let Some(schema) = Self::schema_from_path(path) else {

@@ -195,19 +195,27 @@ impl InlineBatchBuffer {
         &self.batches
     }
 
+    #[must_use]
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Reconstitute the original stream: re-emit the buffered head ahead of the
+    /// unconsumed remainder, so the write path sees every row exactly once and in
+    /// order.
+    ///
+    /// The buffer already owns the batches, so replaying them is a plain
+    /// `stream::iter` — no `MemorySourceConfig`/`ExecutionPlan` round trip, and
+    /// therefore no `TaskContext` and nothing to fail.
     pub(crate) fn into_chained_stream(
         self,
         remaining_stream: SendableRecordBatchStream,
-        context: &Arc<TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let buffered_exec =
-            MemorySourceConfig::try_new_exec(&[self.batches], Arc::clone(&self.schema), None)?;
-        let buffered_stream = execute_stream(buffered_exec, Arc::clone(context))?;
-        let chained_stream = Box::pin(StreamExt::chain(buffered_stream, remaining_stream));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+    ) -> SendableRecordBatchStream {
+        let replay = futures::stream::iter(self.batches.into_iter().map(Ok));
+        Box::pin(RecordBatchStreamAdapter::new(
             self.schema,
-            chained_stream,
-        )))
+            StreamExt::chain(replay, remaining_stream),
+        ))
     }
 }
 
@@ -309,6 +317,10 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<CayenneCdcWrite> {
         self.table.ensure_no_incomplete_write().await?;
+        // Empty-table probe: on the very first write of a freshly-created
+        // table, install warm empty PK caches so the initial load maintains
+        // them and the first upsert never pays the full cold index scan.
+        self.table.maybe_install_warm_pk_caches().await;
         let write_start = Instant::now();
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
@@ -1404,7 +1416,7 @@ impl<'a> AppendMutationWriter<'a> {
             buffer.total_rows() as u64,
             buffer.total_bytes() as u64,
         );
-        let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
+        let re_stream = buffer.into_chained_stream(prepared_stream);
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
             estimated_bytes,

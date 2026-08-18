@@ -27,13 +27,18 @@ datafusion-optimizer-rules = {path = "../datafusion-optimizer-rules"}
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false, optional = true }
+parking_lot.workspace = true
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs", optional = true }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-table-partition = { path = "../runtime-table-partition" }
+s3_vectors = { path = "../s3_vectors", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 tantivy = { workspace = true, optional = true }
+tantivy_datafusion_filter = { path = "../tantivy_datafusion_filter", optional = true }
 tokio.workspace = true
 tracing.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -42,12 +47,13 @@ util = { path = "../util", features = ["datafusion"] }
 default = ["text_search", "s3_vectors"]
 duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers", "dep:duckdb", "llms"]
 elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
-llms = ["dep:llms"]
-s3_vectors = ["data_components/s3_vectors", "llms"]
-text_search = ["dep:tantivy"]
+llms = ["dep:llms", "dep:runtime-datafusion-udfs"]
+s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
+text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
+tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

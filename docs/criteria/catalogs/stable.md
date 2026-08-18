@@ -19,7 +19,7 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 | Oracle        | ➖             |              |
 | PostgreSQL    | ➖             |              |
 | Snowflake     | ➖             |              |
-| Spice.ai      | ➖             |              |
+| Spice.ai      | ✅             | @peasee      |
 | Unity Catalog | ✅             | @Sevenannn   |
 
 ## Stable Release Criteria

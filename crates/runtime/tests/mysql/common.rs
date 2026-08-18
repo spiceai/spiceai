@@ -52,10 +52,48 @@ const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 pub async fn start_mysql_docker_container(
     port: u16,
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
+    start_mysql_docker_container_with_image(port, MYSQL_IMAGE).await
+}
+
+/// Start a `MySQL` container on `port` using a specific image tag. Used by the
+/// version matrix to exercise both the `SHOW BINARY LOG STATUS` path (8.2+) and
+/// the `SHOW MASTER STATUS` fallback (8.0).
+#[instrument]
+pub async fn start_mysql_docker_container_with_image(
+    port: u16,
+    image: &str,
+) -> Result<RunningContainer<'static>, anyhow::Error> {
+    start_mysql_container_inner(port, image, &[]).await
+}
+
+/// Start a single-node `MySQL` container with GTIDs fully enabled
+/// (`gtid_mode = ON`, `enforce_gtid_consistency = ON`). Used by the GTID
+/// auto-positioning resume test — the source must issue GTIDs for the connector
+/// to persist a failover-safe checkpoint.
+#[instrument]
+pub async fn start_mysql_gtid_docker_container(
+    port: u16,
+) -> Result<RunningContainer<'static>, anyhow::Error> {
+    start_mysql_container_inner(
+        port,
+        MYSQL_IMAGE,
+        &["--gtid-mode=ON", "--enforce-gtid-consistency=ON"],
+    )
+    .await
+}
+
+/// Shared container startup. `mysqld_args` are appended to the server command
+/// (the `MySQL` entrypoint prepends `mysqld` when the first arg starts with
+/// `-`), so they configure the server itself (e.g. GTID mode).
+async fn start_mysql_container_inner(
+    port: u16,
+    image: &str,
+    mysqld_args: &[&str],
+) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{MYSQL_DOCKER_CONTAINER}-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
-        .image(MYSQL_IMAGE.to_string())
+    let mut builder = ContainerRunnerBuilder::new(container_name)
+        .image(image.to_string())
         .add_port_binding(3306, port)
         .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
         .add_env_var("MYSQL_DATABASE", "mysqldb")
@@ -71,7 +109,11 @@ pub async fn start_mysql_docker_container(
             retries: Some(120),
             start_period: Some(30_000_000_000), // 30s
             start_interval: None,
-        })
+        });
+    if !mysqld_args.is_empty() {
+        builder = builder.command(mysqld_args.iter().copied());
+    }
+    let running_container = builder
         .build()?
         .run(Some(MYSQL_CONTAINER_START_TIMEOUT))
         .await?;

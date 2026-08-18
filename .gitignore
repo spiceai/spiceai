@@ -17,6 +17,7 @@ Makefile.local
 spicepod.yaml
 !test/tpc-bench/tpch-spicepod/spicepod.yaml
 !examples/cosmosdb-connector/spicepod.yaml
+!examples/cdc-debezium-ingest/spicepod.yaml
 !test/spicepods/chbench/local-writeback/spicepod.yaml
 
 target/
@@ -93,3 +94,7 @@ cluster_logs/
 
 # Distributed helper script working directory
 .distributed/
+
+# insta writes these when a snapshot assertion fails; they are the rejected
+# candidate, reviewed with `cargo insta review` and never committed.
+*.snap.new

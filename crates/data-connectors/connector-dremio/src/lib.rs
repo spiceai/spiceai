@@ -27,13 +27,13 @@ use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::ParameterSpec;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::ParameterSpec;
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -193,7 +193,7 @@ impl DataConnector for Dremio {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
             Ok(table_reference) => table_reference.table_ref,
@@ -232,7 +232,7 @@ impl DataConnector for Dremio {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result =
             ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
@@ -255,3 +255,13 @@ pub const CONNECTOR_NAME: &str = "dremio";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     DremioFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_dremio as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_dremio_connector,
+    DREMIO_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DremioFactory
+);

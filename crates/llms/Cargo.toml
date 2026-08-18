@@ -13,6 +13,9 @@ version.workspace = true
 snafu.workspace = true
 
 async-openai.workspace = true
+chat-api = { path = "../chat-api" }
+embed-api = { path = "../embed-api" }
+rerank-api = { path = "../rerank-api" }
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
@@ -43,17 +46,17 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", optional = true } # branch: spiceai
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", package = "mistralrs-core", optional = true } # branch: spiceai
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "2d15d171236803481d582a9fbf8a80869bf74d8c", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "2d15d171236803481d582a9fbf8a80869bf74d8c", package = "mistralrs-core", optional = true } # branch: lukim/spiceai-v0.9.0 (mistral.rs v0.9.0 upgrade; refresh to merged SHA)
 rand.workspace = true
 
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
     "candle",
 ] }
 
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", optional = true }
 
 cudarc = { version = "0.19", optional = true, features = [
     "cuda-version-from-build-system",
@@ -63,7 +66,7 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "f1190f1f140105f0c5ac8335fbbac402051ab072", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -92,10 +95,10 @@ flash-attn = [
     "mistralrs-core/flash-attn",
     "mistralrs/flash-attn",
 ]
-# Multi-node distributed (tensor-parallel) inference via mistral.rs's pure-TCP
-# ring all-reduce. No system dependency (unlike `nccl`); the ring all-reduce is
-# correct at world_size = 2 — the two-node case. Composes with `cuda`. Activated
-# at runtime when a model sets `params.distributed_backend: ring` + a `nodes` list.
+# Multi-node distributed (tensor-parallel) inference via mistral.rs's pure-TCP ring
+# all-reduce. No system dependency (unlike `nccl`). Composes with `cuda`. Activated at
+# runtime when a model sets `params.distributed_backend: ring` + a `nodes` list; see
+# `DistributedBackend::Ring` for what the backend guarantees.
 #
 # OFF BY DEFAULT: multi-node distributed inference is a Spice enterprise feature
 # and is intentionally not enabled in standard (OSS) builds. The `distributed`

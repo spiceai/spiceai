@@ -32,3 +32,13 @@ pub const CONNECTOR_NAME: &str = "glue";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GlueDataConnectorFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_glue as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_glue_connector,
+    GLUE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    GlueDataConnectorFactory
+);

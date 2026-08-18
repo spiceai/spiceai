@@ -21,13 +21,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use elasticsearch::{Client, ClientOptions, Elasticsearch};
+use elasticsearch::Elasticsearch;
 use search::generation::util::get_primary_keys;
+use search::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 pub(crate) use search::index::elasticsearch::{
-    ElasticsearchIndex, ElasticsearchIndexWriteMaintenance, ElasticsearchIndexWriteOptions,
+    ElasticsearchIndex, ElasticsearchIndexWriteMaintenance,
 };
 use search::metadata::{MetadataColumn, MetadataColumns};
 use spicepod::{
@@ -37,77 +38,12 @@ use spicepod::{
 };
 use tokio::sync::RwLock;
 
-use crate::{
-    model::EmbeddingModelStore,
-    parameters::{ParameterSpec, Parameters},
+use crate::model::EmbeddingModelStore;
+use runtime_parameters_typed::TypedParams as _;
+use runtime_search::store_params::elasticsearch::{
+    ElasticsearchVectorParams, EsDistanceMetric, build_write_options, merge_index_settings,
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
-
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::component("endpoint")
-        .description("Elasticsearch cluster URL (e.g., https://localhost:9200)."),
-    ParameterSpec::component("user")
-        .description("Username for Elasticsearch authentication.")
-        .secret(),
-    ParameterSpec::component("pass")
-        .description("Password for Elasticsearch authentication.")
-        .secret(),
-    ParameterSpec::component("index").description("Elasticsearch index name for storing vectors."),
-    ParameterSpec::component("vector_field").description(
-        "Name of the dense_vector field in Elasticsearch. Defaults to the embedding column name.",
-    ),
-    ParameterSpec::component("distance_metric")
-        .description(
-            "Vector similarity metric for kNN search. One of: cosine | l2_norm | dot_product | max_inner_product.",
-        )
-        .one_of(&["cosine", "l2_norm", "dot_product", "max_inner_product"]),
-    ParameterSpec::component("hnsw_m").description(
-        "HNSW graph parameter m (links per node). Higher = better recall, more memory. ES default: 16.",
-    ),
-    ParameterSpec::component("hnsw_ef_construction").description(
-        "HNSW graph build parameter ef_construction (candidate list size at build time). ES default: 100.",
-    ),
-    ParameterSpec::runtime("client_timeout").description(
-        "Total request timeout for the Elasticsearch HTTP client, in time unit format (e.g. 30s, 1m). Default: 30s.",
-    ),
-    ParameterSpec::runtime("connect_timeout").description(
-        "Connect timeout for the Elasticsearch HTTP client, in time unit format (e.g. 10s). Default: 10s.",
-    ),
-    ParameterSpec::component("max_retries").description(
-        "Maximum number of retry attempts for transient Elasticsearch errors (HTTP 429 / 5xx). Default: 3.",
-    ),
-    ParameterSpec::component("retry_initial_backoff").description(
-        "Initial backoff duration between retries, in time unit format (e.g. 100ms, 1s). Default: 200ms.",
-    ),
-    ParameterSpec::component("batch_write_rows").description(
-        "Maximum number of rows to include in a single Elasticsearch _bulk request. Used to control memory usage and payload size during writes. Default: 1000.",
-    ),
-    ParameterSpec::component("index_settings").description(
-        "JSON object passed as Elasticsearch index settings when creating the index. Existing indexes are not recreated.",
-    ),
-    ParameterSpec::component("number_of_shards").description(
-        "Elasticsearch number_of_shards index setting to use when creating the index. Existing indexes are not recreated.",
-    ),
-    ParameterSpec::component("number_of_replicas").description(
-        "Elasticsearch number_of_replicas index setting to use when creating the index. Existing indexes are not recreated.",
-    ),
-    ParameterSpec::component("refresh_interval").description(
-        "Elasticsearch refresh_interval index setting to use when creating the index. Existing indexes are not recreated.",
-    ),
-    ParameterSpec::component("bulk_load_refresh_interval").description(
-        "Temporary Elasticsearch index.refresh_interval to apply before full/append writes, then restore afterward. Set to -1 to disable refresh during bulk loading.",
-    ),
-    ParameterSpec::component("force_merge_after_write")
-        .description("Run Elasticsearch _forcemerge after full/append writes. Default: false.")
-        .one_of(&["true", "false"]),
-    ParameterSpec::component("force_merge_segments").description(
-        "Maximum number of segments to use with _forcemerge after full/append writes. Setting this also enables force merge. Default when force_merge_after_write=true: 1.",
-    ),
-    ParameterSpec::component("partition_by")
-        .description("Not yet supported for the Elasticsearch vector engine."),
-    ParameterSpec::component("spill_writes")
-        .description("Not yet supported for the Elasticsearch vector engine."),
-];
 
 /// Attempt to construct an [`ElasticsearchIndex`] for the provided dataset/view on the given column.
 #[expect(clippy::too_many_arguments)]
@@ -123,94 +59,41 @@ pub async fn try_from_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = index_schema;
-    let primary_keys: Vec<String> = match config.row_ids.clone() {
-        Some(row_ids) => row_ids,
-        None => get_primary_keys(inner_table_provider)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-    };
-
-    if primary_keys.is_empty() {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
-        )));
-    }
-
-    // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
-    // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
-    let primary_key: Vec<_> = primary_keys
-        .iter()
-        .map(|c| {
-            let (_, f) = inner_schema.column_with_name(c.as_str()).ok_or_else(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "Failed to configure primary key for dataset {ds_name}: column '{c}' does not exist in the dataset schema."
-                ))
-            })?;
-            if f.data_type() == &DataType::LargeUtf8 {
-                Ok(arrow_schema::Field::new(
-                    f.name(),
-                    DataType::Utf8,
-                    f.is_nullable(),
-                ))
-            } else {
-                Ok(f.clone())
-            }
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
+    let primary_key = derive_primary_keys(&inner_schema, inner_table_provider, ds_name, &config)?;
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
-    // Surface explicit "not yet supported" errors for params that require
-    // significant new infrastructure (per-partition index routing / spill
-    // queues). Better to fail loudly than silently ignore the config.
-    if string_from_params(&params, "partition_by").is_some()
-        || !vector_store_config.partition_by.is_empty()
-    {
+    // Surface explicit "not yet supported" errors for params that require significant new
+    // infrastructure (per-partition index routing / spill queues). Better to fail loudly
+    // than silently ignore the config.
+    params.validate()?;
+    if !vector_store_config.partition_by.is_empty() {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
         ));
     }
-    if string_from_params(&params, "spill_writes")
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-    {
-        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
-            "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
-        ));
-    }
 
-    let endpoint = string_from_params(&params, "endpoint").ok_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from(
-            "Missing required parameter 'endpoint' for Elasticsearch vector engine.",
-        )
-    })?;
+    let client = params.client()?;
 
-    let user = string_from_params(&params, "user");
-    let pass = string_from_params(&params, "pass");
+    let es_index = params.index.clone().unwrap_or_else(|| {
+        format!("{ds_name}-{column}-{}", config.model)
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    });
 
-    let client_options = build_client_options(&params)?;
-    let client: Arc<dyn Elasticsearch> = Arc::new(
-        Client::new_with_options(endpoint, user, pass, &client_options)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
-    );
-
-    let es_index = string_from_params(&params, "index").map_or_else(
-        || {
-            format!("{}-{}-{}", ds_name, column, config.model)
-                .to_lowercase()
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect()
-        },
-        ToString::to_string,
-    );
-
-    let vector_field = string_from_params(&params, "vector_field")
-        .map_or_else(|| format!("{column}_embedding"), ToString::to_string);
+    let vector_field = params
+        .vector_field
+        .clone()
+        .unwrap_or_else(|| format!("{column}_embedding"));
 
     // Determine text fields for full-text search from the dataset columns.
     // Match both Utf8 and LargeUtf8 since accelerated tables may use LargeUtf8.
@@ -242,25 +125,34 @@ pub async fn try_from_table(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
         as i32;
 
-    // Parse optional vector-mapping tuning params.
-    let mapping_opts = parse_mapping_options(&params)?;
-    let index_settings = parse_index_settings(&params)?;
-    let write_options = parse_write_options(&params)?;
+    // Resolve optional vector-mapping tuning params.
+    let mapping_opts = VectorMappingOptions {
+        similarity: params
+            .distance_metric
+            .unwrap_or(EsDistanceMetric::Cosine)
+            .as_str()
+            .to_string(),
+        hnsw_m: params.hnsw_m,
+        hnsw_ef_construction: params.hnsw_ef_construction,
+    };
+    let index_settings = merge_index_settings(
+        params.index_settings.as_ref(),
+        params.number_of_shards,
+        params.number_of_replicas,
+        params.refresh_interval.as_deref(),
+    );
+    let write_options = build_write_options(
+        params.bulk_load_refresh_interval.as_deref(),
+        params.force_merge_after_write,
+        params.force_merge_segments,
+    )?;
 
-    // Parse optional batch write size.
-    let batch_write_rows = string_from_params(&params, "batch_write_rows")
-        .map(|s| {
-            s.parse::<usize>()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    format!(
-                        "Invalid value for Elasticsearch parameter 'batch_write_rows': '{s}': {e}"
-                    )
-                    .into()
-                })
-        })
-        .transpose()?
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
+    // A zero batch size would stall writes; fall back to the default like before.
+    let batch_write_rows = if params.batch_write_rows > 0 {
+        params.batch_write_rows
+    } else {
+        DEFAULT_BATCH_WRITE_ROWS
+    };
 
     // Resolve spicepod `vectors: filterable | non-filterable` hints into
     // [`search::metadata::MetadataColumns`]. These shape the ES mapping
@@ -306,6 +198,22 @@ pub async fn try_from_table(
         )));
     }
 
+    // The chunk key is not part of the base table schema (chunking injects it per chunk), so
+    // append it explicitly when chunked. Without it in `source_schema`, `knn_hits_to_batch`
+    // could not extract `_spice.chunk_id` from `_source` and would null-fill a non-nullable
+    // field.
+    if chunked
+        && !source_fields
+            .iter()
+            .any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY)
+    {
+        source_fields.push(Arc::new(arrow_schema::Field::new(
+            CHUNKED_INDEX_CHUNK_KEY,
+            DataType::UInt64,
+            false,
+        )));
+    }
+
     let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
         source_fields,
         inner_schema.metadata().clone(),
@@ -325,6 +233,7 @@ pub async fn try_from_table(
             mapping_opts: &mapping_opts,
             metadata_columns: &metadata_columns,
             index_settings: index_settings.as_ref(),
+            chunk_key: chunked.then_some(CHUNKED_INDEX_CHUNK_KEY),
         },
     )
     .await?;
@@ -338,6 +247,7 @@ pub async fn try_from_table(
         primary_key,
         compute_query: model,
         dims,
+        similarity: mapping_opts.similarity.clone(),
         source_schema,
         metadata_columns,
         batch_write_rows,
@@ -348,248 +258,12 @@ pub async fn try_from_table(
 /// Default number of rows per Elasticsearch `_bulk` request.
 const DEFAULT_BATCH_WRITE_ROWS: usize = 1000;
 
-/// Parsed vector-mapping tuning options (HNSW params + similarity).
+/// Vector-mapping tuning options (HNSW params + similarity).
 #[derive(Debug, Clone)]
 struct VectorMappingOptions {
     similarity: String,
     hnsw_m: Option<u32>,
     hnsw_ef_construction: Option<u32>,
-}
-
-impl Default for VectorMappingOptions {
-    fn default() -> Self {
-        Self {
-            similarity: "cosine".to_string(),
-            hnsw_m: None,
-            hnsw_ef_construction: None,
-        }
-    }
-}
-
-fn parse_mapping_options(
-    params: &Parameters,
-) -> Result<VectorMappingOptions, Box<dyn std::error::Error + Send + Sync>> {
-    let mut opts = VectorMappingOptions::default();
-
-    if let Some(s) = string_from_params(params, "distance_metric") {
-        opts.similarity = match s.trim().to_ascii_lowercase().as_str() {
-            "cosine" => "cosine".to_string(),
-            "l2_norm" | "l2" | "euclidean" => "l2_norm".to_string(),
-            "dot_product" | "dot" => "dot_product".to_string(),
-            "max_inner_product" | "mip" => "max_inner_product".to_string(),
-            other => {
-                return Err(format!(
-                    "Invalid Elasticsearch 'distance_metric': '{other}'. Expected one of: cosine | l2_norm | dot_product | max_inner_product."
-                )
-                .into());
-            }
-        };
-    }
-
-    opts.hnsw_m = parse_u32_param(params, "hnsw_m")?;
-    opts.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?;
-
-    Ok(opts)
-}
-
-fn parse_index_settings(
-    params: &Parameters,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut settings = serde_json::Map::new();
-
-    if let Some(raw) = string_from_params(params, "index_settings") {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Invalid JSON for Elasticsearch parameter 'index_settings': {e}").into()
-            })?;
-        let Some(obj) = value.as_object() else {
-            return Err(
-                "Invalid Elasticsearch parameter 'index_settings': expected a JSON object.".into(),
-            );
-        };
-        settings.extend(obj.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-
-    for key in ["number_of_shards", "number_of_replicas", "refresh_interval"] {
-        if let Some(value) = string_from_params(params, key) {
-            settings.insert(
-                key.to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
-    }
-
-    if settings.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(serde_json::Value::Object(settings)))
-    }
-}
-
-pub(crate) fn parse_index_settings_from_map(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut settings = serde_json::Map::new();
-
-    if let Some(raw) = params.get("index_settings") {
-        let value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Invalid JSON for Elasticsearch parameter 'index_settings': {e}").into()
-            })?;
-        let Some(obj) = value.as_object() else {
-            return Err(
-                "Invalid Elasticsearch parameter 'index_settings': expected a JSON object.".into(),
-            );
-        };
-        settings.extend(obj.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-
-    for key in ["number_of_shards", "number_of_replicas", "refresh_interval"] {
-        if let Some(value) = params.get(key) {
-            settings.insert(key.to_string(), serde_json::Value::String(value.clone()));
-        }
-    }
-
-    if settings.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(serde_json::Value::Object(settings)))
-    }
-}
-
-pub(crate) fn parse_write_options_from_map(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<ElasticsearchIndexWriteOptions, Box<dyn std::error::Error + Send + Sync>> {
-    let refresh_interval_during_write = params
-        .get("bulk_load_refresh_interval")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-
-    let force_merge_after_write = params
-        .get("force_merge_after_write")
-        .map(String::as_str)
-        .map(parse_bool_value)
-        .transpose()?
-        .unwrap_or(false);
-    let force_merge_segments = params
-        .get("force_merge_segments")
-        .map(String::as_str)
-        .map(|value| parse_positive_u32_value(value, "force_merge_segments"))
-        .transpose()?;
-
-    Ok(ElasticsearchIndexWriteOptions {
-        refresh_interval_during_write,
-        force_merge_segments: match (force_merge_after_write, force_merge_segments) {
-            (true, None) => Some(1),
-            (_, Some(value)) => Some(value),
-            (false, None) => None,
-        },
-    })
-}
-
-fn parse_write_options(
-    params: &Parameters,
-) -> Result<ElasticsearchIndexWriteOptions, Box<dyn std::error::Error + Send + Sync>> {
-    let refresh_interval_during_write = string_from_params(params, "bulk_load_refresh_interval")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-
-    let force_merge_after_write = string_from_params(params, "force_merge_after_write")
-        .map(parse_bool_value)
-        .transpose()?
-        .unwrap_or(false);
-    let force_merge_segments = string_from_params(params, "force_merge_segments")
-        .map(|value| parse_positive_u32_value(value, "force_merge_segments"))
-        .transpose()?;
-
-    Ok(ElasticsearchIndexWriteOptions {
-        refresh_interval_during_write,
-        force_merge_segments: match (force_merge_after_write, force_merge_segments) {
-            (true, None) => Some(1),
-            (_, Some(value)) => Some(value),
-            (false, None) => None,
-        },
-    })
-}
-
-fn parse_bool_value(value: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(format!(
-            "Invalid boolean value for Elasticsearch parameter 'force_merge_after_write': '{value}'. Expected true or false."
-        )
-        .into()),
-    }
-}
-
-fn parse_positive_u32_value(
-    value: &str,
-    key: &str,
-) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    let parsed: u32 = value
-        .parse()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Invalid value for Elasticsearch parameter '{key}': '{value}': {e}").into()
-        })?;
-    if parsed == 0 {
-        return Err(format!(
-            "Invalid value for Elasticsearch parameter '{key}': expected a positive integer."
-        )
-        .into());
-    }
-    Ok(parsed)
-}
-
-fn parse_u32_param(
-    params: &Parameters,
-    key: &str,
-) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(s) = string_from_params(params, key) else {
-        return Ok(None);
-    };
-    let v: u32 = s
-        .parse()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
-        })?;
-    Ok(Some(v))
-}
-
-fn parse_duration_param(
-    params: &Parameters,
-    key: &str,
-) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(s) = string_from_params(params, key) else {
-        return Ok(None);
-    };
-    duration_parse::parse_duration(s).map(Some).map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
-        },
-    )
-}
-
-pub(crate) fn build_client_options(
-    params: &Parameters,
-) -> Result<ClientOptions, Box<dyn std::error::Error + Send + Sync>> {
-    let mut opts = ClientOptions::default();
-    if let Some(d) = parse_duration_param(params, "client_timeout")? {
-        opts.request_timeout = d;
-    }
-    if let Some(d) = parse_duration_param(params, "connect_timeout")? {
-        opts.connect_timeout = d;
-    }
-    if let Some(n) = parse_u32_param(params, "max_retries")? {
-        opts.retry.max_retries = n;
-    }
-    if let Some(d) = parse_duration_param(params, "retry_initial_backoff")? {
-        opts.retry.initial_backoff = d;
-    }
-    Ok(opts)
 }
 
 /// Resolve spicepod `vectors` metadata hints from dataset columns into
@@ -634,6 +308,7 @@ async fn ensure_index_with_mapping(
         mapping_opts,
         metadata_columns,
         index_settings,
+        chunk_key,
     } = mapping;
 
     if dims <= 0 {
@@ -713,6 +388,18 @@ async fn ensure_index_with_mapping(
         properties.insert(name, mapping);
     }
 
+    // Explicitly map the chunk key when chunking is enabled. `_source` retrieval works via
+    // dynamic mapping regardless; the explicit `index: false` mapping documents that it is a
+    // never-filtered ordering key.
+    if let Some(chunk_key) = chunk_key
+        && !properties.contains_key(chunk_key)
+    {
+        properties.insert(
+            chunk_key.to_string(),
+            serde_json::json!({ "type": "long", "index": false }),
+        );
+    }
+
     let exists = client
         .index_exists(es_index)
         .await
@@ -771,6 +458,10 @@ struct VectorIndexMapping<'a> {
     mapping_opts: &'a VectorMappingOptions,
     metadata_columns: &'a MetadataColumns,
     index_settings: Option<&'a serde_json::Value>,
+    /// When chunking is enabled, the injected `_spice.chunk_id` field name. Mapped as a
+    /// non-indexed `long` so `_source` retrieval works with clear intent (it is a primary-key
+    /// ordering field, never filtered on).
+    chunk_key: Option<&'a str>,
 }
 
 /// Check whether an error from `create_index` indicates the index already exists
@@ -817,27 +508,33 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
 /// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.
 ///
 /// - `LargeUtf8` → `Utf8`: ES always deserializes strings as `StringArray` (Utf8).
-/// - `FixedSizeList` with any inner field → `FixedSizeList` with `Field::new("item", Float32, false)`:
-///   `build_dense_vector_array` always produces this exact inner field.
+/// - Floating-point `FixedSizeList` (the dense embedding vector) → `FixedSizeList` with
+///   `Field::new("item", Float32, false)`: `build_dense_vector_array` always produces this
+///   exact inner field.
+/// - Integer `FixedSizeList` (e.g. the chunk `{start, end}` offset pair) keeps its inner
+///   type; the reader decodes it back as integers. Coercing it to `Float32` here would make
+///   the advertised offset column type diverge from what the reader produces.
 pub(crate) fn normalize_es_data_type(dt: &DataType) -> DataType {
     match dt {
         DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
-        DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
-            Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
-            *dim,
-        ),
+        DataType::FixedSizeList(inner, dim) => {
+            let inner_type = match inner.data_type() {
+                DataType::Float32 | DataType::Float64 => DataType::Float32,
+                other => other.clone(),
+            };
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", inner_type, false)),
+                *dim,
+            )
+        }
         other => other.clone(),
     }
-}
-
-pub(crate) fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
-    p.get(key).expose().ok()
 }
 
 async fn get_store_params(
     vector_store_config: &VectorStore,
     secrets: Arc<RwLock<Secrets>>,
-) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ElasticsearchVectorParams, Box<dyn std::error::Error + Send + Sync>> {
     let params = vector_store_config
         .params
         .as_ref()
@@ -846,52 +543,12 @@ async fn get_store_params(
 
     let params_with_secrets = get_params_with_secrets(Arc::clone(&secrets), &params).await;
 
-    let params = Parameters::try_new(
+    Ok(ElasticsearchVectorParams::try_from_params(
         "Elasticsearch vector store",
-        params_with_secrets.into_iter().collect(),
-        "elasticsearch",
-        Arc::clone(&secrets),
-        PARAMETERS,
+        params_with_secrets,
+        &secrets,
     )
-    .await?;
-
-    Ok(params)
-}
-
-/// Build an Elasticsearch client from a raw params map.
-/// Used by the FTS connector path which reads params from `dataset.params`.
-pub(crate) fn get_fts_client(
-    params: &std::collections::HashMap<String, String>,
-) -> Result<Arc<dyn Elasticsearch>, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoint = params.get("endpoint").ok_or_else(|| {
-        Box::<dyn std::error::Error + Send + Sync>::from(
-            "Missing required parameter 'endpoint' for Elasticsearch FTS.",
-        )
-    })?;
-    let user = params
-        .get("user")
-        .map(String::as_str)
-        .map(ToString::to_string);
-    let pass = params
-        .get("pass")
-        .map(String::as_str)
-        .map(ToString::to_string);
-
-    let mut opts = ClientOptions::default();
-    if let Some(s) = params.get("client_timeout")
-        && let Ok(d) = duration_parse::parse_duration(s)
-    {
-        opts.request_timeout = d;
-    }
-    if let Some(s) = params.get("connect_timeout")
-        && let Ok(d) = duration_parse::parse_duration(s)
-    {
-        opts.connect_timeout = d;
-    }
-
-    let client = Client::new_with_options(endpoint, user.as_deref(), pass.as_deref(), &opts)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    Ok(Arc::new(client) as Arc<dyn Elasticsearch>)
+    .await?)
 }
 
 /// Ensure the Elasticsearch index exists with `text` field mappings for the given fields.
@@ -945,60 +602,54 @@ pub(crate) async fn ensure_index_with_text_mapping(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Resolve the primary key fields for the Elasticsearch index: configured `row_ids` or
+/// the table's derived primary keys, normalized (`LargeUtf8` → `Utf8` to match what the
+/// Elasticsearch HTTP client returns) and, when chunking is enabled, augmented with the
+/// chunk key so the warm in-memory index can fall back onto Elasticsearch.
+fn derive_primary_keys(
+    inner_schema: &Schema,
+    inner_table_provider: &Arc<dyn TableProvider>,
+    ds_name: &TableReference,
+    config: &ColumnLevelEmbeddingConfig,
+) -> Result<Vec<arrow_schema::Field>, Box<dyn std::error::Error + Send + Sync>> {
+    let primary_keys: Vec<String> = match &config.row_ids {
+        Some(row_ids) => row_ids.clone(),
+        None => get_primary_keys(inner_table_provider)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+    };
 
-    use std::collections::HashMap;
-
-    #[test]
-    fn parse_index_settings_from_map_combines_json_and_shortcuts() {
-        let params = HashMap::from([
-            (
-                "index_settings".to_string(),
-                r#"{"analysis":{"analyzer":{"default":{"type":"standard"}}}}"#.to_string(),
-            ),
-            ("number_of_shards".to_string(), "2".to_string()),
-            ("number_of_replicas".to_string(), "0".to_string()),
-            ("refresh_interval".to_string(), "30s".to_string()),
-        ]);
-
-        let settings = parse_index_settings_from_map(&params)
-            .expect("valid index settings should parse")
-            .expect("settings should be present");
-
-        assert_eq!(
-            settings,
-            serde_json::json!({
-                "analysis": {"analyzer": {"default": {"type": "standard"}}},
-                "number_of_shards": "2",
-                "number_of_replicas": "0",
-                "refresh_interval": "30s",
-            })
-        );
+    if primary_keys.is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
+        )));
     }
 
-    #[test]
-    fn parse_write_options_from_map_enables_force_merge_with_default_segments() {
-        let params = HashMap::from([
-            ("bulk_load_refresh_interval".to_string(), "-1".to_string()),
-            ("force_merge_after_write".to_string(), "true".to_string()),
-        ]);
+    // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
+    // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
+    let primary_key: Vec<_> = primary_keys
+        .iter()
+        .map(|c| {
+            let (_, f) = inner_schema.column_with_name(c.as_str()).ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "Failed to configure primary key for dataset {ds_name}: column '{c}' does not exist in the dataset schema."
+                ))
+            })?;
+            if f.data_type() == &DataType::LargeUtf8 {
+                Ok(arrow_schema::Field::new(
+                    f.name(),
+                    DataType::Utf8,
+                    f.is_nullable(),
+                ))
+            } else {
+                Ok(f.clone())
+            }
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
-        let options =
-            parse_write_options_from_map(&params).expect("valid write options should parse");
-
-        assert_eq!(options.refresh_interval_during_write.as_deref(), Some("-1"));
-        assert_eq!(options.force_merge_segments, Some(1));
-    }
-
-    #[test]
-    fn parse_write_options_from_map_rejects_zero_force_merge_segments() {
-        let params = HashMap::from([("force_merge_segments".to_string(), "0".to_string())]);
-
-        let error = parse_write_options_from_map(&params)
-            .expect_err("zero force_merge_segments should fail");
-
-        assert!(error.to_string().contains("positive integer"));
+    let chunked = config.chunking.as_ref().is_some_and(|c| c.enabled);
+    if chunked {
+        Ok(ChunkedSearchIndex::augment_primary_key(primary_key))
+    } else {
+        Ok(primary_key)
     }
 }

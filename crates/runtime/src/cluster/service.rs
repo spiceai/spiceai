@@ -62,9 +62,8 @@ use runtime_proto::{
     executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
-use runtime_secrets::Secrets;
+use runtime_secrets::{SECRETS, Secrets, iter_secret_references};
 use secrecy::ExposeSecret;
-use spicepod::component::runtime;
 use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
@@ -276,6 +275,18 @@ impl ClusterServiceImpl {
         super::partition::first_unready_accelerated_table(&app, self.datafusion.as_ref()).await
     }
 
+    /// Whether the app declares any accelerated, partitioned table. When it does
+    /// not, there is nothing for the scheduler to assign, so the
+    /// first-assignment gate in `allocate_initial_partitions` must be bypassed —
+    /// otherwise executors would block and retry for a full assignment interval
+    /// during startup with no assignment ever coming.
+    async fn has_partitioned_accelerated_tables(&self) -> bool {
+        let Some(app) = self.app.read().await.clone() else {
+            return false;
+        };
+        !super::partition::accelerated_tables(&app).is_empty()
+    }
+
     /// Returns the executor registry for use by other components.
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
@@ -357,6 +368,14 @@ impl ClusterService for ClusterServiceImpl {
             ));
         }
 
+        // Empty key is never a valid secret reference and is rejected before
+        // any store lookup or allowlist work.
+        if request.key.is_empty() {
+            return Err(Status::invalid_argument(
+                "Unable to expand secret: empty key",
+            ));
+        }
+
         let span = tracing::span!(
             target: "task_history",
             tracing::Level::INFO,
@@ -372,21 +391,65 @@ impl ClusterService for ClusterServiceImpl {
             request.key
         );
 
+        // Only keys referenced by the current app (spicepod) may be expanded.
+        // This closes the "any mTLS peer can request any env/vault key by name"
+        // hole: unreferenced secrets in the host environment or external stores
+        // are never returned, and unallowlisted keys never hit the secret store
+        // (so deny does not create a lookup side-channel).
+        //
+        // Snapshot the `Arc<App>` under the lock and drop the guard before the
+        // (CPU-bound) allowlist build so ExpandSecret does not hold the app
+        // write path while serializing/scanning the spicepod.
+        let Some(app) = self.app.read().await.clone() else {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                "Denied cluster secret expansion: app context not available"
+            );
+            return Err(Status::failed_precondition(
+                "Secret expansion requires a loaded app definition",
+            ));
+        };
+        let allowed_keys = expandable_secret_keys(&app);
+
+        let Some(allowed_stores) = allowed_keys.get(request.key.as_str()) else {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                key = %request.key,
+                "Denied cluster secret expansion: key is not referenced by the app"
+            );
+            // Same status/message shape as a miss so callers cannot distinguish
+            // "not in spicepod" from "not in any store" for unallowlisted keys.
+            return Err(Status::invalid_argument(format!(
+                "Unable to expand secret {}",
+                request.key
+            )));
+        };
+
         tracing::debug!(
             "ExpandSecret: expanding secret {} for executor {}",
             request.key,
             request.executor_id
         );
 
-        let secrets = self.secrets.read().await;
-        let Some(value) = secrets
-            .get_secret(&request.key)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
+        let secrets = Secrets::snapshot(&self.secrets).await;
+        // A reference through the `secrets:` sentinel keeps its normal
+        // "search every configured store in precedence order" resolution; a
+        // reference scoped to a specific store (e.g. `${ env:KEY }`) is
+        // restricted to that store, so a same-named key in an unrelated
+        // store can't answer in its place.
+        let lookup = if allowed_stores.contains(SECRETS) {
+            secrets.get_secret(&request.key).await
+        } else {
+            secrets
+                .get_secret_from_stores(&request.key, allowed_stores)
+                .await
+        };
+        let Some(value) =
+            lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
             return Err(Status::invalid_argument(format!(
-                "Unable to read secret {}",
+                "Unable to expand secret {}",
                 request.key
             )));
         };
@@ -451,14 +514,19 @@ impl ClusterService for ClusterServiceImpl {
         let local_sql = rewrite_task_history_sql(&request.sql)
             .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
 
-        // Execute the query against local_task_history
+        // Always run under the strict read-only validator: GetTaskHistory is a
+        // cluster-internal fan-in for observability, not a general SQL surface.
+        // Without this gate, a peer could smuggle DDL/DML that merely *mentions*
+        // task_history (e.g. `INSERT INTO writable SELECT * FROM runtime.task_history`)
+        // and execute it with the scheduler's full DataFusion context.
         let query_result = self
             .datafusion
             .query_builder(&local_sql)
+            .read_only(true)
             .build()
             .run()
             .await
-            .map_err(|e| Status::internal(format!("Failed to execute query: {e}")))?;
+            .map_err(|e| map_task_history_query_error(&e))?;
 
         // Collect all record batches
         let batches: Vec<RecordBatch> = query_result
@@ -670,6 +738,30 @@ impl ClusterService for ClusterServiceImpl {
             )));
         }
 
+        // Gate on the scheduler's first assignment cycle. Returning already-assigned
+        // partitions before the scheduler has fairly distributed them would hand this
+        // executor an empty set, and its initial snapshot would load zero rows with no
+        // way to backfill (CDC/Changes-mode accelerations only load partition data at
+        // the initial snapshot). Wait for the first cycle — the executor retries this
+        // RPC on `Unavailable` with backoff — so the returned share is the fair one.
+        //
+        // Only gate when there are accelerated partitioned tables to assign. With
+        // none, the scheduler never assigns anything, so blocking would just make
+        // executors retry for a full assignment interval during startup for no
+        // reason.
+        if let Some(partition_service) = self.datafusion.partition_service.as_ref()
+            && !partition_service.is_first_assignment_complete()
+            && self.has_partitioned_accelerated_tables().await
+        {
+            tracing::debug!(
+                executor = %executor_id,
+                "Deferring allocate_initial_partitions: first assignment cycle not yet complete"
+            );
+            return Err(Status::unavailable(
+                "partition assignment pending: scheduler has not completed its first assignment cycle",
+            ));
+        }
+
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
@@ -687,76 +779,54 @@ impl ClusterService for ClusterServiceImpl {
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
         let partition_store = self.executor_registry().accelerations_partition_store();
-        let app_guard = self.app.read().await;
-        let mut total_assigned: usize = 0;
-        if let Some(app) = app_guard.as_ref() {
-            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                runtime::default_max_partitions_per_executor(),
-                |scheduler| scheduler.max_partitions_per_executor,
-            );
-
-            // Find accelerated datasets with partitioning
+        // Snapshot the `Arc<App>` out of the lock and release the guard before the
+        // loop — `partition_value_to_bytes` is awaited per partition below, and
+        // holding the async `RwLock` read guard across those awaits would block
+        // writers (and risk deadlock if an awaited path re-acquires the lock).
+        let app_snapshot = self.app.read().await.clone();
+        if let Some(app) = app_snapshot.as_ref() {
+            // Partition assignment is driven solely by the scheduler's periodic
+            // partition-assignment cycle, which fairly distributes partitions
+            // across all connected executors and pushes them over the control
+            // stream (`notify_executor_of_assignments`). This RPC no longer
+            // allocates — it only returns partitions *already assigned* to this
+            // executor so a reconnecting or failed-over executor recovers its
+            // existing assignments. On a cold start this is empty; the first
+            // assignment cycle assigns and pushes shortly after.
             for table_ref in super::partition::accelerated_tables(app).keys() {
-                if total_assigned >= max_partitions_per_executor {
-                    tracing::debug!(
-                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
-                    );
-                    break;
-                }
-                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
-
-                if partition_store
-                    .get_cached_table_metadata(table_ref)
-                    .is_none()
-                {
-                    tracing::info!(
-                        "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
-                    );
+                let Some(metadata) = partition_store.get_cached_table_metadata(table_ref) else {
                     continue;
-                }
-                match partition_store
-                    .allocate_partitions(table_ref, executor_id, remaining)
+                };
+                let mut items = Vec::new();
+                for partition in &metadata.partitions {
+                    if !partition.is_assigned_to(executor_id) {
+                        continue;
+                    }
+                    match partition_value_to_bytes(
+                        partition.partition_value.clone(),
+                        table_ref,
+                        self.datafusion.as_ref(),
+                    )
                     .await
-                {
-                    Ok(result) => {
-                        let newly_assigned = result.newly_assigned.len();
-                        let partitions = result.all_assigned();
-                        if partitions.is_empty() {
-                            continue;
+                    {
+                        Ok(bytes) => items.push(bytes.to_vec()),
+                        Err(e) => {
+                            // The readiness gate above should make this path
+                            // unreachable for the dataset-not-ready case.
+                            // Anything that lands here is a real bug (corrupt
+                            // expression, etc.) — fail loud rather than silently
+                            // dropping the partition.
+                            tracing::error!(
+                                "Failed to serialize partition expression for table {table_ref}: {e}"
+                            );
+                            return Err(Status::internal(format!(
+                                "Failed to serialize partition expression for table {table_ref}: {e}"
+                            )));
                         }
-                        let mut items = Vec::with_capacity(partitions.len());
-                        for partition in &partitions {
-                            match partition_value_to_bytes(
-                                partition.clone(),
-                                table_ref,
-                                self.datafusion.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(bytes) => items.push(bytes.to_vec()),
-                                Err(e) => {
-                                    // The readiness gate above should make this
-                                    // path unreachable for the dataset-not-ready
-                                    // case. Anything that lands here is a real
-                                    // bug (corrupt expression, etc.) — fail loud
-                                    // rather than silently dropping the partition.
-                                    tracing::error!(
-                                        "Failed to serialize partition expression for table {table_ref}: {e}"
-                                    );
-                                    return Err(Status::internal(format!(
-                                        "Failed to serialize partition expression for table {table_ref}: {e}"
-                                    )));
-                                }
-                            }
-                        }
-                        total_assigned += newly_assigned;
-                        table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to allocate partitions for table {table_ref} to executor {executor_id}: {e}",
-                        );
-                    }
+                }
+                if !items.is_empty() {
+                    table_partitions.insert(table_ref.to_string(), BytesArray { items });
                 }
             }
         }
@@ -874,7 +944,7 @@ async fn handle_executor_message(
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
         }
         ExecutorMessage::ExecutorStatistics(stats_msg) => {
-            handle_executor_statistics(executor_id, stats_msg, datafusion);
+            handle_executor_statistics(executor_id, stats_msg, datafusion).await;
         }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
@@ -929,8 +999,11 @@ async fn notify_scheduler_executor_shutdown(
 
 /// Records a per-table [`ExecutorStatistics`] report into the scheduler's
 /// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
-/// the coordinator's per-executor federated scans. Decoupled from readiness.
-fn handle_executor_statistics(
+/// the coordinator's per-executor federated scans. Also re-evaluates the
+/// table's readiness: `evaluate_table_readiness` gates `Ready` on the first
+/// stats report, so a table whose partitions loaded before its stats arrived
+/// flips to `Ready` here rather than waiting for the next periodic sweep.
+async fn handle_executor_statistics(
     executor_id: &str,
     msg: &runtime_proto::ExecutorStatistics,
     datafusion: &DataFusion,
@@ -942,15 +1015,37 @@ fn handle_executor_statistics(
         Arc::<str>::clone(&resolved.schema),
         Arc::<str>::clone(&resolved.table),
     );
-    let stats = runtime_cluster::decode_statistics(&msg.statistics);
-    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
-        registry.record_executor_statistics(
-            table,
-            executor_id.to_string(),
-            stats,
-            msg.column_names.clone(),
+    let Some(registry) = datafusion.executor_registry() else {
+        return;
+    };
+
+    // A malformed or forward-incompatible payload decodes to `None`. Record an
+    // explicit unknown-statistics entry rather than dropping the report: since
+    // `evaluate_table_readiness` gates `Ready` on `has_statistics_for`,
+    // silently dropping it would leave the table stuck out of `Ready` forever
+    // (and could hang /v1/ready) with no signal. Recording unknown stats still
+    // lets the coordinator observe that this executor reported for the table;
+    // the planner then treats its slice as unknown-cardinality — the same as a
+    // deliberate unknown report from the executor.
+    let (statistics, column_names) = if let Some(statistics) =
+        runtime_cluster::decode_statistics(&msg.statistics)
+    {
+        (statistics, msg.column_names.clone())
+    } else {
+        tracing::warn!(
+            table = %table,
+            executor = %executor_id,
+            "Failed to decode executor statistics report ({} bytes); recording unknown statistics so the table can still become Ready",
+            msg.statistics.len()
         );
-    }
+        (
+            datafusion::common::Statistics::new_unknown(&arrow::datatypes::Schema::empty()),
+            Vec::new(),
+        )
+    };
+
+    registry.record_executor_statistics(&table, executor_id.to_string(), statistics, column_names);
+    evaluate_table_readiness(datafusion, &table).await;
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
@@ -1096,6 +1191,24 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     };
 
     if tracker.is_table_loaded(table, &metadata, datafusion).await {
+        // Gate readiness on having received at least one executor statistics
+        // report for this table. Distributed query plans need the reported
+        // row-count statistics to size joins (so DataFusion's cost-based swap
+        // builds the small side of a hash join rather than the large one); a
+        // table marked `Ready` before stats arrive can plan a query that
+        // exhausts the memory pool. The executor always reports per served
+        // table (unknown stats when unavailable — see
+        // `local_executor_table_statistics`), so a loaded table can't hang
+        // here. Only gates distributed mode: single-node has no registry.
+        if let Some(registry) = datafusion.executor_registry()
+            && !registry.has_statistics_for(table)
+        {
+            tracing::debug!(
+                table = %table,
+                "All assigned partitions loaded but awaiting first executor statistics report before marking Ready"
+            );
+            return;
+        }
         tracing::info!(
             table = %table,
             "All assigned partitions loaded; marking dataset Ready"
@@ -1180,6 +1293,12 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
                             let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
                                 continue;
                             };
+                            // Listing the metadata catalog reaches tables the
+                            // catalog's include/exclude withheld, which the
+                            // schema provider itself never registered.
+                            if !cayenne_schema.selects_table(short_name) {
+                                continue;
+                            }
                             let key = (
                                 catalog_name.clone(),
                                 schema_name.clone(),
@@ -1241,6 +1360,86 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     }
 
     Ok(buffer)
+}
+
+/// Collects, for each secret key the cluster may expand via [`ExpandSecret`],
+/// the set of store names it was referenced through.
+///
+/// Keys are taken from every `${ store:key }` reference in the serialized app
+/// definition (datasets, catalogs, models, tools, runtime auth, snapshots, …);
+/// a key the spicepod never references is absent from the map and therefore
+/// denied. The per-key store set lets the `expand_secret` handler honor the
+/// store a reference named — e.g. `${ env:KEY }` may only expand from
+/// `env` — instead of an unscoped search across every configured store, which
+/// could return an unrelated, same-named secret from a different store than
+/// the spicepod referenced. A key reached via the `${ secrets:KEY }` sentinel
+/// keeps its normal "any configured store" semantics: its store set contains
+/// [`SECRETS`].
+///
+/// Serialization failure fails closed (empty map) so a broken app cannot
+/// open the expansion surface.
+fn expandable_secret_keys(app: &App) -> HashMap<String, HashSet<String>> {
+    match serde_json::to_string(app) {
+        Ok(json) => {
+            let mut allowed: HashMap<String, HashSet<String>> = HashMap::new();
+            for reference in iter_secret_references(&json) {
+                allowed
+                    .entry(reference.key)
+                    .or_default()
+                    .insert(reference.store);
+            }
+            allowed
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize app while building ExpandSecret allowlist: {e}. Denying all secret expansion."
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// Maps a task-history query execution error to a gRPC status.
+///
+/// Read-only validator failures (DDL/DML/COPY/etc.) become
+/// [`Status::permission_denied`] so callers can distinguish policy rejections
+/// from unexpected internal failures.
+fn map_task_history_query_error(e: &crate::datafusion::query::Error) -> Status {
+    // Classify on the underlying DataFusion message, not `Error`'s Display —
+    // `UnableToExecuteQuery` already prefixes with "Failed to execute query: ",
+    // and re-wrapping that string would double the prefix and couple the
+    // mutation classifier to wrapper formatting.
+    let underlying = match e {
+        crate::datafusion::query::Error::UnableToExecuteQuery { source }
+        | crate::datafusion::query::Error::UnableToCreateMemoryStream { source }
+        | crate::datafusion::query::Error::UnableToCollectResults { source }
+        | crate::datafusion::query::Error::BindingParameters { source } => source.to_string(),
+        other => other.to_string(),
+    };
+
+    // Prefer PermissionDenied for any mutation rejection so cluster peers get a
+    // clear policy signal rather than a 500-class Internal. The read-only
+    // validator is the primary gate; the general operations validator can also
+    // reject writes first (e.g. internal datasets) with a different message.
+    if is_task_history_mutation_rejection(&underlying) {
+        Status::permission_denied(format!(
+            "Task history queries are read-only and cannot mutate data: {underlying}"
+        ))
+    } else {
+        // `Error`'s Display already formats `UnableToExecuteQuery` as
+        // "Failed to execute query: …"; use it as-is to avoid a second prefix.
+        Status::internal(e.to_string())
+    }
+}
+
+fn is_task_history_mutation_rejection(message: &str) -> bool {
+    message.contains("read-only SQL context")
+        || message.contains("INSERT operations are not allowed")
+        || message.contains("DELETE operations are not allowed")
+        || message.contains("UPDATE operations are not allowed")
+        || message.contains("COPY operations are not allowed")
+        || message.contains("DDL operation")
+        || message.contains("are not allowed in read-only")
 }
 
 /// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
@@ -1319,16 +1518,58 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::AppBuilder;
     use arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use datafusion::datasource::MemTable;
     use runtime_proto::{
         cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
     };
+    use runtime_secrets::{AnyErrorResult, SecretStore};
+    use secrecy::SecretString;
+    use spicepod::component::dataset::Dataset;
+    use spicepod::param::Params;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Channel, Server};
 
-    async fn make_test_service() -> ClusterServiceImpl {
+    /// Fixed-map secret store for `ExpandSecret` allowlist tests.
+    struct FakeSecretStore(HashMap<String, String>);
+
+    #[async_trait]
+    impl SecretStore for FakeSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    fn secrets_with(entries: &[(&str, &str)]) -> Secrets {
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(FakeSecretStore(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )),
+        );
+        secrets
+    }
+
+    fn app_with_secret_ref(param: &str, reference: &str) -> Arc<App> {
+        let mut ds = Dataset::new("memory:data", "orders");
+        let map: HashMap<String, String> =
+            HashMap::from([(param.to_string(), reference.to_string())]);
+        ds.params = Some(Params::from_string_map(map));
+        Arc::new(AppBuilder::new("test").with_dataset(ds).build())
+    }
+
+    async fn make_test_service_with(
+        app: Option<Arc<App>>,
+        secrets: Secrets,
+        allow_secret_expansion: bool,
+    ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1355,6 +1596,22 @@ mod tests {
             )
             .expect("local task history table should be registered");
 
+        // Writable sink used by read-only mutation tests: INSERT INTO sink
+        // SELECT FROM task_history must still be denied by the read-only gate
+        // even though the target table is individually writable.
+        let sink = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty sink table should be created"),
+        );
+        let sink_ref = TableReference::bare("task_history_sink");
+        datafusion
+            .ctx
+            .register_table(sink_ref.clone(), sink)
+            .expect("sink table should be registered");
+        datafusion
+            .mark_dataset_writable(&sink_ref)
+            .expect("sink table should be marked writable");
+
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let cluster_state = Arc::new(runtime_cluster::ClusterStateStore::new(store, ""));
@@ -1372,15 +1629,19 @@ mod tests {
         ));
 
         ClusterServiceImpl::new(
-            Arc::new(TokioRwLock::new(None)),
-            Arc::new(TokioRwLock::new(Secrets::default())),
+            Arc::new(TokioRwLock::new(app)),
+            Arc::new(TokioRwLock::new(secrets)),
             "127.0.0.1:0".to_string(),
             Arc::new(TokioRwLock::new(HashMap::new())),
             datafusion,
             executor_registry,
             None,
-            true,
+            allow_secret_expansion,
         )
+    }
+
+    async fn make_test_service() -> ClusterServiceImpl {
+        make_test_service_with(None, Secrets::default(), true).await
     }
 
     async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
@@ -1409,6 +1670,185 @@ mod tests {
             .expect("test cluster service client should connect");
 
         (client, shutdown)
+    }
+
+    #[test]
+    fn expandable_secret_keys_collects_dataset_refs() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let keys = expandable_secret_keys(&app);
+        let stores = keys.get("PG_PASS");
+        assert_eq!(
+            stores.map(|s| s.contains(SECRETS)),
+            Some(true),
+            "expected PG_PASS allowlisted via the `secrets` sentinel, got {keys:?}"
+        );
+        assert!(
+            !keys.contains_key("AWS_SECRET_ACCESS_KEY"),
+            "unreferenced keys must not be allowlisted"
+        );
+    }
+
+    #[test]
+    fn expandable_secret_keys_empty_when_app_has_no_refs() {
+        let app = AppBuilder::new("empty").build();
+        let keys = expandable_secret_keys(&app);
+        assert!(keys.is_empty(), "expected empty allowlist, got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_allows_app_referenced_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("UNRELATED_ENV_SECRET", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect("referenced secret should expand");
+
+        let body = response.into_inner();
+        assert_eq!(body.key, "PG_PASS");
+        assert_eq!(body.value, "correct-horse");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_unreferenced_key_even_if_present_in_store() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[
+            ("PG_PASS", "correct-horse"),
+            ("AWS_SECRET_ACCESS_KEY", "should-not-leak"),
+        ]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "AWS_SECRET_ACCESS_KEY".to_string(),
+            }))
+            .await
+            .expect_err("unreferenced secret must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("Unable to expand secret"),
+            "unexpected message: {}",
+            err.message()
+        );
+        // Must not leak the secret value in the error.
+        assert!(!err.message().contains("should-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_store_scoped_reference_ignores_other_stores() {
+        // The spicepod references `${ env:API_KEY }` — a store-scoped
+        // reference, not the `secrets:` sentinel. A higher-precedence
+        // `vault` store happens to define an unrelated secret under the
+        // same key name; ExpandSecret must resolve from `env` (the store
+        // the reference named) and must never return `vault`'s value in
+        // its place.
+        let app = app_with_secret_ref("api_key", "${ env:API_KEY }");
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "vault",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "wrong-store-value".to_string(),
+            )]))),
+        );
+        secrets.register_store(
+            "env",
+            Arc::new(FakeSecretStore(HashMap::from([(
+                "API_KEY".to_string(),
+                "correct-store-value".to_string(),
+            )]))),
+        );
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let response = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "API_KEY".to_string(),
+            }))
+            .await
+            .expect("store-scoped key referenced by the app should expand");
+
+        assert_eq!(response.into_inner().value, "correct-store-value");
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_mtls_disabled() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, false).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without mTLS must be denied");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("requires cluster mTLS"));
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_when_app_missing() {
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(None, secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("ExpandSecret without app must be denied");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_empty_key() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: String::new(),
+            }))
+            .await
+            .expect_err("empty key must be denied");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
+        // Allowlisted key is referenced by the app but not present in any store.
+        let secrets = secrets_with(&[]);
+        let service = make_test_service_with(Some(app), secrets, true).await;
+
+        let err = service
+            .expand_secret(Request::new(ExpandSecretRequest {
+                executor_id: "executor-1".to_string(),
+                key: "PG_PASS".to_string(),
+            }))
+            .await
+            .expect_err("missing allowlisted secret must fail");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Unable to expand secret PG_PASS"));
     }
 
     #[tokio::test]
@@ -1452,6 +1892,136 @@ mod tests {
             .expect("second task history request should also succeed");
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn get_task_history_allows_select() {
+        let service = make_test_service().await;
+        let response = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect("SELECT against task_history must succeed under read-only");
+        // Empty MemTable still produces a valid response (possibly empty IPC).
+        let _ = response.into_inner().arrow_ipc;
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_insert_into_writable_from_task_history() {
+        let service = make_test_service().await;
+        // Target is a writable non-system table so the operations validator
+        // would allow the INSERT; the read-only gate must still reject it.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "INSERT INTO task_history_sink \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("INSERT into writable sink must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_delete() {
+        let service = make_test_service().await;
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "DELETE FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DELETE must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("not allowed"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_task_history_rejects_ddl_over_task_history_select() {
+        let service = make_test_service().await;
+        // CREATE VIEW ... AS SELECT FROM task_history passes the rewrite gate
+        // (references task_history) but is DDL and must be rejected.
+        let err = service
+            .get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS \
+                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            }))
+            .await
+            .expect_err("DDL must be rejected by read-only GetTaskHistory");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("read-only") || err.message().contains("DDL"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_classifies_read_only() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Plan(
+                "INSERT operations are not allowed in read-only SQL context.".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(status.message().contains("read-only"));
+        // Underlying Plan text only — no Error Display wrapper re-prefixed.
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn map_task_history_query_error_keeps_other_failures_internal() {
+        let e = crate::datafusion::query::Error::UnableToExecuteQuery {
+            source: datafusion::error::DataFusionError::Internal(
+                "something unexpected".to_string(),
+            ),
+        };
+        let status = map_task_history_query_error(&e);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        // Error Display already includes "Failed to execute query: " once.
+        assert!(
+            status.message().starts_with("Failed to execute query:"),
+            "unexpected message: {}",
+            status.message()
+        );
+        assert!(
+            !status
+                .message()
+                .contains("Failed to execute query: Failed to execute query:"),
+            "must not double-prefix Display: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("something unexpected"),
+            "unexpected message: {}",
+            status.message()
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
@@ -200,6 +201,75 @@ static GLOBAL_MEM_TIER_BUDGET: LazyLock<RwLock<Option<MemTierBudget>>> =
 /// strand a waiter on a dropped notifier.
 static BUDGET_RELEASED: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+/// Optional `DataFusion` [`MemoryPool`] reservation that **mirrors** the global
+/// mem-tier `used` counter into the query pool for visibility and cross-consumer
+/// pressure. Infallible `resize` (same contract as [`super::memory_account`]):
+/// the hard bound remains the process-global byte budget + spill/durable
+/// fallback; the pool account never gates a reserve that already succeeded.
+///
+/// Installed by the runtime via [`set_global_mem_tier_pool_account`] when Cayenne
+/// memory mode is active. The dynamic re-partition sampler **subtracts** this
+/// consumer from `pool.reserved()` so the host envelope is not double-counted
+/// (the tier already has its own coordinated host slice).
+static POOL_ACCOUNT: LazyLock<RwLock<Option<MemoryReservation>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Register (or replace) the query-pool consumer that mirrors mem-tier `used`.
+/// Call once when installing the budget, with the same session `MemoryPool` the
+/// query path uses. Passing a pool with no budget installed is fine — the
+/// account tracks `used` once reserves begin.
+pub fn set_global_mem_tier_pool_account(pool: &Arc<dyn MemoryPool>) {
+    let reservation = MemoryConsumer::new("cayenne:mem_tier").register(pool);
+    *POOL_ACCOUNT.write() = Some(reservation);
+    // Seed from current `used` so a late install after warm CDC still reflects
+    // resident state (usually 0 at startup).
+    let used = global_mem_tier_used().unwrap_or(0);
+    sync_pool_account_to_used(used);
+    tracing::debug!(
+        target: "cayenne::mem_tier_budget",
+        used,
+        "Cayenne mem-tier query-pool account active (visibility; hard bound remains the byte budget)"
+    );
+}
+
+/// Clear the query-pool account (e.g. when uninstalling the budget). Best-effort
+/// resize to 0 so the pool no longer sees the tier as reserved.
+pub fn clear_global_mem_tier_pool_account() {
+    let mut guard = POOL_ACCOUNT.write();
+    if let Some(res) = guard.take() {
+        res.resize(0);
+    }
+}
+
+/// Bytes currently mirrored into the query pool for the mem-tier consumer, or
+/// `None` when no pool account is installed. Used by the re-partition sampler to
+/// exclude the tier from "query pool usage" when computing the coordinated host
+/// envelope.
+#[must_use]
+pub fn global_mem_tier_pool_account_bytes() -> Option<usize> {
+    let guard = POOL_ACCOUNT.read();
+    guard.as_ref().map(MemoryReservation::size)
+}
+
+/// Sync the query-pool reservation to the latest `used` (infallible resize).
+///
+/// `MemoryReservation` is interior-mutable (`resize`/`size` take `&self` over an
+/// atomic), so it needs no inner lock. But `resize` is an *absolute* set — a
+/// load-then-grow/shrink read-modify-write on the shared pool counter — unlike
+/// egress's delta-based `grow`/`shrink` (individually atomic and composable). Two
+/// concurrent mirrors would lose an update and skew the pool's reserved bytes for
+/// every consumer, so serialize the set through the outer write guard (one lock,
+/// not a second inner mutex). The write is off the query hot path and no worse
+/// than the reserve/release serialization already inherent to the tier budget.
+fn sync_pool_account_to_used(used: u64) {
+    let guard = POOL_ACCOUNT.write();
+    let Some(res) = guard.as_ref() else {
+        return;
+    };
+    let used_usize = usize::try_from(used).unwrap_or(usize::MAX);
+    res.resize(used_usize);
+}
+
 /// Install the process-global in-memory CDC tier byte budget. Called once at
 /// startup with the byte ceiling for the aggregate RAM tier across all tables.
 /// `bytes` of 0 leaves the budget UNSET (memory mode then relies on per-table
@@ -208,6 +278,10 @@ pub fn set_global_mem_tier_bytes(bytes: u64) {
     let mut guard = GLOBAL_MEM_TIER_BUDGET.write();
     if bytes == 0 {
         *guard = None;
+        drop(guard);
+        // Budget gone — drop the pool mirror so the query pool is not left
+        // holding a stale reservation after teardown / reconfigure.
+        clear_global_mem_tier_pool_account();
         return;
     }
     if guard.is_some() {
@@ -221,6 +295,10 @@ pub fn set_global_mem_tier_bytes(bytes: u64) {
         total: Arc::new(AtomicU64::new(bytes)),
         used: Arc::new(AtomicU64::new(0)),
     });
+    drop(guard);
+    // Fresh budget starts at used=0; keep the pool account consistent if it
+    // was already installed for a prior budget.
+    sync_pool_account_to_used(0);
 }
 
 /// Dynamically resize the installed global budget IN PLACE, preserving live
@@ -287,12 +365,20 @@ pub fn global_mem_tier_used() -> Option<u64> {
 /// the caller MUST NOT grow the RAM tier: spill the current epoch and/or fall
 /// back to the durable path. The caller releases via [`release_bytes`] when the
 /// covering epoch is checkpointed.
-pub(crate) fn try_reserve_bytes(bytes: u64) -> bool {
+///
+/// `#[doc(hidden)] pub` so Criterion benches can time the CDC hot path with the
+/// query-pool mirror installed (production callers use the same symbol via
+/// `crate::provider::mem_tier_budget`).
+#[doc(hidden)]
+pub fn try_reserve_bytes(bytes: u64) -> bool {
     match GLOBAL_MEM_TIER_BUDGET.read().as_ref() {
         None => true,
         Some(budget) => {
             let reserved = budget.try_reserve(bytes);
-            if !reserved {
+            if reserved {
+                // Mirror the new aggregate into the query pool (visibility).
+                sync_pool_account_to_used(budget.used.load(Ordering::Acquire));
+            } else {
                 // Budget full: the caller must now wait / spill / fall back to the
                 // durable path — memory-mode ingest backpressure.
                 telemetry::cayenne::track_mem_tier_reserve_refused();
@@ -305,13 +391,19 @@ pub(crate) fn try_reserve_bytes(bytes: u64) -> bool {
 /// Release `bytes` previously reserved via [`try_reserve_bytes`] (or a
 /// successful [`reserve_bytes_or_wait`]). Saturating and a no-op when no budget
 /// is installed.
-pub(crate) fn release_bytes(bytes: u64) {
+///
+/// `#[doc(hidden)] pub` for Criterion benches of the CDC reserve/release hot
+/// path (paired with [`try_reserve_bytes`]).
+#[doc(hidden)]
+pub fn release_bytes(bytes: u64) {
     let guard = GLOBAL_MEM_TIER_BUDGET.read();
     let Some(budget) = guard.as_ref() else {
         return;
     };
     budget.release(bytes);
+    let used_after = budget.used.load(Ordering::Acquire);
     drop(guard);
+    sync_pool_account_to_used(used_after);
     // AFTER the decrement: wake every writer parked in `reserve_bytes_or_wait`
     // so it re-tries against the freed bytes. (Notifying before decrementing
     // could wake a waiter into a still-full budget with no second wake coming.)
@@ -339,9 +431,13 @@ pub(crate) async fn reserve_bytes_or_wait(bytes: u64, max_wait: Duration) -> boo
     match budget {
         None => true,
         Some(budget) => {
-            budget
+            let reserved = budget
                 .reserve_or_wait(&BUDGET_RELEASED, bytes, max_wait)
-                .await
+                .await;
+            if reserved {
+                sync_pool_account_to_used(budget.used.load(Ordering::Acquire));
+            }
+            reserved
         }
     }
 }
@@ -349,6 +445,26 @@ pub(crate) async fn reserve_bytes_or_wait(bytes: u64, max_wait: Duration) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// Serializes every test that mutates the process-global budget / pool
+    /// account so parallel test threads cannot interleave reserves. Async-aware
+    /// (`tokio::sync::Mutex`) so `#[tokio::test]` cases can hold it ACROSS their
+    /// `.await`s — a `parking_lot` guard cannot be, which would force a
+    /// drop-before-await window where a concurrent test could mutate the
+    /// process-global budget.
+    static GLOBAL_BUDGET_TEST_LOCK: LazyLock<AsyncMutex<()>> =
+        LazyLock::new(|| AsyncMutex::new(()));
+
+    fn with_global_budget_lock<R>(f: impl FnOnce() -> R) -> R {
+        // Sync tests run off any runtime, so blocking_lock cannot deadlock.
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.blocking_lock();
+        // Always start from a clean unset budget so tests are order-independent.
+        set_global_mem_tier_bytes(0);
+        let result = f();
+        set_global_mem_tier_bytes(0);
+        result
+    }
 
     fn budget(total: u64) -> MemTierBudget {
         MemTierBudget {
@@ -445,15 +561,173 @@ mod tests {
     /// always unset here.
     #[test]
     fn try_reserve_bytes_is_noop_when_unset() {
-        assert!(try_reserve_bytes(1_000_000));
-        release_bytes(1_000_000);
+        with_global_budget_lock(|| {
+            assert!(try_reserve_bytes(1_000_000));
+            release_bytes(1_000_000);
+        });
+    }
+
+    /// The query-pool account mirrors `used` via infallible resize so operators
+    /// see CDC RAM as reserved without gating reserves that already succeeded.
+    /// Serializes against other global-budget tests by installing then fully
+    /// uninstalling the budget in this test alone.
+    #[test]
+    fn pool_account_mirrors_used_on_reserve_and_release() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        with_global_budget_lock(|| {
+            set_global_mem_tier_bytes(10_000);
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
+            set_global_mem_tier_pool_account(&pool);
+            assert_eq!(global_mem_tier_pool_account_bytes(), Some(0));
+
+            assert!(try_reserve_bytes(3_000));
+            assert_eq!(global_mem_tier_used(), Some(3_000));
+            assert_eq!(global_mem_tier_pool_account_bytes(), Some(3_000));
+            assert_eq!(pool.reserved(), 3_000);
+
+            assert!(try_reserve_bytes(2_000));
+            assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
+
+            // Refused reserve must NOT grow the pool account.
+            assert!(!try_reserve_bytes(10_000), "over budget must refuse");
+            assert_eq!(
+                global_mem_tier_pool_account_bytes(),
+                Some(5_000),
+                "refused reserve must leave the pool mirror unchanged"
+            );
+
+            release_bytes(4_000);
+            assert_eq!(global_mem_tier_used(), Some(1_000));
+            assert_eq!(global_mem_tier_pool_account_bytes(), Some(1_000));
+
+            // Replacing the budget resets used→0 and re-syncs the pool account.
+            set_global_mem_tier_bytes(50_000);
+            assert_eq!(global_mem_tier_used(), Some(0));
+            assert_eq!(
+                global_mem_tier_pool_account_bytes(),
+                Some(0),
+                "fresh budget must re-sync pool account to used=0"
+            );
+
+            set_global_mem_tier_bytes(0);
+            assert_eq!(global_mem_tier_pool_account_bytes(), None);
+            assert_eq!(pool.reserved(), 0, "clearing the account releases the pool");
+        });
+    }
+
+    /// Installing the pool account *after* reserves have already grown `used`
+    /// must seed the reservation from current `used` (late-install path).
+    #[test]
+    fn pool_account_seeds_from_existing_used_on_late_install() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        with_global_budget_lock(|| {
+            set_global_mem_tier_bytes(20_000);
+            // Reserve with no pool account installed — pure atomic path.
+            assert!(try_reserve_bytes(7_500));
+            assert_eq!(global_mem_tier_used(), Some(7_500));
+            assert_eq!(
+                global_mem_tier_pool_account_bytes(),
+                None,
+                "no pool account until install"
+            );
+
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
+            set_global_mem_tier_pool_account(&pool);
+            assert_eq!(
+                global_mem_tier_pool_account_bytes(),
+                Some(7_500),
+                "late install must seed from live used"
+            );
+            assert_eq!(pool.reserved(), 7_500);
+
+            clear_global_mem_tier_pool_account();
+            assert_eq!(global_mem_tier_pool_account_bytes(), None);
+            assert_eq!(pool.reserved(), 0);
+            // Double-clear is safe.
+            clear_global_mem_tier_pool_account();
+
+            // sync with no account is a silent no-op (covered via release after clear).
+            release_bytes(7_500);
+        });
+    }
+
+    /// `reserve_bytes_or_wait` success path also mirrors into the pool account.
+    #[tokio::test(start_paused = true)]
+    async fn pool_account_tracks_reserve_bytes_or_wait() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        // Async-aware guard held across the WHOLE test — including the
+        // reserve_bytes_or_wait await — so no concurrent global-budget test can
+        // interleave a mutation into this test's process-global state.
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock().await;
+        set_global_mem_tier_bytes(0);
+        set_global_mem_tier_bytes(5_000);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
+        set_global_mem_tier_pool_account(&pool);
+
+        // Fast path: budget has room — no wait.
+        assert!(
+            try_reserve_bytes(1_200),
+            "fit request must succeed immediately"
+        );
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(1_200));
+        assert_eq!(pool.reserved(), 1_200);
+
+        assert!(try_reserve_bytes(3_800));
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
+
+        // Wait path with a full budget: a sync-refused reserve (budget full).
+        assert_eq!(global_mem_tier_used(), Some(5_000));
+        assert!(!try_reserve_bytes(1), "full budget must refuse");
+
+        // reserve_bytes_or_wait success once room exists mirrors into the account.
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(5_000));
+        release_bytes(5_000);
+        let ok = reserve_bytes_or_wait(500, Duration::from_millis(100)).await;
+        assert!(ok, "wait path with free budget must succeed");
+        assert_eq!(global_mem_tier_pool_account_bytes(), Some(500));
+        set_global_mem_tier_bytes(0);
+    }
+
+    /// Sampler-facing contract: `pool_reserved` − `mem_tier_account` = query-only usage.
+    #[test]
+    fn pool_account_bytes_subtracts_cleanly_for_sampler() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        with_global_budget_lock(|| {
+            set_global_mem_tier_bytes(10_000);
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_000_000));
+            // Simulate a concurrent query consumer on the same pool.
+            let query_res = MemoryConsumer::new("query:hash_join").register(&pool);
+            query_res.resize(40_000);
+
+            set_global_mem_tier_pool_account(&pool);
+            assert!(try_reserve_bytes(2_500));
+
+            let pool_reserved = u64::try_from(pool.reserved()).expect("fits u64");
+            let mem_tier =
+                u64::try_from(global_mem_tier_pool_account_bytes().unwrap_or(0)).expect("fits u64");
+            let query_only = pool_reserved.saturating_sub(mem_tier);
+            assert_eq!(mem_tier, 2_500);
+            assert_eq!(
+                query_only, 40_000,
+                "sampler must see pure query usage after subtracting mem-tier mirror"
+            );
+            drop(query_res);
+        });
     }
 
     /// With no global budget installed, the bounded wait is the same ungated
     /// success as `try_reserve_bytes` — it must return immediately, not park.
     #[tokio::test(start_paused = true)]
     async fn reserve_bytes_or_wait_is_noop_when_unset() {
-        assert!(reserve_bytes_or_wait(1_000_000, Duration::from_millis(1500)).await);
+        let _guard = GLOBAL_BUDGET_TEST_LOCK.lock().await;
+        set_global_mem_tier_bytes(0);
+        let ok = reserve_bytes_or_wait(1_000_000, Duration::from_millis(1500)).await;
+        assert!(ok);
+        set_global_mem_tier_bytes(0);
     }
 
     /// Budget-release wait (the eviction-victim inversion fix): a "big table"

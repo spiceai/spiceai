@@ -93,6 +93,9 @@ datasets:
       pg_db: myapp
       pg_sslmode: verify-full      # or: disable | prefer | require | verify-ca
       pg_sslrootcert: /etc/ssl/pg-ca.pem   # optional; omit to use system root CAs
+      # `pg_sslrootcert` also accepts the PEM content itself, so a CA held in a
+      # secret store needs no file on disk:
+      #   pg_sslrootcert: ${secrets:pg_ca_pem}
     acceleration:
       enabled: true
       engine: duckdb           # or: sqlite | postgres | cayenne | arrow
@@ -117,10 +120,11 @@ All replication-specific parameters live under `params:` on the dataset and star
 | ------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pg_replication_slot`                 | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names. Datasets on the same connection that name the **same** slot share it — see [Sharing one slot across multiple datasets](#sharing-one-slot-across-multiple-datasets). |
 | `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. When `pg_replication_slot` is set explicitly, the default becomes `<slot>_pub` so datasets sharing a slot land on the same publication.                       |
-| `pg_replication_initial_snapshot`     | `true`                                           | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. Non-persistent accelerators (`arrow`, or `duckdb`/`sqlite` with `mode: memory`/`file_create`) snapshot on **every** start — including slot resume — since they boot empty.            |
-| `pg_replication_temporary_slot`       | `false`                                          | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps.                                                                                                                                                    |
+| `pg_replication_initial_snapshot`     | `auto`                                           | When existing rows load before streaming WAL: `auto` snapshots a freshly-created slot and resumes an existing one without a snapshot; `disabled` streams changes only (pre-seed the accelerator yourself); `always` snapshots on **every** start. Non-persistent accelerators (`arrow`, or `duckdb`/`sqlite` with `mode: memory`/`file_create`) snapshot on every start under `auto` — including slot resume — since they boot empty. The legacy booleans `true`/`false` still work and map to `auto`/`disabled`.            |
+| `pg_replication_temporary_slot`       | —                                                | **Deprecated and ignored.** The slot is always durable. A temporary slot belongs to the Postgres session that creates it, and the slot is created on the short-lived setup connection, so it was dropped before the WAL stream could attach to it. Remove the parameter; to stop an unused slot retaining WAL on the source, drop it with `SELECT pg_drop_replication_slot('<slot_name>')`. |
 | `pg_replication_status_interval`      | `10s`                                            | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
 | `pg_replication_bootstrap_batch_size` | `8192`                                           | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`.                                                      |
+| `pg_replication_ready_lag`            | `2s`                                             | For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied change's WAL commit time) falls below this — it stays not-ready while snapshotting or draining a WAL backlog, so it never serves stale or incomplete data. Accepts any [fundu](https://docs.rs/fundu) duration string. |
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
 
@@ -491,7 +495,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | Schema registry required | Yes (Avro/Protobuf)                          | No — schema derived from Postgres catalog + Spice dataset |
 | Latency                  | Kafka-bound (~100ms+)                        | Commit-driven, typically <100ms                           |
 
-If you are already running Kafka for other reasons, the Debezium path still works via the existing `kafka` / `debezium` connectors. For greenfield Postgres → Spice CDC, prefer this feature.
+If you are already running Kafka for other reasons, the Debezium path still works via the existing `kafka` / `debezium` connectors. For Debezium plugins **without** Kafka, use push ingest (`from: cdc:…` — see [cdc-debezium-ingest.md](./cdc-debezium-ingest.md)). For greenfield Postgres → Spice CDC, prefer this native feature.
 
 ## See also
 

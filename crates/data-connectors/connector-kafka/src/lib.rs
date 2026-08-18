@@ -24,23 +24,28 @@ use data_components::{
     cdc::{ChangesStream, CommitError},
     kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
+use data_connector_api::federated::FederatedTableProvider;
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use runtime::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
-    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
+    component::dataset::acceleration::RefreshMode,
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
         DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
-        UnableToGetReadProviderSnafu, parameters::ConnectorParams,
+        UnableToGetReadProviderSnafu,
+        parameters::{ConnectorContext, ConnectorParams},
     },
-    datafusion::refresh_sql,
-    federated_table::FederatedTable,
-    parameters::{ExposedParamLookup, ParameterSpec, Parameters},
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::{
+    CheckpointError,
+    kafka::{KafkaCheckpoint, KafkaCheckpointStore},
+};
+use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -65,11 +70,14 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
 pub struct Kafka {
     config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
     batching: (usize, Duration),
+    /// Retained so `read_provider` can resolve the offset store over the dataset's
+    /// accelerator. `None` only in unit tests, which build params without a runtime
+    /// attached.
+    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl Kafka {
@@ -169,7 +177,41 @@ impl Kafka {
             config: kafka_config,
             json_options: get_json_format(&params)?,
             batching: (batch_max_size, batch_max_duration),
+            context: None,
         })
+    }
+
+    /// Attach the runtime context the offset store is resolved through.
+    ///
+    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
+    /// alone, which is how they already construct one.
+    #[must_use]
+    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Resolve the offset store over this dataset's accelerator.
+    async fn offset_store(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
+        let context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| CheckpointError::Store {
+                source: "no runtime is attached to the Kafka connector".into(),
+            })?;
+        context.kafka_checkpoint_store(dataset).await
+    }
+}
+
+impl std::fmt::Debug for Kafka {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kafka")
+            .field("config", &self.config)
+            .field("batching", &self.batching)
+            .finish_non_exhaustive()
     }
 }
 
@@ -299,7 +341,8 @@ impl DataConnectorFactory for KafkaFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let kafka = Kafka::new(params.parameters)?;
+            let context = params.context.clone();
+            let kafka = Kafka::new(params.parameters)?.with_context(context);
             Ok(Arc::new(kafka) as Arc<dyn DataConnector>)
         })
     }
@@ -329,7 +372,7 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -354,15 +397,15 @@ impl DataConnector for Kafka {
         );
 
         let kafka_sys = if dataset.is_file_accelerated() {
-            Some(Arc::new(
-                KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
-                    .await
-                    .boxed()
-                    .context(UnableToGetReadProviderSnafu {
-                        dataconnector: "kafka",
-                        connector_component: ConnectorComponent::from(dataset),
-                    })?,
-            ))
+            // A dataset whose offsets cannot be persisted is refused rather than run
+            // ephemerally: replaying the topic from the beginning into an append
+            // accelerator duplicates every row already there.
+            Some(self.offset_store(dataset).await.boxed().context(
+                UnableToGetReadProviderSnafu {
+                    dataconnector: "kafka",
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            )?)
         } else {
             tracing::warn!(
                 dataset = %dataset.name,
@@ -413,7 +456,10 @@ impl DataConnector for Kafka {
         true
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
             let Some(kafka) = table_provider.downcast_ref::<data_components::kafka::Kafka>() else {
@@ -438,11 +484,11 @@ impl DataConnector for Kafka {
 }
 
 async fn init_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
-    kafka_sys: Option<&KafkaSys>,
+    kafka_sys: Option<&dyn KafkaCheckpointStore>,
 ) -> DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let metadata = if let Some(kafka_sys) = kafka_sys {
         get_metadata_from_accelerator(kafka_sys)
@@ -511,46 +557,61 @@ async fn init_kafka_consumer(
 
 pub(crate) use data_components::kafka::KafkaMetadata;
 
+/// The stored checkpoint, as the consumer speaks it.
+///
+/// The durable form carries the schema as JSON; the consumer wants an Arrow schema, so
+/// the two differ by exactly that conversion.
 async fn get_metadata_from_accelerator(
-    kafka_sys: &KafkaSys,
-) -> Result<Option<KafkaMetadata>, spice_sys::Error> {
-    kafka_sys.get().await
+    kafka_sys: &dyn KafkaCheckpointStore,
+) -> Result<Option<KafkaMetadata>, CheckpointError> {
+    let Some(checkpoint) = kafka_sys.get().await? else {
+        return Ok(None);
+    };
+    let schema =
+        arrow_tools::schema::schema_from_json(&checkpoint.schema_json).map_err(|source| {
+            CheckpointError::Store {
+                source: Box::new(source),
+            }
+        })?;
+    Ok(Some(KafkaMetadata {
+        consumer_group_id: checkpoint.consumer_group_id,
+        topic: checkpoint.topic,
+        schema,
+        offsets: checkpoint.offsets,
+    }))
 }
 
 async fn set_metadata_to_accelerator(
-    kafka_sys: &KafkaSys,
+    kafka_sys: &dyn KafkaCheckpointStore,
     metadata: &KafkaMetadata,
-) -> Result<(), spice_sys::Error> {
-    kafka_sys.upsert(metadata).await
+) -> Result<(), CheckpointError> {
+    let schema_json = arrow_tools::schema::schema_to_json(&metadata.schema).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    kafka_sys
+        .upsert(&KafkaCheckpoint {
+            consumer_group_id: metadata.consumer_group_id.clone(),
+            topic: metadata.topic.clone(),
+            schema_json,
+            offsets: metadata.offsets.clone(),
+        })
+        .await
 }
 
-#[async_trait]
-pub(crate) trait SidecarOffsetStore: Send + Sync {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
+pub(crate) struct SidecarOffsetCommitHook {
+    store: Arc<dyn KafkaCheckpointStore>,
 }
 
-#[async_trait]
-impl SidecarOffsetStore for KafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        KafkaSys::upsert_offsets(self, offsets).await
-    }
-}
-
-pub(crate) struct SidecarOffsetCommitHook<T> {
-    store: Arc<T>,
-}
-
-impl<T> SidecarOffsetCommitHook<T> {
-    pub(crate) fn new(store: Arc<T>) -> Self {
+impl SidecarOffsetCommitHook {
+    pub(crate) fn new(store: Arc<dyn KafkaCheckpointStore>) -> Self {
         Self { store }
     }
 }
 
 #[async_trait]
-impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
-where
-    T: SidecarOffsetStore,
-{
+impl KafkaOffsetCommitHook for SidecarOffsetCommitHook {
     async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
         self.store
             .upsert_offsets(offsets)
@@ -561,11 +622,11 @@ where
 }
 
 async fn bootstrap_new_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
-    kafka_sys: Option<&KafkaSys>,
+    kafka_sys: Option<&dyn KafkaCheckpointStore>,
 ) -> DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -762,3 +823,13 @@ impl MetricsProvider for KafkaMetricsProvider {
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     KafkaFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_kafka as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_kafka_connector,
+    KAFKA_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    KafkaFactory
+);

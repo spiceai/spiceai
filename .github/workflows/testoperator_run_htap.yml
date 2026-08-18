@@ -43,6 +43,7 @@ on:
         options:
           - ''
           - 'duckdb'
+          - 'chbench-skip-slow'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -95,7 +96,7 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -222,15 +223,22 @@ jobs:
           CHBENCH_PG_USER: bench
           CHBENCH_PG_PASS: bench
 
-      # MySQL counterpart: the long-lived pod runs a file-agent sidecar
-      # (chbench-mysql chart, sidecar.enabled) that keeps a pristine tablespace
-      # snapshot and restores it with a fast local file copy. This step only
-      # drives it over the MySQL connection: on a hit it issues a `restore`, on a
-      # miss it seeds once via `testoperator --prepare-only` then issues a
-      # `snapshot`. After this the run below uses `--skip-prepare`. Ephemeral
-      # docker-MySQL runners have no sidecar, so they skip this and seed normally.
+      # MySQL counterpart: the long-lived pod runs a supervisor (chbench-mysql
+      # chart) that keeps a pristine whole-data-dir snapshot and restores it with a
+      # fast local file copy, done COLD while mysqld is stopped so a reset can't
+      # corrupt InnoDB. This step only drives it over the MySQL connection: on a
+      # hit it issues a `restore`, on a miss it seeds once via `testoperator
+      # --prepare-only` then issues a `snapshot`. After this the run below uses
+      # `--skip-prepare`. Ephemeral docker-MySQL runners have no supervisor, so
+      # they skip this and seed normally.
       - name: Restore or seed CH-benCH MySQL from template
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        # Backstop so a wedged seed/restore (e.g. a DROP blocked on a stale lock)
+        # fails THIS step fast and attributably, instead of silently consuming the
+        # whole 120-min job budget and reporting a confusing "cancelled". A cold
+        # SF1000 CSV seed finishes comfortably under this; exceeding it means the
+        # seed is stuck.
+        timeout-minutes: 90
         run: bash .github/scripts/chbench_template_mysql.sh
         env:
           SCALE_FACTOR: ${{ github.event.inputs.scale_factor }}
@@ -302,7 +310,7 @@ jobs:
           # cpu N and cpu 64+N), pin spiced and testoperator to whole physical
           # cores so they don't contend — not even via hyperthread siblings:
           #   spiced       -> cores 0-31  (logical CPUs 0-31,64-95   = 64 threads)
-          #   testoperator -> cores 32-39 (logical CPUs 32-39,96-103 = 16 threads)
+          #   testoperator -> cores 32-37 (logical CPUs 32-37,96-101 = 12 threads)
           SPICED_BIN=/usr/local/bin/spiced
           TESTOP_PREFIX=""
           if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
@@ -312,8 +320,8 @@ jobs:
           EOF
             chmod +x /tmp/spiced-pinned.sh
             SPICED_BIN=/tmp/spiced-pinned.sh
-            TESTOP_PREFIX="taskset -c 32-39,96-103"
-            echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 16 logical CPUs"
+            TESTOP_PREFIX="taskset -c 32-37,96-101"
+            echo "CPU pinning: spiced -> 64 logical CPUs, testoperator -> 12 logical CPUs"
           fi
 
           # Optionally capture under-load troubleshooting artifacts
@@ -343,6 +351,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
+            ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \

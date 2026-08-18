@@ -332,6 +332,10 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
+        // Empty-table probe (see `maybe_install_warm_pk_caches`): a staged
+        // append can be a fresh table's very first write, and its committed
+        // keys must land in live caches for the warm-index invariant to hold.
+        self.table.maybe_install_warm_pk_caches().await;
         // Register the in-flight append BEFORE its WAL becomes discoverable on
         // disk. Recovery treats any committed WAL whose id is not in the
         // in-flight set as a crash leftover; writing the WAL first opened a
@@ -917,14 +921,22 @@ impl PreparedStagedAppend {
             .publish_append_snapshot_under_held_fence(prepared);
     }
 
-    /// Remove this partition's staging WAL after its committed snapshot has
-    /// been published. Failure is recoverable maintenance and must not turn a
-    /// durably committed append into a client-visible failure.
+    /// Remove this append's staging WAL after its committed protected-snapshot
+    /// has been finalized (replacement files durably in the target snapshot).
+    /// Called by the cross-partition coordinator after its multi-partition
+    /// commit and by the single-table CDC upsert finalize (`CayenneCdcWrite::finish`),
+    /// since `apply_under_held_barrier` removes the WAL only for `CurrentSnapshot`
+    /// targets.
+    ///
+    /// Callers treat failure as best-effort recoverable maintenance: the append
+    /// is already durably committed, so a failed WAL removal must NOT turn it
+    /// into a client-visible failure — the leftover WAL is rolled forward
+    /// idempotently by the next write's `ensure_no_incomplete_write`.
     ///
     /// # Errors
     ///
     /// Returns an error if the local or object-store WAL cannot be removed.
-    pub async fn remove_deferred_snapshot_wal(&self) -> Result<()> {
+    pub async fn remove_committed_staging_wal(&self) -> Result<()> {
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await
@@ -1283,7 +1295,7 @@ impl CayenneTableProvider {
         // cross-partition append. Refuse before cloning or consuming input until
         // those states are included in the coordinated transaction.
         let current_snapshot_id = self.get_current_snapshot_id();
-        let target_snapshot_id = Self::new_staging_snapshot_id();
+        let (_, target_snapshot_id) = Self::new_staging_snapshot_id_pair();
         let mut setup_cleanup = DeferredSetupCleanup {
             table: self.clone_for_write_operations(),
             snapshots: vec![target_snapshot_id.clone()],
@@ -1672,15 +1684,56 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Ensure no incomplete write is pending before starting a new write.
+    /// Ensure no incomplete write is pending before starting a new write, and
+    /// roll any recoverable one forward (or back) so the table is writable.
     ///
-    /// Checks for a leftover staging WAL, which indicates a previous staged
-    /// append was interrupted during the file-move phase. Returns an error to
-    /// block further writes until the inconsistency is resolved.
+    /// Runs on the pre-write gate (under `write_lock`) and at provider open. For
+    /// each leftover staging WAL it either self-heals — idempotently completing
+    /// the staged file move (roll FORWARD) or discarding an uncommitted staged
+    /// append (roll BACK) — or, for a genuinely ambiguous / torn write, refuses
+    /// and returns [`Error::IncompleteWrite`] so an operator can intervene.
+    ///
+    /// ## Why this can never double-publish or roll back a *committed* append
+    ///
+    /// Finalize normally clears a committed append's WAL itself, so recovery
+    /// fires only for interrupted writes (a crash between the durable move and
+    /// the WAL removal), the cross-partition coordinator's brief post-commit
+    /// window, or a failed best-effort WAL removal. Even when it rolls a
+    /// *committed* `ProtectedSnapshot` append forward, a layered invariant keeps
+    /// that safe:
+    ///
+    /// 1. **In-flight registration covers the entire live-finalize window.**
+    ///    `CayenneStagedAppend::prepare` registers the append in-flight *before*
+    ///    its WAL becomes discoverable, and only `finish()` (which runs *after*
+    ///    `apply_*` has completed the move), `rollback()`, or `Drop`
+    ///    (cancellation) clears it. The `staging_append_is_inflight` skip below
+    ///    therefore excludes any append whose finalize is still live — recovery
+    ///    only ever acts on an append whose finalize has already completed, been
+    ///    rolled back, or been abandoned.
+    /// 2. **`visibility_lock` serializes recovery's move against a concurrent
+    ///    finalize's move**, so even at the instant of hand-off there is no torn
+    ///    concurrent directory mutation (see the lock note below).
+    /// 3. **Roll-forward vs roll-back is decided by the DURABLE snapshot sequence,
+    ///    not the provider pointer.** A single-table CDC upsert commits its
+    ///    `snapshot_sequence` synchronously in Stage A
+    ///    (`commit_on_conflict_deletions_with_tombstone`), which runs *before*
+    ///    `finish()`. Since `not-in-flight ⟹ finish() ran (or the receipt was
+    ///    dropped)`, a *committed* upsert always has a durable sequence when
+    ///    recovery sees its WAL ⟹ it is always rolled FORWARD, never back. An
+    ///    append abandoned *before* its sequence commit has no durable sequence
+    ///    and is correctly rolled back (it published no rows).
+    /// 4. **The roll-forward move is idempotent.**
+    ///    `move_staged_files_to_snapshot` renames whatever is in the (uuid-named)
+    ///    `_staging/<id>/` dir into the target; once finalize has moved the files
+    ///    the staging dir is empty and recovery's move is a no-op — so re-running
+    ///    recovery any number of times neither duplicates rows nor loses them.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
+    /// Returns [`Error::IncompleteWrite`] when a leftover WAL cannot be safely
+    /// self-healed: its target current-snapshot has moved, WAL-listed files are
+    /// missing from both staging and the target snapshot, or the WAL removal
+    /// after a successful move fails.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)

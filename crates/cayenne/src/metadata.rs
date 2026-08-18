@@ -19,6 +19,10 @@ limitations under the License.
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
+// Re-exported so callers configuring a `VortexConfig` (the runtime's Cayenne
+// accelerator) name the mode through this module alongside the other config
+// enums, rather than reaching into `vortex-datafusion` for one type.
+pub use vortex_datafusion::ScanConcurrency;
 
 /// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
 pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
@@ -318,6 +322,28 @@ impl PartitionMetadata {
     }
 }
 
+/// Provenance of [`VortexConfig::sort_columns`] — whether the operator asked
+/// for that sort order or schema inference guessed it.
+///
+/// This exists because the two carry different authority. An explicit
+/// `cayenne_sort_columns` is a statement of intent and wins outright. An
+/// inference-derived value is a *fallback guess* — for `PostgreSQL` CDC tables it
+/// resolves to the primary key when the source has no `CLUSTER` or natural
+/// order, which is close to the worst clustering for range/date predicates. It
+/// must therefore rank below the hot filter columns actually observed on scans,
+/// or the guess permanently shadows the measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortColumnsOrigin {
+    /// Explicitly configured by the operator (or absent, in which case
+    /// `sort_columns` is empty and the distinction is moot). Authoritative.
+    #[default]
+    User,
+    /// Filled in by schema inference from the source's declared sort order.
+    /// A guess — outranked by observed filter columns.
+    Inferred,
+}
+
 /// Which compression strategy the table's FULL encoding tier uses — i.e.
 /// maintenance writes (compaction outputs, rewrites, overwrites) and delta
 /// writes that resolve to a full level (`7..=10`, or `auto` on large /
@@ -342,10 +368,9 @@ pub enum CompressionStrategy {
 ///
 /// zstd-style level scale (`cayenne_delta_encoding` param):
 ///
-/// - `auto` (default) — size-gated: a write smaller than a quarter of the
-///   target file size encodes at a light level (the file is transient by
-///   definition — compaction exists to fold it); larger or unknown-size
-///   writes use the full default encoding.
+/// - `auto` (default) — every delta write encodes at a light level: a delta
+///   is transient by definition (the tiered compactor folds it into a
+///   properly-encoded file), so it skips the full cascade regardless of size.
 /// - `0` — no compression (canonical arrays; cheapest encode).
 /// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
 ///   per-file encoder-strategy search and FSST symbol-table training.
@@ -363,14 +388,15 @@ pub enum CompressionStrategy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
-    /// Size-gated: light for small deltas, full for large writes.
-    /// Local micro A/B (2026-06-06) was neutral on the
-    /// upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-    /// production-scale CDC and is to be validated there. Set the
-    /// param to `7` to opt out (pre-feature behavior).
+    /// `Auto` — light encoding for every delta write. Deltas are transient
+    /// (compaction re-encodes them at the full cascade), so the CDC hot path
+    /// skips the per-file encoder-strategy search + FSST symbol-table training
+    /// regardless of delta size. The SF1000 CH-benCHmark HTAP sweep validated
+    /// this at production scale: shedding checkpoint encode CPU lets the apply
+    /// loop keep up (it enables replication convergence where full-encode does
+    /// not, and gives the best analytic QPH on top of coalescing).
     ///
-    /// `Auto` — size-gated light encoding for small deltas. This is also what
-    /// pre-feature stored table configs deserialize to via
+    /// This is also what pre-feature stored table configs deserialize to via
     /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
     /// (write-time only; existing data files are unaffected and a level
     /// change never forces a table re-create). Set the
@@ -719,6 +745,31 @@ impl StorageClass {
     }
 }
 
+/// Serializes [`ScanConcurrency`] through its own `Display`/`FromStr` pair.
+///
+/// The type is owned by `vortex-datafusion`, which carries no serde dependency, so
+/// the string form is produced here rather than derived there. Going through the
+/// enum's own parser keeps one definition of what `auto`/`off`/`<n>` mean — a
+/// second mapping here would be free to drift from the one the scan honors.
+mod scan_concurrency_serde {
+    use super::ScanConcurrency;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &ScanConcurrency,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ScanConcurrency, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -735,6 +786,16 @@ pub struct VortexConfig {
     ///
     /// Passed through to `vortex-datafusion` as the per-format segment cache size.
     pub segment_cache_mb: usize,
+    /// How many splits a single Vortex file scan decodes concurrently.
+    ///
+    /// `auto` (the default) derives it from `DataFusion` target partitions and the
+    /// planned file count; `off` forces serial decoding; an explicit count pins it.
+    /// Raising it trades resident decode memory for scan throughput — the scan
+    /// memory accounting charges the query pool for every concurrent split, so a
+    /// wide fan-out over a small pool surfaces as a refused query rather than an
+    /// over-committed host.
+    #[serde(default, with = "scan_concurrency_serde")]
+    pub scan_concurrency: ScanConcurrency,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
     /// for better parallelism and more granular statistics for query optimization.
@@ -742,6 +803,19 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Where [`Self::sort_columns`] came from. `user` (an explicit
+    /// `cayenne_sort_columns`) is authoritative and outranks everything.
+    /// `inferred` means schema inference filled it from the source's declared
+    /// order — for a `PostgreSQL` CDC table that is usually just the primary key,
+    /// a *guess* about what queries will filter on. An inferred value therefore
+    /// ranks BELOW the hot filter columns actually observed on scans, so the
+    /// default-on adaptive layout can override a guess with evidence.
+    ///
+    /// Deliberately NOT compared by `configuration_matches`: it is provenance
+    /// about a value, not a data-affecting field. Comparing it would make every
+    /// existing table look config-changed on upgrade and trip the recreate path.
+    #[serde(default)]
+    pub sort_columns_origin: SortColumnsOrigin,
     /// Columns to hash-cluster rows by during intra-write sharding (the parallel
     /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
     /// the historical behavior); PK-less tables shard round-robin. Ignored for
@@ -752,11 +826,11 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Encoding effort for delta writes (fresh CDC/append snapshot files).
-    /// `auto` (default) size-gates: small deltas encode light and are folded
-    /// into properly-encoded files by compaction; explicit `0..=10` pins the
-    /// level (`7` = the full default cascade, the pre-feature behavior).
-    /// Maintenance writes (compaction, rewrites) always use the full default
-    /// encoding. See [`DeltaEncoding`].
+    /// `auto` (default) encodes every delta light (deltas are transient and
+    /// folded into properly-encoded files by compaction); explicit `0..=10`
+    /// pins the level (`7` = the full default cascade, the pre-feature
+    /// behavior). Maintenance writes (compaction, rewrites) always use the full
+    /// default encoding. See [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
@@ -1031,8 +1105,9 @@ pub struct VortexConfig {
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
-    /// with the loop off is inert). Runtime-only — never compared by
+    /// `cayenne_goal_*` params. A goal declares a target, not a controller, so it
+    /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
+    /// accelerator warns). Runtime-only — never compared by
     /// `configuration_matches` (does not affect data layout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_replication_lag_secs: Option<f64>,
@@ -1209,7 +1284,7 @@ impl SchemaEvolutionMode {
 }
 
 fn default_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    cpu_budget::cpu_budget().cayenne_upload_concurrency()
 }
 
 fn default_upload_concurrency() -> usize {
@@ -1365,8 +1440,8 @@ impl VortexConfig {
     ///
     /// Pure and side-effect-free so the rules stay unit-testable. The actual
     /// clamping still happens at the use sites — this only makes it visible
-    /// instead of silent. `available_cores` is the host's logical core count (the
-    /// encode-shard ceiling); pass `std::thread::available_parallelism()`.
+    /// instead of silent. `available_cores` is the encode-shard ceiling; pass
+    /// `cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling()`.
     #[must_use]
     pub fn config_warnings(&self, available_cores: usize) -> Vec<String> {
         let cores = available_cores.max(1);
@@ -1379,7 +1454,7 @@ impl VortexConfig {
             && write_concurrency > cores
         {
             warnings.push(format!(
-                "cayenne_write_concurrency ({write_concurrency}) exceeds the host core count ({cores}); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
+                "cayenne_write_concurrency ({write_concurrency}) exceeds the runtime's CPU budget ({cores} cores); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
             ));
         }
 
@@ -1429,18 +1504,21 @@ impl Default for VortexConfig {
         Self {
             footer_cache_mb: None,
             segment_cache_mb: 256,
+            // Derive intra-file decode concurrency from target partitions and the
+            // planned file count.
+            scan_concurrency: ScanConcurrency::default(),
             // Balanced file size for scan throughput and write amplification
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            sort_columns_origin: SortColumnsOrigin::default(),
             // Shard key derives from the primary key unless overridden
             shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // `auto`: size-gated light encoding for small deltas (re-encoded
-            // by compaction). Local micro A/B (2026-06-06) was neutral on the
-            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
-            // production-scale CDC and is to be validated there. Set the
-            // param to `7` to opt out (pre-feature behavior).
+            // `auto`: light encoding for every delta (re-encoded by
+            // compaction). Validated at production scale by the SF1000
+            // CH-benCHmark HTAP sweep (frees apply CPU → convergence + QPH).
+            // Set the param to `7` to opt out (pre-feature behavior).
             delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
@@ -1500,8 +1578,42 @@ impl Default for VortexConfig {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
+)]
 mod tests {
-    use super::{PkConflictDetection, VortexConfig};
+    use super::{PkConflictDetection, ScanConcurrency, VortexConfig};
+
+    /// `scan_concurrency` must survive a metastore round trip, and a config
+    /// written before the field existed must still load.
+    ///
+    /// The mode is serialized through the enum's own string form because
+    /// `vortex-datafusion` carries no serde derive. A stored table's config is
+    /// deserialized on every open, so a format that only round-trips one way
+    /// would fail the table, not just the setting.
+    #[test]
+    fn scan_concurrency_round_trips_and_tolerates_configs_written_without_it() {
+        for mode in [
+            ScanConcurrency::Auto,
+            ScanConcurrency::Off,
+            ScanConcurrency::Explicit(4),
+        ] {
+            let config = VortexConfig {
+                scan_concurrency: mode,
+                ..Default::default()
+            };
+            let encoded = serde_json::to_string(&config).expect("config should serialize");
+            let decoded: VortexConfig =
+                serde_json::from_str(&encoded).expect("config should deserialize");
+            assert_eq!(decoded.scan_concurrency, mode);
+        }
+
+        // A config persisted before this field existed carries no key for it.
+        let legacy: VortexConfig =
+            serde_json::from_str("{}").expect("a config without the field should deserialize");
+        assert_eq!(legacy.scan_concurrency, ScanConcurrency::Auto);
+    }
 
     #[test]
     fn test_concurrency_defaults_use_available_parallelism_where_global() {

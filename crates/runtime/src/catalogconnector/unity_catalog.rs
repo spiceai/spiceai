@@ -19,7 +19,7 @@ use super::ConnectorComponent;
 use super::ParameterSpec;
 use super::Parameters;
 use crate::Runtime;
-use crate::component::catalog::Catalog;
+use crate::component::catalog::{Catalog, table_selector};
 use crate::dataconnector::parameters::ConnectorParams;
 use async_trait::async_trait;
 use data_components::Read;
@@ -70,6 +70,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description(
+            "The AWS session token to use for S3 storage. Required with temporary (STS) credentials.",
+        )
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
@@ -206,7 +211,7 @@ impl CatalogConnector for UnityCatalog {
             client,
             catalog_id,
             table_creator,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         {
@@ -373,5 +378,45 @@ mod tests {
             }
             _ => panic!("Expected Bare table reference"),
         }
+    }
+
+    /// Temporary (STS) credentials only authenticate when the session token travels with
+    /// the key and secret, so `unity_catalog_aws_session_token` has to survive into the
+    /// storage options handed to `DeltaTableFactory`.
+    #[tokio::test]
+    async fn test_aws_session_token_reaches_delta_storage_options() {
+        use secrecy::ExposeSecret;
+
+        let parameters = Parameters::try_new(
+            "catalog unity_catalog",
+            vec![
+                (
+                    "unity_catalog_aws_access_key_id".to_string(),
+                    SecretString::from("ASIAEXAMPLE"),
+                ),
+                (
+                    "unity_catalog_aws_secret_access_key".to_string(),
+                    SecretString::from("secret"),
+                ),
+                (
+                    "unity_catalog_aws_session_token".to_string(),
+                    SecretString::from("FwoSessionToken"),
+                ),
+            ],
+            "unity_catalog",
+            Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("temporary credential parameters should be accepted for unity_catalog");
+
+        let storage_options = parameters.to_secret_map();
+        assert_eq!(
+            storage_options
+                .get("aws_session_token")
+                .map(ExposeSecret::expose_secret),
+            Some("FwoSessionToken"),
+            "session token must reach the Delta Lake storage options"
+        );
     }
 }

@@ -22,7 +22,9 @@ limitations under the License.
 //! scan/update plumbing. The provider drives these from its insert/delete path.
 
 use super::delete::CayenneDeletionSink;
-use super::pk_index::{CachedPkIndex, PkDigestSet, PkExistenceRef, ShardedPkIndex};
+use super::pk_index::{
+    CachedPkIndex, PendingPkExistence, PkDigestSet, PkExistenceRef, ShardedPkIndex,
+};
 use crate::metadata::InlinedData;
 
 use arrow::record_batch::RecordBatch;
@@ -384,9 +386,70 @@ pub(crate) struct InlineAwareDeletionSink {
     pub(crate) filters: Vec<Expr>,
 }
 
+/// `true` when the delete targets every row — an empty filter list, or every
+/// filter being the always-true literal `true` (a TRUNCATE / `DELETE … WHERE
+/// TRUE`, which the CDC truncate path emits as `vec![lit(true)]`).
+pub(crate) fn is_delete_all(filters: &[Expr]) -> bool {
+    filters.iter().all(|filter| {
+        matches!(
+            filter,
+            Expr::Literal(datafusion_common::ScalarValue::Boolean(Some(true)), _)
+        )
+    })
+}
+
+/// Taints the maintained live row count's exactness around a user `DELETE`.
+///
+/// A delete tombstones rows the persisted `num_rows` still counts, and nothing
+/// re-derives that count — `cached_table_statistics_for_optimizer` only *masks*
+/// the drift while `has_pending_deletions()` holds. Any path that folds the
+/// tombstone (compaction, overwrite, datalake promotion, the seq-prefix bake)
+/// drops that mask, and one that does not also re-baseline the count with
+/// [`RowCountUpdate::Set`] leaves it served `Exact` over a stale value — which a
+/// distributed `COUNT(*)` can substitute into its result. Tainting exactness at
+/// delete time makes the mask no longer the only thing standing between a stale
+/// count and an `Exact` answer, for every fold path at once.
+///
+/// The count itself is deliberately left alone rather than decremented: the
+/// deleted total spans tiers the persisted count does not uniformly include (a
+/// delete-all also purges the mem tier), so subtracting it can under-count. An
+/// over-count served `Inexact` is a planner estimate; an under-count that a later
+/// `Set` has not yet corrected would be a wrong answer.
+///
+/// [`RowCountUpdate::Set`]: super::column_stats::RowCountUpdate::Set
+pub(crate) struct RowCountExactnessTaintingDeletionSink {
+    pub(crate) table: CayenneTableProvider,
+    pub(crate) inner: Arc<dyn DeletionSink>,
+}
+
+#[async_trait]
+impl DeletionSink for RowCountExactnessTaintingDeletionSink {
+    async fn delete_from(
+        &self,
+        context: Arc<TaskContext>,
+    ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        // Taint BEFORE the inner delete, which publishes durably and cannot be
+        // undone. Taint-then-delete can only leave the count conservative (a
+        // delete that removes nothing, errors, or is cancelled costs the metadata
+        // `COUNT(*)` fast path until the next full rewrite); delete-then-taint
+        // leaves the *unsafe* residue — a cancellation, crash, or failed
+        // statistics write between the two, after which the tombstone is durable
+        // while `num_rows_exact` still claims the stale count is the live one, and
+        // a later fold un-masks it as `Exact`. This mirrors
+        // `PkKeysetInvalidatingDeletionSink`'s unconditional pre-delete
+        // `mark_pk_keyset_occ_degraded`, and for the same reason: on this path the
+        // conservative direction is free and the optimistic one is a wrong answer.
+        self.table.taint_persisted_row_count_exactness().await;
+        self.inner.delete_from(context).await
+    }
+}
+
 pub(crate) struct PkKeysetInvalidatingDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) inner: Arc<dyn DeletionSink>,
+    /// The delete request's filters, needed to recognize a delete-all so the
+    /// mem-tier can be purged alongside the inner sink's file-side work.
+    pub(crate) filters: Vec<Expr>,
 }
 
 #[async_trait]
@@ -412,7 +475,34 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
         // below resets the flag and rebuilds exact; an upsert table keeps the
         // stale-superset keyset and stays degraded until its next rebuild.
         self.table.mark_pk_keyset_occ_degraded();
-        let deleted = self.inner.delete_from(context).await?;
+        let mut deleted = self.inner.delete_from(context).await?;
+
+        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the inner sink records
+        // `(file, file-local position)` deletes, and rows resident in the
+        // in-memory tier live in no file — so nothing tombstones them and they
+        // stay visible. A table with no primary key reaches this sink for every
+        // delete (`pk_deletion_strategy` is `PositionBased` exactly then), and in
+        // `mode: memory` the mem-tier is the permanent store, so without this the
+        // table can never be emptied. Mirrors `InlineAwareDeletionSink` below,
+        // which covers the key-based arm. Skipped for filtered deletes, whose
+        // predicate cannot be evaluated against the tier here.
+        //
+        // `purge_mem_tier_all` requires the table `write_lock`, which the inner
+        // sink takes and releases internally, so acquire it here rather than
+        // nesting. Purge before the `deleted > 0` bookkeeping below: on a table
+        // whose rows are *only* in the mem-tier the inner count is 0, and the
+        // cached scan statistics still need invalidating once the purge changes
+        // the visible row count.
+        if is_delete_all(&self.filters) {
+            let _guard = self.table.write_lock.lock().await;
+            let purged = self
+                .table
+                .purge_mem_tier_all()
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(purged);
+        }
+
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever).
             //
@@ -429,7 +519,7 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
             // at ~6106 and the Bloom arm at ~6159 keep the row and emit at most a
             // no-op delete). So for upsert tables we SKIP the clear entirely and
             // keep the stale-superset index — eliminating the O(live-rows)
-            // `load_existing_keyset` cold rebuild the next CDC insert batch would
+            // `load_existing_pk_index` cold rebuild the next CDC insert batch would
             // otherwise pay (measured 277 ms × 244 = 68 s/600 s on `new_order`).
             //
             // `DoNothing` tables need an EXACT answer (a stale-present entry would
@@ -502,11 +592,27 @@ impl DeletionSink for InlineAwareDeletionSink {
             }
         }
 
-        let deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
+        let mut deleted = inlined_deleted.checked_add(file_deleted).ok_or_else(|| {
             Box::new(datafusion_common::DataFusionError::Execution(
                 "Deleted row count overflowed u64".to_string(),
             )) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        // Delete-all (TRUNCATE / `DELETE … WHERE TRUE`): the file/inline sink
+        // above tombstones only durable file rows and catalog-inlined data, and
+        // cannot enumerate keys — so un-checkpointed rows still resident in the
+        // in-memory CDC mem-tier survive and keep showing up in scans (#11987).
+        // Discard them wholesale here, under the `write_lock` held above so no
+        // concurrent CDC apply mutates the tier. Skipped for per-key deletes,
+        // which land their own key tombstones across every tier.
+        if is_delete_all(&self.filters) {
+            let purged = self
+                .table
+                .purge_mem_tier_all()
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+            deleted = deleted.saturating_add(purged);
+        }
 
         if deleted > 0 {
             // Keyset clear-on-delete avoidance (cycle-4 incremental lever) — see
@@ -515,7 +621,7 @@ impl DeletionSink for InlineAwareDeletionSink {
             // here. For an `Upsert` table a stale-present existence entry only
             // yields a harmless redundant delete on a later re-insert (the
             // `PkBloom` false-positive invariant, see `provider::pk_index::PkBloom`), so we SKIP
-            // the clear and avoid the O(live-rows) `load_existing_keyset` rebuild
+            // the clear and avoid the O(live-rows) `load_existing_pk_index` rebuild
             // the next insert batch would pay. `DoNothing` tables need exactness
             // (a stale entry would wrongly drop a new row) and keep the full clear.
             if self.table.upsert_bloom_eligible() {
@@ -837,40 +943,6 @@ pub(crate) enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
-/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
-/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
-pub(crate) struct MergedScanDeletions {
-    /// The FILE-side deletion snapshot the merge was built from, RETAINED for
-    /// the lifetime of the memo.
-    ///
-    /// The memo key's file-side identity is the `Arc::as_ptr` of this snapshot's
-    /// index ([`Self::file_index_ptr`]). Holding the `Arc` here — not merely its
-    /// raw address — is load-bearing for correctness: a live `Arc` allocation
-    /// can never be freed and its address handed to a *different* index
-    /// generation, so a pointer match proves the live file-side index IS this
-    /// same generation, never a coincidental ABA alias. Without the retention a
-    /// deletion publish could free this index and a later publish reuse its
-    /// freed address, yielding a false memo hit that serves a stale merged view
-    /// and resurrects deleted rows (#11303).
-    pub(crate) file_index: PkDeletionSnapshot,
-    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
-    pub(crate) tier_version: u64,
-    /// Structural epoch observed when the memo was built.
-    pub(crate) structural_epoch: u64,
-    pub(crate) merged: PkDeletionSnapshot,
-}
-
-impl MergedScanDeletions {
-    /// `Arc::as_ptr` identity of the retained file-side index — the memo key's
-    /// file-side component. Read from [`Self::file_index`] so the compared
-    /// pointer and the pinned allocation can never diverge. Always `Some` in
-    /// practice: the memo is only stored once the source index has an identity
-    /// (`PositionBased` returns before the store).
-    pub(crate) fn file_index_ptr(&self) -> Option<usize> {
-        self.file_index.index_ptr()
-    }
-}
-
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
 /// tier rows being encoded into the new snapshot), keyed by deletion strategy.
 /// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
@@ -924,43 +996,6 @@ impl PkDeletionSnapshot {
             Self::PositionBased => 0,
             Self::Int64Pk { tombstones } => tombstones.delete_len(),
             Self::RowConverterBased { tombstones } => tombstones.delete_len(),
-        }
-    }
-
-    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
-    /// persistent-index extend. Used by the append path to keep the
-    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
-    /// version-keyed memo can otherwise never hit: every append bumps the tier
-    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
-    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
-    pub(crate) fn extended_by_delta(
-        &self,
-        delta: &crate::provider::mem_tier::SegmentTombstones,
-    ) -> Self {
-        // Every key in `delta` shares one reserved delete sequence (one CDC
-        // apply), so the memo extend applies that single scalar to all of them —
-        // identical to extending by a per-key map whose values are all that seq.
-        let seq = delta.delete_sequence();
-        match self {
-            Self::PositionBased => Self::PositionBased,
-            Self::Int64Pk { tombstones } => {
-                if delta.is_int64_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
-                Self::Int64Pk {
-                    tombstones: Arc::new(updated),
-                }
-            }
-            Self::RowConverterBased { tombstones } => {
-                if delta.is_row_keys_empty() {
-                    return self.clone();
-                }
-                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
-                Self::RowConverterBased {
-                    tombstones: Arc::new(updated),
-                }
-            }
         }
     }
 
@@ -1094,6 +1129,13 @@ pub(crate) struct OnConflictContext<'a> {
     pub(crate) on_conflict: &'a OnConflict,
     pub(crate) upsert_options: &'a UpsertOptions,
     pub(crate) existing: PkExistenceRef<'a>,
+    /// Keys committed by other writers since `existing` was checked out of its
+    /// cache, which `existing` therefore cannot know about (see
+    /// [`PendingPkKeys`](super::pk_index::PendingPkKeys)).
+    /// Consulted on an `existing` miss so a key committed mid-validation is not
+    /// classified as a new primary key. `None` when nothing was committed during
+    /// this checkout — the common case.
+    pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a PkDigestSet,
 }
 
@@ -1184,12 +1226,24 @@ impl OnConflictValidationStream {
             CachedPkIndex::Bloom(bloom) => PkExistenceRef::Bloom(bloom),
         };
 
+        // Snapshot per batch, not per stream: `existing` was checked out before the
+        // first batch, and this stream is consumed lazily as the encode runs, so a
+        // concurrent writer can commit a key between two batches of it.
+        let pending = if self.store_back {
+            self.table.pending_pk_existence()
+        } else {
+            // Off-lock staging validates against a private keyset it just built —
+            // it holds no checkout, so the log is another writer's business.
+            None
+        };
+
         let mut ctx = OnConflictContext {
             pk_indices: &self.pk_indices,
             converter: &self.converter,
             on_conflict: &self.on_conflict,
             upsert_options: &self.upsert_options,
             existing,
+            pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
         };
 

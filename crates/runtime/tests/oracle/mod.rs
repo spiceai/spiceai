@@ -109,7 +109,9 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
             ) VALUES (
                 1, 123.45, 123456789012345678, 555.1234, 3.14, 2.71828,
                 'abc', N'def', 'ghi', N'jkl',
-                'clobtext', N'nclobtext', DATE '2024-06-27', TIMESTAMP '2024-06-27 10:00:00', TIMESTAMP '2024-06-27 10:00:00 -07:00', TIMESTAMP '2024-06-27 10:00:00',
+                -- VAL_DATE carries a time-of-day: an Oracle DATE is a datetime, and a date-only
+                -- mapping would silently truncate this to midnight (regression test for #12096).
+                'clobtext', N'nclobtext', TO_DATE('2024-06-27 14:32:11', 'YYYY-MM-DD HH24:MI:SS'), TIMESTAMP '2024-06-27 10:00:00', TIMESTAMP '2024-06-27 10:00:00 -07:00', TIMESTAMP '2024-06-27 10:00:00',
                 1.23, 4.56, hextoraw('DEADBEEFDEADBEEFDEADBEEFDEADBEEF'), EMPTY_BLOB(),
                 'Y'
             )

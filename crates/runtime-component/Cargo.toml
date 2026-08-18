@@ -1,0 +1,31 @@
+[package]
+name = "runtime-component"
+description = "Config-only component specs (dataset/catalog/view) the runtime builds its Arc<Runtime>-bound wrappers on. Sits below `runtime` so connectors can name a component's configuration without depending on the orchestrator."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+clap.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+opentelemetry.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
+data_components = { path = "../data_components", features = ["flightsql"] }
+datafusion.workspace = true
+datafusion-table-providers = { workspace = true }
+fundu = { workspace = true }
+globset.workspace = true
+logos.workspace = true
+runtime-acceleration = { path = "../runtime-acceleration" }
+serde = { workspace = true, features = ["derive"] }
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -302,7 +302,13 @@ static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
 static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static CGROUP_V1_MEMORY_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 /// Process-wide CPU busy-fraction of available cores (cgroup-aware), stored ×1000.
 /// `u64::MAX` = unknown (non-Linux, unreadable, or the first/too-close sample with
@@ -447,55 +453,156 @@ fn adaptive_mem_tier_bounds_for_budget(
     (MEM_TIER_MIN_BYTES, ceiling.max(initial))
 }
 
-/// Current process/cgroup memory usage in bytes — cgroup v2 (`memory.current`)
-/// then v1 (`memory.usage_in_bytes`); `None` when unavailable. This is the
-/// "detect the environment and adjust" read that closes the loop on memory.
+/// Current process/cgroup memory *demand* in bytes — the unreclaimable working
+/// set, from cgroup v2 then v1, falling back to process RSS; `None` when
+/// unavailable. This is the "detect the environment and adjust" read that closes
+/// the loop on memory.
+///
+/// Demand is the cgroup charge (`memory.current` / `memory.usage_in_bytes`) MINUS
+/// the page cache the kernel can drop on demand. The total charge counts the
+/// file-backed cache left behind by the table's own Vortex writes, which is
+/// reclaimed — not OOM-killed — when the limit is approached: charging it as
+/// demand makes a write-heavy CDC table read as critically short of memory while
+/// its unreclaimable footprint sits far below the budget, and the controller
+/// answers by collapsing the live buffers to their floors, which spills
+/// continuously. `working_set_excludes_reclaimable_page_cache` carries the
+/// measured cgroup accounting from the run that exposed this (issue #12531).
+///
+/// The numerator is read from THIS cgroup, while the budget it is divided against
+/// ([`global_memory_budget`]) is the tightest `memory.max` along the whole cgroup
+/// path (`telemetry::hardware::cgroup_memory_limit`). Where the binding limit sits
+/// on an ancestor shared with other processes, the ratio reads low.
 #[cfg(target_os = "linux")]
 fn current_memory_bytes() -> Option<u64> {
-    cgroup_v2_memory_current()
-        .or_else(cgroup_v1_memory_current)
+    cgroup_v2_working_set()
+        .or_else(cgroup_v1_working_set)
         .or_else(proc_self_rss_bytes)
+}
+
+/// cgroup v2 charge less its freely-reclaimable page cache. An unreadable or
+/// unparseable `memory.stat` subtracts nothing, so the estimate degrades to the
+/// raw charge rather than to an unknown signal.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_working_set() -> Option<u64> {
+    let current = cgroup_v2_memory_current()?;
+    let reclaimable = read_cgroup_file(&CGROUP_V2_MEMORY_STAT_PATH, "memory.stat", true)
+        .as_deref()
+        // All file-backed cache, less the parts the kernel cannot drop without
+        // first doing work: `shmem` (tmpfs pages need swap) and `file_dirty` /
+        // `file_writeback` (writeback must complete first).
+        .and_then(|stat| reclaimable_page_cache(stat, "file", RECLAIM_EXCLUDED_V2))
+        .unwrap_or(0);
+    Some(current.saturating_sub(reclaimable))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v1_working_set() -> Option<u64> {
+    let current = cgroup_v1_memory_current()?;
+    let reclaimable = read_cgroup_file(&CGROUP_V1_MEMORY_STAT_PATH, "memory.stat", false)
+        .as_deref()
+        .and_then(v1_reclaimable_page_cache)
+        .unwrap_or(0);
+    Some(current.saturating_sub(reclaimable))
+}
+
+/// [`reclaimable_page_cache`] for a cgroup v1 `memory.stat`: the `total_*` keys are
+/// the hierarchical tallies matching `memory.usage_in_bytes`, with the unprefixed
+/// keys as the this-cgroup-only fallback for a kernel that omits them.
+#[cfg(target_os = "linux")]
+fn v1_reclaimable_page_cache(contents: &str) -> Option<u64> {
+    reclaimable_page_cache(contents, "total_cache", RECLAIM_EXCLUDED_V1_TOTAL)
+        .or_else(|| reclaimable_page_cache(contents, "cache", RECLAIM_EXCLUDED_V1))
+}
+
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V2: &[&str] = &["shmem", "file_dirty", "file_writeback"];
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V1_TOTAL: &[&str] = &["total_shmem", "total_dirty", "total_writeback"];
+#[cfg(target_os = "linux")]
+const RECLAIM_EXCLUDED_V1: &[&str] = &["shmem", "dirty", "writeback"];
+
+/// Freely-reclaimable page cache from a `memory.stat` body: the `cache_key` total
+/// less the `excluded` keys the kernel cannot drop on demand. Everything the
+/// charge holds beyond this — `anon`, kernel, socket — stays counted as demand.
+///
+/// Built from the totals, never the `*_file` LRU counters: `inactive_file` has
+/// been observed exceeding the `file` total that contains it (issue #12531), so
+/// the kubelet-style `current - inactive_file` working set is not trustworthy
+/// here.
+#[cfg(target_os = "linux")]
+fn reclaimable_page_cache(contents: &str, cache_key: &str, excluded: &[&str]) -> Option<u64> {
+    let cache = parse_cgroup_stat_key(contents, cache_key)?;
+    Some(
+        cache.saturating_sub(
+            excluded
+                .iter()
+                .filter_map(|key| parse_cgroup_stat_key(contents, key))
+                .fold(0, u64::saturating_add),
+        ),
+    )
+}
+
+/// Value for `key` in a cgroup stat body (`"<key> <value>"` per line).
+///
+/// Splits on arbitrary whitespace rather than a single space. The kernel emits one
+/// space today, but a missed key is indistinguishable from an absent one here: the
+/// caller reads `None` as "no reclaimable cache" and falls back to the raw charge —
+/// silently restoring the over-counting this whole path exists to avoid. Being
+/// lenient costs nothing and removes that failure mode.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_stat_key(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse().ok())?
+    })
+}
+
+/// Read a per-cgroup file, resolving and caching its path on first use. `v2`
+/// selects the unified hierarchy; otherwise the v1 `memory` controller.
+#[cfg(target_os = "linux")]
+fn read_cgroup_file(
+    cached_path: &OnceLock<Option<String>>,
+    filename: &'static str,
+    v2: bool,
+) -> Option<String> {
+    let path = cached_path.get_or_init(|| {
+        let (mountpoint, cgroup_path) = if v2 {
+            (
+                cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string()),
+                process_cgroup_v2_path()?,
+            )
+        } else {
+            (
+                cgroup_v1_mountpoint("memory")
+                    .unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string()),
+                process_cgroup_v1_path("memory")?,
+            )
+        };
+        Some(cgroup_file_path(&mountpoint, &cgroup_path, filename))
+    });
+    std::fs::read_to_string(path.as_deref()?).ok()
 }
 
 #[cfg(target_os = "linux")]
 fn cgroup_v2_memory_current() -> Option<u64> {
-    read_u64_file(
-        CGROUP_V2_MEMORY_CURRENT_PATH
-            .get_or_init(resolve_cgroup_v2_memory_current_path)
-            .as_deref()?,
-    )
+    read_cgroup_u64(&CGROUP_V2_MEMORY_CURRENT_PATH, "memory.current", true)
 }
 
 #[cfg(target_os = "linux")]
 fn cgroup_v1_memory_current() -> Option<u64> {
-    read_u64_file(
-        CGROUP_V1_MEMORY_USAGE_PATH
-            .get_or_init(resolve_cgroup_v1_memory_usage_path)
-            .as_deref()?,
-    )
+    read_cgroup_u64(&CGROUP_V1_MEMORY_USAGE_PATH, "memory.usage_in_bytes", false)
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
-    let cgroup_path = process_cgroup_v2_path()?;
-    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-    Some(cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        "memory.current",
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_cgroup_v1_memory_usage_path() -> Option<String> {
-    let cgroup_path = process_cgroup_v1_path("memory")?;
-    let mountpoint =
-        cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-    Some(cgroup_file_path(
-        &mountpoint,
-        &cgroup_path,
-        "memory.usage_in_bytes",
-    ))
+fn read_cgroup_u64(
+    cached_path: &OnceLock<Option<String>>,
+    filename: &'static str,
+    v2: bool,
+) -> Option<u64> {
+    read_cgroup_file(cached_path, filename, v2)?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -610,7 +717,8 @@ fn current_memory_bytes() -> Option<u64> {
     None
 }
 
-/// Sample current memory pressure (cgroup-aware `used / budget`) into `stats`,
+/// Sample current memory pressure (cgroup-aware `used / budget`, where `used` is
+/// the unreclaimable working set — see [`current_memory_bytes`]) into `stats`,
 /// when a budget is installed and usage is readable. Called on the background
 /// tick so the controller can close the loop on memory.
 pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
@@ -626,18 +734,20 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 // ---------------------------------------------------------------------------
 
 /// Sample process-wide CPU busy-fraction into the global [`CPU_PRESSURE_MILLI`]:
-/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), as a delta
-/// busy-fraction `Δusage / (Δwall × cores)`. Needs the previous sample; a too-close
-/// interval (< 0.5 s) is skipped so a double-call can't divide by ~0. Called on the
-/// background tick. Linux-only; elsewhere a no-op (pressure stays unknown → the CPU
-/// rule is inert). Process-global because CPU is shared across all per-table loops.
+/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), divided by the
+/// runtime's CPU *entitlement* rather than the host's core count — on a 4-core
+/// entitlement misread as 18 cores a fully saturated process reports ~0.22, and the
+/// controller then makes CPU-stealing moves believing CPU is idle. Needs the previous
+/// sample; a too-close interval (< 0.5 s) is skipped so a double-call can't divide by
+/// ~0. Called on the background tick. Linux-only; elsewhere a no-op (pressure stays
+/// unknown → the CPU rule is inert). Process-global because CPU is shared across all
+/// per-table loops.
 #[cfg(target_os = "linux")]
 pub(crate) fn sample_cpu_pressure() {
     let Some(now_usage) = cgroup_cpu_usage_usec() else {
         return;
     };
     let now = Instant::now();
-    let cores = cpu_cores_f64();
     let mut prev = CPU_PREV_SAMPLE.lock();
     match *prev {
         Some((prev_usage, prev_at)) => {
@@ -645,9 +755,11 @@ pub(crate) fn sample_cpu_pressure() {
             // Skip samples < 0.5 s apart: a tiny denominator makes the ratio noisy
             // (two ticks can fire close together on a multi-table host). Keep `prev`
             // and wait for a wider window.
-            if wall_secs >= 0.5 && cores > 0.0 {
+            if wall_secs >= 0.5 {
                 let busy_secs = u64_to_f64(now_usage.saturating_sub(prev_usage)) / 1_000_000.0;
-                store_cpu_pressure(busy_secs / (wall_secs * cores));
+                store_cpu_pressure(
+                    cpu_budget::cpu_budget().cpu_busy_fraction(busy_secs, wall_secs),
+                );
                 *prev = Some((now_usage, now));
             }
         }
@@ -672,12 +784,6 @@ fn store_cpu_pressure(frac: f64) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn cpu_cores_f64() -> f64 {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    u64_to_f64(u64::try_from(cores).unwrap_or(1))
-}
-
 /// Cumulative CPU usage in microseconds — cgroup v2 `cpu.stat` `usage_usec`, then
 /// v1 `cpuacct.usage` (nanoseconds → µs). `None` when unreadable.
 #[cfg(target_os = "linux")]
@@ -698,11 +804,7 @@ fn cgroup_cpu_usage_usec() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_cpu_stat_usage_usec(path: &str) -> Option<u64> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    contents.lines().find_map(|line| {
-        line.strip_prefix("usage_usec ")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
+    parse_cgroup_stat_key(&std::fs::read_to_string(path).ok()?, "usage_usec")
 }
 
 #[cfg(target_os = "linux")]
@@ -1561,6 +1663,35 @@ impl Actuator {
             Self::QueryAdmissionReserve => "query_admission_reserve",
         }
     }
+
+    /// Whether RAISING this actuator increases resident bytes. Every such raise
+    /// must be gated on `mem_ok` — growing memory while the memory rule is busy
+    /// shrinking it puts two rules in opposition, and the memory rule is the one
+    /// holding the hard objective.
+    ///
+    /// An exhaustive match rather than a per-rule convention, so a new actuator
+    /// cannot be added without answering the question, and
+    /// `memory_consuming_actuators_are_never_raised_under_pressure` sweeps the
+    /// decider against it. Test-only: it classifies the actuator set for that
+    /// sweep, and the decider's own gating lives in the rules themselves.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn consumes_memory(self) -> bool {
+        match self {
+            // Live buffers, in-flight encode shards, and the compaction output
+            // buffer: each raise is more resident bytes.
+            Self::InlineFlushBytes
+            | Self::MemTierMaxBytes
+            | Self::WriteConcurrency
+            | Self::TargetVortexFileSize => true,
+            // These spend CPU or I/O, not bytes; they carry `cpu_ok` where the
+            // resource they contend for warrants it.
+            Self::CompactionIntervalMs
+            | Self::CompactionTriggerFiles
+            | Self::BakeDeletionIndexTrigger
+            | Self::QueryAdmissionReserve => false,
+        }
+    }
 }
 
 /// A single bounded actuator move with the reason it was made (logged for
@@ -2362,15 +2493,21 @@ pub(crate) fn decide_with_goals(
                     reason: "falling behind: enlarge the in-memory CDC tier (fewer writer-blocking spills)",
                 });
             }
-            // 3. Buffers maxed (or memory tight) and queries are NOT read-amp-bound
-            //    → add encode parallelism. Gated on low read-amp because more shards
-            //    mean more files; ALSO withheld when the stream is delete-heavy,
-            //    where extra shards multiply the per-burst small-file fan-out and
-            //    worsen delete routing off the in-memory tier.
-            // 3. ... Also withheld when CPU-bound (more shards steal query threads)
-            //    or I/O-/publish-bound (more shards = more files, uploads, and
-            //    metastore commits — the slow-storage/EBS bias).
+            // 3. Buffers maxed and queries are NOT read-amp-bound → add encode
+            //    parallelism. Gated on low read-amp because more shards mean more
+            //    files; ALSO withheld when the stream is delete-heavy, where extra
+            //    shards multiply the per-burst small-file fan-out and worsen delete
+            //    routing off the in-memory tier.
+            //    Also withheld when CPU-bound (more shards steal query threads),
+            //    I/O-/publish-bound (more shards = more files, uploads, and
+            //    metastore commits — the slow-storage/EBS bias), and under memory
+            //    pressure: every extra shard is another in-flight encode buffer and
+            //    inline memtable, so this lever buys lag relief with resident bytes
+            //    — near the budget that trade is an OOM kill, not a recovery
+            //    (measured at SF-1000 under a 96 GiB cgroup cap: the tuner raised
+            //    shards at 0.98 pressure and the kernel ended the process).
             if s.read_amp <= READ_AMP_LOW
+                && mem_ok
                 && !mutation_heavy
                 && cpu_ok
                 && !io_bound
@@ -2605,17 +2742,24 @@ fn decide_goal(
         }
         // Grow the target Vortex file size so compaction emits fewer, larger files
         // — better scan throughput and per-file stats, and less file fan-out to
-        // probe per query. No memory/CPU gate: it changes the size of the files the
-        // background compactor already writes, not the write rate.
-        if let Some(v) = clamp_move_i64(
-            cur.target_vortex_file_size_bytes,
-            goal_grow_i64(
+        // probe per query. No CPU gate: it changes the size of the files the
+        // background compactor already writes, not the write rate. It does carry
+        // the same `mem_ok` gate as every other grow move, because a larger target
+        // buffers more encoded bytes per output file — and because the memory rule
+        // above drives the mem-tier cap to its floor, so an ungated raise here
+        // leaves a floor-sized tier feeding a ceiling-sized file target, which
+        // spills on nearly every apply.
+        if mem_ok
+            && let Some(v) = clamp_move_i64(
                 cur.target_vortex_file_size_bytes,
+                goal_grow_i64(
+                    cur.target_vortex_file_size_bytes,
+                    b.target_vortex_file_size_bytes,
+                    query_v,
+                ),
                 b.target_vortex_file_size_bytes,
-                query_v,
-            ),
-            b.target_vortex_file_size_bytes,
-        ) {
+            )
+        {
             return Some(Adjustment {
                 actuator: Actuator::TargetVortexFileSize,
                 new_value: u64::try_from(v).unwrap_or(0),
@@ -2749,8 +2893,13 @@ fn decide_goal(
                 reason: "replication-lag goal: enlarge the in-memory CDC tier (fewer writer-blocking spills)",
             });
         }
+        // Withheld under memory pressure for the same reason as every other
+        // grow move: each extra shard is another in-flight encode buffer and
+        // inline memtable, so near the budget this lever converts a lag
+        // violation into an OOM kill.
         if !query_violated
             && s.read_amp <= READ_AMP_LOW
+            && mem_ok
             && !mutation_heavy
             && cpu_ok
             && !io_bound
@@ -3552,6 +3701,32 @@ mod tests {
     }
 
     #[test]
+    fn memory_pressure_withholds_the_write_concurrency_raise() {
+        // Falling behind with buffers already maxed would normally add encode
+        // parallelism — but every extra shard is more resident bytes, so under
+        // memory pressure the raise must be withheld. Pressure between OK and
+        // HIGH: no shrink tier fires, and the raise must not either. Regression
+        // test for the SF-1000/96G OOMs where shards were raised at 0.98.
+        let s = IngestSnapshot {
+            apply_vs_arrival: 1.5,
+            mem_pressure: Some(f64::midpoint(MEM_PRESSURE_OK, MEM_PRESSURE_HIGH)),
+            ..snap()
+        };
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
+            mem_tier_max_bytes: bounds().mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        if let Some(adj) = decide_fresh(&s, &buffers_maxed, &bounds()) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::WriteConcurrency,
+                "must not add shards (resident bytes) under memory pressure"
+            );
+        }
+    }
+
+    #[test]
     fn memory_pressure_shrinks_memtable_and_overrides_growth() {
         // Even falling behind (which would normally GROW the memtable), high
         // memory pressure forces a SHRINK — memory is the hard constraint.
@@ -4057,6 +4232,269 @@ mod tests {
         );
     }
 
+    /// Current value of `actuator`, as the same `u64` an [`Adjustment`] carries,
+    /// so a move can be classified as a raise or a shrink.
+    fn current_value(cur: &ActuatorValues, actuator: Actuator) -> u64 {
+        match actuator {
+            Actuator::InlineFlushBytes => u64::try_from(cur.inline_flush_max_bytes).unwrap_or(0),
+            Actuator::MemTierMaxBytes => u64::try_from(cur.mem_tier_max_bytes).unwrap_or(0),
+            Actuator::TargetVortexFileSize => {
+                u64::try_from(cur.target_vortex_file_size_bytes).unwrap_or(0)
+            }
+            Actuator::CompactionIntervalMs => cur.compaction_background_interval_ms,
+            Actuator::CompactionTriggerFiles => {
+                u64::try_from(cur.compaction_trigger_files).unwrap_or(0)
+            }
+            Actuator::BakeDeletionIndexTrigger => {
+                u64::try_from(cur.bake_deletion_index_trigger).unwrap_or(0)
+            }
+            Actuator::WriteConcurrency => u64::try_from(cur.write_concurrency).unwrap_or(0),
+            Actuator::QueryAdmissionReserve => {
+                u64::try_from(cur.query_admission_reserve).unwrap_or(0)
+            }
+        }
+    }
+
+    /// The invariant behind [`Actuator::consumes_memory`]: no rule, in either
+    /// ladder, may RAISE a memory-consuming actuator while memory is tight. The
+    /// memory rule holds the hard objective (stay within the budget), so a growth
+    /// rule that ignores it puts two rules in opposition — and the growth rule
+    /// wins whenever it is reached first.
+    ///
+    /// A sweep rather than a per-rule test because both known violations were
+    /// single rules missed in a hand audit: the write-concurrency raise and the
+    /// target-file-size raise, each three lines from a gated sibling. Shrinks are
+    /// expected and allowed — only raises are the violation.
+    ///
+    /// The decider returns at most ONE move per call and the memory rule runs
+    /// first, so the buffers it shrinks are pinned at their floors here: with no
+    /// shrink left to make, the tick falls through to the growth rules that are
+    /// the actual subject. Anything left mid-range would mask them behind a
+    /// shrink. `later_levers_exhausted` walks further still, retiring the
+    /// non-memory levers each ladder reaches before its file-size / shard raises.
+    #[test]
+    fn memory_consuming_actuators_are_never_raised_under_pressure() {
+        let b = bounds();
+        // Memory is the one condition held constant: critically tight.
+        let pressured = |s: IngestSnapshot| IngestSnapshot {
+            mem_pressure: Some(0.95),
+            ..s
+        };
+        let snapshots = [
+            pressured(snap()),
+            // Falling behind: the ingest-speed ladder.
+            pressured(IngestSnapshot {
+                apply_vs_arrival: 3.0,
+                ..snap()
+            }),
+            // Read-amp high: the query-health ladder.
+            pressured(IngestSnapshot {
+                read_amp: 40,
+                ..snap()
+            }),
+            // Bursty arrivals: the durability-buffer pre-grow.
+            pressured(IngestSnapshot {
+                arrival_cv: 2.0,
+                ..snap()
+            }),
+            // I/O and publish cliffs: the decisive-backoff fast path.
+            pressured(IngestSnapshot {
+                io_latency_ms: Some(20.0),
+                io_latency_fast_ms: Some(200.0),
+                publish_latency_ms: Some(20.0),
+                publish_latency_fast_ms: Some(200.0),
+                ..snap()
+            }),
+            // Everything at once, CPU free so no CPU gate masks an ungated raise.
+            pressured(IngestSnapshot {
+                replication_lag_secs: Some(120.0),
+                freshness_secs: Some(120.0),
+                query_latency_p99_ms: Some(500.0),
+                qph: Some(1.0),
+                cpu_pressure: Some(0.1),
+                read_amp: 40,
+                apply_vs_arrival: 3.0,
+                arrival_cv: 2.0,
+                ..snap()
+            }),
+            // Lag violated with every *other* condition permissive — low read-amp,
+            // CPU free, no I/O/publish bound, no query goal competing for the move.
+            // The shard-raise branches sit behind exactly that combination, so
+            // without it the sweep never reaches them.
+            pressured(IngestSnapshot {
+                replication_lag_secs: Some(120.0),
+                apply_vs_arrival: 3.0,
+                cpu_pressure: Some(0.1),
+                read_amp: 1,
+                ..snap()
+            }),
+        ];
+        // The memory buffers sit at their floors so the memory rule has no shrink
+        // to make and the tick reaches the growth rules.
+        let buffers_at_floor = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.0,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.0,
+            ..actuators()
+        };
+        let positions = [
+            buffers_at_floor,
+            // ...and with the CPU/IO levers each ladder tries first also retired,
+            // so the file-size and shard raises beyond them are reachable.
+            ActuatorValues {
+                compaction_background_interval_ms: b.compaction_background_interval_ms.0,
+                compaction_trigger_files: b.compaction_trigger_files.0,
+                bake_deletion_index_trigger: b.bake_deletion_index_trigger.0,
+                // Zero, not the ceiling: a non-zero reserve makes the handback rule
+                // — which runs ahead of the query tier — consume the tick's one move.
+                query_admission_reserve: b.query_admission_reserve.0,
+                write_concurrency: b.write_concurrency.0,
+                ..buffers_at_floor
+            },
+        ];
+        // Each goal alone, then all together: a single-goal tick reaches rules that
+        // an earlier-priority goal would otherwise consume the move for.
+        let window = Duration::from_mins(1);
+        let goal_sets = [
+            Goals::from_targets(Some(5.0), None, None, None, window),
+            Goals::from_targets(None, Some(5.0), None, None, window),
+            Goals::from_targets(None, None, Some(100.0), None, window),
+            Goals::from_targets(None, None, None, Some(10_000.0), window),
+            Goals::from_targets(Some(5.0), Some(5.0), Some(100.0), Some(10_000.0), window),
+        ];
+
+        let mut reached = 0_usize;
+        for s in &snapshots {
+            for cur in &positions {
+                let moves = std::iter::once(("legacy", decide_fresh(s, cur, &b))).chain(
+                    goal_sets
+                        .iter()
+                        .map(|g| ("goal", goal_decide(s, cur, &b, g))),
+                );
+                for (mode, adj) in moves {
+                    let Some(adj) = adj else { continue };
+                    if !adj.actuator.consumes_memory() {
+                        continue;
+                    }
+                    reached += 1;
+                    assert!(
+                        adj.new_value <= current_value(cur, adj.actuator),
+                        "{mode} ladder raised {} from {} to {} at mem_pressure 0.95 (reason: {}) \
+                         — every memory-consuming raise must be gated on `mem_ok`",
+                        adj.actuator.as_str(),
+                        current_value(cur, adj.actuator),
+                        adj.new_value,
+                        adj.reason,
+                    );
+                }
+            }
+        }
+        // Guard against the sweep silently going vacuous: if no combination ever
+        // returns a memory-consuming move, the assertion above proves nothing.
+        assert!(
+            reached > 0,
+            "the sweep never reached a memory-consuming actuator — it is no longer testing anything"
+        );
+    }
+
+    /// Regression test for #12531: the memory signal must not count the page
+    /// cache the table's own Vortex writes leave behind. Numbers are the live
+    /// cgroup accounting captured from a CH-benCHmark SF-1000 runner mid-run —
+    /// 215.6 GiB charged against a 256 GiB limit (ratio 0.842, already past
+    /// `MEM_PRESSURE_OK` and reaching CRITICAL under load — 19% of the run's
+    /// samples, median 0.951) while unreclaimable demand was 152.5 GiB (0.596)
+    /// and the kernel reported 50 µs of reclaim stall over the whole run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn working_set_excludes_reclaimable_page_cache() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let stat = "anon 163775418368\n\
+                    file 65558777856\n\
+                    kernel 2179072000\n\
+                    shmem 0\n\
+                    file_dirty 9480785920\n\
+                    file_writeback 0\n\
+                    inactive_file 208657100800\n\
+                    active_anon 20272680960\n";
+        let current = 231_513_268_224_u64; // 215.6 GiB
+        let limit = 256 * GIB;
+
+        let reclaimable = reclaimable_page_cache(stat, "file", RECLAIM_EXCLUDED_V2)
+            .expect("memory.stat carries `file`");
+        // Only the clean, non-tmpfs page cache: `file` less dirty/writeback/shmem.
+        assert_eq!(reclaimable, 65_558_777_856 - 9_480_785_920);
+
+        let pressure = u64_to_f64(current.saturating_sub(reclaimable)) / u64_to_f64(limit);
+        assert!(
+            pressure < MEM_PRESSURE_OK,
+            "unreclaimable demand must read as headroom, got {pressure}"
+        );
+        // The raw charge is what used to drive the collapse.
+        assert!(u64_to_f64(current) / u64_to_f64(limit) > MEM_PRESSURE_OK);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reclaimable_page_cache_parsing_edge_cases() {
+        // v2: `shmem` (needs swap) and in-flight writeback are demand, not cache.
+        assert_eq!(
+            reclaimable_page_cache(
+                "file 1000\nshmem 200\nfile_writeback 300\n",
+                "file",
+                RECLAIM_EXCLUDED_V2
+            ),
+            Some(500)
+        );
+        // Counters that do not reconcile can never inflate the subtraction.
+        assert_eq!(
+            reclaimable_page_cache("file 100\nshmem 900\n", "file", RECLAIM_EXCLUDED_V2),
+            Some(0)
+        );
+        // No `file` key at all: unknown, so the caller keeps the raw charge.
+        assert_eq!(
+            reclaimable_page_cache("anon 100\n", "file", RECLAIM_EXCLUDED_V2),
+            None
+        );
+        // v1 prefers the hierarchical `total_*` tallies...
+        assert_eq!(
+            v1_reclaimable_page_cache(
+                "cache 10\ntotal_cache 1000\ntotal_shmem 100\ntotal_dirty 50\n"
+            ),
+            Some(850)
+        );
+        // ...and falls back to the this-cgroup-only keys when they are absent.
+        assert_eq!(
+            v1_reclaimable_page_cache("cache 1000\nshmem 100\nwriteback 50\n"),
+            Some(850)
+        );
+    }
+
+    /// Whitespace tolerance in [`parse_cgroup_stat_key`]. The kernel emits a single
+    /// space, but a key missed on a formatting difference reads as "no reclaimable
+    /// cache", which silently restores the raw-charge over-counting — so parse
+    /// leniently rather than relying on the emitted format.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_key_parsing_tolerates_whitespace() {
+        for body in [
+            "file 1000\n",
+            "  file   1000  \n",
+            "file\t1000\n",
+            "anon 5\nfile 1000\nshmem 0\n",
+        ] {
+            assert_eq!(
+                parse_cgroup_stat_key(body, "file"),
+                Some(1000),
+                "failed to parse {body:?}"
+            );
+        }
+        // A key that only appears as a *prefix* of another must not match.
+        assert_eq!(parse_cgroup_stat_key("file_dirty 7\n", "file"), None);
+        // Absent, empty, and value-less lines are all "unknown", never 0.
+        assert_eq!(parse_cgroup_stat_key("anon 1\n", "file"), None);
+        assert_eq!(parse_cgroup_stat_key("\n\n", "file"), None);
+        assert_eq!(parse_cgroup_stat_key("file\n", "file"), None);
+    }
+
     // ---- goal-driven controller ------------------------------------------
 
     /// `decide_with_goals` past the (goal) dwell and warmup, fresh-sample gate open.
@@ -4071,6 +4509,33 @@ mod tests {
 
     fn lag_goal(target_secs: f64) -> Goals {
         Goals::from_targets(Some(target_secs), None, None, None, Duration::from_mins(1))
+    }
+
+    #[test]
+    fn goal_path_withholds_write_concurrency_raise_under_memory_pressure() {
+        // Replication-lag goal violated, buffers maxed, CPU/IO/read-amp all
+        // permissive — the one blocking condition is memory pressure between
+        // OK and HIGH. The goal path must withhold the shard raise exactly
+        // like the legacy ladder does. Regression test for the SF-1000/96G
+        // OOMs where the lag goal raised write concurrency at 0.98 pressure.
+        let s = IngestSnapshot {
+            replication_lag_secs: Some(120.0),
+            apply_vs_arrival: 1.5,
+            mem_pressure: Some(f64::midpoint(MEM_PRESSURE_OK, MEM_PRESSURE_HIGH)),
+            ..snap()
+        };
+        let buffers_maxed = ActuatorValues {
+            inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
+            mem_tier_max_bytes: bounds().mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        if let Some(adj) = goal_decide(&s, &buffers_maxed, &bounds(), &lag_goal(5.0)) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::WriteConcurrency,
+                "the lag goal must not add shards (resident bytes) under memory pressure"
+            );
+        }
     }
 
     #[test]
@@ -4186,6 +4651,36 @@ mod tests {
             adj.new_value < 8,
             "latency goal sheds a shard, never grows one"
         );
+    }
+
+    #[test]
+    fn query_latency_goal_withholds_target_file_size_growth_under_memory_pressure() {
+        // Same setup as the growth test below, but memory is tight. The memory
+        // rule drives the mem-tier cap to its floor, so growing the file target
+        // here would leave a floor-sized tier feeding a ceiling-sized target and
+        // spill on nearly every apply (issue #12531: 24 spills, 465 s of a 908 s
+        // window on `order_line`).
+        let s = IngestSnapshot {
+            query_latency_p99_ms: Some(500.0),
+            read_amp: 2,
+            mem_pressure: Some(0.95),
+            ..snap()
+        };
+        let goals = Goals::from_targets(None, None, Some(100.0), None, Duration::from_mins(1));
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: 128 * 1024 * 1024,
+            compaction_background_interval_ms: 2_000,
+            compaction_trigger_files: 2,
+            target_vortex_file_size_bytes: 256 * 1024 * 1024,
+            ..actuators()
+        };
+        if let Some(adj) = goal_decide(&s, &cur, &bounds(), &goals) {
+            assert_ne!(
+                adj.actuator,
+                Actuator::TargetVortexFileSize,
+                "the query goal must not grow the file target while memory is tight"
+            );
+        }
     }
 
     #[test]

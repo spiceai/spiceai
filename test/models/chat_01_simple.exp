@@ -1,14 +1,16 @@
 #!/usr/bin/expect -f
 
+source [file join [file dirname [info script]] repl_helpers.exp]
+
 # Runtime response timeout
 set timeout 30
 
-spawn spice chat
+spawn spice chat {*}[repl_endpoint_args]
 
 proc chat {message}  {
     global timeout
 
-    send "$message\r"
+    repl_send "$message\r"
 
     expect {
         " ERROR " {
@@ -21,8 +23,7 @@ proc chat {message}  {
             # end of model response
         }
         eof {
-            send_user "Chat process exited before returning a response\n"
-            exit 1
+            repl_died "Waiting for the response to \"$message\""
         }
         timeout {
             send_user "Timeout waiting for expected response\n"
@@ -39,8 +40,7 @@ proc chat {message}  {
 expect {
     "chat> " {}
     eof {
-        send_user "Chat process exited before showing the initial prompt\n"
-        exit 1
+        repl_died "Waiting for the initial chat prompt"
     }
     timeout {
         send_user "Timeout waiting for initial chat prompt\n"
@@ -52,7 +52,10 @@ chat "What datasets you have access to?"
 
 chat "How many issues stored in database?"
 
+# Every verification passed, so the REPL must still be sitting at its prompt.
+repl_assert_running "Checking the chat REPL is still running"
+
 # Signal to exit (Ctrl+C)
-send \x03
+repl_send \x03
 
 exit 0

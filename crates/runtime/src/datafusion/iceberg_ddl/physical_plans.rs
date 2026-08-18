@@ -36,7 +36,7 @@ use iceberg_datafusion::IcebergTableProvider;
 use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use data_components::RefreshableCatalogProvider;
@@ -132,6 +132,16 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
 
     fn name(&self) -> &TableReference {
         &self.name
+    }
+
+    fn connector_name(&self) -> Option<&str> {
+        // A table created by Iceberg DDL has no `from:` — it is reached through the
+        // Iceberg catalog, and no `DataConnector` resolves its refresh mode. So no
+        // connector default applies, and `None` resolves to `full`, matching what
+        // this DDL path itself does with an unset mode (see
+        // `runtime_accel.refresh_mode.unwrap_or(RefreshMode::Full)` in
+        // `create_accelerated_iceberg_table`).
+        None
     }
 
     fn time_column(&self) -> Option<&str> {
@@ -546,15 +556,18 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             "Table '{table_name}' already exists and acceleration was registered"
                         );
                     } else {
+                        let inner = provider;
                         let deletion_provider =
                             data_components::iceberg::delete::IcebergDeletionProvider::new(
                                 Arc::clone(&catalog),
                                 namespace.clone(),
                                 table_name.clone(),
-                                provider,
+                                Arc::clone(&inner),
                             );
-                        schema_provider
-                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
+                        schema_provider.register_table(
+                            table_name.clone(),
+                            spice_table::SpiceTable::over(Arc::new(deletion_provider), inner),
+                        )?;
                         message = format!("Table '{table_name}' already exists");
                     }
 
@@ -625,10 +638,10 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             Arc::clone(&catalog),
                             namespace.clone(),
                             table_name.clone(),
-                            raw_provider,
+                            Arc::clone(&raw_provider),
                         );
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(deletion_provider);
+                        spice_table::SpiceTable::over(Arc::new(deletion_provider), raw_provider);
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };
@@ -753,10 +766,10 @@ async fn create_accelerated_iceberg_table(
     dataset_name: TableReference,
     partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
-    use crate::accelerated_table::refresh::Refresh;
+    use crate::accelerated::refresh::Refresh;
     use crate::component::dataset::TimeFormat;
     use crate::component::dataset::acceleration::RefreshMode;
-    use crate::federated_table::FederatedTable;
+    use crate::federated::FederatedTable;
 
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(
@@ -910,7 +923,8 @@ async fn build_registered_provider(
     )
     .await?;
 
-    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(accelerated);
+    let provider: Arc<dyn datafusion::datasource::TableProvider> =
+        Arc::new(accelerated).into_table();
 
     Ok(provider)
 }

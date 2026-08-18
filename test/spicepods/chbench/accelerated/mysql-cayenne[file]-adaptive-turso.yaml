@@ -32,6 +32,9 @@ name: mysql-cayenne[file]-adaptive-turso
 # sql_results / task_history stay off to match the baseline, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
 
+# All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
+# (server_id derived from the connection identity - the engine default). The
+# -split variant pins distinct per-dataset server_ids for separate dumps.
 mysql_connection_params: &mysql_params
   mysql_host: ${env:CHBENCH_MYSQL_HOST}
   mysql_tcp_port: 3306
@@ -70,8 +73,7 @@ datasets:
     name: warehouse
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1001'
+      mysql_replication_initial_snapshot: auto
     acceleration: &cayenne_accel
       enabled: true
       engine: cayenne
@@ -83,6 +85,10 @@ datasets:
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
         cayenne_cdc_mem_tier_shards: '4'
+        cdc_prefetch_buffer: '16384'
+        cdc_max_coalesced_envelopes: '16384'
+        cdc_max_coalesced_bytes: '536870912'
+        cdc_max_coalesce_age_ms: '2000'
         # The only line that differs from the sqlite-default adaptive twin: select the Turso
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.
@@ -96,48 +102,42 @@ datasets:
     name: district
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1002'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:customer
     name: customer
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1003'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:new_order
     name: new_order
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1004'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:oorder
     name: oorder
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1005'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:order_line
     name: order_line
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1006'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   - from: mysql:stock
     name: stock
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
-      mysql_replication_server_id: '1007'
+      mysql_replication_initial_snapshot: auto
     acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----

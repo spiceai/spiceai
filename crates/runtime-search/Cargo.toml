@@ -9,6 +9,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+cpu-budget = { path = "../cpu-budget" }
+linkme.workspace = true
+runtime-udfs-api = { path = "../runtime-udfs-api" }
 app = { path = "../app" }
 arrow.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
@@ -23,19 +26,27 @@ datafusion.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-expr.workspace = true
 datafusion-functions-json = { workspace = true }
+duration-parse = { workspace = true, optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
+fundu = { workspace = true, optional = true }
 futures.workspace = true
 itertools.workspace = true
 llms = { path = "../llms", default-features = false }
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-request-context = { path = "../runtime-request-context" }
 schemars.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 search = { path = "../search", default-features = false, features = ["text_search"] }
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 spicepod = { path = "../spicepod" }
 rayon = { workspace = true }
 moka.workspace = true
@@ -49,13 +60,14 @@ tracing.workspace = true
 [features]
 default = []
 duckdb = ["search/duckdb"]
-elasticsearch = ["search/elasticsearch"]
+elasticsearch = ["search/elasticsearch", "dep:elasticsearch", "dep:duration-parse"]
 models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]
-s3_vectors = ["search/s3_vectors"]
+s3_vectors = ["search/s3_vectors", "dep:fundu"]
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"] }
+runtime-secrets = { path = "../runtime-secrets" }
 
 [lints]
 workspace = true

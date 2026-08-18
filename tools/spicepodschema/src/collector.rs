@@ -22,10 +22,9 @@ limitations under the License.
 
 use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
 use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, xai,
-};
+use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
+use spicepod::component::model::ModelSource;
 
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
@@ -34,6 +33,7 @@ use connector_clickhouse as _;
 use connector_delta_lake as _;
 use connector_dremio as _;
 use connector_duckdb as _;
+use connector_dynamodb as _;
 use connector_flightsql as _;
 use connector_ftp as _;
 use connector_graphql as _;
@@ -45,6 +45,15 @@ use connector_mysql as _;
 use connector_oracle as _;
 // #[expect(unused_imports)]
 // use runtime::dataconnector::odbc as _;
+use connector_abfs as _;
+use connector_cosmosdb as _;
+use connector_databricks as _;
+use connector_ducklake as _;
+use connector_elasticsearch as _;
+use connector_gcs as _;
+use connector_git as _;
+use connector_github as _;
+use connector_glue as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -52,6 +61,7 @@ use connector_sharepoint as _;
 use connector_smb as _;
 use connector_snowflake as _;
 use connector_spark as _;
+use connector_spiceai as _;
 #[expect(unused_imports)]
 use runtime::dataconnector::s3 as _;
 #[expect(unused_imports)]
@@ -198,56 +208,87 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
 
 /// Collects schema information from all model sources.
 ///
-/// Model sources define their parameters in `crates/runtime/src/model/params/`.
-/// This function enumerates them directly to avoid adding schema-generation-only
-/// code to the runtime.
+/// Model sources define their parameters as `#[derive(TypedParams)]` structs in
+/// `crates/runtime/src/model/params/`; `get_params_spec` regenerates the
+/// `ParameterSpec` list from each struct, keeping the struct the single source
+/// of truth for both runtime deserialization and schema.
 #[must_use]
 pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
             prefix: "openai",
-            parameters: openai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
             prefix: "azure",
-            parameters: azure::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
             prefix: "file",
-            parameters: file::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
             prefix: "databricks",
-            parameters: databricks::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
             prefix: "huggingface",
-            parameters: huggingface::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
             prefix: "anthropic",
-            parameters: anthropic::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
             prefix: "xai",
-            parameters: xai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
             prefix: "bedrock",
-            parameters: bedrock::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
             prefix: "google",
-            parameters: google::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Google),
+        },
+        ModelSourceSchema {
+            name: "spiceai",
+            prefix: "spiceai",
+            parameters: get_params_spec(&ModelSource::SpiceAI),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot-check drift guard: connectors that self-register into the `linkme` slice must appear
+    /// in the generated schema. This catches a broken force-linkage (`use connector_* as _;` in
+    /// this module) or a connector silently dropping out of `.schema/spicepod.schema.json`. The
+    /// sampled connectors span always-linked and feature-gated `connector-*` crates that register
+    /// via `register_data_connector!`; extend the list as more connectors adopt the pattern.
+    #[test]
+    fn documents_slice_registered_connectors() {
+        let names: Vec<String> = collect_data_connectors()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(!names.is_empty(), "no data connectors were collected");
+        for expected in ["dynamodb", "postgres", "clickhouse", "mysql", "graphql"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "connector '{expected}' missing from the generated schema; collected: {names:?}"
+            );
+        }
+    }
 }

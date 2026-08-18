@@ -722,6 +722,27 @@ pub trait MetastoreBackend: Send + Sync {
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         Ok(())
     }
+
+    /// Reclaim a bounded number of freelist pages off the hot path, returning
+    /// how many were reclaimed.
+    ///
+    /// Only meaningful for a backend whose file keeps freed pages on a freelist
+    /// AND has been created in an incremental auto-vacuum mode; the default
+    /// implementation reclaims nothing, which is also the correct answer for a
+    /// database in the default (non-reclaiming) mode — there, freed pages are
+    /// reused for new inserts and the file plateaus at its high-water mark.
+    ///
+    /// Bounded per call by design: reclamation relocates pages under the write
+    /// lock, so an unbounded pass over a large freelist would stall writers for
+    /// as long as it took. Callers run this on the background maintenance tick,
+    /// never inside a hot commit, and let successive ticks converge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reclamation statement fails.
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        Ok(0)
+    }
 }
 
 #[cfg(test)]

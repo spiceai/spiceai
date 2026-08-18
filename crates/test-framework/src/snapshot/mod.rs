@@ -25,6 +25,51 @@ pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
+/// Redact the per-environment connection context that federated connectors embed
+/// in their physical plan (`VirtualExecutionPlan … compute_context=host=…`). The
+/// host/port/db/user string is connection metadata, not plan structure, so leaving
+/// it in the snapshot makes the explain check pass only against the exact endpoint
+/// the snapshot was captured on. Normalizing it to a constant token lets identical
+/// plans compare equal regardless of which host/db they ran against.
+///
+/// `,port=\d+` anchors the match, and each field forbids spaces (`[^, ]+`) so the
+/// match cannot run past the connection context into the pushed-down SQL — critical
+/// because a trailing field such as `user=root` is followed only by a space before
+/// `base_sql=`, and that SQL may contain no comma to otherwise stop a greedy match.
+/// `db`/`user` and the trailing comma are optional to cover connectors that omit
+/// fields (e.g. `MySQL` has no trailing comma, `PostgreSQL` renders `host=Tcp("…")`
+/// and a trailing comma).
+const CONNECTION_CONTEXT_FILTER_PATTERN: &str =
+    r"compute_context=host=[^, ]+,port=\d+(?:,db=[^, ]+)?(?:,user=[^, ]+)?,?";
+const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION>";
+
+/// The same normalization for connectors that render their compute context as an
+/// endpoint URL rather than `host=…,port=…`, which the pattern above cannot match:
+///
+/// - Dremio — `url=grpc://<host>:<port>,username=<user>`
+/// - Spark Connect — `sc://<host>:<port>/;user_id=<user>;x-databricks-cluster-id=…`
+/// - Spice Cloud — `url=https://<host>,username=…,org=…,app=…`
+///
+/// Each of these embeds a host, a port, and often a username or workspace/cluster
+/// identifier, so an otherwise-identical plan compares unequal across environments —
+/// a renamed service, a different workspace, or a dev versus prod endpoint. None of
+/// them contains whitespace, and every one is followed by a space before the next
+/// plan field (`base_sql=`), so matching a non-whitespace run is bounded by the field
+/// itself and cannot reach into the pushed-down SQL.
+const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
+const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
+
+/// Redact the scan counters `CayenneAccelerationExec` surfaces in its plan display.
+/// `snapshots_scanned`/`files_scanned` report read amplification, which depends on
+/// ingestion batching and how far compaction has progressed when the query runs —
+/// state that varies run to run, not plan structure. Left in the snapshot, the
+/// explain check fails whenever the accelerator happens to hold a different file
+/// count (e.g. `files_scanned=30` vs `=35`) even though the plan is identical.
+const CAYENNE_SCAN_COUNTERS_FILTER_PATTERN: &str =
+    r"CayenneAccelerationExec: snapshots_scanned=\d+, files_scanned=\d+";
+const CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT: &str =
+    "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
@@ -44,6 +89,18 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
         (path_filter_pattern, "/data"),
         (CAYENNE_PATH_FILTER_PATTERN.to_string(), CAYENNE_PATH_FILTER_REPLACEMENT),
         (VORTEX_RANGE_FILTER_PATTERN.to_string(), VORTEX_RANGE_FILTER_REPLACEMENT),
+        (
+            CONNECTION_CONTEXT_FILTER_PATTERN.to_string(),
+            CONNECTION_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
+            ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
+        ),
+        (
+            CAYENNE_SCAN_COUNTERS_FILTER_PATTERN.to_string(),
+            CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT,
+        ),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
         (r"file_groups=\{(\d+ groups?): [^}]+\}".to_string(), "file_groups={$1: [<redacted>]}"),
@@ -427,6 +484,115 @@ mod tests {
 
         let result = super::sort_partitioned_union_children(input);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_connection_context_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::CONNECTION_CONTEXT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::CONNECTION_CONTEXT_FILTER_REPLACEMENT;
+
+        // PostgreSQL: host wrapped in Tcp("…") with a trailing comma before base_sql.
+        let input = r#"VirtualExecutionPlan name=postgres compute_context=host=Tcp("benchmarking-postgres-rw.dataplatform.svc.cluster.local"),port=5432,db=tpch_accelerated,user=postgres, base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        let expected = r#"VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A different PostgreSQL host/db must redact to the identical token.
+        let input = r#"VirtualExecutionPlan name=postgres compute_context=host=Tcp("localhost"),port=5433,db=tpch,user=alice, base_sql=SELECT "l_orderkey" FROM "lineitem""#;
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // MySQL: bare host, no trailing comma before base_sql.
+        let input = "VirtualExecutionPlan name=mysql compute_context=host=benchmark-mysql.dataplatform.svc.cluster.local,port=3306,db=tpch_sf1,user=root base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=mysql compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input =
+            "VirtualExecutionPlan name=postgres compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // The anchor `,port=\d+` prevents the greedy host match from consuming the
+        // pushed-down SQL when there is no connection context to redact.
+        let input = "DuckSqlExec compute_context=./data/tpch.db sql=SELECT a, b FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_endpoint_context_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::ENDPOINT_CONTEXT_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::ENDPOINT_CONTEXT_FILTER_REPLACEMENT;
+
+        // Dremio: grpc URL plus a username, comma-separated.
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://dremio-client.example.internal:32010,username=bench base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        let expected = "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A different Dremio endpoint and user must redact to the identical token.
+        let input = "VirtualExecutionPlan name=dremio compute_context=url=grpc://localhost:32010,username=dev base_sql=SELECT \"l_orderkey\" FROM \"lineitem\"";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Spark Connect: `sc://` with a user_id and cluster id, semicolon-separated.
+        let input = "VirtualExecutionPlan name=spark compute_context=sc://dbc-workspace.example.invalid:443/;user_id=svc-account;x-databricks-cluster-id=0000-000000-abcdefgh;use_ssl=true base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        let expected = "VirtualExecutionPlan name=spark compute_context=<CONNECTION> base_sql=SELECT `l_orderkey` FROM `lineitem`";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Spice Cloud: https URL with org and app.
+        let input = "VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username=,org=spiceai,app=benchmark base_sql=SELECT 1";
+        let expected =
+            "VirtualExecutionPlan name=spiceai compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input =
+            "VirtualExecutionPlan name=dremio compute_context=<CONNECTION> base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // Local compute contexts carry no endpoint and must not be redacted.
+        let input = "DuckSqlExec compute_context=./data/tpch.db sql=SELECT a, b FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+        let input = "SqliteExec compute_context=:memory: sql=SELECT a FROM t";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // The `host=` form stays the other pattern's job; this one must not half-match
+        // it and leave a partially-redacted context behind.
+        let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cayenne_scan_counters_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::CAYENNE_SCAN_COUNTERS_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT;
+
+        // Different file counts must redact to the identical token.
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=30   |";
+        let expected = "|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=35   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A not-yet-refreshed accelerator reports zero for both counters.
+        let input = "CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0";
+        let expected = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // Other operators' counters are not this filter's job.
+        let input =
+            "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
     }
 
     #[test]

@@ -37,11 +37,25 @@ impl CachingEngineSys {
         })
     }
 
-    pub fn update_fetched_at(&self) -> Result<()> {
+    #[cfg_attr(
+        not(feature = "duckdb"),
+        expect(
+            clippy::unused_async,
+            reason = "async only when the DuckDB accelerator is compiled in; every other arm errors immediately"
+        )
+    )]
+    pub async fn update_fetched_at(&self) -> Result<()> {
         #[cfg(feature = "duckdb")]
         {
             match &self.acceleration_connection {
-                AccelerationConnection::DuckDB(pool) => self.update_fetched_at_duckdb(pool),
+                AccelerationConnection::DuckDB(pool) => {
+                    let pool = std::sync::Arc::clone(pool);
+                    let dataset_name = self.dataset_name.clone();
+                    super::spawn_duckdb_blocking(move || {
+                        Self::update_fetched_at_duckdb(&dataset_name, &pool)
+                    })
+                    .await
+                }
                 #[cfg(feature = "postgres-accel")]
                 AccelerationConnection::Postgres(_) => Err(Error::NoAccelerationConnection),
                 #[cfg(feature = "sqlite")]

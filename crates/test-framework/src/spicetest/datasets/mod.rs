@@ -71,10 +71,13 @@ pub struct NotStarted {
     validate: bool,
     scale_factor: f64,
     query_executor: Option<Box<dyn crate::execution::QueryExecutor>>,
+    query_executors: Vec<Box<dyn crate::execution::QueryExecutor>>,
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     reference_schema: Option<String>,
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     query_duration_threshold: Option<Duration>,
+    /// Fleet-wide target query issue rate. `0.0` (the default) runs closed-loop.
+    target_qps: f64,
     query_set_type: Option<QuerySet>,
     query_overrides: Option<QueryOverrides>,
 }
@@ -89,10 +92,13 @@ impl Default for NotStarted {
             validate: false,
             scale_factor: 1.0,
             query_executor: None,
+            query_executors: Vec::new(),
             validation_data: None,
             reference_schema: None,
             streaming_metrics_sender: None,
             query_duration_threshold: None,
+            // 0.0 = closed-loop, the historical behaviour.
+            target_qps: 0.0,
             query_set_type: None,
             query_overrides: None,
         }
@@ -111,6 +117,23 @@ impl NotStarted {
         executor: Box<dyn crate::execution::QueryExecutor>,
     ) -> Self {
         self.query_executor = Some(executor);
+        self
+    }
+
+    /// Provide one executor per worker so each concurrent client drives its own
+    /// connection, instead of every worker multiplexing over clones of the
+    /// single [`with_query_executor`] executor (which share one Flight
+    /// channel). Workers are assigned executors round-robin when
+    /// `parallel_count` exceeds the number provided. Takes precedence over
+    /// [`with_query_executor`] for worker assignment when non-empty.
+    ///
+    /// [`with_query_executor`]: Self::with_query_executor
+    #[must_use]
+    pub fn with_query_executors(
+        mut self,
+        executors: Vec<Box<dyn crate::execution::QueryExecutor>>,
+    ) -> Self {
+        self.query_executors = executors;
         self
     }
 
@@ -136,6 +159,15 @@ impl NotStarted {
     #[must_use]
     pub fn with_validate(mut self, validate: bool) -> Self {
         self.validate = validate;
+        self
+    }
+
+    /// Pin the aggregate query issue rate, so two builds under comparison do
+    /// identical work and the difference lands in latency rather than in
+    /// throughput. `0.0` keeps the closed-loop behaviour.
+    #[must_use]
+    pub fn with_target_qps(mut self, target_qps: f64) -> Self {
+        self.target_qps = target_qps;
         self
     }
 
@@ -248,12 +280,14 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        // Ensure executor is configured
-        let executor = self
-            .state
-            .query_executor
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Query executor not configured"))?;
+        // Ensure an executor is configured. Per-worker executors (when
+        // provided) win for worker assignment; the shared executor remains the
+        // fallback so existing callers are unaffected.
+        let shared_executor = self.state.query_executor.take();
+        let per_worker_executors = std::mem::take(&mut self.state.query_executors);
+        if shared_executor.is_none() && per_worker_executors.is_empty() {
+            return Err(anyhow::anyhow!("Query executor not configured"));
+        }
 
         let multi = if self.use_progress_bars {
             Some(MultiProgress::new())
@@ -278,14 +312,25 @@ impl SpiceTest<NotStarted> {
             })
             .unwrap_or_default();
 
+        // ONE pacer shared by every worker: the target is a fleet-wide issue
+        // rate, not a per-worker one.
+        let pacer = crate::spicetest::pacer::QueryPacer::new(self.state.target_qps);
+
         let mut query_workers = Vec::new();
         for id in 0..self.state.parallel_count {
+            let worker_executor = if per_worker_executors.is_empty() {
+                shared_executor
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Query executor not configured"))?
+            } else {
+                per_worker_executors[id % per_worker_executors.len()].clone()
+            };
             let mut worker = SpiceTestQueryWorker::new(
                 id,
                 self.state.query_set.clone(),
                 self.state.end_condition,
                 self.name.clone(),
-                executor.clone(),
+                worker_executor,
             )
             .with_explain_plan_snapshot(self.explain_plan_snapshot)
             .with_results_snapshot(self.results_snapshot_predicate)
@@ -293,7 +338,8 @@ impl SpiceTest<NotStarted> {
             .with_scale_factor(self.state.scale_factor)
             .with_shutdown_token(shutdown_token.clone())
             .with_skip_row_count_validation(row_count_validation_skip_queries.clone())
-            .with_validate_row_count(self.validate_row_count);
+            .with_validate_row_count(self.validate_row_count)
+            .with_pacer(pacer.clone());
 
             if let Some(multi) = &multi {
                 worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
@@ -454,10 +500,12 @@ impl SpiceTest<Completed> {
 
     pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
         // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
-        let lhs = self.state.parallel_count * self.state.query_count * 3600;
-
-        // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
-        let lhs = f64::from(u32::try_from(lhs)?);
+        // Computed in f64: a u32 intermediate overflows once parallel_count
+        // reaches ~12k on a 99-query set (connection-pool simulations run tens
+        // of thousands of clients), while every realistic factor here stays
+        // well inside f64's 2^53 exact-integer range.
+        #[expect(clippy::cast_precision_loss)]
+        let lhs = (self.state.parallel_count as f64) * (self.state.query_count as f64) * 3600.0;
 
         // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
         // apply a modifier based on the query set count
@@ -624,5 +672,42 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
                 )
             })
             .collect::<Result<Vec<_>>>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn throughput_metric_survives_pool_scale_client_counts() {
+        // 12,800 clients x 99 queries x 3600 exceeds u32::MAX; the metric must
+        // compute rather than error for connection-pool-scale runs.
+        let test = SpiceTest {
+            name: "pool-scale".to_string(),
+            spiced_instance: None,
+            start_time: SystemTime::now(),
+            use_progress_bars: false,
+            api_key: None,
+            explain_plan_snapshot: false,
+            results_snapshot_predicate: None,
+            validate_row_count: true,
+            state: Completed {
+                query_durations: BTreeMap::new(),
+                query_iteration_durations: BTreeMap::new(),
+                row_counts: BTreeMap::new(),
+                query_statuses: BTreeMap::new(),
+                test_duration: Duration::from_hours(1),
+                end_time: SystemTime::now(),
+                query_count: 99,
+                parallel_count: 12_800,
+                end_condition: EndCondition::QuerySetCompleted(1),
+            },
+        };
+        let metric = test
+            .get_throughput_metric(1.0)
+            .expect("metric computes at pool scale");
+        // 12,800 * 99 * 3600 / 3600s * scale 1 * set count 1
+        assert!((metric - 1_267_200.0).abs() < f64::EPSILON);
     }
 }

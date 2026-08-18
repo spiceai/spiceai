@@ -41,7 +41,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, sql::TableReference};
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 
 /// A vector index that scores rows in-table via Spice's SIMD similarity UDFs.
 ///
@@ -113,6 +113,18 @@ impl Index for NativeVectorIndex {
         // No augmentation needed — the embedding column is already in the underlying
         // table, written through the normal accelerator sink.
         Ok(batches)
+    }
+
+    // Co-located: the embedding lives in the accelerated table row itself, so it disappears
+    // for free when the accelerator deletes the row — `delete_by_keys` stays the default no-op.
+    // Override `resolve_delete_keys` too so a delete doesn't pay for a pointless resolve scan.
+    async fn resolve_delete_keys(
+        &self,
+        _table: &std::sync::Arc<dyn datafusion::catalog::TableProvider>,
+        _session: &dyn datafusion::catalog::Session,
+        _filters: Vec<datafusion::prelude::Expr>,
+    ) -> Result<Option<RecordBatch>, DataFusionError> {
+        Ok(None)
     }
 
     fn as_any(&self) -> &dyn Any {

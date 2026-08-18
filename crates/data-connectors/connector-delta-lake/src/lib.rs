@@ -21,13 +21,13 @@ use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::listing::build_table_parquet_options;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::ExposeSecret;
 use std::any::Any;
 use std::future::Future;
@@ -154,7 +154,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let parquet_opts = build_table_parquet_options(params.runtime.as_deref()).await?;
+            let parquet_opts = build_table_parquet_options(params.app().as_ref())?;
 
             tracing::debug!(
                 ?parquet_opts,
@@ -182,7 +182,7 @@ impl DataConnector for DeltaLake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.delta_table_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),
@@ -205,7 +205,7 @@ impl DataConnector for DeltaLake {
     /// buckets outside `us-east-1`.
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         let storage_location = dataset.path();
@@ -302,7 +302,7 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::secrets::Secrets;
+    use runtime_secrets::Secrets;
     use secrecy::SecretString;
     use tokio::sync::RwLock;
 
@@ -343,3 +343,13 @@ mod tests {
         assert_eq!(tenant_id, Some("tenant-id"));
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_delta_lake as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_delta_lake_connector,
+    DELTA_LAKE_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    DeltaLakeFactory
+);

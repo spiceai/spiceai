@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `postgres_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Fall back to sensible per-replica defaults for slot & publication names.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
@@ -26,19 +26,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
+    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime::federated_table::FederatedTable;
-use runtime::parameters::{ExposedParamLookup, Parameters};
+use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
 // Standby status feedback cadence. Kept well below Postgres's default
@@ -49,16 +52,127 @@ use secrecy::SecretString;
 const DEFAULT_STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_BOOTSTRAP_BATCH_SIZE: usize = 8192;
 const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
-// Upper bound on the configurable shared-slot member channel capacity. Matches
+// Upper bound on the configurable shared-slot member mailbox capacity. Matches
 // the bootstrap-batch ceiling — a bounded, backpressure-preserving queue in
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
+/// Sidecar table, in the dataset's own accelerator, holding the serialized applied-LSN
+/// watermark.
+const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
+
+/// Resolve the applied-LSN watermark store over the dataset's own accelerator.
+///
+/// `None` means nothing durable can record a position — no runtime attached, or no
+/// usable accelerator connection. The caller treats that as "never loaded", which is
+/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
+/// for one to describe.
+async fn resolve_watermark_store(
+    context: Option<&Arc<dyn ConnectorContext>>,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    context?
+        .blob_checkpoint_store(dataset, WATERMARK_TABLE)
+        .await
+}
+
+/// [`AppliedLsnStore`] over the accelerator's `spice_sys_postgres_replication`
+/// sidecar.
+///
+/// The payload is a single `{"lsn": <u64>}` object rather than the bare number,
+/// so the record can gain fields (a slot identity, a snapshot as-of marker)
+/// without a migration.
+struct SidecarAppliedLsnStore {
+    blobs: Arc<dyn BlobCheckpointStore>,
+    /// Which source the recorded position belongs to (see [`source_identity`]).
+    ///
+    /// LSNs are only comparable within one source's history. Without this, a
+    /// dataset repointed to another server, database, or table while keeping its
+    /// acceleration files would compare the new source's LSNs against a
+    /// watermark describing the old one's contents — and a low new LSN reads as
+    /// "already covered", leaving the old rows in place and never loading the
+    /// new source's.
+    identity: String,
+}
+
+/// Identity of the source a watermark was recorded against: endpoint, database,
+/// and table.
+///
+/// Deliberately not the slot name — a different slot on the same server shares
+/// its LSN space, so slot changes stay comparable. Note this does not detect a
+/// same-endpoint cluster restored from a backup or rewound by PITR, whose LSNs
+/// can move backwards; the resume-position clamp in `postgres_replication` is
+/// what keeps that from silently skipping changes.
+fn source_identity(params: &ReplicationParams, schema: &str, table: &str) -> String {
+    format!(
+        "{}:{}/{}/{}.{}",
+        params.host, params.port, params.database, schema, table
+    )
+}
+
+/// Serialized form of [`AppliedLsn`] in the sidecar.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAppliedLsn {
+    lsn: u64,
+    /// The source this position was recorded against. Absent in records written
+    /// before the field existed, which are treated as belonging to a different
+    /// source — the conservative reading, since they cannot be verified.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for SidecarAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(checkpoint) = self.blobs.get().await? else {
+            return Ok(RecordedPosition::Absent);
+        };
+        // A row that exists but cannot be parsed is surfaced, not swallowed:
+        // treating corruption as "no watermark" would silently resume as if this
+        // were a first load, and the caller's fallback for an unreadable
+        // watermark is a rebuild — the safe direction.
+        let stored: StoredAppliedLsn = serde_json::from_str(&checkpoint.data)?;
+        if stored.source.as_deref() != Some(self.identity.as_str()) {
+            tracing::warn!(
+                recorded_for = stored.source.as_deref().unwrap_or("an unrecorded source"),
+                streaming_from = %self.identity,
+                "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
+            );
+            return Ok(RecordedPosition::ForeignSource);
+        }
+        Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_string(&StoredAppliedLsn {
+            lsn: applied.lsn,
+            source: Some(self.identity.clone()),
+        })?;
+        self.blobs.upsert(&payload).await?;
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The sidecar exposes upsert-only semantics, so "forget" is recorded as a
+        // zero watermark: it precedes every real LSN, so the comparison against
+        // what the slot can supply resolves to a rebuild, which is what clearing
+        // is for.
+        self.save(AppliedLsn { lsn: 0 }).await
+    }
+}
+
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    dataset: &DatasetSpec,
+    context: Option<Arc<dyn ConnectorContext>>,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -77,12 +191,22 @@ pub fn build_changes_stream(
     // A non-persistent accelerator starts empty on every boot, so resuming
     // from an existing slot without a snapshot would silently serve only the
     // rows touched after startup. Force the snapshot on every start for such
-    // accelerators (snapshot + WAL resume converges via the PK upsert).
-    if dataset
+    // accelerators (snapshot + WAL resume converges via the PK upsert). Only
+    // applies when snapshots are enabled at all — `disabled` opts out entirely.
+    //
+    // Recorded on the params either way (independently of `initial_snapshot`,
+    // which only governs snapshotting): such a slot also has no resume value
+    // across restarts, so the stream drops it on graceful shutdown instead of
+    // leaving it pinning WAL on the source.
+    let ephemeral = dataset
         .acceleration
         .as_ref()
-        .is_some_and(accelerator_is_ephemeral)
-    {
+        .is_some_and(accelerator_is_ephemeral);
+    params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
+    if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
             dataset = %dataset_name,
@@ -90,6 +214,11 @@ pub fn build_changes_stream(
              will run on every start, including replication-slot resume"
         );
     }
+
+    // Resolving the watermark store needs to await, so it happens inside the
+    // stream below; clone the dataset handle it needs (cheap — `Dataset` is an
+    // `Arc`-bound wrapper over its spec).
+    let dataset_for_watermark = dataset.clone();
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -220,6 +349,31 @@ pub fn build_changes_stream(
             Err(StreamError::External(msg))?;
         }
 
+        // Where this dataset's applied-LSN watermark lives. An ephemeral
+        // acceleration gets the no-op store: it boots empty and re-snapshots
+        // every start, so a recorded position would describe rows the restart
+        // already threw away, and resuming on it would skip everything before it.
+        //
+        // A durable acceleration with no reachable store also records nothing,
+        // which reads as "never loaded" — correct, since an acceleration that
+        // cannot persist a watermark cannot have persisted the rows one would
+        // describe.
+        let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+            Arc::new(NoopAppliedLsnStore)
+        } else {
+            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
+                Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                    blobs,
+                    identity: source_identity(&params_for_stream, &schema_name, &table_name),
+                }),
+                None => Arc::new(NoopAppliedLsnStore),
+            }
+        };
+
+        // See the note in the MySQL connector: the store is what the stream needs, and
+        // the context has served its purpose once the store is resolved.
+        drop(context);
+
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
             params: params_for_stream,
@@ -228,9 +382,11 @@ pub fn build_changes_stream(
             schema_name,
             table_name,
             metrics,
+            policy: schema_evolution_policy,
+            applied_lsn_store,
         };
 
-        let mut inner = start_replication_stream_with_policy(input, schema_evolution_policy);
+        let mut inner = start_replication_stream(input);
         while let Some(item) = inner.next().await {
             yield item?;
         }
@@ -404,7 +560,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative seconds the shared-slot pump spent blocked delivering committed \
-         changes into this dataset's channel because its sink was not draining \
+         changes into this dataset's mailbox because its sink was not draining \
          (downstream backpressure). The server replication connection stays alive \
          throughout; a rising value indicates a slow apply loop stalling the shared \
          pump. Only reported for datasets on a shared (explicitly-named) slot.",
@@ -430,7 +586,7 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Cumulative microseconds the shared-slot pump spent awaiting this dataset's \
-         delivery channel while applying committed changes. Unlike \
+         delivery mailbox while applying committed changes. Unlike \
          member_send_stalled_seconds_total, this accrues the full per-commit wait \
          (including sub-second waits). The pump subtracts this wait from \
          reader_processing_micros_total at the source, so that counter stays \
@@ -438,6 +594,59 @@ const METRICS: &[MetricSpec] = &[
          Only meaningful for datasets on a shared slot; dedicated-slot datasets will export 0.",
     )
     .unit("us")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelopes_delivered_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Change envelopes the shared-slot pump delivered to this dataset as distinct units \
+         of work. Divide replication_wal_transactions_total by this to get the coalescing \
+         factor the accelerator's apply loop actually sees: adjacent transactions for the \
+         same table are folded into one envelope, so this counter rises more slowly than \
+         the transaction count. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_eager_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope the shared-slot pump was still \
+         holding back, before it crossed into this dataset's delivery mailbox. Paired with \
+         member_envelope_mailbox_merges_total, this attributes envelope reduction between \
+         the pump's short hold and mailbox back-pressure. Only reported for datasets on a \
+         shared (explicitly-named) slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_envelope_mailbox_merges_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Committed transactions folded into an envelope already sitting unclaimed in this \
+         dataset's delivery mailbox. This is the back-pressure-driven half of coalescing: \
+         it rises when the sink is not keeping up, which is when collapsing envelopes \
+         matters most, so a rising value alongside a flat \
+         member_send_stalled_seconds_total means back-pressure is being absorbed rather \
+         than stalling the slot. Only reported for datasets on a shared (explicitly-named) \
+         slot.",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_member_mailbox_coalesce_limited_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Times a committed transaction could not be folded into this dataset's unclaimed \
+         delivery-mailbox tail because a configured bound refused it, rather than because the \
+         changes were not foldable. The mailbox bounds ship deliberately low, since mailbox \
+         folding absorbs back-pressure rather than adding throughput. A value that stays at 0 \
+         means the bounds never bind and there is nothing to tune; a rising value alongside a \
+         rising member_envelope_mailbox_merges_total is the evidence that raising them would \
+         absorb more. Only reported for datasets on a shared (explicitly-named) slot.",
+    )
     .auto_register(),
 ];
 
@@ -597,6 +806,26 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.member_send_wait_micros_total(), &attributes);
                 })))
             }
+            "replication_member_envelopes_delivered_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelopes_delivered_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_eager_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_eager_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_envelope_mailbox_merges_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_envelope_mailbox_merges_total(), &attributes);
+                })))
+            }
+            "replication_member_mailbox_coalesce_limited_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.member_mailbox_coalesce_limited_total(), &attributes);
+                })))
+            }
             _ => None,
         }
     }
@@ -609,18 +838,29 @@ fn accelerator_is_ephemeral(
     acceleration: &runtime::component::dataset::acceleration::Acceleration,
 ) -> bool {
     use runtime::component::dataset::acceleration::{Engine, Mode};
+    // Matched exhaustively (no `_` arm) so a newly added engine has to make an
+    // explicit durability claim here: defaulting a non-persistent engine to
+    // "persistent" silently skips its resume snapshot and leaves the accelerator
+    // missing every row written before startup.
     match acceleration.engine.to_unpartitioned() {
-        // Always in-memory.
-        Engine::Arrow => true,
+        // Always in-memory. `to_unpartitioned` already folded `PartitionedArrow`
+        // into `Arrow`, so it cannot reach the match; it is listed only to keep
+        // the match exhaustive.
+        Engine::Arrow | Engine::PartitionedArrow => true,
         // In-memory unless file-backed; `file_create` truncates on startup,
         // which is just as empty as memory from replication's point of view.
-        Engine::DuckDB | Engine::Sqlite | Engine::Turso => {
+        //
+        // Cayenne belongs here too: `mode: memory` is fully in-RAM (an in-memory
+        // `memdb` metastore and no data directory at all — see the accelerator's
+        // `memory_mode` branch), so nothing about it survives a restart. Only its
+        // file modes (local disk or S3 Express One Zone, both of which require a
+        // file mode) persist independently of this process.
+        Engine::DuckDB | Engine::Sqlite | Engine::Turso | Engine::Cayenne => {
             matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         }
-        // External storage (another Postgres, object-store-backed Cayenne)
-        // persists independently of this process. `to_unpartitioned` already
-        // folded the partitioned variants into their base engines.
-        _ => false,
+        // External storage (another Postgres) persists independently of this
+        // process.
+        Engine::PostgreSQL => false,
     }
 }
 
@@ -628,15 +868,17 @@ fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
 ) -> std::result::Result<ReplicationParams, String> {
-    let host = required_string(params, "host")?;
-    let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
-    let user = required_string(params, "user")?;
-    let password_str = required_secret(params, "pass")?;
-    let database = required_string(params, "db")?;
-    let sslmode =
-        config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
-            .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
-    let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
+    // Same override rule / parser as `PostgresConnectionPool` (see
+    // `crate::connection`): `pg_connection_string` wins over discrete
+    // `pg_host`/`pg_user`/`pg_db`/…; discrete `pg_sslmode` / `pg_sslrootcert`
+    // still override values embedded in the connection string.
+    let identity = crate::connection::connection_identity_from_params(params)?;
+    let sslmode = config::SslMode::from_str_strict(identity.sslmode.as_deref())
+        .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
+    let sslrootcert = identity
+        .sslrootcert
+        .as_deref()
+        .map(config::ca_certificate_from_param);
 
     // An explicitly-named slot is shareable: every dataset on the same
     // connection naming the same slot is multiplexed onto one replication
@@ -647,6 +889,12 @@ fn replication_params_from_connector_params(
     let shared = explicit_slot.is_some();
     let (slot_name, publication_name) = match explicit_slot {
         Some(slot) => {
+            config::validate_replication_slot_name(&slot).map_err(|reason| {
+                format!(
+                    "parameter `{}` {reason}",
+                    params.user_param("replication_slot")
+                )
+            })?;
             let publication = optional_string(params, "publication")
                 .unwrap_or_else(|| config::publication_name_for_slot(&slot));
             (slot, publication)
@@ -657,8 +905,7 @@ fn replication_params_from_connector_params(
                 .unwrap_or_else(|| config::default_publication_name(dataset_name)),
         ),
     };
-    let initial_snapshot = optional_bool(params, "replication_initial_snapshot", true)?;
-    let temporary_slot = optional_bool(params, "replication_temporary_slot", false)?;
+    let (initial_snapshot, snapshot_on_resume) = parse_initial_snapshot(params)?;
     let status_interval = optional_duration(
         params,
         "replication_status_interval",
@@ -670,6 +917,11 @@ fn replication_params_from_connector_params(
         DEFAULT_BOOTSTRAP_BATCH_SIZE,
         MAX_BOOTSTRAP_BATCH_SIZE,
     )?;
+    let ready_lag = optional_duration(
+        params,
+        "replication_ready_lag",
+        data_components::cdc::DEFAULT_READY_LAG,
+    )?;
     // Only meaningful on the shared path, but parsed unconditionally so a
     // misconfigured value is rejected up front regardless of slot mode.
     let member_channel_capacity = optional_usize_in_range(
@@ -680,20 +932,23 @@ fn replication_params_from_connector_params(
     )?;
 
     Ok(ReplicationParams {
-        host,
-        port,
-        user,
-        password: SecretString::from(password_str),
-        database,
+        host: identity.host,
+        port: identity.port,
+        user: identity.user,
+        password: SecretString::from(identity.password),
+        database: identity.database,
         sslmode,
         sslrootcert,
         slot_name,
         publication_name,
         initial_snapshot,
-        // Set by the caller from the dataset's acceleration config.
-        snapshot_on_resume: false,
-        temporary_slot,
+        snapshot_on_resume,
+        // Derived from the dataset's accelerator, which this function does not
+        // see; `build_changes_stream` sets it right after.
+        ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
+        ready_lag,
         bootstrap_batch_size,
         shared,
         member_channel_capacity,
@@ -701,21 +956,11 @@ fn replication_params_from_connector_params(
         // formatting. Not a user-facing parameter; the per-column text fallback
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
     })
-}
-
-fn required_string(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required parameter `{name}`")),
-    }
-}
-
-fn required_secret(params: &Parameters, key: &str) -> std::result::Result<String, String> {
-    match params.get(key).expose() {
-        ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => Err(format!("missing required secret `{name}`")),
-    }
 }
 
 fn optional_string(params: &Parameters, key: &str) -> Option<String> {
@@ -752,34 +997,61 @@ fn optional_usize_in_range(
     }
 }
 
-/// Parses an optional boolean parameter strictly. An absent or empty value
-/// uses `default`; a recognized token maps to its boolean; anything else is
-/// rejected rather than silently falling back. Accepts `true/1/yes/y` and
-/// `false/0/no/n` (case-insensitive, surrounding whitespace trimmed).
+/// Map the shared [`InitialSnapshotMode`] onto Postgres's two internal flags
+/// `(initial_snapshot, snapshot_on_resume)`:
 ///
-/// The lenient predecessors collapsed every unrecognized value to `false`, so
-/// a typo'd `replication_initial_snapshot` silently skipped the bootstrap
-/// snapshot and the accelerator served only post-subscription changes —
+/// - `Auto` -> `(true, false)`: snapshot a freshly-created slot; the caller still
+///   forces a resume snapshot for a non-persistent accelerator.
+/// - `Always` -> `(true, true)`: snapshot on every start, including slot resume.
+/// - `Disabled` -> `(false, false)`: never snapshot.
+fn snapshot_flags(mode: InitialSnapshotMode) -> (bool, bool) {
+    match mode {
+        InitialSnapshotMode::Auto => (true, false),
+        InitialSnapshotMode::Always => (true, true),
+        InitialSnapshotMode::Disabled => (false, false),
+    }
+}
+
+/// Resolve `pg_replication_initial_snapshot` into the two internal snapshot
+/// flags. Accepts the shared canonical vocabulary (`auto|always|disabled`, via
+/// [`InitialSnapshotMode::from_canonical`]) and, for backward compatibility, the
+/// legacy booleans `true|false` (mapped to `auto|disabled`).
+///
+/// A typo is rejected rather than silently falling back: a lenient parse that
+/// collapsed an unrecognized value to `disabled` would skip the bootstrap
+/// snapshot, leaving the accelerator serving only post-subscription changes and
 /// missing every pre-existing row with no error.
-fn optional_bool(
-    params: &Parameters,
-    key: &str,
-    default: bool,
-) -> std::result::Result<bool, String> {
-    let Some(raw) = optional_string(params, key) else {
-        return Ok(default);
+fn parse_initial_snapshot(params: &Parameters) -> std::result::Result<(bool, bool), String> {
+    let Some(raw) = optional_string(params, "replication_initial_snapshot") else {
+        return Ok(snapshot_flags(InitialSnapshotMode::Auto));
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(default);
+        return Ok(snapshot_flags(InitialSnapshotMode::Auto));
     }
+    if let Some(mode) = InitialSnapshotMode::from_canonical(trimmed) {
+        return Ok(snapshot_flags(mode));
+    }
+    // Deprecated boolean spellings map to auto / disabled.
     match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" => Ok(true),
-        "false" | "0" | "no" | "n" => Ok(false),
-        _ => {
-            let user_param = params.user_param(key);
+        legacy @ ("true" | "1" | "yes" | "y") => {
+            tracing::warn!(
+                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'auto' instead (or 'always'/'disabled')",
+                params.user_param("replication_initial_snapshot")
+            );
+            Ok(snapshot_flags(InitialSnapshotMode::Auto))
+        }
+        legacy @ ("false" | "0" | "no" | "n") => {
+            tracing::warn!(
+                "parameter `{}` uses the deprecated boolean value {legacy:?}; use 'disabled' instead",
+                params.user_param("replication_initial_snapshot")
+            );
+            Ok(snapshot_flags(InitialSnapshotMode::Disabled))
+        }
+        other => {
+            let user_param = params.user_param("replication_initial_snapshot");
             Err(format!(
-                "parameter `{user_param}` must be a boolean (true/false), got {raw:?}"
+                "parameter `{user_param}` must be 'auto', 'always', or 'disabled', got {other:?}"
             ))
         }
     }
@@ -788,6 +1060,7 @@ fn optional_bool(
 /// Parses an optional value via `FromStr`. An absent or empty value uses
 /// `default`; a parse failure is reported with the user-facing parameter name
 /// and `expected` description rather than silently substituting the default.
+#[cfg(test)]
 fn optional_parse<T>(
     params: &Parameters,
     key: &str,
@@ -863,6 +1136,7 @@ fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_components::postgres_replication::CaCertificate;
 
     fn params_with_bootstrap_batch_size(value: &str) -> Parameters {
         Parameters::new(
@@ -887,65 +1161,285 @@ mod tests {
         Parameters::new(vec![], "pg", crate::PARAMETERS)
     }
 
+    /// Self-signed CA (`CN=Spice Replication Test CA`, `CA:TRUE`), expiring in 2126.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIC4DCCAcigAwIBAgIJAODHR+uzOPBvMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNV
+BAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRlc3QgQ0EwIBcNMjYwNzI4MDU0MDQ0WhgP
+MjEyNjA3MDQwNTQwNDRaMCQxIjAgBgNVBAMMGVNwaWNlIFJlcGxpY2F0aW9uIFRl
+c3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCzoou00DrTAevF
+RZ6+PFmSBUhzZXsABQFztlPigZzJ1m8hnja66hnkWKyIid9DcitnjkWgtQZCVxm6
+s05tM6QAy5lI2wlfWD7hQi+yIWKv2dcVuD/J4hWPjmG5a5VtRAInV0yBymkCRI6Z
+68JYfvKh+Rku1y6H3dUfNm8dxCbo589L1U8ucJqlQv9Iy/X7Lze+pj2JFU/L1g3t
+k/5ziVgJjdh3VetrHkU1YOiHRPFsqXOxXc2lpzUjd23QR3FfkZkVgLUfEvPWHRSf
+xipaPFhllw9WUWEl6bVqAGO0btPO1OKKqBlIcizf2YO2+lFs/o0e7bApGzI3l5HP
+VZr/e6ZLAgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQAD
+ggEBACC1XMNpbA+172MQks9R7cqRY5I0HObJRX3dpIsOqrm3EUcHMt9kx7QrO1Af
+gzAWC0ZNHppeU/cuq9ZKZQiFrSmr5fKtXzsxkvgLYRCFO+ZCKZl9k3z9j0AQbTPR
+klJa4bo2SS6WbmoATimD6e0moT++neRIDx7MlijtWB8grfhuH7yFN9xoTRDgdYBU
+KLeFNAIi+S5cVzUwjMiOQnmljphKSRoQnihpA/c6WAVAN3VqMdoPpfmR2pTi7rio
+38busw0nt/y+JCVWzNDr/i5f3mvNi5SaHZ5PTOVnocyMUw+ysx5eQOrJwrirW9XD
+TXTE85+Or9IUwDI9543jsyCvuQ8=
+-----END CERTIFICATE-----
+";
+
+    /// A complete connection, so parsing reaches `sslrootcert` instead of
+    /// aborting on a missing required parameter.
+    fn params_with_sslrootcert(value: &str) -> Parameters {
+        Parameters::new(
+            vec![
+                ("host".to_string(), SecretString::from("pg.internal")),
+                ("user".to_string(), SecretString::from("spice")),
+                ("db".to_string(), SecretString::from("myapp")),
+                ("sslmode".to_string(), SecretString::from("verify-full")),
+                ("sslrootcert".to_string(), SecretString::from(value)),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    /// `pg_sslrootcert` is documented as accepting a path *or* inline PEM
+    /// content, and a CA injected as a secret arrives as content. Both spellings
+    /// must reach the replication stream as a usable trust anchor.
     #[test]
-    fn optional_bool_recognizes_true_and_false_tokens() {
-        for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_initial_snapshot", v),
-                    "replication_initial_snapshot",
-                    false
-                ),
-                Ok(true),
-                "expected {v:?} to parse as true"
-            );
+    fn inline_pem_sslrootcert_reaches_replication_params_as_content() {
+        let repl =
+            replication_params_from_connector_params(&params_with_sslrootcert(TEST_CA_PEM), "hits")
+                .expect("inline PEM sslrootcert should parse");
+
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec())),
+            "inline PEM must not be reinterpreted as a filesystem path"
+        );
+    }
+
+    #[test]
+    fn inline_pem_sslrootcert_survives_a_single_line_secret() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert(&TEST_CA_PEM.replace('\n', "\\n")),
+            "hits",
+        )
+        .expect("single-line inline PEM sslrootcert should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Pem(TEST_CA_PEM.as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn path_sslrootcert_reaches_replication_params_as_a_path() {
+        let repl = replication_params_from_connector_params(
+            &params_with_sslrootcert("/etc/ssl/pg-ca.pem"),
+            "hits",
+        )
+        .expect("sslrootcert path should parse");
+
+        assert_eq!(
+            repl.sslrootcert,
+            Some(CaCertificate::Path("/etc/ssl/pg-ca.pem".into()))
+        );
+    }
+
+    /// `accelerator_is_ephemeral` decides whether a slot resume re-snapshots.
+    /// Getting it wrong in the "persistent" direction is silent data loss: the
+    /// accelerator boots empty, the slot resumes from `confirmed_flush_lsn`, and
+    /// the dataset then serves only rows touched after startup. Each engine's
+    /// durability is asserted for every mode so a wrong answer fails here rather
+    /// than in production.
+    #[test]
+    fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
+        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+
+        let ephemeral = |engine: Engine, mode: Mode| {
+            accelerator_is_ephemeral(&Acceleration {
+                engine,
+                mode,
+                ..Acceleration::default()
+            })
+        };
+
+        // Cayenne `mode: memory` is fully in-RAM (in-memory `memdb` metastore, no
+        // data directory), so it must re-snapshot on every start. This is also
+        // the mode catalog-level CDC acceleration runs in, and `mode: memory` is
+        // the default for an acceleration block that doesn't name one.
+        assert!(
+            ephemeral(Engine::Cayenne, Mode::Memory),
+            "in-memory Cayenne does not survive a restart"
+        );
+        assert!(
+            ephemeral(Engine::Cayenne, Mode::FileCreate),
+            "`file_create` truncates on startup, which is as empty as memory"
+        );
+        // File-backed Cayenne (local disk, or S3 Express One Zone — which also
+        // requires a file mode) persists, so a plain slot resume is correct.
+        assert!(!ephemeral(Engine::Cayenne, Mode::File));
+        assert!(!ephemeral(Engine::Cayenne, Mode::FileUpdate));
+
+        for engine in [Engine::DuckDB, Engine::Sqlite, Engine::Turso] {
+            assert!(ephemeral(engine, Mode::Memory), "{engine} memory");
+            assert!(ephemeral(engine, Mode::FileCreate), "{engine} file_create");
+            assert!(!ephemeral(engine, Mode::File), "{engine} file");
+            assert!(!ephemeral(engine, Mode::FileUpdate), "{engine} file_update");
         }
-        for v in ["false", "FALSE", "0", "no", "N", " false "] {
-            assert_eq!(
-                optional_bool(
-                    &params_with("replication_initial_snapshot", v),
-                    "replication_initial_snapshot",
-                    true
+
+        // Arrow is in-memory whatever `mode` says; Postgres is external storage.
+        for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
+            assert!(ephemeral(Engine::Arrow, mode), "arrow {mode}");
+            assert!(ephemeral(Engine::PartitionedArrow, mode), "arrow {mode}");
+            assert!(!ephemeral(Engine::PostgreSQL, mode), "postgres {mode}");
+        }
+    }
+
+    /// `snapshot_on_resume` is only forced when snapshots are enabled at all;
+    /// `pg_replication_initial_snapshot: disabled` is an explicit opt-out that a
+    /// non-persistent accelerator must not override.
+    #[test]
+    fn disabled_initial_snapshot_is_not_overridden_by_ephemerality() {
+        let (initial_snapshot, snapshot_on_resume) =
+            parse_initial_snapshot(&params_with("replication_initial_snapshot", "disabled"))
+                .expect("`disabled` is a canonical value");
+        assert!(!initial_snapshot);
+        assert!(!snapshot_on_resume);
+    }
+
+    // Regression for #11994: CDC must honor `pg_connection_string` the same way
+    // as the federated read pool (libpq key=value; default sslmode verify-full).
+    #[test]
+    fn connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from(
+                        "host=db.internal port=5433 dbname=csdb user=csuser password=secret",
+                    ),
                 ),
-                Ok(false),
-                "expected {v:?} to parse as false"
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("valid connection_string should parse");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn uri_connection_string_flows_into_replication_params() {
+        let params = Parameters::new(
+            vec![
+                (
+                    "connection_string".to_string(),
+                    SecretString::from("postgresql://csuser:secret@db.internal:5433/csdb"),
+                ),
+                ("host".to_string(), SecretString::from("ignored")),
+            ],
+            "pg",
+            crate::PARAMETERS,
+        );
+        let repl = replication_params_from_connector_params(&params, "hits")
+            .expect("URI connection_string should parse for CDC");
+        assert_eq!(repl.host, "db.internal");
+        assert_eq!(repl.port, 5433);
+        assert_eq!(repl.user, "csuser");
+        assert_eq!(repl.database, "csdb");
+        assert_eq!(repl.sslmode, config::SslMode::VerifyFull);
+        assert_eq!(
+            secrecy::ExposeSecret::expose_secret(&repl.password),
+            "secret"
+        );
+    }
+
+    /// Regression test for #12213. `pg_replication_temporary_slot` is retained
+    /// only as a deprecated spec: it must stay declared, so an operator who
+    /// still sets it is told it is ignored, and it must stay deprecated, so it
+    /// is struck through in the Spicepod schema and cannot be mistaken for a
+    /// working knob. A temporary slot is owned by the session that creates it,
+    /// and creation happens on the short-lived setup connection, so the slot
+    /// was always gone before `START_REPLICATION` ran.
+    #[test]
+    fn temporary_slot_parameter_is_declared_and_deprecated() {
+        let spec = crate::PARAMETERS
+            .iter()
+            .find(|p| p.name == "replication_temporary_slot")
+            .expect("the deprecated spec must remain declared so setting it is not silent");
+        assert!(
+            spec.deprecation_message.is_some(),
+            "pg_replication_temporary_slot cannot be honoured and must stay deprecated"
+        );
+        assert!(
+            spec.default.is_none(),
+            "an ignored parameter must not advertise a default"
+        );
+    }
+
+    /// Setting the deprecated parameter must not fail the dataset: it is warned
+    /// about and ignored, so a pod carrying it loads and streams with a durable
+    /// slot instead of breaking at `START_REPLICATION`.
+    #[test]
+    fn deprecated_temporary_slot_is_accepted_and_ignored() {
+        for value in ["true", "false", "ture"] {
+            let params = Parameters::new(
+                vec![
+                    ("host".to_string(), SecretString::from("pg.internal")),
+                    ("user".to_string(), SecretString::from("spice")),
+                    ("db".to_string(), SecretString::from("myapp")),
+                    (
+                        "replication_temporary_slot".to_string(),
+                        SecretString::from(value),
+                    ),
+                ],
+                "pg",
+                crate::PARAMETERS,
             );
+            if let Err(e) = replication_params_from_connector_params(&params, "hits") {
+                panic!("pg_replication_temporary_slot={value} must be ignored, not rejected: {e}");
+            }
         }
     }
 
     #[test]
-    fn optional_bool_uses_default_when_absent_or_empty() {
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_initial_snapshot", true),
-            Ok(true)
-        );
-        assert_eq!(
-            optional_bool(&empty_params(), "replication_temporary_slot", false),
-            Ok(false)
-        );
-        assert_eq!(
-            optional_bool(
-                &params_with("replication_initial_snapshot", "   "),
-                "replication_initial_snapshot",
-                true
-            ),
-            Ok(true)
-        );
+    fn parse_initial_snapshot_maps_enum_and_legacy_booleans() {
+        // Canonical enum values -> (initial_snapshot, snapshot_on_resume).
+        for (raw, expected) in [
+            ("auto", (true, false)),
+            ("AUTO", (true, false)),
+            ("always", (true, true)),
+            ("disabled", (false, false)),
+            // Deprecated boolean spellings map to auto / disabled.
+            ("true", (true, false)),
+            ("1", (true, false)),
+            ("false", (false, false)),
+            ("no", (false, false)),
+        ] {
+            assert_eq!(
+                parse_initial_snapshot(&params_with("replication_initial_snapshot", raw)),
+                Ok(expected),
+                "raw: {raw}"
+            );
+        }
+        // Absent -> auto default.
+        assert_eq!(parse_initial_snapshot(&empty_params()), Ok((true, false)));
     }
 
-    // Regression for #11274: a typo'd `replication_initial_snapshot` previously
-    // collapsed to `false`, silently skipping the bootstrap snapshot and
-    // dropping every pre-existing row. It must now error loudly instead.
     #[test]
-    fn optional_bool_rejects_unrecognized_value() {
-        let result = optional_bool(
-            &params_with("replication_initial_snapshot", "ture"),
-            "replication_initial_snapshot",
-            true,
-        );
+    fn parse_initial_snapshot_rejects_unrecognized_value() {
+        let err = parse_initial_snapshot(&params_with("replication_initial_snapshot", "sometimes"))
+            .expect_err("typo must error");
         assert_eq!(
-            result,
-            Err("parameter `pg_replication_initial_snapshot` must be a boolean (true/false), got \"ture\"".to_string())
+            err,
+            "parameter `pg_replication_initial_snapshot` must be 'auto', 'always', or 'disabled', got \"sometimes\"".to_string()
         );
     }
 
@@ -1051,5 +1545,42 @@ mod tests {
                     "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
                 )
         );
+    }
+
+    fn replication_connection_params(slot: Option<&str>) -> Parameters {
+        let mut entries = vec![
+            ("host".to_string(), SecretString::from("localhost")),
+            ("user".to_string(), SecretString::from("spice")),
+            ("db".to_string(), SecretString::from("spice")),
+        ];
+        if let Some(slot) = slot {
+            entries.push(("replication_slot".to_string(), SecretString::from(slot)));
+        }
+        Parameters::new(entries, "pg", crate::PARAMETERS)
+    }
+
+    #[test]
+    fn replication_params_rejects_invalid_slot_name() {
+        let params =
+            replication_connection_params(Some("scp-onboarding-realtime-analytics-prod-us-east-1"));
+        let err = replication_params_from_connector_params(&params, "hits")
+            .expect_err("hyphenated slot must be rejected");
+        assert!(
+            err.starts_with("parameter `pg_replication_slot` must contain only lowercase"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("invalid character '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replication_params_accepts_valid_explicit_slot_name() {
+        let params = replication_connection_params(Some("spice_hits_cdc"));
+        let parsed = replication_params_from_connector_params(&params, "hits")
+            .expect("valid slot must parse");
+        assert_eq!(parsed.slot_name, "spice_hits_cdc");
+        assert!(parsed.shared);
     }
 }

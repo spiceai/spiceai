@@ -14,363 +14,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_schema::SchemaRef;
-
-use super::{find_first_delimiter, validate_identifier};
-use crate::{Runtime, component::access::AccessMode, dataaccelerator::AccelerationSource};
-use acceleration::{Acceleration, Engine};
 use app::App;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        dialect::{Dialect, GenericDialect},
-        parser::{Parser, ParserError},
-    },
-};
-use datafusion_table_providers::util::column_reference;
-use snafu::prelude::*;
-use spicepod::{
-    component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
-    metric::Metrics,
-    semantic::{Column, IndexStore},
-    vector::VectorStore,
-};
-use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
+use datafusion::sql::TableReference;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-pub mod acceleration;
+use crate::{Runtime, dataaccelerator::AccelerationSource};
+
 pub mod builder;
-pub mod declared_schema;
-pub mod declared_type;
-pub mod metadata;
-pub mod replication;
-pub mod schema_inference;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "Column for index '{index}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
-    ))]
-    IndexColumnNotFound {
-        index: String,
-        valid_columns: String,
-    },
+#[cfg(test)]
+mod moved_tests;
 
-    #[snafu(display(
-        "Primary key column '{invalid_column}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
-    ))]
-    PrimaryKeyColumnNotFound {
-        invalid_column: String,
-        valid_columns: String,
-    },
+// Config-only spec, config types, and config-only submodules live in
+// `runtime-component`. Re-exported here for path compatibility
+// (`crate::component::dataset::{DatasetSpec, Acceleration, acceleration, ...}`).
+pub use runtime_component::dataset::{
+    CheckAvailability, DatasetSpec, Error, FullTextSearchDatasetConfig, InvalidColumnTypeSnafu,
+    InvalidConfigurationSnafu, OnSchemaChange, ReadyState, Result, TimeFormat,
+    UnsupportedTypeAction, acceleration, declared_schema, declared_type, metadata, replication,
+    schema_inference,
+};
+// `validate_identifier` is used by `builder` via `super::validate_identifier`.
+use runtime_component::dataset::acceleration::Acceleration;
+use runtime_component::validate_identifier;
 
-    #[snafu(display(
-        "Cannot configure {constraint} because the dataset schema has no columns. This usually means the source table does not exist or could not be read. Verify the dataset's `from` target exists and is accessible, then try again."
-    ))]
-    AcceleratedSchemaEmpty { constraint: String },
-
-    #[snafu(display("Failed to retrieve table constraints for the dataset: {source}"))]
-    UnableToGetTableConstraints {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Failed to convert the dataset schema for query planning: {source}"))]
-    UnableToConvertSchemaRefToDFSchema {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display(
-        "Only one `on_conflict` target can be specified, or all `on_conflict` targets must be specified and set to `drop`. {extra_detail}"
-    ))]
-    OnConflictTargetMismatch { extra_detail: String },
-
-    #[snafu(display("Error parsing column reference {column_ref}: {source}"))]
-    UnableToParseColumnReference {
-        column_ref: String,
-        source: column_reference::Error,
-    },
-
-    #[snafu(display("Error parsing {field} as duration: {source}"))]
-    UnableToParseFieldAsDuration {
-        field: String,
-        source: fundu::ParseError,
-    },
-
-    #[snafu(display("Error parsing 'snapshots_batches` as integer: {source}"))]
-    UnableToParseSnapshotsBatches { source: std::num::ParseIntError },
-
-    #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
-    UnableToParseTableReferenceFromPath { path: String, source: ParserError },
-
-    #[snafu(display(
-        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
-    ))]
-    UnableToBuildDataset {
-        dataset: String,
-        missing_component: String,
-    },
-
-    #[snafu(display(
-        "Both a 'refresh_cron' and 'refresh_check_interval' were specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
-    ))]
-    MultipleRefreshExpressionSpecified,
-
-    #[snafu(display(
-        "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
-    ))]
-    ChunkingNotSupportedForVectorEngine { column: String },
-
-    #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
-    InvalidConfiguration { config_key: String, message: String },
-
-    #[snafu(display("Invalid column type in dataset '{dataset}': {source}"))]
-    InvalidColumnType {
-        dataset: String,
-        source: declared_schema::DeclaredSchemaError,
-    },
-
-    #[snafu(display(
-        "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
-    ))]
-    SnapshotTriggerIntervalRequiresInterval,
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<runtime_acceleration::AccelerationParseError> for Error {
-    fn from(e: runtime_acceleration::AccelerationParseError) -> Self {
-        use runtime_acceleration::AccelerationParseError;
-        match e {
-            AccelerationParseError::UnableToParseColumnReference { column_ref, source } => {
-                Error::UnableToParseColumnReference { column_ref, source }
-            }
-            AccelerationParseError::UnableToParseFieldAsDuration { source, field } => {
-                Error::UnableToParseFieldAsDuration { source, field }
-            }
-            AccelerationParseError::MultipleRefreshExpressionSpecified => {
-                Error::MultipleRefreshExpressionSpecified
-            }
-            AccelerationParseError::IndexColumnNotFound {
-                index,
-                valid_columns,
-            } => Error::IndexColumnNotFound {
-                index,
-                valid_columns,
-            },
-            AccelerationParseError::PrimaryKeyColumnNotFound {
-                invalid_column,
-                valid_columns,
-            } => Error::PrimaryKeyColumnNotFound {
-                invalid_column,
-                valid_columns,
-            },
-            AccelerationParseError::AcceleratedSchemaEmpty { constraint } => {
-                Error::AcceleratedSchemaEmpty { constraint }
-            }
-            AccelerationParseError::UnableToGetTableConstraints { source } => {
-                Error::UnableToGetTableConstraints { source }
-            }
-            AccelerationParseError::OnConflictTargetMismatch { extra_detail } => {
-                Error::OnConflictTargetMismatch { extra_detail }
-            }
-            _ => Error::InvalidConfiguration {
-                config_key: "acceleration".into(),
-                message: e.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum TimeFormat {
-    #[default]
-    Timestamp,
-    Timestamptz,
-    UnixSeconds,
-    UnixMillis,
-    ISO8601,
-    Date,
-}
-
-impl From<spicepod_dataset::TimeFormat> for TimeFormat {
-    fn from(time_format: spicepod_dataset::TimeFormat) -> Self {
-        match time_format {
-            spicepod_dataset::TimeFormat::UnixSeconds => TimeFormat::UnixSeconds,
-            spicepod_dataset::TimeFormat::UnixMillis => TimeFormat::UnixMillis,
-            spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
-            spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
-            spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
-            spicepod_dataset::TimeFormat::Date => TimeFormat::Date,
-        }
-    }
-}
-
-impl std::fmt::Display for TimeFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum UnsupportedTypeAction {
-    Error,
-    Warn,
-    Ignore,
-    String,
-}
-
-impl From<spicepod_dataset::UnsupportedTypeAction> for UnsupportedTypeAction {
-    fn from(action: spicepod_dataset::UnsupportedTypeAction) -> Self {
-        match action {
-            spicepod_dataset::UnsupportedTypeAction::Error => UnsupportedTypeAction::Error,
-            spicepod_dataset::UnsupportedTypeAction::Warn => UnsupportedTypeAction::Warn,
-            spicepod_dataset::UnsupportedTypeAction::Ignore => UnsupportedTypeAction::Ignore,
-            spicepod_dataset::UnsupportedTypeAction::String => UnsupportedTypeAction::String,
-        }
-    }
-}
-
-impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedTypeAction {
-    fn from(action: UnsupportedTypeAction) -> Self {
-        match action {
-            UnsupportedTypeAction::Error => {
-                datafusion_table_providers::UnsupportedTypeAction::Error
-            }
-            UnsupportedTypeAction::Warn => datafusion_table_providers::UnsupportedTypeAction::Warn,
-            UnsupportedTypeAction::Ignore => {
-                datafusion_table_providers::UnsupportedTypeAction::Ignore
-            }
-            UnsupportedTypeAction::String => {
-                datafusion_table_providers::UnsupportedTypeAction::String
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum OnSchemaChange {
-    #[default]
-    Block,
-    Fail,
-    AppendNewColumns,
-    SyncAllColumns,
-    DropAndRecreate,
-}
-
-impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
-    fn from(on_schema_change: spicepod_dataset::OnSchemaChange) -> Self {
-        match on_schema_change {
-            spicepod_dataset::OnSchemaChange::Block => OnSchemaChange::Block,
-            spicepod_dataset::OnSchemaChange::Fail => OnSchemaChange::Fail,
-            spicepod_dataset::OnSchemaChange::AppendNewColumns => OnSchemaChange::AppendNewColumns,
-            spicepod_dataset::OnSchemaChange::SyncAllColumns => OnSchemaChange::SyncAllColumns,
-            spicepod_dataset::OnSchemaChange::DropAndRecreate => OnSchemaChange::DropAndRecreate,
-        }
-    }
-}
-
-impl Display for OnSchemaChange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnSchemaChange::Block => write!(f, "block"),
-            OnSchemaChange::Fail => write!(f, "fail"),
-            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
-            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
-            OnSchemaChange::DropAndRecreate => write!(f, "drop_and_recreate"),
-        }
-    }
-}
-
-/// Controls when the table is marked ready for queries.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum ReadyState {
-    /// The table is ready once the initial load completes.
-    #[default]
-    OnLoad,
-    /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
-    OnRegistration,
-    /// The table is ready once the federated source's schema has been resolved (which also implies access
-    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
-    /// fall back to the federated source until the initial load completes.
-    OnSchemaResolved,
-}
-
-impl From<spicepod_dataset::ReadyState> for ReadyState {
-    fn from(ready_state: spicepod_dataset::ReadyState) -> Self {
-        match ready_state {
-            spicepod_dataset::ReadyState::OnLoad => ReadyState::OnLoad,
-            spicepod_dataset::ReadyState::OnRegistration => ReadyState::OnRegistration,
-            spicepod_dataset::ReadyState::OnSchemaResolved => ReadyState::OnSchemaResolved,
-        }
-    }
-}
-
-impl Display for ReadyState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadyState::OnLoad => write!(f, "on_load"),
-            ReadyState::OnRegistration => write!(f, "on_registration"),
-            ReadyState::OnSchemaResolved => write!(f, "on_schema_resolved"),
-        }
-    }
-}
-
-/// Controls whether the federated table periodically has its availability checked.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum CheckAvailability {
-    /// The dataset is checked for availability if it isn't accelerated.
-    #[default]
-    Auto,
-    /// The dataset is not checked for availability.
-    Disabled,
-}
-
-impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
-    fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
-        match monitor {
-            spicepod_dataset::CheckAvailability::Auto => CheckAvailability::Auto,
-            spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
-        }
-    }
-}
-
-impl Display for CheckAvailability {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckAvailability::Auto => write!(f, "auto"),
-            CheckAvailability::Disabled => write!(f, "disabled"),
-        }
-    }
-}
-
+/// `Arc<Runtime>`-bound wrapper over a [`DatasetSpec`]. Derefs to the spec so
+/// `dataset.acceleration`, `dataset.columns`, `dataset.refresh_sql()`, etc. keep
+/// working unchanged; `app`/`runtime` are the runtime handles the spec omits.
 #[derive(Clone)]
 pub struct Dataset {
-    pub from: String,
-    pub name: TableReference,
-    pub access: AccessMode,
-    pub params: HashMap<String, String>,
-    pub metadata: HashMap<String, String>,
-    pub columns: Vec<Column>,
-    /// Arrow schema derived from `columns[].type` declarations. `None` when no
-    /// column carries an explicit type. Connectors merge this with their inferred
-    /// schema so declared types take precedence.
-    pub schema: Option<SchemaRef>,
-    pub has_metadata_table: bool,
-    pub replication: Option<replication::Replication>,
-    pub time_column: Option<String>,
-    pub time_format: Option<TimeFormat>,
-    pub time_partition_column: Option<String>,
-    pub time_partition_format: Option<TimeFormat>,
-    pub acceleration: Option<acceleration::Acceleration>,
-    pub embeddings: Vec<ColumnEmbeddingConfig>,
+    pub spec: DatasetSpec,
     pub app: Arc<App>,
-    pub unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub on_schema_change: OnSchemaChange,
-    pub ready_state: ReadyState,
-    pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
-    pub vectors: Option<VectorStore>,
-    pub full_text_search: Option<spicepod::fts::FtsStore>,
-    pub check_availability: CheckAvailability,
+}
+
+impl Deref for Dataset {
+    type Target = DatasetSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
+}
+
+impl DerefMut for Dataset {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.spec
+    }
 }
 
 impl std::fmt::Debug for Dataset {
@@ -398,34 +88,22 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
+            .field("drasi", &self.drasi)
             .field("check_availability", &self.check_availability)
+            .field(
+                "check_availability_interval",
+                &self.check_availability_interval,
+            )
             .finish_non_exhaustive()
     }
 }
 
-// Implement a custom PartialEq for Dataset to ignore the app field
-// This allows the Runtime to compare datasets like-for-like between App reloads,
-// because different App instances will cause datasets that are exactly the same to be considered different.
+// Equality ignores the `app`/`runtime` handles — they are not part of a
+// dataset's identity — so the runtime can compare datasets like-for-like across
+// App reloads. It delegates to `DatasetSpec`'s configuration comparison.
 impl PartialEq for Dataset {
     fn eq(&self, other: &Self) -> bool {
-        self.from == other.from
-            && self.name == other.name
-            && self.access == other.access
-            && self.params == other.params
-            && self.has_metadata_table == other.has_metadata_table
-            && self.replication == other.replication
-            && self.time_column == other.time_column
-            && self.time_format == other.time_format
-            && self.time_partition_column == other.time_partition_column
-            && self.time_partition_format == other.time_partition_format
-            && self.acceleration == other.acceleration
-            && self.embeddings == other.embeddings
-            && self.columns == other.columns
-            && self.metrics == other.metrics
-            && self.on_schema_change == other.on_schema_change
-            && self.vectors == other.vectors
-            && self.full_text_search == other.full_text_search
-            && self.check_availability == other.check_availability
+        self.spec == other.spec
     }
 }
 
@@ -441,8 +119,8 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
-        self.params = params;
+    pub fn with_params(mut self, params: std::collections::HashMap<String, String>) -> Self {
+        self.spec.params = params;
         self
     }
 
@@ -462,227 +140,6 @@ impl Dataset {
         }
     }
 
-    /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
-    #[must_use]
-    pub fn source(&self) -> &str {
-        if self.from == "sink" || self.from.is_empty() {
-            return "sink";
-        }
-
-        match find_first_delimiter(&self.from) {
-            Some((0, _)) => "",
-            Some((pos, _)) => &self.from[..pos],
-            None => "spice.ai",
-        }
-    }
-
-    /// Returns the dataset path - the remainder of the `from` field after the first '://', ':', or '/'
-    #[must_use]
-    pub fn path(&self) -> &str {
-        match find_first_delimiter(&self.from) {
-            Some((pos, len)) => &self.from[pos + len..],
-            None => &self.from,
-        }
-    }
-
-    /// For [`Dataset`]s where the path in the `from` field is a [`TableReference`], parse and return the [`TableReference`].
-    ///
-    ///
-    pub fn parse_path(
-        &self,
-        case_sensitive: bool,
-        dialect: Option<&dyn Dialect>,
-    ) -> Result<TableReference> {
-        // Manually parse the table reference to avoid case folding.
-        if case_sensitive {
-            let path_str = self.path();
-            let dialect = dialect.unwrap_or(&GenericDialect {});
-            let mut parts = Parser::new(dialect)
-                .try_with_sql(path_str)
-                .context(UnableToParseTableReferenceFromPathSnafu {
-                    path: path_str.to_string(),
-                })?
-                .parse_multipart_identifier()
-                .context(UnableToParseTableReferenceFromPathSnafu {
-                    path: path_str.to_string(),
-                })?
-                .iter()
-                .map(|i| i.value.clone())
-                .collect::<Vec<_>>()
-                .into_iter();
-
-            let tbl = match (parts.next(), parts.next(), parts.next()) {
-                (Some(catalog), Some(schema), Some(table)) => TableReference::Full {
-                    catalog: catalog.into(),
-                    schema: schema.into(),
-                    table: table.into(),
-                },
-                (Some(schema), Some(table), None) => TableReference::Partial {
-                    schema: schema.into(),
-                    table: table.into(),
-                },
-                (Some(table), None, None) => TableReference::Bare {
-                    table: table.into(),
-                },
-                _ => TableReference::Bare {
-                    table: self.path().into(),
-                },
-            };
-            Ok(tbl)
-        } else {
-            Ok(self.path().into())
-        }
-    }
-
-    #[must_use]
-    pub fn refresh_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_check_interval;
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_cron(&self) -> Option<Arc<str>> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_cron.clone();
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_max_jitter(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && acceleration.refresh_jitter_enabled
-        {
-            // If `refresh_jitter_max` is not set, use 10% of `refresh_check_interval`.
-            return match acceleration.refresh_jitter_max {
-                Some(jitter) => Some(jitter),
-                None => self.refresh_check_interval().map(|i| i.mul_f64(0.1)),
-            };
-        }
-        None
-    }
-
-    pub fn retention_check_interval(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && let Some(retention_check_interval) = &acceleration.retention_check_interval
-        {
-            if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
-                return Some(duration);
-            }
-            tracing::warn!(
-                "Unable to parse retention check interval for dataset {}: {}",
-                self.name,
-                retention_check_interval
-            );
-        }
-
-        None
-    }
-
-    pub fn retention_period(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && let Some(retention_period) = &acceleration.retention_period
-        {
-            if let Ok(duration) = fundu::parse_duration(retention_period) {
-                return Some(duration);
-            }
-            tracing::warn!(
-                "Unable to parse retention period for dataset {}: {}",
-                self.name,
-                retention_period
-            );
-        }
-
-        None
-    }
-
-    #[must_use]
-    pub fn retention_sql(&self) -> Option<String> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.retention_sql.clone();
-        }
-
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_sql(&self) -> Option<String> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_sql.clone();
-        }
-
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_data_window(&self) -> Option<Duration> {
-        if let Some(acceleration) = &self.acceleration
-            && let Some(refresh_data_window) = &acceleration.refresh_data_window
-        {
-            if let Ok(duration) = fundu::parse_duration(refresh_data_window) {
-                return Some(duration);
-            }
-            tracing::warn!(
-                "Unable to parse refresh period for dataset {}: {}",
-                self.name,
-                refresh_data_window
-            );
-        }
-
-        None
-    }
-
-    #[must_use]
-    pub fn refresh_retry_enabled(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_enabled;
-        }
-        false
-    }
-
-    #[must_use]
-    pub fn refresh_retry_max_attempts(&self) -> Option<usize> {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.refresh_retry_max_attempts;
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn access(&self) -> AccessMode {
-        self.access
-    }
-
-    #[must_use]
-    pub fn is_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            return acceleration.enabled;
-        }
-
-        false
-    }
-
-    #[must_use]
-    pub fn is_file_accelerated(&self) -> bool {
-        if let Some(acceleration) = &self.acceleration {
-            if acceleration.engine == Engine::PostgreSQL {
-                return true;
-            }
-
-            return acceleration.enabled
-                && matches!(
-                    acceleration.mode,
-                    acceleration::Mode::File
-                        | acceleration::Mode::FileCreate
-                        | acceleration::Mode::FileUpdate
-                );
-        }
-
-        false
-    }
-
     #[must_use]
     pub async fn is_accelerator_initialized(&self) -> bool {
         if let Some(acceleration_settings) = &self.acceleration {
@@ -700,96 +157,6 @@ impl Dataset {
 
         false
     }
-
-    /// Get a parameter from the dataset's params, with a default value if the parameter is not set or is not valid.
-    ///
-    /// Returns `default_value` if the parameter is not set or is not valid.
-    ///
-    /// If the parameter is set but is not valid, logs a warning and returns `default_value`.
-    #[must_use]
-    pub fn get_param<T>(&self, param: &str, default_value: T) -> T
-    where
-        T: Display + FromStr,
-    {
-        let Some(value) = self.params.get(param) else {
-            return default_value;
-        };
-
-        if let Ok(parsed_value) = value.parse::<T>() {
-            parsed_value
-        } else {
-            tracing::warn!(
-                "Dataset {}: params.{param} is not valid, defaulting to {default_value}",
-                self.name
-            );
-            default_value
-        }
-    }
-
-    #[must_use]
-    pub fn has_embeddings(&self) -> bool {
-        !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
-    }
-
-    #[must_use]
-    pub fn has_full_text_column(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
-    }
-
-    /// Returns the dataset-level FTS engine name if configured and enabled.
-    /// e.g. `Some("elasticsearch")` when `full_text_search.engine: elasticsearch`.
-    #[must_use]
-    pub fn fts_engine(&self) -> Option<&str> {
-        self.full_text_search
-            .as_ref()
-            .filter(|fts| fts.enabled)
-            .and_then(|fts| fts.engine.as_deref())
-    }
-
-    /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
-    ///  1. Primary key defined in `.columns[].embeddings[].row_id`
-    ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
-    ///  3. Primary key defined in `.embeddings[].column_pk` (on the path to deprecation)
-    pub fn primary_key_override(&self) -> Option<Vec<String>> {
-        let pks_from_embeddings: Option<Vec<String>> =
-            self.embeddings.iter().find_map(|e| e.primary_keys.clone());
-
-        let mut pks_from_columns: Option<Vec<String>> = self
-            .columns
-            .iter()
-            .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
-
-        let pks_from_fts: Option<Vec<String>> = self
-            .columns
-            .iter()
-            .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
-
-        pks_from_columns = pks_from_columns.or(pks_from_fts);
-
-        let primary_keys = match (pks_from_columns, pks_from_embeddings) {
-            (Some(pks), None) | (None, Some(pks)) => pks,
-            (Some(pks), Some(_)) => {
-                tracing::warn!(
-                    "Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.",
-                    self.name
-                );
-                pks
-            }
-            (None, None) => return None,
-        };
-
-        Some(primary_keys)
-    }
-}
-
-/// Summarizes all full-text search configuration for a given [`Dataset`] (compared to the column-level [`FullTextSearchConfig`]).
-pub struct FullTextSearchDatasetConfig {
-    pub index_store: IndexStore,
-    pub index_path: Option<String>,
-    pub search_fields: Vec<String>,
-    pub primary_key: Vec<String>,
 }
 
 impl AccelerationSource for Dataset {
@@ -798,7 +165,8 @@ impl AccelerationSource for Dataset {
     }
 
     fn is_file_accelerated(&self) -> bool {
-        self.is_file_accelerated()
+        // Deref resolves to `DatasetSpec::is_file_accelerated`.
+        DatasetSpec::is_file_accelerated(self)
     }
 
     fn app(&self) -> Arc<app::App> {
@@ -815,6 +183,12 @@ impl AccelerationSource for Dataset {
 
     fn name(&self) -> &TableReference {
         &self.name
+    }
+
+    fn connector_name(&self) -> Option<&str> {
+        // `DatasetSpec::source()` is the authoritative `from:` parse: it recognizes
+        // `://`, `:` AND `/` as delimiters and maps an empty value to `sink`.
+        Some(DatasetSpec::source(self))
     }
 
     fn time_column(&self) -> Option<&str> {

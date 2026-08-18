@@ -57,6 +57,46 @@ forbid = [["extension-utility", "runtime"]]
 # clickhouse-rs now lives only in connector-clickhouse (provider + pool + block
 # decoder all moved out of data_components / db_connection_pool / arrow_sql_gen).
 clickhouse-rs = ["connector-clickhouse"]
+# The mongodb driver moved out of data_components into connector-mongodb (runtime keeps it as a
+# dev-dep-exempt test dependency; the spice_sys/mongodb resume-token checkpoint stores JSON, no driver). spidapter is the MongoDB bench/adapter tool.
+mongodb = ["connector-mongodb", "spidapter"]
+
+# The DynamoDB AWS SDK drivers moved out of runtime + data_components into
+# connector-dynamodb. `dynamodb-streams` is the low-level streams client the
+# connector builds on; `testoperator`/`spidapter` drive DynamoDB in bench/adapter
+# tooling. runtime keeps aws-sdk-dynamodb only as a (dev-dep-exempt) test dependency,
+# so it is intentionally absent here — a normal-dep regression into runtime/
+# data_components would fail this guard.
+aws-sdk-dynamodbstreams = ["connector-dynamodb", "dynamodb-streams"]
+aws-sdk-dynamodb = ["connector-dynamodb", "dynamodb-streams", "testoperator", "spidapter"]
+
+# git2 now lives only in connector-git (the git provider moved out of data_components).
+git2 = ["connector-git"]
+
+# The IMAP driver stack (imap client + charset + mailparse) moved out of
+# data_components into connector-imap.
+charset = ["connector-imap"]
+imap = ["connector-imap"]
+mailparse = ["connector-imap"]
+
+# scylla now lives only in connector-scylladb (provider + pool + connection all moved
+# out of data_components / db_connection_pool), like clickhouse-rs.
+scylla = ["connector-scylladb"]
+
+# odbc-api + arrow-odbc now live only in connector-odbc (provider + pool + connection
+# all moved out of data_components / db_connection_pool), like clickhouse-rs.
+odbc-api = ["connector-odbc"]
+arrow-odbc = ["connector-odbc"]
+# Azure Cosmos DB provider (client + resilience + schema inference) moved out of
+# data_components into connector-cosmosdb. `azure_data_cosmos` is Cosmos-specific
+# and now lives only there. (`azure_core` is intentionally NOT confined — it is
+# shared by runtime/runtime-secrets for Azure Blob storage + Key Vault secrets.)
+azure_data_cosmos = ["connector-cosmosdb"]
+
+# SharePoint/OneDrive provider (Graph client + object-store + auth + table)
+# moved out of data_components into connector-sharepoint. The Microsoft Graph
+# SDK now lives only there.
+graph-rs-sdk = ["connector-sharepoint"]
 
 # Path-prefix rules (checked after per-crate overrides, in order).
 [[rules]]
@@ -78,9 +118,48 @@ tier = "foundation"
 # Per-crate overrides win over rules.
 [override]
 runtime = "runtime"
+# Config-only component specs (DatasetSpec/CatalogSpec/ViewSpec + their config
+# submodules) carved out of the `runtime` crate body. It names nothing from
+# `runtime` (no Arc<Runtime>/App/secrets/datafusion) and its own deps are all
+# shared-utility/foundation, so it sits below `runtime` — which is what lets the
+# interface crates a connector needs (data-connector-api) name a component's
+# configuration without pulling in the orchestrator.
+runtime-component = "shared-utility"
+# Connector HTTP rate control carved out of the `runtime` crate body: the
+# per-dataset parameters, the process-wide per-origin registry, and its metrics.
+# `shared-utility`, NOT `extension-utility`, even though it is a connector-facing
+# building block: `runtime`'s own in-body https connector uses it, and
+# extension-utility may not be depended on by `runtime`. It becomes eligible to
+# move up once that connector is evacuated (see docs/dev/crate_layering.md).
+data-http-rate-control = "shared-utility"
+# The table-provider layers carved out of the `runtime` crate body: the
+# `AcceleratedTable` machinery (refresh/retention/CDC-apply/caching) and the
+# `FederatedTable` it wraps. An *implementation* sibling of `runtime`, not a
+# contract, so it stays in the `runtime` tier rather than shared-utility — that is
+# what keeps extensions from building on it (see the extension -> runtime-impl
+# rule in docs/dev/crate_layering.md). It reaches `runtime` types only through
+# the narrow `RefreshSource` trait it defines itself, so nothing pulls the
+# orchestrator back in.
+runtime-table = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
+# TEMPORARY (see docs/dev/crate_layering.md). This crate lives under
+# crates/data-connectors/ (which the path rule would place in `extension`), but
+# it is a leaf helper — its entire workspace-internal dep closure is empty (only
+# external deps: datafusion-common, datafusion-table-providers, snafu,
+# tokio-postgres). It holds the PostgreSQL catalog/CDC-support queries
+# (list_schemas/list_tables/primary_key_columns/check_cdc_prerequisites), which
+# `data_components::postgres::provider` re-exports so `runtime` reaches them
+# WITHOUT a direct dependency on a connector-* crate. Placing it in
+# `shared-utility` keeps the data_components -> connector-postgres-common edge a
+# legal same-tier dep. The eventual goal is to consolidate ALL PostgreSQL
+# functionality — `data_components::postgres`, this crate, and
+# `runtime::catalogconnector::postgres_accelerated` — into a single
+# `connector-postgres` crate that owns the CDC mechanisms; once runtime no longer
+# depends (even transitively via re-export) on these queries, drop this override
+# so the crate returns to the default `extension` tier.
+connector-postgres-common = "shared-utility"
 
 # --- foundation: near-dependency-free utilities + config/platform primitives.
 # (crates/ libraries whose full normal-dep closure stays within foundation.)
@@ -88,6 +167,10 @@ ansi_colors = "foundation"
 arrow_tools = "foundation"
 aws-sdk-credential-bridge = "foundation"
 chunking = "foundation"
+# Shared by implementations outside this repo via a git dependency, so its
+# dependency closure has to stay small — foundation is also a budget here.
+cloud-connect-crypto = "foundation"
+cpu-budget = "foundation"
 dataformat-json = "foundation"
 datafusion-dml = "foundation"
 datafusion-flightsql = "foundation"
@@ -108,14 +191,38 @@ otel-arrow = "foundation"
 repl = "foundation"
 runtime-api-types = "foundation"
 runtime-async = "foundation"
+# Interface crate: the accelerator (runtime side) satisfies CheckpointStore; a
+# connector only calls it, so it lives low (foundation) below both.
+runtime-checkpoint-api = "foundation"
+# The model-provider contracts, one per capability. Split because their dependency
+# sets are nearly disjoint (see docs/dev/crate_layering.md, "How finely to split a
+# family"): a reranker vendor is a small HTTP client and has no business waiting on
+# `cache`/`chunking`/`hf-hub`, which only the embedding contract needs.
+#
+# `chat-api` and `rerank-api` are foundation: their whole closure is external crates
+# plus `spicepod`. Keeping them there is the constraint — a contract that grows a
+# shared-utility dependency has stopped being a thin interface, and the guard says so.
+# `embed-api` is assigned explicitly rather than left to `default_tier`, so that
+# changing the default can never silently relocate it away from `cache`/`hf-hub`.
+chat-api = "foundation"
+embed-api = "shared-utility"
+rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
+spice-table = "foundation"
 runtime-metrics = "foundation"
 runtime-object-store = "foundation"
 runtime-parameter-spec = "foundation"
+runtime-parameters-typed = "foundation"
 runtime-proto = "foundation"
 runtime-query-engine = "foundation"
 runtime-rate-control = "foundation"
+# Host/container resource introspection (cgroup-aware memory totals, process usage
+# monitoring). A leaf utility whose only workspace dep is `util`, so it belongs at
+# foundation — stated explicitly rather than left to `default_tier`, which would
+# silently place it in shared-utility.
+runtime-resources = "foundation"
+runtime-status = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"
 scheduler = "foundation"
@@ -123,6 +230,7 @@ smb = "foundation"
 spice-cloud-client = "foundation"
 spicepod = "foundation"
 system-open = "foundation"
+tantivy_datafusion_filter = "foundation"
 telemetry = "foundation"
 token_provider = "foundation"
 tools = "foundation"
@@ -134,11 +242,12 @@ yaml = "foundation"
 # --- shared-utility: composable libraries the runtime is built from (default
 # tier, but listed here for clarity / auditability). Everything else defaults to
 # `shared-utility`:
-#   app, cache, cayenne, data_components, datafusion-ddl,
+#   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
 #   datafusion-optimizer-rules, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
-#   runtime-parameters, runtime-request-context, runtime-search, runtime-secrets,
-#   runtime-table-partition, runtime-tools, search, test-framework, workers
+#   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
+#   runtime-secrets, runtime-table-partition, runtime-tools, search,
+#   test-framework, workers
 #
 # --- extension-utility: connector-specific building blocks that only extensions
 # depend on (never `runtime`). Populated as the data_components monolith is

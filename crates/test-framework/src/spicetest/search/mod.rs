@@ -24,7 +24,9 @@ use crate::{
         Builder, BuilderTarget, ExtendedMetrics, MetricCollector, QueryMetric, QueryStatus,
         StatisticsCollector, system_time_to_unix_epoch_ms,
     },
-    spicetest::search::evaluate::calculate_ndcg,
+    spicetest::search::evaluate::{
+        calculate_retrieval_metrics, calculate_retrieval_metrics_at_all_k,
+    },
 };
 use anyhow::{Context, Result};
 use arrow::{
@@ -37,6 +39,7 @@ use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 
 mod evaluate;
 mod worker;
+pub use evaluate::RetrievalMetrics;
 pub use worker::SearchResult;
 pub use worker::{SearchConfig, SearchRequest};
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
@@ -182,27 +185,49 @@ impl SpiceTest<Completed> {
 
         #[expect(clippy::cast_precision_loss)]
         let total_requests = self.state.search_results.len() as f64;
-        if total_duration.as_secs() == 0 {
+        let seconds = total_duration.as_secs_f64();
+        if seconds <= 0.0 {
             return Ok(total_requests);
         }
-        Ok(total_requests / total_duration.as_secs_f64())
+        Ok(total_requests / seconds)
     }
 
-    /// Calculate overall search score metric based on the search results and query relevance data.
-    /// The `transform` function is used to convert the search results into a format suitable for
-    /// evaluation
-    pub fn calculate_search_score_metric<S, F>(
+    /// Calculate retrieval-quality metrics (NDCG, Recall, MRR, Precision, all at the same rank
+    /// cutoff) based on the search results and query relevance data. The `transform` function is
+    /// used to convert the search results into a format suitable for evaluation.
+    pub fn calculate_search_score_metrics<S, F>(
         &self,
         qrels: &HashMap<String, HashMap<String, i32, S>, S>,
         transform: F,
-    ) -> Result<f64>
+    ) -> Result<RetrievalMetrics>
     where
         S: ::std::hash::BuildHasher,
         F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
     {
         let transformed_results = transform(&self.state.search_results);
-        // Similar to MTEB, use NDCG@10 as the main metric for search score
-        Ok(calculate_ndcg(qrels, &transformed_results, 10))
+        // Matches MTEB's methodology of evaluating retrieval quality at rank cutoff 10.
+        calculate_retrieval_metrics(qrels, &transformed_results, 10)
+    }
+
+    /// Calculate retrieval-quality metrics (NDCG, Recall, MRR, Precision) at every rank cutoff `k`
+    /// in `1..=n`, where `n` is the largest number of results returned for any query. Computing the
+    /// full metric-vs-`k` curve requires no additional search — it is post-processing over the
+    /// already-ranked results. The `transform` function converts the search results into a format
+    /// suitable for evaluation. The returned map is keyed by `k` (ascending).
+    pub fn calculate_search_score_metrics_at_all_k<S, F>(
+        &self,
+        qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+        transform: F,
+    ) -> Result<BTreeMap<usize, RetrievalMetrics>>
+    where
+        S: ::std::hash::BuildHasher,
+        F: Fn(&BTreeMap<String, SearchResult>) -> HashMap<String, HashMap<String, f64, S>, S>,
+    {
+        let transformed_results = transform(&self.state.search_results);
+        Ok(calculate_retrieval_metrics_at_all_k(
+            qrels,
+            &transformed_results,
+        ))
     }
 }
 
@@ -277,7 +302,11 @@ impl SearchScoreMetric {
 pub struct SearchRunMetric {
     pub rps: f64,
     pub p95_latency_ms: f64,
+    /// NDCG@10 (kept as `score` for telemetry backward-compatibility).
     pub score: f64,
+    pub recall: f64,
+    pub mrr: f64,
+    pub precision: f64,
 }
 impl ExtendedMetrics for SearchRunMetric {
     fn fields() -> Vec<Field> {
@@ -285,6 +314,9 @@ impl ExtendedMetrics for SearchRunMetric {
             Field::new("rps", DataType::Float64, false),
             Field::new("p95_latency_ms", DataType::Float64, false),
             Field::new("score", DataType::Float64, false),
+            Field::new("recall", DataType::Float64, false),
+            Field::new("mrr", DataType::Float64, false),
+            Field::new("precision", DataType::Float64, false),
         ]
     }
 
@@ -296,6 +328,15 @@ impl ExtendedMetrics for SearchRunMetric {
             Builder::Float64(Float64Builder::new()),
         );
         builders.insert("score".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "recall".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
+        builders.insert("mrr".to_string(), Builder::Float64(Float64Builder::new()));
+        builders.insert(
+            "precision".to_string(),
+            Builder::Float64(Float64Builder::new()),
+        );
         builders
     }
 
@@ -304,16 +345,29 @@ impl ExtendedMetrics for SearchRunMetric {
             BuilderTarget::Float64(("rps".to_string(), self.rps)),
             BuilderTarget::Float64(("p95_latency_ms".to_string(), self.p95_latency_ms)),
             BuilderTarget::Float64(("score".to_string(), self.score)),
+            BuilderTarget::Float64(("recall".to_string(), self.recall)),
+            BuilderTarget::Float64(("mrr".to_string(), self.mrr)),
+            BuilderTarget::Float64(("precision".to_string(), self.precision)),
         ])
     }
 }
 impl SearchRunMetric {
     #[must_use]
-    pub fn new(rps: f64, p95_latency_ms: f64, score: f64) -> Self {
+    pub fn new(
+        rps: f64,
+        p95_latency_ms: f64,
+        score: f64,
+        recall: f64,
+        mrr: f64,
+        precision: f64,
+    ) -> Self {
         Self {
             rps,
             p95_latency_ms,
             score,
+            recall,
+            mrr,
+            precision,
         }
     }
 }

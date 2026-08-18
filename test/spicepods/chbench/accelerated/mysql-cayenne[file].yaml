@@ -31,7 +31,7 @@ datasets:
     name: warehouse
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1001'
     acceleration: &cayenne_accel
       enabled: true
@@ -46,7 +46,7 @@ datasets:
     name: district
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1002'
     acceleration:
       <<: *cayenne_accel
@@ -58,7 +58,7 @@ datasets:
     name: customer
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1003'
     acceleration:
       <<: *cayenne_accel
@@ -70,7 +70,7 @@ datasets:
     name: new_order
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1004'
     acceleration:
       <<: *cayenne_accel
@@ -82,7 +82,7 @@ datasets:
     name: oorder
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1005'
     acceleration:
       <<: *cayenne_accel
@@ -94,7 +94,7 @@ datasets:
     name: order_line
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1006'
     acceleration:
       <<: *cayenne_accel
@@ -106,7 +106,7 @@ datasets:
     name: stock
     params:
       <<: *mysql_params
-      mysql_replication_snapshot_mode: auto
+      mysql_replication_initial_snapshot: auto
       mysql_replication_server_id: '1007'
     acceleration:
       <<: *cayenne_accel

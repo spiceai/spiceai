@@ -74,17 +74,41 @@ limitations under the License.
 //!
 //! # Backpressure vs. server liveness
 //!
-//! A slow member sink backpressures the pump: `deliver_commit` blocks on the
-//! member channel, which stops the pump calling `client.recv()`, which lets
-//! events pile up in the `pgwire_replication` worker's channel. What keeps this
-//! from killing the connection is the **worker** (`pgwire_replication`'s
-//! `send_event`): it keeps emitting standby status feedback on `status_interval`
-//! while its own channel is full, so Postgres never hits `wal_sender_timeout`.
-//! The pump-side handling here ([`MEMBER_SEND_STALL_WARN`], the `send_timeout`
-//! loop in `deliver_commit`) is therefore *not* what prevents server-side
-//! timeout — it exists only for observability (the
-//! `dataset_postgres_replication_member_send_stalled_seconds_total` counter) and
-//! to keep the pump's shutdown check responsive while a member stalls.
+//! Committed changes reach a member through two coalescing stages, both folding
+//! raw pgoutput-message chunks without decoding a tuple:
+//!
+//! 1. The pump briefly holds one unpublished envelope **per member**
+//!    ([`EagerHold`]) and folds consecutive commits for that table into it, until
+//!    the eager row limit fills it or [`DEFAULT_MAX_ENVELOPE_AGE`] elapses from
+//!    the *first* commit it absorbed. The age bound is what keeps a low-traffic
+//!    table from being held indefinitely.
+//! 2. Publishing appends to the member's bounded coalescing mailbox, folding into
+//!    the unclaimed incoming tail with no age limit — a stalled sink therefore
+//!    collapses envelopes rather than multiplying them. The receiver atomically
+//!    swaps the published vector and drains it without pump involvement.
+//!
+//! The two stages are deliberately asymmetric. Stage 1 is the throughput lever
+//! and carries the working limits; stage 2 only engages once a member's sink has
+//! stopped draining, so its bounds
+//! ([`DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE`],
+//! [`DEFAULT_MAX_MAILBOX_BYTES`]) ship low — enough to blunt a transient stall
+//! without letting buffered memory drift far above what stage 1 already implies.
+//! Once the mailbox can neither merge nor admit, `deliver_commit` backpressures
+//! the pump, which stops it calling `client.recv()` and lets events pile up in
+//! the `pgwire_replication` worker's channel. The worker keeps emitting standby
+//! status feedback on `status_interval`, so Postgres never hits
+//! `wal_sender_timeout`.
+//!
+//! Observability, per member:
+//! `..._member_envelopes_delivered_total` against `..._wal_transactions_total`
+//! gives the coalescing factor the accelerator's apply loop sees;
+//! `..._envelope_{eager,mailbox}_merges_total` attribute it between the stages;
+//! and `..._member_mailbox_coalesce_limited_total` reports when stage 2's low
+//! bounds are what refused a fold — a flat zero means they never bind, a rising
+//! value is the evidence for raising them.
+//!
+//! The pump-side [`MEMBER_SEND_STALL_WARN`] loop is therefore for
+//! observability and shutdown responsiveness, not server-side liveness.
 //!
 //! # Lifecycle
 //!
@@ -96,27 +120,40 @@ limitations under the License.
 //! - Fatal errors (auth, decode, slot dropped) are broadcast to all members.
 //! - The pump exits and deregisters once every member has detached; a later
 //!   subscriber starts a fresh pump that resumes from the slot.
+//! - *Not yet attached* is the same situation as detached and gets the same
+//!   hold. On a resuming slot the first member to attach reserves a floor at
+//!   the slot's resume LSN for every published table with no member, so a
+//!   dataset that joins later is not seated at a position a slot-mate was
+//!   credited to — above changes it never consumed (#12609). Its member takes
+//!   the hold over on registration. A hold nothing claims within
+//!   the configured unclaimed-reservation grace (a table left in the publication by a
+//!   removed dataset) would pin WAL forever, so the table is dropped from the
+//!   publication — which is what makes releasing its floor safe — and logged at
+//!   ERROR.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream, task::AtomicWaker};
+use parking_lot::Mutex as ParkingMutex;
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationEvent, TryRecvEvent};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::Notify;
 
 use bytes::Bytes;
 
 use super::{
-    Error, ReplicationMetricsCollector, ReplicationStreamInput, Result, bootstrap,
-    changes::PgChangeRows, client, config::ReplicationParams, pgoutput, resilience, slot,
+    AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
+    Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
+    config::ReplicationParams, pgoutput, resilience, schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
-use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
+use crate::cdc::{
+    ChangeEnvelope, ChangeRows, ChangesStream, CommitChange, CommitError, StreamError,
+};
 use crate::postgres_replication::pgoutput::RelationId;
 
 /// A resolved route for one relation, cached at `Relation` time. Bundling the
@@ -127,6 +164,12 @@ struct Route {
     key: MemberKey,
     member: Arc<MemberHandle>,
     slot: Arc<AckSlot>,
+    /// The member's *current* working schema: its registered schema plus any
+    /// mid-stream widening adopted by the per-member [`RelationSchemaTracker`]
+    /// (see [`handle_relation`]). Under [`SchemaEvolutionPolicy::Block`] this is
+    /// just the registered `member.schema`. `deliver_commit` builds each
+    /// `PgChangeRows` against this so an adopted column reaches the accelerator.
+    working_schema: SchemaRef,
 }
 
 /// Per-connection routing table: relation id -> resolved [`Route`]. `FxHashMap`
@@ -141,22 +184,221 @@ type RouteMap = FxHashMap<RelationId, Route>;
 /// `FxHashMap` for the same hot-path reason as [`RouteMap`].
 type TxnBuffer = FxHashMap<RelationId, Vec<Bytes>>;
 
-/// Default bounded per-member delivery queue depth (envelopes), overridable via
+/// Pump-local, per-member schema-evolution state. Held in a map that PERSISTS
+/// across reconnects (see `run_pump`, matching the former dedicated path): an
+/// adopted mid-stream column add / lossless widening must survive a transient
+/// disconnect, or the first `Relation` after reconnect (a tracker "first
+/// observation") would fail to re-adopt it and silently drop the column's
+/// values. A removed member's entry is cleared in [`handle_relation`].
+#[derive(Default)]
+struct MemberSchemaState {
+    /// Adopts mid-stream widening under a non-[`SchemaEvolutionPolicy::Block`]
+    /// policy; `None` under `Block`, where the working schema is fixed.
+    tracker: Option<RelationSchemaTracker>,
+    /// `Block`-mode observability only: the source column set last seen, so a
+    /// mid-stream column add is warned about exactly once (under `Block` the
+    /// new column is dropped because the working schema stays fixed).
+    known_columns: Option<HashSet<String>>,
+    /// The member registration this state was seeded from. Because the state
+    /// persists across reconnects and is keyed only by source `(schema, table)`,
+    /// a detach + re-subscribe for the same table with a *different* registered
+    /// schema / policy / primary keys (e.g. a config reload while the shared
+    /// pump keeps running) would otherwise reuse a tracker built on stale
+    /// assumptions and mis-shape the `ChangeBatch`. [`handle_relation`] rebuilds
+    /// the state whenever this no longer matches the current member.
+    seed: Option<MemberSeed>,
+}
+
+/// Fingerprint of the member registration a [`MemberSchemaState`] was built for.
+struct MemberSeed {
+    dataset_name: String,
+    schema: SchemaRef,
+    policy: SchemaEvolutionPolicy,
+    primary_keys: Vec<String>,
+}
+
+impl MemberSeed {
+    fn of(member: &MemberHandle) -> Self {
+        Self {
+            dataset_name: member.dataset_name.clone(),
+            schema: Arc::clone(&member.schema),
+            policy: member.policy,
+            primary_keys: member.primary_keys.clone(),
+        }
+    }
+
+    fn matches(&self, member: &MemberHandle) -> bool {
+        // `dataset_name` is included so a rename (same source table + schema)
+        // rebuilds the tracker — it embeds the dataset name in its warnings, so a
+        // reused tracker would misattribute schema-evolution logs to the old name.
+        self.dataset_name == member.dataset_name
+            && self.policy == member.policy
+            && self.primary_keys == member.primary_keys
+            && self.schema == member.schema
+    }
+}
+
+/// Pump-local map of per-member schema state, keyed like [`RouteMap`].
+type MemberSchemaStates = FxHashMap<MemberKey, MemberSchemaState>;
+
+/// Default bounded per-member mailbox depth (envelopes), overridable via
 /// `pg_replication_member_channel_capacity`
 /// ([`ReplicationParams::member_channel_capacity`]). When one member's sink
-/// stops draining the pump blocks on its channel and the whole shared stream
-/// pauses (in addition to the WAL pinning the ack floor already causes) —
-/// bounded memory is preferred over unbounded buffering behind a stalled sink.
-/// This queue sits in front of the accelerator's much larger prefetch buffer,
-/// so a too-shallow value turns a member's transient stall into slot-wide
-/// head-of-line blocking; the default is deep enough to absorb a burst without
-/// transmitting one member's stall to the whole slot.
+/// stops draining, compatible source transactions continue coalescing into the
+/// newest envelope. The pump blocks only when the mailbox can neither merge nor
+/// admit another envelope. Bounded memory is preferred over unbounded buffering
+/// behind a stalled sink.
 pub const DEFAULT_MEMBER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum time the pump holds an unpublished raw envelope for eager
+/// coalescing, measured from the first source transaction it contains.
+const DEFAULT_MAX_ENVELOPE_AGE: std::time::Duration = std::time::Duration::from_millis(10);
+const MAX_MAX_ENVELOPE_AGE_MS: u64 = 60_000;
+
+/// Output-row limit for the pump's eager hold: how large one envelope may grow
+/// before it is published. A single source transaction may exceed it and is
+/// still admitted intact; the limit only prevents folding in another.
+const DEFAULT_MAX_ROWS_PER_ENVELOPE: usize = 8_192;
+const MAX_MAX_ROWS_PER_ENVELOPE: usize = 1_048_576;
+
+/// Row limit for mailbox-tail folding — deliberately a quarter of the eager
+/// limit.
+///
+/// Mailbox folding is a back-pressure absorber, not a throughput lever: it only
+/// engages once a member's sink has stopped draining, and measurement shows the
+/// eager hold already collapses envelopes ~46x before anything reaches the
+/// mailbox. So the default is set low enough to blunt a transient stall while
+/// keeping buffered memory close to what the eager stage alone implies, and
+/// `member_mailbox_coalesce_limited_total` reports when the bound actually binds
+/// — that counter, not a guess, is the signal to raise it.
+const DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE: usize = 2_048;
+
+/// Ceiling on the estimated Arrow bytes one member's mailbox may hold across
+/// every buffered envelope (see [`MemberMailbox::buffered_bytes`]).
+///
+/// Two effects make an item count alone a poor memory bound. The eager hold
+/// already puts tens of transactions in each queued envelope, so `max_items`
+/// envelopes is tens of times more data than the one-transaction-per-envelope
+/// shape it was sized for; and tail folding only ever targets the newest
+/// unclaimed envelope, so a stalled sink fills each of `max_items` envelopes to
+/// the row limit in turn. This budget bounds both, and is set to the same order
+/// as the eager stage's natural footprint at measured transaction shapes rather
+/// than to the accelerator's much larger `max_coalesced_bytes`. Raise it only
+/// against evidence from `member_mailbox_coalesce_limited_total`.
+const DEFAULT_MAX_MAILBOX_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MAX_MAILBOX_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct CoalescingLimits {
+    max_envelope_age: std::time::Duration,
+    eager_max_rows: usize,
+    backpressure_max_rows: usize,
+    max_mailbox_bytes: usize,
+}
+
+/// Process-wide coalescing limits, read once from the environment.
+///
+/// These are operator escape hatches for the shared pump's internal batching, not
+/// dataset configuration — nothing about a Spicepod should need to name them, and
+/// the defaults are what every deployment runs:
+///
+/// - `SPICE_POSTGRES_CDC_MAX_ENVELOPE_AGE_MS` (10, max 60000) — how long the pump
+///   may hold a member's envelope open. `0` publishes every commit straight
+///   through, disabling stage 1 entirely.
+/// - `SPICE_POSTGRES_CDC_MAX_ROWS_PER_ENVELOPE` (8192, max 1048576) — rows at
+///   which a held envelope is published.
+/// - `SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE` (2048, max 1048576) —
+///   rows at which mailbox-tail folding seals an envelope.
+/// - `SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES` (32 MiB, max 8 GiB) — estimated Arrow
+///   bytes one member's mailbox may hold in total.
+///
+/// The last two are the stage-2 bounds and ship low on purpose; raise them
+/// against `..._member_mailbox_coalesce_limited_total`, not on a guess.
+static COALESCING_LIMITS: LazyLock<CoalescingLimits> = LazyLock::new(|| CoalescingLimits {
+    max_envelope_age: std::time::Duration::from_millis(env_u64_in_range(
+        "SPICE_POSTGRES_CDC_MAX_ENVELOPE_AGE_MS",
+        u64::try_from(DEFAULT_MAX_ENVELOPE_AGE.as_millis()).unwrap_or(10),
+        MAX_MAX_ENVELOPE_AGE_MS,
+    )),
+    eager_max_rows: env_usize_in_range(
+        "SPICE_POSTGRES_CDC_MAX_ROWS_PER_ENVELOPE",
+        DEFAULT_MAX_ROWS_PER_ENVELOPE,
+        MAX_MAX_ROWS_PER_ENVELOPE,
+    ),
+    backpressure_max_rows: env_usize_in_range(
+        "SPICE_POSTGRES_CDC_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE",
+        DEFAULT_MAX_BACKPRESSURE_ROWS_PER_ENVELOPE,
+        MAX_MAX_ROWS_PER_ENVELOPE,
+    ),
+    max_mailbox_bytes: env_usize_in_range(
+        "SPICE_POSTGRES_CDC_MAX_MAILBOX_BYTES",
+        DEFAULT_MAX_MAILBOX_BYTES,
+        MAX_MAX_MAILBOX_BYTES,
+    ),
+});
+
+fn env_u64_in_range(name: &'static str, default: u64, max: u64) -> u64 {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.parse::<u64>() {
+        Ok(value) if value <= max => value,
+        _ => {
+            tracing::warn!(
+                environment_variable = name,
+                value = %raw,
+                default,
+                max,
+                "invalid shared Postgres CDC mailbox setting; using default"
+            );
+            default
+        }
+    }
+}
+
+fn env_usize_in_range(name: &'static str, default: usize, max: usize) -> usize {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.parse::<usize>() {
+        Ok(value) if value > 0 && value <= max => value,
+        _ => {
+            tracing::warn!(
+                environment_variable = name,
+                value = %raw,
+                default,
+                max,
+                "invalid shared Postgres CDC mailbox setting; using default"
+            );
+            default
+        }
+    }
+}
 
 /// Upper bound on how long the pump blocks in `recv()` before re-checking
 /// membership (joins, dropped receivers). Idle Postgres servers can go tens
 /// of seconds between messages; this keeps membership changes responsive.
 const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the shared slot holds its ack floor for a published table whose
+/// dataset has not joined (see `SharedSource::install_reservations`) before
+/// giving up on it: dropping the table from the publication and releasing the
+/// hold. Sized to comfortably cover a runtime loading many datasets — and a
+/// catalog that discovers and attaches its members over several refreshes —
+/// since expiring a hold early costs that dataset a full re-snapshot.
+pub const DEFAULT_UNCLAIMED_RESERVATION_GRACE: std::time::Duration =
+    std::time::Duration::from_mins(5);
+
+/// How often idle members' recorded applied positions are carried forward to the
+/// slot's acknowledged position (see [`flush_idle_watermarks`]).
+///
+/// Sized against what it protects rather than against freshness: a graceful shutdown
+/// flushes on its way out, so this only bounds how stale a *crash* leaves the record,
+/// and a stale record costs one rebuild rather than a wrong resume. Long enough that
+/// a slot with many quiet tables writes rarely, short enough that a crash-looping
+/// process does not rebuild every table every time.
+pub const DEFAULT_WATERMARK_FLUSH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 /// Yield to the Tokio scheduler after draining this many buffered events via the
 /// non-blocking `try_recv` fast path. Most `handle_decoded` branches (Insert /
@@ -233,8 +475,26 @@ struct MemberHandle {
     /// pgoutput `Relation` messages by Postgres design; tolerated during
     /// schema validation and applied as NULL.
     generated_columns: Vec<String>,
-    sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
+    /// The dataset's `on_schema_change` policy. Drives the per-member
+    /// [`RelationSchemaTracker`] in [`handle_relation`]: under a non-`Block`
+    /// policy a mid-stream source column add / lossless type widening is adopted
+    /// into the member's working schema (the runtime apply loop then reconciles
+    /// the wider batch against the accelerator). Under `Block` the schema is
+    /// fixed and a new source column is validated-then-dropped with a warning.
+    policy: SchemaEvolutionPolicy,
+    sender: MemberMailboxSender,
     metrics: Arc<ReplicationMetricsCollector>,
+    /// Lag-based readiness threshold for this member's dataset. WAL envelopes
+    /// and idle keepalive heartbeats are flagged `is_dataset_ready` when their
+    /// source-commit time is within this of now, so the dataset becomes Ready
+    /// only once it has caught up to the source head.
+    ready_lag: std::time::Duration,
+    /// Where this member's applied-LSN watermark is recorded. Only
+    /// [`run_applied_lsn_writer`] writes it, which is what keeps concurrent
+    /// producers from landing out of order.
+    applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// Wakes the applied-position writer when this member publishes a position.
+    watermark_notify: Arc<Notify>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -272,12 +532,40 @@ const STREAMING: u8 = 0b100;
 struct AckSlot {
     /// Highest commit LSN durably applied by this member's sink.
     committed: AtomicU64,
-    /// Highest commit LSN delivered into this member's channel.
+    /// Highest commit LSN staged for this member, either in the pump-local eager
+    /// coalescer or its mailbox.
     delivered: AtomicU64,
     /// [`LIVE`] | [`SNAPSHOTTING`] | [`STREAMING`] bitflags. Mutated only under
     /// the [`AckTable`] write lock (register/detach/promote/snapshot-finished);
     /// read lock-free everywhere else.
     state: AtomicU8,
+    /// Highest LSN *durably recorded* in this member's applied-position store, or
+    /// 0 when nothing has been recorded for it yet.
+    ///
+    /// Set only after a store write succeeds, which is what makes it usable as a
+    /// durability gate: both committers that write it are either deferral-gated
+    /// (`SharedLsnCommitter`, held until the covering checkpoint is durable) or
+    /// deferral-refusing (`SnapshotWatermarkCommitter`, so the snapshot's rows are
+    /// durable before its watermark claims them). A non-zero value therefore means
+    /// "everything at or below this LSN is durably in the acceleration", which is
+    /// the premise [`flush_idle_watermarks`] needs before it may carry the position
+    /// forward over an interval that contained nothing to apply.
+    ///
+    /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
+    /// used), so it adds no false sharing.
+    recorded: AtomicU64,
+    /// Highest position *proven durable and eligible to record*, published by
+    /// whichever producer established it — an envelope commit, a snapshot/rebuild
+    /// boundary, or the idle carry-forward sweep — and drained by the single
+    /// applied-position writer ([`run_applied_lsn_writer`]).
+    ///
+    /// Producers advance it with a monotonic max rather than a store, because they
+    /// run on different tasks and can publish out of order; taking the max makes
+    /// "the furthest position anyone has proven" observable at any instant without
+    /// a lock, and makes a late straggler a no-op instead of a regression. Starts at
+    /// 0: a position is only ever published by something that has proven it durable,
+    /// never by registration.
+    pending: AtomicU64,
 }
 
 impl AckSlot {
@@ -286,6 +574,22 @@ impl AckSlot {
             committed: AtomicU64::new(at),
             delivered: AtomicU64::new(at),
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
+            recorded: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+        }
+    }
+
+    /// A floor held for a published table that has no member yet — the same
+    /// state a detached member is left in (no [`LIVE`], no [`STREAMING`]), so
+    /// it is never routed to and never credited, but its `committed` counts
+    /// toward the slot-level floor. See [`AckTable::reserve`].
+    fn reserved(at: u64) -> Self {
+        Self {
+            committed: AtomicU64::new(at),
+            delivered: AtomicU64::new(at),
+            state: AtomicU8::new(0),
+            recorded: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
         }
     }
 
@@ -297,14 +601,37 @@ impl AckSlot {
         self.delivered.load(Ordering::Acquire)
     }
 
+    /// The highest position durably recorded for this member, 0 if none.
+    fn recorded(&self) -> u64 {
+        self.recorded.load(Ordering::Acquire)
+    }
+
+    /// Note that `lsn` is now durably recorded for this member (monotonic). Called
+    /// by the writer after a successful store write, and once at attach for a member
+    /// resuming on a position a previous process recorded.
+    fn note_recorded(&self, lsn: u64) {
+        advance_monotonic(&self.recorded, lsn);
+    }
+
+    /// The highest position published for recording, 0 if none.
+    fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// Publish `lsn` as proven durable and eligible to record (monotonic). Cheap
+    /// enough for the commit path: one atomic max, no I/O and no lock.
+    fn note_pending(&self, lsn: u64) {
+        advance_monotonic(&self.pending, lsn);
+    }
+
     /// Advance this member's committed floor (monotonic). Called lock-free from
     /// the consumer commit path via [`SharedLsnCommitter`].
     fn commit(&self, lsn: u64) {
         advance_monotonic(&self.committed, lsn);
     }
 
-    /// Record an envelope delivered into this member's channel (monotonic).
-    /// The pump is the only caller; the CAS loop is kept for uniformity.
+    /// Record an envelope staged for this member (monotonic). The pump is the
+    /// only caller; the CAS loop is kept for uniformity.
     fn deliver(&self, lsn: u64) {
         advance_monotonic(&self.delivered, lsn);
     }
@@ -363,6 +690,35 @@ impl AckTable {
         }
     }
 
+    /// Hold the floor at `at` for a published table that has no member on this
+    /// source yet, so the slot cannot ack past changes nobody has consumed.
+    /// Returns whether a new hold was installed (an existing entry — a member
+    /// that already joined — is never disturbed).
+    ///
+    /// This is the *not yet attached* case of the same situation as a detached
+    /// member, and gets the same treatment: the entry is inert for routing and
+    /// crediting, and pins [`Self::flush_lsn`] until the real member arrives
+    /// and [`Self::register`] takes it over through the rejoin branch. Without
+    /// it, the first member to join a resuming slot is credited to the WAL head
+    /// by the next keepalive, and a member joining after that is seated above
+    /// its own unconsumed changes — which are then acked away (#12609).
+    fn reserve(&self, key: &MemberKey, at: u64) -> bool {
+        let mut members = write_lock(&self.members);
+        if members.contains_key(key) {
+            return false;
+        }
+        members.insert(key.clone(), Arc::new(AckSlot::reserved(at)));
+        true
+    }
+
+    /// Drop a hold installed by [`Self::reserve`] that no member ever claimed,
+    /// releasing the slot-level floor it pins. Only ever called for a table
+    /// that has also been dropped from the publication, so nothing can arrive
+    /// for it after this.
+    fn release(&self, key: &MemberKey) {
+        write_lock(&self.members).remove(key);
+    }
+
     /// The member's initial snapshot finished cleanly. It stays *held* until
     /// the pump's next (re)connect promotes it — the caller must also request
     /// that reconnect.
@@ -395,7 +751,7 @@ impl AckTable {
 
     /// Credit streaming members with no in-flight envelopes up to `upto` —
     /// the connection's in-order replay guarantees their routed changes below
-    /// `upto` were already delivered. Detached members are never credited
+    /// `upto` were already staged. Detached members are never credited
     /// (that's the point of the hold), and neither are held (not-yet-promoted)
     /// members — they have no route yet, so "no in-flight envelopes" says
     /// nothing about what they've missed.
@@ -440,8 +796,11 @@ impl AckTable {
     /// monotonically into `shared_flush`. Recomputed on read, so nobody should
     /// cache the result expecting eager freshness. The monotonic CAS preserves
     /// the never-regress guarantee even if a `register` seeds a slot below the
-    /// last reported floor mid-sweep. The sweep is ≤ 8 atomic loads under an
-    /// uncontended read lock — it replaces the old per-commit `recompute`.
+    /// last reported floor mid-sweep. The sweep is one atomic load per entry
+    /// under an uncontended read lock — typically ≤ 8 members, transiently more
+    /// on a resuming slot that is still holding floors for tables whose
+    /// datasets have not joined ([`Self::reserve`]) — and it replaces the old
+    /// per-commit `recompute`.
     fn flush_lsn(&self) -> u64 {
         let floor = read_lock(&self.members)
             .values()
@@ -451,6 +810,13 @@ impl AckTable {
             advance_monotonic(&self.shared_flush, floor);
         }
         self.shared_flush.load(Ordering::Acquire)
+    }
+
+    /// Whether `key`'s member has been promoted to the streaming phase (past its
+    /// initial snapshot). Cold-path only (idle-heartbeat readiness gating); the
+    /// hot commit/deliver paths read `STREAMING` off the cached `AckSlot`.
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
     }
 }
 
@@ -470,10 +836,6 @@ impl AckTable {
         if let Some(slot) = self.slot(key) {
             slot.deliver(lsn);
         }
-    }
-
-    fn is_streaming(&self, key: &MemberKey) -> bool {
-        self.slot(key).is_some_and(|slot| slot.has(STREAMING))
     }
 
     fn committed(&self, key: &MemberKey) -> u64 {
@@ -505,44 +867,634 @@ fn advance_monotonic(flush: &AtomicU64, to: u64) {
 struct SharedLsnCommitter {
     slot: Arc<AckSlot>,
     flush_to: u64,
+    /// Member dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` when the transaction carried no commit time.
+    source_commit_ts_ms: Option<i64>,
+    /// Wakes the applied-position writer once this commit publishes its position.
+    ///
+    /// The position is published from [`CommitChange::commit`] specifically, which
+    /// is the only point at which the acked changes are known durable: this
+    /// committer supports deferral, so under an in-memory CDC durability tier the
+    /// runtime holds it until the covering checkpoint is durable
+    /// (`SlotAdvancer::on_checkpoint_durable`). Publishing anywhere earlier — when a
+    /// batch reaches the memory tier — would claim rows a restart loses, and the
+    /// next start would then resume *past* changes the acceleration never durably
+    /// received.
+    watermark_notify: Arc<Notify>,
 }
 
 #[async_trait]
 impl CommitChange for SharedLsnCommitter {
     async fn commit(&self) -> std::result::Result<(), CommitError> {
         self.slot.commit(self.flush_to);
+        // Publish the position alongside the slot ack, never ahead of it, and let
+        // the writer persist it. Publishing is an atomic max and a wakeup, so the
+        // commit path does no I/O: positions established while a write is in flight
+        // coalesce into that write's successor instead of queueing behind it.
+        self.slot.note_pending(self.flush_to);
+        self.watermark_notify.notify_one();
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
         Ok(())
     }
 
-    /// Same argument as the per-dataset `LsnCommitter`: the slot retains WAL
-    /// until the shared floor advances past this commit, so a crash before a
-    /// deferred commit re-streams the un-acked tail. Safe to defer.
+    /// The runtime may hold this commit until the covering checkpoint is durable;
+    /// see `slot`'s and `watermark_notify`'s docs for why that gate is what makes a
+    /// published position safe.
     fn supports_deferral(&self) -> bool {
         true
     }
+}
 
-    /// Fold another shared-slot commit that targets the *same* member slot into
-    /// this one by keeping the higher LSN. Sound because [`Self::commit`] is a
-    /// monotonic `max` into the slot's `committed` — infallible and
-    /// order-insensitive, so folding N consecutive commits to their max is
-    /// identical to running them in order. A different slot (or a non-shared
-    /// committer) is refused, so a mixed run never coalesces across members.
-    fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
-        match other
-            .as_any()
-            .and_then(|a| a.downcast_ref::<SharedLsnCommitter>())
+/// A shared-slot `PostgreSQL` envelope before it crosses the member stream
+/// boundary. It keeps pgoutput messages raw so adjacent source transactions can
+/// be folded without tuple decoding or Arrow construction on the pump.
+/// The zero-row boundary envelope that carries a
+/// [`SnapshotWatermarkCommitter`], or the stream error if its (empty) batch
+/// cannot be built.
+fn snapshot_watermark_envelope(
+    schema: &SchemaRef,
+    watermark_notify: Arc<Notify>,
+    slot: Option<Arc<AckSlot>>,
+    lsn: u64,
+    dataset: String,
+    history_unavailable: bool,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(schema, None, false)
+        .map_err(|e| StreamError::External(e.to_string()))?
+        .into_parts()
+        .map_err(|e| StreamError::External(e.to_string()))?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotWatermarkCommitter {
+            watermark_notify,
+            slot,
+            lsn,
+            dataset,
+        }),
+        batch,
+        // Readiness stays lag-based: an acceleration being loaded is not ready.
+        false,
+        history_unavailable,
+    ))
+}
+
+/// Records the watermark for a just-completed snapshot, as its own zero-row
+/// boundary envelope.
+///
+/// Without this the watermark is first written by the acknowledgement of a *WAL*
+/// change, so a restart in the window between "snapshot applied" and "first
+/// change acked" reads no watermark at all and treats a fully populated
+/// acceleration as a first load — appending a fresh snapshot over surviving rows,
+/// which is the silent divergence the watermark exists to prevent.
+///
+/// Deliberately does **not** override `supports_deferral`, so it inherits the
+/// conservative `false`: the consumer cannot hold this commit behind a later
+/// in-memory durability fence, which is what guarantees the snapshot's rows are
+/// durable before their watermark claims them. Same contract as
+/// `mysql_replication`'s snapshot-boundary committer.
+struct SnapshotWatermarkCommitter {
+    watermark_notify: Arc<Notify>,
+    /// The member's ack slot, so a successful write marks the position durable for
+    /// [`flush_idle_watermarks`]. Carried by both boundary envelopes — a snapshot's
+    /// and a rebuild's — because for a table that then sees no changes this is the
+    /// only thing that ever records a position, and without it the member could never
+    /// carry that position forward over idle intervals. `Option` only because the
+    /// envelope is also built in tests without a slot.
+    slot: Option<Arc<AckSlot>>,
+    /// The LSN the snapshot's contents are complete as of: the slot's consistent
+    /// point, which is at or before the snapshot's visibility. Undershooting is
+    /// safe — replay from it re-delivers changes the snapshot already reflects —
+    /// whereas a later LSN could skip a change the snapshot did not see.
+    lsn: u64,
+    dataset: String,
+}
+
+#[async_trait]
+impl CommitChange for SnapshotWatermarkCommitter {
+    async fn commit(&self) -> std::result::Result<(), CommitError> {
+        // This committer refuses deferral, so the rows this position describes are
+        // durable by the time it runs; publishing it here is what lets the idle
+        // carry-forward extend it later.
+        if let Some(slot) = &self.slot {
+            slot.note_pending(self.lsn);
+        }
+        self.watermark_notify.notify_one();
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("snapshot-complete lsn={}", self.lsn),
+            None,
+        );
+        Ok(())
+    }
+}
+
+struct PendingPgEnvelope {
+    rows: PgChangeRows,
+    slot: Arc<AckSlot>,
+    flush_to: u64,
+    dataset: String,
+    /// Cloned from the member; see [`run_applied_lsn_writer`].
+    watermark_notify: Arc<Notify>,
+    is_dataset_ready: bool,
+    first_received_at: std::time::Instant,
+}
+
+/// Why a fold did not happen. The distinction matters for tuning: a `Limited`
+/// refusal means raising a configured bound would have folded this transaction,
+/// whereas `Incompatible` is a correctness boundary no bound can move.
+enum MergeOutcome {
+    Merged,
+    Limited(PendingPgEnvelope),
+    Incompatible(PendingPgEnvelope),
+}
+
+impl PendingPgEnvelope {
+    fn try_merge(&mut self, other: Self, max_rows: usize) -> MergeOutcome {
+        if !Arc::ptr_eq(&self.slot, &other.slot) {
+            return MergeOutcome::Incompatible(other);
+        }
+        if self
+            .rows
+            .num_rows_hint()
+            .saturating_add(other.rows.num_rows_hint())
+            > max_rows
         {
-            Some(other) if Arc::ptr_eq(&self.slot, &other.slot) => {
-                self.flush_to = self.flush_to.max(other.flush_to);
-                true
-            }
-            _ => false,
+            return MergeOutcome::Limited(other);
+        }
+
+        let Self {
+            rows: other_rows,
+            slot,
+            flush_to,
+            dataset,
+            // Same member (the `slot` pointer check above proves it), so both
+            // sides carry the same notify; either may be kept.
+            watermark_notify,
+            is_dataset_ready,
+            first_received_at,
+        } = other;
+        // A differing relation generation or working schema: not foldable at any
+        // limit (see `PgChangeRows::try_append`).
+        if let Some(rows) = self.rows.try_append(other_rows) {
+            return MergeOutcome::Incompatible(Self {
+                rows,
+                slot,
+                flush_to,
+                dataset,
+                watermark_notify,
+                is_dataset_ready,
+                first_received_at,
+            });
+        }
+
+        self.flush_to = self.flush_to.max(flush_to);
+        // `other` is appended after `self`, so applying the merged envelope
+        // advances the dataset to `other`'s commit — its readiness is the one that
+        // describes the resulting state. (In practice readiness only ever rises
+        // within a stream, since later commits are closer to now, but taking the
+        // newest keeps the flag exact rather than relying on that.)
+        self.is_dataset_ready = is_dataset_ready;
+        MergeOutcome::Merged
+    }
+
+    fn into_envelope(self) -> ChangeEnvelope {
+        let source_commit_ts_ms = self.rows.source_commit_ts_ms();
+        ChangeEnvelope::new_from_rows(
+            Box::new(SharedLsnCommitter {
+                slot: self.slot,
+                flush_to: self.flush_to,
+                dataset: self.dataset,
+                source_commit_ts_ms,
+                watermark_notify: self.watermark_notify,
+            }),
+            Box::new(self.rows),
+            self.is_dataset_ready,
+        )
+    }
+}
+
+enum PendingItem {
+    Changes(PendingPgEnvelope),
+    Envelope(std::result::Result<ChangeEnvelope, StreamError>),
+}
+
+impl PendingItem {
+    fn into_stream_item(self) -> std::result::Result<ChangeEnvelope, StreamError> {
+        match self {
+            Self::Changes(pending) => Ok(pending.into_envelope()),
+            Self::Envelope(item) => item,
         }
     }
 
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
+    /// What this item contributed to [`MemberMailbox::buffered_bytes`]. Control
+    /// items (heartbeats, terminal errors) buffer no rows and contribute nothing.
+    fn buffered_bytes(&self) -> usize {
+        match self {
+            Self::Changes(pending) => pending.rows.encoded_len(),
+            Self::Envelope(_) => 0,
+        }
     }
+}
+
+struct EagerPendingEnvelope {
+    member: Arc<MemberHandle>,
+    envelope: PendingPgEnvelope,
+}
+
+#[derive(Clone, Copy)]
+struct EagerSettings {
+    limits: CoalescingLimits,
+    shutdown_epoch: u64,
+}
+
+/// Pump-local envelopes held back briefly so consecutive commits for one table
+/// coalesce before they ever cross a member boundary.
+///
+/// One hold per member rather than a single most-recently-used slot: a TPC-C-style
+/// transaction touches several tables per commit, so a single slot would publish
+/// on every relation switch and never fold anything on a slot carrying more than
+/// one table. Per-member holds fold regardless of how the commits interleave.
+///
+/// Every hold is published within [`CoalescingLimits::max_envelope_age`] of the
+/// *first* commit it absorbed: merging leaves `first_received_at` alone, so a
+/// low-traffic table's envelope cannot be deferred indefinitely by a trickle of
+/// later commits. [`Self::next_deadline`] caches the earliest of those deadlines
+/// so the per-event expiry check and the receive timeout are both O(1) while
+/// anything is held.
+#[derive(Default)]
+struct EagerHold {
+    pending: FxHashMap<MemberKey, EagerPendingEnvelope>,
+    next_deadline: Option<std::time::Instant>,
+}
+
+impl EagerHold {
+    /// How long until the earliest held envelope must be published, or `None`
+    /// when nothing is held. Zero means one is already due.
+    fn next_flush_in(&self) -> Option<std::time::Duration> {
+        self.next_deadline
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Recompute the cached earliest deadline. Called after any change to the
+    /// held set, so the O(members) scan is paid on publish, never per event.
+    fn refresh_deadline(&mut self, max_age: std::time::Duration) {
+        self.next_deadline = self
+            .pending
+            .values()
+            .map(|held| held.envelope.first_received_at + max_age)
+            .min();
+    }
+
+    /// Take every hold whose deadline has passed, with its member key.
+    fn take_expired(
+        &mut self,
+        max_age: std::time::Duration,
+    ) -> Vec<(MemberKey, EagerPendingEnvelope)> {
+        let now = std::time::Instant::now();
+        if self.next_deadline.is_none_or(|at| at > now) {
+            return Vec::new();
+        }
+        let expired: Vec<(MemberKey, EagerPendingEnvelope)> = self
+            .pending
+            .extract_if(|_, held| held.envelope.first_received_at + max_age <= now)
+            .collect();
+        self.refresh_deadline(max_age);
+        expired
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CommitBoundary {
+    end_lsn: u64,
+    commit_time_micros: i64,
+}
+
+struct MemberMailbox {
+    /// The only mergeable region. The receiver atomically swaps this vector
+    /// into its private `draining` vector; that swap seals every claimed item.
+    incoming: ParkingMutex<Vec<PendingItem>>,
+    receiver_waker: AtomicWaker,
+    capacity_notify: Notify,
+    receiver_alive: AtomicBool,
+    sender_closed: AtomicBool,
+    /// Includes both `incoming` and the receiver's private `draining` vector.
+    /// Capacity is released only when `poll_next` yields an item, not on swap.
+    buffered_items: AtomicUsize,
+    /// Estimated Arrow bytes buffered across the same two vectors, tracked
+    /// alongside `buffered_items` so tail merging cannot grow memory without
+    /// bound (see [`DEFAULT_MAX_MAILBOX_BYTES`]). Incremented by whatever a
+    /// publish contributes — a fresh envelope's `encoded_len`, or just the merged
+    /// operand's — and decremented on `pop` by the item's final `encoded_len`, so
+    /// the two always agree.
+    buffered_bytes: AtomicUsize,
+    max_items: usize,
+    limits: CoalescingLimits,
+}
+
+impl MemberMailbox {
+    /// Whether merging into the unclaimed tail is still allowed. Merging leaves
+    /// the item count alone, so only the byte budget can forbid it — the item
+    /// budget must not, since absorbing into the tail is exactly how a mailbox at
+    /// its item ceiling keeps taking work instead of stalling the pump.
+    fn may_merge(&self) -> bool {
+        self.buffered_bytes.load(Ordering::Acquire) < self.limits.max_mailbox_bytes
+    }
+
+    /// Whether another item may be appended. A completely empty mailbox always
+    /// admits: one source transaction can exceed any budget on its own, and
+    /// refusing it would wedge the slot rather than back-pressure it.
+    fn may_admit(&self) -> bool {
+        let items = self.buffered_items.load(Ordering::Acquire);
+        items == 0
+            || (items < self.max_items
+                && self.buffered_bytes.load(Ordering::Acquire) < self.limits.max_mailbox_bytes)
+    }
+}
+
+struct MemberMailboxSender {
+    shared: Arc<MemberMailbox>,
+}
+
+impl MemberMailboxSender {
+    fn is_closed(&self) -> bool {
+        !self.shared.receiver_alive.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.shared.sender_closed.store(true, Ordering::Release);
+        self.shared.receiver_waker.wake();
+        // Also release anyone parked waiting for capacity. `send_control` blocks
+        // on `capacity_notify` and only re-reads `sender_closed` after being
+        // woken, so closing without this wake would leave that sender asleep
+        // until the receiver happened to drain — and on a stalled sink, never.
+        self.shared.capacity_notify.notify_waiters();
+    }
+
+    /// Publish a pending data envelope, appending it to the compatible,
+    /// unclaimed incoming tail up to the backpressure row limit.
+    ///
+    /// A successful merge is reported as [`MailboxSendOutcome::Merged`] so the
+    /// caller can meter how much of the envelope reduction came from this stage
+    /// rather than the pump's eager hold.
+    fn try_publish(
+        &self,
+        mut envelope: PendingPgEnvelope,
+    ) -> MailboxSendOutcome<PendingPgEnvelope> {
+        if self.is_closed() || self.shared.sender_closed.load(Ordering::Acquire) {
+            return MailboxSendOutcome::Closed(envelope);
+        }
+
+        let mut incoming = self.shared.incoming.lock();
+        // Close can race with the optimistic check above. Recheck while holding
+        // the same lock the receiver takes when it clears pending work so a
+        // sender can never enqueue behind a receiver that has already exited.
+        if self.is_closed() || self.shared.sender_closed.load(Ordering::Acquire) {
+            return MailboxSendOutcome::Closed(envelope);
+        }
+        // Whether a configured bound (not a correctness boundary) is what stopped
+        // this transaction folding into the tail. Reported so operators can tell a
+        // mailbox that is absorbing back-pressure from one that is being clipped
+        // by its own limits.
+        let mut coalesce_limited = false;
+        if let Some(PendingItem::Changes(current)) = incoming.last_mut() {
+            if self.shared.may_merge() {
+                let merged_bytes = envelope.rows.encoded_len();
+                match current.try_merge(envelope, self.shared.limits.backpressure_max_rows) {
+                    MergeOutcome::Merged => {
+                        self.shared
+                            .buffered_bytes
+                            .fetch_add(merged_bytes, Ordering::AcqRel);
+                        return MailboxSendOutcome::Merged;
+                    }
+                    MergeOutcome::Limited(returned) => {
+                        coalesce_limited = true;
+                        envelope = returned;
+                    }
+                    MergeOutcome::Incompatible(returned) => envelope = returned,
+                }
+            } else {
+                // The byte budget, not the row limit, is what refused the fold.
+                coalesce_limited = true;
+            }
+        }
+
+        if !self.shared.may_admit() {
+            // Counting the refused fold is left to the retry that finally lands,
+            // so a long stall reports it once rather than once per wakeup.
+            return MailboxSendOutcome::Full(envelope);
+        }
+
+        let bytes = envelope.rows.encoded_len();
+        let wake_receiver = incoming.is_empty();
+        incoming.push(PendingItem::Changes(envelope));
+        self.shared.buffered_items.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .buffered_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        drop(incoming);
+        if wake_receiver {
+            self.shared.receiver_waker.wake();
+        }
+        MailboxSendOutcome::Sent { coalesce_limited }
+    }
+
+    fn try_send_control(
+        &self,
+        item: std::result::Result<ChangeEnvelope, StreamError>,
+    ) -> MailboxSendOutcome<std::result::Result<ChangeEnvelope, StreamError>> {
+        if self.is_closed() || self.shared.sender_closed.load(Ordering::Acquire) {
+            return MailboxSendOutcome::Closed(item);
+        }
+        let mut incoming = self.shared.incoming.lock();
+        if self.is_closed() || self.shared.sender_closed.load(Ordering::Acquire) {
+            return MailboxSendOutcome::Closed(item);
+        }
+        if !self.shared.may_admit() {
+            return MailboxSendOutcome::Full(item);
+        }
+        // Control items (heartbeats, terminal errors) carry no buffered rows, so
+        // they consume an item slot but no byte budget.
+        let wake_receiver = incoming.is_empty();
+        incoming.push(PendingItem::Envelope(item));
+        self.shared.buffered_items.fetch_add(1, Ordering::AcqRel);
+        drop(incoming);
+        if wake_receiver {
+            self.shared.receiver_waker.wake();
+        }
+        MailboxSendOutcome::Sent {
+            coalesce_limited: false,
+        }
+    }
+
+    async fn send_control(
+        &self,
+        mut item: std::result::Result<ChangeEnvelope, StreamError>,
+    ) -> Option<std::result::Result<ChangeEnvelope, StreamError>> {
+        loop {
+            let notified = self.shared.capacity_notify.notified();
+            match self.try_send_control(item) {
+                // Control items never merge — `try_send_control` only appends.
+                MailboxSendOutcome::Sent { .. } | MailboxSendOutcome::Merged => return None,
+                MailboxSendOutcome::Closed(returned) => return Some(returned),
+                MailboxSendOutcome::Full(returned) => {
+                    item = returned;
+                    notified.await;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MemberMailboxSender {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+enum MailboxSendOutcome<T> {
+    /// Appended as a new item. `coalesce_limited` marks that a configured bound —
+    /// not a correctness boundary — is what kept it from folding into the tail,
+    /// which is the signal that raising that bound would coalesce more.
+    Sent {
+        coalesce_limited: bool,
+    },
+    /// Folded into the unclaimed tail without consuming an item slot.
+    Merged,
+    Full(T),
+    Closed(T),
+}
+
+#[cfg(test)]
+impl<T> MailboxSendOutcome<T> {
+    /// Whether the item reached the mailbox, however it got there.
+    fn is_delivered(&self) -> bool {
+        matches!(self, Self::Sent { .. } | Self::Merged)
+    }
+}
+
+struct MemberMailboxReceiver {
+    shared: Arc<MemberMailbox>,
+    draining: Vec<PendingItem>,
+}
+
+impl MemberMailboxReceiver {
+    fn refill(&mut self) {
+        debug_assert!(self.draining.is_empty());
+        let mut incoming = self.shared.incoming.lock();
+        std::mem::swap(&mut self.draining, &mut *incoming);
+        self.draining.reverse();
+    }
+
+    fn pop(&mut self) -> Option<std::result::Result<ChangeEnvelope, StreamError>> {
+        let item = self.draining.pop()?;
+        self.shared.buffered_items.fetch_sub(1, Ordering::AcqRel);
+        // Release exactly what the publishes contributed: an envelope's final
+        // `encoded_len` is the sum of its own and every operand merged into it.
+        self.shared
+            .buffered_bytes
+            .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
+        self.shared.capacity_notify.notify_one();
+        Some(item.into_stream_item())
+    }
+}
+
+impl Stream for MemberMailboxReceiver {
+    type Item = std::result::Result<ChangeEnvelope, StreamError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if let Some(item) = self.pop() {
+            return std::task::Poll::Ready(Some(item));
+        }
+        self.refill();
+        if let Some(item) = self.pop() {
+            return std::task::Poll::Ready(Some(item));
+        }
+        if self.shared.sender_closed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(None);
+        }
+
+        self.shared.receiver_waker.register(cx.waker());
+        // Register-then-recheck closes the race where the sender pushes between
+        // the empty check and waker registration.
+        self.refill();
+        if let Some(item) = self.pop() {
+            return std::task::Poll::Ready(Some(item));
+        }
+        if self.shared.sender_closed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for MemberMailboxReceiver {
+    fn drop(&mut self) {
+        self.shared.receiver_alive.store(false, Ordering::Release);
+        let (incoming_len, incoming_bytes): (usize, usize) = {
+            let mut incoming = self.shared.incoming.lock();
+            let counts = (
+                incoming.len(),
+                incoming.iter().map(PendingItem::buffered_bytes).sum(),
+            );
+            incoming.clear();
+            counts
+        };
+        let dropped_items = incoming_len.saturating_add(self.draining.len());
+        let dropped_bytes: usize = incoming_bytes
+            + self
+                .draining
+                .iter()
+                .map(PendingItem::buffered_bytes)
+                .sum::<usize>();
+        self.shared
+            .buffered_items
+            .fetch_sub(dropped_items, Ordering::AcqRel);
+        self.shared
+            .buffered_bytes
+            .fetch_sub(dropped_bytes, Ordering::AcqRel);
+        self.draining.clear();
+        self.shared.capacity_notify.notify_waiters();
+    }
+}
+
+fn member_mailbox(capacity: usize) -> (MemberMailboxSender, MemberMailboxReceiver) {
+    member_mailbox_with_limits(capacity, *COALESCING_LIMITS)
+}
+
+fn member_mailbox_with_limits(
+    capacity: usize,
+    limits: CoalescingLimits,
+) -> (MemberMailboxSender, MemberMailboxReceiver) {
+    let shared = Arc::new(MemberMailbox {
+        incoming: ParkingMutex::new(Vec::new()),
+        receiver_waker: AtomicWaker::new(),
+        capacity_notify: Notify::new(),
+        receiver_alive: AtomicBool::new(true),
+        sender_closed: AtomicBool::new(false),
+        buffered_items: AtomicUsize::new(0),
+        buffered_bytes: AtomicUsize::new(0),
+        max_items: capacity,
+        limits,
+    });
+    (
+        MemberMailboxSender {
+            shared: Arc::clone(&shared),
+        },
+        MemberMailboxReceiver {
+            shared,
+            draining: Vec::new(),
+        },
+    )
 }
 
 /// One shared replication source: registry entry + pump state.
@@ -563,6 +1515,11 @@ struct SharedSource {
     /// Set when the pump has exited (fatal error or all members detached).
     /// Subscribers seeing this create a fresh source.
     dead: AtomicBool,
+    /// Wakes [`run_applied_lsn_writer`] when a member publishes a position.
+    watermark_notify: Arc<Notify>,
+    /// Positions published by members that have since detached, which the writer's
+    /// member sweep can no longer reach. See [`OrphanedPosition`].
+    orphaned_positions: Mutex<Vec<OrphanedPosition>>,
     /// Whether the slot was created fresh by this process. Members that join
     /// later must snapshot even if their table already sat in the publication:
     /// a fresh slot has no history for anyone.
@@ -570,6 +1527,19 @@ struct SharedSource {
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
+    /// Published tables this source is holding the ack floor for until their
+    /// dataset joins, with the instant each hold was installed (see
+    /// [`AckTable::reserve`] and [`Self::release_unclaimed_reservations`]).
+    /// Installed once, on the first member to attach to a resuming slot.
+    reservations: Mutex<HashMap<MemberKey, std::time::Instant>>,
+    /// Whether [`Self::reservations`] has been populated — the decision is
+    /// made once per source, by whichever member attaches first.
+    reservations_installed: AtomicBool,
+    /// `reservations.len()`, maintained under that mutex so the pump's
+    /// per-event expiry sweep is one relaxed load in the steady state (holds
+    /// exist only between a resume and the last member joining) instead of a
+    /// lock acquisition.
+    outstanding_reservations: AtomicUsize,
 }
 
 impl SharedSource {
@@ -583,8 +1553,13 @@ impl SharedSource {
             pump_started: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
+            watermark_notify: Arc::new(Notify::new()),
+            orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
+            reservations: Mutex::new(HashMap::new()),
+            reservations_installed: AtomicBool::new(false),
+            outstanding_reservations: AtomicUsize::new(0),
         }
     }
 
@@ -659,6 +1634,20 @@ impl SharedSource {
     /// re-subscription, which re-attaches immediately — only WARN).
     fn detach_member(&self, key: &MemberKey, reason: &str, stalls_slot: bool) {
         let removed = lock(&self.members).remove(key);
+        // The writer sweeps members, so anything this one published but had not yet
+        // had written would be dropped on the floor by the removal above. Hand it
+        // over rather than writing it here, which would make a second writer.
+        if let Some(member) = &removed
+            && let Some(slot) = self.ack.slot(key)
+            && slot.pending() > slot.recorded()
+        {
+            lock(&self.orphaned_positions).push(OrphanedPosition {
+                dataset: member.dataset_name.clone(),
+                store: Arc::clone(&member.applied_lsn_store),
+                slot,
+            });
+            self.watermark_notify.notify_one();
+        }
         let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
@@ -705,6 +1694,156 @@ impl SharedSource {
                          re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
                          the table from the publication manually before re-adding: {e}"
                     );
+                }
+            });
+        }
+    }
+
+    /// Hold the ack floor at the slot's resume LSN for every published table
+    /// that has no member yet, so the slot cannot acknowledge changes belonging
+    /// to a dataset that has not joined this source yet (#12609).
+    ///
+    /// Decided once per source, by the first member to attach, under the setup
+    /// lock and before the pump starts — so the floor is pinned before the
+    /// first connect can credit anyone.
+    fn install_reservations(&self, setup: &slot::SharedMemberSetup) {
+        if self.reservations_installed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Only a *resuming* slot is owed anything below a join point.
+        // `created_fresh` covers both cases where nothing is: a slot this
+        // process created, and one fast-forwarded past its history for a
+        // re-bootstrap — that one only happens when every member re-snapshots
+        // (`slot_is_disposable`), which is what makes discarding the history
+        // safe there and holding a floor pointless. A slot whose
+        // `confirmed_flush_lsn` the catalog has not published yet offers no
+        // floor worth holding (0 would pin the ack forever).
+        if setup.slot.created_fresh || setup.slot.consistent_lsn == 0 {
+            return;
+        }
+        let resume_lsn = setup.slot.consistent_lsn;
+        let held: Vec<MemberKey> = setup
+            .publication_tables
+            .iter()
+            .filter(|key| self.ack.reserve(key, resume_lsn))
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        tracing::info!(
+            slot = %self.key.slot_name,
+            tables = held.len(),
+            resume_lsn = %slot::format_lsn(resume_lsn),
+            "holding the shared slot's ack floor for published tables whose dataset has not \
+             joined yet"
+        );
+        let now = std::time::Instant::now();
+        let mut reservations = lock(&self.reservations);
+        for key in held {
+            reservations.insert(key, now);
+        }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+    }
+
+    /// A member has taken over its reservation (or joined a table that never
+    /// had one) — stop tracking it as unclaimed. The ack entry itself is kept:
+    /// [`AckTable::register`] hands the held floor to the member.
+    fn claim_reservation(&self, key: &MemberKey) {
+        let mut reservations = lock(&self.reservations);
+        reservations.remove(key);
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+    }
+
+    /// Holds no dataset has claimed within `grace`, removed from tracking as
+    /// they are returned: the caller releases each one exactly once, rather
+    /// than a per-second sweep re-spawning a release that is already in flight.
+    fn take_expired_reservations(&self, grace: std::time::Duration) -> Vec<MemberKey> {
+        // The pump sweeps per decoded event; nothing held is the steady state.
+        if self.outstanding_reservations.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut reservations = lock(&self.reservations);
+        let expired: Vec<MemberKey> = reservations
+            .iter()
+            .filter(|(_, held_since)| held_since.elapsed() >= grace)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired {
+            reservations.remove(key);
+        }
+        self.outstanding_reservations
+            .store(reservations.len(), Ordering::Relaxed);
+        expired
+    }
+
+    /// Release holds no dataset claimed within `grace`.
+    ///
+    /// A table can sit in the publication with no dataset behind it — one
+    /// removed from the spicepod, or renamed — and its hold would otherwise pin
+    /// WAL retention for the whole slot forever. Dropping the table from the
+    /// publication first is what makes releasing the floor safe rather than a
+    /// second silent-loss path: an unpublished table produces no more changes,
+    /// and if the dataset ever comes back, `table_added` sends it through the
+    /// initial-snapshot path instead of a resume.
+    fn release_unclaimed_reservations(self: &Arc<Self>, grace: std::time::Duration) {
+        for key in self.take_expired_reservations(grace) {
+            let params = self.params.clone();
+            let slot_name = self.key.slot_name.clone();
+            let publication = self.params.publication_name.clone();
+            let grace_secs = grace.as_secs();
+            let source = Arc::clone(self);
+            tokio::spawn(async move {
+                // The setup lock is what `attach_member` holds while it adds a
+                // table to the publication and registers, so taking it here
+                // makes "is this table still unsubscribed?" a decision the
+                // attach path cannot land inside. A dataset that arrives first
+                // wins and keeps its table published; one that arrives after
+                // finds the table gone from the publication and takes a fresh
+                // snapshot, which is correct either way.
+                let _guard = source.setup_lock.lock().await;
+                if source.member(&key).is_some() {
+                    return;
+                }
+                tracing::error!(
+                    table = %format_member(&key),
+                    slot = %slot_name,
+                    publication = %publication,
+                    grace_secs,
+                    "no dataset subscribed to a published table on this shared slot within the \
+                     grace period; it was pinning WAL retention for every dataset on the slot, \
+                     so it is being dropped from the publication and the slot's acknowledgement \
+                     released. Re-adding a dataset for this table will take a fresh initial \
+                     snapshot"
+                );
+                let (schema_name, table_name) = key.clone();
+                match slot::remove_table_from_publication(&params, &schema_name, &table_name).await
+                {
+                    // Only release the floor once the table is provably out of
+                    // the publication: while it is still published its changes
+                    // keep arriving with no member to route them to, and acking
+                    // past them would be the very loss this hold exists to
+                    // prevent.
+                    Ok(()) => source.ack.release(&key),
+                    Err(e) => {
+                        // Keep the hold and re-arm the grace period so the next
+                        // sweep tries again, rather than leaving a table pinning
+                        // WAL with nothing watching it.
+                        let mut reservations = lock(&source.reservations);
+                        reservations.insert(key, std::time::Instant::now());
+                        source
+                            .outstanding_reservations
+                            .store(reservations.len(), Ordering::Relaxed);
+                        tracing::warn!(
+                            table = %format!("{schema_name}.{table_name}"),
+                            slot = %slot_name,
+                            "failed to drop an unsubscribed table from the shared publication; \
+                             the shared slot keeps holding WAL for it and will retry. Drop it \
+                             manually to release retention now: {e}"
+                        );
+                    }
                 }
             });
         }
@@ -788,6 +1927,8 @@ async fn attach_member(
         schema_name,
         table_name,
         metrics,
+        policy,
+        applied_lsn_store,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -815,6 +1956,29 @@ async fn attach_member(
         });
     }
 
+    // Slot lifetime is not a connection parameter, but it *is* a property of
+    // the slot rather than of one member: the slot is released on shutdown, and
+    // its history discarded when re-bootstrapping, exactly when
+    // `slot_is_disposable` holds. A member that needs the history retained --
+    // because it does not re-snapshot, whether its accelerator persists or its
+    // initial snapshot is disabled -- would resume from a `confirmed_flush_lsn`
+    // no longer backed by retained WAL, and silently serve a gap.
+    //
+    // Compare the same predicate the two action sites use (`drop_slot_if_ephemeral`
+    // and `slot::advance_slot_for_rebootstrap`) rather than `ephemeral_accelerator`
+    // alone. Both act on the params of whichever member opened the source, so a
+    // pair that agrees on ephemerality but disagrees on `snapshot_on_resume`
+    // would otherwise have its slot's fate decided by join order -- and in one
+    // order that discards history the non-snapshotting member depends on.
+    if params.slot_is_disposable() != source.params.slot_is_disposable() {
+        return Err(Error::SharedSlotDurabilityMismatch {
+            dataset: dataset_name,
+            slot: source.key.slot_name.clone(),
+            joining: slot_lifetime_description(params.slot_is_disposable()),
+            existing: slot_lifetime_description(source.params.slot_is_disposable()),
+        });
+    }
+
     if let Some(existing) = source.member(&member_key) {
         if existing.sender.is_closed() {
             // The previous subscription's receiver is gone (dataset reload,
@@ -839,6 +2003,11 @@ async fn attach_member(
         source.ack.seed(setup.slot.consistent_lsn);
         metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
     }
+    // Before anything can be credited on this source, pin the floor for the
+    // published tables whose datasets have not joined yet — including, when
+    // this member is the first to arrive on a resuming slot, the ones that will
+    // join after it.
+    source.install_reservations(&setup);
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
@@ -856,11 +2025,145 @@ async fn attach_member(
         || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
     let snapshotting = need_snapshot && params.initial_snapshot;
-    let (sender, receiver) = mpsc::channel(params.member_channel_capacity);
+
+    // Is there a gap this slot cannot supply?
+    //
+    // Computed, not inferred. The watermark records the LSN the acceleration's
+    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
+    // still stream from. A watermark older than that is a gap no stream can fill:
+    // a row deleted at the source in that window has no change event left to
+    // replay, so appending snapshot rows over the survivors would leave the
+    // deletion applied at the source and never here, in every later query.
+    //
+    // The three outcomes:
+    //
+    //   * no watermark -> this acceleration has never been loaded. A first
+    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
+    //     also every ephemeral accelerator (their store records nothing, since
+    //     they boot empty and re-snapshot every start).
+    //   * watermark, and the slot still reaches it -> resume; the WAL between the
+    //     two is still there to replay.
+    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
+    //     to the consumer, which owns the accelerator and can replace its
+    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    let watermark = match applied_lsn_store.load().await {
+        Ok(watermark) => watermark,
+        Err(e) => {
+            // Reading it failed, so we cannot prove the gap is fillable. Treat it
+            // the same as a position belonging to another source — unusable — so
+            // the acceleration is rebuilt: a needless rebuild costs a re-read,
+            // while a wrong resume silently keeps rows the source has deleted.
+            tracing::warn!(
+                dataset = %dataset_name,
+                "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
+            );
+            super::RecordedPosition::ForeignSource
+        }
+    };
+    // Absence of a watermark is evidence of a gap only when the acceleration
+    // could be holding rows this process did not load AND a position could have
+    // been recorded. An ephemeral acceleration boots empty, so absence means
+    // nothing is there; a store that cannot record (no durable sidecar) makes
+    // absence permanent, and rebuilding on it would re-read the whole table on
+    // every restart rather than once.
+    let tracks_positions = applied_lsn_store.records_positions();
+    if !params.ephemeral_accelerator && !tracks_positions {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "this acceleration persists across restarts but has nowhere to record how far it has been advanced, so a replication slot that is dropped or invalidated cannot be detected and rows deleted at the source while it was gone would survive here"
+        );
+    }
+    // Seat the member *before* classifying it, and classify against the floor it was
+    // actually seated at.
+    //
+    // `setup.slot.consistent_lsn` was read while the slot's DDL was being set up, and
+    // the pump does not take `setup_lock` — so it can acknowledge more WAL between
+    // that read and this registration. Classifying on the stale snapshot and then
+    // seating the member at the current floor is a silent skip in exactly the shape
+    // this change exists to fix: the watermark reads as reachable, while the member
+    // starts above it. Registering first closes the window, because the floor it is
+    // seated at is then a fact rather than a prediction.
+    //
+    // `register` also takes over any hold installed for this table through its rejoin
+    // branch, keeping the held floor — so the replay this member is owed starts where
+    // the slot resumed, not where a slot-mate was credited.
+    let (sender, receiver) = member_mailbox(params.member_channel_capacity);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
-    // (Membership liveness is marked by `mark_member_attached` just below.)
+    // (Membership liveness is marked by `mark_member_attached` below.)
     metrics.set_slot_name(source.key.slot_name.clone());
     source.ack.register(&member_key, snapshotting);
+    source.claim_reservation(&member_key);
+    let ack_slot = source.ack.slot(&member_key);
+
+    // The earliest position this member can actually be supplied from, which is *not*
+    // the earliest the slot still retains. Two distinct limits, and the later one
+    // binds:
+    //
+    //   * Postgres forwards a `START_REPLICATION` position below the slot's
+    //     `confirmed_flush_lsn` up to it ("has been already streamed, forwarding to
+    //     ..." in `CreateDecodingContext`), so once the slot has acknowledged past a
+    //     change no client can ask for it again — the WAL may still be on disk under
+    //     `restart_lsn`, but it is unreachable through this slot.
+    //   * this member's own seated floor, which a slot-mate's traffic may have
+    //     carried past the snapshot above.
+    //
+    // Comparing against `restart_lsn` alone would call an unfillable gap resumable
+    // and skip the difference silently.
+    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
+    let earliest_streamable_lsn = setup
+        .slot_restart_lsn
+        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
+    // A durable acceleration that has recorded no position is rebuilt, because a
+    // missing watermark cannot be told apart from one whose write failed — except
+    // when the acceleration is observed to hold no rows at all, which is proof
+    // enough on its own: nothing is present that could be stale, and no deletion
+    // can be missing.
+    //
+    // Gated on `snapshotting`, because emptiness only licenses skipping the
+    // rebuild when something *else* is going to load the table. When no snapshot
+    // runs — a pre-existing slot whose publication already carries this table, so
+    // none of `need_snapshot`'s conditions hold, or snapshots disabled outright —
+    // the rebuild is the only thing that would populate the acceleration, and
+    // skipping it would resume from the slot's position and leave every row that
+    // predates it missing for good.
+    let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
+    let rebuild_via_consumer = super::needs_rebuild(
+        &watermark,
+        earliest_streamable_lsn,
+        !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
+    );
+
+    // Why the rebuild, in the terms the operator can act on. The four causes are
+    // genuinely different situations, and the acknowledged-past one is the easiest to
+    // mistake for a retention problem: the WAL is still on disk, but a slot cannot
+    // re-stream what it has already acknowledged.
+    let rebuild_reason = match &watermark {
+        super::RecordedPosition::Absent => {
+            "it has no recorded position, so any rows it already holds cannot be shown to be current"
+        }
+        super::RecordedPosition::ForeignSource => {
+            "the position it recorded belongs to a different source, so it does not describe these rows"
+        }
+        super::RecordedPosition::At(watermark)
+            if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
+        {
+            "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
+        }
+        super::RecordedPosition::At(_) => {
+            "the slot no longer retains the changes following the position it recorded as applied"
+        }
+    };
+
+    // A member resuming on a position a previous process recorded already has a
+    // durable position, even though nothing has been committed in *this* process.
+    // Seeding it lets an idle member carry that position forward (see
+    // `flush_idle_watermarks`) instead of waiting for a change that may never come.
+    if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
+        && !rebuild_via_consumer
+    {
+        slot.note_recorded(resumed.lsn);
+        slot.note_pending(resumed.lsn);
+    }
     lock(&source.members).insert(
         member_key.clone(),
         Arc::new(MemberHandle {
@@ -868,8 +2171,12 @@ async fn attach_member(
             schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
             generated_columns: setup.generated_columns.clone(),
+            policy,
             sender,
             metrics: Arc::clone(&metrics),
+            ready_lag: params.ready_lag,
+            applied_lsn_store: Arc::clone(&applied_lsn_store),
+            watermark_notify: Arc::clone(&source.watermark_notify),
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -902,6 +2209,10 @@ async fn attach_member(
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
         tokio::spawn(run_pump(pump_source));
+        tokio::spawn(run_applied_lsn_writer(
+            Arc::clone(source),
+            params.watermark_flush_interval,
+        ));
     } else if !snapshotting {
         // A resuming/rejoining member needs the pump to reconnect so Postgres
         // re-sends Relation messages (and replays its held WAL) — joins
@@ -924,7 +2235,74 @@ async fn attach_member(
     // `bootstrap_finished` hook flips the member live and asks the pump to
     // reconnect — Postgres resumes from the held floor and replays the
     // member's gap (idempotent for everyone).
-    let head: ChangesStream = if snapshotting {
+    // Flips the member live and asks the pump to reconnect, so Postgres replays
+    // from the held floor. Shared by the two held-at-join arms below: after a
+    // clean snapshot, and after the consumer has been told to reload.
+    let live_flip_hook = |source: &Arc<SharedSource>, key: &MemberKey| {
+        let hook_source = Arc::clone(source);
+        let hook_key = key.clone();
+        let mut hook_fired = false;
+        stream::poll_fn(move |_| {
+            if !hook_fired {
+                hook_fired = true;
+                hook_source.ack.snapshot_finished(&hook_key);
+                hook_source.restart_requested.store(true, Ordering::Release);
+            }
+            std::task::Poll::Ready(None)
+        })
+    };
+
+    let head: ChangesStream = if rebuild_via_consumer {
+        // One zero-row envelope asking the consumer to replace the accelerator's
+        // contents from the source, then the same live-flip as a finished
+        // snapshot. The consumer applies nothing further until the reload
+        // completes, so the WAL that follows lands on top of it — back-pressure
+        // in the member mailbox is what orders the two.
+        // The signal carries the watermark committer, not a no-op one, so the
+        // position is recorded when the consumer finishes the rebuild and commits
+        // it. Without that, a rebuild would leave no watermark behind and the
+        // very next start would rebuild again — re-reading the whole table on
+        // every restart of a dataset whose source happens to be quiet.
+        //
+        // A real committer also keeps this envelope out of the consumer's
+        // heartbeat stripping (which requires a no-op committer), so it reaches
+        // the write path and is committed with the usual durability-then-commit
+        // ordering.
+        let signal_item = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&source.watermark_notify),
+            ack_slot,
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            true,
+        );
+        let signal = stream::once(async move { signal_item });
+        tracing::warn!(
+            dataset = %dataset_name,
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            recorded_position = %match &watermark {
+                super::RecordedPosition::At(watermark) => slot::format_lsn(watermark.lsn),
+                _ => "none".to_string(),
+            },
+            slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
+            "this acceleration will be rebuilt from the source before changes are applied: {rebuild_reason}"
+        );
+        // No snapshot runs on this path — the consumer's reload replaces it — so
+        // the gauge's documented "finished, or skipped" state is reached here.
+        // Leaving it at 0 would strand every readiness probe reading it.
+        metrics.mark_bootstrap_complete();
+        Box::pin(signal.chain(live_flip_hook(source, &member_key)))
+    } else if snapshotting {
+        // Built before `dataset_name` is moved into the snapshot input below.
+        let watermark_boundary = snapshot_watermark_envelope(
+            &schema,
+            Arc::clone(&source.watermark_notify),
+            ack_slot,
+            setup.slot.consistent_lsn,
+            dataset_name.clone(),
+            false,
+        );
         let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
             params: params.clone(),
             schema_name,
@@ -949,28 +2327,67 @@ async fn attach_member(
         let hook_source = Arc::clone(source);
         let hook_key = member_key.clone();
         let mut hook_fired = false;
+        let flip_error_flag = Arc::clone(&saw_error);
         let bootstrap_finished = stream::poll_fn(move |_| {
             if !hook_fired {
                 hook_fired = true;
-                if !saw_error.load(Ordering::Acquire) {
+                if !flip_error_flag.load(Ordering::Acquire) {
                     hook_source.ack.snapshot_finished(&hook_key);
                     hook_source.restart_requested.store(true, Ordering::Release);
                 }
             }
             std::task::Poll::Ready(None)
         });
-        Box::pin(snapshot.chain(bootstrap_finished))
+        // Record the snapshot's position, but ONLY for a snapshot that completed
+        // cleanly — gated on the same flag as the live flip above.
+        //
+        // A failed snapshot ends its stream after yielding the error, so without
+        // this gate the boundary would still be reached and could record a
+        // watermark for an acceleration that is missing base rows. The next start
+        // would then find that watermark reachable, resume, and never load the
+        // rows the snapshot never delivered.
+        //
+        // The committer itself cannot be deferred, so when it does run, the
+        // snapshot's rows are already durable.
+        let mut boundary_item = Some(watermark_boundary);
+        let boundary = stream::poll_fn(move |_| {
+            let Some(item) = boundary_item.take() else {
+                return std::task::Poll::Ready(None);
+            };
+            if saw_error.load(Ordering::Acquire) {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Ready(Some(item))
+        });
+        Box::pin(snapshot.chain(boundary).chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
-        let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
-            Error::SchemaMismatch {
-                message: e.to_string(),
-            }
-        })?;
-        Box::pin(stream::once(async move { Ok(envelope) }))
+        // Readiness is lag-based: a resuming member becomes Ready via lag-gated
+        // WAL envelopes and the pump's keepalive heartbeats (see `deliver_commit`
+        // and `run_pump`'s KeepAlive handling), not an immediate resume-time
+        // ready signal that could mark a still-behind member Ready.
+        Box::pin(stream::empty::<
+            std::result::Result<ChangeEnvelope, StreamError>,
+        >())
     };
 
-    Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
+    Ok(Box::pin(head.chain(receiver)))
+}
+
+/// Render the slot lifetime a member needs for
+/// [`Error::SharedSlotDurabilityMismatch`], which describes both sides of the
+/// disagreement in one sentence. Keyed on `slot_is_disposable`, so a member is
+/// described by what it needs of the *slot*, not by its accelerator alone: a
+/// dataset with `pg_replication_initial_snapshot: disabled` needs the history
+/// retained even though its accelerator starts empty.
+fn slot_lifetime_description(disposable: bool) -> &'static str {
+    if disposable {
+        "can be discarded at shutdown (an acceleration `mode` that starts empty on every restart, \
+         and an initial snapshot that re-runs to rebuild it)"
+    } else {
+        "is retained across restarts so its history can be replayed (a file-backed acceleration \
+         `mode`, or `pg_replication_initial_snapshot: disabled`)"
+    }
 }
 
 /// Compare connection-level params of a joining member against the shared
@@ -990,9 +2407,6 @@ fn connection_params_mismatch(
     if member.sslrootcert != source.sslrootcert {
         return Some("pg_sslrootcert");
     }
-    if member.temporary_slot != source.temporary_slot {
-        return Some("pg_replication_temporary_slot");
-    }
     None
 }
 
@@ -1005,8 +2419,9 @@ async fn fatal_broadcast(source: &Arc<SharedSource>, message: String) {
     for (_, member) in source.live_members() {
         let _ = member
             .sender
-            .send(Err(StreamError::External(message.clone())))
+            .send_control(Err(StreamError::External(message.clone())))
             .await;
+        member.sender.close();
     }
 }
 
@@ -1016,21 +2431,166 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
     if let Some(member) = source.member(key) {
         let _ = member
             .sender
-            .send(Err(StreamError::External(message)))
+            .send_control(Err(StreamError::External(message)))
             .await;
+        member.sender.close();
     }
     source.detach_member(key, "fatal member error", true);
 }
 
 /// Mark the source dead and drop it from the registry (only if the registry
 /// still points at this instance — a replacement may already exist).
+/// A member's applied position that outlived its member, kept so the last thing it
+/// proved durable is still written. A detached member is removed from the source's
+/// member map, so the writer's normal sweep can no longer see it.
+struct OrphanedPosition {
+    dataset: String,
+    store: Arc<dyn AppliedLsnStore>,
+    slot: Arc<AckSlot>,
+}
+
+/// The **only** writer of applied positions for a source.
+///
+/// Producers publish a position onto their member's [`AckSlot::pending`] with an
+/// atomic max and wake this task; it persists whatever the furthest published
+/// position is when it gets there. Two properties follow, and both matter:
+///
+///   * **No reordering.** [`AppliedLsnStore::save`] overwrites rather than taking a
+///     maximum, so concurrent writers could land out of order and move a recorded
+///     position backwards — costing a rebuild that does not self-correct until the
+///     member advances past the lost value. One writer makes that unrepresentable.
+///   * **Coalescing.** Positions published while a write is in flight collapse into
+///     that write's successor, so a busy member costs writes at the store's pace
+///     rather than one per commit.
+///
+/// It also wakes on a timer for the idle carry-forward, which has no producer to
+/// wake it: see [`publish_idle_positions`].
+async fn run_applied_lsn_writer(source: Arc<SharedSource>, interval: std::time::Duration) {
+    loop {
+        tokio::select! {
+            () = source.watermark_notify.notified() => {}
+            () = tokio::time::sleep(interval) => {}
+        }
+        publish_idle_positions(&source);
+        write_published_positions(&source).await;
+        if source.dead.load(Ordering::Acquire) {
+            // Nothing will retry after this, so an unwritten position is final.
+            let stranded: Vec<String> = lock(&source.orphaned_positions)
+                .iter()
+                .map(|orphan| orphan.dataset.clone())
+                .collect();
+            if !stranded.is_empty() {
+                tracing::warn!(
+                    datasets = ?stranded,
+                    "the shared replication slot is shutting down with how far these accelerations were advanced still unrecorded; each will be rebuilt from the source on the next start rather than resumed"
+                );
+            }
+            return;
+        }
+    }
+}
+
+/// Carry each idle member's position forward to what the slot has acknowledged on
+/// its behalf, by publishing it like any other producer.
+///
+/// The slot's acknowledgement advances for a member that had nothing to apply, via
+/// [`AckTable::credit_idle`], which routes no envelope and so runs no committer.
+/// Left alone the recorded position and the acknowledgement drift apart for any
+/// quiet table, and the next start reads a position behind the slot's
+/// `confirmed_flush_lsn` — indistinguishable from changes acknowledged but never
+/// applied, so a healthy acceleration is rebuilt on every restart.
+///
+/// Publishing here claims nothing new: crediting requires `delivered == committed`,
+/// so everything routed to the member has been committed (durability-gated), and the
+/// interval carried over contained no changes for it. Two conditions keep that
+/// reasoning honest:
+///
+///   * the member must be **streaming** — one still bootstrapping has a held floor
+///     rather than an applied position;
+///   * a position must already have been **recorded** for it ([`AckSlot::recorded`]
+///     non-zero) — otherwise there is no established durable prefix to extend, and a
+///     snapshot whose rows are not durable yet would have its floor recorded as
+///     though they were (#11896).
+fn publish_idle_positions(source: &Arc<SharedSource>) {
+    for (member_key, _) in source.live_members() {
+        let Some(slot) = source.ack.slot(&member_key) else {
+            continue;
+        };
+        if !slot.has(STREAMING) || slot.recorded() == 0 {
+            continue;
+        }
+        slot.note_pending(slot.committed());
+    }
+}
+
+/// Persist every member whose published position has moved past what is recorded,
+/// plus any left behind by a detached member. Called only from the writer task and
+/// from the pump's shutdown, which never run concurrently: the pump sets `dead`
+/// before its final flush, and the writer exits on seeing it.
+async fn write_published_positions(source: &Arc<SharedSource>) {
+    // An orphan has no member left for the next sweep to rediscover, so a failed
+    // write has to be put back or the detached member's last position is lost to a
+    // transient sidecar error. Extend rather than assign, so a detach racing this
+    // pass is not clobbered.
+    let orphans = std::mem::take(&mut *lock(&source.orphaned_positions));
+    let mut unwritten = Vec::new();
+    for orphan in orphans {
+        write_one(&orphan.dataset, &orphan.store, &orphan.slot).await;
+        if orphan.slot.pending() > orphan.slot.recorded() {
+            unwritten.push(orphan);
+        }
+    }
+    if !unwritten.is_empty() {
+        lock(&source.orphaned_positions).extend(unwritten);
+    }
+    for (member_key, member) in source.live_members() {
+        let Some(slot) = source.ack.slot(&member_key) else {
+            continue;
+        };
+        write_one(&member.dataset_name, &member.applied_lsn_store, &slot).await;
+    }
+}
+
+async fn write_one(dataset: &str, store: &Arc<dyn AppliedLsnStore>, slot: &Arc<AckSlot>) {
+    let pending = slot.pending();
+    if pending == 0 || pending <= slot.recorded() {
+        return;
+    }
+    match store.save(AppliedLsn { lsn: pending }).await {
+        Ok(()) => slot.note_recorded(pending),
+        Err(e) => tracing::warn!(
+            dataset = %dataset,
+            "could not record how far this acceleration has been advanced (lsn={pending}); a restart before it is recorded rebuilds from the source rather than resuming: {e}"
+        ),
+    }
+}
+
 fn finish_pump(source: &Arc<SharedSource>) {
     source.dead.store(true, Ordering::Release);
+    for (_, member) in source.live_members() {
+        member.sender.close();
+    }
     let mut registry = lock(&REGISTRY);
     if let Some(current) = registry.get(&source.key)
         && Arc::ptr_eq(current, source)
     {
         registry.remove(&source.key);
+    }
+}
+
+/// Drop the shared slot when the pump stops for runtime shutdown and no member
+/// needs it to survive.
+///
+/// Reading the source's own params is authoritative for every member: a member
+/// whose accelerator durability disagrees is rejected at join time with
+/// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
+/// this value.
+///
+/// Best-effort and time-bounded — shutdown never blocks on the source, and a
+/// surviving slot costs retained WAL, not correctness.
+async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
+    if source.params.slot_is_disposable() {
+        slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
 
@@ -1078,7 +2638,7 @@ struct BoundaryMetrics {
     /// Shared ack floor to publish as each member's `confirmed_flush_lsn`, or
     /// `0` to leave it unchanged (idle ticks do not advance the ack).
     confirmed_flush_lsn: u64,
-    /// Commit time of the transaction just delivered, for the freshness
+    /// Commit time of the transaction just routed, for the freshness
     /// watermark; `None` on keepalive/idle boundaries.
     commit_watermark: Option<std::time::SystemTime>,
 }
@@ -1106,11 +2666,37 @@ async fn run_pump(source: Arc<SharedSource>) {
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();
+    let coalescing_limits = *COALESCING_LIMITS;
+    let eager_settings = EagerSettings {
+        limits: coalescing_limits,
+        shutdown_epoch,
+    };
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
+    // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
+    // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
+    // ACK is unaffected. Members share the slot's connection params, so the
+    // interval is derived from the source's ready_lag.
+    let heartbeat_every = crate::cdc::heartbeat_interval(params.ready_lag);
+    let mut last_heartbeat_at: Option<std::time::Instant> = None;
     // When the stream dropped (set as the inner loop breaks to reconnect); consumed
     // on the next successful connect to attribute the disconnected duration.
     let mut disconnect_at: Option<std::time::Instant> = None;
+    // Per-member schema-evolution state. PERSISTS across reconnects (declared
+    // OUTSIDE the reconnect loop, matching the former dedicated path). A
+    // mid-stream column add / lossless widening is adopted only on the *second*
+    // `Relation` for a member — the first is the baseline. If this were rebuilt
+    // per reconnect, the first `Relation` after a transient disconnect would be
+    // a fresh "first observation" and would NOT re-adopt an already-adopted
+    // column, silently dropping its values until the next schema change. Keeping
+    // the tracker (and its widened working schema) across reconnects means
+    // `handle_relation` reseeds each rebuilt route's `working_schema` from it, so
+    // an adopted column survives a reconnect; pre-evolution WAL replayed after a
+    // reconnect null-fills the (nullable) added column correctly. `routes` is
+    // still rebuilt per connection; a removed member's entry is cleared in
+    // `handle_relation`.
+    let mut schema_state: MemberSchemaStates = MemberSchemaStates::default();
 
     'reconnect: loop {
         if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1118,7 +2704,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                 slot = %slot_name,
                 "runtime shutdown; releasing shared replication connection and slot"
             );
+            publish_idle_positions(&source);
             finish_pump(&source);
+            write_published_positions(&source).await;
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         source.reap_closed_members();
@@ -1197,6 +2786,11 @@ async fn run_pump(source: Arc<SharedSource>) {
         // consumer decodes + builds them (see `PgChangeRows`).
         let mut txn: TxnBuffer = TxnBuffer::default();
         let mut txn_open = false;
+        // Unpublished envelopes, one per member, folding consecutive commits for
+        // the same table. Dropped on reconnect: a held envelope was `deliver`ed
+        // but never `commit`ted, so it pins this member's ack floor and the slot
+        // replays it from `confirmed_flush_lsn` (applied idempotently).
+        let mut eager_hold = EagerHold::default();
 
         // Reader-timing accumulators (see `BoundaryMetrics` /
         // `flush_member_metrics`): summed per decoded event, fanned out to
@@ -1223,7 +2817,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                     "runtime shutdown; releasing shared replication connection and slot"
                 );
                 drop(client);
+                publish_idle_positions(&source);
                 finish_pump(&source);
+                write_published_positions(&source).await;
+                // After `drop(client)`: Postgres refuses to drop a slot its
+                // walsender still holds.
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
@@ -1241,6 +2840,12 @@ async fn run_pump(source: Arc<SharedSource>) {
                 );
                 return;
             }
+            source.release_unclaimed_reservations(params.unclaimed_reservation_grace);
+            // Busy streams may never enter the blocking receive path, so check
+            // eager deadlines once per decoded event as well as through the
+            // receive timeout below. `EagerHold` caches the earliest deadline, so
+            // the common (nothing due) case is one comparison.
+            let _ = flush_expired_eager_envelopes(&source, &mut eager_hold, eager_settings).await;
 
             // Acquire the next event. Fast path: drain events the worker has
             // already buffered via the non-blocking `try_recv`, which arms no
@@ -1271,7 +2876,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                 Ok(TryRecvEvent::Empty | TryRecvEvent::Closed) => {
                     drained_since_yield = 0;
                     let recv_start = std::time::Instant::now();
-                    let polled = tokio::time::timeout(RECV_POLL_INTERVAL, client.recv()).await;
+                    let wait_for = eager_hold
+                        .next_flush_in()
+                        .map_or(RECV_POLL_INTERVAL, |eager| eager.min(RECV_POLL_INTERVAL));
+                    let polled = tokio::time::timeout(wait_for, client.recv()).await;
                     input_us_acc = input_us_acc.saturating_add(
                         u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
@@ -1335,7 +2943,7 @@ async fn run_pump(source: Arc<SharedSource>) {
 
             let processing_start = std::time::Instant::now();
             // Microseconds spent blocked delivering this event's committed
-            // changes into slow member channels (set only by a Commit). Kept
+            // changes into slow member mailboxes (set only by a Commit). Kept
             // separate so it can be subtracted from processing below —
             // downstream back-pressure is not our decode cost.
             let mut send_wait_us: u64 = 0;
@@ -1376,7 +2984,14 @@ async fn run_pump(source: Arc<SharedSource>) {
                             };
                             match msg {
                                 pgoutput::DecodedMessage::Relation(rel) => {
-                                    handle_relation(&source, &mut decoder, &mut routes, rel).await;
+                                    handle_relation(
+                                        &source,
+                                        &mut decoder,
+                                        &mut routes,
+                                        &mut schema_state,
+                                        rel,
+                                    )
+                                    .await;
                                 }
                                 pgoutput::DecodedMessage::Truncate { relation_ids } => {
                                     buffer_raw_truncate(&routes, &mut txn, &relation_ids, &raw);
@@ -1405,12 +3020,15 @@ async fn run_pump(source: Arc<SharedSource>) {
                     txn_open = false;
                     send_wait_us = deliver_commit(
                         &source,
+                        &mut eager_hold,
+                        eager_settings,
                         &decoder,
                         &routes,
                         std::mem::take(&mut txn),
-                        end_lsn.0,
-                        commit_time_micros,
-                        shutdown_epoch,
+                        CommitBoundary {
+                            end_lsn: end_lsn.0,
+                            commit_time_micros,
+                        },
                     )
                     .await;
                     // The ack floor + freshness watermark are published to every
@@ -1420,7 +3038,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                     should_flush = true;
                 }
-                ReplicationEvent::KeepAlive { wal_end, .. } => {
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    server_time_micros,
+                    ..
+                } => {
                     // Accumulate the server WAL end; the per-member fan-out
                     // (server_wal_end + confirmed_flush) happens once in the
                     // consolidated boundary flush below, not inline per event.
@@ -1428,6 +3050,131 @@ async fn run_pump(source: Arc<SharedSource>) {
                     should_flush = true;
                     if !txn_open {
                         source.ack.credit_idle(wal_end.0);
+                        // Idle heartbeat for lag-based readiness. `!txn_open`
+                        // means the pump has caught up to the source head, so a
+                        // streaming member with a drained channel is caught up
+                        // too. Fan out a zero-row heartbeat stamped with the
+                        // source-attested keepalive clock via NON-BLOCKING
+                        // publish: a member whose bounded mailbox is full is
+                        // behind, so dropping its heartbeat is both harmless (a
+                        // later keepalive re-sends) and correct, and — the fix
+                        // for the reverted #11554 heartbeat regression — a slow
+                        // member can never block this fan-out and starve another
+                        // member's Ready signal. Only streaming members (promoted
+                        // past their snapshot) are eligible; a still-snapshotting
+                        // member has not caught up. `server_time_micros` is
+                        // Postgres-epoch microseconds; 0 marks a synthetic
+                        // keepalive, which we skip.
+                        if server_time_micros > 0
+                            && last_heartbeat_at.is_none_or(|at| at.elapsed() >= heartbeat_every)
+                        {
+                            last_heartbeat_at = Some(std::time::Instant::now());
+                            let heartbeat_ts_ms =
+                                client::pg_epoch_to_system_time(server_time_micros)
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .and_then(|d| i64::try_from(d.as_millis()).ok());
+                            for (member_key, member) in source.live_members() {
+                                if !source.ack.is_streaming(&member_key) {
+                                    continue;
+                                }
+                                // A heartbeat must not overtake data still held
+                                // for this member. Publish that data
+                                // non-blockingly first; if its mailbox can
+                                // neither merge nor admit it, put the data back
+                                // and skip only this member's heartbeat so one
+                                // slow member cannot starve another's Ready
+                                // signal.
+                                if let Some(held) = eager_hold.pending.remove(&member_key) {
+                                    let EagerPendingEnvelope {
+                                        member: held_member,
+                                        envelope,
+                                    } = held;
+                                    let published = match held_member.sender.try_publish(envelope) {
+                                        MailboxSendOutcome::Sent { coalesce_limited } => {
+                                            held_member.metrics.inc_envelope_delivered();
+                                            if coalesce_limited {
+                                                held_member.metrics.inc_mailbox_coalesce_limited();
+                                            }
+                                            true
+                                        }
+                                        MailboxSendOutcome::Merged => {
+                                            held_member.metrics.inc_envelope_merged_mailbox();
+                                            true
+                                        }
+                                        MailboxSendOutcome::Full(envelope) => {
+                                            eager_hold.pending.insert(
+                                                member_key.clone(),
+                                                EagerPendingEnvelope {
+                                                    member: held_member,
+                                                    envelope,
+                                                },
+                                            );
+                                            false
+                                        }
+                                        // Receiver gone. Drop it and let
+                                        // `reap_closed_members` detach the
+                                        // member at the top of the loop; the
+                                        // ack floor stays held, so the slot
+                                        // replays these changes.
+                                        MailboxSendOutcome::Closed(_) => false,
+                                    };
+                                    eager_hold.refresh_deadline(coalescing_limits.max_envelope_age);
+                                    if !published {
+                                        continue;
+                                    }
+                                }
+                                let is_ready = crate::cdc::source_commit_within_ready_lag(
+                                    heartbeat_ts_ms,
+                                    member.ready_lag,
+                                );
+                                // Build the heartbeat against the member's CURRENT
+                                // working schema — which may have widened under
+                                // non-`Block` schema evolution (see
+                                // `handle_relation`) — so an idle heartbeat carries
+                                // the same schema `deliver_commit` builds data
+                                // batches against, never a stale narrower one.
+                                let heartbeat_schema = schema_state
+                                    .get(&member_key)
+                                    .and_then(|s| s.tracker.as_ref())
+                                    .map_or_else(
+                                        || Arc::clone(&member.schema),
+                                        |t| Arc::clone(t.working_schema()),
+                                    );
+                                match crate::cdc::build_heartbeat_envelope(
+                                    &heartbeat_schema,
+                                    heartbeat_ts_ms,
+                                    is_ready,
+                                ) {
+                                    Ok(heartbeat) => {
+                                        // Log the idle heartbeat (per member) so
+                                        // lag-based readiness can be verified from
+                                        // the logs (target spice_cdc::heartbeat).
+                                        let heartbeat_lag_ms =
+                                            crate::cdc::replication_lag_ms(heartbeat_ts_ms);
+                                        tracing::debug!(
+                                            target: "spice_cdc::heartbeat",
+                                            connector = "postgres",
+                                            dataset = %member.dataset_name,
+                                            source_commit_ts_ms = ?heartbeat_ts_ms,
+                                            is_dataset_ready = is_ready,
+                                            lag_ms = ?heartbeat_lag_ms,
+                                            "CDC idle heartbeat emitted"
+                                        );
+                                        // Drop-if-full / drop-if-closed: never
+                                        // block the pump on a slow member.
+                                        let _ = member.sender.try_send_control(Ok(heartbeat));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            dataset = %member.dataset_name,
+                                            error = %e,
+                                            "failed to build shared Postgres CDC heartbeat envelope; skipping"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     client.update_applied_lsn(Lsn(source.ack.flush_lsn()));
                 }
@@ -1448,7 +3195,7 @@ async fn run_pump(source: Arc<SharedSource>) {
             // path free of the per-event member-iteration fan-out.
             //
             // `send_wait_us` — time the Commit spent BLOCKED `await`ing a slow
-            // member's bounded channel in `deliver_commit` — is subtracted here:
+            // member's bounded mailbox in `deliver_commit` — is subtracted here:
             // that is downstream back-pressure, not our decode cost, and is
             // carried per dataset by `member_send_wait_micros_total` instead. So
             // the reader-processing bucket stays honest (decode + route only) and
@@ -1495,10 +3242,11 @@ async fn run_pump(source: Arc<SharedSource>) {
     for (_, member) in source.live_members() {
         let _ = member
             .sender
-            .send(Err(StreamError::External(
+            .send_control(Err(StreamError::External(
                 "shared replication stream terminated".to_string(),
             )))
             .await;
+        member.sender.close();
     }
     finish_pump(&source);
 }
@@ -1512,6 +3260,7 @@ async fn handle_relation(
     source: &Arc<SharedSource>,
     decoder: &mut pgoutput::Decoder,
     routes: &mut RouteMap,
+    schema_state: &mut MemberSchemaStates,
     rel: pgoutput::Relation,
 ) {
     let member_key: MemberKey = (rel.namespace.clone(), rel.name.clone());
@@ -1519,6 +3268,7 @@ async fn handle_relation(
         // No member for this table (e.g. publication membership left over from
         // a removed dataset). Its changes are dropped (never routed).
         routes.remove(&rel.relation_id);
+        schema_state.remove(&member_key);
         tracing::debug!(
             table = %format_member(&member_key),
             slot = %source.key.slot_name,
@@ -1546,31 +3296,122 @@ async fn handle_relation(
         );
         return;
     }
-    if let Err(e) = client::validate_relation_against_schema(
-        &member.schema,
-        &rel,
-        &member.primary_keys,
-        &member.generated_columns,
-    ) {
-        member.metrics.inc_schema_mismatch_error();
-        routes.remove(&rel.relation_id);
-        member_fatal(
-            source,
-            &member_key,
-            format!("schema mismatch for {}: {e}", member.dataset_name),
-        )
-        .await;
-        return;
+
+    // Reconcile the Relation against the member's working schema, mirroring the
+    // former per-dataset path so slot-consolidated datasets keep their schema
+    // evolution. Under `block` the schema is fixed (validate, then warn if the
+    // source added a column whose values are being dropped). Otherwise a
+    // per-member `RelationSchemaTracker` adopts a mid-stream column add / lossless
+    // type widening into the working schema, so the built `ChangeBatch` carries
+    // the wider data struct — the runtime apply loop then reconciles it against
+    // the accelerator per the policy. `schema_state` persists across reconnects
+    // (declared outside the reconnect loop in `run_pump`), so an adopted column
+    // survives a transient disconnect rather than being dropped as a fresh
+    // "first observation".
+    let state = schema_state.entry(member_key.clone()).or_default();
+    // Guard the persistence against a re-subscribe: if this member was
+    // re-registered for the same source table with a different schema / policy /
+    // primary keys (config reload), the persisted tracker's assumptions are
+    // stale — rebuild the state from the current registration so it never
+    // mis-shapes the `ChangeBatch`.
+    if !state.seed.as_ref().is_some_and(|s| s.matches(&member)) {
+        *state = MemberSchemaState {
+            seed: Some(MemberSeed::of(&member)),
+            ..MemberSchemaState::default()
+        };
     }
+    let working_schema = if member.policy == SchemaEvolutionPolicy::Block {
+        if let Err(e) = client::validate_relation_against_schema(
+            &member.schema,
+            &rel,
+            &member.primary_keys,
+            &member.generated_columns,
+        ) {
+            member.metrics.inc_schema_mismatch_error();
+            routes.remove(&rel.relation_id);
+            member_fatal(
+                source,
+                &member_key,
+                format!("schema mismatch for {}: {e}", member.dataset_name),
+            )
+            .await;
+            return;
+        }
+        // Observability-only (behavior unchanged under `block`): a mid-stream
+        // column add is silently dropped — say so loudly once per change.
+        client::warn_on_new_relation_columns(
+            &rel,
+            &mut state.known_columns,
+            &member.dataset_name,
+            &member.metrics,
+        );
+        Arc::clone(&member.schema)
+    } else {
+        // PK columns must exist and be part of the replica identity for every
+        // policy — UPDATE/DELETE cannot route without them. (The tracker does
+        // not re-check this.)
+        if let Err(e) = client::validate_relation_primary_keys(&rel, &member.primary_keys) {
+            member.metrics.inc_schema_mismatch_error();
+            routes.remove(&rel.relation_id);
+            member_fatal(
+                source,
+                &member_key,
+                format!("schema mismatch for {}: {e}", member.dataset_name),
+            )
+            .await;
+            return;
+        }
+        let tracker = state.tracker.get_or_insert_with(|| {
+            RelationSchemaTracker::new(
+                Arc::clone(&member.schema),
+                member.policy,
+                member.dataset_name.clone(),
+                member.primary_keys.clone(),
+            )
+        });
+        match tracker.observe_relation(&rel) {
+            Ok(observation) => {
+                let widened = observation.schema_changed;
+                let working = Arc::clone(tracker.working_schema());
+                if widened {
+                    member.metrics.inc_schema_evolution();
+                    tracing::info!(
+                        dataset = %member.dataset_name,
+                        "adopted source schema change: {}",
+                        observation.summary
+                    );
+                }
+                working
+            }
+            Err(e) => {
+                member.metrics.inc_schema_evolution_rejected();
+                member.metrics.inc_schema_mismatch_error();
+                routes.remove(&rel.relation_id);
+                member_fatal(
+                    source,
+                    &member_key,
+                    format!(
+                        "schema change for {} cannot be applied: {e}",
+                        member.dataset_name
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
     decoder.apply_declared_primary_keys(rel.relation_id, &member.primary_keys);
-    // Cache the resolved handle + ack slot alongside the key so the per-event
-    // path skips the `members` lock + string hash (see `buffer_raw_change`).
+    // Cache the resolved handle + ack slot + current working schema alongside the
+    // key so the per-event path skips the `members` lock + string hash (see
+    // `buffer_raw_change`) and `deliver_commit` builds against the working schema.
     routes.insert(
         rel.relation_id,
         Route {
             key: member_key,
             member,
             slot,
+            working_schema,
         },
     );
 }
@@ -1621,7 +3462,7 @@ fn buffer_raw_truncate(
     }
 }
 
-/// Outcome of delivering one envelope into a member's channel. Every variant
+/// Outcome of delivering one envelope into a member's mailbox. Every variant
 /// carries the microseconds spent `await`ing the channel (already recorded into
 /// the member's `member_send_wait_micros_total`), which the caller folds into
 /// the commit total it subtracts from reader-processing.
@@ -1635,7 +3476,7 @@ enum SendOutcome {
     ShutdownAbandon(u64),
 }
 
-/// Must-deliver one envelope into a member's bounded channel, timing the wait.
+/// Must-deliver one envelope into a member's bounded mailbox, timing the wait.
 ///
 /// The envelope carries committed changes and a `SharedLsnCommitter` that
 /// advances the ack floor, so it cannot be dropped under back-pressure. But one
@@ -1644,12 +3485,12 @@ enum SendOutcome {
 /// `MEMBER_SEND_STALL_WARN` tick we WARN + bump the stall metric, and abandon if
 /// the runtime is shutting down. Server-side liveness is handled a layer down by
 /// the worker. Records the full awaited time into `member_send_wait_micros_total`
-/// (≈0 when the channel had spare capacity) and returns it in the outcome.
+/// (≈0 when the mailbox had spare capacity) and returns it in the outcome.
 async fn deliver_to_member(
     metrics: &ReplicationMetricsCollector,
     dataset_name: &str,
-    sender: &mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
-    envelope: std::result::Result<ChangeEnvelope, StreamError>,
+    sender: &MemberMailboxSender,
+    envelope: PendingPgEnvelope,
     shutdown_epoch: u64,
 ) -> SendOutcome {
     let send_start = std::time::Instant::now();
@@ -1657,54 +3498,209 @@ async fn deliver_to_member(
         |start: std::time::Instant| u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     let mut pending = envelope;
     loop {
-        match sender.send_timeout(pending, MEMBER_SEND_STALL_WARN).await {
-            Ok(()) => {
+        let notified = sender.shared.capacity_notify.notified();
+        match sender.try_publish(pending) {
+            MailboxSendOutcome::Merged => {
+                metrics.inc_envelope_merged_mailbox();
                 let w = waited(send_start);
                 metrics.add_member_send_wait_micros(w);
                 return SendOutcome::Sent(w);
             }
-            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+            MailboxSendOutcome::Sent { coalesce_limited } => {
+                metrics.inc_envelope_delivered();
+                if coalesce_limited {
+                    metrics.inc_mailbox_coalesce_limited();
+                }
+                let w = waited(send_start);
+                metrics.add_member_send_wait_micros(w);
+                return SendOutcome::Sent(w);
+            }
+            MailboxSendOutcome::Closed(_) => {
                 let w = waited(send_start);
                 metrics.add_member_send_wait_micros(w);
                 return SendOutcome::ReceiverGone(w);
             }
-            Err(mpsc::error::SendTimeoutError::Timeout(returned)) => {
-                if crate::cdc::shutdown_epoch() != shutdown_epoch {
-                    let w = waited(send_start);
-                    metrics.add_member_send_wait_micros(w);
-                    return SendOutcome::ShutdownAbandon(w);
-                }
-                metrics.add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
-                tracing::warn!(
-                    dataset = %dataset_name,
-                    stalled_for = ?MEMBER_SEND_STALL_WARN,
-                    "shared Postgres CDC member sink is not draining; the pump is \
-                     waiting to deliver committed changes (watch \
-                     dataset_postgres_replication_member_send_stalled_seconds_total)"
-                );
+            MailboxSendOutcome::Full(returned) => {
                 pending = returned;
+                match tokio::time::timeout(MEMBER_SEND_STALL_WARN, notified).await {
+                    Ok(()) => {}
+                    Err(_elapsed) => {
+                        if crate::cdc::shutdown_epoch() != shutdown_epoch {
+                            let w = waited(send_start);
+                            metrics.add_member_send_wait_micros(w);
+                            return SendOutcome::ShutdownAbandon(w);
+                        }
+                        metrics.add_send_stalled(MEMBER_SEND_STALL_WARN.as_secs());
+                        // Log the cumulative wait for THIS delivery, not the
+                        // constant poll interval: a monotonically growing value
+                        // distinguishes one long continuous stall from scattered
+                        // brief ones.
+                        tracing::warn!(
+                            dataset = %dataset_name,
+                            stalled_for = ?send_start.elapsed(),
+                            "shared Postgres CDC member sink is not draining; the pump is \
+                             waiting to deliver committed changes (watch \
+                             dataset_postgres_replication_member_send_stalled_seconds_total)"
+                        );
+                    }
+                }
             }
         }
     }
 }
 
+/// Deliver one held envelope into its member's mailbox, detaching the member if
+/// its receiver is gone. Returns the microseconds spent awaiting the mailbox.
+async fn publish_eager_envelope(
+    source: &Arc<SharedSource>,
+    member_key: &MemberKey,
+    held: EagerPendingEnvelope,
+    shutdown_epoch: u64,
+) -> u64 {
+    let EagerPendingEnvelope { member, envelope } = held;
+    match deliver_to_member(
+        &member.metrics,
+        &member.dataset_name,
+        &member.sender,
+        envelope,
+        shutdown_epoch,
+    )
+    .await
+    {
+        SendOutcome::Sent(waited) | SendOutcome::ShutdownAbandon(waited) => waited,
+        SendOutcome::ReceiverGone(waited) => {
+            source.detach_member(member_key, "changes stream receiver dropped", true);
+            waited
+        }
+    }
+}
+
+/// Fold a freshly-committed envelope into this member's eager hold, publishing
+/// whatever the row limit or a disabled hold makes ready. Returns the
+/// microseconds spent awaiting a member mailbox.
+async fn push_eager_envelope(
+    source: &Arc<SharedSource>,
+    hold: &mut EagerHold,
+    member_key: &MemberKey,
+    next: EagerPendingEnvelope,
+    settings: EagerSettings,
+) -> u64 {
+    let limits = settings.limits;
+    // Eager holding disabled, or this transaction alone already fills an
+    // envelope: publish straight through rather than paying the hold.
+    //
+    // Whatever this member already holds absorbed earlier commits, so it is
+    // sealed and published FIRST. Changes are applied in delivery order and
+    // nothing downstream re-sorts by LSN, so letting this transaction overtake
+    // the hold would apply an older commit's rows over a newer one's; and
+    // because `SharedLsnCommitter` takes a monotonic max, the overtaking
+    // envelope acks the higher LSN, so the skipped WAL is recyclable and never
+    // replayed. This is the same invariant the idle-heartbeat path keeps, and
+    // the one `MergeOutcome::Limited` keeps below. The sealed hold carries its
+    // own member handle, so it stays correct across a detach + re-subscribe
+    // that installs a new handle under the same key.
+    if limits.max_envelope_age.is_zero()
+        || next.envelope.rows.num_rows_hint() >= limits.eager_max_rows
+    {
+        let mut waited: u64 = 0;
+        if let Some(sealed) = hold.pending.remove(member_key) {
+            hold.refresh_deadline(limits.max_envelope_age);
+            waited =
+                publish_eager_envelope(source, member_key, sealed, settings.shutdown_epoch).await;
+        }
+        return waited.saturating_add(
+            publish_eager_envelope(source, member_key, next, settings.shutdown_epoch).await,
+        );
+    }
+
+    let Some(current) = hold.pending.get_mut(member_key) else {
+        hold.pending.insert(member_key.clone(), next);
+        hold.refresh_deadline(limits.max_envelope_age);
+        return 0;
+    };
+
+    let EagerPendingEnvelope {
+        member: next_member,
+        envelope: next_envelope,
+    } = next;
+    // A detach + re-subscribe for the same source table installs a NEW handle
+    // (and mailbox) under the same key. Folding across that boundary would send
+    // the older handle's changes to the newer one, so require the same handle;
+    // the stale hold is sealed and published to the mailbox it was built for.
+    // (In practice a re-subscribe also forces a pump reconnect, which discards
+    // the whole hold — this keeps the invariant local rather than inherited.)
+    let merge_result = if Arc::ptr_eq(&current.member, &next_member) {
+        current
+            .envelope
+            .try_merge(next_envelope, limits.eager_max_rows)
+    } else {
+        MergeOutcome::Incompatible(next_envelope)
+    };
+    // Either refusal seals the hold and starts a new one. `Limited` is normal
+    // operation here (a full envelope is exactly what we want to publish), so
+    // unlike the mailbox it is not a tuning signal.
+    let unmerged = match merge_result {
+        MergeOutcome::Merged => {
+            current.member.metrics.inc_envelope_merged_eager();
+            // Keep holding unless the fold filled the envelope. The deadline is
+            // unchanged either way — merging never extends it.
+            if current.envelope.rows.num_rows_hint() < limits.eager_max_rows {
+                return 0;
+            }
+            None
+        }
+        MergeOutcome::Limited(returned) | MergeOutcome::Incompatible(returned) => {
+            Some(EagerPendingEnvelope {
+                member: next_member,
+                envelope: returned,
+            })
+        }
+    };
+
+    let Some(sealed) = hold.pending.remove(member_key) else {
+        return 0;
+    };
+    if let Some(replacement) = unmerged {
+        hold.pending.insert(member_key.clone(), replacement);
+    }
+    hold.refresh_deadline(limits.max_envelope_age);
+    publish_eager_envelope(source, member_key, sealed, settings.shutdown_epoch).await
+}
+
+/// Publish every hold whose age deadline has passed. This is what guarantees a
+/// low-traffic table's coalesced envelope still reaches its member promptly
+/// instead of waiting on traffic that may not come.
+async fn flush_expired_eager_envelopes(
+    source: &Arc<SharedSource>,
+    hold: &mut EagerHold,
+    settings: EagerSettings,
+) -> u64 {
+    let mut waited: u64 = 0;
+    for (member_key, held) in hold.take_expired(settings.limits.max_envelope_age) {
+        waited = waited.saturating_add(
+            publish_eager_envelope(source, &member_key, held, settings.shutdown_epoch).await,
+        );
+    }
+    waited
+}
+
 /// Route a committed transaction's buffered changes to their members, then
 /// credit idle members and recompute the shared ack floor. Returns the total
-/// microseconds spent `await`ing slow member channels during this commit — the
+/// microseconds spent `await`ing slow member mailboxes during this commit — the
 /// caller subtracts it from the reader-processing accumulator so downstream
 /// back-pressure is not misattributed to decode cost (it is carried per dataset
 /// by `member_send_wait_micros_total`). Returns ~0 whenever every member's
-/// channel had spare capacity.
+/// mailbox had spare capacity.
 async fn deliver_commit(
     source: &Arc<SharedSource>,
+    eager_hold: &mut EagerHold,
+    eager_settings: EagerSettings,
     decoder: &pgoutput::Decoder,
     routes: &RouteMap,
     txn: TxnBuffer,
-    end_lsn: u64,
-    commit_time_micros: i64,
-    shutdown_epoch: u64,
+    boundary: CommitBoundary,
 ) -> u64 {
-    let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
+    let commit_time = client::pg_epoch_to_system_time(boundary.commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
     // accelerator (distinct from the `SystemTime` watermark published by the
     // caller's boundary flush).
@@ -1712,7 +3708,7 @@ async fn deliver_commit(
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_millis()).ok());
-    // Total time blocked awaiting member channels this commit, returned to the
+    // Total time blocked awaiting member mailboxes this commit, returned to the
     // caller for the reader-processing subtraction.
     let mut total_send_wait_us: u64 = 0;
 
@@ -1733,6 +3729,7 @@ async fn deliver_commit(
             key: member_key,
             member,
             slot,
+            working_schema,
         }) = routes.get(&relation_id)
         else {
             continue;
@@ -1740,7 +3737,7 @@ async fn deliver_commit(
         if !slot.has(STREAMING) {
             continue;
         }
-        if slot.already_committed(end_lsn) {
+        if slot.already_committed(boundary.end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).
             continue;
@@ -1762,51 +3759,57 @@ async fn deliver_commit(
         // build off this shared pump task onto the per-dataset consumer: the
         // pump only peeked + buffered the raw bytes, and `PgChangeRows::build`
         // decodes + builds later on the consumer (see `ChangeRows`), so neither
-        // decode nor build serializes every member behind one thread. The
-        // relation is cloned once per commit-per-relation (schema metadata, not
-        // per row) so the rows own their inputs; a decode/build failure (e.g. an
-        // unmergeable unchanged-TOAST column) then surfaces as a `StreamError` on
-        // this dataset's stream at consume time rather than a pump-side
-        // `member_fatal`, isolating it to the one dataset.
-        let rows = PgChangeRows::new(Arc::clone(&member.schema), rel.clone(), raw, commit_ts_ms);
-        member.metrics.inc_transaction();
-        // Readiness was already signaled by the member's snapshot / ready
-        // envelope at subscribe time, so WAL envelopes never need to carry it.
-        let envelope = ChangeEnvelope::new_from_rows(
-            Box::new(SharedLsnCommitter {
-                slot: Arc::clone(slot),
-                flush_to: end_lsn,
-            }),
-            Box::new(rows),
-            false,
+        // decode nor build serializes every member behind one thread. The rows
+        // hold the decoder's refcounted relation generation, so they own their
+        // decoding contract without copying the column layout — and two commits
+        // sharing that pointer are exactly the pair `try_append` may fold. A
+        // decode/build failure (e.g. an unmergeable unchanged-TOAST column) then
+        // surfaces as a `StreamError` on this dataset's stream at consume time
+        // rather than a pump-side `member_fatal`, isolating it to the one dataset.
+        // Build against the member's *working* schema (registered schema plus any
+        // adopted mid-stream widening — see `handle_relation`), not the fixed
+        // registered schema, so an adopted column reaches the accelerator.
+        let rows = PgChangeRows::new(
+            Arc::clone(working_schema),
+            Arc::clone(rel),
+            raw,
+            commit_ts_ms,
         );
-        slot.deliver(end_lsn);
-        match deliver_to_member(
-            &member.metrics,
-            &member.dataset_name,
-            &member.sender,
-            Ok(envelope),
-            shutdown_epoch,
-        )
-        .await
-        {
-            SendOutcome::Sent(waited) => {
-                total_send_wait_us = total_send_wait_us.saturating_add(waited);
-            }
-            SendOutcome::ReceiverGone(waited) => {
-                total_send_wait_us = total_send_wait_us.saturating_add(waited);
-                source.detach_member(member_key, "changes stream receiver dropped", true);
-            }
-            SendOutcome::ShutdownAbandon(waited) => {
-                return total_send_wait_us.saturating_add(waited);
-            }
-        }
+        member.metrics.inc_transaction();
+        // Lag-based readiness: this WAL envelope marks the dataset Ready only if
+        // its source commit time is within the member's `ready_lag` of now, i.e.
+        // the member has caught up to the source head. A backlog (post-snapshot
+        // gap replay, resume catch-up) keeps the dataset not-ready until closed.
+        let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts_ms, member.ready_lag);
+        let envelope = PendingPgEnvelope {
+            rows,
+            slot: Arc::clone(slot),
+            flush_to: boundary.end_lsn,
+            dataset: member.dataset_name.clone(),
+            watermark_notify: Arc::clone(&member.watermark_notify),
+            is_dataset_ready: is_ready,
+            first_received_at: std::time::Instant::now(),
+        };
+        slot.deliver(boundary.end_lsn);
+        total_send_wait_us = total_send_wait_us.saturating_add(
+            push_eager_envelope(
+                source,
+                eager_hold,
+                member_key,
+                EagerPendingEnvelope {
+                    member: Arc::clone(member),
+                    envelope,
+                },
+                eager_settings,
+            )
+            .await,
+        );
     }
 
     // The slot-level freshness watermark for this commit is published to every
     // member by the caller's consolidated boundary flush
     // (`BoundaryMetrics::commit_watermark`), not a separate per-member pass.
-    source.ack.credit_idle(end_lsn);
+    source.ack.credit_idle(boundary.end_lsn);
 
     total_send_wait_us
 }
@@ -1822,10 +3825,71 @@ mod tests {
     /// A one-column schema — `build_ready_signal_envelope` cannot build a
     /// zero-field struct array, so tests that emit a ready envelope need at
     /// least one field.
-    fn tiny_schema() -> SchemaRef {
+    ///
+    /// Shared across calls so envelopes built by [`pending_change`] carry the same
+    /// working-schema pointer, matching the pump (where consecutive commits take
+    /// the schema from one cached route). Merge compatibility is decided by
+    /// pointer, so a fresh allocation per call would make every merge decline.
+    static TINY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
         ]))
+    });
+
+    /// One relation generation, shared for the same reason as [`TINY_SCHEMA`].
+    static TINY_RELATION: LazyLock<Arc<pgoutput::Relation>> = LazyLock::new(|| {
+        Arc::new(pgoutput::Relation {
+            relation_id: 1,
+            namespace: "public".to_string(),
+            name: "t".to_string(),
+            replica_identity: b'd',
+            columns: vec![],
+        })
+    });
+
+    fn tiny_schema() -> SchemaRef {
+        Arc::clone(&TINY_SCHEMA)
+    }
+
+    /// A pending envelope buffering `rows` change messages, for a transaction big
+    /// enough to reach `eager_max_rows` on its own.
+    fn pending_change_rows(
+        slot: &Arc<AckSlot>,
+        flush_to: u64,
+        source_commit_ts_ms: i64,
+        rows: usize,
+    ) -> PendingPgEnvelope {
+        PendingPgEnvelope {
+            rows: PgChangeRows::new(
+                tiny_schema(),
+                Arc::clone(&TINY_RELATION),
+                vec![Bytes::from_static(b"I"); rows],
+                Some(source_commit_ts_ms),
+            ),
+            ..pending_change(slot, flush_to, source_commit_ts_ms, false)
+        }
+    }
+
+    fn pending_change(
+        slot: &Arc<AckSlot>,
+        flush_to: u64,
+        source_commit_ts_ms: i64,
+        ready: bool,
+    ) -> PendingPgEnvelope {
+        PendingPgEnvelope {
+            rows: PgChangeRows::new(
+                tiny_schema(),
+                Arc::clone(&TINY_RELATION),
+                vec![Bytes::from_static(b"I")],
+                Some(source_commit_ts_ms),
+            ),
+            slot: Arc::clone(slot),
+            watermark_notify: Arc::new(Notify::new()),
+            flush_to,
+            dataset: "ds".to_string(),
+            is_dataset_ready: ready,
+            first_received_at: std::time::Instant::now(),
+        }
     }
 
     /// Minimal shared params for tests that only exercise members/metrics; the
@@ -1843,25 +3907,144 @@ mod tests {
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
-            temporary_slot: false,
+            ephemeral_accelerator: false,
+            acceleration: crate::cdc::AccelerationContents::Unknown,
             status_interval: std::time::Duration::from_secs(5),
+            watermark_flush_interval: std::time::Duration::from_secs(30),
             bootstrap_batch_size: 8192,
+            unclaimed_reservation_grace: DEFAULT_UNCLAIMED_RESERVATION_GRACE,
             shared: true,
             member_channel_capacity: DEFAULT_MEMBER_CHANNEL_CAPACITY,
             pg_output_format: crate::postgres_replication::PgOutputFormat::Binary,
+            ready_lag: crate::cdc::DEFAULT_READY_LAG,
         }
+    }
+
+    /// A `setup_shared_member` outcome for a slot holding `tables` in its
+    /// publication.
+    fn shared_setup(
+        consistent_lsn: u64,
+        created_fresh: bool,
+        tables: &[&str],
+    ) -> slot::SharedMemberSetup {
+        slot::SharedMemberSetup {
+            slot_restart_lsn: Some(0),
+            slot: slot::SlotInfo {
+                slot_name: "slot".to_string(),
+                publication_name: "pub".to_string(),
+                consistent_lsn,
+                snapshot_name: None,
+                created_fresh,
+                generated_columns: vec![],
+            },
+            table_added: false,
+            generated_columns: vec![],
+            publication_tables: tables.iter().map(|t| key(t)).collect(),
+        }
+    }
+
+    /// The two slot lifetimes must render as distinguishable prose -- the
+    /// mismatch error states both sides in one sentence, and identical (or
+    /// vague) text would leave an operator unable to tell which dataset to move.
+    #[test]
+    fn slot_lifetime_descriptions_distinguish_the_two_cases() {
+        let disposable = slot_lifetime_description(true);
+        let retained = slot_lifetime_description(false);
+        assert_ne!(disposable, retained);
+        assert!(disposable.contains("discarded at shutdown"), "{disposable}");
+        assert!(retained.contains("retained across restarts"), "{retained}");
+        // Both name a setting an operator would actually change.
+        assert!(disposable.contains("`mode`"), "{disposable}");
+        assert!(retained.contains("`mode`"), "{retained}");
+        // The retained side must surface the non-obvious half of the predicate:
+        // a disabled initial snapshot needs the history even though the
+        // accelerator starts empty.
+        assert!(
+            retained.contains("pg_replication_initial_snapshot"),
+            "{retained}"
+        );
+    }
+
+    /// The mismatch error must name the slot and describe both lifetimes, so an
+    /// operator can tell which dataset to move without reading the source.
+    #[test]
+    fn durability_mismatch_error_is_actionable() {
+        let message = Error::SharedSlotDurabilityMismatch {
+            dataset: "orders".to_string(),
+            slot: "spice_shared".to_string(),
+            joining: slot_lifetime_description(false),
+            existing: slot_lifetime_description(true),
+        }
+        .to_string();
+
+        assert!(message.contains("orders"), "{message}");
+        assert!(message.contains("spice_shared"), "{message}");
+        assert!(message.contains("pg_replication_slot"), "{message}");
+        assert!(message.contains("acceleration `mode`"), "{message}");
+        assert!(message.contains("https://spiceai.org/docs"), "{message}");
+    }
+
+    /// The guard must key on the SAME predicate that releases the slot at
+    /// shutdown and fast-forwards it on re-bootstrap (`slot_is_disposable`), not
+    /// on `ephemeral_accelerator` alone.
+    ///
+    /// Two members can agree on ephemerality and still want opposite slot
+    /// lifetimes: `pg_replication_initial_snapshot: disabled` leaves an
+    /// empty-starting accelerator with no way to rebuild itself, so it needs the
+    /// slot's history replayed. Both action sites read the params of whichever
+    /// member opened the source, so admitting that pair would let join order
+    /// decide whether the history survives -- and one order silently drops the
+    /// non-snapshotting member's changes.
+    #[test]
+    fn slot_lifetime_conflicts_are_keyed_on_disposability_not_ephemerality() {
+        let member = |ephemeral, snapshot_on_resume| {
+            let mut p = test_params();
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p
+        };
+
+        // Same ephemerality, opposite disposability -- the case the old
+        // `ephemeral_accelerator` comparison waved through.
+        let re_snapshots = member(true, true);
+        let needs_history = member(true, false);
+        assert!(re_snapshots.slot_is_disposable());
+        assert!(!needs_history.slot_is_disposable());
+        assert_eq!(
+            re_snapshots.ephemeral_accelerator, needs_history.ephemeral_accelerator,
+            "the pair must be indistinguishable to the old comparison for this to be a regression test"
+        );
+
+        // Opposite ephemerality, same disposability: neither can discard the
+        // slot's history, so they can share it.
+        let durable = member(false, false);
+        assert_eq!(
+            durable.slot_is_disposable(),
+            needs_history.slot_is_disposable()
+        );
     }
 
     type MemberProbe = (
         MemberKey,
         Arc<ReplicationMetricsCollector>,
-        mpsc::Receiver<std::result::Result<ChangeEnvelope, StreamError>>,
+        MemberMailboxReceiver,
     );
 
     /// Build a `SharedSource` with `n` members wired to fresh metrics collectors
     /// and (capacity-4) channels, returning a probe per member so tests can read
     /// its metrics and drive its channel.
     fn test_source_with_members(n: usize) -> (Arc<SharedSource>, Vec<MemberProbe>) {
+        test_source_with_member_limits(n, *COALESCING_LIMITS)
+    }
+
+    /// As [`test_source_with_members`], with the member mailboxes' coalescing
+    /// limits chosen by the caller. A `backpressure_max_rows` low enough to
+    /// refuse the fold keeps each delivery a distinct mailbox item, which is how
+    /// a test observes *delivery order* rather than a merged result.
+    fn test_source_with_member_limits(
+        n: usize,
+        limits: CoalescingLimits,
+    ) -> (Arc<SharedSource>, Vec<MemberProbe>) {
         let source_key = SourceKey::from_params(&test_params());
         let source = Arc::new(SharedSource::new(source_key, test_params()));
         let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
@@ -1869,21 +4052,265 @@ mod tests {
         for i in 0..n {
             let member_key = key(&format!("t{i}"));
             let metrics = ReplicationMetricsCollector::new();
-            let (sender, receiver) = mpsc::channel(4);
+            let (sender, receiver) = member_mailbox_with_limits(4, limits);
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
                     dataset_name: format!("ds{i}"),
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
                     generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::Block,
                     sender,
                     metrics: Arc::clone(&metrics),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
                 }),
             );
             probes.push((member_key, metrics, receiver));
         }
         (source, probes)
+    }
+
+    /// The ported schema-evolution wiring: under a non-`Block` policy, a
+    /// mid-stream source column add must be adopted into the member's working
+    /// schema (which `deliver_commit` then builds the `ChangeBatch` against), so
+    /// the runtime evolution layer sees the wider batch. A new column is adopted
+    /// only on the *second* Relation (the first establishes the baseline), so
+    /// this drives a baseline Relation then an ALTER-widened one.
+    #[tokio::test]
+    async fn handle_relation_adopts_mid_stream_column_add_into_working_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let (sender, _rx) = member_mailbox(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                watermark_notify: Arc::new(Notify::new()),
+                dataset_name: "users".into(),
+                schema,
+                primary_keys: vec!["id".into()],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::AppendNewColumns,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        source.ack.promote_ready_members();
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        // Baseline Relation: working schema unchanged (id only).
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
+        assert_eq!(working(&routes), vec!["id".to_string()]);
+
+        // Mid-stream ALTER adds `name` (text): the shared pump must adopt it.
+        let name_col = || Column {
+            is_key: false,
+            name: "name".into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col()]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "shared pump adopted the mid-stream column add under append_new_columns"
+        );
+
+        // Simulate a transient reconnect: the pump rebuilds `routes` per
+        // connection but `schema_state` PERSISTS (declared outside the reconnect
+        // loop in run_pump). The first Relation after reconnect already carries
+        // `name` (the stream resumed past the ALTER) — a tracker "first
+        // observation" that on its own would NOT adopt an added column. The
+        // persisted tracker must keep the adoption so the column is not dropped.
+        routes.clear();
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), name_col()]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "name".to_string()],
+            "adopted column survives a reconnect because schema_state persists across the WAL gap"
+        );
+    }
+
+    /// The persisted `schema_state` must not carry stale assumptions across a
+    /// re-subscribe: if the same source table is re-registered with a different
+    /// schema (config reload while the pump keeps running), the tracker is
+    /// rebuilt from the new registration rather than reusing the old widened
+    /// working schema.
+    #[tokio::test]
+    async fn handle_relation_rebuilds_state_on_resubscribe_with_changed_schema() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let member_key: MemberKey = ("public".to_string(), "users".to_string());
+        // Keep receivers alive so the members' senders stay open for the test.
+        let mut keepalive = Vec::new();
+        let mut register = |schema: SchemaRef| {
+            let (sender, rx) = member_mailbox(4);
+            keepalive.push(rx);
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
+                    dataset_name: "users".into(),
+                    schema,
+                    primary_keys: vec!["id".into()],
+                    generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::AppendNewColumns,
+                    sender,
+                    metrics: ReplicationMetricsCollector::new(),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                }),
+            );
+            source.ack.register(&member_key, false);
+            source.ack.promote_ready_members();
+        };
+
+        let id_col = || Column {
+            is_key: true,
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+        };
+        let text_col = |name: &str| Column {
+            is_key: false,
+            name: name.into(),
+            type_oid: 25,
+            type_modifier: -1,
+        };
+        let rel = |cols: Vec<Column>| Relation {
+            relation_id: 42,
+            namespace: "public".into(),
+            name: "users".into(),
+            replica_identity: b'd',
+            columns: cols,
+        };
+        let working = |routes: &RouteMap| -> Vec<String> {
+            routes
+                .get(&42)
+                .expect("route built")
+                .working_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        let mut schema_state = MemberSchemaStates::default();
+
+        // First registration: schema [id]; adopt `name` mid-stream → [id, name].
+        register(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col()]),
+        )
+        .await;
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("name")]),
+        )
+        .await;
+        assert_eq!(working(&routes), vec!["id".to_string(), "name".to_string()]);
+
+        // Re-subscribe for the same table with a DIFFERENT registered schema
+        // ([id, email]). The stale tracker (which had adopted `name`) must be
+        // discarded and rebuilt from the new registration, so the first Relation
+        // is a fresh baseline that yields exactly the new schema — not the old
+        // widened [id, name] or a mash-up.
+        register(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("email", DataType::Utf8, true),
+        ])));
+        handle_relation(
+            &source,
+            &mut decoder,
+            &mut routes,
+            &mut schema_state,
+            rel(vec![id_col(), text_col("email")]),
+        )
+        .await;
+        assert_eq!(
+            working(&routes),
+            vec!["id".to_string(), "email".to_string()],
+            "re-subscribe with a new schema rebuilds the tracker; the stale `name` adoption is dropped"
+        );
     }
 
     /// Item 1: one boundary flush publishes every field to every member.
@@ -1926,7 +4353,752 @@ mod tests {
         }
     }
 
-    /// Item 4: a stalled (full) member channel lands the pump's blocked time in
+    /// Coalescing limits for a test, defaulting the mailbox byte budget high
+    /// enough that only the limit under test can bind.
+    fn test_limits(eager_max_rows: usize, backpressure_max_rows: usize) -> CoalescingLimits {
+        CoalescingLimits {
+            max_envelope_age: std::time::Duration::from_secs(1),
+            eager_max_rows,
+            backpressure_max_rows,
+            max_mailbox_bytes: usize::MAX,
+        }
+    }
+
+    /// Estimated bytes one [`pending_change`] contributes to the mailbox byte
+    /// budget: one 1-byte pgoutput message floored at the fixed-width Arrow
+    /// footprint of [`TINY_SCHEMA`]'s single `Int32`.
+    const PENDING_CHANGE_BYTES: usize = 4;
+
+    #[tokio::test]
+    async fn mailbox_merges_compatible_tail_and_commits_latest_lsn() {
+        let (tx, mut rx) = member_mailbox_with_limits(4, test_limits(8, 8));
+        let slot = Arc::new(AckSlot::new(0, false));
+
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 10, 100, false)),
+            MailboxSendOutcome::Sent {
+                coalesce_limited: false
+            }
+        ));
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&slot, 20, 200, true)),
+                MailboxSendOutcome::Merged
+            ),
+            "a compatible transaction should fold into the unclaimed tail"
+        );
+        assert_eq!(
+            tx.shared.buffered_items.load(Ordering::Acquire),
+            1,
+            "compatible source transactions should occupy one mailbox item"
+        );
+        assert_eq!(
+            tx.shared.buffered_bytes.load(Ordering::Acquire),
+            2 * PENDING_CHANGE_BYTES,
+            "a merge must still charge the byte budget for what it absorbed"
+        );
+
+        let envelope = rx
+            .next()
+            .await
+            .expect("coalesced envelope")
+            .expect("valid envelope");
+        assert_eq!(envelope.num_rows_hint(), 2);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(200));
+        assert!(envelope.is_dataset_ready());
+        envelope.commit().await.expect("commit coalesced envelope");
+        assert_eq!(slot.committed(), 20);
+        assert_eq!(
+            tx.shared.buffered_bytes.load(Ordering::Acquire),
+            0,
+            "yielding the coalesced envelope must release everything it absorbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_row_limit_seals_tail_and_preserves_fifo() {
+        let (tx, mut rx) = member_mailbox_with_limits(4, test_limits(8, 1));
+        let slot = Arc::new(AckSlot::new(0, false));
+
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(
+            tx.try_publish(pending_change(&slot, 20, 200, false))
+                .is_delivered()
+        );
+        assert_eq!(tx.shared.buffered_items.load(Ordering::Acquire), 2);
+
+        let first = rx
+            .next()
+            .await
+            .expect("first envelope")
+            .expect("valid first envelope");
+        let second = rx
+            .next()
+            .await
+            .expect("second envelope")
+            .expect("valid second envelope");
+        assert_eq!(first.source_commit_ts_ms(), Some(100));
+        assert_eq!(second.source_commit_ts_ms(), Some(200));
+    }
+
+    fn eager_settings(limits: CoalescingLimits) -> EagerSettings {
+        EagerSettings {
+            limits,
+            shutdown_epoch: crate::cdc::shutdown_epoch(),
+        }
+    }
+
+    #[tokio::test]
+    async fn eager_age_limit_flushes_unpublished_envelope() {
+        let mut limits = test_limits(8, 8);
+        limits.max_envelope_age = std::time::Duration::from_millis(10);
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut first = pending_change(&slot, 10, 100, false);
+        first.first_received_at -= std::time::Duration::from_secs(1);
+        let mut hold = EagerHold::default();
+        hold.pending.insert(
+            member_key.clone(),
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: first,
+            },
+        );
+        hold.refresh_deadline(limits.max_envelope_age);
+
+        let waited =
+            flush_expired_eager_envelopes(&source, &mut hold, eager_settings(limits)).await;
+        assert!(waited < 100_000);
+        assert!(
+            hold.pending.is_empty() && hold.next_deadline.is_none(),
+            "expired envelope should be published and its deadline cleared"
+        );
+        assert_eq!(
+            rx.next()
+                .await
+                .expect("first envelope")
+                .expect("valid envelope")
+                .source_commit_ts_ms(),
+            Some(100)
+        );
+    }
+
+    /// A trickle of later commits must not defer a table's envelope past the age
+    /// limit: merging keeps the deadline anchored at the FIRST commit absorbed, so
+    /// a low-traffic member always publishes within `max_envelope_age`.
+    #[tokio::test]
+    async fn eager_merge_does_not_extend_the_age_deadline() {
+        let mut limits = test_limits(64, 64);
+        limits.max_envelope_age = std::time::Duration::from_millis(50);
+        let settings = eager_settings(limits);
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        // First commit starts the hold, and is already 40ms old.
+        let mut first = pending_change(&slot, 10, 100, false);
+        first.first_received_at -= std::time::Duration::from_millis(40);
+        let deadline = first.first_received_at + limits.max_envelope_age;
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: first,
+            },
+            settings,
+        )
+        .await;
+        assert_eq!(hold.next_deadline, Some(deadline));
+
+        // A later commit folds in but must not push the deadline out.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 20, 200, false),
+            },
+            settings,
+        )
+        .await;
+        assert_eq!(
+            hold.next_deadline,
+            Some(deadline),
+            "a merge must leave the original deadline in place"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let _ = flush_expired_eager_envelopes(&source, &mut hold, settings).await;
+        assert!(hold.pending.is_empty(), "the original deadline should fire");
+        let envelope = rx
+            .next()
+            .await
+            .expect("coalesced envelope")
+            .expect("valid envelope");
+        assert_eq!(envelope.num_rows_hint(), 2);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn eager_row_limit_publishes_completed_envelope() {
+        let settings = eager_settings(test_limits(2, 8));
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        for (lsn, timestamp) in [(10, 100), (20, 200)] {
+            let _ = push_eager_envelope(
+                &source,
+                &mut hold,
+                &member_key,
+                EagerPendingEnvelope {
+                    member: Arc::clone(&member),
+                    envelope: pending_change(&slot, lsn, timestamp, false),
+                },
+                settings,
+            )
+            .await;
+        }
+
+        assert!(
+            hold.pending.is_empty(),
+            "reaching the eager row limit should publish immediately"
+        );
+        let envelope = rx
+            .next()
+            .await
+            .expect("eager envelope")
+            .expect("valid envelope");
+        assert_eq!(envelope.num_rows_hint(), 2);
+    }
+
+    /// Regression test for #12311. A transaction that fills an envelope on its own
+    /// publishes straight through, but it must not overtake what this member
+    /// already holds: changes are applied in delivery order, so the earlier
+    /// commit arriving second would apply its rows over the later commit's — and
+    /// since `SharedLsnCommitter` takes a monotonic max, the overtaking envelope
+    /// acks the higher LSN, so the skipped WAL is recyclable and never replayed.
+    #[tokio::test]
+    async fn eager_oversized_transaction_does_not_overtake_the_held_envelope() {
+        // `backpressure_max_rows` 1 stops the mailbox folding the two deliveries
+        // into one item, leaving the order directly observable.
+        let limits = test_limits(2, 1);
+        let settings = eager_settings(limits);
+        let (source, mut probes) = test_source_with_member_limits(1, limits);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        // A small commit starts the hold.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            settings,
+        )
+        .await;
+        assert_eq!(hold.pending.len(), 1, "the small commit should be held");
+
+        // A bulk transaction reaching `eager_max_rows` on its own takes the
+        // straight-through path.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change_rows(&slot, 120, 120, 2),
+            },
+            settings,
+        )
+        .await;
+
+        assert!(
+            hold.pending.is_empty() && hold.next_deadline.is_none(),
+            "the hold should be sealed and its deadline cleared"
+        );
+        let first = rx
+            .next()
+            .await
+            .expect("first envelope")
+            .expect("valid first envelope");
+        let second = rx
+            .next()
+            .await
+            .expect("second envelope")
+            .expect("valid second envelope");
+        assert_eq!(
+            (first.source_commit_ts_ms(), second.source_commit_ts_ms()),
+            (Some(100), Some(120)),
+            "the held commit must be delivered before the bulk transaction"
+        );
+        assert_eq!(first.num_rows_hint(), 1);
+        assert_eq!(second.num_rows_hint(), 2);
+    }
+
+    /// Sealing the hold is scoped to the member being published to: a bulk
+    /// transaction on one table must not flush another table's coalescing
+    /// envelope, whose age deadline has to survive intact.
+    #[tokio::test]
+    async fn eager_oversized_transaction_leaves_other_members_held() {
+        let limits = test_limits(2, 1);
+        let settings = eager_settings(limits);
+        let (source, mut probes) = test_source_with_member_limits(2, limits);
+        let (first_key, _first_metrics, mut first_rx) = probes.remove(0);
+        let (second_key, _second_metrics, mut second_rx) = probes.remove(0);
+        let first_member = source.member(&first_key).expect("first member");
+        let second_member = source.member(&second_key).expect("second member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &first_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&first_member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            settings,
+        )
+        .await;
+        let first_deadline = hold.next_deadline.expect("the first member holds");
+
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &second_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&second_member),
+                envelope: pending_change_rows(&slot, 120, 120, 2),
+            },
+            settings,
+        )
+        .await;
+
+        assert_eq!(
+            hold.pending.len(),
+            1,
+            "only the published member's hold should be sealed"
+        );
+        assert!(hold.pending.contains_key(&first_key));
+        assert_eq!(
+            hold.next_deadline,
+            Some(first_deadline),
+            "the untouched member's age deadline must survive"
+        );
+        assert!(
+            futures::FutureExt::now_or_never(first_rx.next()).is_none(),
+            "the other member's envelope should still be held"
+        );
+        assert_eq!(
+            second_rx
+                .next()
+                .await
+                .expect("bulk envelope")
+                .expect("valid envelope")
+                .source_commit_ts_ms(),
+            Some(120)
+        );
+    }
+
+    /// The straight-through path drains the hold whichever condition selected it.
+    /// A zero `max_envelope_age` means no hold is ever started, so this guards the
+    /// shape of the drain rather than a state the pump reaches today: the two
+    /// conditions share one branch, and a future dynamic `max_envelope_age` would
+    /// make holding reachable after a hold already exists.
+    #[tokio::test]
+    async fn eager_disabled_hold_still_publishes_held_data_first() {
+        let enabled = test_limits(8, 1);
+        let (source, mut probes) = test_source_with_member_limits(1, enabled);
+        let (member_key, _metrics, mut rx) = probes.remove(0);
+        let member = source.member(&member_key).expect("member");
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+        let mut disabled = enabled;
+        disabled.max_envelope_age = std::time::Duration::ZERO;
+
+        // Start the hold while holding is on, then publish with it off.
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 100, 100, false),
+            },
+            eager_settings(enabled),
+        )
+        .await;
+        let _ = push_eager_envelope(
+            &source,
+            &mut hold,
+            &member_key,
+            EagerPendingEnvelope {
+                member: Arc::clone(&member),
+                envelope: pending_change(&slot, 120, 120, false),
+            },
+            eager_settings(disabled),
+        )
+        .await;
+
+        assert!(hold.pending.is_empty() && hold.next_deadline.is_none());
+        let first = rx
+            .next()
+            .await
+            .expect("first envelope")
+            .expect("valid first envelope");
+        let second = rx
+            .next()
+            .await
+            .expect("second envelope")
+            .expect("valid second envelope");
+        assert_eq!(
+            (first.source_commit_ts_ms(), second.source_commit_ts_ms()),
+            (Some(100), Some(120)),
+            "disabling the hold must not let the new commit overtake held data"
+        );
+    }
+
+    /// One hold per member, not one most-recently-used slot: a transaction
+    /// touching several tables must leave every member's envelope still open to
+    /// folding, or a slot carrying more than one table would never coalesce.
+    #[tokio::test]
+    async fn eager_hold_keeps_one_envelope_per_member() {
+        let settings = eager_settings(test_limits(8, 8));
+        let (source, mut probes) = test_source_with_members(2);
+        let (first_key, _first_metrics, mut first_rx) = probes.remove(0);
+        let (second_key, _second_metrics, _second_rx) = probes.remove(0);
+        let first_member = source.member(&first_key).expect("first member");
+        let second_member = source.member(&second_key).expect("second member");
+        let first_slot = Arc::new(AckSlot::new(0, false));
+        let second_slot = Arc::new(AckSlot::new(0, false));
+        let mut hold = EagerHold::default();
+
+        // Interleave the two members the way a multi-table commit does.
+        for (key, member, slot, lsn, ts) in [
+            (&first_key, &first_member, &first_slot, 10, 100),
+            (&second_key, &second_member, &second_slot, 20, 200),
+            (&first_key, &first_member, &first_slot, 30, 300),
+        ] {
+            let _ = push_eager_envelope(
+                &source,
+                &mut hold,
+                key,
+                EagerPendingEnvelope {
+                    member: Arc::clone(member),
+                    envelope: pending_change(slot, lsn, ts, false),
+                },
+                settings,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            hold.pending.len(),
+            2,
+            "each member should hold its own envelope"
+        );
+        assert_eq!(
+            hold.pending
+                .get(&first_key)
+                .expect("first hold")
+                .envelope
+                .rows
+                .num_rows_hint(),
+            2,
+            "the interleaved second commit for the first member should have folded"
+        );
+        assert!(
+            futures::FutureExt::now_or_never(first_rx.next()).is_none(),
+            "nothing should have been published yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_tail_coalescing_has_no_age_limit() {
+        let (tx, mut rx) = member_mailbox_with_limits(1, test_limits(8, 8));
+        let slot = Arc::new(AckSlot::new(0, false));
+        let mut first = pending_change(&slot, 10, 100, false);
+        first.first_received_at -= std::time::Duration::from_secs(1);
+        assert!(tx.try_publish(first).is_delivered());
+
+        let collector = ReplicationMetricsCollector::new();
+        assert!(matches!(
+            deliver_to_member(
+                &collector,
+                "ds",
+                &tx,
+                pending_change(&slot, 20, 200, false),
+                crate::cdc::shutdown_epoch(),
+            )
+            .await,
+            SendOutcome::Sent(_)
+        ));
+        assert_eq!(
+            tx.shared.buffered_items.load(Ordering::Acquire),
+            1,
+            "backpressure should merge into the old incoming tail"
+        );
+        let envelope = rx
+            .next()
+            .await
+            .expect("coalesced envelope")
+            .expect("valid envelope");
+        assert_eq!(envelope.num_rows_hint(), 2);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(200));
+    }
+
+    #[test]
+    fn mailbox_backpressure_coalescing_still_enforces_row_limit() {
+        let (tx, _rx) = member_mailbox_with_limits(1, test_limits(8, 1));
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 20, 200, false)),
+            MailboxSendOutcome::Full(_)
+        ));
+        assert_eq!(tx.shared.buffered_items.load(Ordering::Acquire), 1);
+    }
+
+    /// The per-envelope row limit alone does not bound mailbox memory — tail
+    /// merging only targets the newest item, so a stalled sink would otherwise
+    /// fill every one of `max_items` envelopes to the row limit. The byte budget
+    /// stops both merging and admitting, turning that growth back into
+    /// back-pressure.
+    #[test]
+    fn mailbox_byte_budget_stops_merging_and_admitting() {
+        let mut limits = test_limits(1024, 1024);
+        limits.max_mailbox_bytes = PENDING_CHANGE_BYTES;
+        let (tx, _rx) = member_mailbox_with_limits(8, limits);
+        let slot = Arc::new(AckSlot::new(0, false));
+
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&slot, 20, 200, false)),
+                MailboxSendOutcome::Full(_)
+            ),
+            "over the byte budget, neither a merge nor a new item is allowed \
+             even with item slots to spare"
+        );
+        assert_eq!(tx.shared.buffered_items.load(Ordering::Acquire), 1);
+        assert_eq!(
+            tx.shared.buffered_bytes.load(Ordering::Acquire),
+            PENDING_CHANGE_BYTES
+        );
+    }
+
+    /// `close` must release a sender parked waiting for capacity, not just the
+    /// receiver. `send_control` re-reads `sender_closed` only after a wake, so a
+    /// close that woke only the receiver would leave the sender asleep until the
+    /// sink drained — and a stalled sink never does. Unreachable today (one
+    /// sender per mailbox, all sends from the pump task), which is exactly why it
+    /// needs a test: a second sender would turn it into a hang.
+    #[tokio::test]
+    async fn close_releases_a_sender_parked_on_a_full_mailbox() {
+        let (tx, _rx) = member_mailbox_with_limits(1, test_limits(8, 8));
+        let slot = Arc::new(AckSlot::new(0, false));
+        // Fill the single item slot so the next control send must park.
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        let heartbeat = crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("heartbeat");
+        assert!(matches!(
+            tx.try_send_control(Ok(heartbeat)),
+            MailboxSendOutcome::Full(_)
+        ));
+
+        let tx = Arc::new(tx);
+        let sender = Arc::clone(&tx);
+        let parked = tokio::spawn(async move {
+            let heartbeat =
+                crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("second heartbeat");
+            sender.send_control(Ok(heartbeat)).await
+        });
+        // Let it reach the await, then close. The receiver never drains.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.close();
+
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("close must release the parked sender rather than hang it")
+            .expect("sender task panicked");
+        assert!(
+            returned.is_some(),
+            "a closed mailbox should hand the item back, not swallow it"
+        );
+    }
+
+    /// The row limit refusing a fold is a tuning signal: raising it would have
+    /// coalesced more.
+    #[test]
+    fn row_limit_refusal_is_reported_as_coalesce_limited() {
+        let (tx, _rx) = member_mailbox_with_limits(4, test_limits(8, 1));
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 10, 100, false)),
+            MailboxSendOutcome::Sent {
+                coalesce_limited: false
+            }
+        ));
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&slot, 20, 200, false)),
+                MailboxSendOutcome::Sent {
+                    coalesce_limited: true
+                }
+            ),
+            "a fold refused by the row limit should be flagged for tuning"
+        );
+    }
+
+    /// Same for the byte budget — with item slots to spare, so it is the budget
+    /// and not capacity doing the refusing.
+    #[test]
+    fn byte_budget_refusal_is_reported_as_coalesce_limited() {
+        let mut limits = test_limits(1024, 1024);
+        limits.max_mailbox_bytes = PENDING_CHANGE_BYTES;
+        let (tx, _rx) = member_mailbox_with_limits(8, limits);
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 20, 200, false)),
+            MailboxSendOutcome::Full(_)
+        ));
+    }
+
+    /// A fold refused because the envelopes are not foldable at all must NOT be
+    /// reported as limit-bound — no configured bound would change it, and
+    /// counting it would send operators tuning knobs that cannot help.
+    #[test]
+    fn incompatible_refusal_is_not_reported_as_coalesce_limited() {
+        // Generous limits, so only compatibility can refuse the fold.
+        let (tx, _rx) = member_mailbox_with_limits(4, test_limits(1024, 1024));
+        let first_slot = Arc::new(AckSlot::new(0, false));
+        let other_slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&first_slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&other_slot, 20, 200, false)),
+                MailboxSendOutcome::Sent {
+                    coalesce_limited: false
+                }
+            ),
+            "a different ack slot is a correctness boundary, not a tuning signal"
+        );
+    }
+
+    /// One source transaction can exceed any budget on its own. An empty mailbox
+    /// must still take it, or the slot would wedge instead of back-pressuring.
+    #[test]
+    fn mailbox_admits_an_oversized_transaction_when_empty() {
+        let mut limits = test_limits(1024, 1024);
+        limits.max_mailbox_bytes = 1;
+        let (tx, _rx) = member_mailbox_with_limits(8, limits);
+        let slot = Arc::new(AckSlot::new(0, false));
+
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered(),
+            "an empty mailbox always admits, however large the transaction"
+        );
+        assert!(matches!(
+            tx.try_publish(pending_change(&slot, 20, 200, false)),
+            MailboxSendOutcome::Full(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mailbox_heartbeat_is_immediate_but_ordered_after_data() {
+        let (tx, mut rx) = member_mailbox_with_limits(4, test_limits(8, 8));
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        let heartbeat = crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("heartbeat");
+        assert!(
+            tx.try_send_control(Ok(heartbeat)).is_delivered(),
+            "heartbeat should enqueue without waiting for another source event"
+        );
+
+        let data = rx
+            .next()
+            .await
+            .expect("data envelope")
+            .expect("valid data envelope");
+        let heartbeat = rx
+            .next()
+            .await
+            .expect("heartbeat envelope")
+            .expect("valid heartbeat envelope");
+        assert!(!data.is_heartbeat());
+        assert!(heartbeat.is_heartbeat());
+    }
+
+    #[test]
+    fn mailbox_swap_does_not_release_capacity_before_yield() {
+        let (tx, mut rx) = member_mailbox_with_limits(2, test_limits(8, 1));
+        let slot = Arc::new(AckSlot::new(0, false));
+        assert!(
+            tx.try_publish(pending_change(&slot, 10, 100, false))
+                .is_delivered()
+        );
+        assert!(
+            tx.try_publish(pending_change(&slot, 20, 200, false))
+                .is_delivered()
+        );
+
+        rx.refill();
+        assert!(
+            matches!(
+                tx.try_publish(pending_change(&slot, 30, 300, false)),
+                MailboxSendOutcome::Full(_)
+            ),
+            "moving items into the receiver-local vector must not free capacity"
+        );
+
+        let _ = rx.pop().expect("yield one item");
+        assert!(
+            tx.try_publish(pending_change(&slot, 30, 300, false))
+                .is_delivered(),
+            "yielding one item should release exactly one capacity slot"
+        );
+    }
+
+    /// Item 4: a stalled (full) member mailbox lands the pump's blocked time in
     /// `member_send_wait_micros_total` — the value the caller subtracts from the
     /// reader-processing bucket — while a channel with spare capacity waits ~0.
     #[tokio::test]
@@ -1934,28 +5106,32 @@ mod tests {
         let epoch = crate::cdc::shutdown_epoch();
         let schema = tiny_schema();
         let collector = ReplicationMetricsCollector::new();
-        let (tx, mut rx) = mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
+        let (tx, mut rx) = member_mailbox(1);
+        let slot = Arc::new(AckSlot::new(0, false));
 
         // Spare capacity → immediate send, negligible wait.
-        let env0 = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("ready envelope"));
+        let env0 = pending_change(&slot, 10, 100, false);
         match deliver_to_member(&collector, "ds", &tx, env0, epoch).await {
             SendOutcome::Sent(w) => assert!(w < 100_000, "fast path should be ~0µs, got {w}"),
             _ => panic!("expected Sent on the fast path"),
         }
-        let _ = rx.recv().await.expect("drain fast-path envelope");
+        let _ = rx.next().await.expect("drain fast-path envelope");
 
         // Fill to capacity; free a slot only after a delay so the next send blocks.
-        tx.send(Ok(
-            crate::cdc::build_ready_signal_envelope(&schema).expect("env")
-        ))
-        .await
-        .expect("prefill to capacity");
+        assert!(
+            tx.send_control(Ok(
+                crate::cdc::build_ready_signal_envelope(&schema).expect("env")
+            ))
+            .await
+            .is_none(),
+            "prefill to capacity"
+        );
         let drainer = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            let _ = rx.recv().await; // free one slot
+            let _ = rx.next().await; // free one slot
             rx // keep the receiver alive until the send completes
         });
-        let env1 = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
+        let env1 = pending_change(&slot, 20, 200, false);
         let SendOutcome::Sent(waited) = deliver_to_member(&collector, "ds", &tx, env1, epoch).await
         else {
             panic!("expected Sent once the slot frees")
@@ -1977,11 +5153,11 @@ mod tests {
     #[tokio::test]
     async fn deliver_to_member_reports_receiver_gone() {
         let epoch = crate::cdc::shutdown_epoch();
-        let schema = tiny_schema();
         let collector = ReplicationMetricsCollector::new();
-        let (tx, rx) = mpsc::channel::<std::result::Result<ChangeEnvelope, StreamError>>(1);
+        let (tx, rx) = member_mailbox(1);
         drop(rx);
-        let env = Ok(crate::cdc::build_ready_signal_envelope(&schema).expect("env"));
+        let slot = Arc::new(AckSlot::new(0, false));
+        let env = pending_change(&slot, 10, 100, false);
         assert!(matches!(
             deliver_to_member(&collector, "ds", &tx, env, epoch).await,
             SendOutcome::ReceiverGone(_)
@@ -2099,6 +5275,129 @@ mod tests {
         assert_eq!(ack.flush_lsn(), 900);
     }
 
+    /// Regression for #12609. On a resuming slot the first member to join is
+    /// credited to the WAL head by the next keepalive, and the floor only ever
+    /// rises — so a member joining after that would be seated above changes to
+    /// its own table that nobody consumed, and they would be acked away. A hold
+    /// for the published-but-unattached table keeps the floor at the resume LSN
+    /// until its member arrives to take it over.
+    #[test]
+    fn reserved_hold_pins_the_floor_until_its_member_joins() {
+        let ack = AckTable::default();
+        // Resume: the slot's confirmed_flush_lsn from before the restart.
+        ack.seed(100);
+        assert!(ack.reserve(&key("a"), 100), "a is published, no member yet");
+        assert!(ack.reserve(&key("b"), 100), "b is published, no member yet");
+
+        // b's dataset joins first, streams, and goes idle at the WAL head.
+        ack.register(&key("b"), false);
+        assert!(!ack.reserve(&key("b"), 100), "a member is never disturbed");
+        ack.promote_ready_members();
+        ack.deliver(&key("b"), 500);
+        ack.commit(&key("b"), 500);
+        ack.credit_idle(500);
+        assert_eq!(
+            ack.flush_lsn(),
+            100,
+            "a's hold pins the slot at the resume LSN while b races ahead"
+        );
+
+        // a's dataset joins second and inherits the hold, not b's position.
+        ack.register(&key("a"), false);
+        assert_eq!(
+            ack.committed(&key("a")),
+            100,
+            "the second joiner must resume from the slot's resume LSN"
+        );
+        assert_eq!(ack.delivered(&key("a")), 100, "nothing delivered to a yet");
+
+        // The reconnect starts at 100, replays a's gap, and only once a has
+        // applied it does the slot acknowledge past it.
+        ack.promote_ready_members();
+        ack.deliver(&key("a"), 500);
+        assert_eq!(
+            ack.flush_lsn(),
+            100,
+            "in-flight replay still holds the floor"
+        );
+        ack.commit(&key("a"), 500);
+        assert_eq!(ack.flush_lsn(), 500);
+    }
+
+    /// The first member to attach a resuming slot holds a floor for every
+    /// published table; each member's own hold is handed over when it
+    /// registers, and only the ones nothing ever claims expire.
+    #[test]
+    fn reservations_cover_published_tables_until_their_members_join() {
+        let (source, _) = test_source_with_members(0);
+        source.install_reservations(&shared_setup(100, false, &["t0", "t1", "orphan"]));
+        assert_eq!(
+            source.ack.flush_lsn(),
+            100,
+            "the slot cannot ack past the resume LSN while tables are unattached"
+        );
+
+        // The decision belongs to the first member to attach: a later attach
+        // does not re-open it (its table is already published and held, and a
+        // table that appears afterwards was added by that attach itself, so it
+        // snapshots).
+        source.install_reservations(&shared_setup(900, false, &["late"]));
+        assert!(
+            source.ack.slot(&key("late")).is_none(),
+            "reservations are installed once per source"
+        );
+
+        // t0's dataset joins and takes over its hold; the rest stay held.
+        source.ack.register(&key("t0"), false);
+        source.claim_reservation(&key("t0"));
+        let mut expired = source.take_expired_reservations(std::time::Duration::ZERO);
+        expired.sort();
+        assert_eq!(
+            expired,
+            vec![key("orphan"), key("t1")],
+            "only holds no member claimed expire"
+        );
+        assert!(
+            source
+                .take_expired_reservations(std::time::Duration::ZERO)
+                .is_empty(),
+            "an expired hold is handed out once, so one release is spawned per table"
+        );
+    }
+
+    /// A slot this process created owes nobody WAL below their join point —
+    /// every member of it snapshots — so nothing is held.
+    #[test]
+    fn a_freshly_created_slot_reserves_nothing() {
+        let (source, _) = test_source_with_members(0);
+        source.install_reservations(&shared_setup(100, true, &["t0"]));
+        assert!(source.ack.slot(&key("t0")).is_none());
+        assert!(
+            source
+                .take_expired_reservations(std::time::Duration::ZERO)
+                .is_empty()
+        );
+    }
+
+    /// A published table no dataset ever subscribes to would pin WAL for the
+    /// whole slot forever. Releasing its hold (done only once the table is out
+    /// of the publication) lets the floor advance again.
+    #[test]
+    fn releasing_an_unclaimed_hold_unpins_the_floor() {
+        let ack = AckTable::default();
+        ack.seed(100);
+        ack.reserve(&key("gone"), 100);
+        ack.register(&key("a"), false);
+        ack.promote_ready_members();
+        ack.deliver(&key("a"), 400);
+        ack.commit(&key("a"), 400);
+        ack.credit_idle(400);
+        assert_eq!(ack.flush_lsn(), 100, "the unclaimed hold pins the slot");
+
+        ack.release(&key("gone"));
+        assert_eq!(ack.flush_lsn(), 400);
+    }
+
     #[test]
     fn replayed_older_commits_never_regress() {
         let ack = AckTable::default();
@@ -2124,12 +5423,38 @@ mod tests {
         ack.seed(10);
         ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
+            watermark_notify: Arc::new(Notify::new()),
             slot: ack.slot(&key("a")).expect("slot registered"),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
         committer.commit().await.expect("commit");
         assert_eq!(ack.flush_lsn(), 42);
+    }
+
+    /// Producers publish positions from different tasks — envelope commits, the
+    /// snapshot/rebuild boundary, and the idle sweep — and can do so out of order.
+    /// Publishing takes the max rather than storing, so a straggler is a no-op
+    /// instead of moving the position backwards; a plain store here would make the
+    /// writer persist a stale position and rebuild the acceleration on the next
+    /// start, without self-correcting until the member advanced past the lost value.
+    #[test]
+    fn a_position_published_out_of_order_never_moves_backwards() {
+        let slot = AckSlot::new(0, false);
+        assert_eq!(slot.pending(), 0, "registration publishes nothing");
+
+        slot.note_pending(200);
+        slot.note_pending(100);
+        assert_eq!(
+            slot.pending(),
+            200,
+            "a position published late but superseded must not lower what is observable"
+        );
+
+        slot.note_pending(300);
+        assert_eq!(slot.pending(), 300);
     }
 
     #[test]

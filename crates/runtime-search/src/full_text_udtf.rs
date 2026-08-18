@@ -42,6 +42,8 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use futures::FutureExt;
 use search::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "elasticsearch")]
+use search::index::compound::CompoundSearchIndex;
+#[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchTextIndex;
 use search::{
     index::SearchIndex,
@@ -432,6 +434,89 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
             )));
         };
 
+        // Phase 0: compound (write-through) full-text index — a warm Tantivy primary paired
+        // with an external Elasticsearch secondary. For single-column FTS datasets with an
+        // external store, only the compound is registered, so this arm must precede the
+        // concrete Tantivy and Elasticsearch probes below. A `CompoundSearchIndex` can also
+        // compose *vector* tiers, so restrict to text compounds (those without a vector view).
+        #[cfg(feature = "elasticsearch")]
+        if let Some((compound_indexes, _)) = self
+            .explorer
+            .find_index::<CompoundSearchIndex>(&table_provider)
+        {
+            let text_compounds: Vec<&CompoundSearchIndex> = compound_indexes
+                .into_iter()
+                .filter(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+                .collect();
+
+            if !text_compounds.is_empty() {
+                // Each compound keys on a single search column (multi-column is out of scope,
+                // tracked in #11963): pick the compound matching the requested column, or the
+                // sole compound when no column argument was supplied.
+                let compound = if let Some(ref requested) = args.column {
+                    text_compounds
+                        .iter()
+                        .copied()
+                        .find(|c| &c.search_column() == requested)
+                } else if text_compounds.len() == 1 {
+                    Some(text_compounds[0])
+                } else {
+                    None
+                };
+
+                let Some(compound) = compound else {
+                    // The compound(s) are this table's full-text mechanism, so an unmatched
+                    // explicit column — or an omitted column when several are indexed — is an
+                    // error here. Mirror the concrete-index arm rather than falling through to
+                    // the misleading "does not have a full text search index" message below.
+                    let indexed: Vec<String> =
+                        text_compounds.iter().map(|c| c.search_column()).collect();
+                    if let Some(ref requested) = args.column {
+                        return Err(DataFusionError::Plan(format!(
+                            "User function 'text_search' is called on table '{}' that does not have a full text search index on '{requested}' column. Indexed column(s): {}.{}",
+                            args.tbl,
+                            indexed.join(", "),
+                            suggest_column(requested, &indexed)
+                                .map(|s| format!(" Did you mean '{s}'?"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    return Err(DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                        args.tbl,
+                        indexed.len(),
+                        indexed.join(", "),
+                    )));
+                };
+
+                let column = compound.search_column();
+                let udtf_source = UdtfSource::TextSearch {
+                    table: args.tbl.to_string(),
+                    query: args.query.clone(),
+                    column: Some(column),
+                    limit: args.limit,
+                    include_score: args.include_score,
+                };
+                return Ok(Arc::new(
+                    SearchQueryProvider::try_from_index(
+                        &(Arc::new(compound.clone()) as Arc<dyn SearchIndex>),
+                        Arc::clone(&table_provider),
+                        args.query.as_str(),
+                        args.limit,
+                    )?
+                    .with_udtf_source(udtf_source)
+                    .with_include_score(args.include_score.unwrap_or(true))
+                    .call_on_scan(Arc::new(|| {
+                        async {
+                            let request_context = RequestContext::current(AsyncMarker::new().await);
+                            telemetry::track_text_search(&request_context.to_dimensions());
+                        }
+                        .boxed()
+                    })),
+                ));
+            }
+        }
+
         let fts_indexes = self
             .explorer
             .find_index::<FullTextDatabaseIndex>(&table_provider);
@@ -572,7 +657,7 @@ mod tests {
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::TableReference;
-    use runtime_datafusion_index::Index;
+    use spice_table::Index;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -591,6 +676,13 @@ mod tests {
             &self,
             _tbl: &'a Arc<dyn datafusion::datasource::TableProvider>,
         ) -> Option<(Vec<&'a T>, Arc<dyn datafusion::datasource::TableProvider>)> {
+            None
+        }
+
+        fn not_ready_error(
+            &self,
+            _tbl: &Arc<dyn datafusion::datasource::TableProvider>,
+        ) -> Option<datafusion::error::DataFusionError> {
             None
         }
     }

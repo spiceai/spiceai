@@ -21,6 +21,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use ballista_core::JobId;
 use ballista_core::error::Result;
 use ballista_core::extension::{ResultFetchMetricsCallback, ShuffleReadMetricsCallback};
 use ballista_executor::execution_engine::QueryStageExecutor;
@@ -48,7 +49,7 @@ impl OtelExecutorMetricsCollector {
 }
 
 impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
-    fn record_task_started(&self, _job_id: &str, _stage_id: usize, _partition: usize) {
+    fn record_task_started(&self, _job_id: &JobId, _stage_id: usize, _partition: usize) {
         cluster::record_task_started(&self.node_id, "executor");
 
         // Also update executor-specific active task count
@@ -58,7 +59,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_stage(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _plan: Arc<dyn QueryStageExecutor>,
@@ -82,7 +83,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_task_failed(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         error_type: &str,
@@ -108,7 +109,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_shuffle_write(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         bytes: u64,
@@ -122,7 +123,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_shuffle_read(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _bytes: u64,
@@ -136,7 +137,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_shuffle_read_local(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         bytes: u64,
@@ -150,7 +151,7 @@ impl ExecutorMetricsCollector for OtelExecutorMetricsCollector {
 
     fn record_shuffle_read_remote(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _source_executor_id: &str,
@@ -198,7 +199,7 @@ impl OtelShuffleReadMetricsCallback {
 impl ShuffleReadMetricsCallback for OtelShuffleReadMetricsCallback {
     fn record_local_read(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _source_executor_id: &str,
@@ -213,7 +214,7 @@ impl ShuffleReadMetricsCallback for OtelShuffleReadMetricsCallback {
 
     fn record_remote_read(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _source_executor_id: &str,
@@ -254,7 +255,7 @@ impl OtelResultFetchMetricsCallback {
 impl ResultFetchMetricsCallback for OtelResultFetchMetricsCallback {
     fn record_result_fetch(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _partition: usize,
         _source_executor_id: &str,
@@ -290,20 +291,20 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
     // Job lifecycle events
     // =========================================================================
 
-    fn record_submitted(&self, _job_id: &str, _queued_at: u64, _submitted_at: u64) {
+    fn record_submitted(&self, _job_id: &JobId, _queued_at: u64, _submitted_at: u64) {
         // Job metrics are tracked at a higher level; we focus on stage/task metrics here.
         // This could be extended to track job queue latency if needed.
     }
 
-    fn record_completed(&self, _job_id: &str, _queued_at: u64, _completed_at: u64) {
+    fn record_completed(&self, _job_id: &JobId, _queued_at: u64, _completed_at: u64) {
         // Job completion is tracked at a higher level.
     }
 
-    fn record_failed(&self, _job_id: &str, _queued_at: u64, _failed_at: u64) {
+    fn record_failed(&self, _job_id: &JobId, _queued_at: u64, _failed_at: u64) {
         // Job failure is tracked at a higher level.
     }
 
-    fn record_cancelled(&self, _job_id: &str) {
+    fn record_cancelled(&self, _job_id: &JobId) {
         // Job cancellation is tracked at a higher level.
     }
 
@@ -325,13 +326,13 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
     // Stage lifecycle events
     // =========================================================================
 
-    fn record_stage_started(&self, _job_id: &str, _stage_id: usize, task_count: usize) {
+    fn record_stage_started(&self, _job_id: &JobId, _stage_id: usize, task_count: usize) {
         // Record the number of tasks per stage when it starts
         let labels = [KeyValue::new("node_id", self.node_id.clone())];
         cluster::SCHEDULER_TASKS_PER_STAGE.record(task_count as u64, &labels);
     }
 
-    fn record_stage_completed(&self, _job_id: &str, _stage_id: usize, duration_ms: u64) {
+    fn record_stage_completed(&self, _job_id: &JobId, _stage_id: usize, duration_ms: u64) {
         #[expect(clippy::cast_precision_loss)]
         let duration_ms_f64 = duration_ms as f64;
         // task_count is recorded in record_stage_started, use 0 here as placeholder
@@ -339,11 +340,11 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
         cluster::record_stage_completed(&self.node_id, duration_ms_f64, 0);
     }
 
-    fn record_stage_failed(&self, _job_id: &str, _stage_id: usize, error_type: &str) {
+    fn record_stage_failed(&self, _job_id: &JobId, _stage_id: usize, error_type: &str) {
         cluster::record_stage_failed(&self.node_id, error_type);
     }
 
-    fn record_stage_retry(&self, _job_id: &str, _stage_id: usize) {
+    fn record_stage_retry(&self, _job_id: &JobId, _stage_id: usize) {
         cluster::record_stage_retry(&self.node_id);
     }
 
@@ -353,7 +354,7 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
 
     fn record_task_scheduled(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         latency_ms: u64,
@@ -369,7 +370,7 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
         cluster::record_task_started(&self.node_id, "scheduler");
     }
 
-    fn record_task_completed(&self, _job_id: &str, _stage_id: usize, _executor_id: &str) {
+    fn record_task_completed(&self, _job_id: &JobId, _stage_id: usize, _executor_id: &str) {
         // Task completed - decrement active count
         // Duration is tracked on the executor side
         let labels = [
@@ -388,7 +389,7 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
 
     fn record_task_failed(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
         error_type: &str,
@@ -396,13 +397,13 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
         cluster::record_task_failed(&self.node_id, "scheduler", error_type);
     }
 
-    fn record_task_retry(&self, _job_id: &str, _stage_id: usize) {
+    fn record_task_retry(&self, _job_id: &JobId, _stage_id: usize) {
         cluster::record_task_retry(&self.node_id, "scheduler");
     }
 
     fn record_task_shuffle_affinity_hit(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
@@ -414,7 +415,7 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
 
     fn record_task_shuffle_affinity_miss(
         &self,
-        _job_id: &str,
+        _job_id: &JobId,
         _stage_id: usize,
         _executor_id: &str,
     ) {
@@ -446,7 +447,7 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
     // Planning events
     // =========================================================================
 
-    fn record_planning_duration(&self, _job_id: &str, duration_ms: u64) {
+    fn record_planning_duration(&self, _job_id: &JobId, duration_ms: u64) {
         #[expect(clippy::cast_precision_loss)]
         cluster::record_planning_duration(&self.node_id, duration_ms as f64);
     }
@@ -470,28 +471,28 @@ mod tests {
     fn test_executor_record_task_started() {
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
         // Should not panic
-        collector.record_task_started("job-1", 1, 0);
+        collector.record_task_started(&JobId::new("job-1"), 1, 0);
     }
 
     #[test]
     fn test_executor_record_task_failed() {
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
         // Should not panic
-        collector.record_task_failed("job-1", 1, 0, "timeout");
+        collector.record_task_failed(&JobId::new("job-1"), 1, 0, "timeout");
     }
 
     #[test]
     fn test_executor_record_shuffle_write() {
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
         // Should not panic
-        collector.record_shuffle_write("job-1", 1, 0, 1024, 100, 50);
+        collector.record_shuffle_write(&JobId::new("job-1"), 1, 0, 1024, 100, 50);
     }
 
     #[test]
     fn test_executor_record_shuffle_read() {
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
         // Should not panic
-        collector.record_shuffle_read("job-1", 1, 0, 2048, 200, 75);
+        collector.record_shuffle_read(&JobId::new("job-1"), 1, 0, 2048, 200, 75);
     }
 
     #[test]
@@ -517,10 +518,10 @@ mod tests {
         let now = 1_000_000_u64;
 
         // Job lifecycle methods should not panic
-        collector.record_submitted("job-1", now, now + 100);
-        collector.record_completed("job-1", now, now + 5000);
-        collector.record_failed("job-2", now, now + 1000);
-        collector.record_cancelled("job-3");
+        collector.record_submitted(&JobId::new("job-1"), now, now + 100);
+        collector.record_completed(&JobId::new("job-1"), now, now + 5000);
+        collector.record_failed(&JobId::new("job-2"), now, now + 1000);
+        collector.record_cancelled(&JobId::new("job-3"));
     }
 
     #[test]
@@ -547,10 +548,10 @@ mod tests {
         let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
 
         // Stage lifecycle methods should not panic
-        collector.record_stage_started("job-1", 1, 4);
-        collector.record_stage_completed("job-1", 1, 1000);
-        collector.record_stage_failed("job-2", 2, "resource_exhausted");
-        collector.record_stage_retry("job-3", 3);
+        collector.record_stage_started(&JobId::new("job-1"), 1, 4);
+        collector.record_stage_completed(&JobId::new("job-1"), 1, 1000);
+        collector.record_stage_failed(&JobId::new("job-2"), 2, "resource_exhausted");
+        collector.record_stage_retry(&JobId::new("job-3"), 3);
     }
 
     #[test]
@@ -558,10 +559,10 @@ mod tests {
         let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
 
         // Task scheduling methods should not panic
-        collector.record_task_scheduled("job-1", 1, "executor-1", 50);
-        collector.record_task_completed("job-1", 1, "executor-1");
-        collector.record_task_failed("job-2", 2, "executor-2", "network_error");
-        collector.record_task_retry("job-3", 3);
+        collector.record_task_scheduled(&JobId::new("job-1"), 1, "executor-1", 50);
+        collector.record_task_completed(&JobId::new("job-1"), 1, "executor-1");
+        collector.record_task_failed(&JobId::new("job-2"), 2, "executor-2", "network_error");
+        collector.record_task_retry(&JobId::new("job-3"), 3);
     }
 
     #[test]
@@ -579,7 +580,7 @@ mod tests {
         let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
 
         // Planning duration should not panic
-        collector.record_planning_duration("job-1", 250);
+        collector.record_planning_duration(&JobId::new("job-1"), 250);
     }
 
     // =========================================================================
@@ -595,20 +596,20 @@ mod tests {
         let scheduler = OtelSchedulerMetricsCollector::new("scheduler-1".to_string());
 
         // Scheduler receives job and schedules task
-        scheduler.record_stage_started("job-1", 1, 4);
-        scheduler.record_task_scheduled("job-1", 1, "executor-1", 10);
+        scheduler.record_stage_started(&JobId::new("job-1"), 1, 4);
+        scheduler.record_task_scheduled(&JobId::new("job-1"), 1, "executor-1", 10);
 
         // Executor picks up and runs task
-        executor.record_task_started("job-1", 1, 0);
-        executor.record_shuffle_read_local("job-1", 1, 0, 512, 50, 10);
-        executor.record_shuffle_read_remote("job-1", 1, 0, "executor-2", 512, 50, 20);
+        executor.record_task_started(&JobId::new("job-1"), 1, 0);
+        executor.record_shuffle_read_local(&JobId::new("job-1"), 1, 0, 512, 50, 10);
+        executor.record_shuffle_read_remote(&JobId::new("job-1"), 1, 0, "executor-2", 512, 50, 20);
 
         // Task completes (simulated without calling record_stage)
-        executor.record_shuffle_write("job-1", 1, 0, 512, 50, 15);
+        executor.record_shuffle_write(&JobId::new("job-1"), 1, 0, 512, 50, 15);
 
         // Scheduler records completion
-        scheduler.record_task_completed("job-1", 1, "executor-1");
-        scheduler.record_stage_completed("job-1", 1, 600);
+        scheduler.record_task_completed(&JobId::new("job-1"), 1, "executor-1");
+        scheduler.record_stage_completed(&JobId::new("job-1"), 1, 600);
     }
 
     #[test]
@@ -618,15 +619,15 @@ mod tests {
         let scheduler = OtelSchedulerMetricsCollector::new("scheduler-1".to_string());
 
         // Scheduler schedules task
-        scheduler.record_task_scheduled("job-fail", 1, "executor-2", 5);
+        scheduler.record_task_scheduled(&JobId::new("job-fail"), 1, "executor-2", 5);
 
         // Executor starts task but it fails
-        executor.record_task_started("job-fail", 1, 0);
-        executor.record_task_failed("job-fail", 1, 0, "out_of_memory");
+        executor.record_task_started(&JobId::new("job-fail"), 1, 0);
+        executor.record_task_failed(&JobId::new("job-fail"), 1, 0, "out_of_memory");
 
         // Scheduler records failure and retries
-        scheduler.record_task_failed("job-fail", 1, "executor-2", "out_of_memory");
-        scheduler.record_task_retry("job-fail", 1);
-        scheduler.record_stage_retry("job-fail", 1);
+        scheduler.record_task_failed(&JobId::new("job-fail"), 1, "executor-2", "out_of_memory");
+        scheduler.record_task_retry(&JobId::new("job-fail"), 1);
+        scheduler.record_stage_retry(&JobId::new("job-fail"), 1);
     }
 }

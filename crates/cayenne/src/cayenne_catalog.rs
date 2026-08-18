@@ -22,7 +22,7 @@ use super::metadata::{
     InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
     TableMetadata, TableStatistics,
 };
-use super::metastore::sqlite::SqliteMetastore;
+use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
 use super::metastore::{
@@ -177,6 +177,14 @@ impl MetastoreImpl {
             MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
             #[cfg(feature = "turso")]
             MetastoreImpl::Turso(m) => m.checkpoint_wal().await,
+        }
+    }
+
+    pub(crate) async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.incremental_vacuum().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.incremental_vacuum().await,
         }
     }
 
@@ -896,8 +904,10 @@ impl CayenneCatalog {
         // The proven overwrite clear FIRST (it also clears the cold manifest —
         // replace-all), then register this graduation's cold files, so cold
         // graduation is exactly an overwrite whose new content lives on the
-        // cold store.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id)
+        // cold store. No inline payload: a graduation's content is the cold files
+        // registered below, and the overwrite clear correctly drops the warm
+        // tier's inline corpus along with everything else keyed on the old snapshot.
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
             .await?;
         for f in cold_files {
             txn.execute(ExecuteParams {
@@ -927,12 +937,15 @@ impl CayenneCatalog {
     /// Returns [`CatalogError::InvalidOperationNoSource`] if either UUID is
     /// malformed.
     /// Returns [`CatalogError::FailedToSetCurrentSnapshot`] if the
-    /// `execute_batch` call against the borrowed transaction fails.
+    /// `execute_batch` call against the borrowed transaction fails, and
+    /// [`CatalogError::InvalidOperation`] if inserting the overwrite's inline
+    /// replacement row fails after it.
     pub async fn commit_overwrite_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
         new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -967,11 +980,33 @@ impl CayenneCatalog {
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
-        txn.execute_batch(&batch_sql)
-            .await
-            .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
+        txn.execute_batch(&batch_sql).await.map_err(|e| {
+            CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
-            })
+            }
+        })?;
+
+        // The overwrite's own replacement rows, when the whole refresh fit inline.
+        // Inserted AFTER the batch — which just deleted every inline row for this
+        // table — and inside the same transaction, so a reader either sees the old
+        // snapshot with the old inline corpus or the new snapshot with exactly
+        // these rows, never a mix. Bound as a parameter rather than folded into the
+        // `execute_batch` SQL above because `data_ipc` is a binary BLOB.
+        if let Some(inlined) = inlined {
+            let (_inlined_id, insert) =
+                inlined_data_insert(inlined.clone(), table_id, inlined.sequence_number);
+            // NOT `FailedToSetCurrentSnapshot`: the snapshot UPDATE above already
+            // succeeded, so reporting this as a snapshot failure points at the
+            // wrong statement.
+            txn.execute(insert)
+                .await
+                .map_err(|e| CatalogError::InvalidOperation {
+                    message: "Failed to insert the inlined replacement rows for the overwrite"
+                        .to_string(),
+                    source: Box::new(e),
+                })?;
+        }
+        Ok(())
     }
 
     /// Mark primary keys dirty for durable federated write-back (#11838) inside
@@ -1085,17 +1120,23 @@ impl CayenneCatalog {
         Ok(rows.into_iter().next().unwrap_or(0))
     }
 
-    /// Reconcile the datalake (cold tier) fields of a reopened table's stored
-    /// `VortexConfig` with the currently configured options.
+    /// Reconcile a reopened table's stored `VortexConfig` with the currently
+    /// configured options, for the fields that describe how the table is RUN
+    /// rather than how its data is written: the datalake (cold tier) settings
+    /// and the scan concurrency.
     ///
-    /// The cold fields are deliberately excluded from [`configuration_matches`]
-    /// (toggling the tier never recreates the table), and the provider runs
-    /// with the STORED config — so a spicepod change must be persisted here to
-    /// take effect on reopen. One change is rejected instead of persisted:
-    /// moving (or unsetting) the location while cold files exist, because the
-    /// cold manifest's absolute file URLs point at the old location and the
-    /// next promotion's replace-all would strand them.
-    async fn reconcile_cold_tier_config(
+    /// These are deliberately excluded from [`configuration_matches`] (changing
+    /// them never recreates the table), and the provider runs with the STORED
+    /// config — so a spicepod change must be persisted here to take effect on
+    /// reopen. Without that, `cayenne_scan_concurrency` would be inert on every
+    /// table that already exists, which is exactly when an operator reaches for
+    /// it: lowering it under memory pressure would silently keep the old value.
+    ///
+    /// One change is rejected instead of persisted: moving (or unsetting) the
+    /// cold location while cold files exist, because the cold manifest's
+    /// absolute file URLs point at the old location and the next promotion's
+    /// replace-all would strand them.
+    async fn reconcile_runtime_only_config(
         &self,
         stored: &mut TableMetadata,
         options: &CreateTableOptions,
@@ -1123,7 +1164,8 @@ impl CayenneCatalog {
 
         let stored_vc = &stored.vortex_config;
         let new_vc = &options.vortex_config;
-        let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
+        let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
+            || stored_vc.cold_tier_location != new_vc.cold_tier_location
             || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
@@ -1131,9 +1173,11 @@ impl CayenneCatalog {
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
                 != new_vc.cold_tier_background_interval_ms;
-        if !cold_fields_differ {
+        if !runtime_fields_differ {
             return Ok(());
         }
+
+        stored.vortex_config.scan_concurrency = new_vc.scan_concurrency;
 
         stored
             .vortex_config
@@ -1153,7 +1197,7 @@ impl CayenneCatalog {
         let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to serialize updated datalake configuration for table {}.",
+                    "Failed to serialize updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
@@ -1170,14 +1214,14 @@ impl CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to persist updated datalake configuration for table {}.",
+                    "Failed to persist updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
             })?;
         tracing::debug!(
             table = stored.table_name.as_str(),
-            "Reconciled datalake configuration from spicepod params on table reopen"
+            "Reconciled runtime configuration from spicepod params on table reopen"
         );
         Ok(())
     }
@@ -1201,7 +1245,7 @@ impl CayenneCatalog {
                 // state. Rejects a location change while cold files exist;
                 // persists any other cold-field change.
                 if configuration_matches_ignoring_schema(&stored_metadata, options) {
-                    self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                    self.reconcile_runtime_only_config(&mut stored_metadata, options)
                         .await?;
                 }
 
@@ -1752,48 +1796,58 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn init(&self) -> CatalogResult<()> {
-        // Create database directory if it doesn't exist
+        // Create database directory if it doesn't exist.
+        //
+        // In-memory databases (Cayenne `mode: memory`, connection string
+        // `sqlite://file:/cayenne-mem-N?vfs=memdb`) have no backing file, so
+        // there is no parent directory to create — and `Path::parent()` of that
+        // path is the bare scheme component `file:`, so creating it would leave
+        // a stray, empty `file:` directory in the process working directory
+        // (#11922). Skip directory setup entirely for them, matching the guard
+        // in `SqliteMetastore::open_connection`.
         let db_path = self.db_path();
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
-                })?;
+        if !is_memory_db_path(db_path) {
+            let db_dir =
+                Path::new(db_path)
+                    .parent()
+                    .ok_or_else(|| CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    })?;
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+            if !db_dir.exists() {
+                tokio::fs::create_dir_all(db_dir).await?;
 
-            // Best-effort sync of the parent directory so the db_dir entry
-            // itself is durable on local FS before we proceed to create the
-            // catalog DB file and initialize its schema.
-            //
-            // We keep this best-effort (with warning on failure) rather than
-            // fatal because:
-            // - Catalog DB directory creation is a one-time initialization
-            //   event (not a hot write path).
-            // - It is immediately followed by DB file creation and schema
-            //   initialization, which provide strong content durability.
-            // - The parent directory is frequently a stable, operator-
-            //   managed volume root (e.g., K8s PersistentVolume) where
-            //   directory entry durability is already handled at a higher
-            //   level.
-            //
-            // This is still the right thing to do for consistency with the
-            // uniform durability contract used for all per-table mutable
-            // data paths, and it gives operators a clear warning if
-            // something unusual happens on a fresh deployment.
-            if let Some(parent) = db_dir.parent() {
-                let parent = parent.to_path_buf();
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&parent).and_then(|f| f.sync_all())
-                })
-                .await
-                {
-                    tracing::warn!(
-                        "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
-                        db_dir.display()
-                    );
+                // Best-effort sync of the parent directory so the db_dir entry
+                // itself is durable on local FS before we proceed to create the
+                // catalog DB file and initialize its schema.
+                //
+                // We keep this best-effort (with warning on failure) rather than
+                // fatal because:
+                // - Catalog DB directory creation is a one-time initialization
+                //   event (not a hot write path).
+                // - It is immediately followed by DB file creation and schema
+                //   initialization, which provide strong content durability.
+                // - The parent directory is frequently a stable, operator-
+                //   managed volume root (e.g., K8s PersistentVolume) where
+                //   directory entry durability is already handled at a higher
+                //   level.
+                //
+                // This is still the right thing to do for consistency with the
+                // uniform durability contract used for all per-table mutable
+                // data paths, and it gives operators a clear warning if
+                // something unusual happens on a fresh deployment.
+                if let Some(parent) = db_dir.parent() {
+                    let parent = parent.to_path_buf();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        std::fs::File::open(&parent).and_then(|f| f.sync_all())
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to sync parent of catalog DB directory {} (subsequent DB writes will still be durable; directory entry may not survive crash): {e}",
+                            db_dir.display()
+                        );
+                    }
                 }
             }
         }
@@ -1812,6 +1866,10 @@ impl MetadataCatalog for CayenneCatalog {
     /// PASSIVE checkpoint (delegated to the backend).
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         self.metastore.checkpoint_wal().await
+    }
+
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        self.metastore.incremental_vacuum().await
     }
 
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
@@ -2986,10 +3044,18 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
+    async fn commit_overwrite(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+    ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
-        // commit_overwrite_in_txn below.
+        // commit_overwrite_in_txn below. Retrying is safe with an inline payload:
+        // a conflicted attempt rolled back, so the next one re-runs the same
+        // clear-then-insert against the unchanged pre-state and cannot duplicate
+        // the row (`inlined_id` is fixed by the caller, not minted per attempt).
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
@@ -3005,7 +3071,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -3646,28 +3712,10 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
-        let inlined_id = if data.inlined_id.is_empty() {
-            uuid::Uuid::now_v7().to_string()
-        } else {
-            data.inlined_id
-        };
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: r"
-                INSERT INTO cayenne_inlined_data
-                    (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ",
-                params: vec![
-                    MetastoreValue::Text(inlined_id.clone()),
-                    MetastoreValue::Text(data.table_id),
-                    data.partition_key.into(),
-                    MetastoreValue::Blob(data.data_ipc),
-                    MetastoreValue::Integer(data.record_count),
-                    MetastoreValue::Integer(data.sequence_number),
-                ],
-            })
-            .await?;
+        let table_id = data.table_id.clone();
+        let sequence_number = data.sequence_number;
+        let (inlined_id, insert) = inlined_data_insert(data, &table_id, sequence_number);
+        self.metastore.execute_helper(insert).await?;
         Ok(inlined_id)
     }
 
@@ -4037,34 +4085,18 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             for data_entry in &data {
-                let inlined_id = if data_entry.inlined_id.is_empty() {
-                    uuid::Uuid::now_v7().to_string()
-                } else {
-                    data_entry.inlined_id.clone()
-                };
-                tx.execute(ExecuteParams {
-                    sql: r"
-                    INSERT INTO cayenne_inlined_data
-                        (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(inlined_id),
-                        MetastoreValue::Text(table_id.to_string()),
-                        data_entry.partition_key.clone().into(),
-                        MetastoreValue::Blob(data_entry.data_ipc.clone()),
-                        MetastoreValue::Integer(data_entry.record_count),
-                        // Lever B2: stamp the caller-allocated sequence directly,
-                        // replacing the prior correlated subquery read of the DB
-                        // counter (which no longer moves inside this txn).
-                        MetastoreValue::Integer(assigned_sequence),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
+                // Lever B2: stamp the caller-allocated sequence directly, replacing
+                // the prior correlated subquery read of the DB counter (which no
+                // longer moves inside this txn). Cloned per attempt so a retry
+                // re-binds the same row against the unchanged pre-state.
+                let (_inlined_id, insert) =
+                    inlined_data_insert(data_entry.clone(), table_id, assigned_sequence);
+                tx.execute(insert)
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to execute inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    })?;
             }
 
             match tx.commit().await {
@@ -4954,6 +4986,52 @@ fn insert_record_table_id_blob_literal(table_id: &str) -> String {
     hex
 }
 
+/// The one statement that appends a row to `cayenne_inlined_data`. Shared by
+/// every inline write path so the column list and parameter order cannot drift
+/// between them; see [`inlined_data_insert`].
+const INLINED_DATA_INSERT_SQL: &str = "INSERT INTO cayenne_inlined_data \
+     (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Bind one `cayenne_inlined_data` row, minting a `UUIDv7` identity when the row
+/// carries none, and return that identity alongside the statement.
+///
+/// Every inline write path funnels through here: the standalone
+/// [`MetadataCatalog::add_inlined_data`], the CDC
+/// [`MetadataCatalog::commit_inlined_mutation`], and the overwrite's atomic
+/// clear-then-replace in [`CayenneCatalog::commit_overwrite_in_txn`].
+///
+/// `table_id` and `sequence_number` are passed separately rather than read off
+/// `data`: the mutation path validates the caller's `table_id` against every row
+/// and stamps each appended row with the sequence its caller allocated, which is
+/// not the (unset) sequence on the row it hands in.
+fn inlined_data_insert(
+    data: InlinedData,
+    table_id: &str,
+    sequence_number: i64,
+) -> (String, ExecuteParams<'static>) {
+    let inlined_id = if data.inlined_id.is_empty() {
+        uuid::Uuid::now_v7().to_string()
+    } else {
+        data.inlined_id
+    };
+    let params = vec![
+        MetastoreValue::Text(inlined_id.clone()),
+        MetastoreValue::Text(table_id.to_string()),
+        data.partition_key.into(),
+        MetastoreValue::Blob(data.data_ipc),
+        MetastoreValue::Integer(data.record_count),
+        MetastoreValue::Integer(sequence_number),
+    ];
+    (
+        inlined_id,
+        ExecuteParams {
+            sql: INLINED_DATA_INSERT_SQL,
+            params,
+        },
+    )
+}
+
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
     if table.path.starts_with("s3://") {
         return Ok(());
@@ -5257,7 +5335,12 @@ mod tests {
         );
 
         drop(catalog);
-        let _ = std::fs::remove_file(test_db.trim_start_matches("sqlite://"));
+
+        // Cleanup test database
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     #[tokio::test]
@@ -8120,6 +8203,105 @@ mod tests {
         // Snapshot pointer advanced.
         let table = catalog
             .get_table("in_txn_parity")
+            .await
+            .expect("Failed to get table after commit");
+        assert_eq!(table.current_snapshot_id, new_snapshot_id);
+
+        // Cleanup.
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Issue #11477 — at an unbounded cutoff, `commit_compaction_fenced_in_txn`
+    /// clears every tombstone (matching the wholesale
+    /// [`CayenneCatalog::commit_compaction_in_txn`]) while still clearing ONLY
+    /// the named protected snapshots.
+    ///
+    /// This is the shape the position-delete full rewrite commits with: it holds
+    /// `write_lock` for its whole pass so no tombstone can survive it, but the
+    /// mem-tier checkpoint can still publish a protected snapshot the scan never
+    /// folded in — and deleting that row here loses its rows durably.
+    #[tokio::test]
+    async fn test_commit_compaction_fenced_unbounded_cutoff_retains_unfolded_snapshots() {
+        let test_db = format!(
+            "sqlite://./.test_fenced_unbounded_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let table_id =
+            setup_table_with_delete_file(&catalog, "fenced_unbounded", "/tmp/fenced_unbounded")
+                .await;
+
+        // Two protected snapshots the rewrite folded in, and one published after
+        // its scan (the racing checkpoint).
+        let folded: Vec<String> = vec![
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let late = uuid::Uuid::now_v7().to_string();
+        for (idx, id) in folded.iter().chain(std::iter::once(&late)).enumerate() {
+            let seq = i64::try_from(idx).expect("test index fits in i64") + 1;
+            catalog
+                .set_snapshot_sequence(&table_id, id, seq)
+                .await
+                .expect("Failed to register protected snapshot");
+        }
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let mut tx = catalog
+            .begin_transaction()
+            .await
+            .expect("Failed to begin transaction");
+        catalog
+            .commit_compaction_fenced_in_txn(
+                &mut *tx,
+                &table_id,
+                &new_snapshot_id,
+                i64::MAX,
+                &folded,
+            )
+            .await
+            .expect("commit_compaction_fenced_in_txn failed");
+        tx.commit()
+            .await
+            .expect("Failed to commit caller transaction");
+
+        // An unbounded cutoff clears every tombstone, exactly as the wholesale
+        // variant does.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("Failed to get delete files after commit");
+        assert!(
+            delete_files.is_empty(),
+            "an unbounded cutoff must clear every delete file"
+        );
+
+        // Only the folded protected snapshots are cleared.
+        let sequences = catalog
+            .get_all_snapshot_sequences(&table_id)
+            .await
+            .expect("Failed to read snapshot sequences");
+        assert!(
+            sequences.contains_key(&late),
+            "DATA LOSS: the protected snapshot published after the scan was cleared; \
+             remaining ids: {:?}",
+            sequences.keys().collect::<Vec<_>>()
+        );
+        for id in &folded {
+            assert!(
+                !sequences.contains_key(id),
+                "folded snapshot {id} must be cleared"
+            );
+        }
+
+        // Snapshot pointer advanced.
+        let table = catalog
+            .get_table("fenced_unbounded")
             .await
             .expect("Failed to get table after commit");
         assert_eq!(table.current_snapshot_id, new_snapshot_id);

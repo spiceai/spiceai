@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use super::{
     CheckAvailability, Dataset, Error, InvalidColumnTypeSnafu, InvalidConfigurationSnafu,
@@ -65,7 +65,9 @@ pub struct DatasetBuilder {
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<FtsStore>,
+    pub drasi: Option<spicepod::drasi::Drasi>,
     pub check_availability: CheckAvailability,
+    pub check_availability_interval: Option<Duration>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -108,6 +110,35 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         validate_identifier(&dataset.name).context(crate::ComponentSnafu)?;
 
         let table_reference = Dataset::parse_table_reference(&dataset.name)?;
+
+        // Parse the duration string once here (raw string stays in the Spicepod
+        // representation; the runtime component holds the typed value). An
+        // invalid value fails dataset construction rather than silently
+        // disabling the check.
+        let check_availability_interval = dataset
+            .check_availability_interval
+            .as_deref()
+            .map(|raw| {
+                fundu::parse_duration(raw).map_err(|source| {
+                    crate::component::dataset::Error::UnableToParseFieldAsDuration {
+                        field: "check_availability_interval".to_string(),
+                        source,
+                    }
+                })
+            })
+            .transpose()
+            .context(crate::InvalidSpicepodDatasetSnafu)?;
+
+        // Availability monitoring only applies to non-accelerated datasets, so
+        // warn (rather than silently ignore) when it is configured on an
+        // accelerated one.
+        if check_availability_interval.is_some() && acceleration.as_ref().is_some_and(|a| a.enabled)
+        {
+            tracing::warn!(
+                "Dataset {} sets `check_availability_interval` but is accelerated; availability monitoring applies only to non-accelerated datasets and will be ignored. An accelerated dataset keeps serving from the accelerator even when its source is unavailable.",
+                dataset.name
+            );
+        }
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
@@ -153,7 +184,9 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             runtime: None,
             vectors: dataset.vectors,
             full_text_search: dataset.full_text_search,
+            drasi: dataset.drasi,
             check_availability: CheckAvailability::from(dataset.check_availability),
+            check_availability_interval,
         })
     }
 }
@@ -186,7 +219,9 @@ impl DatasetBuilder {
             runtime: None,
             vectors: None,
             full_text_search: None,
+            drasi: None,
             check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
         })
     }
 
@@ -272,30 +307,34 @@ impl DatasetBuilder {
             })?;
 
         let dataset = Dataset {
-            from: self.from,
-            name: self.name,
-            access: self.access,
-            params: self.params,
-            metadata: self.metadata,
-            columns: self.columns,
-            schema,
-            has_metadata_table: self.has_metadata_table,
-            replication: self.replication,
-            time_column: self.time_column,
-            time_format: self.time_format,
-            time_partition_column: self.time_partition_column,
-            time_partition_format: self.time_partition_format,
-            acceleration: self.acceleration,
-            embeddings: self.embeddings,
+            spec: super::DatasetSpec {
+                from: self.from,
+                name: self.name,
+                access: self.access,
+                params: self.params,
+                metadata: self.metadata,
+                columns: self.columns,
+                schema,
+                has_metadata_table: self.has_metadata_table,
+                replication: self.replication,
+                time_column: self.time_column,
+                time_format: self.time_format,
+                time_partition_column: self.time_partition_column,
+                time_partition_format: self.time_partition_format,
+                acceleration: self.acceleration,
+                embeddings: self.embeddings,
+                unsupported_type_action: self.unsupported_type_action,
+                on_schema_change: self.on_schema_change,
+                ready_state: self.ready_state,
+                metrics: self.metrics,
+                vectors: self.vectors,
+                full_text_search: self.full_text_search,
+                drasi: self.drasi,
+                check_availability: self.check_availability,
+                check_availability_interval: self.check_availability_interval,
+            },
             app,
-            unsupported_type_action: self.unsupported_type_action,
-            on_schema_change: self.on_schema_change,
-            ready_state: self.ready_state,
-            metrics: self.metrics,
             runtime,
-            vectors: self.vectors,
-            full_text_search: self.full_text_search,
-            check_availability: self.check_availability,
         };
 
         Ok(dataset)

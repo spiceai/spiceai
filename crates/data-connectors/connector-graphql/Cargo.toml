@@ -23,20 +23,36 @@ license-file.workspace = true
 description = "GraphQL data connector for Spice.ai runtime"
 
 [dependencies]
+arrow.workspace = true
 async-trait.workspace = true
+data-http-rate-control = { path = "../../data-http-rate-control" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
+futures.workspace = true
+graphql-parser.workspace = true
+http.workspace = true
 linkme.workspace = true
 paste.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-rate-control = { path = "../../runtime-rate-control" }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 token_provider = { path = "../../token_provider" }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
 url.workspace = true
+util = { path = "../../util", features = ["datafusion"] }
 
 [dev-dependencies]
 app = { path = "../../app" }
+runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 tokio.workspace = true
 
 [features]

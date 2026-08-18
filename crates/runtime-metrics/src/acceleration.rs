@@ -359,6 +359,40 @@ pub static CDC_PREFETCH_BUFFER_CAPACITY: LazyLock<Gauge<u64>> = LazyLock::new(||
         .build()
 });
 
+/// Estimated **size** of the CDC prefetch backlog, as distinct from the envelope
+/// count next to it. The channel is bounded by count, not size, and an envelope
+/// carries a batch whose width the bound says nothing about — so occupancy in
+/// envelopes can sit mid-range while the backlog behind it is large enough to
+/// matter to the process.
+///
+/// Nothing else sizes this. The query and compaction pools account for their own
+/// reservations, the mem-tier budget accounts for applied rows, and the
+/// coalescing path is bounded by `cdc_max_coalesced_bytes` — but what *waits* in
+/// this channel, ahead of apply, appears in none of them. Reading it against a
+/// process total is what tells an operator whether this path is worth
+/// investigating at all: this measures, it does not bound.
+///
+/// **This is an estimate, not measured resident bytes.** It sums each envelope's
+/// `ChangeRows::encoded_len()`, the same decode-free figure
+/// `cdc_max_coalesced_bytes` budgets against, chosen so that sampling never
+/// forces a deferred envelope to build. What that figure means depends on the
+/// envelope: for one already built it is the Arrow footprint
+/// (`get_array_memory_size`); for one still deferred in wire form it is the
+/// source's proxy for the Arrow memory the envelope *will* occupy — `PostgreSQL`
+/// uses `max(wire_bytes, rows × fixed-width footprint)` — which can exceed what
+/// the queued object holds today. Read it as the backlog's size on the same
+/// scale the coalescing budget uses, not as this path's exact contribution to
+/// RSS. Labeled by `dataset`.
+pub static CDC_PREFETCH_BUFFER_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_cdc_prefetch_buffer_bytes")
+        .with_description(
+            "Estimated encoded size of the CDC source-reader→apply prefetch backlog, summed from the same decode-free per-envelope estimate the coalescing byte budget uses (not measured resident bytes). The channel is bounded by envelope count, not size, and this backlog is counted by no other budget.",
+        )
+        .with_unit("By")
+        .build()
+});
+
 /// Counts applied CDC bursts by what ended coalescing (the flush `reason`):
 /// `deadline` (the `cdc_max_coalesce_age_ms` linger timer fired — the batch was
 /// held for freshness-cost time waiting for more rows), `envelope_cap`

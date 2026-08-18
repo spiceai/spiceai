@@ -21,13 +21,17 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::ExposedParamLookup,
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::ducklake::provider::DuckLakeCatalogProvider;
-use data_components::ducklake::{DuckLakeS3Params, build_ducklake_attach_sql};
+use data_components::ducklake::{
+    DuckLakeS3Params, build_ducklake_attach_sql, configure_duckdb_httpfs,
+};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
@@ -64,6 +68,11 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_secret_access_key")
         .description("The AWS secret access key for S3 storage.")
         .secret(),
+    ParameterSpec::component("aws_session_token")
+        .description(
+            "The AWS session token for S3 storage. Required with temporary (STS) credentials.",
+        )
+        .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("Custom S3-compatible endpoint URL (e.g. for MinIO).")
         .secret(),
@@ -73,59 +82,6 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         "Automatically migrate an older DuckLake catalog schema to the version required by the ducklake extension on attach. Defaults to false; migration rewrites catalog metadata and cannot be undone.",
     ),
 ];
-
-fn configure_duckdb_httpfs(
-    conn: &duckdb::Connection,
-    s3: &DuckLakeS3Params,
-) -> Result<(), duckdb::Error> {
-    conn.execute("INSTALL httpfs", [])?;
-    conn.execute("LOAD httpfs", [])?;
-
-    let has_explicit_creds =
-        s3.access_key_id.is_some() || s3.endpoint.is_some() || s3.region.is_some();
-    if !has_explicit_creds {
-        return Ok(());
-    }
-
-    let region = s3.region.as_deref().unwrap_or("us-east-1");
-    let use_ssl = !s3.allow_http;
-
-    let mut secret_parts = vec![
-        "TYPE s3".to_string(),
-        format!("REGION '{}'", region.replace('\'', "''")),
-        format!("USE_SSL {use_ssl}"),
-    ];
-
-    if let Some(key_id) = &s3.access_key_id {
-        secret_parts.push("PROVIDER config".to_string());
-        secret_parts.push(format!("KEY_ID '{}'", key_id.replace('\'', "''")));
-        if let Some(secret) = &s3.secret_access_key {
-            secret_parts.push(format!("SECRET '{}'", secret.replace('\'', "''")));
-        } else {
-            tracing::warn!(
-                "DuckLake: 'aws_access_key_id' provided without 'aws_secret_access_key'. Both must be set for S3 authentication."
-            );
-        }
-    } else {
-        secret_parts.push("PROVIDER credential_chain".to_string());
-    }
-
-    if let Some(endpoint) = &s3.endpoint {
-        let endpoint = endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        secret_parts.push(format!("ENDPOINT '{}'", endpoint.replace('\'', "''")));
-        secret_parts.push("URL_STYLE 'path'".to_string());
-    }
-
-    let secret_sql = format!(
-        "CREATE OR REPLACE SECRET __ducklake_s3 ({})",
-        secret_parts.join(", ")
-    );
-    conn.execute(&secret_sql, [])?;
-
-    Ok(())
-}
 
 /// A catalog connector for `DuckLake`, providing access to schemas and tables via `DuckDB`.
 #[derive(Clone)]
@@ -236,6 +192,13 @@ impl CatalogConnector for DuckLakeCatalog {
                 .params
                 .parameters
                 .get("aws_secret_access_key")
+                .expose()
+                .ok()
+                .map(ToString::to_string),
+            session_token: self
+                .params
+                .parameters
+                .get("aws_session_token")
                 .expose()
                 .ok()
                 .map(ToString::to_string),
@@ -357,7 +320,7 @@ impl CatalogConnector for DuckLakeCatalog {
             catalog_name,
             writable,
             ddl_enabled,
-            catalog.include.clone(),
+            table_selector(catalog),
         ));
 
         // Initial refresh to populate schemas and tables
@@ -371,5 +334,42 @@ impl CatalogConnector for DuckLakeCatalog {
             })?;
 
         Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PARAMETERS;
+    use crate::parameters::Parameters;
+    use crate::secrets::Secrets;
+    use secrecy::{ExposeSecret, SecretString};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// The S3 secret built for `DuckDB` only carries `SESSION_TOKEN` when the parameter
+    /// survives `Parameters::try_new` — otherwise temporary (STS) credentials fail with
+    /// `InvalidAccessKeyId`.
+    #[tokio::test]
+    async fn ducklake_aws_session_token_is_accepted() {
+        let parameters = Parameters::try_new(
+            "catalog ducklake",
+            vec![(
+                "ducklake_aws_session_token".to_string(),
+                SecretString::from("FwoSessionToken"),
+            )],
+            "ducklake",
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("session token should be accepted for ducklake");
+
+        assert_eq!(
+            parameters
+                .to_secret_map()
+                .get("aws_session_token")
+                .map(ExposeSecret::expose_secret),
+            Some("FwoSessionToken")
+        );
     }
 }

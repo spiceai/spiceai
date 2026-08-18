@@ -6,6 +6,22 @@
 
 While a test is executing, `testoperator` continuously probes the `/health` and `/v1/ready` endpoints on the running `spiced` instance. Responses that fail or take longer than 5 ms are recorded and surfaced after the test run; any such issues will cause the test to fail with a summary that includes the number of failures and the worst latency observed.
 
+## Liveness endpoints (`testoperator run htap`)
+
+An HTAP run seeds the source, waits for `spiced`, drives load for hours, then runs its gates — and from outside the process every one of those phases looks like the same quiet `testoperator`. So the run serves, about itself, the two endpoints it probes on `spiced`. They bind `127.0.0.1:8099` by default (`--health-listen <ADDR>`, `TESTOPERATOR_HEALTH_LISTEN`; `off` disables them):
+
+- `GET /health` — liveness: `200 ok` while the process is up. Answered on the same Tokio runtime that drives the workload, so its *latency* also says whether that runtime is still scheduling promptly.
+- `GET /v1/ready` — readiness, meaning **the measured workload is running**: `200` only while load is being applied, `503` naming the current phase otherwise.
+
+Both bodies are one line of `key=value` tokens, so a shell probe can read them without a JSON parser:
+
+```shell
+$ curl -s localhost:8099/v1/ready
+not_ready phase=preparing_source phase_s=412
+```
+
+Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the only ready one), `finalizing` and `finished`. Failing to bind is a warning, never a failed run.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
@@ -13,6 +29,7 @@ While a test is executing, `testoperator` continuously probes the `/health` and 
 - `-d, --data-dir <DATA_DIR>`: An optional data directory to symlink into the `spiced` instance.
 - `--ready-wait <WAIT TIME>`: How long to wait before spiced is ready.
 - `--disable-progress-bars`: Disable progress bars during the test.
+- `--health-listen <ADDR>`: Where testoperator serves its own `/health` and `/v1/ready` (default `127.0.0.1:8099`, `off` to disable). See [Liveness endpoints](#liveness-endpoints-testoperator-run-htap).
 - `--otlp-endpoint <URL>` / `--otlp-header KEY=VALUE`: Export metrics to an OTLP collector over the standard OTLP protocol instead of the default Arrow exporter. Repeat `--otlp-header` to add multiple headers (e.g., auth tokens).
 
 ## Use cases
@@ -27,9 +44,11 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
 - `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.
-- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration.
+- `--disable-caching`: Whether to disable results cache by supplying a `Cache-Control: no-cache` header over the Flight request. Allows disabling results cache separately from spicepod configuration. A benchmark should almost always pass this: `runtime.caching.sql_results` is on by default with a one-second `item_ttl`, and a benchmark runs one warmup query followed by its timed iterations of the same SQL back-to-back, so without it the timed iterations read the cache the warmup filled. The `bench` workflow passes it by default; turn it off only for a spicepod that is benchmarking the cache itself, such as those under `test/spicepods/tpch/sf5/cache`.
 
-Running a benchmark test will always generate snapshots for the query explain plan and results for `tpch` and `tpcds` queries. Only explain plans will be generated for `clickbench` queries.
+Running a benchmark test will always generate snapshots for the query explain plan, and result snapshots for the `tpch` and `tpcds` queries. `clickbench` records result snapshots for the subset of its queries whose rows do not depend on how the engine breaks ties — see `SNAPSHOTTED_CLICKBENCH_QUERIES` in `src/commands/bench/mod.rs` — and explain plans for all of them.
+
+A snapshot that does not match, or that does not exist yet, fails the benchmark. Result snapshots are asserted on the warmup run — the only run that takes them — so that verdict comes from the warmup rather than from a timed iteration.
 
 Snapshots can be automatically re-generated using the [`INSTA_UPDATE`](https://docs.rs/insta/latest/insta/#updating-snapshots) environment variable.
 

@@ -251,7 +251,7 @@ fn create_cache_invalidation_exec(
                 }
             }
             if ok {
-                invalidate_cache_for_table(&table, &caching);
+                invalidate_cache_for_table(&table, &caching).await;
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, s)) as SendableRecordBatchStream)
@@ -274,9 +274,9 @@ fn create_cache_invalidation_exec(
     )
 }
 
-fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
+async fn invalidate_cache_for_table(table: &TableReference, caching: &Weak<Caching>) {
     if let Some(cache) = caching.upgrade() {
-        if let Err(e) = cache.invalidate_for_table(table.clone()) {
+        if let Err(e) = cache.invalidate_for_table(table.clone()).await {
             tracing::warn!("Failed to invalidate cache for table {table}: {e}");
         } else {
             tracing::trace!("Successfully invalidated cache for table {table}");

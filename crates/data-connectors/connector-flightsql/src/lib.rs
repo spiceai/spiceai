@@ -24,13 +24,13 @@ use datafusion::datasource::TableProvider;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::{ClientIdentity, ClientTlsOptions, new_tls_flight_channel_with_options};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::ParameterSpec;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::ParameterSpec;
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -235,12 +235,9 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
+            let app = params.app();
             let max_message_size =
-                match params
-                    .app
-                    .as_ref()
-                    .and_then(|app| app.runtime.flight.as_ref())
-                {
+                match app.as_ref().and_then(|app| app.runtime.flight.as_ref()) {
                     Some(flight) => flight.max_message_size_bytes().map_err(|err| {
                         Error::InvalidParameterValue {
                             parameter: "max_message_size".to_string(),
@@ -295,7 +292,7 @@ impl DataConnector for FlightSQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {
             Ok(provider) => Ok(provider),
@@ -316,3 +313,13 @@ pub const CONNECTOR_NAME: &str = "flightsql";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     FlightSQLFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_flightsql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_flightsql_connector,
+    FLIGHTSQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    FlightSQLFactory
+);

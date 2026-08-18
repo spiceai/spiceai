@@ -155,7 +155,8 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
     }
 
     // Extract primary key (as document _id).
-    let primary_keys = extract_primary_key(index, &record)?;
+    let primary_keys =
+        extract_primary_key_from_fields(&index.primary_key, &index.es_index, &record)?;
 
     // Build all documents in a sync block so the arrow-json encoders (which are
     // `!Send`) are dropped before any subsequent `.await`.
@@ -358,112 +359,6 @@ fn build_documents(
     Ok(docs)
 }
 
-fn extract_primary_key(
-    index: &ElasticsearchIndex,
-    record: &RecordBatch,
-) -> Result<Vec<Option<String>>> {
-    let schema = record.schema();
-
-    match index.primary_key.as_slice() {
-        [] => Ok(vec![None; record.num_rows()]),
-        [f] => {
-            let Some((i, _)) = schema.column_with_name(f.name()) else {
-                return PrimaryKeyColumnNotFoundSnafu {
-                    index: index.es_index.clone(),
-                    column: f.name().clone(),
-                }
-                .fail();
-            };
-            let c = record.column(i);
-            if let Some(iter) = convert_string_arrow_to_iterator!(c) {
-                return Ok(iter
-                    .map(|o: Option<&str>| o.map(ToString::to_string))
-                    .collect());
-            }
-            let casted = arrow::compute::cast(c, &DataType::Utf8).context(
-                IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                },
-            )?;
-            let iter_opt: Option<Box<dyn Iterator<Item = Option<&str>> + Send>> =
-                convert_string_arrow_to_iterator!(casted);
-            let Some(iter) = iter_opt else {
-                return Err(Error::IssueWithArrowProcessing {
-                    index: index.es_index.clone(),
-                    source: arrow::error::ArrowError::CastError(format!(
-                        "could not cast primary key column '{}' to Utf8",
-                        f.name()
-                    )),
-                });
-            };
-            Ok(iter
-                .map(|o: Option<&str>| o.map(ToString::to_string))
-                .collect())
-        }
-        fields => {
-            // Composite key: JSON-encode the projected key columns and use that string as _id.
-            let mut proj = Vec::with_capacity(fields.len());
-            for f in fields {
-                let Some((i, _)) = schema.column_with_name(f.name()) else {
-                    return PrimaryKeyColumnNotFoundSnafu {
-                        index: index.es_index.clone(),
-                        column: f.name().clone(),
-                    }
-                    .fail();
-                };
-                proj.push(i);
-            }
-            let pk = record
-                .project(&proj)
-                .context(IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-
-            // A row with any NULL component in a composite key has no stable
-            // identity. Mark those rows as `None` so the null-PK skip logic
-            // (which already handles single-column keys) applies here too.
-            let num_rows = pk.num_rows();
-            let mut row_is_null: Vec<bool> = vec![false; num_rows];
-            for col in pk.columns() {
-                for (i, is_null) in row_is_null.iter_mut().enumerate() {
-                    if col.is_null(i) {
-                        *is_null = true;
-                    }
-                }
-            }
-
-            let mut writer = arrow_json::ArrayWriter::new(Vec::new());
-            writer
-                .write_batches(&[&pk])
-                .context(IssueWithArrowProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-            writer.finish().context(IssueWithArrowProcessingSnafu {
-                index: index.es_index.clone(),
-            })?;
-
-            let values: Vec<Value> = serde_json::from_reader(writer.into_inner().as_slice())
-                .context(IssueWithJsonProcessingSnafu {
-                    index: index.es_index.clone(),
-                })?;
-            values
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    if row_is_null.get(i).copied().unwrap_or(false) {
-                        Ok(None)
-                    } else {
-                        serde_json::to_string(&v).map(Some)
-                    }
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context(IssueWithJsonProcessingSnafu {
-                    index: index.es_index.clone(),
-                })
-        }
-    }
-}
-
 async fn embed_column(
     rb: &RecordBatch,
     column_idx: usize,
@@ -588,7 +483,8 @@ fn create_embedding_array(
                 });
             }
             None => {
-                builder.values().append_nulls(expected);
+                // Store `f32` child values, not `Option<f32>`; the list slot represents a null embedding.
+                builder.values().append_value_n(0.0, expected);
                 builder.append(false);
             }
         }
@@ -699,7 +595,15 @@ fn build_text_documents(
 
 /// Extract primary key strings from a record batch, parameterised on field definitions
 /// rather than an [`ElasticsearchIndex`] instance.
-fn extract_primary_key_from_fields(
+///
+/// The returned string is the document `_id` under which the row is written. A row whose
+/// key is NULL (any component, for a composite key) has no stable identity and yields
+/// `None`; such rows are skipped rather than written under a generated `_id`.
+///
+/// [`super::delete`] derives the `_id`s it deletes with this same function, so an exact-key
+/// delete addresses precisely the documents a write produced. Keep it that way: a second,
+/// parallel derivation would let the two drift and leave deletes silently matching nothing.
+pub(super) fn extract_primary_key_from_fields(
     primary_key: &[Field],
     es_index: &str,
     record: &RecordBatch,
@@ -800,10 +704,113 @@ fn extract_primary_key_from_fields(
     }
 }
 
+/// Stands in for a categorical token that does not look like one.
+const UNRECOGNIZED_CATEGORY: &str = "<unrecognized>";
+
+/// Longest categorical token accepted; Elasticsearch's longest exception name is well under it.
+const MAX_CATEGORY_LEN: usize = 64;
+
+/// Accept `value` only if it has the shape of an Elasticsearch categorical token.
+///
+/// Elasticsearch derives `error.type` from the exception's class name and its response keys
+/// are fixed, so both are short `lower_snake_case` identifiers. Nothing in the response is
+/// *guaranteed* to be, though — a proxy or a non-Elasticsearch endpoint can put anything
+/// there, which is the same interference [`describe_unexpected_response`] exists to handle.
+/// Rather than copy a network-provided string into an error, a token that does not match the
+/// expected shape is replaced wholesale (never truncated, so no fragment of it survives).
+/// This also keeps the message on one line, as the logging rules require.
+fn categorical_token(value: &str) -> &str {
+    let looks_categorical = !value.is_empty()
+        && value.len() <= MAX_CATEGORY_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if looks_categorical {
+        value
+    } else {
+        UNRECOGNIZED_CATEGORY
+    }
+}
+
+/// Describe a failed `_bulk` item from a whitelist of non-identifying fields.
+///
+/// The document `_id` is the row's primary key (see [`extract_primary_key_from_fields`]),
+/// and Elasticsearch's free-form `error.reason` quotes it — a version conflict reads
+/// `[<_id>]: version conflict, document already exists (current version [1])`, and a
+/// mapper rejection quotes the offending field *value*. Both this error and the refresh
+/// failure that wraps it are logged and recorded in `runtime.task_history`, so anything
+/// carried here becomes operational output. Only fixed vocabulary is reported: the HTTP
+/// `status`, the exception class names from `error.type` / `error.caused_by.type` (each
+/// through [`categorical_token`]), and the item's position within the request — never
+/// `reason`, never `_id`, never the item itself.
+fn describe_bulk_failure(position: usize, op: &Value) -> String {
+    let mut parts = Vec::with_capacity(3);
+
+    if let Some(status) = op.get("status").and_then(Value::as_u64) {
+        parts.push(format!("status {status}"));
+    }
+
+    let error = op.get("error");
+    if let Some(kind) = error.and_then(|e| e.get("type")).and_then(Value::as_str) {
+        parts.push(categorical_token(kind).to_string());
+    }
+    if let Some(cause) = error
+        .and_then(|e| e.get("caused_by"))
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("caused by {}", categorical_token(cause)));
+    }
+
+    if parts.is_empty() {
+        // Neither a status nor a typed error: say so rather than falling back to
+        // stringifying the item, which would name the document directly.
+        parts.push("no status or error type reported".to_string());
+    }
+
+    // The position is relative to the `_bulk` request this response answers, which is one
+    // chunk of `batch_write_rows` documents — not an offset into the whole record batch.
+    format!(
+        "document at position {position} in the request ({})",
+        parts.join(", ")
+    )
+}
+
+/// Describe an unexpected `_bulk` response body by its shape alone.
+///
+/// A successful bulk response contains one item per document, each naming its `_id`, so the
+/// body itself can never be reported. Its top-level key names are what actually distinguish
+/// the interesting cases (an `{"error": …}` envelope from a proxy versus a truncated
+/// response), and each goes through [`categorical_token`] because an unexpected response is
+/// exactly the case where the keys are not Elasticsearch's own.
+fn describe_unexpected_response(resp: &Value) -> String {
+    match resp {
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(|k| categorical_token(k)).collect();
+            keys.sort_unstable();
+            // Several rejected keys collapse onto the same placeholder; report it once.
+            keys.dedup();
+            if keys.is_empty() {
+                "an empty JSON object".to_string()
+            } else {
+                format!("a JSON object with keys: {}", keys.join(", "))
+            }
+        }
+        Value::Array(items) => format!("a JSON array of {} element(s)", items.len()),
+        Value::String(_) => "a JSON string".to_string(),
+        Value::Number(_) => "a JSON number".to_string(),
+        Value::Bool(_) => "a JSON boolean".to_string(),
+        Value::Null => "JSON null".to_string(),
+    }
+}
+
 /// Check an ES `_bulk` response body and return an error if any items failed.
 ///
 /// The bulk API returns HTTP 200 even when individual documents fail, so we must
-/// inspect `errors` and the per-item `error` fields to surface problems.
+/// inspect `errors` and the per-item `error` fields to surface problems. Every
+/// reported detail goes through [`describe_bulk_failure`] /
+/// [`describe_unexpected_response`], which keep the row's primary key out of the
+/// message.
 fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
     // ES _bulk response MUST include a boolean `errors` field. A missing or
     // non-boolean `errors` indicates an unexpected response shape (e.g. a
@@ -817,37 +824,399 @@ fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
                 index: es_index.to_string(),
                 failures: 1,
                 first: format!(
-                    "Elasticsearch bulk response is missing a boolean `errors` field; got: {resp}"
+                    "Elasticsearch bulk response is missing a boolean `errors` field; got {}",
+                    describe_unexpected_response(resp)
                 ),
             });
         }
     }
 
-    let items = resp.get("items").and_then(Value::as_array);
-    let (failures, first_error) = items.map_or((1usize, "unknown".to_string()), |arr| {
-        let mut failures = 0usize;
-        let mut first: Option<String> = None;
-        for item in arr {
-            // Each item is a map with one key (index/create/update/delete) → op result.
-            let Some(op) = item.as_object().and_then(|m| m.values().next()) else {
-                continue;
-            };
-            if op.get("error").is_some() {
-                failures += 1;
-                if first.is_none() {
-                    first = Some(
-                        op.get("error")
-                            .map_or_else(|| op.to_string(), ToString::to_string),
-                    );
-                }
-            }
-        }
-        (failures, first.unwrap_or_else(|| "unknown".to_string()))
-    });
+    let (failures, first_error) = match resp.get("items").and_then(Value::as_array) {
+        None => (
+            1,
+            "the response reported errors but carried no `items` array".to_string(),
+        ),
+        Some(items) => match scan_failed_items(items) {
+            (failures, Some(first)) => (failures, first),
+            // `errors: true` with no item carrying an `error` is a contradictory response.
+            // Report one failure rather than the scanned zero: a message reading "0 document
+            // failure(s)" would claim success by count while returning an error.
+            (_, None) => (
+                1,
+                "the response reported errors but no item carried one".to_string(),
+            ),
+        },
+    };
 
     Err(Error::BulkIndexItemErrors {
         index: es_index.to_string(),
         failures,
         first: first_error,
     })
+}
+
+/// Count the `_bulk` items that carry an `error`, and describe the first of them.
+fn scan_failed_items(items: &[Value]) -> (usize, Option<String>) {
+    let mut failures = 0usize;
+    let mut first = None;
+    for (position, item) in items.iter().enumerate() {
+        // Each item is a map with one key (index/create/update/delete) → op result.
+        let Some(op) = item.as_object().and_then(|m| m.values().next()) else {
+            continue;
+        };
+        if op.get("error").is_some() {
+            failures += 1;
+            if first.is_none() {
+                first = Some(describe_bulk_failure(position, op));
+            }
+        }
+    }
+    (failures, first)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        Error, MAX_CATEGORY_LEN, UNRECOGNIZED_CATEGORY, categorical_token, inspect_bulk_response,
+    };
+
+    /// A primary-key value of the shape that makes this a data-leak: identifying on its own.
+    const SENTINEL_KEY: &str = "ada@example.com";
+    /// One component of a composite key, which the write path encodes into the `_id` as JSON.
+    const SENTINEL_COMPONENT: &str = "acct-99887766";
+
+    fn describe(resp: &serde_json::Value) -> String {
+        let Err(e) = inspect_bulk_response(resp, "idx") else {
+            panic!("expected inspect_bulk_response to reject this response");
+        };
+        e.to_string()
+    }
+
+    fn failure_count(resp: &serde_json::Value) -> usize {
+        let Err(Error::BulkIndexItemErrors { failures, .. }) = inspect_bulk_response(resp, "idx")
+        else {
+            panic!("expected a BulkIndexItemErrors rejection");
+        };
+        failures
+    }
+
+    #[test]
+    fn a_clean_bulk_response_is_accepted() {
+        let resp = json!({ "errors": false, "items": [{ "index": { "_id": SENTINEL_KEY } }] });
+        inspect_bulk_response(&resp, "idx").expect("a response with errors:false must succeed");
+    }
+
+    /// Regression test for #12370: a version conflict names the document by `_id` in its
+    /// `reason`, and `_id` is the row's primary key.
+    #[test]
+    fn a_version_conflict_does_not_report_the_primary_key() {
+        let resp = json!({
+            "errors": true,
+            "items": [{
+                "index": {
+                    "_index": "idx",
+                    "_id": SENTINEL_KEY,
+                    "status": 409,
+                    "error": {
+                        "type": "version_conflict_engine_exception",
+                        "reason": format!("[{SENTINEL_KEY}]: version conflict, document already exists (current version [1])"),
+                        "index_uuid": "xIB-tPZlQm2rXwRDbhBGmA",
+                        "shard": "0",
+                        "index": "idx"
+                    }
+                }
+            }]
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "primary key leaked into the error: {message}"
+        );
+        assert!(
+            !message.contains("version conflict, document already exists"),
+            "the free-form reason (which quotes the key) leaked: {message}"
+        );
+        assert!(
+            message.contains("status 409") && message.contains("version_conflict_engine_exception"),
+            "the failure must stay diagnosable by status and type: {message}"
+        );
+        assert!(
+            message.contains("position 0"),
+            "the failing document must still be locatable by position: {message}"
+        );
+    }
+
+    /// A mapper rejection quotes the offending *value*, not just the `_id`.
+    #[test]
+    fn a_mapper_rejection_does_not_report_the_offending_value() {
+        let resp = json!({
+            "errors": true,
+            "items": [{
+                "index": {
+                    "_id": SENTINEL_KEY,
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": format!("failed to parse field [email] of type [long] in document with id '{SENTINEL_KEY}'. Preview of field's value: '{SENTINEL_KEY}'"),
+                        "caused_by": {
+                            "type": "illegal_argument_exception",
+                            "reason": format!("For input string: \"{SENTINEL_KEY}\"")
+                        }
+                    }
+                }
+            }]
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "the offending field value leaked into the error: {message}"
+        );
+        assert!(
+            message.contains("status 400")
+                && message.contains("document_parsing_exception")
+                && message.contains("caused by illegal_argument_exception"),
+            "the exception classes must survive redaction: {message}"
+        );
+    }
+
+    /// A composite primary key is encoded into the `_id` as JSON, so every component is in it.
+    #[test]
+    fn a_composite_key_does_not_reach_the_error() {
+        let composite = json!([SENTINEL_KEY, SENTINEL_COMPONENT]).to_string();
+        let resp = json!({
+            "errors": true,
+            "items": [{
+                "create": {
+                    "_id": composite,
+                    "status": 409,
+                    "error": {
+                        "type": "version_conflict_engine_exception",
+                        "reason": format!("[{composite}]: version conflict")
+                    }
+                }
+            }]
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY) && !message.contains(SENTINEL_COMPONENT),
+            "a composite key component leaked into the error: {message}"
+        );
+    }
+
+    /// The pre-fix code stringified the whole item when it carried no `error` object, and the
+    /// item names the document directly.
+    #[test]
+    fn an_item_without_a_typed_error_is_not_stringified() {
+        let resp = json!({
+            "errors": true,
+            "items": [{
+                "index": { "_id": SENTINEL_KEY, "error": { "reason": format!("[{SENTINEL_KEY}] rejected") } }
+            }]
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "the item leaked into the error: {message}"
+        );
+        assert!(
+            message.contains("no status or error type reported"),
+            "an untyped failure must say so rather than dumping the item: {message}"
+        );
+    }
+
+    /// The pre-fix code interpolated the entire response body, which carries every `_id`.
+    #[test]
+    fn an_unexpected_response_is_reported_by_shape_only() {
+        let resp = json!({
+            "took": 3,
+            "items": [{ "index": { "_id": SENTINEL_KEY, "status": 201 } }]
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "the response body leaked every document id: {message}"
+        );
+        assert!(
+            message.contains("missing a boolean `errors` field")
+                && message.contains("a JSON object with keys: items, took"),
+            "the response shape must stay diagnosable: {message}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_unexpected_response_is_reported_by_shape_only() {
+        let resp = json!([{ "index": { "_id": SENTINEL_KEY } }]);
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "the response body leaked: {message}"
+        );
+        assert!(
+            message.contains("a JSON array of 1 element(s)"),
+            "expected the array shape to be named: {message}"
+        );
+    }
+
+    #[test]
+    fn every_failure_is_counted_and_the_first_one_is_located() {
+        let ok_item = json!({ "index": { "_id": "ok", "status": 201 } });
+        let failed = |id: &str, status: u16| {
+            json!({ "index": {
+                "_id": id,
+                "status": status,
+                "error": { "type": "version_conflict_engine_exception", "reason": format!("[{id}]") }
+            }})
+        };
+        let resp = json!({
+            "errors": true,
+            "items": [ok_item, failed(SENTINEL_KEY, 409), failed("second", 429)]
+        });
+
+        assert_eq!(
+            failure_count(&resp),
+            2,
+            "both failing items must be counted"
+        );
+
+        let message = describe(&resp);
+        assert!(
+            message.contains("position 1"),
+            "the first failure's position must be its index in the request, not 0: {message}"
+        );
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "primary key leaked into the error: {message}"
+        );
+    }
+
+    #[test]
+    fn errors_true_without_an_items_array_is_still_an_error() {
+        let resp = json!({ "errors": true });
+        let message = describe(&resp);
+        assert!(
+            message.contains("carried no `items` array"),
+            "expected the missing-items case to be named: {message}"
+        );
+    }
+
+    #[test]
+    fn errors_true_with_no_failing_item_is_still_an_error() {
+        let resp = json!({ "errors": true, "items": [{ "index": { "_id": SENTINEL_KEY, "status": 201 } }] });
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "primary key leaked into the error: {message}"
+        );
+        assert!(
+            message.contains("no item carried one"),
+            "expected the contradictory-response case to be named: {message}"
+        );
+        assert_eq!(
+            failure_count(&resp),
+            1,
+            "a contradictory response must not report 0 failures while returning an error"
+        );
+    }
+
+    /// `error.type` is a network-provided string, not a code-enforced constant: a proxy or a
+    /// non-Elasticsearch endpoint can put row data or a newline there.
+    #[test]
+    fn a_type_field_that_is_not_a_categorical_token_is_replaced_wholesale() {
+        for hostile in [
+            SENTINEL_KEY,
+            SENTINEL_COMPONENT,
+            "version_conflict\nada@example.com",
+            "Version_Conflict_Engine_Exception",
+            &"a".repeat(MAX_CATEGORY_LEN + 1),
+            "",
+        ] {
+            let resp = json!({
+                "errors": true,
+                "items": [{ "index": {
+                    "status": 409,
+                    "error": { "type": hostile, "caused_by": { "type": hostile } }
+                }}]
+            });
+
+            let message = describe(&resp);
+            assert!(
+                !message.contains(SENTINEL_KEY) && !message.contains(SENTINEL_COMPONENT),
+                "a hostile `type` reached the error: {message}"
+            );
+            assert!(
+                !message.contains('\n') && !message.contains('\r'),
+                "the error must stay on one line: {message:?}"
+            );
+            assert!(
+                message.contains(UNRECOGNIZED_CATEGORY),
+                "a rejected token must be named as unrecognized: {message}"
+            );
+            assert!(
+                message.contains("status 409"),
+                "the status must survive a rejected type: {message}"
+            );
+        }
+    }
+
+    /// The keys of an *unexpected* response are, by definition, not Elasticsearch's own.
+    #[test]
+    fn hostile_response_keys_are_replaced_and_reported_once() {
+        let resp = json!({
+            "took": 3,
+            SENTINEL_KEY: 1,
+            SENTINEL_COMPONENT: 2,
+            "bad\nkey": 3
+        });
+
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY) && !message.contains(SENTINEL_COMPONENT),
+            "a hostile response key reached the error: {message}"
+        );
+        assert!(
+            !message.contains('\n') && !message.contains('\r'),
+            "the error must stay on one line: {message:?}"
+        );
+        assert_eq!(
+            message.matches(UNRECOGNIZED_CATEGORY).count(),
+            1,
+            "the three rejected keys must collapse to one placeholder: {message}"
+        );
+        assert!(
+            message.contains("took"),
+            "a legitimate key must still be reported: {message}"
+        );
+    }
+
+    #[test]
+    fn a_real_exception_name_is_accepted_unchanged() {
+        assert_eq!(
+            categorical_token("version_conflict_engine_exception"),
+            "version_conflict_engine_exception"
+        );
+        assert_eq!(categorical_token("http_2_error"), "http_2_error");
+        assert_eq!(categorical_token("ada@example.com"), UNRECOGNIZED_CATEGORY);
+        assert_eq!(categorical_token("acct-99887766"), UNRECOGNIZED_CATEGORY);
+    }
+
+    #[test]
+    fn a_non_boolean_errors_field_is_treated_as_an_unexpected_shape() {
+        let resp = json!({ "errors": "true", "items": [{ "index": { "_id": SENTINEL_KEY } }] });
+        let message = describe(&resp);
+        assert!(
+            !message.contains(SENTINEL_KEY),
+            "primary key leaked into the error: {message}"
+        );
+        assert!(
+            message.contains("missing a boolean `errors` field"),
+            "expected the non-boolean `errors` case to be rejected by shape: {message}"
+        );
+    }
 }

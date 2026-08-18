@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::QueryExecutor;
+use crate::spicetest::pacer::QueryPacer;
 use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
@@ -64,6 +65,9 @@ pub(crate) struct SpiceTestQueryWorker {
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
     /// Duration threshold - queries exceeding this are marked as failed in streaming metrics
     query_duration_threshold: Option<Duration>,
+    /// Fleet-wide issue-rate limiter. `None` runs closed-loop, where the offered
+    /// rate is whatever the server's latency allows.
+    pacer: Option<Arc<QueryPacer>>,
 }
 
 pub struct SpiceTestQueryWorkerResult {
@@ -128,6 +132,7 @@ impl SpiceTestQueryWorker {
             shutdown_token: CancellationToken::new(),
             streaming_metrics_sender: None,
             query_duration_threshold: None,
+            pacer: None,
         }
     }
 
@@ -153,6 +158,12 @@ impl SpiceTestQueryWorker {
 
     pub fn with_query_duration_threshold(mut self, threshold: Duration) -> Self {
         self.query_duration_threshold = Some(threshold);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pacer(mut self, pacer: Option<Arc<QueryPacer>>) -> Self {
+        self.pacer = pacer;
         self
     }
 
@@ -361,7 +372,8 @@ impl SpiceTestQueryWorker {
                         let warmup_start = std::time::Instant::now();
 
                         let QueryRunResult {
-                            connection_failed, ..
+                            connection_failed,
+                            query_failure,
                         } = self
                             .run_single_query(
                                 query,
@@ -371,6 +383,13 @@ impl SpiceTestQueryWorker {
                                 false,
                             )
                             .await?;
+
+                        // The warmup's timing is thrown away; its verdict is not. This is the
+                        // only run of the query that compares results against their snapshot —
+                        // the timed iterations below pass `false` for `results_snapshot` so they
+                        // do not re-assert it — so dropping this failure is what would let a
+                        // wrong answer, or a missing baseline, finish the benchmark green.
+                        query_status = status_after_run(query_status, query_failure);
 
                         println!(
                             "Worker {} - Query '{}' - Warmup query completed in {:?}",
@@ -427,9 +446,7 @@ impl SpiceTestQueryWorker {
                                 ));
                             }
 
-                            if let Some(query_failure) = query_failure {
-                                query_status = QueryStatus::Failed(Some(query_failure.into()));
-                            }
+                            query_status = status_after_run(query_status, query_failure);
 
                             current_query_count += 1;
                         }
@@ -451,6 +468,42 @@ impl SpiceTestQueryWorker {
         })
     }
 
+    /// Whether this worker should stop issuing queries: shutdown was requested,
+    /// or a duration-based run has reached its scheduled end.
+    fn should_stop(&self, start: &Instant) -> bool {
+        self.shutdown_token.is_cancelled()
+            || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
+    }
+
+    /// Wait for this worker's turn in the fleet's issue schedule, giving up if
+    /// the run ends first.
+    ///
+    /// At low target rates a slot can be many seconds out. Sleeping through one
+    /// that will never be used would drag a duration-based run past its
+    /// scheduled end and leave a cancelled run lingering, so the wait races the
+    /// run's own end. Abandoning a reserved slot on the way out costs nothing:
+    /// no further queries are issued either way.
+    async fn await_issue_slot(&self, pacer: &QueryPacer, start: &Instant) {
+        tokio::select! {
+            () = pacer.acquire() => {}
+            () = self.shutdown_token.cancelled() => {}
+            () = Self::sleep_until_scheduled_end(self.end_condition, start) => {}
+        }
+    }
+
+    /// Completes when a duration-based run reaches its scheduled end, and never
+    /// for a run with no deadline to reach.
+    async fn sleep_until_scheduled_end(end_condition: EndCondition, start: &Instant) {
+        match end_condition {
+            EndCondition::Duration(duration) => {
+                tokio::time::sleep(duration.saturating_sub(start.elapsed())).await;
+            }
+            EndCondition::QuerySetCompleted(_) | EndCondition::Unlimited => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     // run queries as a duration-based test
     async fn run_query_set(
         &self,
@@ -463,10 +516,20 @@ impl SpiceTestQueryWorker {
         for query in queries {
             // Stop submitting new queries once the duration has elapsed or shutdown
             // was requested, so the test finishes close to the scheduled duration.
-            if self.shutdown_token.is_cancelled()
-                || matches!(self.end_condition, EndCondition::Duration(d) if start.elapsed() >= d)
-            {
+            if self.should_stop(start) {
                 break;
+            }
+
+            // Hold this worker at the fleet's scheduled issue rate before doing
+            // anything else, so the wait is not counted in the query's own
+            // duration below.
+            if let Some(pacer) = &self.pacer {
+                self.await_issue_slot(pacer, start).await;
+                // The wait can end because the run did rather than because the
+                // slot came up.
+                if self.should_stop(start) {
+                    break;
+                }
             }
 
             let QueryRunResult {
@@ -793,6 +856,25 @@ impl SpiceTestQueryWorker {
     }
 }
 
+/// Fold one run of a query into the status the benchmark reports for it.
+///
+/// Every run funnels through here — the warmup and each timed iteration alike — so
+/// the two cannot drift about what a failure is worth. A failure is sticky: once a
+/// run has failed, a later one that succeeds does not clear it.
+///
+/// The warmup is the reason this is a named function rather than an `if` at each
+/// site. Its *timing* is discarded by design, which makes it tempting to discard
+/// its verdict too, but it is the only run that asserts the result snapshot — the
+/// timed iterations pass `false` for `results_snapshot` so they never re-assert it.
+/// A status that skipped the warmup would let a wrong answer, or a missing
+/// baseline, finish the benchmark green.
+fn status_after_run(current: QueryStatus, query_failure: Option<String>) -> QueryStatus {
+    match query_failure {
+        Some(failure) => QueryStatus::Failed(Some(failure.into())),
+        None => current,
+    }
+}
+
 fn validation_result_after_reference_validation(
     validation_result: QueryValidationResult,
     reference_validation_passed: bool,
@@ -877,6 +959,36 @@ mod tests {
 
     use super::*;
     use std::sync::Arc;
+
+    /// The warmup is the only run that asserts a result snapshot, so its failure has
+    /// to reach the reported status. Regression test for a benchmark that logged
+    /// `FAIL` for a mismatched or missing snapshot and still finished green.
+    #[test]
+    fn a_failed_run_fails_the_query() {
+        let status = status_after_run(
+            QueryStatus::Passed,
+            Some(
+                "Query `s3[parquet]-cayenne[file]` `clickbench_q1` snapshot assertion failed"
+                    .to_string(),
+            ),
+        );
+
+        assert!(matches!(status, QueryStatus::Failed(Some(_))));
+    }
+
+    #[test]
+    fn a_successful_run_leaves_the_status_alone() {
+        assert!(status_after_run(QueryStatus::Passed, None) == QueryStatus::Passed);
+    }
+
+    /// A failure is sticky: the timed iterations run after the warmup, and a passing
+    /// one must not clear a warmup that already failed its snapshot.
+    #[test]
+    fn a_successful_run_does_not_clear_an_earlier_failure() {
+        let failed = QueryStatus::Failed(Some("snapshot assertion failed".into()));
+
+        assert!(status_after_run(failed.clone(), None) == failed);
+    }
 
     #[test]
     fn test_reference_validation_does_not_skip_static_validation_failures() {

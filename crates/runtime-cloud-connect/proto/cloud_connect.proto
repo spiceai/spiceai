@@ -15,9 +15,51 @@
 // Spice Cloud Connect — bidirectional control plane between a spiced
 // runtime (standalone or cluster-managed) and the Spice Cloud control
 // plane. One service, two instance kinds disambiguated by
-// `Hello.kind`.
+// `Hello.instance_kind`.
+//
+// THIS FILE IS THE AUTHORITATIVE COPY of the Cloud Connect wire contract.
+// The other implementations of the protocol keep their own copies rather
+// than generating from this one, so a change starts here and lands in
+// every copy in the same review — a field number or message shape that
+// moves on one side alone is a wire break that only shows up at runtime.
+//
+// The bytes each side derives but never sends — the HPKE suite, `key_id`,
+// and the additional authenticated data of the sealed-secret payloads —
+// are not expressible in proto. Those live in the `cloud-connect-crypto`
+// crate, which is the equivalent single source for them, and are shared
+// as code rather than copied.
+//
+// Protocol version
+// ----------------
+// `Hello.protocol_version` negotiates *within* `spice.cloud.v1`: the client
+// announces the highest revision it implements and the control plane
+// restricts itself to the lower of the two. `Hello.capabilities` narrows it
+// further, naming the optional commands this particular instance answers, so
+// the control plane can decide what to dispatch instead of discovering it by
+// dispatching and reading the failure. A standalone runtime answers a real
+// subset of what an operator does — it has no cluster workloads, kube API, or
+// sealed-secret key — so the list, not the instance kind, is what says which
+// commands are safe to send. The package name (`v1`) changes only for a break
+// neither field can bridge.
+//
+// Field numbering
+// ---------------
+// A oneof is its own group and numbers its arms contiguously from 1; the
+// enclosing message's remaining fields follow it. Every other message numbers
+// contiguously from 1 in declaration order. New fields take the next free
+// number. Removed field and enum numbers are reserved and never reused.
+//
+// Protobuf shares one number space across a message and the oneofs inside it,
+// so a message whose oneof starts at 1 declares that oneof first and its own
+// fields after — which is why the `ControlMessage` envelope fields sit below
+// the command they carry.
+//
+// Timestamps are `google.protobuf.Timestamp` throughout — never raw integers,
+// which leave both the unit and the epoch to a comment.
 syntax = "proto3";
 package spice.cloud.v1;
+
+import "google/protobuf/timestamp.proto";
 
 service CloudConnect {
   // Bidirectional control stream between a Spice runtime and the Spice
@@ -33,6 +75,68 @@ enum InstanceKind {
   INSTANCE_KIND_STANDALONE = 2;  // Standalone spiced runtime.
 }
 
+// Outcome class of a command, so the control plane can act on the *kind* of
+// failure — disable a control for UNSUPPORTED, offer a retry for FAILED,
+// surface the operator's mistake for INVALID_ARGUMENT — without matching on
+// the English in `CommandResult.message`.
+enum ResultCode {
+  RESULT_CODE_UNSPECIFIED = 0;
+  RESULT_CODE_OK = 1;
+  // The instance does not implement this command. Permanent for this
+  // instance at this version; not worth retrying.
+  RESULT_CODE_UNSUPPORTED = 2;
+  // The command is implemented but its arguments were rejected. Retrying
+  // the identical command fails identically.
+  RESULT_CODE_INVALID_ARGUMENT = 3;
+  // The command was attempted and did not succeed. May succeed on retry.
+  RESULT_CODE_FAILED = 4;
+  // The instance hit a fault of its own while handling the command.
+  RESULT_CODE_INTERNAL = 5;
+  // A command of this kind is already in flight; this one was refused before
+  // any work started. Retryable once the first one finishes.
+  RESULT_CODE_BUSY = 6;
+  // The command ran but its result exceeds what the control stream carries.
+  // No partial payload accompanies this code — a narrower command may
+  // succeed, an identical retry will not.
+  RESULT_CODE_RESULT_TOO_LARGE = 7;
+}
+
+// Coarse runtime state. The single vocabulary for "how is this runtime
+// doing": carried on every `Heartbeat` and repeated on the `GetStatus`
+// document, which adds the detail behind it.
+enum RuntimePhase {
+  RUNTIME_PHASE_UNSPECIFIED = 0;
+  // Every registered component has reached readiness.
+  RUNTIME_PHASE_READY = 1;
+  // Components are still initializing, or erroring in a way the runtime can
+  // still serve around (an accelerated dataset whose source is down keeps
+  // serving from its acceleration).
+  RUNTIME_PHASE_PROGRESSING = 2;
+  // The runtime cannot serve — it is shutting down or has failed terminally.
+  RUNTIME_PHASE_FAILED = 3;
+}
+
+enum RestartMode {
+  RESTART_MODE_UNSPECIFIED = 0;
+  // Stop accepting new work, let in-flight requests finish, then restart.
+  RESTART_MODE_GRACEFUL = 1;
+  // Restart now, abandoning in-flight requests.
+  RESTART_MODE_IMMEDIATE = 2;
+  // Drain to zero in-flight work (bounded by the instance's drain budget)
+  // before restarting.
+  RESTART_MODE_DRAIN_THEN_RESTART = 3;
+}
+
+enum PauseState {
+  PAUSE_STATE_UNSPECIFIED = 0;
+  // Serving normally.
+  PAUSE_STATE_RUNNING = 1;
+  // Rejecting all query traffic.
+  PAUSE_STATE_PAUSED = 2;
+  // Rejecting writes and refreshes; reads still served.
+  PAUSE_STATE_PAUSED_READS_ALLOWED = 3;
+}
+
 message ClientMessage {
   oneof body {
     Hello hello = 1;
@@ -41,162 +145,381 @@ message ClientMessage {
     Telemetry telemetry = 4;
     EventLog event = 5;
     AdoptAck adopt_ack = 6;
+    SecretsKey secrets_key = 7;
+    ExportMetrics export_metrics = 8;
   }
 }
 
+// Envelope for everything the control plane sends.
+//
+// `command_id` and `target` live here rather than on each command so that
+// per-command metadata (a deadline, a trace id, an idempotency key, the actor
+// who initiated it) is one edit rather than one per command message — and so
+// that a command this build does not know about is still answerable: prost
+// decodes an unknown oneof arm to an absent `body`, and the envelope still
+// carries the `command_id` needed to reply RESULT_CODE_UNSUPPORTED instead of
+// leaving the control plane waiting out its timeout.
 message ControlMessage {
   oneof body {
     Ack ack = 1;
     GetRuntimeInfo get_runtime_info = 2;
-    RunQuery run_query = 3;
-    Restart restart = 4;
-    ApplySpicepod apply_spicepod = 10;
-    UpgradeRuntime upgrade_runtime = 11;
-    Adopt adopt = 12;
-    Forget forget = 13;
-    ApplyManifest apply_manifest = 20;
-    DeleteManifest delete_manifest = 21;
-    GetStatus get_status = 22;
-    Drain drain = 23;
-    Pause pause = 24;
+    Restart restart = 3;
+    ApplySpicepod apply_spicepod = 4;
+    UpgradeRuntime upgrade_runtime = 5;
+    Adopt adopt = 6;
+    Remove remove = 7;
+    GetStatus get_status = 8;
+    GetLogs get_logs = 9;
+    ApplyManifest apply_manifest = 10;
+    DeleteManifest delete_manifest = 11;
+    Drain drain = 12;
+    Pause pause = 13;
+    ApplySecrets apply_secrets = 14;
+    DeleteSecrets delete_secrets = 15;
+    ExecuteQuery execute_query = 18;
+    AttachApp attach_app = 19;
   }
+
+  // Correlates the eventual `CommandResult`. Empty for an unsolicited
+  // message that expects no reply.
+  string command_id = 16;
+  // The workload the command addresses, for the commands that address one.
+  // Absent for a standalone instance, which is the workload.
+  WorkloadRef target = 17;
 }
 
+// Addresses a workload inside a cluster instance. `kind` is a Kubernetes
+// resource kind — the word means nothing else inside this message.
+message WorkloadRef {
+  string namespace = 1;
+  string kind = 2;
+  string name = 3;
+  // Narrows to a single pod of the workload, for the commands that read from
+  // one (GetLogs). Empty selects the workload's ready pod.
+  string pod_name = 4;
+}
+
+// First frame on every stream. Carries no credential: the client presents its
+// cloud-issued leaf as the mTLS client certificate, and enrollment happens
+// out-of-band over HTTPS (DR-025).
 message Hello {
-  InstanceKind kind = 1;
+  InstanceKind instance_kind = 1;
   string identifier = 2;
-  string credential = 3;
-  string runtime_version = 4;
-  map<string, string> extra_versions = 5;
-  string hostname = 6;
-  string os = 7;
-  string arch = 8;
-  string fingerprint = 9;
-  string public_ip_hint = 10;
-  string operator_version = 30;
-  map<string, string> runtime_versions = 31;
-  string agent_pubkey_pem = 32;     // client identity public key (PEM); set during enrollment
-  // PKCS#10 CSR (PEM) for the client-generated keypair. Present on the
-  // enrollment Hello; dp validates `credential`, signs this CSR with its
-  // issuing CA, and returns the leaf in Adopt.identity_cert_pem. Binding the
-  // issued cert to a client-proven key is what makes the subsequent mTLS real.
-  string csr_pem = 33;
+  string runtime_version = 3;
+  string hostname = 4;
+  string os = 5;
+  string arch = 6;
+  string fingerprint = 7;
+  string public_ip_hint = 8;
+  string operator_version = 9;
+  map<string, string> runtime_versions = 10;
+  // Highest revision of `spice.cloud.v1` this instance implements. 0 means
+  // the instance predates version negotiation.
+  uint32 protocol_version = 11;
+  // Optional commands this instance answers, by wire name (`apply_spicepod`,
+  // `get_logs`, `secrets.hpke`, …). A command absent from this list is
+  // answered RESULT_CODE_UNSUPPORTED if dispatched anyway; the list exists so
+  // the control plane does not have to find that out by dispatching. A
+  // standalone runtime answers a subset of the operator's commands, so read
+  // this rather than inferring from `instance_kind`.
+  repeated string capabilities = 12;
 }
 
 message Heartbeat {
   string identifier = 1;
   uint64 sequence = 2;
-  string status = 3;
+  // Same vocabulary the `GetStatus` document reports; that document adds the
+  // reason and the per-component detail behind this value.
+  RuntimePhase phase = 3;
   repeated string warnings = 4;
-  uint32 active_datasets = 10;
-  uint32 active_models = 11;
-  uint32 active_spicepods = 30;
-  map<string, string> runtime_versions = 31;
+  // The fixed counter set the control plane renders per instance. Anything
+  // outside this set belongs in `Telemetry.metrics`, never in both.
+  uint32 active_datasets = 5;
+  uint32 active_models = 6;
+  uint32 active_spicepods = 7;
+  map<string, string> runtime_versions = 8;
+  // Presence distinguishes an unreported status from a reported empty status.
+  StandaloneRuntimeStatus standalone_runtime = 9;
 }
 
+message StandaloneRuntimeStatus {
+  // Configuration paths whose desired values require a restart to take effect.
+  repeated string restart_required = 1;
+}
+
+// Terminal reply to a command, correlated by `command_id`.
+//
+// `payload` says how its own bytes are encoded, so there is no per-command
+// rule to remember (and no way to send JSON down the raw-text path or the
+// reverse). Absent means the command produced no payload.
 message CommandResult {
-  string command_id = 1;
-  bool success = 2;
-  string error = 3;
-  // Small structured payloads (e.g. GetRuntimeInfo) and RunQuery metadata
-  // ({"row_count":N,"truncated":bool}). Tabular RunQuery data rides in
-  // result_arrow_ipc instead.
-  string payload_json = 4;
-  // Arrow IPC stream bytes for tabular results (RunQuery). Empty for
-  // non-tabular commands. The cloud control plane decodes these natively;
-  // results are never JSON-encoded on the wire.
-  bytes result_arrow_ipc = 5;
+  oneof payload {
+    // A JSON document (GetRuntimeInfo, GetStatus, ApplySpicepod, Adopt).
+    string json = 1;
+    // Verbatim text, not JSON-encoded (GetLogs).
+    string text = 2;
+    // Opaque bytes — Arrow IPC stream bytes for a tabular result, for
+    // example, decoded natively rather than flattened to JSON.
+    bytes binary = 3;
+  }
+
+  string command_id = 4;
+  ResultCode code = 5;
+  // Human-readable detail. Explains a non-OK `code`; usually empty on OK.
+  string message = 6;
 }
 
+// Windowed numeric metrics: the open channel for everything outside the fixed
+// counter set on `Heartbeat`. A datum belongs to exactly one of the two.
 message Telemetry {
   string identifier = 1;
-  uint64 window_start_unix = 2;
-  uint64 window_end_unix = 3;
+  google.protobuf.Timestamp window_start = 2;
+  google.protobuf.Timestamp window_end = 3;
   map<string, double> metrics = 4;
 }
 
+// Structured event record. Declared for the control plane's audit channel;
+// the standalone client does not emit these yet.
 message EventLog {
-  string identifier = 1;
-  string kind = 2;
-  string event_json = 3;
-  uint64 timestamp_unix = 4;
+  // Encoding-explicit, for the same reason `CommandResult.payload` is.
+  oneof payload {
+    string json = 1;
+    string text = 2;
+    bytes binary = 3;
+  }
+
+  string identifier = 4;
+  // What happened, as a stable dotted identifier (`spicepod.applied`).
+  string event_type = 5;
+  google.protobuf.Timestamp timestamp = 6;
 }
 
-message Ack {
-  string for_command_id = 1;
-}
+// The command named by `ControlMessage.command_id` was received. An `Ack`
+// carries no body of its own.
+message Ack {}
 
 message AdoptAck {
   string identifier = 1;
   string identity_pubkey_pem = 2;
 }
 
-message GetRuntimeInfo {
-  string command_id = 1;
-}
-
-message RunQuery {
-  string command_id = 1;
-  string sql = 2;
-  uint32 max_rows = 3;
-}
+message GetRuntimeInfo {}
 
 message Restart {
-  string command_id = 1;
-  bool graceful = 2;
+  RestartMode mode = 1;
 }
 
+// `sealed_secret_payload` carries a standalone instance's app secrets
+// alongside its spicepod, in the same dispatch: applying a spicepod is a
+// restart, so secrets arriving in a separate command would land after the
+// components that needed them had already tried to load.
+//
+// It reuses SealedSecretPayload's shape rather than inlining flat fields, so
+// there is exactly one envelope type and one crypto path in the system — but
+// here it carries the OUTER seal, exactly as ApplySecrets does: the gateway
+// wraps the control plane's inner envelope (itself a SealedSecretPayload,
+// sealed to the instance's enrolled encryption key) in an HPKE seal to the
+// session's announced SecretsKey. A session that has not announced one cannot
+// receive it — the same gate as ApplySecrets, so standalone gets the same
+// double-seal guarantee as an operator-managed cluster.
+//
+// Unlike ApplySecrets there is no namespace/secret_name on this message: a
+// standalone instance has no Kubernetes namespace or Secret to name, so both
+// halves of the AAD are pinned literals every party must hold identically and
+// none of them sends — see `cloud-connect-crypto`, which is the single source
+// for them. Absent means "no secrets with this deploy" and is backward
+// compatible with peers that predate the field.
+//
+// Redelivering a spicepod the instance is already serving is a no-op, not
+// another apply: applying restarts the instance, so an apply-on-redelivery is a
+// restart loop.
 message ApplySpicepod {
-  string command_id = 1;
-  string spicepod_yaml = 2;
+  string spicepod_yaml = 1;
+  SealedSecretPayload sealed_secret_payload = 2;
+  // The app this instance's telemetry is attributed to. The control plane knows
+  // which app an instance is attached to and the instance cannot derive it, so
+  // it rides the same command that tells the instance what to run. The runtime
+  // stamps it as `scp_app_id`, the label the metrics backend's app dashboards
+  // filter on; empty means the control plane named none, and an instance that
+  // has never been given one exports no metrics rather than unattributed ones.
+  string app_id = 3;
 }
 
 message UpgradeRuntime {
-  string command_id = 1;
-  string target_version = 2;
+  string target_version = 1;
 }
 
+// Trust marker: the control plane confirms this instance is adopted. The
+// identity is issued out-of-band at enroll (DR-025) — the leaf, CA bundle, and
+// expiry all arrive on the enroll/renew HTTP response — so the marker carries
+// no certificate material and the client acknowledges against the identity it
+// already holds.
 message Adopt {
-  string command_id = 1;
-  string assigned_identifier = 2;
-  string identity_cert_pem = 3;     // leaf cert dp signed from Hello.csr_pem
-  uint64 not_after_unix = 4;
-  string ca_bundle_pem = 5;         // dp issuing-CA chain the client pins for mTLS
+  // Absent when the control plane assigns no name. Distinguishable from an
+  // assigned empty name, which is why it carries presence. A marker naming a
+  // different instance is refused rather than applied.
+  optional string assigned_identifier = 1;
 }
 
-message Forget {
-  string command_id = 1;
+// Release the instance from cloud management. The instance discards its
+// identity and stops connecting; the runtime process itself keeps serving.
+message Remove {}
+
+// Reports runtime readiness. Addressed by `ControlMessage.target` on a
+// cluster instance; a standalone instance reports itself. The reply is a JSON
+// document carrying the `RuntimePhase` as its `phase`, a `reason`, and
+// whatever per-component detail the instance can supply.
+message GetStatus {}
+
+// GetLogs returns recent stdout/stderr of a spiced runtime. A cluster (BYOC)
+// instance reads them from the customer cluster's kube API for the workload
+// named by `ControlMessage.target`; a standalone instance has no pod and
+// returns its own recently-captured log lines. Either way the log text comes
+// back in CommandResult.payload.text.
+message GetLogs {
+  // Trailing lines to return. Absent means the instance's own default.
+  optional uint32 tail_lines = 1;
 }
 
-// Operator-only (reserved).
+// Operator-only (reserved). Addressed by `ControlMessage.target`.
 message ApplyManifest {
-  string command_id = 1;
-  string namespace = 2;
-  string kind = 3;
-  string yaml = 4;
+  string yaml = 1;
 }
 
-message DeleteManifest {
-  string command_id = 1;
-  string namespace = 2;
-  string kind = 3;
-  string name = 4;
-}
+// Operator-only (reserved). Addressed by `ControlMessage.target`.
+message DeleteManifest {}
 
-message GetStatus {
-  string command_id = 1;
-  string namespace = 2;
-  string kind = 3;
-  string name = 4;
-}
-
-message Drain {
-  string command_id = 1;
-  string namespace = 2;
-  string name = 3;
-}
+// Operator-only (reserved). Addressed by `ControlMessage.target`.
+message Drain {}
 
 message Pause {
-  string command_id = 1;
-  bool paused = 2;
+  PauseState state = 1;
+}
+
+// Run a SQL query against the instance's in-process runtime and return the
+// rows as a complete Arrow IPC stream in `CommandResult.binary`.
+//
+// READ-ONLY. The statement is planned and then refused if it carries DDL, DML,
+// COPY, or a write-capable extension: this command arrives from the control
+// plane rather than from someone holding the instance's own credentials, so it
+// reads the instance and never changes it.
+//
+// The instance holds the limits, not the caller: at most 500 rows and at most
+// 4 MiB of Arrow IPC in the single result, one query in flight at a time — a
+// second is answered RESULT_CODE_BUSY before it executes — and a deadline after
+// which the query is abandoned and the slot freed. An oversized result is
+// RESULT_CODE_RESULT_TOO_LARGE with no payload; there is no partial success and
+// no chunking.
+//
+// The SQL text and the result values never leave the instance except as this
+// command's own result: nothing about them reaches the control plane's logs,
+// traces, or metrics, which carry only the command id, duration, row count,
+// byte count, and outcome. The instance still records the statement in its own
+// local query history, the same as for a query it received directly.
+//
+// `CommandResult.message` is the one place caller-derived text rides the wire:
+// on RESULT_CODE_INVALID_ARGUMENT it carries the engine's diagnostic, without
+// which a rejected statement cannot be fixed. It goes to the caller who wrote
+// the query and is not to be logged or retained on the way.
+//
+// There is no cancellation command: a caller that stops waiting releases its
+// own waiter, and the query runs on inside the instance until it finishes or
+// hits the instance's deadline.
+message ExecuteQuery {
+  string sql = 1;
+  // Requested row cap. Zero means the instance default; the effective cap is
+  // min(max_rows, 500) with zero mapping to 500.
+  uint32 max_rows = 2;
+}
+
+// `app_id` absent means detached; in that shape every metadata field MUST also
+// be absent. When `app_id` is present, every present field must be non-empty
+// and must not carry leading or trailing whitespace.
+message AttachApp {
+  optional string app_id = 1;
+  optional string org_name = 2;
+  optional string app_name = 3;
+  optional string monitor_url = 4;
+}
+
+// Sealed secrets delivery. A secret value is sealed TWICE with HPKE
+// (RFC 9180), so no component between the Spice Cloud control plane and the
+// receiving instance ever holds the plaintext:
+//
+//   INNER — the control plane seals SecretPayload to the instance's
+//           *enrolled* X25519 encryption key, whose public half the instance
+//           registers when it enrolls and rotates on every renewal. Neither
+//           the gateway nor anything else in the path can open it.
+//   OUTER — the gateway seals that inner envelope (SealedSecretPayload) to
+//           the instance's *per-connection* key, announced in SecretsKey and
+//           held in memory only. The gateway is sealing opaque bytes it
+//           cannot read, which keeps recorded ciphertext undecryptable even
+//           if the instance's persisted enrolled key is later compromised.
+//
+// Nesting: SecretPayload -> inner seal -> SealedSecretPayload -> outer seal ->
+// ApplySecrets.{enc,ciphertext}. The instance opens outer, then inner. There
+// is no plaintext delivery path: a session that announced no SecretsKey
+// cannot receive secrets, and a payload that fails to open at either layer is
+// rejected rather than applied.
+//
+// The bytes that are NOT on the wire — the HPKE suite, the info label, the
+// key_id derivation, and the additional authenticated data both sides derive
+// independently — are the other half of this contract, and proto cannot
+// express them. They live in the `cloud-connect-crypto` crate, which is the
+// single source for them; see that crate rather than reimplementing from
+// these comments.
+//
+// Announced by instances whose capability list contains `secrets.hpke`.
+message SecretsKey {
+  string key_id = 1;     // see cloud-connect-crypto: derive_key_id
+  uint32 kem_id = 2;     // RFC 9180 registry id for the KEM
+  uint32 kdf_id = 3;     // RFC 9180 registry id for the KDF
+  uint32 aead_id = 4;    // RFC 9180 registry id for the AEAD
+  bytes public_key = 5;  // raw KEM public key bytes (32 for X25519)
+}
+
+message ApplySecrets {
+  string secret_name = 1;
+  string key_id = 2;     // OUTER: which announced SecretsKey was sealed to
+  bytes enc = 3;         // OUTER: HPKE encapsulated key
+  bytes ciphertext = 4;  // OUTER: sealed serialized SealedSecretPayload
+}
+
+message DeleteSecrets {
+  string secret_name = 1;
+}
+
+// The inner, control-plane-sealed envelope: the plaintext of the outer seal,
+// which the gateway wraps into ApplySecrets.ciphertext without being able to
+// read it.
+message SealedSecretPayload {
+  // INNER: the enrolled recipient key the control plane sealed to — the
+  // instance's current or previous encryption key. Derived exactly as
+  // SecretsKey.key_id is.
+  string key_id = 1;
+  bytes enc = 2;         // INNER: HPKE encapsulated key
+  bytes ciphertext = 3;  // INNER: sealed serialized SecretPayload
+}
+
+// The plaintext schema sealed inside SealedSecretPayload.ciphertext.
+message SecretPayload {
+  map<string, bytes> string_data = 1;
+}
+
+// Pushes metrics from the runtime to the control plane.
+//
+// Unsolicited: the runtime exports on its own cadence rather than answering a
+// command, so this rides on ClientMessage with no command_id and draws no
+// CommandResult.
+//
+// `otlp_request` is a serialized
+// `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest` in
+// protobuf binary encoding — byte-for-byte what an OTLP/gRPC exporter sends —
+// so the control plane can hand it to an OTLP pipeline without transcoding.
+// Carried as bytes rather than an imported message so this contract does not
+// pin a version of the OpenTelemetry protos, and so the runtime can forward
+// what its exporter already produced instead of re-encoding it.
+message ExportMetrics {
+  string identifier = 1;
+  bytes otlp_request = 2;
 }

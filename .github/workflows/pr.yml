@@ -67,12 +67,240 @@ jobs:
     # stuck.
     name: Attestation
     runs-on: ubuntu-latest
+    # A few API calls. Anything past this is a wedged step, not a slow one.
+    timeout-minutes: 15
     permissions:
       contents: read
       statuses: read
       # pulls.listCommits for pure-revert fast-track detection
       pull-requests: read
     steps:
+      # An explicit sign-off verdict on the head commit answers the only question
+      # this job asks, so it is settled before anything below can route around
+      # it. `Inspect developer sign-off` treats a non-success status as an absent
+      # one and walks the first-parent chain, which is right for an intermediate
+      # merge commit — its status says nothing about the tree under review — but
+      # wrong for HEAD: inheritance exists so that merging the base costs no
+      # re-sign-off, not so that it can resurrect a sign-off that HEAD's own run
+      # has already overturned. The fast-track paths below skip the inspection
+      # entirely, and they mean "this head needs no sign-off", not "a failed one
+      # may be ignored". A `pending` status is deliberately not rejected here: it
+      # is not a verdict, and a sign-off still running must not turn Attestation
+      # red on a branch that already has a valid sign-off to inherit. See #12357.
+      - name: Reject a failed sign-off on the head commit
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const headSha = context.payload.pull_request.head.sha;
+
+            // 'signoff' matches the hardcoded STATUS_CONTEXT in scripts/signoff.
+            const { data } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+            });
+            const signoff = data.statuses.find((status) => status.context === 'signoff');
+            if (signoff?.state !== 'failure' && signoff?.state !== 'error') {
+              return;
+            }
+
+            const reported = signoff.description ? `: ${signoff.description}` : '';
+            core.setFailed(
+              `The developer sign-off for ${headSha} reported ${signoff.state}${reported}. ` +
+              `Fix what it found and run make signoff again on the pushed HEAD; a sign-off ` +
+              `that has failed on this commit cannot be satisfied by an earlier one. ` +
+              `See docs/dev/ci_signoff.md.`
+            );
+
+      # Dependabot dependency bumps are fast-tracked: a PR Dependabot opened that
+      # is still exactly the one commit Dependabot pushed carries no
+      # human-authored change to sign off on, and the merge queue re-runs the
+      # whole suite on the merged result anyway. The moment the branch grows a
+      # second commit — a build fix after the queue rejects it, a base merge, a
+      # follow-up — the PR no longer matches and needs a normal `make signoff`.
+      - name: Fast-track Dependabot dependency bumps
+        id: dependabot
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation.
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            // Dependabot pushes its branches into this repository, so a fork PR
+            // can never be one — and auto-passing a fork would sidestep the
+            // trusted-committer boundary the sign-off model rests on.
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; Dependabot fast-track does not apply.');
+              return;
+            }
+
+            let commits;
+            try {
+              commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR commits for Dependabot fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+
+            if (commits.length !== 1) {
+              core.info(
+                `PR carries ${commits.length} commits; the Dependabot fast-track covers only ` +
+                `the single commit Dependabot pushed. Run make signoff on the pushed HEAD.`
+              );
+              return;
+            }
+
+            // Dependabot opened the PR, but its branch lives in this repository,
+            // so anyone with write access can replace that commit. Require the
+            // commit itself to be Dependabot's, on all three counts below.
+            const [commit] = commits;
+            if (commit.author?.login !== 'dependabot[bot]') {
+              core.info(
+                `The PR's single commit ${commit.sha} is authored by ` +
+                `${commit.author?.login ?? 'an unknown account'}, not dependabot[bot]; ` +
+                `Dependabot fast-track does not apply.`
+              );
+              return;
+            }
+
+            // The author line alone proves nothing: it is plain commit metadata,
+            // and GitHub's signature verification attests the *committer*, not
+            // the author. Someone with write access and a registered signing key
+            // could push a commit they authored as themselves while naming
+            // dependabot[bot] as author, and it would still verify. Dependabot
+            // creates its commits through GitHub's API, so GitHub signs them and
+            // the committer is its own web-flow identity (noreply@github.com) --
+            // which a locally-committed commit cannot claim. Verified against
+            // every Dependabot bump in this repository. If GitHub ever changes
+            // that identity this check fails closed: bumps stop being
+            // fast-tracked and fall back to a normal sign-off.
+            if (commit.committer?.login !== 'web-flow') {
+              core.info(
+                `The PR's single commit ${commit.sha} was committed by ` +
+                `${commit.committer?.login ?? 'an unknown account'} rather than GitHub ` +
+                `itself, so its signature does not attest Dependabot authorship; ` +
+                `Dependabot fast-track does not apply.`
+              );
+              return;
+            }
+
+            const verification = commit.commit?.verification;
+            if (!verification?.verified) {
+              core.info(
+                `The PR's single commit ${commit.sha} does not carry a verified signature ` +
+                `(${verification?.reason ?? 'no verification data'}); Dependabot fast-track ` +
+                `does not apply.`
+              );
+              return;
+            }
+
+            core.setOutput('fast_track', 'true');
+            core.notice(
+              `Fast-tracked Dependabot commit ${commit.sha.slice(0, 12)}; the full suite ` +
+              `still runs in the merge queue.`
+            );
+
+      # Branches that can't affect Rust lint, build, or tests are fast-tracked.
+      # `make signoff` already skips every Rust check for these (see
+      # branch_has_rust_changes in scripts/signoff) and posts the status anyway,
+      # so requiring the developer to run it buys nothing — the sign-off would
+      # attest a run that did no work. The merge queue's `check_changes` gate
+      # applies the same reasoning to the merged result.
+      #
+      # KEEP THE PATTERN IN SYNC with RUST_AFFECTING_PATH_PATTERN in
+      # scripts/signoff, and covered by the check-code-changes filter;
+      # scripts/check_rust_gate_paths.py enforces both. This step also inspects
+      # renames (previous_filename), so it is strictly the more conservative of
+      # the two regexes.
+      - name: Fast-track branches with no Rust-affecting files
+        id: no_rust
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' }}
+        # Best-effort: any unexpected script failure must fall through to the
+        # normal developer sign-off path, not fail required Attestation.
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pull_number = context.payload.pull_request.number;
+
+            // Same-repo only, matching the other fast-tracks: a fork PR still
+            // takes a maintainer sign-off (posting a status needs write access),
+            // and that trusted-committer boundary shouldn't depend on which
+            // files the PR happens to touch.
+            const headRepo = context.payload.pull_request.head.repo?.full_name;
+            const baseRepo = context.payload.pull_request.base.repo?.full_name;
+            if (!headRepo || headRepo !== baseRepo) {
+              core.info('PR is from a fork; no-Rust fast-track does not apply.');
+              return;
+            }
+
+            let files;
+            try {
+              files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.info(
+                `Could not list PR files for no-Rust fast-track (${error.message}); ` +
+                `falling back to developer sign-off.`
+              );
+              return;
+            }
+
+            // listFiles caps at 3000 entries with no truncation flag, so treat a
+            // diff at the cap as unknown rather than assume the tail is docs.
+            if (files.length === 0 || files.length >= 3000) {
+              core.info(
+                `PR reports ${files.length} changed files; no-Rust fast-track does not apply.`
+              );
+              return;
+            }
+
+            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability)\.py$|^Makefile$)/;
+            for (const file of files) {
+              // A rename off a .rs path changes Rust sources even though the new
+              // name doesn't match, so both sides of the rename must be clean.
+              for (const path of [file.filename, file.previous_filename]) {
+                if (path && rustAffecting.test(path)) {
+                  core.info(
+                    `${path} can affect Rust lint/build/tests; no-Rust fast-track does ` +
+                    `not apply.`
+                  );
+                  return;
+                }
+              }
+            }
+
+            core.setOutput('fast_track', 'true');
+            // Name the pattern rather than a subset of what it matches: the two drift
+            // apart every time a path is added to the gate.
+            core.notice(
+              `Fast-tracked ${files.length} changed file(s): none matches the ` +
+              `rustAffecting pattern in .github/workflows/pr.yml, so a sign-off would ` +
+              `run no Rust checks. The full suite still runs in the merge queue.`
+            );
+
       # Pure reverts are fast-tracked: undoing a commit that already landed on
       # (and so passed the full suite through) the base branch is low-risk, and
       # the merge queue re-runs the whole suite on the merged result anyway. A
@@ -85,7 +313,7 @@ jobs:
       # sign-off. Anything not matching falls through to the sign-off check below.
       - name: Fast-track pure reverts
         id: revert
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' }}
         # Best-effort: any unexpected script failure must fall through to the
         # normal developer sign-off path, not fail required Attestation for
         # every PR. listCommits/compare errors are also try/caught inside.
@@ -186,7 +414,7 @@ jobs:
 
       - name: Inspect developer sign-off
         id: signoff
-        if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track != 'true' }}
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track != 'true' && steps.no_rust.outputs.fast_track != 'true' && steps.revert.outputs.fast_track != 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -276,7 +504,7 @@ jobs:
       # and blobs to reproduce the merge without relying on a lazy network fetch.
       - name: Check out pull request history
         if: ${{ github.event_name == 'pull_request' && steps.signoff.outputs.inheritance_candidate == 'true' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -354,13 +582,42 @@ jobs:
               `Inherited developer sign-off from ${signedSha} across ${merges.length} ` +
               `clean base merge(s).`
             );
+      - name: Dependabot fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.dependabot.outputs.fast_track == 'true' }}
+        run: echo "Single-commit Dependabot bump fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
+
+      - name: No-Rust fast-track passthrough
+        if: ${{ github.event_name == 'pull_request' && steps.no_rust.outputs.fast_track == 'true' }}
+        run: echo "No Rust-affecting files in the diff, so a sign-off would run no Rust checks; the full suite runs on the merged result in the merge queue."
+
       - name: Revert fast-track passthrough
         if: ${{ github.event_name == 'pull_request' && steps.revert.outputs.fast_track == 'true' }}
         run: echo "Pure revert fast-tracked past sign-off; the full suite runs on the merged result in the merge queue."
 
+      # Named rather than negated. Entry into the queue is itself gated on a green
+      # Attestation, so by the time a merge_group run exists the sign-off has already
+      # been validated — that precondition is what makes passing here sound. Any other
+      # non-pull_request trigger reaching this step would be borrowing an assumption it
+      # does not satisfy.
       - name: Merge queue passthrough
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ github.event_name == 'merge_group' }}
         run: echo "Sign-off was validated at queue entry; the full suite runs in this merge_group run."
+
+      # A dispatch carries no pull_request payload, so every inspection above is
+      # unreachable: there is no head SHA to read a `signoff` status for, no base to
+      # walk the first-parent chain from, and no author or commit list for the
+      # fast-tracks. It has no queue-entry precondition either, so the passthrough
+      # above must not cover it. Since Attestation is the only gate a pull request has,
+      # a green one minted here would satisfy that gate having verified nothing, which
+      # makes failing the only honest verdict.
+      #
+      # This does not cost the dispatch its purpose: the heavy jobs below gate on
+      # `check_changes`, not on this job, so they still run.
+      - name: Reject an attestation asserted by dispatch
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          echo "::error title=Attestation cannot be established by dispatch::A workflow_dispatch of pr.yml has no pull request payload, so no sign-off can be read and no verdict asserted. Dispatch this workflow only to run the heavy jobs. To report Attestation on a pull request whose checks are absent, re-run the pull_request-triggered 'pr' run for that head commit, or push to the branch so the pull_request event fires again."
+          exit 1
 
   # The jobs below run ONLY in the merge queue (merge_group) and on manual
   # dispatch — never on a pull request. They stay required, so the full suite
@@ -370,10 +627,14 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-macos
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Use fetch-depth 2 for PR change detection (dorny/paths-filter only needs base + head)
           fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
@@ -391,13 +652,15 @@ jobs:
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 126 min.
+    timeout-minutes: 300
     needs: check_changes
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -421,13 +684,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -458,8 +722,13 @@ jobs:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -477,13 +746,15 @@ jobs:
   build-test:
     name: Build and Test
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 117 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -511,13 +782,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -538,9 +810,15 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Build CLI and run nextest
+      # No separate CLI build: nextest's `--tests` build already emits the `spice`
+      # binary, since cargo builds a package's bins alongside that package's
+      # integration tests, so a CLI link error fails nextest itself. `verify-cli`
+      # asserts the binary is there and runs, so the gate reports it if cargo ever
+      # stops producing it. The required `Build (release profile)` job below does
+      # the real release installs.
+      - name: Run nextest and verify the CLI
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make build-cli nextest
+        run: make nextest verify-cli
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -554,6 +832,11 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
+          # Lighter Cayenne fuzz/race depth for the merge-queue gate (see
+          # crates/cayenne/tests/mutation_property_test.rs and common::env_scale);
+          # both knobs default to 1.0 (full depth) when unset.
+          CAYENNE_PROPTEST_SCALE: "0.25"
+          CAYENNE_PROPTEST_OPS_SCALE: "0.25"
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -564,8 +847,13 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -599,13 +887,15 @@ jobs:
   build-install-release:
     name: Build (release profile)
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 106 min.
+    timeout-minutes: 300
     needs: [check_changes]
     if: ${{ github.event_name != 'pull_request' }}
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
@@ -617,13 +907,14 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
           token: ${{ github.token }}
           bucket: sccache
           region: us-west-1
+          immutable-objects: "true"
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -672,8 +963,13 @@ jobs:
         run: make install-spiced
 
       - name: Show sccache stats
-        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
-        run: sccache --show-stats
+        if: ${{ always() && (needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true') }}
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''

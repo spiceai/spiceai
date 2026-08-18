@@ -14,61 +14,87 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Parameter validation for secret-store configuration.
+//! Bootstrap resolution for secret-store `params:`.
 //!
 //! Secret stores are configured via the `params:` field on a Spicepod
-//! `secrets:` entry. They reuse [`runtime_parameter_spec::ParameterSpec`]
-//! (the same type used by data connectors and accelerators) to declare
-//! their accepted parameters, and run a lightweight validator at load time.
+//! `secrets:` entry. Each store's accepted parameters are declared as a
+//! `#[derive(TypedParams)]` struct (see `crate::stores`), which validates
+//! names, defaults, and `one_of`, and — via `#[params(deny_unknown)]` — fails
+//! fast on unknown keys (silently dropping a misspelled `regoin` is exactly the
+//! failure mode this design prevents).
 //!
-//! Differences from `runtime_parameters::Parameters::try_new`:
+//! This module holds the two pieces of that pipeline that run *before* the
+//! typed parse:
 //!
-//! - Secret-store params are **not** themselves resolved against a
-//!   [`crate::Secrets`] registry. Secret stores must be initialized before
-//!   any `${ store:KEY }` resolution is possible, so resolving secret-store
-//!   params from secrets would be a chicken-and-egg cycle. Use
-//!   environment-variable expansion (handled at the spicepod-loading layer)
-//!   if you need to inject runtime values.
-//! - There is no `prefix`. Secret-store param names are written as-is
-//!   (`region`, `namespace`, `file_path`, ...).
-//! - Validation is fail-fast: unknown parameters return an error rather
-//!   than logging a warning, because silently dropping (for example) a
-//!   misspelled `regoin` parameter is exactly the failure mode this
-//!   feature is meant to fix.
+//! - [`expand_bootstrap_refs`] resolves `${ env:KEY }` / `${ secrets:KEY }`
+//!   references inside the params. Secret-store params are **not** resolved
+//!   against the full [`crate::Secrets`] registry: secret stores must be
+//!   initialized before any `${ store:KEY }` resolution is possible, so that
+//!   would be a chicken-and-egg cycle. Only the bootstrap `env` store is
+//!   available at this point.
+//! - `non_empty` / `non_empty_secret` / `non_empty_path` normalize blank
+//!   values to `None`, used by the stores' `into_config` conversions. Each is
+//!   compiled only for the store features that call it, so a build without
+//!   those stores does not carry them as dead code.
 
 use std::collections::HashMap;
+#[cfg(feature = "hashicorp_vault")]
+use std::path::PathBuf;
 
-use runtime_parameter_spec::ParameterSpec;
-use secrecy::ExposeSecret;
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 
 use crate::SecretStore;
 use crate::lexer::SecretReplacementMatcher;
 
+/// Trims a param value and maps an empty result to `None`.
+///
+/// Secret stores treat a defined-but-blank param (e.g. `client_secret: ""`, or
+/// a whitespace-only value from a templated config) as *absent* — otherwise an
+/// empty string would slip past validation and surface later as an opaque SDK
+/// error instead of a clean "missing parameter".
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
+#[must_use]
+pub(crate) fn non_empty(value: Option<String>) -> Option<String> {
+    let trimmed = value.map(|v| v.trim().to_string())?;
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// [`non_empty`] for secret values: trims and drops blanks without leaving the
+/// trimmed bytes in a non-zeroizing intermediate `String`.
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
+#[must_use]
+pub(crate) fn non_empty_secret(value: Option<SecretString>) -> Option<SecretString> {
+    let value = value?;
+    let trimmed = value.expose_secret().trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(SecretString::from(trimmed.to_string()))
+    }
+}
+
+/// [`non_empty`] for filesystem-path values.
+#[cfg(feature = "hashicorp_vault")]
+#[must_use]
+pub(crate) fn non_empty_path(value: Option<PathBuf>) -> Option<PathBuf> {
+    let value = value?;
+    let trimmed = value.to_string_lossy();
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum ParamError {
-    #[snafu(display(
-        "Unknown parameter '{param}' for secret store '{store}'. Supported parameters: {supported}."
-    ))]
-    UnknownParam {
-        store: String,
-        param: String,
-        supported: String,
-    },
-
-    #[snafu(display("Missing required parameter '{param}' for secret store '{store}'."))]
-    MissingRequired { store: String, param: String },
-
-    #[snafu(display(
-        "Invalid value for parameter '{param}' on secret store '{store}': must be one of [{allowed}]; got '{value}'."
-    ))]
-    InvalidOneOf {
-        store: String,
-        param: String,
-        value: String,
-        allowed: String,
-    },
-
     #[snafu(display(
         "Secret-store params for '{store}' may only reference `env` or `secrets` (which resolves only env at bootstrap) (got `${{ {actual}:{key} }}` in '{param}'). Other stores are not yet initialized at this point."
     ))]
@@ -191,176 +217,4 @@ async fn expand_one(
 
     out.push_str(&value[last_end..]);
     Ok(Some(out))
-}
-
-/// Validates a set of user-provided params against a static [`ParameterSpec`]
-/// list, returning a normalized `HashMap`.
-///
-/// Steps performed (in order):
-/// 1. Reject any user-provided key that is not present in `spec`.
-/// 2. Emit a tracing warning for each provided key that is marked deprecated.
-/// 3. Fill in any unset parameters that have a `default`.
-/// 4. Verify all `required` parameters are now present.
-/// 5. Verify any `one_of`-constrained parameters hold an allowed value.
-///
-/// Secret-store params are never themselves expanded against the secrets
-/// registry (see module-level docs for the rationale), so this function does
-/// not take a `Secrets` handle.
-///
-/// # Errors
-///
-/// Returns [`ParamError::UnknownParam`] for params not in `spec`,
-/// [`ParamError::MissingRequired`] when a required param is absent, or
-/// [`ParamError::InvalidOneOf`] when a `one_of`-constrained param holds
-/// an unsupported value.
-pub fn validate_params<S: ::std::hash::BuildHasher>(
-    store: &str,
-    user_params: HashMap<String, String, S>,
-    spec: &'static [ParameterSpec],
-) -> Result<HashMap<String, String, S>, ParamError> {
-    // 1. Reject unknown keys up-front. We do not silently drop them because
-    //    the most common failure for secret-store config is a misspelled
-    //    parameter name, and silent drops are exactly what makes the bug
-    //    invisible.
-    for key in user_params.keys() {
-        if !spec.iter().any(|p| p.name == key) {
-            return Err(ParamError::UnknownParam {
-                store: store.to_string(),
-                param: key.clone(),
-                supported: supported_list(spec),
-            });
-        }
-    }
-
-    // 2. Warn about deprecated params the user did supply.
-    for p in spec {
-        if let Some(msg) = p.deprecation_message
-            && user_params.contains_key(p.name)
-        {
-            tracing::warn!(
-                "Parameter '{}' is deprecated for secret store '{}': {}",
-                p.name,
-                store,
-                msg
-            );
-        }
-    }
-
-    // 3. Apply defaults for any unset, defaulted params.
-    let mut params = user_params;
-    for p in spec {
-        if let Some(default) = p.default
-            && !params.contains_key(p.name)
-        {
-            params.insert(p.name.to_string(), default.to_string());
-        }
-    }
-
-    // 4. Required-param check (after defaults, so a defaulted param can be
-    //    declared `required` for documentation without breaking the load).
-    for p in spec {
-        if p.required && !params.contains_key(p.name) {
-            return Err(ParamError::MissingRequired {
-                store: store.to_string(),
-                param: p.name.to_string(),
-            });
-        }
-    }
-
-    // 5. one_of validation.
-    for p in spec {
-        let Some(allowed) = p.one_of else {
-            continue;
-        };
-        if let Some(value) = params.get(p.name)
-            && !allowed.contains(&value.as_str())
-        {
-            return Err(ParamError::InvalidOneOf {
-                store: store.to_string(),
-                param: p.name.to_string(),
-                value: value.clone(),
-                allowed: allowed.join(", "),
-            });
-        }
-    }
-
-    Ok(params)
-}
-
-fn supported_list(spec: &'static [ParameterSpec]) -> String {
-    let mut names: Vec<&str> = spec
-        .iter()
-        .filter(|p| p.deprecation_message.is_none())
-        .map(|p| p.name)
-        .collect();
-    names.sort_unstable();
-    if names.is_empty() {
-        "<none>".to_string()
-    } else {
-        names.join(", ")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TEST_SPEC: &[ParameterSpec] = &[
-        ParameterSpec::runtime("region")
-            .description("AWS region")
-            .examples(&["us-east-1"]),
-        ParameterSpec::runtime("mode")
-            .default("auto")
-            .one_of(&["auto", "manual"]),
-        ParameterSpec::runtime("legacy").deprecated("use `region` instead"),
-    ];
-
-    fn map(items: &[(&str, &str)]) -> HashMap<String, String> {
-        items
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn rejects_unknown_param() {
-        let err = validate_params("test", map(&[("regoin", "us-east-1")]), TEST_SPEC)
-            .expect_err("unknown param must be rejected");
-        assert!(
-            matches!(err, ParamError::UnknownParam { ref param, .. } if param == "regoin"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn applies_defaults() {
-        let out = validate_params("test", HashMap::new(), TEST_SPEC).expect("validates");
-        assert_eq!(out.get("mode").map(String::as_str), Some("auto"));
-        assert!(!out.contains_key("region"));
-    }
-
-    #[test]
-    fn enforces_one_of() {
-        let err = validate_params("test", map(&[("mode", "wat")]), TEST_SPEC)
-            .expect_err("invalid one_of must be rejected");
-        assert!(
-            matches!(err, ParamError::InvalidOneOf { ref value, .. } if value == "wat"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn allows_known_param() {
-        let out =
-            validate_params("test", map(&[("region", "eu-west-2")]), TEST_SPEC).expect("validates");
-        assert_eq!(out.get("region").map(String::as_str), Some("eu-west-2"));
-    }
-
-    #[test]
-    fn warns_on_deprecated_but_accepts() {
-        // Deprecated params remain accepted; the warning is observed via
-        // `tracing` and is not asserted here.
-        let out = validate_params("test", map(&[("legacy", "x")]), TEST_SPEC).expect("validates");
-        assert_eq!(out.get("legacy").map(String::as_str), Some("x"));
-    }
 }

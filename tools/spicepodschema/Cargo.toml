@@ -24,7 +24,6 @@ runtime = { path = "../../crates/runtime", features = [
     "delta_lake",
     "dremio",
     "duckdb",
-    "dynamodb",
     "flightsql",
     "ftp",
     "imap",
@@ -50,7 +49,18 @@ runtime = { path = "../../crates/runtime", features = [
 
 # Extracted connector crates (for linkme registration)
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse" }
+connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
+connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
+connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
+connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb" }
+connector-databricks = { path = "../../crates/data-connectors/connector-databricks" }
+connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch" }
+connector-git = { path = "../../crates/data-connectors/connector-git" }
+connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-glue = { path = "../../crates/data-connectors/connector-glue" }
+connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake" }
+connector-dynamodb = { path = "../../crates/data-connectors/connector-dynamodb" }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio" }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb" }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql" }

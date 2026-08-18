@@ -23,8 +23,12 @@ license-file.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
+linkme.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
@@ -32,8 +36,12 @@ fundu.workspace = true
 futures.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
+runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true

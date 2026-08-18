@@ -33,6 +33,7 @@ mod federation;
 pub mod replication;
 #[cfg(feature = "duckdb")]
 pub mod replication_e2e;
+pub mod replication_shared;
 mod schema_inference;
 
 use super::*;

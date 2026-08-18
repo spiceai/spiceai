@@ -20,7 +20,7 @@ limitations under the License.
 //! It uses file-local row positions tracked via `RoaringBitmap` for efficient
 //! row exclusion during Vortex scans.
 
-// `vortex::array::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
+// `vortex::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
 // `execute_arrow(ctx)`; migrating requires threading a Vortex session through the delete path,
 // which is deferred. Use `expect` (not `allow`) so it resurfaces once that migration lands.
 #![expect(deprecated)]
@@ -36,7 +36,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::DFSchema;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::utils::get_available_parallelism;
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
@@ -48,7 +47,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::IntoArrowArray;
+use vortex::arrow::IntoArrowArray;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::DefaultExpressionConvertor;
@@ -81,7 +80,8 @@ impl Drop for PositionDeleteCleanup {
     }
 }
 
-static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> = LazyLock::new(get_available_parallelism);
+static MAX_CONCURRENT_FILE_SCANS: LazyLock<usize> =
+    LazyLock::new(|| cpu_budget::cpu_budget().cayenne_max_concurrent_file_scans());
 
 impl CayenneDeletionSink {
     /// Delete filtered rows using Vortex-native streaming scan with per-file deletion tracking.

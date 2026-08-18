@@ -8,7 +8,13 @@ on:
       - release-*
       - release/*
     paths:
+      # The model contracts these tests exercise are no longer all under
+      # `crates/llms/` — a change to a trait in one of the API crates reaches
+      # every provider implementing it.
       - 'crates/llms/**'
+      - 'crates/chat-api/**'
+      - 'crates/embed-api/**'
+      - 'crates/rerank-api/**'
   merge_group:
     branches:
       - trunk
@@ -44,6 +50,8 @@ jobs:
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
+    # Evaluates one inline script.
+    timeout-minutes: 15
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -88,11 +96,16 @@ jobs:
   build:
     name: Build Test Binary
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
+    # every sample had a warm sccache. Sized against the other macOS workspace
+    # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
+    # build into a red one.
+    timeout-minutes: 300
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1 # Shallow clone for faster checkout
@@ -112,7 +125,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -146,6 +159,8 @@ jobs:
   test:
     runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 90
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
@@ -155,14 +170,14 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@973bc49a7be396ec9430255ad0f7ed684d7a1317 # v0.5.8
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -200,6 +215,10 @@ jobs:
           SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
           SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
+          # The spiceio setup action exports AWS_ENDPOINT_URL for sccache; the AWS SDK
+          # honours it for every service, so leaving it set sends this suite's Bedrock
+          # calls to the local build cache instead of AWS.
+          unset AWS_ENDPOINT_URL
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
               echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."

@@ -15,9 +15,5 @@ limitations under the License.
 */
 
 pub mod dbconnection;
-#[cfg(feature = "odbc")]
-pub mod odbcpool;
-#[cfg(feature = "scylladb")]
-pub mod scylladbpool;
 #[cfg(feature = "snowflake")]
 pub mod snowflakepool;

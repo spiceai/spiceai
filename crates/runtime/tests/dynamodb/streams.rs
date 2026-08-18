@@ -1212,9 +1212,12 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                     () = cloned_rt.load_components() => {}
                 }
 
-                // With ready_before_load, should rebootstrap and restore all 8 rows (5 original + 3 new)
+                // `ready_before_load` is a deprecated alias that now maps to
+                // `restart` (the ready-before-load behavior was removed because
+                // it served stale data during the reload). It must still trigger
+                // a rebootstrap and restore all 8 rows (5 original + 3 new).
                 let has_rows = wait_for_dataset_rows(&rt, table_name, 8, 30).await;
-                assert!(has_rows, "Phase 3: Dataset should have 8 rows after rebootstrap with ready_before_load (5 original + 3 added while down)");
+                assert!(has_rows, "Phase 3: Dataset should have 8 rows after rebootstrap with the deprecated ready_before_load alias (5 original + 3 added while down)");
 
                 runtime_ready_check(&rt).await;
             }

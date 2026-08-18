@@ -44,3 +44,13 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 pub fn legacy_factory() -> Arc<dyn DataConnectorFactory> {
     SpiceAIFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_spiceai as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_spiceai_connector,
+    SPICEAI_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    SpiceAIFactory
+);

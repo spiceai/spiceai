@@ -19,6 +19,48 @@ limitations under the License.
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
+
+/// The kind of cursor a persisted checkpoint resumes from. Stored explicitly
+/// with each checkpoint (never inferred from the presence of a GTID set): a
+/// GTID checkpoint with an empty executed set (`gtid_mode = ON`, zero
+/// transactions applied yet) must still reload as GTID, so an engine that maps
+/// an empty string to `NULL` on the round-trip cannot silently reclassify it as
+/// file — which would resume from a server-local offset unrelated to the GTID
+/// set and open a silent gap on failover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorType {
+    /// File+offset positioning (`COM_BINLOG_DUMP`). Server-local; re-snapshots
+    /// on failover.
+    File,
+    /// GTID auto-positioning (`COM_BINLOG_DUMP_GTID`). Failover-safe.
+    Gtid,
+}
+
+impl CursorType {
+    /// The value persisted in the sidecar `cursor_type` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Gtid => "gtid",
+        }
+    }
+
+    /// Parse a stored `cursor_type` value. Returns `None` for an absent/unknown
+    /// value (a row that predates the column, or corrupt data); the sidecar
+    /// loader resolves that (unreleased-feature-only) case by inferring the type
+    /// from the persisted GTID set rather than propagating the `None`.
+    #[must_use]
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "gtid" => Some(Self::Gtid),
+            _ => None,
+        }
+    }
+}
+
 /// Parameters for a single dataset's binlog replication stream.
 ///
 /// Built by the connector from spicepod params; see
@@ -36,7 +78,7 @@ pub struct ReplicationParams {
     /// server-side state is keyed on it, so it may change across restarts.
     pub server_id: u32,
     /// Whether/when the initial table snapshot runs.
-    pub snapshot_mode: SnapshotMode,
+    pub snapshot_mode: InitialSnapshotMode,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
     /// How often the stream persists its committed binlog position to the
@@ -46,7 +88,13 @@ pub struct ReplicationParams {
     pub checkpoint_interval: Duration,
     /// What to do when the persisted binlog position is no longer available
     /// on the source (binary logs purged past it).
-    pub invalid_position_behavior: InvalidPositionBehavior,
+    pub invalid_position_behavior: InvalidCheckpointBehavior,
+    /// Lag-based readiness threshold: the dataset is marked Ready once its
+    /// replication lag (now minus the newest applied commit's binlog-header
+    /// timestamp) falls below this, so a snapshotting or backlog-draining
+    /// dataset stays not-ready and never serves stale data. User param
+    /// `mysql_replication_ready_lag` (default 2s).
+    pub ready_lag: Duration,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -61,44 +109,9 @@ impl std::fmt::Debug for ReplicationParams {
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("checkpoint_interval", &self.checkpoint_interval)
             .field("invalid_position_behavior", &self.invalid_position_behavior)
+            .field("ready_lag", &self.ready_lag)
             .finish_non_exhaustive()
     }
-}
-
-/// Whether/when the initial table snapshot runs.
-///
-/// There is no separate "snapshot on resume" knob (the Postgres connector
-/// needs one because its cursor lives server-side in the replication slot
-/// and can outlive an empty accelerator): the `MySQL` position is persisted
-/// *inside* the accelerator's sidecar, so a non-persistent accelerator can
-/// never present a stale resumable position — data and cursor share one
-/// lifecycle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SnapshotMode {
-    /// Snapshot the table's existing rows when no resumable binlog position
-    /// exists; resume without a snapshot when one does. The default.
-    #[default]
-    Auto,
-    /// Never snapshot: stream changes only, from the persisted position when
-    /// one exists or from the current binlog head otherwise.
-    Never,
-    /// Snapshot on every start, discarding any persisted position — a
-    /// truncate barrier clears stale accelerator state first.
-    Always,
-}
-
-/// Behavior when the persisted binlog position cannot be honored by the
-/// source (the binary log file was purged, e.g. by `binlog_expire_logs_seconds`
-/// or `PURGE BINARY LOGS`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum InvalidPositionBehavior {
-    /// Surface a clear error so the operator can decide. The default,
-    /// because silently re-snapshotting a large table should be opt-in.
-    #[default]
-    Error,
-    /// Drop the persisted position and fall through to the cold-bootstrap
-    /// path, re-snapshotting the table.
-    Rebootstrap,
 }
 
 /// A position in the source's binary log: file name plus byte offset.

@@ -19,27 +19,19 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
 arrow-row.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { workspace = true, optional = true }
-aws-sdk-dynamodbstreams = { workspace = true, optional = true }
-aws-smithy-async = { workspace = true, optional = true }
-azure_core = { version = "0.31.0", optional = true }
-azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
-    "hmac_rust",
-    "key_auth",
-], optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
 bigdecimal = { workspace = true, optional = true }
 bytes.workspace = true
-charset = { workspace = true, optional = true }
 chrono.workspace = true
+connector-postgres-common = { path = "../data-connectors/connector-postgres-common", optional = true }
 dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -56,13 +48,9 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
     "appender-arrow",
 ], optional = true }
-dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-git2 = { workspace = true }
 globset.workspace = true
-graph-rs-sdk = { workspace = true, optional = true }
-graphql-parser.workspace = true
 hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
@@ -70,12 +58,15 @@ iceberg.workspace = true
 parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
-imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
-mongodb = { workspace = true, optional = true }
-mailparse = { workspace = true, optional = true }
+# Value-only row-image parsing (mysql_replication::binlog::TableMapRowDecoder):
+# `ParseBuf` is not re-exported by mysql_async; the version matches the
+# mysql_async pin so this adds no extra compilation unit.
+mysql_common = { version = "0.35.5", default-features = false, features = ["binlog"], optional = true }
+# Included-column bitmaps in mysql_common's rows-event API are bitvec slices.
+bitvec = { version = "1", optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
@@ -91,17 +82,18 @@ rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
-scylla = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
     "tls",
@@ -126,6 +118,15 @@ uuid.workspace = true
 zip = "8.3.0"
 tokio-stream.workspace = true
 
+# Align on 0.21 (already pulled in via iceberg) so the binary carries one
+# apache-avro, not two majors. Default features off avoids `xz` (pulls
+# `lzma-sys`, which conflicts with DataFusion's `liblzma`).
+apache-avro = { version = "0.21", optional = true, default-features = false, features = [
+    "bzip",
+    "snappy",
+    "zstandard",
+] }
+
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
@@ -136,13 +137,12 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/
 # upstream `impl SQLExecutor for SqlTable`, which is gated behind
 # `datafusion-table-providers/federation`.
 federation = ["datafusion-table-providers/federation"]
-cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
 databricks = [
     "delta_lake",
     "spark_connect",
     "datafusion-table-providers/federation",
 ]
-debezium = ["dep:rdkafka"]
+debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
 delta_lake = ["dep:delta_kernel"]
 elasticsearch = ["dep:elasticsearch"]
@@ -152,24 +152,20 @@ duckdb = [
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = [
-    "dep:aws-config",
-    "dep:aws-sdk-dynamodb",
-    "dep:aws-sdk-dynamodbstreams",
-    "dep:aws-smithy-async",
-    "dep:dynamodb-streams",
-]
 flightsql = []
-imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
+# Kerberos integrated auth (GSSAPI) for MSSQL on Unix.
+# Opt-in: only links libgssapi_krb5 when explicitly enabled. Windows integrated auth uses SSPI and needs no extra feature.
+# Weak dep so this is a no-op unless `mssql` is also on.
+mssql-kerberos-unix = ["tiberius?/integrated-auth-gssapi"]
 mysql = [
     "dep:mysql_async",
+    "dep:mysql_common",
+    "dep:bitvec",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]
-odbc = ["federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
@@ -177,16 +173,12 @@ postgres = [
     "dep:native-tls",
     "dep:postgres-native-tls",
     "dep:postgres-protocol",
+    "dep:connector-postgres-common",
     "federation",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
-scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
-sharepoint = ["dep:graph-rs-sdk"]
-# Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
-# accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
-sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
 snowflake = [
     "dep:snowflake-api",
     "federation",
@@ -201,8 +193,6 @@ sqlite = [
 ]
 turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
-test_hadoop_catalog_docker = []
-
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
@@ -210,7 +200,6 @@ aws-smithy-types = { workspace = true }
 brotli = "8.0.2"
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-ctor = "0.8.0"
 flate2 = "1.1.5"
 iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
@@ -243,11 +232,6 @@ required-features = ["postgres"]
 
 [[bench]]
 harness = false
-name = "mongodb_change_stream"
-required-features = ["mongodb"]
-
-[[bench]]
-harness = false
 name = "kafka_decode"
 required-features = ["bench", "kafka"]
 
@@ -255,6 +239,11 @@ required-features = ["bench", "kafka"]
 harness = false
 name = "pgoutput_decode"
 required-features = ["postgres"]
+
+[[bench]]
+harness = false
+name = "mysql_binlog_replay"
+required-features = ["mysql"]
 
 [lints]
 workspace = true

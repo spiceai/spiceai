@@ -84,7 +84,6 @@ pub(super) fn snapshot_stream(input: SnapshotInput) -> ChangesStream {
     Box::pin(try_stream! {
         tracing::info!(
             dataset = %dataset_name,
-            table = %format!("{database}.{table}"),
             "mysql replication: starting initial snapshot"
         );
 

@@ -19,14 +19,19 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::{LogicalPlan, LogicalPlanBuilder},
+};
 use futures::future::try_join_all;
-use runtime_datafusion_index::Index;
+use spice_table::{Index, WriteWindow};
 
-use crate::index::{SearchIndex, VectorIndex};
+use crate::index::{SearchIndex, VectorIndex, primary_key_projection};
 
 use super::{
-    CompoundReadMode, Error, compound_on_write_start, compound_required_columns, compound_write,
+    COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
+    CompoundReadMode, Error, compound_delete_by_keys, compound_on_write_complete,
+    compound_on_write_start, compound_required_columns, compound_write,
     fallback::fallback_on_empty_plan, validate_compatibility,
 };
 
@@ -76,6 +81,16 @@ impl CompoundVectorIndex {
             read_mode,
         }
     }
+
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn VectorIndex> {
+        &self.primary
+    }
+
+    #[must_use]
+    pub fn read_mode(&self) -> CompoundReadMode {
+        self.read_mode
+    }
 }
 
 impl VectorIndex for CompoundVectorIndex {
@@ -88,6 +103,31 @@ impl VectorIndex for CompoundVectorIndex {
                 fallback_on_empty_plan(primary, secondary)
             }
         }
+    }
+
+    /// Both halves, unioned — never narrowed by [`Self::read_mode`].
+    ///
+    /// `list_table_provider` answers "what should a read see", and for
+    /// [`CompoundReadMode::PrimaryOnly`] that is the warm primary alone; the primary only holds
+    /// rows the write path has passed through it, so it is not authoritative for what is stored.
+    /// A union rather than a fallback because the two halves can disagree in *either* direction:
+    /// an entry either one holds is an entry a delete still has to resolve, and
+    /// [`Index::delete_by_keys`] already fans out to both.
+    ///
+    /// Each half is projected to the key columns *before* the union. [`validate_compatibility`]
+    /// guarantees the halves agree there on name, type and nullability; it guarantees nothing of
+    /// the rest of their listings, which is why [`fallback_on_empty_plan`] has to cast and
+    /// re-project to reconcile them for reads.
+    fn list_all_entry_keys(&self) -> Result<LogicalPlan, DataFusionError> {
+        let keys = |half: &Arc<dyn VectorIndex>| {
+            LogicalPlanBuilder::from(half.list_all_entry_keys()?)
+                .project(primary_key_projection(&half.primary_fields()))?
+                .build()
+        };
+
+        LogicalPlanBuilder::from(keys(&self.primary)?)
+            .union(keys(&self.secondary)?)?
+            .build()
     }
 
     fn dimension(&self) -> i32 {
@@ -127,8 +167,8 @@ impl Index for CompoundVectorIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref()).await
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref(), window).await
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -142,12 +182,25 @@ impl Index for CompoundVectorIndex {
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        // As with `on_write_failed`: both completion callbacks must run.
-        let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_complete(),
-            self.secondary.on_write_complete()
-        );
-        primary_result.and(secondary_result)
+        compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
+        // index when *both* halves act on one.
+        self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        COMPOUND_WRITE_START_FAILURE_IS_FATAL
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
     }
 
     fn as_any(&self) -> &dyn Any {

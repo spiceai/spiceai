@@ -1,0 +1,21 @@
+[package]
+description = "Runtime component status tracker (readiness, per-component status, and shutdown signalling) for the Spice runtime"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-status"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+datafusion-common = { workspace = true }
+opentelemetry = { workspace = true }
+runtime-api-types = { path = "../runtime-api-types" }
+runtime-metrics = { path = "../runtime-metrics" }
+tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
+
+[lints]
+workspace = true

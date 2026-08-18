@@ -19,10 +19,11 @@ limitations under the License.
 //! Detects the number of vCPUs, GPUs, and available memory on the host machine,
 //! including support for containerized environments (Docker, Kubernetes).
 //!
-//! ## Container Support
+//! ## Cgroup Limits
 //!
-//! For containerized deployments, this module automatically detects and respects
-//! container resource limits from cgroup v1 and v2:
+//! This module detects and respects the cgroup v1/v2 resource limits that bind
+//! the process — in a container, but equally under `systemd-run -p CPUQuota=…`
+//! / `-p MemoryMax=…` or inside any capped slice:
 //!
 //! - **CPU limits**: Reads from cgroup v2 `cpu.max` or cgroup v1 `cpu.cfs_quota_us`
 //! - **Memory limits**: Reads from cgroup v2 `memory.max` or cgroup v1 `memory.limit_in_bytes`
@@ -31,6 +32,9 @@ limitations under the License.
 //!
 //! Cgroup mountpoints are resolved via `/proc/self/mountinfo` with `/sys/fs/cgroup`
 //! as the fallback. The process's cgroup path is read from `/proc/self/cgroup`.
+//! Each limit is read at every level from that path up to the mountpoint root,
+//! and the smallest is taken: the kernel enforces the tightest limit on the
+//! path, so a single-level read reports "unlimited" for a capped process.
 //!
 //! ## GPU Detection
 //!
@@ -136,8 +140,9 @@ impl std::fmt::Display for HardwareInfo {
 
 /// Detects the number of vCPUs available to the process.
 ///
-/// For containers, respects cgroup CPU limits. Falls back to host CPU count
-/// if container limits are not set or cannot be read.
+/// Respects a cgroup CPU limit binding anywhere on the process's cgroup path
+/// (containers, systemd `CPUQuota`, capped slices); falls back to the host CPU
+/// count when no limit binds or none can be read.
 fn detect_vcpu_count() -> usize {
     // First try container CPU limits (cgroup v2, then v1)
     if let Some(container_cpus) = get_container_cpu_limit() {
@@ -165,8 +170,12 @@ fn get_system_cpu_count() -> usize {
     }
 }
 
-/// Attempts to read container CPU limit from cgroup v2 or v1.
-/// Returns None if not in a container or if the limit cannot be read.
+/// The effective cgroup CPU limit for this process, or `None` when no limit
+/// binds anywhere on its cgroup path.
+///
+/// Not just for containers: a process launched under `systemd-run -p
+/// CPUQuota=…`, or inside any slice carrying a quota, is throttled exactly as
+/// hard as a container is.
 ///
 /// The effective CPU count is the minimum of:
 /// - CPU quota limit (from `cpu.max` or `cpu.cfs_quota_us`)
@@ -196,6 +205,12 @@ fn get_cpu_quota_limit() -> Option<usize> {
 
 /// Gets the effective CPU count from cpuset controller.
 /// cpuset can further restrict which CPUs are available beyond quota limits.
+///
+/// Unlike the quota files, cpuset needs no walk up the hierarchy: cgroup v2's
+/// `cpuset.cpus.effective` is computed by the kernel after applying every
+/// ancestor's restriction, and cgroup v1 enforces at write time that a child's
+/// `cpuset.cpus` is a subset of its parent's. Either way the leaf value is
+/// already the effective one.
 fn get_cpuset_effective_count() -> Option<usize> {
     // Try cgroup v2 cpuset.cpus.effective first
     if let Some(count) = get_cgroup_v2_cpuset_effective() {
@@ -271,6 +286,70 @@ fn build_cgroup_file_path(mountpoint: &str, cgroup_path: &str, filename: &str) -
 // =============================================================================
 // Cgroup Path Detection
 // =============================================================================
+
+/// The process's cgroup path and every ancestor above it, leaf first, ending
+/// at the mountpoint root.
+///
+/// Each entry is rooted (`"/a/b"`, `"/a"`, `"/"`) so it can be handed straight
+/// to [`build_cgroup_file_path`]. A process already at the root yields a single
+/// `"/"`, which is also the cgroup-namespaced container case: inside one,
+/// `/proc/self/cgroup` reads `0::/` and the container's limits sit at the
+/// mountpoint root.
+fn cgroup_path_ancestors(cgroup_path: &str) -> Vec<String> {
+    let mut levels = Vec::new();
+    let mut rel = cgroup_path.trim_matches('/').to_string();
+    loop {
+        levels.push(format!("/{rel}"));
+        match rel.rfind('/') {
+            Some(i) => rel.truncate(i),
+            None if !rel.is_empty() => rel.clear(),
+            None => break,
+        }
+    }
+    levels
+}
+
+/// Walks the cgroup hierarchy from the process's own cgroup up to the
+/// mountpoint root, calling `read_level` with the mountpoint and each level's
+/// path, and returns the smallest limit any level reports.
+///
+/// The walk is the point: a limit can be imposed at ANY ancestor — a systemd
+/// slice above the service, a Kubernetes pod cgroup above the container — and
+/// the kernel enforces the smallest one. Reading only the leaf (or only the
+/// root, as the runtime once did) reports "unlimited" for a process that is
+/// one allocation away from an OOM kill, or entitled to a fraction of the
+/// cores it thinks it has.
+///
+/// Levels that report nothing are skipped rather than treated as a limit of
+/// zero, so an unlimited leaf under a capped parent resolves to the parent's
+/// figure.
+fn min_along_cgroup_path<T: Ord>(
+    mountpoint: &str,
+    cgroup_path: &str,
+    read_level: impl Fn(&str, &str) -> Option<T>,
+) -> Option<T> {
+    cgroup_path_ancestors(cgroup_path)
+        .iter()
+        .filter_map(|rel| read_level(mountpoint, rel))
+        .min()
+}
+
+/// The smallest limit `filename` reports along the process's cgroup path.
+///
+/// For controllers whose limit is spread over more than one file — cgroup v1
+/// CPU, whose quota and period are separate — use [`min_along_cgroup_path`]
+/// directly.
+fn min_limit_along_path<T: Ord>(
+    mountpoint: &str,
+    cgroup_path: &str,
+    filename: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Option<T> {
+    min_along_cgroup_path(mountpoint, cgroup_path, |mountpoint, rel| {
+        let path = build_cgroup_file_path(mountpoint, rel, filename);
+        parse(&std::fs::read_to_string(path).ok()?)
+    })
+}
 
 /// Gets the process's cgroup v2 path from `/proc/self/cgroup`.
 /// Returns the path (possibly "/") or None if not on cgroup v2.
@@ -403,15 +482,22 @@ fn parse_mountinfo_cgroup_v1(contents: &str, controller: &str) -> Option<String>
     None
 }
 
-/// Reads CPU limit from cgroup v2.
+/// Reads CPU limit from cgroup v2: the smallest `cpu.max` quota along the
+/// process's cgroup path, leaf to root.
 /// cgroup v2 uses `cpu.max` file with format: `$MAX $PERIOD`
 fn get_cgroup_v2_cpu_limit() -> Option<usize> {
     let cgroup_path = get_process_cgroup_v2_path()?;
     let mountpoint = get_cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    cgroup_v2_cpu_quota_at(&mountpoint, &cgroup_path)
+}
 
-    let path = build_cgroup_file_path(&mountpoint, &cgroup_path, "cpu.max");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_cgroup_v2_cpu_max(&contents)
+/// The smallest `cpu.max` quota along `cgroup_path` under `mountpoint`.
+///
+/// Split from [`get_cgroup_v2_cpu_limit`] so the walk can be driven over a
+/// temporary directory in tests; the only part left out is resolving the two
+/// arguments from `/proc`.
+fn cgroup_v2_cpu_quota_at(mountpoint: &str, cgroup_path: &str) -> Option<usize> {
+    min_limit_along_path(mountpoint, cgroup_path, "cpu.max", parse_cgroup_v2_cpu_max)
 }
 
 /// Parses cgroup v2 cpu.max content.
@@ -441,20 +527,32 @@ fn parse_cgroup_v2_cpu_max(contents: &str) -> Option<usize> {
     Some(cpus.max(1))
 }
 
-/// Reads CPU limit from cgroup v1.
+/// Reads CPU limit from cgroup v1: the smallest quota along the process's
+/// `cpu`-controller path, leaf to root.
 /// cgroup v1 uses separate files for quota and period.
 fn get_cgroup_v1_cpu_limit() -> Option<usize> {
     let cpu_path = get_process_cgroup_v1_path("cpu")?;
     let mountpoint =
         get_cgroup_v1_mountpoint("cpu").unwrap_or_else(|| "/sys/fs/cgroup/cpu".to_string());
+    cgroup_v1_cpu_quota_at(&mountpoint, &cpu_path)
+}
 
-    let quota_path = build_cgroup_file_path(&mountpoint, &cpu_path, "cpu.cfs_quota_us");
-    let period_path = build_cgroup_file_path(&mountpoint, &cpu_path, "cpu.cfs_period_us");
-
-    let quota_str = std::fs::read_to_string(&quota_path).ok()?;
-    let period_str = std::fs::read_to_string(&period_path).ok()?;
-
-    parse_cgroup_v1_cpu_quota(&quota_str, &period_str)
+/// The smallest `cpu.cfs_quota_us` / `cpu.cfs_period_us` ratio along
+/// `cgroup_path` under `mountpoint`.
+///
+/// Split from [`get_cgroup_v1_cpu_limit`] so the walk can be driven over a
+/// temporary directory in tests; the only part left out is resolving the two
+/// arguments from `/proc`.
+fn cgroup_v1_cpu_quota_at(mountpoint: &str, cgroup_path: &str) -> Option<usize> {
+    min_along_cgroup_path(mountpoint, cgroup_path, |mountpoint, rel| {
+        // The period is per-cgroup, so quota and period must be read from the
+        // same level; a quota compared against an ancestor's period is meaningless.
+        let quota_path = build_cgroup_file_path(mountpoint, rel, "cpu.cfs_quota_us");
+        let period_path = build_cgroup_file_path(mountpoint, rel, "cpu.cfs_period_us");
+        let quota_str = std::fs::read_to_string(quota_path).ok()?;
+        let period_str = std::fs::read_to_string(period_path).ok()?;
+        parse_cgroup_v1_cpu_quota(&quota_str, &period_str)
+    })
 }
 
 /// Parses cgroup v1 CPU quota and period.
@@ -483,12 +581,12 @@ fn parse_cgroup_v1_cpu_quota(quota_str: &str, period_str: &str) -> Option<usize>
 
 /// Detects the total memory available in bytes.
 ///
-/// For containerized deployments, returns the container memory limit from cgroup.
-/// For bare-metal deployments, returns the system's total memory.
+/// Returns the effective cgroup memory limit when one binds anywhere on the
+/// process's cgroup path (containers, systemd `MemoryMax`, capped slices);
+/// otherwise the system's total memory.
 fn detect_total_memory() -> u64 {
-    // Prefer container memory limit if available
-    if let Some(container_memory) = get_container_memory_limit() {
-        return container_memory;
+    if let Some(limit) = cgroup_memory_limit() {
+        return limit;
     }
 
     // Fall back to system memory
@@ -502,9 +600,17 @@ fn get_system_total_memory() -> u64 {
     system.total_memory()
 }
 
-/// Attempts to read container memory limit from cgroup v2 or v1.
-/// Returns None if not in a container or if the limit cannot be read.
-fn get_container_memory_limit() -> Option<u64> {
+/// The effective cgroup memory limit for THIS process, or `None` when no
+/// limit binds anywhere on its cgroup path.
+///
+/// Not just for containers: a bare-metal process launched under
+/// `systemd-run -p MemoryMax=…` (or inside any slice with a cap) has exactly
+/// as hard a ceiling as a container does — the OOM killer enforces it either
+/// way. Sizing budgets from host RAM while running under such a cap is how a
+/// 121 GiB host kills a process at 96 GiB (spiceai#12179), so every sizing
+/// decision should go through this, not the host total.
+#[must_use]
+pub fn cgroup_memory_limit() -> Option<u64> {
     // Try cgroup v2 first (newer container runtimes)
     if let Some(limit) = get_cgroup_v2_memory_limit() {
         return Some(limit);
@@ -514,14 +620,17 @@ fn get_container_memory_limit() -> Option<u64> {
     get_cgroup_v1_memory_limit()
 }
 
-/// Reads memory limit from cgroup v2.
+/// Reads memory limit from cgroup v2: the minimum `memory.max` along the
+/// process's cgroup path, leaf to root.
 fn get_cgroup_v2_memory_limit() -> Option<u64> {
     let cgroup_path = get_process_cgroup_v2_path()?;
     let mountpoint = get_cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-
-    let path = build_cgroup_file_path(&mountpoint, &cgroup_path, "memory.max");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_cgroup_v2_memory_max(&contents)
+    min_limit_along_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.max",
+        parse_cgroup_v2_memory_max,
+    )
 }
 
 /// Parses cgroup v2 memory.max content.
@@ -544,15 +653,18 @@ fn parse_cgroup_v2_memory_max(contents: &str) -> Option<u64> {
     Some(limit)
 }
 
-/// Reads memory limit from cgroup v1.
+/// Reads memory limit from cgroup v1: the minimum `memory.limit_in_bytes`
+/// along the process's memory-controller path, leaf to root.
 fn get_cgroup_v1_memory_limit() -> Option<u64> {
     let mem_path = get_process_cgroup_v1_path("memory")?;
     let mountpoint =
         get_cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-
-    let path = build_cgroup_file_path(&mountpoint, &mem_path, "memory.limit_in_bytes");
-    let contents = std::fs::read_to_string(&path).ok()?;
-    parse_cgroup_v1_memory_limit(&contents)
+    min_limit_along_path(
+        &mountpoint,
+        &mem_path,
+        "memory.limit_in_bytes",
+        parse_cgroup_v1_memory_limit,
+    )
 }
 
 /// Parses cgroup v1 memory limit.
@@ -705,6 +817,145 @@ fn detect_metal_gpus() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn walk_takes_the_smallest_limit_on_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        // /a/b is the process's cgroup: leaf says "max", the slice above caps
+        // at 96G, the top level is unlimited. The effective limit is 96G.
+        std::fs::create_dir_all(base.join("a/b")).expect("mkdirs");
+        std::fs::write(base.join("a/b/memory.max"), "max\n").expect("leaf");
+        std::fs::write(base.join("a/memory.max"), "103079215104\n").expect("slice");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/a/b",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(103_079_215_104));
+
+        // A tighter ancestor beats a looser leaf: kernel enforces the min.
+        std::fs::write(base.join("a/b/memory.max"), "203079215104\n").expect("leaf2");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/a/b",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(103_079_215_104));
+    }
+
+    #[test]
+    fn walk_reads_the_mountpoint_root_for_namespaced_containers() {
+        // Inside a cgroup-namespaced container /proc/self/cgroup says "0::/"
+        // and the container's limit sits at the mountpoint root.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("memory.max"), "8589934592\n").expect("root file");
+        let got = min_limit_along_path(
+            &root.path().to_string_lossy(),
+            "/",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, Some(8_589_934_592));
+    }
+
+    #[test]
+    fn walk_reports_none_when_nothing_binds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("x/y")).expect("mkdirs");
+        std::fs::write(base.join("x/y/memory.max"), "max\n").expect("leaf");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/x/y",
+            "memory.max",
+            parse_cgroup_v2_memory_max,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn walk_applies_v1_unlimited_threshold_per_level() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("docker/abc")).expect("mkdirs");
+        // Leaf: v1 "unlimited" sentinel (huge); parent: a real 4G limit.
+        std::fs::write(
+            base.join("docker/abc/memory.limit_in_bytes"),
+            "9223372036854771712\n",
+        )
+        .expect("leaf");
+        std::fs::write(base.join("docker/memory.limit_in_bytes"), "4294967296\n").expect("parent");
+        let got = min_limit_along_path(
+            &base.to_string_lossy(),
+            "/docker/abc",
+            "memory.limit_in_bytes",
+            parse_cgroup_v1_memory_limit,
+        );
+        assert_eq!(got, Some(4_294_967_296));
+    }
+
+    #[test]
+    fn walk_takes_the_smallest_v2_cpu_quota_on_the_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        // The arrangement `systemd-run --slice=capped.slice` produces: the quota
+        // sits on the slice, the service's own cgroup is unlimited. A process in
+        // /capped.slice/svc on a many-core host is entitled to 4 CPUs.
+        std::fs::create_dir_all(base.join("capped.slice/svc")).expect("mkdirs");
+        std::fs::write(base.join("capped.slice/svc/cpu.max"), "max 100000\n").expect("leaf");
+        std::fs::write(base.join("capped.slice/cpu.max"), "400000 100000\n").expect("slice");
+        let got = cgroup_v2_cpu_quota_at(&base.to_string_lossy(), "/capped.slice/svc");
+        assert_eq!(got, Some(4));
+
+        // A tighter ancestor beats a looser leaf: the kernel enforces both, so
+        // the smallest is what the process actually gets.
+        std::fs::write(base.join("capped.slice/svc/cpu.max"), "1600000 100000\n").expect("leaf2");
+        let got = cgroup_v2_cpu_quota_at(&base.to_string_lossy(), "/capped.slice/svc");
+        assert_eq!(got, Some(4));
+    }
+
+    #[test]
+    fn walk_reports_no_v2_cpu_quota_when_nothing_binds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("a/b")).expect("mkdirs");
+        std::fs::write(base.join("a/b/cpu.max"), "max 100000\n").expect("leaf");
+        std::fs::write(base.join("a/cpu.max"), "max 100000\n").expect("parent");
+        let got = cgroup_v2_cpu_quota_at(&base.to_string_lossy(), "/a/b");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn walk_pairs_v1_cpu_quota_with_its_own_level_period() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base = root.path();
+        std::fs::create_dir_all(base.join("kubepods/pod1")).expect("mkdirs");
+        // Leaf: unlimited (-1), and a period that would give a wrong answer if it
+        // were paired with the parent's quota. Parent: 2 CPUs over a 50ms period.
+        std::fs::write(base.join("kubepods/pod1/cpu.cfs_quota_us"), "-1\n").expect("leaf quota");
+        std::fs::write(base.join("kubepods/pod1/cpu.cfs_period_us"), "100000\n")
+            .expect("leaf period");
+        std::fs::write(base.join("kubepods/cpu.cfs_quota_us"), "100000\n").expect("parent quota");
+        std::fs::write(base.join("kubepods/cpu.cfs_period_us"), "50000\n").expect("parent period");
+        let got = cgroup_v1_cpu_quota_at(&base.to_string_lossy(), "/kubepods/pod1");
+        assert_eq!(got, Some(2));
+    }
+
+    #[test]
+    fn ancestors_run_from_the_leaf_to_the_mountpoint_root() {
+        assert_eq!(
+            cgroup_path_ancestors("/a/b/c"),
+            vec!["/a/b/c", "/a/b", "/a", "/"]
+        );
+        // A process already at the root has exactly one level to read.
+        assert_eq!(cgroup_path_ancestors("/"), vec!["/"]);
+        assert_eq!(cgroup_path_ancestors(""), vec!["/"]);
+        // Trailing separators must not produce an empty duplicate level.
+        assert_eq!(cgroup_path_ancestors("/a/"), vec!["/a", "/"]);
+    }
+
     use super::*;
 
     // -------------------------------------------------------------------------

@@ -109,8 +109,9 @@ pub(crate) const CLUSTER_GRPC_RUNTIME_PARAMS: &[&str] = &[
     CLUSTER_GRPC_CONNECT_TIMEOUT_SECONDS_PARAM,
 ];
 
-/// gRPC client tuning for internal cluster communication (the executor's
-/// `poll_work` calls to the scheduler), read from the `cluster_grpc_*` keys in
+/// gRPC client tuning for internal cluster communication — the executor's
+/// `poll_work` calls to the scheduler and the cluster-service channels built by
+/// [`cluster_service_endpoint`] — read from the `cluster_grpc_*` keys in
 /// `runtime.params`. The defaults detect a silently-dropped connection within
 /// (ping interval + ping timeout) so it is torn down and reconnected well under
 /// `executor_timeout`. Without this, a stale connection hangs each `poll_work`
@@ -336,6 +337,7 @@ fn spawn_scheduler_poll_loop(
                         tcp_keepalive_seconds: grpc_client.tcp_keep_alive_seconds,
                         http2_keepalive_interval_seconds: grpc_client
                             .http2_keep_alive_interval_seconds,
+                        ..Default::default()
                     };
                     let scheduler_endpoint =
                         match create_grpc_client_endpoint(endpoint_url.clone(), Some(&grpc_config))
@@ -471,9 +473,12 @@ fn spawn_scheduler_poll_loop(
 async fn fetch_scheduler_membership(
     scheduler_url: &Url,
     client_tls_config: Option<ClientTlsConfig>,
+    grpc_client: &ClusterGrpcClientConfig,
 ) -> Option<Vec<String>> {
     let mut cluster_client =
-        match create_cluster_service_client(scheduler_url, client_tls_config.clone()).await {
+        match create_cluster_service_client(scheduler_url, client_tls_config.clone(), grpc_client)
+            .await
+        {
             Ok(client) => client,
             Err(err) => {
                 tracing::warn!("Failed to create scheduler membership client: {err}");
@@ -1314,8 +1319,15 @@ pub async fn initialize_cluster_executor(
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
-    let mut cluster_client =
-        create_cluster_service_client(scheduler_url, client_tls_config.clone()).await?;
+    //
+    // The app definition this client fetches is what carries the `cluster_grpc_*`
+    // params, so this one channel necessarily uses the defaults.
+    let mut cluster_client = create_cluster_service_client(
+        scheduler_url,
+        client_tls_config.clone(),
+        &ClusterGrpcClientConfig::default(),
+    )
+    .await?;
 
     let initial_scheduler_addresses =
         match cluster_client.get_schedulers(GetSchedulersRequest {}).await {
@@ -1464,16 +1476,11 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    let Some(concurrent_tasks) = std::thread::available_parallelism()
-        .ok()
-        .and_then(|nz| u32::try_from(nz.get()).ok())
-    else {
-        return Err(FailedToStartClusterExecutor {
-            source: "Unable to determine executor task parallelism."
-                .to_string()
-                .into(),
-        });
-    };
+    // The CPU budget is always at least one core, so this only saturates on a
+    // machine with more than 4 billion of them.
+    let concurrent_tasks =
+        u32::try_from(cpu_budget::cpu_budget().cluster_executor_concurrent_tasks())
+            .unwrap_or(u32::MAX);
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -1487,6 +1494,7 @@ pub async fn initialize_cluster_executor(
                 resource: Some(Resource::TaskSlots(concurrent_tasks)),
             }],
         }),
+        os_info: None,
     };
 
     // Use advertise address as node_id for metrics
@@ -1695,6 +1703,7 @@ pub async fn initialize_cluster_executor(
                     if let Some(addresses) = fetch_scheduler_membership(
                         &scheduler_url_for_manager,
                         client_tls_config_for_manager.clone(),
+                        &scheduler_grpc_client_for_manager,
                     )
                     .await
                     {
@@ -1985,7 +1994,7 @@ async fn create_scheduler_server(
 
                     Some(TaskCancelInfo {
                         task_id,
-                        job_id: task.job_id,
+                        job_id: task.job_id.to_string(),
                         stage_id,
                         partition_id,
                     })
@@ -2258,19 +2267,49 @@ async fn create_scheduler_server(
     Ok((scheduler, executor_stream_registry))
 }
 
+/// Builds the endpoint for the scheduler's internal cluster service.
+///
+/// The keepalive settings are what let a channel built here survive an idle
+/// period. The secret-expansion channel is created once at executor bring-up and
+/// then sits idle between secret resolutions, so without HTTP/2 pings a load
+/// balancer reaps the connection silently and the reset only surfaces when the
+/// next `ExpandSecret` is written — failing that lookup. Pinging while idle keeps
+/// the connection from being reaped in the first place. The poll, control-stream
+/// and metrics channels get the same treatment from
+/// [`create_grpc_client_endpoint`].
+fn cluster_service_endpoint(
+    endpoint_url: String,
+    grpc_client: &ClusterGrpcClientConfig,
+) -> std::result::Result<Endpoint, tonic::transport::Error> {
+    let endpoint = Endpoint::from_shared(endpoint_url)?;
+    Ok(endpoint
+        // Bound connect so a unreachable/misconfigured scheduler fails the
+        // executor startup future instead of hanging until the harness ready
+        // timeout (OS TCP timeouts can exceed several minutes). The scheduler
+        // poll loop bounds its own connect from the same setting, so the two
+        // paths to the same scheduler agree.
+        .connect_timeout(Duration::from_secs(grpc_client.connect_timeout_seconds))
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(
+            grpc_client.tcp_keep_alive_seconds,
+        )))
+        .http2_keep_alive_interval(Duration::from_secs(
+            grpc_client.http2_keep_alive_interval_seconds,
+        ))
+        .keep_alive_timeout(Duration::from_secs(grpc_client.keep_alive_timeout_seconds))
+        .keep_alive_while_idle(true))
+}
+
 /// Creates a gRPC client for the scheduler's internal cluster service.
 async fn create_cluster_service_client(
     scheduler_url: &Url,
     client_tls_config: Option<ClientTlsConfig>,
+    grpc_client: &ClusterGrpcClientConfig,
 ) -> crate::Result<ClusterServiceClient<Channel>> {
     let endpoint_url = scheduler_url.to_string();
-    let mut endpoint = Endpoint::from_shared(endpoint_url.clone())
+    let mut endpoint = cluster_service_endpoint(endpoint_url.clone(), grpc_client)
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
-    // Bound connect so a unreachable/misconfigured scheduler fails the
-    // executor startup future instead of hanging until the harness ready
-    // timeout (OS TCP timeouts can exceed several minutes).
-    endpoint = endpoint.connect_timeout(Duration::from_secs(30));
     if let Some(tls_config) = client_tls_config {
         endpoint = endpoint
             .tls_config(tls_config)
@@ -2348,11 +2387,14 @@ async fn executor_bind_app(
         });
     };
 
+    let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
     *rt.app.write().await = Some(app_def);
 
-    // Create a cluster client for secrets
+    // Create a cluster client for secrets. This channel outlives every secret
+    // resolution on the executor, so it is the one that most needs the keepalive
+    // settings the app's `cluster_grpc_*` params carry.
     let secrets_cluster_client =
-        create_cluster_service_client(scheduler_url, client_tls_config).await?;
+        create_cluster_service_client(scheduler_url, client_tls_config, &grpc_client).await?;
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
@@ -2579,6 +2621,123 @@ mod tests {
         assert_eq!(
             config.connect_timeout_seconds,
             defaults.connect_timeout_seconds
+        );
+    }
+
+    /// HTTP/2 frame header length and the frame type/flag codes from RFC 9113 §4.1, §6.
+    const H2_FRAME_HEADER_LEN: usize = 9;
+    const H2_FRAME_TYPE_SETTINGS: u8 = 0x4;
+    const H2_FRAME_TYPE_PING: u8 = 0x6;
+    const H2_FLAG_ACK: u8 = 0x1;
+
+    /// Serves one HTTP/2 connection far enough to complete the preface, then reports
+    /// whether the client sends a (non-ACK) PING within `window` while no request is
+    /// in flight — i.e. whether the endpoint keeps an idle connection alive.
+    async fn client_pings_while_idle(
+        build_endpoint: impl FnOnce(String) -> super::Endpoint,
+        window: std::time::Duration,
+    ) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("read the listener address");
+
+        let (ping_tx, ping_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept the connection");
+
+            // Consume the client connection preface and answer with our own SETTINGS
+            // so the HTTP/2 handshake completes and the client goes idle.
+            let mut preface = [0u8; 24];
+            socket
+                .read_exact(&mut preface)
+                .await
+                .expect("read the client preface");
+            socket
+                .write_all(&[0, 0, 0, H2_FRAME_TYPE_SETTINGS, 0, 0, 0, 0, 0])
+                .await
+                .expect("write the server SETTINGS");
+
+            let mut ping_tx = Some(ping_tx);
+            let mut header = [0u8; H2_FRAME_HEADER_LEN];
+            while socket.read_exact(&mut header).await.is_ok() {
+                let length =
+                    usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]]))
+                        .expect("frame length fits in usize");
+                let (frame_type, flags) = (header[3], header[4]);
+                let mut payload = vec![0u8; length];
+                if socket.read_exact(&mut payload).await.is_err() {
+                    break;
+                }
+
+                match frame_type {
+                    H2_FRAME_TYPE_SETTINGS if (flags & H2_FLAG_ACK) == 0 => {
+                        socket
+                            .write_all(&[0, 0, 0, H2_FRAME_TYPE_SETTINGS, H2_FLAG_ACK, 0, 0, 0, 0])
+                            .await
+                            .expect("write the SETTINGS ack");
+                    }
+                    H2_FRAME_TYPE_PING if (flags & H2_FLAG_ACK) == 0 => {
+                        // Ack it so the client's keepalive timeout never fires and tears
+                        // the connection down mid-test.
+                        let mut ack = vec![0, 0, 8, H2_FRAME_TYPE_PING, H2_FLAG_ACK, 0, 0, 0, 0];
+                        ack.extend_from_slice(&payload);
+                        socket.write_all(&ack).await.expect("write the PING ack");
+                        if let Some(tx) = ping_tx.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let endpoint = build_endpoint(format!("http://{addr}"));
+        // Hold the channel open for the whole window: a dropped channel stops pinging.
+        let _channel = endpoint
+            .connect()
+            .await
+            .expect("connect to the test HTTP/2 server");
+        let observed = tokio::time::timeout(window, ping_rx).await.is_ok();
+        server.abort();
+        observed
+    }
+
+    /// Regression test for #12301: the executor holds this channel for its whole
+    /// lifetime and it is idle between secret resolutions, so without keepalive an
+    /// idle-timeout load balancer reaps it and the next `ExpandSecret` fails.
+    #[tokio::test]
+    async fn cluster_service_endpoint_pings_an_idle_connection() {
+        let grpc_client = super::ClusterGrpcClientConfig {
+            http2_keep_alive_interval_seconds: 1,
+            ..super::ClusterGrpcClientConfig::default()
+        };
+
+        assert!(
+            client_pings_while_idle(
+                |url| super::cluster_service_endpoint(url, &grpc_client)
+                    .expect("build the cluster service endpoint"),
+                std::time::Duration::from_secs(15),
+            )
+            .await,
+            "the cluster service channel must ping while idle"
+        );
+    }
+
+    /// Control for [`cluster_service_endpoint_pings_an_idle_connection`]: an endpoint
+    /// without the keepalive settings observes no ping, so that test is measuring the
+    /// settings rather than something the harness produces on its own.
+    #[tokio::test]
+    async fn a_bare_endpoint_does_not_ping_an_idle_connection() {
+        assert!(
+            !client_pings_while_idle(
+                |url| super::Endpoint::from_shared(url).expect("parse the endpoint"),
+                std::time::Duration::from_secs(4),
+            )
+            .await,
+            "a bare endpoint must not ping while idle"
         );
     }
 

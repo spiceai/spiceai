@@ -101,12 +101,25 @@ pub async fn download_release_asset(
         format_size(asset.size)
     );
 
-    // Download with progress
+    let data = download_reporting_progress(client, asset, "Downloading").await?;
+
+    // Extract tar.gz
+    extract_tar_gz(&data, download_dir)?;
+
+    Ok(())
+}
+
+/// Download an asset, reporting progress on stderr under `label`.
+async fn download_reporting_progress(
+    client: &GitHubClient,
+    asset: &ReleaseAsset,
+    label: &str,
+) -> Result<Vec<u8>, GitHubError> {
     let total_size = asset.size;
     let start_time = std::time::Instant::now();
 
     let data = client
-        .download_with_progress(&asset.browser_download_url, |downloaded, _| {
+        .download_asset(asset, |downloaded| {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = if elapsed > 0.0 {
                 downloaded as f64 / elapsed / 1024.0 / 1024.0
@@ -116,7 +129,7 @@ pub async fn download_release_asset(
             let percent = (downloaded as f64 / total_size as f64) * 100.0;
 
             eprint!(
-                "\rDownloading: {:.1}% ({}/{}) @ {:.1} MB/s",
+                "\r{label}: {:.1}% ({}/{}) @ {:.1} MB/s",
                 percent,
                 format_size(downloaded),
                 format_size(total_size),
@@ -127,10 +140,7 @@ pub async fn download_release_asset(
 
     eprintln!(); // New line after progress
 
-    // Extract tar.gz
-    extract_tar_gz(&data, download_dir)?;
-
-    Ok(())
+    Ok(data)
 }
 
 /// Download a release asset with fallback to alternative asset names.
@@ -183,31 +193,7 @@ pub async fn upgrade_cli_in_place(
         format_size(asset.size)
     );
 
-    // Download with progress
-    let total_size = asset.size;
-    let start_time = std::time::Instant::now();
-
-    let data = client
-        .download_with_progress(&asset.browser_download_url, |downloaded, _| {
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                downloaded as f64 / elapsed / 1024.0 / 1024.0
-            } else {
-                0.0
-            };
-            let percent = (downloaded as f64 / total_size as f64) * 100.0;
-
-            eprint!(
-                "\rDownloading CLI: {:.1}% ({}/{}) @ {:.1} MB/s",
-                percent,
-                format_size(downloaded),
-                format_size(total_size),
-                speed
-            );
-        })
-        .await?;
-
-    eprintln!(); // New line after progress
+    let data = download_reporting_progress(client, asset, "Downloading CLI").await?;
 
     // Get the current executable path
     let current_exe = std::env::current_exe().map_err(|e| GitHubError::Io {
@@ -532,6 +518,170 @@ fn get_cuda_version() -> Option<String> {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use wiremock::matchers::{method, path as path_matcher};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ASSET_NAME: &str = "spiced_linux_x86_64.tar.gz";
+
+    /// Build a gzipped tar holding a single entry, as a release asset would.
+    fn tar_gz_containing(entry_name: &str, contents: &[u8]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o755);
+        builder
+            .append_data(&mut header, entry_name, contents)
+            .expect("tar entry is appended");
+
+        builder
+            .into_inner()
+            .expect("tar builder is finished")
+            .finish()
+            .expect("gzip stream is finished")
+    }
+
+    /// A release advertising one asset of `size` bytes, served by `server_uri`.
+    fn release_advertising(server_uri: &str, size: u64) -> RepoRelease {
+        RepoRelease {
+            url: String::new(),
+            html_url: String::new(),
+            assets_url: String::new(),
+            tag_name: "v1.0.0".to_string(),
+            name: None,
+            draft: false,
+            prerelease: false,
+            created_at: String::new(),
+            published_at: None,
+            assets: vec![ReleaseAsset {
+                url: String::new(),
+                id: 1,
+                name: ASSET_NAME.to_string(),
+                content_type: "application/gzip".to_string(),
+                size,
+                download_count: 0,
+                browser_download_url: format!("{server_uri}/{ASSET_NAME}"),
+            }],
+        }
+    }
+
+    /// Serve `body` for the asset, and download it into a fresh directory.
+    async fn download_body(
+        body: Vec<u8>,
+        advertised_size: u64,
+    ) -> (Result<(), GitHubError>, tempfile::TempDir) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/{ASSET_NAME}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let release = release_advertising(&server.uri(), advertised_size);
+        let dest = tempfile::tempdir().expect("temp dir is created");
+        let client = GitHubClient::new("spiceai", "spiceai");
+
+        let result = download_release_asset(&client, &release, ASSET_NAME, dest.path()).await;
+        (result, dest)
+    }
+
+    /// Regression test for #12120.
+    ///
+    /// Unchecked, a truncated body went straight to the gzip decoder and surfaced as whatever
+    /// the decoder made of the fragment that arrived (`Failed to extract archive: invalid
+    /// gzip header`, `… failed to iterate over archive`) — blaming the archive for a network
+    /// failure. Note that the mock serves a `Content-Length` consistent with the short body,
+    /// as a truncating proxy would, so only the published asset size reveals the mismatch.
+    #[tokio::test]
+    async fn a_body_shorter_than_the_release_advertises_is_reported_as_a_failed_download() {
+        let archive = tar_gz_containing("spiced", b"payload");
+        let advertised_size = archive.len() as u64;
+
+        // Empty, a first chunk, midway, and one byte short — the last of these is what makes
+        // the check exact rather than a plausibility test.
+        for received_bytes in [0, 1, archive.len() / 2, archive.len() - 1] {
+            let (result, dest) =
+                download_body(archive[..received_bytes].to_vec(), advertised_size).await;
+
+            let Err(error) = result else {
+                panic!("a download of {received_bytes} bytes must not be reported as a success");
+            };
+            assert!(
+                matches!(error, GitHubError::IncompleteDownload { .. }),
+                "expected an incomplete download of {received_bytes} bytes, got: {error}"
+            );
+
+            let message = error.to_string();
+            assert!(message.contains(ASSET_NAME), "asset not named: {message}");
+            assert!(
+                message.contains(&advertised_size.to_string())
+                    && message.contains(&received_bytes.to_string()),
+                "both sizes must be reported: {message}"
+            );
+            assert!(
+                !message.contains("extract") && !message.contains("archive"),
+                "a failed transfer must not be blamed on the archive: {message}"
+            );
+            assert!(
+                std::fs::read_dir(dest.path())
+                    .expect("destination is readable")
+                    .next()
+                    .is_none(),
+                "a failed download must not leave anything extracted"
+            );
+        }
+    }
+
+    /// A body longer than the release advertises is just as wrong as a short one — it is not
+    /// the asset that was published, whatever it decodes to.
+    #[tokio::test]
+    async fn a_body_longer_than_the_release_advertises_is_rejected() {
+        let archive = tar_gz_containing("spiced", b"payload");
+        let advertised_size = archive.len() as u64;
+        let mut with_trailing_bytes = archive;
+        with_trailing_bytes.extend_from_slice(b"unexpected trailer");
+
+        let (result, _dest) = download_body(with_trailing_bytes, advertised_size).await;
+
+        assert!(
+            matches!(result, Err(GitHubError::IncompleteDownload { .. })),
+            "an over-long body must be rejected"
+        );
+    }
+
+    /// The guard must not stand between a good download and its extraction: a body matching
+    /// the advertised size installs exactly as it did before.
+    #[tokio::test]
+    async fn a_complete_asset_is_downloaded_and_extracted() {
+        let archive = tar_gz_containing("spiced", b"runtime binary");
+        let advertised_size = archive.len() as u64;
+
+        let (result, dest) = download_body(archive, advertised_size).await;
+
+        result.expect("a complete download extracts");
+        let extracted = std::fs::read(dest.path().join("spiced")).expect("spiced is extracted");
+        assert_eq!(extracted, b"runtime binary");
+    }
+
+    /// The length check is not a stand-in for decoding: a body of the right length that is
+    /// still not an archive keeps reporting the extraction failure, so a genuinely corrupt
+    /// asset is not relabelled as a network problem.
+    #[tokio::test]
+    async fn a_complete_body_that_is_not_an_archive_still_reports_extraction() {
+        let not_an_archive = b"<html>this is not a tarball</html>".to_vec();
+        let advertised_size = not_an_archive.len() as u64;
+
+        let (result, _dest) = download_body(not_an_archive, advertised_size).await;
+
+        let Err(error) = result else {
+            panic!("a body that is not an archive must not be reported as a success");
+        };
+        assert!(
+            matches!(error, GitHubError::Io { .. }),
+            "expected an extraction failure, got: {error}"
+        );
+    }
 
     impl Arch {
         fn x86() -> Arch {

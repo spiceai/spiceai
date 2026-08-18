@@ -131,13 +131,10 @@ impl ManagedTokioRuntimeBuilder {
     ///
     /// Returns [`Error::RuntimeCreation`] if the Tokio runtime cannot be constructed.
     pub fn build(self) -> Result<ManagedTokioRuntime> {
-        let cpu_cores = num_cpus::get();
-        let worker_threads = std::cmp::max(cpu_cores.saturating_sub(1), 1);
-
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder
             // Reserve one core for the primary Tokio runtime handling HTTP and control-plane work.
-            .worker_threads(worker_threads)
+            .worker_threads(cpu_budget::cpu_budget().dedicated_runtime_worker_threads())
             .enable_all();
 
         if let Some(name) = &self.thread_name {
@@ -192,6 +189,39 @@ where
         Ok(result) => Ok(result),
         Err(_) => Err(Error::TaskExecution),
     }
+}
+
+/// True when a failure is the runtime shutting down under a task on the
+/// blocking pool, rather than the operation itself failing.
+///
+/// A sidecar helper that runs on the blocking pool surfaces a shutdown as a
+/// cancelled [`tokio::task::JoinError`] wrapped in [`Error::External`], which
+/// callers see only as an opaque `"Acceleration error: task ... was cancelled"` —
+/// hence classifying by type rather than by message. The task never started, so
+/// there is nothing to retry and nothing an operator can act on; a caller that
+/// reports its failures at `warn` should report this one below the default level.
+///
+/// Prefer this over the `RuntimeStatus::is_shutdown()` guard the refresh task uses
+/// for the same purpose: `is_shutdown()` is only *coincidental* — every failure that
+/// races a shutdown gets quietened, including real ones — whereas the `JoinError`
+/// is a *causal* statement that this specific work did not run.
+///
+/// The condition it reads is "the task was cancelled", and the shutdown reading
+/// holds because a `spawn_blocking` task is cancelled only when the runtime is
+/// dropped with the task still queued; nothing here calls `JoinHandle::abort`. A
+/// caller that starts aborting sidecar tasks (a per-operation timeout, say) has to
+/// revisit that.
+///
+/// The whole source chain is walked, so it holds however deeply the caller has
+/// boxed or wrapped the error. A *panicked* task is deliberately not matched: that
+/// is a bug and must stay loud.
+#[must_use]
+pub fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| std::error::Error::source(*error)).any(|error| {
+        error
+            .downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(tokio::task::JoinError::is_cancelled)
+    })
 }
 
 #[cfg(test)]

@@ -178,10 +178,10 @@ Tests silently skip when the required env vars are not set.
 
 ## Architectural notes
 
-- The object-store-backed path lives in `data_components::sharepoint::object_store`.
-- URL parsing (drive target + in-drive path) is in `data_components::sharepoint::url`.
-- Auth flows are in `data_components::sharepoint::auth` (OAuth/OIDC) and
-  `data_components::sharepoint::auth::saml` (SAML bearer grant).
+- The object-store-backed path lives in `connector_sharepoint::sharepoint::object_store`.
+- URL parsing (drive target + in-drive path) is in `connector_sharepoint::sharepoint::url`.
+- Auth flows are in `connector_sharepoint::sharepoint::auth` (OAuth/OIDC) and
+  `connector_sharepoint::sharepoint::auth::saml` (SAML bearer grant).
 - The `Sharepoint` top-level connector dispatches reads/writes between the
   object-store path and the legacy `SharepointTableProvider` by `from:` URL syntax.
 - Store registration happens in `Sharepoint::register_object_stores`, which

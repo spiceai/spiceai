@@ -20,7 +20,14 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::catalogconnector::postgres_accelerated::{
+    AcceleratedCatalogProvider, NoEligibleTablesError, SlotInUseError,
+};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::postgres::provider::PostgresCatalogProvider;
@@ -120,24 +127,48 @@ impl CatalogConnector for PostgresCatalog {
             .with_unsupported_type_action(unsupported_type_action);
 
         let pool = Arc::new(pool);
-        let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
 
-        let catalog_provider = Arc::new(PostgresCatalogProvider::new(
-            catalog.name.clone(),
-            pool,
-            table_factory,
-            catalog.include.clone(),
-        ));
+        let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
+            if let Some(acceleration) = catalog.acceleration.as_ref() {
+                Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
+            } else {
+                let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
+                Arc::new(PostgresCatalogProvider::new(
+                    catalog.name.clone(),
+                    pool,
+                    table_factory,
+                    table_selector(catalog),
+                ))
+            };
 
-        catalog_provider
-            .refresh()
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component,
-                source: e,
-            })?;
+        catalog_provider.refresh().await.map_err(|e| {
+            // Two classes of permanent (non-retryable) configuration problem,
+            // surfaced as a terminal ERROR status instead of retried forever:
+            //   - zero eligible tables: this is the *initial* refresh, so failing
+            //     it means the catalog never registers and never gets a periodic
+            //     refresh -- fixing the source/filters then requires a restart, so
+            //     surface it loudly rather than starting an empty catalog; and
+            //   - the catalog's replication slot already actively held by another
+            //     live consumer after the bounded wait (running two instances
+            //     against one catalog is a misconfiguration, not a transient).
+            if e.downcast_ref::<NoEligibleTablesError>().is_some()
+                || e.downcast_ref::<SlotInUseError>().is_some()
+            {
+                super::Error::InvalidConfiguration {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    message: e.to_string(),
+                    source: e,
+                }
+            } else {
+                super::Error::UnableToGetCatalogProvider {
+                    connector: PREFIX.to_string(),
+                    connector_component: connector_component.clone(),
+                    source: e,
+                }
+            }
+        })?;
 
-        Ok(catalog_provider as Arc<dyn RefreshableCatalogProvider>)
+        Ok(catalog_provider)
     }
 }

@@ -313,7 +313,11 @@ impl SearchQueryProvider {
             .alias("search_index")?
             .join(
                 self.underlying_table_scan(projection_column_names, filters, &search_index_schema)?,
-                JoinType::Left,
+                // The base table decides which rows exist, so a hit whose primary key is
+                // not there is a stale index entry rather than a result. An outer join
+                // would emit it with the base-table columns NULL-padded and a real
+                // `_score`, turning index staleness into a row the dataset does not have.
+                JoinType::Inner,
                 self.primary_key
                     .iter()
                     .map(|pk| {
@@ -370,13 +374,15 @@ impl SearchQueryProvider {
         &self,
         projection: Option<&Vec<usize>>,
         input: LogicalPlanBuilder,
+        match_required_by_filter: bool,
     ) -> Result<LogicalPlanBuilder, DataFusionError> {
         let search_col = self.search_column.as_str();
         let search_offset = ChunkedSearchIndex::chunking_offset_col(search_col);
         // If projection doesn't include/need the 'match' column, early exit.
         // Or if its not a chunked search query (doesn't have offsets in schema).
-        let match_not_required = projection
-            .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
+        let match_not_required = !match_required_by_filter
+            && projection
+                .is_some_and(|proj| self.match_column_index().is_none_or(|i| !proj.contains(&i)));
         let chunked_search_field = self
             .schema()
             .column_with_name(search_offset.as_str())
@@ -407,7 +413,7 @@ impl SearchQueryProvider {
                 //  'Utf8') as '_match'
                 cast(
                     substring(
-                        col(search_col),
+                        ident(search_col),
                         binary_expr(first.clone(), Operator::Plus, lit(1)),
                         binary_expr(second, Operator::Minus, first),
                     ),
@@ -525,8 +531,19 @@ impl TableProvider for SearchQueryProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        // Like `ViewTable`, a filter is added on `scan` when needed
-        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        // `_match` is synthesized after the search index and base table are joined, so it
+        // cannot be applied by either input scan. Keep its predicate above this provider.
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if expr_references_match_column(filter) {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    // Like `ViewTable`, a filter is added on `scan` when needed.
+                    TableProviderFilterPushDown::Exact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -539,6 +556,14 @@ impl TableProvider for SearchQueryProvider {
         if let Some(ref callback) = self.scan_callback {
             callback().await;
         }
+
+        // `_match` is synthesized below, after the search index and base table are joined.
+        // Do not pass predicates that reference it to either input plan.
+        let (match_filters, input_filters): (Vec<Expr>, Vec<Expr>) = filters
+            .iter()
+            .cloned()
+            .partition(expr_references_match_column);
+        let match_required_by_filter = !match_filters.is_empty();
 
         // Final schema to match requested projection
         let schema_proj: SchemaRef = match projection {
@@ -557,7 +582,7 @@ impl TableProvider for SearchQueryProvider {
             let Some(match_idx) = self.match_column_index() else {
                 return proj;
             };
-            if !proj.contains(&match_idx) {
+            if !match_required_by_filter && !proj.contains(&match_idx) {
                 return proj;
             }
             let mut proj2 = proj;
@@ -583,9 +608,12 @@ impl TableProvider for SearchQueryProvider {
         let just_use_index = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
-            filters,
+            &input_filters,
         )?;
-        let search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
+        let mut search_lp = match (
+            just_use_index,
+            input_filters.iter().cloned().reduce(Expr::and),
+        ) {
             (true, None) => search_base.limit(0, self.pre_limit)?.limit(0, limit)?,
             (true, Some(filter)) => search_base
                 .filter(filter)?
@@ -595,7 +623,7 @@ impl TableProvider for SearchQueryProvider {
                 // Add supported filters BEFORE the pre_limit so they can be pushed down
                 // into the search index scan by DataFusion's PushDownFilter optimizer.
                 let search_index = if let Some(filter) =
-                    exprs_supported(filters, search_base.schema())
+                    exprs_supported(&input_filters, search_base.schema())
                         .iter()
                         .cloned()
                         .reduce(Expr::and)
@@ -605,10 +633,17 @@ impl TableProvider for SearchQueryProvider {
                     search_base.limit(0, self.pre_limit)?
                 };
 
-                self.join_with_base(inner_proj.as_ref(), search_index, filters)?
+                self.join_with_base(inner_proj.as_ref(), search_index, &input_filters)?
             }
+        };
+
+        search_lp =
+            self.add_match_column(inner_proj.as_ref(), search_lp, match_required_by_filter)?;
+        if let Some(filter) = match_filters.into_iter().reduce(Expr::and) {
+            search_lp = search_lp.filter(filter)?;
         }
-        .sort_with_limit(
+
+        let search_lp = search_lp.sort_with_limit(
             {
                 let mut sort_exprs = vec![SortExpr::new(
                     Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
@@ -628,8 +663,7 @@ impl TableProvider for SearchQueryProvider {
         )?;
 
         // Add final
-        let final_plan = self
-            .add_match_column(inner_proj.as_ref(), search_lp)?
+        let final_plan = search_lp
             .project(
                 schema_proj
                     .fields()
@@ -671,6 +705,12 @@ fn columns_missing_from(expr: &[Expr], schema: &DFSchemaRef) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn expr_references_match_column(expr: &Expr) -> bool {
+    expr.column_refs()
+        .iter()
+        .any(|column| column.name() == SEARCH_MATCH_COLUMN_NAME)
+}
+
 // Returns all expr in exprs that are supported by the `schema`.
 fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
     let schema_cols = schema
@@ -690,4 +730,217 @@ fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
         })
         .cloned()
         .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        Array, FixedSizeListArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    };
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+
+    /// Base table: the source of truth. `extra` is deliberately absent from the
+    /// search index so a `SELECT *` cannot be served by the index alone and the
+    /// join under test is actually planned.
+    fn base_table() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["dog elephant", "cat"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    /// A search index holding one entry per `(id, score)` pair. An `id` absent
+    /// from [`base_table`] stands in for an entry the source row no longer backs.
+    fn search_index_plan(hits: &[(i64, f64)]) -> Result<Arc<LogicalPlan>, DataFusionError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec!["dog elephant"; hits.len()])),
+                Arc::new(Float64Array::from(
+                    hits.iter().map(|(_, score)| *score).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+        let index: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                "search_index_source",
+                Arc::new(DefaultTableSource::new(index)),
+                None,
+            )?
+            .build()?,
+        ))
+    }
+
+    fn chunked_search_index_plan() -> Result<Arc<LogicalPlan>, DataFusionError> {
+        let offset_field = Arc::new(Field::new("item", DataType::Int32, false));
+        let offset_column = ChunkedSearchIndex::chunking_offset_col("content");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, true),
+            Field::new(
+                offset_column,
+                DataType::FixedSizeList(Arc::clone(&offset_field), 2),
+                false,
+            ),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, true),
+        ]));
+        let offsets = FixedSizeListArray::try_new(
+            offset_field,
+            2,
+            Arc::new(Int32Array::from(vec![0, 3])),
+            None,
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["dog elephant"])),
+                Arc::new(offsets),
+                Arc::new(Float64Array::from(vec![0.5])),
+            ],
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let index: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+
+        Ok(Arc::new(
+            LogicalPlanBuilder::scan(
+                "chunked_search_index_source",
+                Arc::new(DefaultTableSource::new(index)),
+                None,
+            )?
+            .build()?,
+        ))
+    }
+
+    /// `SELECT id, extra` over a search of [`base_table`] whose index holds `hits`.
+    async fn search_ids_and_extra(
+        hits: &[(i64, f64)],
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let provider = SearchQueryProvider::new(
+            search_index_plan(hits)?,
+            base_table()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            None,
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("searched", Arc::new(provider))?;
+        ctx.sql("SELECT id, extra FROM searched ORDER BY id")
+            .await?
+            .collect()
+            .await
+    }
+
+    fn ids(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column is Int64");
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Regression test for #12089: an unfiltered search must not surface an index
+    /// entry whose primary key is absent from the base table. Under an outer join
+    /// the stale `id = 999` entry came back with `extra` NULL and a real `_score` —
+    /// a row the dataset does not contain — and because it scored highest it was
+    /// the first result a top-k search would spend a slot on.
+    #[tokio::test]
+    async fn a_hit_with_no_base_row_is_dropped() -> Result<(), DataFusionError> {
+        let batches = search_ids_and_extra(&[(1, 0.5), (999, 0.98)]).await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1],
+            "only the hit backed by a base-table row should be returned"
+        );
+
+        // The surviving row must carry real base-table values, not NULL padding.
+        let extra = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("extra column is Utf8");
+        assert!(
+            !extra.is_null(0),
+            "base-table columns must be populated for a live hit"
+        );
+        assert_eq!(extra.value(0), "a");
+
+        Ok(())
+    }
+
+    /// The join must not drop live hits: every base row the index knows about is
+    /// still returned, so the fix cannot pass by filtering too aggressively.
+    #[tokio::test]
+    async fn every_hit_backed_by_a_base_row_survives() -> Result<(), DataFusionError> {
+        let batches = search_ids_and_extra(&[(1, 0.5), (2, 0.25)]).await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1, 2],
+            "both live hits should be returned"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for #12233: `_match` exists only after the provider joins
+    /// chunked search results with the base table, so its predicate must not be
+    /// planned against the base-table scan.
+    #[tokio::test]
+    async fn match_filter_is_applied_after_match_column_is_synthesized()
+    -> Result<(), DataFusionError> {
+        let provider = SearchQueryProvider::new(
+            chunked_search_index_plan()?,
+            base_table()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            None,
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("searched", Arc::new(provider))?;
+
+        let batches = ctx
+            .sql("SELECT id, extra FROM searched WHERE _match LIKE '%dog%'")
+            .await?
+            .collect()
+            .await?;
+
+        assert_eq!(ids(&batches), vec![1]);
+        Ok(())
+    }
 }

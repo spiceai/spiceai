@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Larger async fns (start_runtime) overflow the default type-layout query depth
+// Larger async fns (`spiced::run`) overflow the default type-layout query depth
 // under the full feature set; raise the recursion limit for layout computation.
 #![recursion_limit = "256"]
 
@@ -69,37 +69,93 @@ const fn get_allocator_name() -> Option<&'static str> {
     }
 }
 
+/// Whether `id` was given on the command line, rather than falling back to its default.
+fn chosen_on_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+/// The line every run opens with: it names the build every later line came from,
+/// plus the allocator when one was compiled in over the default.
+fn log_startup_banner() {
+    if let Some(allocator_name) = get_allocator_name() {
+        tracing::info!(
+            "Starting runtime {version} (allocator: {allocator_name})",
+            version = get_version_string(),
+        );
+    } else {
+        tracing::info!("Starting runtime {version}", version = get_version_string());
+    }
+}
+
 fn main() {
-    let matches = spiced::Args::command().get_matches();
-    let open_telemetry_deprecated =
-        matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
-    let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    // Before anything else, so a fault during startup is still reported. A native
+    // crash is not a panic: without this the process dies silently with exit 139.
+    // Attaching runs before the banner but reports after it, so the banner stays the
+    // first line of the log. The version goes in so a report names the build that
+    // produced it.
+    let crash_reporting = spiced::crash_handler::install(&get_version_string());
+
+    let (mut args, open_telemetry_deprecated, flight_chosen, http_chosen) = {
+        let mut matches = spiced::Args::command().get_matches();
+        let open_telemetry_deprecated =
+            matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+        // `--repl-flight-endpoint` moves only the REPL's SQL target, leaving the HTTP endpoint that
+        // `nql` uses wherever it already was. Choosing one without the other leaves nothing pointing
+        // the HTTP endpoint at that runtime, so `nql` says so instead of answering from whatever
+        // that endpoint reaches. See #11005.
+        let flight_chosen = chosen_on_command_line(&matches, "repl_flight_endpoint");
+        let http_chosen = chosen_on_command_line(&matches, "http_endpoint");
+        let args =
+            spiced::Args::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
+        (args, open_telemetry_deprecated, flight_chosen, http_chosen)
+    };
+    // Mutable extraction removes typed values from `ArgMatches`; ending its
+    // scope here also drops clap's remaining parse state before startup. The
+    // enrollment key is left only in the zeroizing `Args` value, which the
+    // Cloud Connect bootstrap removes immediately.
     args.open_telemetry_deprecated = open_telemetry_deprecated;
+    args.repl_config.http_endpoint_may_be_another_runtime =
+        repl::http_endpoint_unpaired(flight_chosen, http_chosen);
 
     if args.version {
         println!("{}", get_version_string());
         return;
     }
 
-    let tokio_runtime = match Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("Unable to start Tokio runtime: {err}");
-            std::process::exit(1);
-        }
-    };
-
     // Install the default AWS LC RS crypto provider for rusttls
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if args.repl {
-        if let Err(e) = tokio_runtime.block_on(repl::run(args.repl_config)) {
+        if let Err(err) = &crash_reporting {
+            in_tracing_context(|| tracing::warn!("{err}"));
+        }
+        // The REPL is a Flight client, not the runtime: it sizes nothing, so it
+        // keeps Tokio's own default runtime.
+        let repl_runtime = match Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("Unable to start Tokio runtime: {err}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = repl_runtime.block_on(repl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
         }
         return;
     }
 
-    if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
+    // Nothing may log before this: the banner dates the run and names the build, so
+    // a line above it belongs to a build the reader cannot identify. Anything that
+    // resolves earlier — the crash-handler attach above, the spicepod, the CPU
+    // budget — reports here or later.
+    in_tracing_context(|| {
+        log_startup_banner();
+        if let Err(err) = &crash_reporting {
+            tracing::warn!("{err}");
+        }
+    });
+
+    if let Err(err) = load_and_run(args) {
         in_tracing_context(|| {
             tracing::error!("{err}");
         });
@@ -110,18 +166,47 @@ fn main() {
     tracing::info!("Goodbye!");
 }
 
-async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    in_tracing_context(|| {
-        if let Some(allocator_name) = get_allocator_name() {
-            tracing::info!(
-                "Starting runtime {version} (allocator: {allocator_name})",
-                version = get_version_string(),
-            );
-        } else {
-            tracing::info!("Starting runtime {version}", version = get_version_string());
+/// Load the spicepod, resolve the CPU budget it configures, and only then build
+/// the runtime that budget sizes.
+///
+/// The ordering is the point: `runtime.cpu.cores` lives in the spicepod, and the
+/// budget sizes this runtime's own worker pool — so the spicepod has to be
+/// parsed before the pool exists. It is loaded here on a throwaway
+/// current-thread runtime and handed to `spiced::run`, so it is read exactly
+/// once and all three configuration surfaces resolve through one path.
+fn load_and_run(mut args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
+    // One temporary subscriber for the whole window before `spiced::run` installs the
+    // global one, so every line the spicepod load and the CPU budget emit — including
+    // any added later — has somewhere to go. Both the bootstrap runtime and
+    // `install_cpu_budget` run on this thread, which is what a thread-local default
+    // covers. It ends here rather than wrapping `spiced::run`: a thread-local default
+    // outranks the global subscriber, and would shadow it for the rest of the process.
+    let app_bundle = in_tracing_context(|| {
+        let bootstrap = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        // Cloud Connect `--token` bootstrap: enrollment must be durable
+        // before the runtime is built, any listener binds, or readiness is
+        // reachable — so it runs first, on the throwaway runtime. A terminal
+        // enrollment failure exits 1 with nothing bound and no identity
+        // persisted; retryable failures were already retried for up to the
+        // headless budget inside the call.
+        if let Err(err) = bootstrap.block_on(spiced::cloud_connect_bootstrap(&mut args)) {
+            tracing::error!("{err}");
+            std::process::exit(1);
         }
-    });
-    spiced::run(args).await?;
+        let app_bundle = bootstrap.block_on(spiced::build_app(&args))?;
+        drop(bootstrap);
+
+        spiced::install_cpu_budget(&args, app_bundle.app.as_deref())?;
+        Ok::<_, Box<dyn std::error::Error>>(app_bundle)
+    })?;
+
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cpu_budget::cpu_budget().main_runtime_worker_threads())
+        .enable_all()
+        .build()?;
+    tokio_runtime.block_on(spiced::run(args, app_bundle))?;
     Ok(())
 }
 

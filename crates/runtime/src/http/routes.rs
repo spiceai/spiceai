@@ -58,6 +58,7 @@ use utoipa::{
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
+use super::response_outcome;
 use super::v1;
 use runtime_metrics::http as metrics;
 
@@ -90,6 +91,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
+        v1::cdc::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -336,6 +338,7 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -536,10 +539,9 @@ async fn track_metrics(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    let app_lock = app.read().await;
-    let app = app_lock.as_ref().map(Arc::clone);
+    let app = app.read().await.as_ref().map(Arc::clone);
     let mut request_context_builder = RequestContext::builder(Protocol::Http)
-        .with_app_opt(app_lock.as_ref().map(Arc::clone))
+        .with_app_opt(app.clone())
         .from_headers(&headers);
 
     if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)
@@ -580,7 +582,8 @@ async fn track_metrics(
             // the streaming response, not just the response future.
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = next.run(req).await;
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
+            runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
             let body = axum::body::Body::new(util::cancel_guard_body::CancelGuardBody::new(
                 body,
                 cancel_guard,
@@ -604,7 +607,23 @@ async fn track_metrics(
     metrics::REQUESTS.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
-    response
+    // The metrics above describe the response *head*. For a streaming response
+    // the head is `200 OK` before the first batch exists, so a query that fails
+    // partway through would otherwise be counted as a success. Observe the end
+    // of the body as well, and report the terminal outcome and the true
+    // end-to-end duration under their own instruments so the `status` series
+    // keeps its existing meaning.
+    let (parts, body) = response.into_parts();
+    let body = axum::body::Body::new(response_outcome::OutcomeTrackedBody::new(
+        body,
+        move |outcome| {
+            labels.push(KeyValue::new("outcome", outcome.as_label()));
+            metrics::RESPONSES.add(1, &labels);
+            metrics::RESPONSES_DURATION_MS.record(start.elapsed().as_secs_f64() * 1000.0, &labels);
+        },
+    ));
+
+    axum::response::Response::from_parts(parts, body)
 }
 
 /// Build the MCP [`StreamableHttpServerConfig`] from the optional `runtime.mcp` config.

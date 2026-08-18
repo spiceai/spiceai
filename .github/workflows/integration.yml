@@ -62,6 +62,10 @@ jobs:
   # steps on GitHub-hosted runners; the full suite runs only on non-PR events.
   check_changes:
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
@@ -71,7 +75,7 @@ jobs:
         if: ${{ github.event_name == 'pull_request' }}
         run: echo "Integration tests run on the merge-group commit"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ github.event_name != 'pull_request' }}
         with:
           persist-credentials: false
@@ -86,12 +90,14 @@ jobs:
     name: Build Test Binary
     needs: check_changes
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 125 min.
+    timeout-minutes: 300
     steps:
       - name: Pull request passthrough
         if: ${{ github.event_name == 'pull_request' }}
         run: echo "Integration test binaries build on the merge-group commit"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
@@ -256,6 +262,8 @@ jobs:
     permissions:
       contents: write
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'spiceai-dev-runners' }}
+    # Slowest observed success in the 2026-07-25..08-08 window: 19 min.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -271,7 +279,7 @@ jobs:
         if: ${{ github.event_name == 'pull_request' }}
         run: echo "Integration test part ${{ matrix.label }} runs on the merge-group commit"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           persist-credentials: false
@@ -333,7 +341,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.check_changes.outputs.relevant_changes == 'true' && github.repository == 'spiceai/spiceai'
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -444,6 +452,8 @@ jobs:
   upload-integration-snapshots:
     name: Upload Integration Snapshots
     if: github.event.inputs.update_snapshots == 'always'
+    # A checkout, a commit and a push.
+    timeout-minutes: 60
     needs:
       - test
     permissions:
@@ -451,7 +461,7 @@ jobs:
       pull-requests: write
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -493,11 +503,13 @@ jobs:
   test-aws-sdk:
     name: AWS SDK Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 2 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -534,7 +546,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -553,11 +565,13 @@ jobs:
   test-aws-sdk-credential-bridge:
     name: AWS SDK Credential Bridge Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -594,7 +608,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -617,11 +631,13 @@ jobs:
   test-snapshot-refresh:
     name: Snapshot Refresh Mode Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -657,7 +673,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -675,11 +691,13 @@ jobs:
   test-data-components:
     name: Data Components Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 1 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -726,10 +744,12 @@ jobs:
   test-runtime-partition:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 60
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
@@ -765,7 +785,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io

@@ -10,23 +10,18 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
-arrow-odbc = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
-dyn-clone = { version = "1.0.17", optional = true }
 futures.workspace = true
-odbc-api = { workspace = true, optional = true }
 pkcs8 = { version = "0.10.2", features = [
   "encryption",
   "pem",
   "3des",
 ], optional = true }
-scylla = { workspace = true, optional = true }
 secrecy.workspace = true
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
@@ -43,21 +38,12 @@ duckdb = [
   "datafusion-table-providers/duckdb-federation",
 ]
 mysql = ["datafusion-table-providers/mysql"]
-odbc = [
-  "dep:odbc-api",
-  "dep:async-stream",
-  "dep:arrow-odbc",
-  "dep:tokio",
-  "dep:dyn-clone",
-  "dep:sha2",
-]
 postgres = [
   "dep:tokio",
   "dep:async-stream",
   "datafusion-table-providers/postgres",
   "datafusion-table-providers/postgres-federation",
 ]
-scylladb = ["dep:scylla", "dep:async-stream"]
 snowflake = [
   "dep:snowflake-api",
   "dep:pkcs8",

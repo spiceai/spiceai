@@ -42,10 +42,13 @@ runtime:
   # dataset. These are the high-level targets the closed loop converges toward — NOT
   # actuator knobs. QPH is GLOBAL-ONLY (measured across all datasets).
   params:
-    # Deep prefetch, matching the default `-adaptive` pod so this 1-slot config differs from it
-    # ONLY in slot count (isolating the slot-count effect at the standard prefetch depth).
+    # Deep prefetch + higher-coalescing pins, matching the default `-adaptive` pod so this 1-slot
+    # config differs from it ONLY in slot count (isolating the slot-count effect at a fixed
+    # prefetch depth and coalescing budget).
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '2000'
     cayenne_goal_replication_lag: '5s'
     cayenne_goal_freshness: '30s'
     cayenne_goal_query_latency: '10s'

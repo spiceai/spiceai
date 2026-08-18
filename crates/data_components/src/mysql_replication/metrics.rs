@@ -37,6 +37,9 @@ pub struct MetricsCollector {
     /// known-empty source table.
     bootstrap_rows_expected: AtomicU64,
     bootstrap_complete: AtomicU64,
+    /// `1` when the stream is positioning by GTID auto-positioning
+    /// (failover-safe), `0` for file+offset. Set once at stream start.
+    gtid_enabled: AtomicU64,
     /// Byte offset of the most recently committed (acked) binlog position.
     committed_pos: AtomicU64,
     /// Numeric suffix of the committed binlog file (`binlog.000042` → 42);
@@ -59,6 +62,18 @@ pub struct MetricsCollector {
     reconnects: AtomicU64,
     checkpoint_persists: AtomicU64,
     checkpoint_persist_errors: AtomicU64,
+    /// Shared-binlog membership liveness: `1` while this dataset is an attached
+    /// member of a shared dump (`super::shared`), `0` once detached.
+    /// Initialized to `1` — a member starts attached to its group. A detached
+    /// member holds the shared resume position back, so this is the
+    /// unambiguous signal for *which* dataset stalled the group.
+    member_attached: AtomicU64,
+    /// Cumulative seconds the shared dump's pump spent blocked delivering
+    /// committed changes into this dataset's channel because its sink was not
+    /// draining. The pump reads the dump socket for the whole group, so this is
+    /// also the time the socket went undrained — the source aborts the dump once
+    /// that passes its `net_write_timeout`.
+    member_send_stalled_seconds: AtomicU64,
 }
 
 impl MetricsCollector {
@@ -67,6 +82,9 @@ impl MetricsCollector {
         Arc::new(Self {
             bootstrap_rows_expected: AtomicU64::new(u64::MAX),
             lag_bytes: AtomicU64::new(u64::MAX),
+            // A member starts attached to its shared dump; the shared path
+            // flips this to 0 on detach.
+            member_attached: AtomicU64::new(1),
             ..Self::default()
         })
     }
@@ -94,6 +112,10 @@ impl MetricsCollector {
     }
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+    }
+    pub fn set_gtid_enabled(&self, enabled: bool) {
+        self.gtid_enabled
+            .store(u64::from(enabled), Ordering::Relaxed);
     }
 
     /// Record the acked (committed-to-sidecar-visible) binlog position.
@@ -142,6 +164,23 @@ impl MetricsCollector {
         self.checkpoint_persist_errors
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Mark this dataset an attached member of a shared binlog dump.
+    pub fn mark_member_attached(&self) {
+        self.member_attached.store(1, Ordering::Relaxed);
+    }
+
+    /// Mark this dataset detached from the shared dump (its floor is now held,
+    /// pinning the shared resume position).
+    pub fn mark_member_detached(&self) {
+        self.member_attached.store(0, Ordering::Relaxed);
+    }
+
+    /// Accrue another stall interval spent waiting on this dataset's channel.
+    pub fn add_send_stalled(&self, secs: u64) {
+        self.member_send_stalled_seconds
+            .fetch_add(secs, Ordering::Relaxed);
+    }
 }
 
 /// Read handle for the connector's `MetricsProvider` callbacks.
@@ -183,6 +222,10 @@ impl Metrics {
     #[must_use]
     pub fn bootstrap_complete(&self) -> u64 {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn gtid_enabled(&self) -> u64 {
+        self.collector.gtid_enabled.load(Ordering::Relaxed)
     }
     #[must_use]
     pub fn bootstrap_rows_expected(&self) -> Option<u64> {
@@ -270,6 +313,19 @@ impl Metrics {
     pub fn checkpoint_persist_errors_total(&self) -> u64 {
         self.collector
             .checkpoint_persist_errors
+            .load(Ordering::Relaxed)
+    }
+    /// `1` while attached to the shared dump, `0` once detached from it.
+    #[must_use]
+    pub fn member_attached(&self) -> u64 {
+        self.collector.member_attached.load(Ordering::Relaxed)
+    }
+    /// Cumulative seconds the shared dump's pump waited on this dataset's
+    /// channel, i.e. seconds the dump socket went undrained on its behalf.
+    #[must_use]
+    pub fn member_send_stalled_seconds_total(&self) -> u64 {
+        self.collector
+            .member_send_stalled_seconds
             .load(Ordering::Relaxed)
     }
 }

@@ -37,7 +37,7 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
-use vortex::dtype::arrow::FromArrowType;
+use vortex::arrow::FromArrowType;
 
 /// Joint accumulator state held under a single mutex so `update()` and
 /// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`

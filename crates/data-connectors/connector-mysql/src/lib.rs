@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::inferred_schema::InferredSchema;
 use data_components::mysql_replication::{ReplicationMetrics, ReplicationMetricsCollector};
 use datafusion::datasource::TableProvider;
@@ -27,15 +28,15 @@ use datafusion_table_providers::sql::db_connection_pool::{
 };
 use mysql_async::{Metrics, prelude::Queryable};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
+    DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
 };
-use runtime::datafusion::udf::deny_spice_functions_for_table_providers;
-use runtime::parameters::{ParameterSpec, Parameters};
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use secrecy::{ExposeSecret, SecretBox};
 use snafu::prelude::*;
 use std::any::Any;
@@ -68,6 +69,10 @@ pub struct MySQL {
     /// Connector params retained for the replication path, which opens its
     /// own dedicated connections outside the pool.
     params: Parameters,
+    /// Retained so the replication path can resolve the binlog-position store over
+    /// the dataset's accelerator. `None` only in unit tests, which build params
+    /// without a runtime attached.
+    context: Option<Arc<dyn ConnectorContext>>,
     replication_metrics: Arc<ReplicationMetricsCollector>,
 }
 
@@ -155,14 +160,15 @@ const PARAMETERS: &[ParameterSpec] = &[
              the dataset name and process.",
         )
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_snapshot_mode")
+    ParameterSpec::component("replication_initial_snapshot")
         .description(
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
-             snapshots when no resumable binlog position exists; 'never' streams changes only; \
-             'always' re-snapshots on every start.",
+             snapshots when no resumable binlog position exists and resumes without a snapshot \
+             when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
+             start, discarding any persisted position. Default: auto.",
         )
         .default("auto")
-        .one_of_ignore_ascii_case(&["auto", "never", "always"])
+        .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("replication_checkpoint_interval")
         .description(
@@ -179,14 +185,23 @@ const PARAMETERS: &[ParameterSpec] = &[
         )
         .default("8192")
         .help_link(MYSQL_DOCS),
-    ParameterSpec::component("replication_invalid_position_behavior")
+    ParameterSpec::component("replication_invalid_checkpoint_behavior")
         .description(
             "What to do when the persisted binlog position was purged from the source: 'error' \
-             (default) surfaces an actionable error; 'rebootstrap' drops the saved position and \
-             re-snapshots the table.",
+             (default) surfaces an actionable error; 'restart' drops the saved position and \
+             re-snapshots the table. Default: error.",
         )
         .default("error")
-        .one_of_ignore_ascii_case(&["error", "rebootstrap"])
+        .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
+        .help_link(MYSQL_DOCS),
+    ParameterSpec::component("replication_ready_lag")
+        .description(
+            "For `refresh_mode: changes`, the dataset is marked Ready once its replication lag \
+             (now minus the newest applied commit's binlog-header timestamp) falls below this. It \
+             stays not-ready while snapshotting or draining a backlog on resume, so it never serves \
+             stale data. Default: 2s.",
+        )
+        .default("2s")
         .help_link(MYSQL_DOCS),
 ];
 
@@ -354,6 +369,7 @@ impl DataConnectorFactory for MySQLFactory {
                 mysql_factory,
                 pool,
                 params: params_for_replication,
+                context: params.context.clone(),
                 replication_metrics: ReplicationMetricsCollector::new(),
             }) as Arc<dyn DataConnector>)
         })
@@ -487,7 +503,7 @@ async fn mysql_inferred_schema_metadata(
 /// `enrich_with_postgres_metadata`.
 async fn enrich_with_mysql_metadata(
     pool: &Arc<MySQLConnectionPool>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     table_reference: &datafusion::sql::TableReference,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
@@ -550,7 +566,7 @@ impl DataConnector for MySQL {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let tbl = dataset
             .parse_path(true, Some(&MySqlDialect {}))
@@ -601,15 +617,14 @@ impl DataConnector for MySQL {
 
     fn changes_stream(
         &self,
-        federated_table: Arc<runtime::federated_table::FederatedTable>,
-        dataset: &Dataset,
-        _accelerated_table_provider: Arc<dyn TableProvider>,
-        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
-        _cpu_runtime: Option<tokio::runtime::Handle>,
+        federated_table: Arc<dyn data_connector_api::federated::FederatedTableProvider>,
+        dataset: &DatasetSpec,
+        _acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
         Some(replication::build_changes_stream(
             &self.params,
             dataset,
+            self.context.clone(),
             federated_table,
             Arc::clone(&self.replication_metrics),
         ))
@@ -852,3 +867,13 @@ pub const CONNECTOR_NAME: &str = "mysql";
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     MySQLFactory::new_arc()
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_mysql as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_mysql_connector,
+    MYSQL_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    MySQLFactory
+);

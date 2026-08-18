@@ -32,6 +32,9 @@ itertools.workspace = true
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
+runtime-udfs-api = { path = "../../runtime-udfs-api" }
 snowflake-api.workspace = true
 snafu.workspace = true
 

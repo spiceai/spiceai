@@ -148,10 +148,8 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
     };
 
     if is_newer_version(&current, &latest) {
-        // Use green color for the version
-        let green_version = format!("\x1b[92m{latest}\x1b[0m");
         println!();
-        tracing::info!("CLI version {green_version} is now available!");
+        tracing::info!("CLI version {latest} is now available!");
         tracing::info!("To upgrade, run \"spice upgrade\".");
     }
 }

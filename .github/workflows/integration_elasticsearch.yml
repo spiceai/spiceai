@@ -36,10 +36,14 @@ jobs:
   # changed-files check instead of running Elasticsearch for every merge entry.
   changes:
     runs-on: ubuntu-latest
+    # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
+    # cold runner having to clone from scratch, not the ~1 min a warm
+    # self-hosted workspace takes.
+    timeout-minutes: 45
     outputs:
       relevant: ${{ steps.check.outputs.relevant_changes }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -57,6 +61,8 @@ jobs:
   test-elasticsearch:
     name: Elasticsearch Integration Tests
     needs: changes
+    # Slowest observed success in the 2026-07-25..08-08 window: 15 min.
+    timeout-minutes: 90
     if: ${{ needs.changes.outputs.relevant == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: spiceai-dev-runners
 
@@ -77,7 +83,7 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1

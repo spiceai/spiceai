@@ -44,6 +44,7 @@ use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{FileExtensions, PartitionedFile, TableSchema};
 use futures::TryStreamExt;
+use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
@@ -52,18 +53,18 @@ use {
     datafusion_datasource::file_format::FileFormatFactory, vortex_datafusion::VortexFormatFactory,
 };
 
-use crate::Runtime;
-use crate::accelerated_table::AcceleratedTable;
-use crate::component::dataset::Dataset;
+use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::{
     ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
+use app::App;
 use data_components::object::{
     metadata::{MetadataColumn, ObjectStoreMetadataTable},
     text::ObjectStoreTextTable,
 };
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -508,7 +509,7 @@ pub trait ListingTableConnector: DataConnector {
     /// A [`DataConnectorResult`] containing the resolved [`Url`] of the object store.
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url>;
 
@@ -525,7 +526,7 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
-    fn get_object_store(&self, dataset: &Dataset) -> DataConnectorResult<Arc<dyn ObjectStore>>
+    fn get_object_store(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn ObjectStore>>
     where
         Self: Display,
     {
@@ -546,7 +547,12 @@ pub trait ListingTableConnector: DataConnector {
             })
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
+    /// The loaded app, for the runtime-level configuration this connector's
+    /// reads consult (currently `runtime.params.parquet_page_index`).
+    ///
+    /// `None` where no runtime is attached — connector unit tests that build the
+    /// connector directly.
+    fn get_app(&self) -> Option<Arc<App>> {
         None
     }
 
@@ -556,7 +562,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn construct_metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
     where
         Self: Display,
@@ -592,7 +598,7 @@ pub trait ListingTableConnector: DataConnector {
     /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
     async fn get_file_format_and_extension(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
     where
         Self: Display,
@@ -709,7 +715,11 @@ pub trait ListingTableConnector: DataConnector {
             )),
             #[cfg(not(windows))]
             (Some("vortex"), _) | (None, Some("vortex")) => Ok((
-                Some(VortexFormatFactory::new().default()),
+                Some(
+                    VortexFormatFactory::new()
+                        .with_cache_name(dataset.name.to_string())
+                        .default(),
+                ),
                 listing_extension(
                     configured_extension.as_ref(),
                     path_extension.as_ref(),
@@ -800,7 +810,11 @@ pub trait ListingTableConnector: DataConnector {
                     )),
                     #[cfg(not(windows))]
                     Some("vortex") => Ok((
-                        Some(VortexFormatFactory::new().default()),
+                        Some(
+                            VortexFormatFactory::new()
+                                .with_cache_name(dataset.name.to_string())
+                                .default(),
+                        ),
                         listing_extension(
                             configured_extension.as_ref(),
                             path_extension.as_ref(),
@@ -837,7 +851,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_jsonl_format(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         params: &Parameters,
         file_compression_type: FileCompressionType,
     ) -> DataConnectorResult<Arc<JsonFormat>>
@@ -866,7 +880,7 @@ pub trait ListingTableConnector: DataConnector {
     /// If the [`Dataset`] has the relevant parameter, return an error if the value is invalid.
     fn get_json_format(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         params: &Parameters,
         default_format: Format,
         file_compression_type: FileCompressionType,
@@ -991,21 +1005,18 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn get_table_parquet_options(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<TableParquetOptions>
     where
         Self: Display,
     {
-        let runtime = self.get_runtime();
-        build_table_parquet_options(runtime.as_ref())
-            .await
-            .map_err(
-                |e| crate::dataconnector::DataConnectorError::UnableToConnectInternal {
-                    dataconnector: format!("{self}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                },
-            )
+        build_table_parquet_options(self.get_app().as_ref()).map_err(|e| {
+            crate::dataconnector::DataConnectorError::UnableToConnectInternal {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })
     }
 
     /// A hook that is called when an accelerated table is registered to the
@@ -1016,15 +1027,20 @@ pub trait ListingTableConnector: DataConnector {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        _dataset: &Dataset,
-        _accelerated_table: &mut AcceleratedTable,
+        _dataset: &DatasetSpec,
+        _accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
+    /// Turn an `object_store` error into the error the user sees.
+    ///
+    /// An implementation that inspects [`object_store::Error::Generic`] must call
+    /// [`object_store_timeout_message`] before classifying it any other way — see that function
+    /// for why.
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError
     where
@@ -1039,7 +1055,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_text_table(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
     ) -> DataConnectorResult<Arc<dyn TableProvider>>
@@ -1080,7 +1096,7 @@ pub trait ListingTableConnector: DataConnector {
 
     async fn create_listing_table(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: &Url,
         extension: &str,
         file_format: Arc<dyn FileFormat>,
@@ -1295,7 +1311,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn deduplicate_partition_columns_expressed_in_file(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         schema: SchemaRef,
         partition_cols: &[(String, DataType)],
     ) -> DataConnectorResult<SchemaRef> {
@@ -1351,7 +1367,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !dataset.has_metadata_table {
             return None;
@@ -1362,7 +1378,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let url = self.get_object_store_url(dataset, None)?;
 
@@ -1382,7 +1398,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         let url = self.get_object_store_url(dataset, None)?;
@@ -1429,15 +1445,65 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     /// the table when the file is updated.
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &DatasetSpec,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ListingTableConnector::on_accelerated_table_registration(self, dataset, accelerated_table)
             .await
     }
 }
 
-fn refresh_skip_enabled(dataset: &Dataset) -> bool {
+/// Walks an `object_store` error's source chain for the typed `HttpError`.
+///
+/// `object_store` 0.13 classifies `reqwest`/`hyper`/I/O timeouts into `HttpErrorKind::Timeout`
+/// before flattening the error into `object_store::Error::Generic`, so a timeout is detectable by
+/// a typed downcast rather than by matching on the error message.
+fn object_store_http_error_kind(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<HttpErrorKind> {
+    let mut next = Some(source);
+    while let Some(err) = next {
+        if let Some(http_error) = err.downcast_ref::<HttpError>() {
+            return Some(http_error.kind());
+        }
+        next = err.source();
+    }
+    None
+}
+
+/// The message for an object-store request that timed out, or `None` when `source` is not a
+/// transport timeout.
+///
+/// Every [`ListingTableConnector::handle_object_store_error`] that inspects
+/// [`object_store::Error::Generic`] must consult this **before** classifying the error any other
+/// way. `object_store` flattens a timeout into the same `Generic` variant an authentication
+/// failure arrives in, so a connector that classifies `Generic` by which credentials are
+/// configured reports a network timeout as bad credentials — sending the user to rotate a working
+/// secret while the parameter that actually resolves it goes unmentioned (#12793).
+///
+/// `client_timeout` is the connector's configured value. `None` reports `object_store`'s own
+/// default, which every connector inherits by forwarding the parameter unset.
+#[must_use]
+pub fn object_store_timeout_message(
+    source: &(dyn std::error::Error + 'static),
+    service: &str,
+    client_timeout: Option<&str>,
+    docs_url: &str,
+) -> Option<String> {
+    if object_store_http_error_kind(source) != Some(HttpErrorKind::Timeout) {
+        return None;
+    }
+
+    let client_timeout = client_timeout.unwrap_or("30s (default)");
+    Some(format!(
+        "{service} request timed out (client_timeout: {client_timeout}). This often happens when \
+         many datasets are loaded concurrently and saturate the network or I/O. Consider \
+         increasing the `client_timeout` parameter or reducing the number of concurrent dataset \
+         loads. See {docs_url}#params for details."
+    ))
+}
+
+fn refresh_skip_enabled(dataset: &DatasetSpec) -> bool {
     match dataset.params.get("refresh_skip").map(String::as_str) {
         None | Some("enabled") => true,
         Some("disabled") => false,
@@ -1456,7 +1522,7 @@ fn add_metadata_columns_if_required(
     options: ListingOptions,
     table_url: &Url,
     schema: &Schema,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> ListingOptions {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
@@ -1489,7 +1555,7 @@ fn get_url_prefix(table_url: &Url) -> String {
 
 fn resolve_file_compression_type(
     dataconnector: &str,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     params: &Parameters,
     detected_compression: Option<FileCompressionType>,
 ) -> DataConnectorResult<FileCompressionType> {
@@ -1550,7 +1616,7 @@ const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 /// - If no files with the specified extension are found
 async fn get_last_modified(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     extension: &str,
     table_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1644,7 +1710,7 @@ async fn get_last_modified(
 
 async fn verify_schema_source_path(
     dataconnector: String,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     extension: &str,
     schema_source_path: ListingTableUrl,
     ctx: &SessionContext,
@@ -1710,7 +1776,7 @@ fn file_matches_extension(location: &Path, extension: &str) -> bool {
 fn to_listing_table_url(
     original_url: &Url,
     path: &Path,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     dataconnector: &str,
 ) -> DataConnectorResult<SensitiveListingTableUrl> {
     let mut new_url = original_url.clone();
@@ -1761,14 +1827,14 @@ impl SensitiveListingTableUrl {
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
 /// `enable_page_index` retains the `DataFusion` default (`true`).
-pub async fn build_table_parquet_options(
-    runtime: Option<&Runtime>,
+pub fn build_table_parquet_options(
+    app: Option<&Arc<App>>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
     let mut opts = TableParquetOptions::new();
     opts.set("pushdown_filters", "true")?;
 
-    if let Some(rt) = runtime {
-        let page_index_options = parquet_page_index_options(rt).await;
+    if let Some(app) = app {
+        let page_index_options = parquet_page_index_options(app);
         opts.set(
             "enable_page_index",
             &page_index_options.enable_page_index.to_string(),
@@ -1799,11 +1865,11 @@ impl Default for ParquetPageIndexOptions {
 ///   params:
 ///     parquet_page_index: required # skip, auto
 /// ```
-async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOptions {
-    let runtime_app = runtime.app();
-    let app = runtime_app.read().await;
+fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
+    // `App::get_runtime_param` reads the `Option<Arc<App>>` the runtime stores.
+    let app = Some(Arc::clone(app));
     let parquet_page_index_param =
-        app::App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
+        App::get_runtime_param(&app, "parquet_page_index", "required".to_string());
 
     match parquet_page_index_param.as_str() {
         // Note: "auto" and "required" both enable page index now. The difference was that "auto"
@@ -1824,6 +1890,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
 
 #[cfg(test)]
 mod tests {
+    use crate::component::dataset::Dataset;
     use arrow::array::RecordBatch;
     use chrono::{TimeZone, Utc};
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -1895,7 +1962,7 @@ mod tests {
 
         fn get_object_store_url(
             &self,
-            dataset: &Dataset,
+            dataset: &DatasetSpec,
             _url: Option<&str>,
         ) -> DataConnectorResult<Url> {
             Url::parse("test")
@@ -2967,33 +3034,27 @@ mod tests {
         assert_eq!(get_url_prefix(&url), "file:///");
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_default() {
-        let app = app::AppBuilder::new("test").build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+    #[test]
+    fn test_parquet_page_index_options_default() {
+        let app = Arc::new(app::AppBuilder::new("test").build());
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_auto() {
+    #[test]
+    fn test_parquet_page_index_options_auto() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "auto".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
         // "auto" and "required" now behave the same since tolerate_missing_page_index
         // was removed in DataFusion v51. Page index reading handles missing indexes gracefully.
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
@@ -3099,52 +3160,48 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_skip() {
+    #[test]
+    fn test_parquet_page_index_options_skip() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "skip".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(!options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_required() {
+    #[test]
+    fn test_parquet_page_index_options_required() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "required".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
+        let options = parquet_page_index_options(&app);
         assert!(options.enable_page_index);
     }
 
-    #[tokio::test]
-    async fn test_parquet_page_index_options_invalid() {
+    #[test]
+    fn test_parquet_page_index_options_invalid() {
         let mut params = std::collections::HashMap::new();
         params.insert("parquet_page_index".to_string(), "invalid".to_string());
-        let app = app::AppBuilder::new("test")
-            .with_runtime_params(params)
-            .build();
-        let runtime = crate::Runtime::builder()
-            .with_app_opt(Some(Arc::new(app)))
-            .build()
-            .await;
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_runtime_params(params)
+                .build(),
+        );
 
-        let options = parquet_page_index_options(&runtime).await;
-        // Should fall back to default
-        assert!(options.enable_page_index);
+        let options = parquet_page_index_options(&app);
+        assert!(
+            options.enable_page_index,
+            "an invalid value falls back to the default"
+        );
     }
 }

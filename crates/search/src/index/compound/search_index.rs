@@ -19,16 +19,20 @@ use std::{any::Any, sync::Arc};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
+};
 use futures::future::try_join_all;
-use runtime_datafusion_index::Index;
+use spice_table::{Index, WriteWindow};
 
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_on_write_start,
-    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
+    compound_on_write_complete, compound_on_write_start, compound_required_columns, compound_write,
+    fallback::fallback_on_empty_plan, validate_compatibility,
 };
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
@@ -61,6 +65,19 @@ impl CompoundSearchIndex {
             read_mode,
         })
     }
+
+    /// The tier reads and writes are served from first.
+    #[must_use]
+    pub fn primary(&self) -> &Arc<dyn SearchIndex> {
+        &self.primary
+    }
+
+    /// The tier reads fall back to (in [`CompoundReadMode::FallbackToSecondary`]) and every
+    /// write also reaches.
+    #[must_use]
+    pub fn secondary(&self) -> &Arc<dyn SearchIndex> {
+        &self.secondary
+    }
 }
 
 #[async_trait]
@@ -83,8 +100,8 @@ impl Index for CompoundSearchIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref()).await
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref(), window).await
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -98,12 +115,25 @@ impl Index for CompoundSearchIndex {
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        // As with `on_write_failed`: both completion callbacks must run.
-        let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_complete(),
-            self.secondary.on_write_complete()
-        );
-        primary_result.and(secondary_result)
+        compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
+    }
+
+    async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
+        compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        // `delete_by_keys` fans out to both halves, so a partial key only clears this compound
+        // index when *both* halves act on one.
+        self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        COMPOUND_WRITE_START_FAILURE_IS_FATAL
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
     }
 
     fn as_any(&self) -> &dyn Any {

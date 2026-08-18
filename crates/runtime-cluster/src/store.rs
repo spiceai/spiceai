@@ -70,26 +70,6 @@ pub enum CopyAssignmentsResult {
     NoAssignments,
 }
 
-#[derive(Debug, Clone)]
-pub struct AllocationResult {
-    pub previously_assigned: Vec<PartitionValue>,
-    pub newly_assigned: Vec<PartitionValue>,
-}
-
-impl AllocationResult {
-    #[must_use]
-    pub fn all_assigned(self) -> Vec<PartitionValue> {
-        let mut all = self.previously_assigned;
-        all.extend(self.newly_assigned);
-        all
-    }
-
-    #[must_use]
-    pub fn count(&self) -> usize {
-        self.previously_assigned.len() + self.newly_assigned.len()
-    }
-}
-
 /// A single (table, partition, executor) assignment, used by the
 /// batched [`PartitionStore::apply_assignments`] API.
 #[derive(Debug, Clone)]
@@ -265,91 +245,6 @@ impl PartitionStore {
                 },
             })?;
         Ok(())
-    }
-
-    /// Allocates unassigned partitions to an executor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table metadata is not found, or if the cluster state mutation fails.
-    pub async fn allocate_partitions(
-        &self,
-        table: &TableReference,
-        executor_id: &str,
-        limit: usize,
-    ) -> Result<AllocationResult> {
-        let key = normalized_table_name(table);
-        let scope = self.scope;
-
-        let mut captured: Option<AllocationResult> = None;
-        let executor = executor_id.to_string();
-        let key_for_err = key.clone();
-        let res = self
-            .cluster
-            .mutate(|state| {
-                let now_ms = match crate::cluster_state::now_ms() {
-                    Ok(v) => u128::from(v),
-                    Err(e) => return MutationOutcome::Abort(e),
-                };
-                let map = scope.map_mut(state);
-                let Some(metadata) = map.get_mut(&key) else {
-                    return MutationOutcome::Abort(MutateError::Conflict {
-                        message: format!("no partition metadata for table {key}"),
-                    });
-                };
-
-                let previously_assigned: Vec<PartitionValue> = metadata
-                    .partitions
-                    .iter()
-                    .filter(|p| p.is_assigned_to(&executor))
-                    .map(|p| p.partition_value.clone())
-                    .collect();
-                let mut newly_assigned: Vec<PartitionValue> = Vec::new();
-                let mut total = previously_assigned.len();
-                let mut changes = false;
-                for partition in &mut metadata.partitions {
-                    if total >= limit {
-                        break;
-                    }
-                    if !partition.is_assigned() {
-                        partition.assign_to(executor.clone(), now_ms);
-                        newly_assigned.push(partition.partition_value.clone());
-                        total += 1;
-                        changes = true;
-                    }
-                }
-
-                let result = AllocationResult {
-                    previously_assigned,
-                    newly_assigned,
-                };
-                captured = Some(result);
-
-                if changes {
-                    metadata.updated_at = now_ms;
-                    MutationOutcome::Apply
-                } else {
-                    MutationOutcome::NoChange
-                }
-            })
-            .await
-            .map_err(|e| match e {
-                MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
-                    table: key_for_err.clone(),
-                },
-                MutateError::Conflict { message } if message.contains("no partition metadata") => {
-                    Error::TableMetadataNotFound {
-                        table: key_for_err.clone(),
-                    }
-                }
-                other => Error::MetadataAccess {
-                    table: key_for_err.clone(),
-                    source: other,
-                },
-            })?;
-
-        let _ = res;
-        captured.ok_or_else(|| Error::TableMetadataNotFound { table: key_for_err })
     }
 
     /// Assigns a single partition to an executor. Most callers should

@@ -10,6 +10,8 @@ description = "SFTP data connector for Spice.ai runtime"
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true

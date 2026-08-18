@@ -80,54 +80,6 @@ impl ChangeOp {
     }
 }
 
-/// Buffer collecting `DecodedChange`s within a single transaction.
-pub struct TransactionBuffer {
-    pub begin_lsn: u64,
-    pub changes: Vec<DecodedChange>,
-}
-
-impl TransactionBuffer {
-    #[must_use]
-    pub fn new(begin_lsn: u64) -> Self {
-        Self {
-            begin_lsn,
-            changes: Vec::new(),
-        }
-    }
-
-    pub fn push_insert(&mut self, _relation: &Relation, tuple: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Create,
-            row: tuple,
-        });
-    }
-
-    pub fn push_update(&mut self, relation: &Relation, old: Option<TupleData>, new: TupleData) {
-        push_update_change(&mut self.changes, relation, old, new);
-    }
-
-    pub fn push_delete(&mut self, _relation: &Relation, old: TupleData) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Delete,
-            row: old,
-        });
-    }
-
-    /// Record a TRUNCATE for the relation. Row payload is empty — the
-    /// accelerator path applies it as an unconditional delete-all.
-    pub fn push_truncate(&mut self, _relation: &Relation) {
-        self.changes.push(DecodedChange {
-            op: ChangeOp::Truncate,
-            row: TupleData { columns: vec![] },
-        });
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-    }
-}
-
 /// Resolve `Value::Unchanged` (`TOAST`ed columns omitted from an UPDATE's new
 /// tuple) by substituting the value from the old tuple, when `REPLICA
 /// IDENTITY FULL` provides one — for an *unchanged* column, the old value IS
@@ -325,11 +277,15 @@ pub fn build_change_batch(
 /// route it. A throwaway [`super::pgoutput::Decoder`] is used because the
 /// change decoders are structural (they don't consult the relation cache); the
 /// `relation` argument, not the decoder, drives typing and key detection.
-fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<DecodedChange>> {
+fn decode_raw_changes_iter<'a>(
+    relation: &Relation,
+    raw: impl Iterator<Item = &'a bytes::Bytes>,
+    capacity: usize,
+) -> Result<Vec<DecodedChange>> {
     use super::pgoutput::{DecodedMessage, Decoder};
     let mut decoder = Decoder::new();
     // Lower bound on capacity (a PK-changing UPDATE grows the vec by one).
-    let mut changes = Vec::with_capacity(raw.len());
+    let mut changes = Vec::with_capacity(capacity);
     for msg in raw {
         match decoder.decode(msg.clone())? {
             DecodedMessage::Insert { tuple, .. } => changes.push(DecodedChange {
@@ -358,20 +314,35 @@ fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<D
     Ok(changes)
 }
 
-/// A committed transaction's raw change messages for one relation, carried
-/// through the shared-slot [`ChangeEnvelope`] as a deferred [`ChangeRows`]
-/// source.
+/// Slice-taking wrapper over [`decode_raw_changes_iter`] for the tests that
+/// assert the raw path against the eager one.
+#[cfg(test)]
+fn decode_raw_changes(relation: &Relation, raw: &[bytes::Bytes]) -> Result<Vec<DecodedChange>> {
+    decode_raw_changes_iter(relation, raw.iter(), raw.len())
+}
+
+/// The raw change messages of one or more committed transactions for a single
+/// relation, carried through the shared-slot [`ChangeEnvelope`] as a deferred
+/// [`ChangeRows`] source.
 ///
 /// The shared Postgres replication pump only peeks each message's type +
 /// relation id to route it, then buffers the raw pgoutput bytes here;
 /// [`ChangeRows::build`] decodes + transforms + Arrow-builds them later on the
-/// per-dataset consumer (see [`decode_raw_changes`] and [`build_change_batch`]),
-/// moving the entire decode + O(rows × columns) build off the single shared
-/// read path. Metadata is answered from the buffered bytes without decoding.
+/// per-dataset consumer (see [`decode_raw_changes_iter`] and
+/// [`build_change_batch`]), moving the entire decode + O(rows × columns) build
+/// off the single shared read path. Metadata is answered from the buffered bytes
+/// without decoding.
+///
+/// Adjacent transactions for the same relation generation are folded together by
+/// [`Self::try_append`], so one instance may span several source commits.
 pub struct PgChangeRows {
     schema: SchemaRef,
-    relation: Relation,
-    raw: Vec<bytes::Bytes>,
+    relation: Arc<Relation>,
+    /// One raw pgoutput-message vector per source transaction. Keeping the
+    /// transaction vectors as chunks makes pump-side envelope coalescing O(1):
+    /// merging pushes a `Vec` instead of moving every `Bytes` while holding the
+    /// member mailbox lock.
+    raw_chunks: Vec<Vec<bytes::Bytes>>,
     source_commit_ts_ms: Option<i64>,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
@@ -383,7 +354,7 @@ impl PgChangeRows {
     #[must_use]
     pub fn new(
         schema: SchemaRef,
-        relation: Relation,
+        relation: Arc<Relation>,
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
     ) -> Self {
@@ -413,11 +384,46 @@ impl PgChangeRows {
         Self {
             schema,
             relation,
-            raw,
+            raw_chunks: vec![raw],
             source_commit_ts_ms,
             row_hint,
             byte_len,
         }
+    }
+
+    /// Append a compatible committed transaction without decoding or moving
+    /// its individual pgoutput messages.
+    ///
+    /// Returns `other` unchanged unless both sides were built against the very
+    /// same relation generation and working schema. A `Relation` message is the
+    /// decoding contract for the raw tuple bytes, so combining messages across
+    /// generations could interpret values with the wrong type or column layout.
+    ///
+    /// Compatibility is decided by pointer, not structure. Consecutive commits
+    /// for one relation take their schema from the same cached route and their
+    /// relation from the same decoder cache entry, so the pointers match on
+    /// every mergeable pair; a new `Relation` (or an adopted schema widening)
+    /// installs a fresh `Arc` and separates the generations. Pointer inequality
+    /// on structurally identical inputs only declines a merge, never mis-decodes
+    /// one — and this runs while the member mailbox lock is held, where a deep
+    /// `Schema` (fields plus metadata) and per-column name comparison would be
+    /// paid on every merge.
+    pub(super) fn try_append(&mut self, mut other: Self) -> Option<Self> {
+        if !Arc::ptr_eq(&self.schema, &other.schema)
+            || !Arc::ptr_eq(&self.relation, &other.relation)
+        {
+            return Some(other);
+        }
+
+        self.raw_chunks.append(&mut other.raw_chunks);
+        self.row_hint = self.row_hint.saturating_add(other.row_hint);
+        self.byte_len = self.byte_len.saturating_add(other.byte_len);
+        self.source_commit_ts_ms = match (self.source_commit_ts_ms, other.source_commit_ts_ms) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left @ Some(_), None) => left,
+            (None, right) => right,
+        };
+        None
     }
 }
 
@@ -454,7 +460,7 @@ impl ChangeRows for PgChangeRows {
     fn is_empty(&self) -> bool {
         // Exact: every buffered change message yields at least one output row,
         // so no messages ⟺ no rows.
-        self.raw.is_empty()
+        self.raw_chunks.iter().all(Vec::is_empty)
     }
 
     fn num_rows_hint(&self) -> usize {
@@ -486,10 +492,13 @@ impl ChangeRows for PgChangeRows {
     }
 
     fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
-        let changes = decode_raw_changes(&self.relation, &self.raw).map_err(|e| {
-            ChangeBatchError::DeferredBuild {
-                message: e.to_string(),
-            }
+        let changes = decode_raw_changes_iter(
+            &self.relation,
+            self.raw_chunks.iter().flatten(),
+            self.row_hint,
+        )
+        .map_err(|e| ChangeBatchError::DeferredBuild {
+            message: e.to_string(),
         })?;
         build_change_batch(&self.schema, &self.relation, &changes)
             .map(|b| b.with_source_commit_ts_ms(self.source_commit_ts_ms))
@@ -526,11 +535,17 @@ pub fn envelope_with_lsn(
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
     is_dataset_ready: bool,
+    dataset: String,
 ) -> ChangeEnvelope {
+    // Capture the batch's source-commit timestamp before it's moved into the
+    // envelope, so the committer can log end-to-end lag when it acks progress.
+    let source_commit_ts_ms = batch.source_commit_ts_ms();
     ChangeEnvelope::new(
         Box::new(LsnCommitter {
             confirmed_flush,
             flush_to,
+            dataset,
+            source_commit_ts_ms,
         }),
         batch,
         is_dataset_ready,
@@ -543,6 +558,11 @@ pub fn envelope_with_lsn(
 struct LsnCommitter {
     confirmed_flush: Arc<AtomicU64>,
     flush_to: u64,
+    /// Dataset name, for the committer-progress log line.
+    dataset: String,
+    /// Source-commit timestamp (ms since the Unix epoch) of the batch this
+    /// commit acks; `None` for snapshot-boundary batches.
+    source_commit_ts_ms: Option<i64>,
 }
 
 #[async_trait]
@@ -553,7 +573,7 @@ impl CommitChange for LsnCommitter {
         let mut current = self.confirmed_flush.load(Ordering::Relaxed);
         loop {
             if self.flush_to <= current {
-                return Ok(());
+                break;
             }
             match self.confirmed_flush.compare_exchange(
                 current,
@@ -561,10 +581,17 @@ impl CommitChange for LsnCommitter {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => break,
                 Err(actual) => current = actual,
             }
         }
+        crate::cdc::log_committer_progress(
+            "postgres",
+            &self.dataset,
+            &format!("lsn={}", self.flush_to),
+            self.source_commit_ts_ms,
+        );
+        Ok(())
     }
 
     /// The Postgres logical replication slot retains WAL until `confirmed_flush`
@@ -1830,6 +1857,8 @@ mod tests {
         let committer = LsnCommitter {
             confirmed_flush: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             flush_to: 42,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         assert!(committer.supports_deferral());
     }
@@ -1982,6 +2011,8 @@ mod tests {
         let c1 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 100,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c1.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
@@ -1990,6 +2021,8 @@ mod tests {
         let c2 = LsnCommitter {
             confirmed_flush: Arc::clone(&lsn),
             flush_to: 50,
+            dataset: "test".to_string(),
+            source_commit_ts_ms: None,
         };
         c2.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
@@ -3140,12 +3173,13 @@ mod tests {
 mod raw_decode_tests {
     use super::*;
     use crate::postgres_replication::pgoutput::Column;
+    use arrow::array::AsArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use std::sync::Arc;
 
-    fn relation() -> Relation {
-        Relation {
+    fn relation() -> Arc<Relation> {
+        Arc::new(Relation {
             relation_id: 1,
             namespace: "public".to_string(),
             name: "t".to_string(),
@@ -3164,7 +3198,7 @@ mod raw_decode_tests {
                     type_modifier: -1,
                 },
             ],
-        }
+        })
     }
 
     fn schema() -> SchemaRef {
@@ -3304,6 +3338,106 @@ mod raw_decode_tests {
         let eager_batch = build_change_batch(&sch, &rel, &eager).expect("eager build");
         let raw_batch = build_change_batch(&sch, &rel, &raw_changes).expect("raw build");
         assert_eq!(eager_batch.record, raw_batch.record);
+    }
+
+    #[test]
+    fn coalesced_raw_chunks_build_in_source_order() {
+        // Both sides take their schema and relation from the same generation, as
+        // consecutive commits for one table do on the pump.
+        let (sch, rel) = (schema(), relation());
+        let mut first = PgChangeRows::new(
+            Arc::clone(&sch),
+            Arc::clone(&rel),
+            vec![raw_insert(&["1", "a"])],
+            Some(100),
+        );
+        let second = PgChangeRows::new(sch, rel, vec![raw_insert(&["2", "b"])], Some(200));
+        assert!(
+            first.try_append(second).is_none(),
+            "compatible relation should append"
+        );
+
+        assert_eq!(first.num_rows_hint(), 2);
+        assert_eq!(first.source_commit_ts_ms(), Some(200));
+        let batch = Box::new(first).build().expect("build coalesced chunks");
+        assert_eq!(batch.record.num_rows(), 2);
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data column")
+            .as_struct();
+        let ids = data
+            .column_by_name("id")
+            .expect("id column")
+            .as_string::<i32>();
+        assert_eq!(ids.value(0), "1");
+        assert_eq!(ids.value(1), "2");
+        assert_eq!(batch.source_commit_ts_ms(), Some(200));
+    }
+
+    #[test]
+    fn raw_chunks_from_different_relation_generations_do_not_merge() {
+        let sch = schema();
+        let mut first = PgChangeRows::new(
+            Arc::clone(&sch),
+            relation(),
+            vec![raw_insert(&["1", "a"])],
+            Some(100),
+        );
+        let mut changed_relation = relation();
+        Arc::make_mut(&mut changed_relation).columns[1].type_oid = 1_043;
+        let second = PgChangeRows::new(
+            sch,
+            changed_relation,
+            vec![raw_insert(&["2", "b"])],
+            Some(200),
+        );
+
+        let returned = first.try_append(second);
+        assert!(
+            returned.is_some(),
+            "different relation metadata must seal the current envelope"
+        );
+        assert_eq!(first.num_rows_hint(), 1);
+        assert_eq!(first.source_commit_ts_ms(), Some(100));
+    }
+
+    #[test]
+    fn structurally_identical_but_distinct_generations_decline_the_merge() {
+        // Compatibility is decided by pointer, so a relation rebuilt from
+        // scratch declines the merge even though it compares equal field for
+        // field. That is the safe direction: a declined merge only costs one
+        // extra envelope, while merging across a generation the decoder has
+        // replaced could type the raw tuple bytes wrongly.
+        let sch = schema();
+        let mut first = PgChangeRows::new(
+            Arc::clone(&sch),
+            relation(),
+            vec![raw_insert(&["1", "a"])],
+            Some(100),
+        );
+        let second = PgChangeRows::new(sch, relation(), vec![raw_insert(&["2", "b"])], Some(200));
+
+        assert!(
+            first.try_append(second).is_some(),
+            "a separately-allocated relation must not merge"
+        );
+        assert_eq!(first.num_rows_hint(), 1);
+
+        // Same for the working schema: an adopted widening installs a new `Arc`.
+        let rel = relation();
+        let mut first = PgChangeRows::new(
+            schema(),
+            Arc::clone(&rel),
+            vec![raw_insert(&["1", "a"])],
+            Some(100),
+        );
+        let second = PgChangeRows::new(schema(), rel, vec![raw_insert(&["2", "b"])], Some(200));
+        assert!(
+            first.try_append(second).is_some(),
+            "a separately-allocated schema must not merge"
+        );
+        assert_eq!(first.num_rows_hint(), 1);
     }
 
     #[test]

@@ -262,22 +262,16 @@ impl SegmentTombstones {
         self.delete_sequence = delete_sequence;
     }
 
-    /// The reserved delete sequence stamped on this segment (the uniform sequence
-    /// applied to every key).
-    pub(crate) fn delete_sequence(&self) -> i64 {
-        self.delete_sequence
-    }
-
-    /// The deleted `Int64Pk` keys (empty for the row-key strategy). Each yields
-    /// once; the effective delete sequence is the uniform [`Self::delete_sequence`].
+    /// The deleted `Int64Pk` keys in this segment (empty for the row-key strategy).
+    /// Test-only since the merged-scan-deletions lockstep that consumed it in
+    /// production was retired when the per-scan merge memos gave way to the
+    /// demand-driven scan-view cache.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used only by mem-tier tombstone tests")
+    )]
     pub(crate) fn int64_keys(&self) -> impl Iterator<Item = i64> + '_ {
         self.int64_pk.keys().copied()
-    }
-
-    /// The deleted row keys (empty for the `Int64Pk` strategy). Each yields once;
-    /// the effective delete sequence is the uniform [`Self::delete_sequence`].
-    pub(crate) fn row_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        self.row_keys.keys().map(Box::as_ref)
     }
 
     /// Whether this segment carries no `Int64Pk` tombstone keys.

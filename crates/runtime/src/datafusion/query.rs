@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fmt::Display, fmt::Write as _, sync::Arc};
+use std::{borrow::Cow, fmt::Display, fmt::Write as _, sync::Arc};
 
 use ::cache::{
     AsTableRefs, get_logical_plan_input_tables,
@@ -93,6 +93,7 @@ use crate::datafusion::{
     query::cache::RequestCacheManager,
     sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
+use crate::task_history::correlation;
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_auth::AuthRequestContext;
@@ -601,17 +602,17 @@ impl Query {
             total_executor_ms = tracing::field::Empty,
         );
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         let result = self
             .submit_distributed_internal(
                 job_id,
                 request_context,
                 span.clone(),
+                trace_span.clone(),
                 DistributedSubmitMode::New,
             )
+            .instrument(trace_span)
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -640,17 +641,17 @@ impl Query {
             total_executor_ms = tracing::field::Empty,
         );
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         let result = self
             .submit_distributed_internal(
                 job_id,
                 request_context,
                 span.clone(),
+                trace_span.clone(),
                 DistributedSubmitMode::Resume,
             )
+            .instrument(trace_span)
             .await;
         if let Err(e) = &result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -664,6 +665,7 @@ impl Query {
         job_id: &str,
         request_context: Arc<RequestContext>,
         span: Span,
+        trace_span: Span,
         mode: DistributedSubmitMode,
     ) -> Result<QueryHandle> {
         // Get the scheduler server
@@ -776,6 +778,7 @@ impl Query {
                                 None, // Cache key already used for lookup
                                 cached_result.data,
                                 Arc::clone(&request_context),
+                                trace_span,
                                 Arc::clone(&sql_preview),
                             ));
                         }
@@ -833,6 +836,7 @@ impl Query {
                             None,
                             Box::pin(stream),
                             Arc::clone(&request_context),
+                            trace_span,
                             Arc::clone(&sql_preview),
                         ));
                     }
@@ -859,7 +863,7 @@ impl Query {
         }
 
         // Get the schema from the logical plan
-        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let schema = Arc::clone(plan.schema().inner());
 
         let input_tables = get_logical_plan_input_tables(&plan);
         if input_tables
@@ -904,7 +908,7 @@ impl Query {
         // the Ballista job id so it can be addressed across schedulers.
         let ballista_job_id = if mode == DistributedSubmitMode::Resume {
             scheduler
-                .recover_job(job_id)
+                .recover_job(&ballista_core::JobId::from(job_id))
                 .await
                 .map_err(|e| Error::JobSubmissionFailed {
                     message: e.to_string(),
@@ -935,6 +939,7 @@ impl Query {
             tracker,
             request_context,
             span,
+            trace_span,
             sql_preview,
             query_start,
             plan_capture::logical_plan_is_explain(&plan),
@@ -991,9 +996,12 @@ impl Query {
         let query_start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
-        if let Some(traceparent) = request_context.trace_parent() {
-            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
-        }
+        // Carries this query's trace id onto every log record it produces — its
+        // own and those of everything it reaches — for the whole of planning,
+        // execution and result streaming. Unlike `span` above, it survives
+        // `runtime.task_history.enabled: false`, which is the case that
+        // otherwise leaves a failure with nothing to correlate on.
+        let trace_span = correlation::begin_task_trace(&span, &request_context);
 
         // Resolve the cancellation token for this query. An explicit token on
         // the `Query` takes precedence; otherwise the query inherits the
@@ -1056,6 +1064,7 @@ impl Query {
             self.query_id,
             sql_preview.as_ref(),
             request_context.protocol(),
+            Arc::from(request_context.cache_namespace().storage_id()),
             query_cancel_token.clone(),
         );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
@@ -1255,7 +1264,11 @@ impl Query {
                 // - plans cache must be cleared so future queries re-resolve table
                 //   providers with up-to-date in-memory state.
                 if let Some(dml_table) = extract_dml_target_table(&plan)
-                    && let Err(e) = ctx.df.caching().invalidate_for_table(dml_table.clone())
+                    && let Err(e) = ctx
+                        .df
+                        .caching()
+                        .invalidate_for_table(dml_table.clone())
+                        .await
                 {
                     tracing::warn!(
                         "Failed to invalidate caches for table {dml_table} before DML: {e}",
@@ -1444,8 +1457,10 @@ impl Query {
                         }
                     };
 
-                    let mut execution_session = session.clone();
-                    if let Some(batch_size) =
+                    // Only clone SessionState when adaptive Flight batch sizing
+                    // rebuilds the physical plan; otherwise TaskContext can borrow
+                    // the existing session.
+                    let task_ctx = if let Some(batch_size) =
                         Self::adaptive_flight_batch_size(&session, &request_context, &physical_plan)
                     {
                         Self::ensure_not_cancelled(
@@ -1468,11 +1483,12 @@ impl Query {
                                 )
                             }
                         };
-                        execution_session = adaptive_session;
-                    }
+                        Arc::new(TaskContext::from(&adaptive_session))
+                    } else {
+                        Arc::new(TaskContext::from(&session))
+                    };
 
                     Self::ensure_not_cancelled(&query_cancel_token, &query_id_str, &timeout_state)?;
-                    let task_ctx = Arc::new(TaskContext::from(&execution_session));
 
                     let stream = match execute_stream_preserving_output_order(
                         Arc::clone(&physical_plan),
@@ -1545,6 +1561,7 @@ impl Query {
                         res_stream,
                         cache_manager.raw_cache_key,
                         datasets,
+                        query_start,
                     )
                 } else {
                     res_stream
@@ -1600,7 +1617,8 @@ impl Query {
                     cache_manager.cache_status,
                 ))
             }
-            .instrument(span.clone());
+            .instrument(span.clone())
+            .instrument(trace_span.clone());
 
         // Keep this large async block out of callers' state machines. This
         // preserves the concrete future type, avoiding dynamic dispatch while
@@ -1608,7 +1626,14 @@ impl Query {
         let query_result = Box::pin(query_result).await;
 
         match query_result {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                // The result stream outlives this call — Flight drains it
+                // lazily, the managed runtime drives it on another task — and a
+                // query fails mid-stream as readily as during planning, so the
+                // trace id has to travel with the stream, not just the future
+                // that produced it.
+                Ok(instrument_query_result(result, trace_span))
+            }
             Err(e) => {
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
@@ -1716,10 +1741,11 @@ impl Query {
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
         // If there is an error getting the schema, we still want to track it in task history
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
+        let trace_span = correlation::begin_task_trace(&span, request_context);
         let error_code = ErrorCode::from(e);
-        span.in_scope(|| {
-            self.finish_with_error(request_context, e.to_string(), error_code);
-        });
+        let _trace = trace_span.enter();
+        let _task = span.enter();
+        self.finish_with_error(request_context, e.to_string(), error_code);
     }
 }
 
@@ -1768,6 +1794,45 @@ fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataF
     Ok(maybe_schema)
 }
 
+/// Collapses the control characters in a query error message so it logs as a
+/// single record.
+///
+/// A memory-pool refusal spreads its top-consumer breakdown over several lines,
+/// and a record that breaks mid-message is one a log collector cannot group or
+/// alert on. Every control character is replaced rather than dropped, so
+/// offsets into the logged line still match the message the response carries.
+/// Only the logged copy is collapsed — the body keeps what the engine wrote —
+/// and a message with nothing to collapse is borrowed, so the common path does
+/// not allocate.
+pub(crate) fn single_line(message: &str) -> Cow<'_, str> {
+    if message.contains(char::is_control) {
+        Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(message)
+    }
+}
+
+/// The `err_code` a failure raised while batches are being polled is recorded
+/// under.
+///
+/// A memory-pool refusal is characteristically mid-stream — an operator grows
+/// its reservation as batches arrive — so this site has to name it, or capacity
+/// never appears in a `query_failures{err_code}` breakdown. Everything else
+/// stays `QueryExecutionError`: the stream is executing, and `ErrorCode::from`
+/// would put Arrow, IO and Parquet failures under `InternalError`, which reads
+/// as a runtime bug rather than a data-plane one.
+fn stream_error_code(error: &DataFusionError) -> ErrorCode {
+    match ErrorCode::from(error) {
+        ErrorCode::ResourcesExhausted => ErrorCode::ResourcesExhausted,
+        _ => ErrorCode::QueryExecutionError,
+    }
+}
+
 #[must_use]
 /// Attaches a query tracker to a stream of record batches.
 ///
@@ -1792,7 +1857,10 @@ fn attach_query_tracker_to_stream(
     let mut num_records = 0u64;
     let mut num_output_bytes = 0u64;
 
-    let mut captured_output = "[]".to_string(); // default to empty preview
+    // Only the task history row reads the captured output preview, so the
+    // default costs no allocation on the path that never fills it in.
+    let capture_task_history = tracker.task_history_enabled;
+    let mut captured_output = Cow::Borrowed("[]"); // default to empty preview
 
     let inner_span = span.clone();
     let updated_stream = stream! {
@@ -1801,8 +1869,8 @@ fn attach_query_tracker_to_stream(
             match &batch_result {
                 Ok(batch) => {
                     // Create a truncated output for the query history table on first batch.
-                    if num_records == 0 {
-                        captured_output = write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default();
+                    if capture_task_history && num_records == 0 {
+                        captured_output = Cow::Owned(write_to_json_string(&[batch.slice(0, batch.num_rows().min(3))]).unwrap_or_default());
                     }
 
                     num_output_bytes += batch.get_array_memory_size() as u64;
@@ -1817,9 +1885,11 @@ fn attach_query_tracker_to_stream(
                         .finish_with_error(
                             &request_context,
                             e.to_string(),
-                            ErrorCode::QueryExecutionError,
+                            stream_error_code(e),
                         );
-                    tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                    if capture_task_history {
+                        tracing::error!(target: "task_history", parent: &inner_span, "{e}");
+                    }
                     yield batch_result;
                     return;
                 }
@@ -1833,7 +1903,7 @@ fn attach_query_tracker_to_stream(
         tracker
             .schema(schema_copy)
             .rows_produced(num_records)
-            .finish(&request_context, &Arc::from(captured_output));
+            .finish(&request_context, &captured_output);
     };
 
     Box::pin(RecordBatchStreamAdapter::new(
@@ -1844,35 +1914,51 @@ fn attach_query_tracker_to_stream(
 
 /// This guard guarantees:
 ///  * If we incremented nested query count, we will decrement. And vice versa.
-///  * If we incremented active query count, we will decrement. And vice versa.
+///  * A request that goes from idle to busy increments the active query count
+///    exactly once, and decrements it exactly once when it goes back to idle.
 ///  * Active query count decrement will be called with the same dimensions as increment.
+///
+/// The increment and the decrement are taken from the two *edges* of the
+/// request's query count — idle to busy, and busy back to idle — rather than
+/// from a flag remembered on the guard that saw the first edge. Independent
+/// queries can share one request context and overlap (a search fans out one
+/// query per table and per embedding column; NSQL samples datasets with
+/// `buffer_unordered`, which yields in completion order), so the guard that
+/// opened the request is not guaranteed to be the one that closes it. Anchoring
+/// the release on that guard instead of on the edge fails whichever way it is
+/// written: releasing only when it is *also* the last one out strands the
+/// decrement every time it is not, and releasing unconditionally fires it while
+/// siblings are still running.
+///
+/// Each guard keeps the dimensions it was built with, which pins the pair for
+/// a request that runs one query at a time. Across overlapping queries the two
+/// edges can land on different guards, and those agree because
+/// `to_protocol_dimensions` interns one `'static` slice per `Protocol` and the
+/// only writer of a context's protocol is `set_flightsql_protocol`, which every
+/// `FlightSQL` handler calls before it runs a query.
 pub struct QueryActiveGuard {
     request_context: Arc<RequestContext>,
     dimensions: &'static [KeyValue],
-    active: bool,
 }
 
 impl QueryActiveGuard {
     pub fn new(request_context: Arc<RequestContext>) -> Self {
         let dimensions = request_context.to_protocol_dimensions();
 
-        let active = request_context.entered_top_level_query();
-        if active {
+        if request_context.entered_top_level_query() {
             runtime_metrics::telemetry::inc_query_active_count(dimensions);
         }
 
         Self {
             request_context,
             dimensions,
-            active,
         }
     }
 }
 
 impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
-        let exited = self.request_context.exited_top_level_query();
-        if self.active && exited {
+        if self.request_context.exited_top_level_query() {
             runtime_metrics::telemetry::dec_query_active_count(self.dimensions);
         }
     }
@@ -1899,6 +1985,27 @@ fn attach_query_active_guard_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// Enters `span` for every poll of a result stream, so records emitted while
+/// batches are produced are attributed to the query that asked for them.
+pub(crate) fn instrument_record_batch_stream(
+    stream: SendableRecordBatchStream,
+    span: Span,
+) -> SendableRecordBatchStream {
+    // `RecordBatchStreamAdapter` pin-projects its stream, so no inner `Box::pin`
+    // is needed — one fewer allocation and one fewer virtual call per poll.
+    let schema = stream.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream.instrument(span),
+    ))
+}
+
+/// [`instrument_record_batch_stream`] applied to a whole [`QueryResult`].
+fn instrument_query_result(query_result: QueryResult, span: Span) -> QueryResult {
+    let QueryResult { data, cache_status } = query_result;
+    QueryResult::new(instrument_record_batch_stream(data, span), cache_status)
 }
 
 fn attach_cancellation_to_query_result<G>(
@@ -2776,6 +2883,53 @@ mod tests {
 
     use super::*;
 
+    /// A pool refusal is the one condition this site names, in every wrapper
+    /// the join and execution paths produce.
+    #[test]
+    fn stream_error_code_names_a_pool_refusal() {
+        assert_eq!(
+            stream_error_code(&DataFusionError::ResourcesExhausted("oom".to_string())),
+            ErrorCode::ResourcesExhausted
+        );
+        assert_eq!(
+            stream_error_code(&DataFusionError::Shared(Arc::new(
+                DataFusionError::ResourcesExhausted("oom".to_string())
+            ))),
+            ErrorCode::ResourcesExhausted
+        );
+        assert_eq!(
+            stream_error_code(&DataFusionError::Context(
+                "Join Error".to_string(),
+                Box::new(DataFusionError::ResourcesExhausted("oom".to_string()))
+            )),
+            ErrorCode::ResourcesExhausted
+        );
+    }
+
+    /// Everything else keeps the code it had before capacity was split out —
+    /// including the variants `ErrorCode::from` would otherwise move to
+    /// `InternalError`.
+    #[test]
+    fn stream_error_code_leaves_every_other_failure_alone() {
+        for error in [
+            DataFusionError::Execution("boom".to_string()),
+            DataFusionError::External("connector failed".into()),
+            DataFusionError::ArrowError(
+                Box::new(arrow::error::ArrowError::ComputeError("cast".to_string())),
+                None,
+            ),
+            DataFusionError::IoError(std::io::Error::other("disk")),
+            DataFusionError::Internal("bug".to_string()),
+            DataFusionError::Plan("bad plan".to_string()),
+        ] {
+            assert_eq!(
+                stream_error_code(&error),
+                ErrorCode::QueryExecutionError,
+                "{error} must stay on the execution code"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct NoopDmlHandler;
 
@@ -3001,11 +3155,20 @@ mod tests {
         assert_eq!(cached_query.cache_status, CacheStatus::CacheHit);
         let registry = df.query_cancel_registry();
         assert!(
-            registry.list().iter().any(|info| info.query_id == query_id),
+            registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id),
             "cached query should remain registered while its stream is alive"
         );
 
-        assert!(registry.cancel(query_id));
+        let owner = registry
+            .list_all()
+            .into_iter()
+            .find(|info| info.query_id == query_id)
+            .map(|info| info.owner)
+            .expect("the registered query should expose its owning scope");
+        assert!(registry.cancel_owned(query_id, &owner));
         assert!(cancel_token.is_cancelled());
         let cancellation = cached_query
             .data
@@ -3018,9 +3181,40 @@ mod tests {
         );
         assert!(cached_query.data.next().await.is_none());
         assert!(
-            registry.list().iter().all(|info| info.query_id != query_id),
+            registry
+                .list_all()
+                .iter()
+                .all(|info| info.query_id != query_id),
             "cached query should be deregistered after the stream terminates"
         );
+    }
+
+    /// [query admission] The three states of
+    /// `runtime.query.max_concurrent_queries`: unset sizes the gate from the CPU
+    /// budget, `0` opts out of admission control entirely, and any other value is
+    /// that many permits. `0` is the only way to get the unbounded behavior, so a
+    /// regression that reinstated "unset means unbounded" would show up here.
+    #[tokio::test]
+    async fn query_admission_permits_follow_the_configured_value() {
+        let gate = |configured: Option<usize>| {
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .max_concurrent_queries(configured)
+            .build()
+            .query_admission_semaphore()
+            .map(|s| s.available_permits())
+        };
+
+        assert_eq!(
+            gate(None),
+            Some(cpu_budget::cpu_budget().max_concurrent_queries()),
+            "unset must be bounded by the CPU budget, not unbounded"
+        );
+        assert_eq!(gate(Some(0)), None, "0 opts out of admission control");
+        assert_eq!(gate(Some(7)), Some(7));
     }
 
     /// [query admission] With `max_concurrent_queries = 1`, a second
@@ -3127,7 +3321,11 @@ mod tests {
         // a fixed sleep (which is flaky under slow CI). Bounded fallback (~5s).
         let registry = df.query_cancel_registry();
         for _ in 0..500 {
-            if registry.list().iter().any(|info| info.query_id == query_id) {
+            if registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3145,6 +3343,58 @@ mod tests {
             } => assert_eq!(cancelled, query_id.to_string()),
             other => panic!("expected QueryCancelled, got: {other:?}"),
         }
+    }
+
+    /// A query fails mid-stream as readily as during planning, and the result
+    /// stream is drained long after `run` returns — by Flight, or by the
+    /// managed runtime on another task. So the trace span has to be entered on
+    /// every poll of the stream, not merely while the query is being built.
+    #[tokio::test]
+    async fn instrumented_query_result_enters_the_trace_span_while_streaming() {
+        use futures::StreamExt as _;
+
+        // A registry is enough: the span only has to exist for `Span::current()`
+        // to report it — nothing here formats or exports it. Installed before
+        // the span is created, or the span would be a no-op.
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry());
+
+        let schema = Arc::new(Schema::empty());
+        let spans_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        let recorder = Arc::clone(&spans_seen);
+        let batches = futures::stream::iter(vec![
+            Ok(RecordBatch::new_empty(Arc::clone(&schema))),
+            Ok(RecordBatch::new_empty(Arc::clone(&schema))),
+        ])
+        .inspect(move |_| {
+            recorder
+                .lock()
+                .push(Span::current().metadata().map(tracing::Metadata::name));
+        });
+
+        let result = QueryResult::new(
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches)),
+            CacheStatus::CacheDisabled,
+        );
+        let request_context = RequestContext::builder(Protocol::Http)
+            .with_client_trace_id(Some(Arc::from("4bf92f3577b34da6a3ce929d0e0e4736")))
+            .build();
+        let instrumented = instrument_query_result(
+            result,
+            correlation::begin_task_trace(&Span::none(), &request_context),
+        );
+
+        let batches: Vec<_> = instrumented.data.collect().await;
+        assert_eq!(batches.len(), 2, "both batches must still reach the caller");
+
+        assert_eq!(
+            *spans_seen.lock(),
+            vec![
+                Some(correlation::TRACE_SPAN_NAME),
+                Some(correlation::TRACE_SPAN_NAME)
+            ],
+            "every poll of the result stream must run inside the query's trace span"
+        );
     }
 
     /// [query timeout] A query still QUEUED for an admission permit when the

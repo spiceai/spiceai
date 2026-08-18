@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use crate::datafusion::pg_catalog::{
-    COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME, register_postgres_comment_udfs,
-};
 use crate::datafusion::udtf::flatten_json::{
     FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
 };
@@ -30,16 +27,16 @@ use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, Js
 use crate::embeddings::udtf::VectorSearchTableFunc;
 use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
 use datafusion::execution::FunctionRegistry;
-use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
 #[cfg(feature = "models")]
-use runtime_datafusion_udfs::{
-    ai::{AI_UDF_NAME, Ai},
-    embed::{self, EMBED_UDF_NAME},
-};
+use runtime_datafusion_udfs::{ai::Ai, embed};
+// The UDF *names* are no longer part of any production path here — each function
+// registers its own deny-list entry — but both test modules still assert against
+// them, so they are imported for tests only.
+#[cfg(all(test, feature = "models"))]
+use runtime_datafusion_udfs::{ai::AI_UDF_NAME, embed::EMBED_UDF_NAME};
 use runtime_query_engine::query_engine::QueryEngine;
 use runtime_search::full_text_udtf::TextSearchTableFunc;
 use runtime_search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
@@ -50,40 +47,21 @@ use runtime_search::udtf::{TEXT_SEARCH_UDTF_NAME, VECTOR_SEARCH_UDTF_NAME};
 use runtime_secrets::{ExposeSecret, get_params_with_secrets};
 #[cfg(not(feature = "models"))]
 const EMBED_UDF_NAME: &str = "embed";
-use runtime_datafusion_udfs::{
-    alias::ScalarUDFAlias,
-    assert::Assert,
-    bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
-    cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
-    digest_many::{DIGEST_UDF_NAME, INSTANCE},
-    inner_product::{INNER_PRODUCT_UDF_NAME, InnerProduct},
-    l2_distance::{
-        L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME, L2Distance, L2SquaredDistance,
-    },
-    l2_norm::{L2_NORM_UDF_NAME, L2Norm},
-    truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
-};
+// `runtime-datafusion-udfs` gates its `embed` module on `models`, so without that
+// feature the name has no registration there — but `embed` must still be denied,
+// so register it here alongside the fallback constant.
+#[cfg(not(feature = "models"))]
+runtime_udfs_api::register_spice_function!(EMBED_SPICE_FUNCTION_FALLBACK, EMBED_UDF_NAME);
 use serde_json::Value;
 use spicepod::component::function::{Function, FunctionKind, Volatility};
 use util::in_tracing_context_async;
 
-/// Register core scalar UDFs that have no runtime dependencies.
-///
-/// These UDFs only need a [`SessionContext`] and can be registered on any
-/// context, including isolated ones like the refresh-task context.
-pub fn register_core_scalar_udfs(ctx: &SessionContext) {
-    ctx.register_udf(ScalarUDFAlias::new(Arc::new(RandomFunc::default()), "rand").into());
-    ctx.register_udf(Bucket::new().into());
-    ctx.register_udf(CosineDistance::new().into());
-    ctx.register_udf(InnerProduct::new().into());
-    ctx.register_udf(L2Distance::new().into());
-    ctx.register_udf(L2SquaredDistance::new().into());
-    ctx.register_udf(L2Norm::new().into());
-    ctx.register_udf(Truncate::new().into());
-    ctx.register_udf(Assert::new().into());
-    ctx.register_udf(INSTANCE.clone());
-    register_postgres_comment_udfs(ctx);
-}
+// `rand` is a Spice alias over DataFusion's `RandomFunc`, registered by
+// `register_core_scalar_udfs` below, so its deny-list entry is declared here
+// rather than in a UDF crate.
+runtime_udfs_api::register_spice_function!(RAND_SPICE_FUNCTION, "rand");
+
+pub use runtime_datafusion::udf::register_core_scalar_udfs;
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
     let ctx = &runtime.df.ctx;
@@ -561,54 +539,6 @@ pub async fn apply_function_diff(
     }
 }
 
-/// Returns the full list of Spice-specific scalar function names denied for
-/// federation by default.
-fn denied_spice_function_names() -> Vec<String> {
-    let mut names: Vec<String> = [
-        "rand",
-        BUCKET_SCALAR_UDF_NAME,
-        COSINE_DISTANCE_UDF_NAME,
-        INNER_PRODUCT_UDF_NAME,
-        L2_DISTANCE_UDF_NAME,
-        L2_SQUARED_DISTANCE_UDF_NAME,
-        L2_NORM_UDF_NAME,
-        TRUNCATE_SCALAR_UDF_NAME,
-        OBJ_DESCRIPTION_UDF_NAME,
-        COL_DESCRIPTION_UDF_NAME,
-        EMBED_UDF_NAME,
-        #[cfg(feature = "models")]
-        AI_UDF_NAME,
-        DIGEST_UDF_NAME,
-        FLATTEN_JSON_PROPERTIES_UDTF_NAME,
-        FLATTEN_JSON_UDTF_NAME,
-        JSON_TREE_UDTF_NAME,
-        RERANK_UDTF_NAME,
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    names.extend(json_functions());
-    names
-}
-
-static BUILTIN_DENIED_SPICE_FUNCTION_NAMES: LazyLock<Vec<String>> =
-    LazyLock::new(denied_spice_function_names);
-
-/// Dynamic deny-list: built-ins plus any user-registered functions. Held
-/// in a [`RwLock`] so that hot-reload can update the user slice without
-/// requiring callers to refactor.
-static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
-    RwLock::new(Arc::new(build_function_support(
-        BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
-        &[],
-    )))
-});
-
-/// Names of user-defined functions currently in the deny-list. Kept
-/// separate so we can rebuild the combined [`FunctionSupport`] when
-/// either slice changes.
-static USER_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> = LazyLock::new(|| RwLock::new(vec![]));
-
 /// Names of UDFs whose invocation can execute external code or make RPC/API
 /// calls. Read-only API keys are not allowed to plan or execute these functions.
 static CODE_EXECUTING_FUNCTION_NAMES: LazyLock<RwLock<Vec<String>>> =
@@ -649,75 +579,23 @@ fn remove_user_function_info(name: &str) {
     USER_FUNCTION_INFO.write().retain(|i| i.name != name);
 }
 
-fn build_function_support(builtins: &[String], user: &[String]) -> FunctionSupport {
-    let mut denied: Vec<String> = Vec::with_capacity(builtins.len() + user.len());
-    denied.extend(builtins.iter().cloned());
-    denied.extend(user.iter().cloned());
-    FunctionSupport::new(Some(FunctionRestriction::Deny(denied)), None, None)
-}
-
-/// Drop from a deny-list any function a backend can execute natively (the
-/// `native` names, typically derived from that backend's unparser dialect).
-///
-/// A Spice-specific function that the backend's dialect can rewrite into a real
-/// remote function — e.g. `cosine_distance` → `array_cosine_distance`, or `rand`
-/// → `random()` for `DuckDB` — should be federated, not denied. Names in
-/// `native` that aren't in the deny-list are ignored.
-fn deny_list_excluding_native(deny: &[String], native: &[&str]) -> Vec<String> {
-    let native: HashSet<&str> = native.iter().copied().collect();
-    deny.iter()
-        .filter(|name| !native.contains(name.as_str()))
-        .cloned()
-        .collect()
-}
-
-fn rebuild_deny_lists(user: &[String]) {
-    let combined = build_function_support(BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(), user);
-    *DENY_LIST.write() = Arc::new(combined);
-}
-
 /// Add a user function name to the federation deny-list. Idempotent.
 pub fn add_user_function_to_deny_list(name: &str) {
-    add_user_functions_to_deny_list(std::iter::once(name.to_string()));
+    runtime_udfs_api::add_user_function(name);
 }
 
 fn add_user_functions_to_deny_list(names: impl IntoIterator<Item = String>) {
-    let user = {
-        let mut guard = USER_FUNCTION_NAMES.write();
-        let mut changed = false;
-        for name in names {
-            if !guard.iter().any(|n| n == &name) {
-                guard.push(name);
-                changed = true;
-            }
-        }
-        changed.then(|| guard.clone())
-    };
-    if let Some(user) = user {
-        rebuild_deny_lists(&user);
-    }
+    runtime_udfs_api::add_user_functions(names);
 }
 
 /// Remove a user function name from the federation deny-list. No-op if
 /// not present.
 pub fn remove_user_function_from_deny_list(name: &str) {
-    remove_user_functions_from_deny_list(&[name.to_string()]);
+    runtime_udfs_api::remove_user_function(name);
 }
 
 fn remove_user_functions_from_deny_list(names: &[String]) {
-    if names.is_empty() {
-        return;
-    }
-    let user = {
-        let mut guard = USER_FUNCTION_NAMES.write();
-        let before = guard.len();
-        guard.retain(|n| !names.iter().any(|name| name == n));
-        if guard.len() == before {
-            return;
-        }
-        guard.clone()
-    };
-    rebuild_deny_lists(&user);
+    runtime_udfs_api::remove_user_functions(names);
 }
 
 /// Add a function name to the read-write API key requirement set. Idempotent.
@@ -744,201 +622,93 @@ pub fn is_code_executing_function(name: &str) -> bool {
         .any(|function_name| function_name.eq_ignore_ascii_case(name))
 }
 
-/// Return the current combined deny-list: built-ins plus every
-/// user-registered function. The returned [`Arc`] is cheap to clone and is
-/// safe to use from per-query filter pushdown paths.
-#[must_use]
-pub fn deny_spice_specific_functions() -> Arc<FunctionSupport> {
-    Arc::clone(&*DENY_LIST.read())
-}
+pub use runtime_datafusion::function_support::{
+    deny_spice_functions_for_duckdb, deny_spice_functions_for_duckdb_table_providers,
+    deny_spice_functions_for_postgres_table_providers,
+};
+pub use runtime_udfs_api::{
+    deny_spice_functions_for_table_providers, deny_spice_specific_functions,
+    deny_spice_specific_functions_excluding,
+};
 
-/// Return a backend-specific federation deny-list: the default deny-list with
-/// the `native` functions removed so they federate (push down) instead.
-///
-/// `native` is the set of functions the target backend can execute itself,
-/// typically obtained from that backend's unparser dialect (e.g.
-/// [`crate::datafusion::dialect::duckdb_native_function_names`]). This is how the
-/// deny-list becomes connector/accelerator-aware: each backend only denies the
-/// Spice functions it genuinely can't run, and pushes down the ones its dialect
-/// can rewrite into a real remote function. Names in `native` that aren't in the
-/// deny-list are ignored. User-registered functions are always denied — no
-/// remote backend has a built-in equivalent for them — so only the built-in
-/// Spice functions are eligible for the carve-out.
-///
-/// Returns the cached default list when `native` is empty.
-#[must_use]
-pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionSupport> {
-    if native.is_empty() {
-        return deny_spice_specific_functions();
-    }
-    let builtins =
-        deny_list_excluding_native(BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(), native);
-    let user = USER_FUNCTION_NAMES.read().clone();
-    Arc::new(build_function_support(&builtins, &user))
-}
+#[cfg(test)]
+mod deny_list_registration_tests {
+    //! The deny-list is derived from a `linkme` slice, so a registration whose
+    //! crate is not linked simply vanishes — and a missing name does not fail
+    //! loudly, it makes the function federatable. This module keeps the expected
+    //! set written out by hand, as *test* data only, and asserts the registry
+    //! still contains all of it. Adding a UDF therefore fails a test rather than
+    //! silently pushing a Spice function down to a remote source.
 
-/// Return the [`FunctionSupport`] for `DuckDB` connectors and accelerators.
-///
-/// Identical to [`deny_spice_specific_functions`] except it allows every
-/// function the `DuckDB` unparser dialect can rewrite into native `DuckDB` SQL
-/// (e.g. `cosine_distance` → `array_cosine_distance`, `rand` → `random()`). The
-/// allowed set is derived from
-/// [`crate::datafusion::dialect::duckdb_native_function_names`] so it tracks the
-/// dialect automatically.
-#[must_use]
-pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    deny_spice_specific_functions_excluding(
-        &crate::datafusion::dialect::duckdb_native_function_names(),
-    )
-}
+    use std::collections::HashSet;
 
-/// The list of Spice function names denied to `DuckDB`: every built-in Spice UDF
-/// the `DuckDB` dialect can't rewrite into native SQL, plus all user-registered
-/// functions. Shared source of truth for both the local
-/// [`deny_spice_functions_for_duckdb`] ([`FunctionSupport`]) and the
-/// table-providers-typed [`deny_spice_functions_for_duckdb_table_providers`].
-fn denied_function_names_for_duckdb() -> Vec<String> {
-    let builtins = deny_list_excluding_native(
-        BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
-        &crate::datafusion::dialect::duckdb_native_function_names(),
-    );
-    let user = USER_FUNCTION_NAMES.read().clone();
-    let mut denied = Vec::with_capacity(builtins.len() + user.len());
-    denied.extend(builtins);
-    denied.extend(user);
-    denied
-}
+    use crate::datafusion::pg_catalog::{COL_DESCRIPTION_UDF_NAME, OBJ_DESCRIPTION_UDF_NAME};
+    use runtime_datafusion_udfs::{
+        bucket::BUCKET_SCALAR_UDF_NAME,
+        cosine_distance::COSINE_DISTANCE_UDF_NAME,
+        digest_many::DIGEST_UDF_NAME,
+        inner_product::INNER_PRODUCT_UDF_NAME,
+        l2_distance::{L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME},
+        l2_norm::L2_NORM_UDF_NAME,
+        truncate::TRUNCATE_SCALAR_UDF_NAME,
+    };
+    use runtime_datafusion_udfs::{
+        flatten_json::FLATTEN_JSON_UDTF_NAME, json_properties::FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        json_tree::JSON_TREE_UDTF_NAME,
+    };
+    use runtime_search::rerank::RERANK_UDTF_NAME;
+    // `EMBED_UDF_NAME` / `AI_UDF_NAME` resolve from the parent module, which
+    // defines or imports them depending on the `models` feature.
+    #[cfg(feature = "models")]
+    use super::AI_UDF_NAME;
+    use super::EMBED_UDF_NAME;
 
-/// DuckDB-specific deny-list: same set as [`deny_spice_functions_for_duckdb`]
-/// expressed as a value rather than `Arc`. Used with
-/// `DuckDBTableFactory::with_function_support`. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
-    FunctionSupport::new(
-        Some(FunctionRestriction::Deny(denied_function_names_for_duckdb())),
-        None,
-        None,
-    )
-}
-
-/// Full Spice UDF deny-list as a value (not `Arc`). Suitable for any SQL
-/// connector whose unparser dialect has no Spice-function carve-out — every
-/// built-in Spice UDF plus any user-registered function is blocked from being
-/// pushed down to the remote source. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
-    deny_spice_specific_functions().as_ref().clone()
-}
-
-/// `DataFusion`'s built-in nested (array/list/map) scalar functions, by canonical
-/// name AND every alias.
-///
-/// Aliases are essential here: when a function is invoked by an alias, the
-/// planner keeps the alias in the logical plan (e.g. `array_contains(...)` shows
-/// up as `array_contains`, not its canonical `array_has`), and federation matches
-/// the deny-list against that name. Collecting only canonical names would let
-/// every alias federate and be unparsed straight into the remote engine — which
-/// is exactly how `array_contains` was reaching Redshift.
-fn datafusion_nested_function_names() -> &'static [String] {
-    // The default nested-function set is fixed for the lifetime of the process,
-    // so compute the name+alias list once instead of re-allocating it on every
-    // Postgres table-provider construction.
-    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
-        datafusion::functions_nested::all_default_nested_functions()
-            .iter()
-            .flat_map(|udf| {
-                std::iter::once(udf.name().to_string()).chain(udf.aliases().iter().cloned())
-            })
-            .collect()
-    });
-    NAMES.as_slice()
-}
-
-/// `DataFusion` array functions that `PostgreSQL` implements under the SAME name,
-/// with a matching argument signature AND matching semantics, so they can keep
-/// being federated (pushed down) to a `PostgreSQL`-wire backend rather than being
-/// denied. Anything not on this list is denied for Postgres (see
-/// [`denied_function_names_for_postgres`]).
-///
-/// Cross-checked against the `DataFusion` array functions and `PostgreSQL`'s array functions:
-/// - <https://datafusion.apache.org/user-guide/sql/scalar_functions.html#array-functions>
-/// - <https://www.postgresql.org/docs/current/functions-array.html>
-///
-/// Everything else in `DataFusion`'s array family is denied because `PostgreSQL`
-/// either:
-/// - lacks the function entirely — `array_has`/`array_contains` (`PostgreSQL` uses
-///   the `@>`/`= ANY` operators), `make_array` (`ARRAY[...]` syntax), `flatten`,
-///   `range`/`generate_series` (set-returning, not an array), the set ops
-///   (`array_distinct`/`array_union`/`array_intersect`/`array_except`),
-///   element/slice accessors (`array_element`/`array_slice`/`array_pop_*`),
-///   `array_distance`, `array_max`/`array_min`, `map_*`, ...;
-/// - spells it differently — `DataFusion`'s canonical `array_concat` vs
-///   `PostgreSQL`'s `array_cat`. These could be a candidate for function rewrite later.
-/// - uses an incompatible signature — `array_length(array)` is valid in
-///   `DataFusion` (dimension optional) but `PostgreSQL` requires the dimension;
-///   `array_dims` returns a list in `DataFusion` but `text` in `PostgreSQL`. Could also be a candidate for function rewrite later.
-/// - diverges in semantics — `array_remove`/`array_replace` affect only the
-///   first match in `DataFusion` but every match in `PostgreSQL`;
-/// - is too new / unavailable on Redshift — `array_reverse`, `array_sort`
-///   (`PostgreSQL` 16/17+).
-const POSTGRES_PUSHABLE_ARRAY_FUNCTIONS: &[&str] = &[
-    "array_append",    // (array, element) — identical to PostgreSQL
-    "array_prepend",   // (element, array) — identical to PostgreSQL
-    "array_ndims",     // (array) -> int
-    "array_position",  // (array, element[, start]) -> int
-    "array_positions", // (array, element) -> int[]
-    "array_to_string", // (array, delimiter[, null_string]) -> text
-    "cardinality",     // (array) -> int
-    "string_to_array", // (string, delimiter[, null_string]) -> text[]
-];
-
-/// The Spice UDF deny-list extended with the `DataFusion` array functions that
-/// `PostgreSQL` can't run, for `PostgreSQL` and PostgreSQL-wire backends (e.g.
-/// Redshift). The PostgreSQL-compatible array functions
-/// ([`POSTGRES_PUSHABLE_ARRAY_FUNCTIONS`]) are kept OUT of the deny-list so they
-/// continue to push down. Shared source of truth for both the connector and
-/// accelerator deny-lists.
-fn denied_function_names_for_postgres() -> Vec<String> {
-    let builtins = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.clone();
-    let user = USER_FUNCTION_NAMES.read().clone();
-    let denied_array = deny_list_excluding_native(
-        datafusion_nested_function_names(),
-        POSTGRES_PUSHABLE_ARRAY_FUNCTIONS,
-    );
-    let mut denied = Vec::with_capacity(builtins.len() + user.len() + denied_array.len());
-    denied.extend(builtins);
-    denied.extend(user);
-    denied.extend(denied_array);
-    denied
-}
-
-/// Postgres-flavored deny-list as a value (not `Arc`): the full Spice UDF
-/// deny-list extended with the `DataFusion` array functions `PostgreSQL` (and
-/// PostgreSQL-wire backends like Redshift) can't execute, while still allowing
-/// the array functions that match `PostgreSQL` exactly to push down. Used both
-/// with `PostgresTableProviderFactory::with_function_support` (accelerator) and
-/// the `PostgreSQL` data connector's federation deny-list. See issue #10703.
-#[must_use]
-pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
-    FunctionSupport::new(
-        Some(FunctionRestriction::Deny(
-            denied_function_names_for_postgres(),
-        )),
-        None,
-        None,
-    )
-}
-
-fn json_functions() -> Vec<String> {
-    let mut ctx = SessionContext::new();
-    let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
-    let _ = datafusion_functions_json::register_all(&mut ctx);
-    ctx.state()
-        .scalar_functions()
-        .keys()
-        .filter(|&k| !existing.contains(k))
-        .cloned()
+    /// Every Spice-specific function name expected to be denied for federation.
+    ///
+    /// Written out by hand on purpose: it is the independent expectation the
+    /// link-time registry is checked against. The JSON function names are
+    /// excluded — the registry derives those from `datafusion-functions-json`
+    /// rather than from a name constant.
+    fn expected_denied_spice_function_names() -> Vec<String> {
+        [
+            "rand",
+            BUCKET_SCALAR_UDF_NAME,
+            COSINE_DISTANCE_UDF_NAME,
+            INNER_PRODUCT_UDF_NAME,
+            L2_DISTANCE_UDF_NAME,
+            L2_SQUARED_DISTANCE_UDF_NAME,
+            L2_NORM_UDF_NAME,
+            TRUNCATE_SCALAR_UDF_NAME,
+            OBJ_DESCRIPTION_UDF_NAME,
+            COL_DESCRIPTION_UDF_NAME,
+            EMBED_UDF_NAME,
+            #[cfg(feature = "models")]
+            AI_UDF_NAME,
+            DIGEST_UDF_NAME,
+            FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+            FLATTEN_JSON_UDTF_NAME,
+            JSON_TREE_UDTF_NAME,
+            RERANK_UDTF_NAME,
+        ]
+        .iter()
+        .map(ToString::to_string)
         .collect()
+    }
+
+    #[test]
+    fn registry_contains_every_expected_spice_function() {
+        let expected: HashSet<String> =
+            expected_denied_spice_function_names().into_iter().collect();
+        let registered: HashSet<String> = runtime_udfs_api::spice_function_names()
+            .into_iter()
+            .collect();
+
+        let missing: Vec<&String> = expected.difference(&registered).collect();
+        assert!(
+            missing.is_empty(),
+            "these Spice functions have no link-time registration, so they would federate: {missing:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -954,7 +724,20 @@ mod tests {
         json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
         json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
     };
-    use runtime_datafusion_udfs::inner_product::DOT_PRODUCT_UDF_ALIAS;
+    use runtime_datafusion::function_support::POSTGRES_PUSHABLE_ARRAY_FUNCTIONS;
+    use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
+    use runtime_datafusion_udfs::inner_product::{DOT_PRODUCT_UDF_ALIAS, INNER_PRODUCT_UDF_NAME};
+    use runtime_datafusion_udfs::{
+        bucket::Bucket, cosine_distance::CosineDistance, digest_many::INSTANCE, truncate::Truncate,
+    };
+    use runtime_udfs_api::datafusion_nested_function_names;
+    use std::collections::HashSet;
+
+    /// The Spice function names the deny-list is built from — now the link-time
+    /// registry rather than a static in this module.
+    fn builtin_denied_names() -> Vec<String> {
+        runtime_udfs_api::spice_function_names()
+    }
 
     use super::*;
 
@@ -1163,7 +946,7 @@ mod tests {
     }
 
     /// Build a no-arg scalar-function expression with the given name so we can
-    /// probe a [`FunctionSupport`] by name regardless of the real UDF impl.
+    /// probe a `FunctionSupport` by name regardless of the real UDF impl.
     fn make_named_expr(name: &str) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(stub_scalar_udf(name)),
@@ -1302,7 +1085,7 @@ mod tests {
         // functions a specific dialect could otherwise push down, e.g.
         // cosine_distance / rand).
         let support = deny_spice_specific_functions();
-        for name in BUILTIN_DENIED_SPICE_FUNCTION_NAMES.iter() {
+        for name in &builtin_denied_names() {
             assert!(
                 !support.supports(&make_named_expr(name)),
                 "{name} must be denied by the default (backend-agnostic) deny-list"
@@ -1335,7 +1118,7 @@ mod tests {
             .into_iter()
             .collect();
         let support = deny_spice_functions_for_duckdb();
-        for denied in BUILTIN_DENIED_SPICE_FUNCTION_NAMES.iter() {
+        for denied in &builtin_denied_names() {
             let expected_allowed = native.contains(denied.as_str());
             assert_eq!(
                 support.supports(&make_named_expr(denied)),
@@ -1358,7 +1141,8 @@ mod tests {
         // deny-list carve-out.)
         use std::collections::BTreeSet;
         let support = deny_spice_functions_for_duckdb();
-        let pushable: BTreeSet<&str> = BUILTIN_DENIED_SPICE_FUNCTION_NAMES
+        let denied_names = builtin_denied_names();
+        let pushable: BTreeSet<&str> = denied_names
             .iter()
             .filter(|name| support.supports(&make_named_expr(name)))
             .map(String::as_str)

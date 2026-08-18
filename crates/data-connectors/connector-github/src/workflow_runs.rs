@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::github::{Error as GithubError, GithubRestClient};
 use async_trait::async_trait;
-use data_components::github::{Error as GithubError, GithubRestClient};
 use datafusion::{
     catalog::Session,
     common::{Column, Statistics},
@@ -41,7 +41,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{TryFutureExt, TryStreamExt};
-use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -206,7 +206,7 @@ impl WorkflowRunsTableProvider {
         repo: &str,
         workflow_id: &str,
         fetch_logs: bool,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> runtime::dataconnector::DataConnectorResult<Self> {
         let mut fields = vec![
             Field::new("id", DataType::Int64, false),
@@ -274,7 +274,7 @@ impl WorkflowRunsTableProvider {
                 });
             } else if e
                 .downcast_ref::<GithubError>()
-                .is_some_and(data_components::github::Error::is_transient)
+                .is_some_and(crate::github::Error::is_transient)
             {
                 tracing::warn!(
                     "GitHub workflow runs provider initialization for {component} could not validate access because GitHub is temporarily unavailable: {e} The dataset will retry on the next query or refresh."

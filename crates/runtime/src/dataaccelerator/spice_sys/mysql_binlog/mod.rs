@@ -27,18 +27,33 @@ limitations under the License.
 //! bare Arrow schema JSON object; the replication layer treats those as
 //! unknown layout and refuses unsafe resume.
 //!
+//! `gtid_executed` holds the source's executed GTID set for failover-safe
+//! resume (`COM_BINLOG_DUMP_GTID`); it is `NULL` for file+offset positioning.
+//! `cursor_type` (`file`|`gtid`) records the checkpoint's positioning type
+//! explicitly, so resume never has to *infer* it from whether `gtid_executed`
+//! is set — an empty GTID set (`gtid_mode = ON`, zero transactions yet) must
+//! still reload as `gtid`, and an engine that maps an empty string to `NULL`
+//! must not silently reclassify it as `file`. Both columns were added after the
+//! initial schema, so each is created lazily via `ALTER TABLE ... ADD COLUMN`
+//! on tables that predate it.
+//!
 //! ```sql
 //! CREATE TABLE spice_sys_mysql_binlog (
 //!     dataset_name TEXT PRIMARY KEY,
 //!     binlog_file TEXT NOT NULL,
 //!     binlog_pos BIGINT NOT NULL,
 //!     schema_json TEXT,
+//!     gtid_executed TEXT,
+//!     cursor_type TEXT,
 //!     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 //!     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 //! );
 //! ```
 
-use super::{AccelerationConnection, Error, Result, acceleration_connection};
+use super::{
+    AccelerationConnection, Error, Result, UPSERT_MAX_RETRIES, UPSERT_MAX_RETRY_DELAY,
+    acceleration_connection, is_retryable_lock_error,
+};
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
@@ -62,18 +77,10 @@ mod sqlite;
 #[cfg(feature = "turso")]
 mod turso;
 
-#[derive(Clone, Debug, Default)]
-pub struct MySqlBinlogCheckpoint {
-    /// Binlog file name to resume from, e.g. `binlog.000042`.
-    pub binlog_file: String,
-    /// Byte offset of the next event to read within `binlog_file`.
-    pub binlog_pos: u64,
-    /// Optional serialized Arrow schema snapshot for detecting drift between
-    /// runs.
-    pub schema_json: Option<String>,
-    /// When the row was last updated. Populated by the database layer on read.
-    pub updated_at: Option<std::time::SystemTime>,
-}
+// The checkpoint's shape is the connector-facing contract, so it lives in
+// `runtime-checkpoint-api` below both sides. The engine modules here name it through
+// this path.
+pub use runtime_checkpoint_api::mysql_binlog::MySqlBinlogCheckpoint;
 
 pub struct MySqlBinlogSys {
     pub dataset_name: String,
@@ -90,10 +97,27 @@ impl MySqlBinlogSys {
         })
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
+        )
+    )]
     pub async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.get_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking_opt(move || Self::get_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -147,6 +171,18 @@ impl MySqlBinlogSys {
         .await
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
+        )
+    )]
     async fn upsert_once(
         &self,
         #[cfg_attr(
@@ -162,7 +198,15 @@ impl MySqlBinlogSys {
     ) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.upsert_duckdb(pool, checkpoint),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                let checkpoint = checkpoint.clone();
+                super::spawn_duckdb_blocking(move || {
+                    Self::upsert_duckdb(&dataset_name, &pool, &checkpoint)
+                })
+                .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.upsert_postgres(pool, checkpoint).await,
             #[cfg(feature = "sqlite")]
@@ -181,10 +225,27 @@ impl MySqlBinlogSys {
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(
+            clippy::unused_async,
+            reason = "async only when an accelerator backend is compiled in; with none, every arm errors immediately"
+        )
+    )]
     pub async fn delete(&self) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            AccelerationConnection::DuckDB(pool) => {
+                let pool = std::sync::Arc::clone(pool);
+                let dataset_name = self.dataset_name.clone();
+                super::spawn_duckdb_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+                    .await
+            }
             #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
             #[cfg(feature = "sqlite")]
@@ -201,11 +262,6 @@ impl MySqlBinlogSys {
             )))]
             _ => Err(Error::NoAccelerationConnection),
         }
-    }
-
-    /// Serialize an Arrow schema to a JSON string for `schema_json` storage.
-    pub fn serialize_schema(schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<String> {
-        serde_json::to_string(schema).map_err(Error::external)
     }
 
     /// Convert a stored position (`BIGINT`) back to the u64 the replication
@@ -241,37 +297,22 @@ impl MySqlBinlogSys {
     }
 }
 
-/// Retries for a checkpoint upsert contending with the accelerator's writer
-/// lock, on top of the initial attempt. Bounded and short: paired with
-/// [`UPSERT_MAX_RETRY_DELAY`] the worst-case added latency stays well under one
-/// checkpoint interval, and a persistent lock just retries on the next interval
-/// anyway.
-const UPSERT_MAX_RETRIES: usize = 4;
+#[async_trait::async_trait]
+impl runtime_checkpoint_api::mysql_binlog::MySqlBinlogStore for MySqlBinlogSys {
+    async fn get(&self) -> Option<MySqlBinlogCheckpoint> {
+        MySqlBinlogSys::get(self).await
+    }
 
-/// Per-attempt cap on the [`FibonacciBackoffBuilder`] delay for
-/// [`MySqlBinlogSys::upsert`] retries. The shared Fibonacci schedule starts at
-/// 1s, far longer than a transient writer-lock hand-off needs, so clamp each
-/// delay to keep the whole retry budget (~4 × 100ms) short relative to the
-/// checkpoint interval.
-const UPSERT_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    async fn upsert(
+        &self,
+        checkpoint: &MySqlBinlogCheckpoint,
+    ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MySqlBinlogSys::upsert(self, checkpoint)
+            .await
+            .map_err(Into::into)
+    }
 
-/// Whether a sidecar write failure is a transient lock/contention error worth
-/// retrying rather than surfacing.
-///
-/// Deliberately a string heuristic over the boxed engine error (rusqlite,
-/// Turso, `DuckDB`, and tokio-postgres all report contention differently),
-/// mirroring the reconnect classifier in
-/// `data_components::mysql_replication::resilience`. Slight over-matching is
-/// harmless: retries are bounded, so a misclassified non-lock error only costs
-/// a few short sleeps before it is returned unchanged.
-fn is_retryable_lock_error(err: &Error) -> bool {
-    const MARKERS: &[&str] = &[
-        "database is locked",
-        "database table is locked",
-        "sqlite_busy",
-        "sqlite_locked",
-        "deadlock",
-    ];
-    let msg = err.to_string().to_ascii_lowercase();
-    MARKERS.iter().any(|marker| msg.contains(marker))
+    async fn delete(&self) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+        MySqlBinlogSys::delete(self).await.map_err(Into::into)
+    }
 }

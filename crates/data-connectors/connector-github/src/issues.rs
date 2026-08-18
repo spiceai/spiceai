@@ -15,19 +15,17 @@ limitations under the License.
 */
 
 use runtime::dataconnector::ConnectorComponent;
-use runtime::datafusion::error::find_datafusion_root;
+use runtime_datafusion::error::find_datafusion_root;
 
 use super::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
+use crate::github::error_checker;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::{
-    github::error_checker,
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{GraphQLQuery, UnnestBehavior},
-    },
+use connector_graphql::graphql::{
+    ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+    client::{GraphQLQuery, UnnestBehavior},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -123,10 +121,15 @@ impl GitHubTableArgs for IssuesTableArgs {
                 owner = self.owner,
                 name = self.repo
             ),
+            // `orderBy` must name an immutable field. A GitHub `after:` cursor is a value
+            // predicate on the sort key, so ordering by a mutable field (e.g. UPDATED_AT)
+            // lets an issue touched on the source mid-scan jump ahead of the cursor, where
+            // no remaining page will return it — silently dropping the row from the scan.
+            // CREATED_AT ASC is GitHub's own default order for this connection.
             GitHubQueryMode::Auto => format!(
                 r#"{{
                 repository(owner: "{owner}", name: "{name}") {{
-                    issues(first: 100) {{
+                    issues(first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -234,4 +237,76 @@ fn gql_schema() -> SchemaRef {
             true,
         ),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use std::sync::OnceLock;
+
+    /// Building a `ConnectorComponent` requires a full runtime + app
+    /// construction. Cache a single shared instance so the unit tests don't
+    /// spin up a tokio runtime per invocation.
+    fn shared_component() -> ConnectorComponent {
+        // The tokio runtime is cached alongside the component and never dropped:
+        // `RuntimeBuilder::build` defaults `io_runtime` to `Handle::current()`, so
+        // dropping the runtime that built it would leave the constructed `Runtime`
+        // holding handles to a dead tokio runtime.
+        static COMPONENT: OnceLock<(tokio::runtime::Runtime, ConnectorComponent)> = OnceLock::new();
+        COMPONENT
+            .get_or_init(|| {
+                let app = AppBuilder::new("test").build();
+                let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
+                let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
+                let dataset = DatasetBuilder::try_new("github".to_string(), "test.issues")
+                    .expect("to create dataset builder")
+                    .with_app(Arc::new(app))
+                    .with_runtime(Arc::new(spice_runtime))
+                    .build()
+                    .expect("to create dataset");
+                (runtime, ConnectorComponent::from(&dataset))
+            })
+            .1
+            .clone()
+    }
+
+    fn auto_args() -> IssuesTableArgs {
+        IssuesTableArgs {
+            owner: "spiceai".to_string(),
+            repo: "spiceai".to_string(),
+            query_mode: GitHubQueryMode::Auto,
+            component: shared_component(),
+        }
+    }
+
+    #[test]
+    fn auto_mode_query_orders_by_created_at_asc() {
+        // Deterministic ordering on an immutable key: see
+        // `auto_mode_query_never_paginates_on_a_mutable_sort_key`.
+        let params = auto_args().get_graphql_values();
+        let query = params.query.as_ref();
+        assert!(
+            query.contains("issues(first: 100, orderBy: {field: CREATED_AT, direction: ASC})"),
+            "auto-mode issues query must order by CREATED_AT ASC, got:\n{query}"
+        );
+    }
+
+    /// Regression test for #12067. A GitHub `after:` cursor is a value predicate on the
+    /// sort key, so a connection paginated on a mutable field silently drops any row
+    /// that is touched on the source mid-scan: the row's key moves ahead of the cursor
+    /// and no remaining page returns it. Only immutable sort keys are safe here.
+    #[test]
+    fn auto_mode_query_never_paginates_on_a_mutable_sort_key() {
+        let params = auto_args().get_graphql_values();
+        let query = params.query.as_ref();
+        // The GraphQL enum is upper-case (`UPDATED_AT`), so this cannot collide with the
+        // `updated_at: updatedAt` field alias the query also selects.
+        assert!(
+            !query.contains("UPDATED_AT"),
+            "auto-mode issues query must not order by the mutable UPDATED_AT, got:\n{query}"
+        );
+    }
 }

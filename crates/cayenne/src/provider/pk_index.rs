@@ -146,8 +146,15 @@ struct PkKeysetEntry {
 const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 
 pub(crate) fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
+    // Charge what the map actually stores per entry: the u128 digest key, the
+    // whole `PkKeysetEntry` (the `OwnedRow` fat pointer, `RowLocation`, and the
+    // OCC `sequence`), and the key's heap bytes. An estimate that drops any of
+    // those bounds the cache at a fraction of its believed size - a
+    // counting-allocator measurement puts the real per-entry cost at 1.6-3.5x
+    // a key-plus-location-only figure.
     key.as_ref().len()
-        + std::mem::size_of::<RowLocation>()
+        + std::mem::size_of::<u128>()
+        + std::mem::size_of::<PkKeysetEntry>()
         + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
 
@@ -725,6 +732,368 @@ impl CachedPkIndex {
     }
 }
 
+/// One committed key batch held while a PK existence index was checked out of
+/// its cache. Carries the recorded [`RowLocation`] and commit sequence verbatim
+/// so replaying it into the restored index is byte-identical to having recorded
+/// it directly.
+struct PendingPkKeyBatch {
+    keys: PkDigestSet,
+    location: RowLocation,
+    sequence: i64,
+}
+
+/// Divisor applied to a PK cache's byte budget to bound its pending-key log.
+/// The log is transient (it lives only while an index is checked out) and holds
+/// the same per-key payload as the cache, so a quarter keeps the worst case a
+/// fraction of the index it protects.
+const PENDING_PK_KEYS_BUDGET_DIVISOR: usize = 4;
+
+/// Keys committed by other writers while a PK existence index was checked out
+/// of its cache for validation.
+///
+/// A validation stream takes the shared index out of its cache cell and holds it
+/// for the whole lazily-consumed stream, so a writer that commits during that
+/// window finds the cell empty. Recording its keys there is a no-op, and an
+/// existence entry that never lands leaves the index a strict UNDER-approximation
+/// of the live rows — a later upsert probes the restored index, misses, and
+/// classifies the key as new, so it emits no supersede and the table ends up with
+/// two live rows for one primary key. (Over-approximation is the safe direction:
+/// a stale-present entry only costs a redundant tombstone.)
+///
+/// The keys are therefore held here instead, and are both:
+/// - merged into the index when it is restored, so the cache regains every key, and
+/// - probed by the in-flight validation that holds the checked-out index, so a key
+///   committed mid-stream is not read as a new primary key by the writer whose
+///   snapshot predates it.
+///
+/// Bounded by a byte cap. Past it the log stops recording, its snapshot reports
+/// [`PendingPkExistence::is_incomplete`], and the restore discards the index
+/// (forcing an authoritative rebuild) rather than caching one that is silently
+/// missing keys.
+#[derive(Default)]
+pub(crate) struct PendingPkKeys {
+    /// How many indexes are currently checked out over this cache. Distinguishes
+    /// "checked out" from "no cache at all": a cold cache needs no log, because the
+    /// next validation rebuilds the index from the table and sees every committed
+    /// key. Normally 0 or 1 (writers are serialized by the table write lock); see
+    /// [`Self::begin_checkout`] for what a second one means.
+    outstanding: usize,
+    batches: Vec<PendingPkKeyBatch>,
+    approx_bytes: usize,
+    /// The log hit its byte cap and stopped recording, so it no longer holds every
+    /// key committed during the checkout.
+    overflowed: bool,
+    /// The cache was invalidated while the index was checked out, so the index
+    /// describes a table state that has since been superseded (a DELETE, a
+    /// compaction, a recovery) and must not be cached when it comes back.
+    invalidated: bool,
+}
+
+impl PendingPkKeys {
+    /// Byte cap for a log protecting a cache with `cache_budget` bytes.
+    pub(crate) fn budget_from_cache_budget(cache_budget: usize) -> usize {
+        cache_budget / PENDING_PK_KEYS_BUDGET_DIVISOR
+    }
+
+    /// Open a checkout window: keys committed from here until [`Self::end_checkout`]
+    /// are recorded. Any residue from an abandoned checkout is dropped — that index
+    /// was never stored back, so the next validation rebuilds from the table and
+    /// already sees those keys.
+    ///
+    /// Opening a SECOND window while one is outstanding puts two independently-aged
+    /// indexes over one cache: each was read at a different point, so whichever is
+    /// stored last silently reverts the other's keys. Neither is trustworthy, so both
+    /// are marked for discard and the cache goes cold — one rebuild instead of a
+    /// cache that answers "absent" for a live key. Writers are serialized by the
+    /// table write lock, so this is a backstop, not a routine path.
+    pub(crate) fn begin_checkout(&mut self) {
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        } else {
+            self.invalidated = true;
+        }
+        self.batches.clear();
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_add(1);
+    }
+
+    /// Report that the cache was invalidated while an index was checked out, so the
+    /// restore drops that index instead of resurrecting a superseded one. A no-op
+    /// when nothing is checked out — there is then no index in flight, and the flag
+    /// would otherwise leak into the next checkout.
+    pub(crate) fn invalidate(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        self.invalidated = true;
+        self.batches.clear();
+        self.approx_bytes = 0;
+    }
+
+    /// Hold one committed key batch. A no-op when no index is checked out, or once
+    /// the log has stopped recording. Callers read [`Self::approx_bytes`] around the
+    /// call to account the change.
+    pub(crate) fn record(
+        &mut self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+        max_bytes: usize,
+    ) {
+        if self.outstanding == 0 || self.overflowed || self.invalidated {
+            return;
+        }
+        let batch_bytes = keys
+            .iter()
+            .map(approx_pk_keyset_entry_bytes)
+            .fold(0, usize::saturating_add);
+        if self.approx_bytes.saturating_add(batch_bytes) > max_bytes {
+            // Stop holding keys rather than grow without bound, and release the ones
+            // already held: the index this log protects is now unrecoverable either
+            // way, and `end_checkout` reports that so it is discarded instead of
+            // being stored back missing entries.
+            self.overflowed = true;
+            self.batches.clear();
+            self.approx_bytes = 0;
+            return;
+        }
+        self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
+        self.batches.push(PendingPkKeyBatch {
+            keys: keys.clone(),
+            location: location.clone(),
+            sequence,
+        });
+    }
+
+    /// Close the checkout window and hand back everything committed during it. With
+    /// several windows outstanding every one of them reports a discard, and the flags
+    /// only reset once the last closes.
+    pub(crate) fn end_checkout(&mut self) -> RestoredPkKeys {
+        let restored = RestoredPkKeys {
+            batches: std::mem::take(&mut self.batches),
+            discard_index: self.overflowed || self.invalidated,
+        };
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        }
+        restored
+    }
+
+    /// Existence view over the keys held so far, for the validation that holds the
+    /// checked-out index. `None` when nothing was committed during this checkout —
+    /// the overwhelmingly common case, which costs one uncontended lock.
+    pub(crate) fn existence(&self) -> Option<PendingPkExistence> {
+        if self.batches.is_empty() && !self.overflowed {
+            return None;
+        }
+        let capacity = self
+            .batches
+            .iter()
+            .map(|batch| batch.keys.len())
+            .fold(0, usize::saturating_add);
+        let mut locations: HashMap<u128, RowLocation, PrehashedBuildHasher> =
+            HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher);
+        // Later batches win: a key committed twice during the checkout lives where
+        // its most recent commit put it.
+        for batch in &self.batches {
+            for (digest, _) in batch.keys.iter_with_digest() {
+                locations.insert(digest, batch.location.clone());
+            }
+        }
+        Some(PendingPkExistence {
+            locations,
+            incomplete: self.overflowed,
+        })
+    }
+
+    /// Bytes currently held, for memory accounting.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+}
+
+/// Keys committed while an index was checked out, handed to the restore.
+pub(crate) struct RestoredPkKeys {
+    batches: Vec<PendingPkKeyBatch>,
+    discard_index: bool,
+}
+
+impl RestoredPkKeys {
+    /// Whether the index that was checked out must be dropped rather than cached:
+    /// keys committed during the checkout went unheld (the log hit its cap), or the
+    /// cache was invalidated while the index was out. Caching it either way would
+    /// answer "absent" for a live key, which reads as a new primary key.
+    pub(crate) fn index_must_be_discarded(&self) -> bool {
+        self.discard_index
+    }
+
+    /// Replay every held batch, oldest first, so a key committed twice ends on its
+    /// most recent location and sequence.
+    pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
+        self.batches
+            .iter()
+            .map(|batch| (&batch.keys, &batch.location, batch.sequence))
+    }
+}
+
+/// Snapshot of a [`PendingPkKeys`] log handed to per-batch validation alongside
+/// the checked-out index, so an index miss can still see a concurrent commit.
+pub(crate) struct PendingPkExistence {
+    locations: HashMap<u128, RowLocation, PrehashedBuildHasher>,
+    incomplete: bool,
+}
+
+impl PendingPkExistence {
+    /// Where a key committed during this checkout lives, or `None` if no such key
+    /// was recorded.
+    pub(crate) fn location_by_digest(&self, digest: u128) -> Option<&RowLocation> {
+        self.locations.get(&digest)
+    }
+
+    /// Whether keys committed during this checkout went unrecorded, so a miss here
+    /// does not prove the key is absent from the table.
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.incomplete
+    }
+}
+
+/// Streaming, budget-bounded builder for the cold PK-index rebuild
+/// (`load_existing_pk_index`). Routes every scanned key to its shard
+/// (`shard_of_pk`) as it arrives and, when a byte budget is set (upsert tables,
+/// where a bloom is a sound existence answer), degrades the accumulating exact
+/// keysets to bounded per-shard blooms the moment the total would exceed it.
+///
+/// One pass, memory bounded by `max_bytes`: the rebuild never materializes an
+/// over-budget exact keyset only to re-shard it (`ShardedPkIndex::from_exact`)
+/// or throw it away for blooms — the O(table-rows) second pass and unbounded
+/// allocation that stalled the first CDC apply after a large initial snapshot.
+///
+/// `max_bytes: None` never degrades — `on_conflict: do-nothing` needs an exact
+/// answer (a bloom false positive would wrongly drop a genuinely new row).
+pub(crate) struct BoundedShardedPkIndexBuilder {
+    /// Exact per-shard keysets; drained into `blooms` on budget overflow.
+    shards: Vec<CachedPkKeyset>,
+    /// `Some` once degraded: bounded per-shard blooms (upsert-only superset).
+    blooms: Option<Vec<PkBloom>>,
+    /// Total byte budget across all shards; `None` = exact answer required.
+    max_bytes: Option<usize>,
+}
+
+impl BoundedShardedPkIndexBuilder {
+    pub(crate) fn new(shard_count: usize, max_bytes: Option<usize>) -> Self {
+        let n = shard_count.max(1);
+        Self {
+            shards: (0..n)
+                .map(|_| CachedPkKeyset::with_capacity(1024))
+                .collect(),
+            blooms: None,
+            max_bytes,
+        }
+    }
+
+    /// Shard routing in exact mode (bloom mode routes by `blooms.len()` at the
+    /// call site — `shards` is drained once degraded).
+    #[inline]
+    fn shard_of(&self, key: &OwnedRow) -> usize {
+        shard_of_pk(key.as_ref(), self.shards.len())
+    }
+
+    /// Keys retained so far. In bloom mode this is the inserted-key count
+    /// (observability only — blooms retain no entries).
+    pub(crate) fn len(&self) -> usize {
+        match &self.blooms {
+            Some(blooms) => blooms.iter().map(|b| b.inserted_keys).sum(),
+            None => self.shards.iter().map(CachedPkKeyset::len).sum(),
+        }
+    }
+
+    /// Insert `key`, overwriting an existing entry's location (the scan-order
+    /// override semantics of `CachedPkKeyset::insert`).
+    pub(crate) fn insert(&mut self, key: OwnedRow, location: RowLocation) {
+        if let Some(blooms) = &mut self.blooms {
+            let s = shard_of_pk(key.as_ref(), blooms.len());
+            blooms[s].insert(key.as_ref());
+            return;
+        }
+        let s = self.shard_of(&key);
+        self.shards[s].insert(key, location);
+        self.degrade_if_over_budget();
+    }
+
+    /// Insert `key` only when absent, preserving an existing entry's location
+    /// (`CachedPkKeyset::insert_if_absent` — the mem-tier fold semantics). In
+    /// bloom mode a plain bloom insert (idempotent superset).
+    pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
+        if let Some(blooms) = &mut self.blooms {
+            let s = shard_of_pk(key.as_ref(), blooms.len());
+            blooms[s].insert(key.as_ref());
+            return;
+        }
+        let s = self.shard_of(&key);
+        self.shards[s].insert_if_absent(key, location);
+        self.degrade_if_over_budget();
+    }
+
+    /// Raise every retained entry's OCC sequence to at least `sequence` (the
+    /// end-of-scan high-water; see `CachedPkKeyset::stamp_all_sequences_min`).
+    /// No-op once degraded — bloomed tables fall back to per-table OCC.
+    pub(crate) fn stamp_all_sequences_min(&mut self, sequence: i64) {
+        if self.blooms.is_none() {
+            for shard in &mut self.shards {
+                shard.stamp_all_sequences_min(sequence);
+            }
+        }
+    }
+
+    fn degrade_if_over_budget(&mut self) {
+        let Some(max_bytes) = self.max_bytes else {
+            return;
+        };
+        let total: usize = self
+            .shards
+            .iter()
+            .map(|k| k.approx_bytes)
+            .fold(0, usize::saturating_add);
+        if total <= max_bytes {
+            return;
+        }
+        // Shard keysets are already routed by `shard_of_pk`, so shard i's keys
+        // drain into bloom i directly. Each bloom gets an even split of the
+        // budget; `with_byte_budget` floors every bloom at 64 bits, so a
+        // pathologically small split (under 8 bytes per shard) still allocates
+        // a usable filter, overshooting the budget by at most 8 bytes per
+        // shard rather than degrading to an always-positive zero-bit bloom.
+        let n = self.shards.len();
+        let mut blooms: Vec<PkBloom> = (0..n)
+            .map(|_| PkBloom::with_byte_budget(max_bytes / n))
+            .collect();
+        for (shard, bloom) in self.shards.drain(..).zip(&mut blooms) {
+            for key in shard.rows() {
+                bloom.insert(key.as_ref());
+            }
+        }
+        tracing::debug!(
+            max_bytes,
+            shards = n,
+            "cold PK-index rebuild exceeded the keyset byte budget; continuing into bounded per-shard blooms"
+        );
+        self.blooms = Some(blooms);
+    }
+
+    /// Finish the build. `Exact` shards keep their per-key locations and OCC
+    /// stamps; `Bloom` is the bounded existence superset.
+    pub(crate) fn finish(self) -> ShardedPkIndex {
+        match self.blooms {
+            Some(blooms) => ShardedPkIndex::Bloom(blooms.into_boxed_slice()),
+            None => ShardedPkIndex::Exact(self.shards.into_boxed_slice()),
+        }
+    }
+}
+
 /// The per-shard PK existence index — the sharded analog of [`CachedPkIndex`]
 /// (§2.3c). A key is owned by `shard_of_pk(OwnedRow bytes)` (§3.5), the SAME
 /// routing the tier append + reads use, so a key's existence entry co-locates
@@ -741,9 +1110,15 @@ impl ShardedPkIndex {
     /// each key's `OwnedRow` bytes (§3.5). Bloom-path indices are built sharded at
     /// load time instead — a combined bloom can't be partitioned (its keys are
     /// unrecoverable), so per-shard blooms are constructed by routing keys to N
-    /// blooms during `load_existing_keyset` / `try_load_persisted_pk_index`.
+    /// blooms during `load_existing_pk_index` / `try_load_persisted_pk_index`.
     pub(crate) fn from_exact(keyset: CachedPkKeyset, n: usize) -> Self {
         let n = n.max(1);
+        // At n == 1 every key routes to shard 0, so wrap the keyset directly —
+        // re-inserting each entry would be an O(rows) pass for nothing (the
+        // persisted-checkpoint load on the serial path takes this branch).
+        if n == 1 {
+            return Self::Exact(vec![keyset].into_boxed_slice());
+        }
         let mut shards: Vec<CachedPkKeyset> =
             (0..n).map(|_| CachedPkKeyset::with_capacity(0)).collect();
         // The position-delete capture set is table-global; every shard needs the
@@ -806,10 +1181,13 @@ impl ShardedPkIndex {
     /// insert and the per-apply `incoming_keys` set).
     ///
     /// NOTE: unlike `record_pk_keys_with_location`, this intentionally does NOT do
-    /// per-insert over-budget exact→bloom conversion. The sharded path recomputes
-    /// the keyset byte tally ONCE after all per-shard appends (recompute-once), so a
-    /// shard never converts exact→bloom mid-life — a deliberate divergence, not an
-    /// oversight.
+    /// per-insert over-budget exact→bloom conversion — the `Exact`/`Bloom` variant
+    /// is table-global, so one shard cannot convert while its siblings are still
+    /// appending under their own publish locks. The sharded path instead recomputes
+    /// the tally ONCE after all per-shard appends and enforces the budget there
+    /// (step 6 of `validate_and_append_sharded`, via
+    /// [`ShardedPkIndex::degrade_to_blooms`]; upsert tables only, for the reasons
+    /// documented at that call site).
     pub(crate) fn record_keys_in_shard(
         &mut self,
         shard: usize,
@@ -844,6 +1222,176 @@ impl ShardedPkIndex {
             }
         }
     }
+    /// Insert with the byte budget enforced DURING the loop, returning whether
+    /// the index stayed inside it.
+    ///
+    /// The previous shape inserted every key with `usize::MAX` and left the
+    /// caller to reconcile afterwards, which made the budget a trim rather than
+    /// an admission control: the peak is `batch_keys x entry_bytes` with no
+    /// ceiling, and each entry retains a cloned `OwnedRow` alongside its digest,
+    /// location and sequence. At SF-1000 a heap profile attributed ~14.5 GiB to
+    /// this path against a 256 MiB per-table default — 58x the budget, and the
+    /// budget was doing exactly what it was written to do, just too late.
+    ///
+    /// The tally is re-read every [`BUDGET_RECHECK_KEYS`] keys rather than per
+    /// key: `approx_bytes` is O(shards) over cached per-keyset totals, so it is
+    /// cheap but not free, and a bound that only has to stop unbounded growth
+    /// does not need to be exact. Overshoot is therefore bounded by one chunk
+    /// instead of one batch.
+    ///
+    /// Returning `false` rather than degrading here keeps the policy with the
+    /// caller: an upsert table can fall back to blooms (a false positive is a
+    /// harmless redundant delete) while `DoNothing` needs exactness and must
+    /// drop the index instead.
+    pub(crate) fn record_keys_bounded(
+        &mut self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        max_bytes: usize,
+    ) -> bool {
+        /// Keys between budget re-reads. Small enough that a wide batch cannot
+        /// overshoot far, large enough to keep the sum out of the hot loop.
+        const BUDGET_RECHECK_KEYS: usize = 512;
+
+        let n = self.shard_count();
+        match self {
+            Self::Exact(keysets) => {
+                let tally = |keysets: &[CachedPkKeyset]| {
+                    keysets
+                        .iter()
+                        .map(|k| k.approx_bytes)
+                        .fold(0, usize::saturating_add)
+                };
+                if tally(keysets) > max_bytes {
+                    return false;
+                }
+                let mut since_check = 0usize;
+                for (digest, key) in keys.iter_with_digest() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(keyset) = keysets.get_mut(shard) {
+                        // Still `usize::MAX` per insert: the per-keyset cap would
+                        // bound one shard, and the budget being enforced here is
+                        // the table-global one across all of them.
+                        let _ = keyset.try_insert_with_digest(
+                            digest,
+                            key,
+                            location.clone(),
+                            usize::MAX,
+                        );
+                    }
+                    since_check = since_check.saturating_add(1);
+                    if since_check >= BUDGET_RECHECK_KEYS {
+                        since_check = 0;
+                        if tally(keysets) > max_bytes {
+                            return false;
+                        }
+                    }
+                }
+                tally(keysets) <= max_bytes
+            }
+            // Blooms are allocated at a fixed size, so recording into them
+            // cannot grow the index past its budget.
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Record every key of a batch into an already-degraded bloom index.
+    ///
+    /// MUST be called after [`Self::degrade_to_blooms`] when the degrade was
+    /// triggered by [`Self::record_keys_bounded`] returning `false`. That stops
+    /// at the budget, so the keys after the stop were never inserted, and
+    /// `degrade_to_blooms` only converts what the keysets already hold — leaving
+    /// the rest of the batch absent from the bloom.
+    ///
+    /// An absent key is a FALSE NEGATIVE. Under upsert that reads as "this PK is
+    /// new" and writes a duplicate live row, which is the one failure the bloom
+    /// fallback is documented never to cause (a false POSITIVE is merely a
+    /// redundant delete). The single-keyset path has always re-inserted the full
+    /// batch after converting; this is the sharded equivalent.
+    ///
+    /// Cheap and unconditional: blooms are fixed-size, so re-inserting keys
+    /// already present costs a hash and a few bit sets, and no memory.
+    pub(crate) fn record_keys_after_degrade(&mut self, keys: &PkDigestSet) {
+        let n = self.shard_count();
+        match self {
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+            }
+            // Not degraded, so `record_keys_bounded` admitted the whole batch
+            // and there is nothing to backfill.
+            Self::Exact(_) => {}
+        }
+    }
+
+    /// Convert every exact shard keyset into a byte-budgeted bloom (no-op on
+    /// an already-bloomed index). The budget backstop for the maintained
+    /// index: exact keysets grow with every recorded key, and a caller whose
+    /// running total exceeds its byte budget degrades here instead of growing
+    /// unbounded. Safe only under upsert semantics (a bloom false positive
+    /// yields a harmless redundant delete) — the caller gates on that.
+    pub(crate) fn degrade_to_blooms(&mut self, per_shard_max_bytes: usize) {
+        self.degrade_to_blooms_observed(per_shard_max_bytes, |_, _| {});
+    }
+
+    /// [`Self::degrade_to_blooms`], reporting each shard as it converts.
+    ///
+    /// `observe` receives the shard just converted and the exact bytes still
+    /// held across every keyset. That the figure falls at each step — rather
+    /// than staying at the full exact total until the last shard — is the
+    /// difference between releasing as the conversion goes and releasing at the
+    /// end, and it is not visible in the post-state the two share. Production
+    /// callers pass a no-op.
+    fn degrade_to_blooms_observed(
+        &mut self,
+        per_shard_max_bytes: usize,
+        mut observe: impl FnMut(usize, usize),
+    ) {
+        if let Self::Exact(keysets) = self {
+            let mut exact_bytes_held = keysets
+                .iter()
+                .map(|k| k.approx_bytes)
+                .fold(0, usize::saturating_add);
+            let blooms: Vec<PkBloom> = keysets
+                .iter_mut()
+                .enumerate()
+                .map(|(shard, keyset)| {
+                    // Right-size per shard: conversion-time keys with 4× growth
+                    // headroom, capped by the per-shard budget split (rationale:
+                    // `bloom_from_keyset`).
+                    let mut bloom = PkBloom::with_expected_keys(
+                        keyset.len().saturating_mul(4),
+                        per_shard_max_bytes,
+                    );
+                    for key in keyset.rows() {
+                        bloom.insert(key.as_ref());
+                    }
+                    // Release this shard's exact entries as soon as its bloom
+                    // exists. Building every bloom first and dropping the
+                    // keysets at the end would peak at exact + blooms together,
+                    // which is the worst moment to need extra memory: this
+                    // conversion only runs because the budget was already hit.
+                    exact_bytes_held = exact_bytes_held.saturating_sub(keyset.approx_bytes);
+                    *keyset = CachedPkKeyset::with_capacity(0);
+                    observe(shard, exact_bytes_held);
+                    bloom
+                })
+                .collect();
+            *self = Self::Bloom(blooms.into_boxed_slice());
+        }
+    }
 }
 
 /// Borrowed view of a [`CachedPkIndex`] handed to per-batch validation. The
@@ -857,9 +1405,220 @@ pub(crate) enum PkExistenceRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset, ColdPkExistence, PkBloom,
-        PkKeysetInsertOutcome, RowLocation, approx_pk_keyset_entry_bytes, pk_digest,
+        BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
+        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
+        approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
     };
+
+    /// Degrading after a mid-batch stop must not lose the rest of the batch.
+    ///
+    /// `record_keys_bounded` stops once the budget is reached, so the keys after
+    /// the stop were never inserted. `degrade_to_blooms` only converts what the
+    /// keysets already hold, so those keys would be absent from the bloom — and
+    /// an absent key is a FALSE NEGATIVE, which under upsert reads as "this PK
+    /// is new" and writes a duplicate live row. The single-keyset path has
+    /// always re-inserted the full batch after converting; the sharded path must
+    /// match that contract.
+    ///
+    /// A bloom may answer `true` for a key it never saw; it must never answer
+    /// `false` for one it did.
+    #[test]
+    fn degrading_after_a_mid_batch_stop_still_records_every_key() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(8_000);
+        for i in 0..8_000u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        // Tight enough that the insert stops long before the batch ends.
+        let one_entry = approx_pk_keyset_entry_bytes(&owned_key(&key(0)));
+        let max_bytes = one_entry.saturating_mul(500);
+
+        let within = index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, max_bytes);
+        assert!(
+            !within,
+            "this batch must exceed the budget for the test to mean anything"
+        );
+
+        let per_shard = max_bytes / index.shard_count().max(1);
+        index.degrade_to_blooms(per_shard);
+        index.record_keys_after_degrade(&keys);
+
+        let n = index.shard_count();
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                for k in keys.iter() {
+                    let shard = shard_of_pk(k.as_ref(), n);
+                    assert!(
+                        blooms[shard].maybe_contains(k.as_ref()),
+                        "every key in the batch must survive degradation; a false negative \
+                         here is a duplicate live row under upsert"
+                    );
+                }
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
+        }
+    }
+
+    /// The budget must stop growth DURING the insert, not after it.
+    ///
+    /// The previous shape recorded the whole batch with `usize::MAX` and
+    /// reconciled afterwards, so the peak was `batch_keys x entry_bytes` with no
+    /// ceiling regardless of the configured budget — the mechanism behind ~14.5
+    /// GiB against a 256 MiB default at SF-1000. This asserts the index stops
+    /// near the budget rather than at the end of the batch.
+    #[test]
+    fn a_batch_over_the_budget_stops_inside_it_not_after_it() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        // Far more keys than the budget admits, in one batch.
+        let mut keys = PkDigestSet::with_capacity(20_000);
+        for i in 0..20_000u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        let one_entry = approx_pk_keyset_entry_bytes(&owned_key(&key(0)));
+        // Room for ~1000 entries; the batch is 20x that.
+        let max_bytes = one_entry.saturating_mul(1000);
+
+        let within = index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, max_bytes);
+        assert!(
+            !within,
+            "a batch this far over budget must report over-budget"
+        );
+
+        let held = index.approx_bytes();
+        // Overshoot is bounded by one BUDGET_RECHECK_KEYS chunk (512 entries),
+        // not by the batch. Without the in-loop check this would be all 20,000.
+        let ceiling = max_bytes.saturating_add(one_entry.saturating_mul(512 + 4));
+        assert!(
+            held <= ceiling,
+            "index held {held} bytes, over the {ceiling}-byte chunk-bounded ceiling \
+             (budget {max_bytes}); the budget is being applied after the batch, not during it"
+        );
+    }
+
+    /// Each shard's exact entries are released as its bloom is built, so exact
+    /// and blooms are never both fully resident.
+    ///
+    /// The post-state alone cannot show this — an implementation that built
+    /// every bloom first and dropped the keysets at the end reaches the same
+    /// one. What separates them is the exact bytes still held at each step, so
+    /// the conversion is run through its observation hook: releasing as it goes
+    /// steps the figure down per shard and reaches zero on the last, while
+    /// releasing at the end would report the full exact total until then.
+    #[test]
+    fn degrading_releases_each_shard_as_it_converts() {
+        const SHARDS: usize = 4;
+
+        let keysets: Vec<CachedPkKeyset> = (0..SHARDS)
+            .map(|_| CachedPkKeyset::with_capacity(0))
+            .collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(4096);
+        for i in 0..4096u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        assert!(index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, usize::MAX));
+        let exact_bytes = index.approx_bytes();
+        assert!(
+            exact_bytes > 0,
+            "the exact index should hold something to release"
+        );
+
+        // (shard converted, exact bytes still held) after each conversion.
+        let mut steps: Vec<(usize, usize)> = Vec::new();
+        index.degrade_to_blooms_observed(64 * 1024, |shard, still_held| {
+            steps.push((shard, still_held));
+        });
+
+        assert_eq!(
+            steps.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(),
+            (0..SHARDS).collect::<Vec<_>>(),
+            "every shard converts, in order"
+        );
+        let mut previously_held = exact_bytes;
+        for (shard, still_held) in &steps {
+            assert!(
+                *still_held < previously_held,
+                "shard {shard} was converted without releasing its exact entries: \
+                 {still_held} bytes still held, unchanged from {previously_held}"
+            );
+            previously_held = *still_held;
+        }
+        assert_eq!(
+            previously_held, 0,
+            "the last conversion must leave no exact entries behind"
+        );
+
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                assert_eq!(blooms.len(), SHARDS, "every shard converts");
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
+        }
+        assert!(
+            index.approx_bytes() < exact_bytes,
+            "the bloom index must be smaller than the exact one it replaced"
+        );
+    }
+
+    /// `record_keys_bounded` routes each key to its `shard_of_pk` shard, and
+    /// `degrade_to_blooms` converts over-budget exact keysets into blooms with
+    /// no false negatives — the budget backstop for the maintained index.
+    /// `usize::MAX` here isolates routing from the budget, which has its own
+    /// tests below.
+    #[test]
+    fn record_keys_routes_and_degrades_to_blooms_without_false_negatives() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(32);
+        for i in 0..32u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        assert!(index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, usize::MAX));
+        match &index {
+            ShardedPkIndex::Exact(keysets) => {
+                let total: usize = keysets.iter().map(CachedPkKeyset::len).sum();
+                assert_eq!(total, 32, "every recorded key must land in some shard");
+                for (shard, keyset) in keysets.iter().enumerate() {
+                    for k in keyset.rows() {
+                        assert_eq!(
+                            shard_of_pk(k.as_ref(), 4),
+                            shard,
+                            "keys must be routed to their shard_of_pk shard"
+                        );
+                    }
+                }
+            }
+            ShardedPkIndex::Bloom(_) => panic!("recording alone must not degrade"),
+        }
+
+        index.degrade_to_blooms(1024);
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                for i in 0..32u64 {
+                    let k = owned_key(&key(i));
+                    let shard = shard_of_pk(k.as_ref(), 4);
+                    assert!(
+                        blooms[shard].maybe_contains(k.as_ref()),
+                        "degrading must not lose any key (no false negatives)"
+                    );
+                }
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade must convert to blooms"),
+        }
+    }
     use crate::row_converter::Row;
 
     fn key(n: u64) -> [u8; 8] {
@@ -868,6 +1627,105 @@ mod tests {
 
     fn owned_key(bytes: &[u8]) -> super::OwnedRow {
         Row::from_encoded(bytes).owned()
+    }
+
+    #[test]
+    fn entry_estimate_charges_the_digest_the_entry_struct_and_the_key() {
+        // Pins the figure every keyset byte budget is computed from (rationale on
+        // `approx_pk_keyset_entry_bytes`). Asserted as a concrete number rather
+        // than re-derived from the same `size_of`s the function adds, which would
+        // restate the implementation and pass no matter what it charged: on 64-bit
+        // an 8-byte key costs 8 + 16 (u128 digest) + 56 (`PkKeysetEntry`) + 16
+        // (map slot) = 96. `sharded_table_splits_the_keyset_budget_between_the_two_caches`
+        // sizes its key count against this, so changing the estimate must fail
+        // HERE rather than silently widen that test's budget window.
+        assert_eq!(approx_pk_keyset_entry_bytes(&owned_key(&key(7))), 96);
+    }
+
+    #[test]
+    fn bounded_builder_stays_exact_within_budget() {
+        let mut builder = BoundedShardedPkIndexBuilder::new(4, Some(1 << 20));
+        for n in 0..100u64 {
+            builder.insert(owned_key(&key(n)), RowLocation::FileUnlocated);
+        }
+        assert_eq!(builder.len(), 100);
+        let ShardedPkIndex::Exact(shards) = builder.finish() else {
+            panic!("within-budget build must stay exact");
+        };
+        assert_eq!(shards.len(), 4);
+        // Every key must sit in exactly the shard `shard_of_pk` routes it to.
+        for n in 0..100u64 {
+            let k = owned_key(&key(n));
+            let s = shard_of_pk(k.as_ref(), 4);
+            assert!(
+                shards[s].location_by_digest(pk_digest(&k)).is_some(),
+                "key {n} missing from its routed shard {s}"
+            );
+        }
+        let total: usize = shards.iter().map(CachedPkKeyset::len).sum();
+        assert_eq!(total, 100, "no key may land in two shards");
+    }
+
+    #[test]
+    fn bounded_builder_degrades_to_blooms_over_budget_without_false_negatives() {
+        // Budget below even a handful of entries: the build must degrade
+        // mid-stream and keep accepting keys, never exceeding the budget.
+        let budget = approx_pk_keyset_entry_bytes(&owned_key(&key(0))) * 8;
+        let mut builder = BoundedShardedPkIndexBuilder::new(4, Some(budget));
+        for n in 0..1000u64 {
+            builder.insert(owned_key(&key(n)), RowLocation::FileUnlocated);
+        }
+        let ShardedPkIndex::Bloom(blooms) = builder.finish() else {
+            panic!("over-budget upsert build must degrade to blooms");
+        };
+        assert_eq!(blooms.len(), 4);
+        // No false negatives — including the keys inserted BEFORE the degrade.
+        for n in 0..1000u64 {
+            let k = owned_key(&key(n));
+            let s = shard_of_pk(k.as_ref(), 4);
+            assert!(
+                blooms[s].maybe_contains(k.as_ref()),
+                "key {n} lost across the exact->bloom degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_builder_without_budget_never_degrades() {
+        // `on_conflict: do-nothing` requires an exact answer; `max_bytes: None`
+        // must keep building exact keysets regardless of size.
+        let mut builder = BoundedShardedPkIndexBuilder::new(2, None);
+        for n in 0..1000u64 {
+            builder.insert(owned_key(&key(n)), RowLocation::FileUnlocated);
+        }
+        assert!(
+            matches!(builder.finish(), ShardedPkIndex::Exact(_)),
+            "unbudgeted build must stay exact"
+        );
+    }
+
+    #[test]
+    fn bounded_builder_insert_if_absent_preserves_location() {
+        let mut builder = BoundedShardedPkIndexBuilder::new(1, None);
+        let k = owned_key(&key(7));
+        builder.insert(
+            k.clone(),
+            RowLocation::FilePositioned {
+                file_path: "f".into(),
+                position: 3,
+            },
+        );
+        builder.insert_if_absent(k.clone(), RowLocation::FileUnlocated);
+        let ShardedPkIndex::Exact(shards) = builder.finish() else {
+            panic!("exact expected");
+        };
+        assert!(
+            matches!(
+                shards[0].location_by_digest(pk_digest(&k)),
+                Some(RowLocation::FilePositioned { .. })
+            ),
+            "insert_if_absent must not clobber a durable-scan location"
+        );
     }
 
     #[test]

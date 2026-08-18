@@ -637,10 +637,22 @@ pub trait MetadataCatalog: Send + Sync {
     /// (separate) inlined-data clear would leave stale inlined rows that scan
     /// would union into the new snapshot's results.
     ///
+    /// `inlined` carries the overwrite's own replacement rows when the whole
+    /// refresh was small enough to live in the metastore instead of in Vortex
+    /// files. It is inserted AFTER the clear, inside the same transaction, so
+    /// clear-then-replace is atomic exactly as clear-then-flip is: a crash
+    /// mid-commit leaves the old snapshot and its old inline rows fully intact.
+    /// `None` for a file-backed (or empty) overwrite.
+    ///
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
-    async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    async fn commit_overwrite(
+        &self,
+        table_id: &str,
+        new_snapshot_id: &str,
+        inlined: Option<&InlinedData>,
+    ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
     async fn add_partition(&self, partition: PartitionMetadata) -> CatalogResult<String>;
@@ -985,6 +997,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// is a no-op the next tick retries. Default implementation does nothing.
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         Ok(())
+    }
+
+    /// Reclaim a bounded slice of the metastore freelist off the hot path,
+    /// returning the pages reclaimed. Called from the same background
+    /// maintenance tick as [`Self::checkpoint_wal`] and immediately before it,
+    /// because the relocation lands in the WAL and the file only shrinks once a
+    /// checkpoint copies it back. A no-op unless the metastore was created in an
+    /// incremental auto-vacuum mode. Default implementation does nothing.
+    async fn incremental_vacuum(&self) -> CatalogResult<u64> {
+        Ok(0)
     }
 
     /// Drop a table and all its associated metadata (delete files, insert records,

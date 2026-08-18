@@ -1,0 +1,10 @@
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-cayenne[file]-adaptive-split.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 1000
+    terminals: 100
+    duration: 900
+    ready_wait: 900
+    query_overrides: chbench-skip-slow
+    rate: 9250

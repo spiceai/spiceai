@@ -22,8 +22,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use app::AppBuilder;
 
 use runtime::{
-    Runtime, accelerated_table::refresh::RefreshOverrides,
-    component::dataset::acceleration::RefreshMode,
+    Runtime, accelerated::refresh::RefreshOverrides, component::dataset::acceleration::RefreshMode,
 };
 use spicepod::{acceleration::Acceleration, component::dataset::Dataset, param::Params};
 

@@ -11,6 +11,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | ADBC                             | ➖              |                 |
 | Azure BlobFS                     | ➖              |                 |
 | Clickhouse                       | ➖              |                 |
+| Cosmos DB (NoSQL)                | ➖              |                 |
 | Databricks (mode: delta_lake)    | ✅              | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖              |                 |
 | Databricks (mode: sql_warehouse) | ➖              |                 |
@@ -19,11 +20,12 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Dremio                           | ✅              | @Sevenannn      |
 | DuckDB                           | ✅              | @peasee         |
 | DuckLake                         | ➖              |                 |
-| DynamoDB                         | ➖              |                 |
+| DynamoDB                         | ✅              | @krinart        |
 | File                             | ✅              | @ewgenius       |
 | FlightSQL                        | ➖              |                 |
 | FTP/SFTP                         | ➖              |                 |
 | GCS                              | ➖              |                 |
+| Git                              | ➖              |                 |
 | GitHub                           | ✅              | @phillipleblanc |
 | Glue                             | ➖              |                 |
 | GraphQL                          | ➖              |                 |
@@ -61,6 +63,7 @@ This table defines the required features and/or tests for each connector:
 | ADBC                             | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
 | Azure BlobFS                     | ✅ (5)                 | ✅ (5)                   | ☑️                 | ✅                        | ✅                   | ☑️                          |
 | Clickhouse                       | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Cosmos DB (NoSQL)                | ➖                     | ➖                       | ➖                 | ✅                        | ✅                   | ☑️                          |
 | Databricks (mode: delta_lake)    | ✅ (5)                 | ✅ (5)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: spark_connect) | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: sql_warehouse) | ➖                     | ➖                       | ✅                 | ✅                        | ✅                   | ✅                          |
@@ -73,6 +76,7 @@ This table defines the required features and/or tests for each connector:
 | File                             | ✅ (5)                 | ✅ (5)                   | ➖                 | ✅                        | ✅                   | ☑️                          |
 | FTP/SFTP                         | ➖                     | ➖                       | ➖                 | ✅                        | ✅                   | ☑️                          |
 | GCS                              | ✅ (5)                 | ✅ (5)                   | ➖                 | ✅                        | ✅                   | ☑️                          |
+| Git                              | ➖                     | ➖                       | ☑️                 | ✅                        | ✅                   | ☑️                          |
 | GitHub                           | ➖                     | ➖                       | ☑️                 | ✅                        | ✅                   | ☑️                          |
 | Glue                             | ➖                     | ➖                       | ☑️                 | ✅                        | ✅                   | ✅                          |
 | GraphQL                          | ➖                     | ➖                       | ➖                 | ✅                        | ✅                   | ☑️                          |

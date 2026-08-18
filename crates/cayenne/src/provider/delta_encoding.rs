@@ -43,19 +43,18 @@ limitations under the License.
 //! | level | scheme set |
 //! |---|---|
 //! | 0 | `Uncompressed` only (canonical arrays; zero search, zero transform) |
-//! | 1 | + `Constant` / `Sparse` (near-free detection; common CDC shapes) |
-//! | 2 | + `Dict` (cheap, high-value on repetitive CDC data) |
-//! | 3 | + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) |
+//! | 1 | `Sparse` only (near-free detection; constant detection is built into the cascade as of Vortex 0.79) |
+//! | 2 | string `Zstd` only — the `auto` light level (one entropy pass over the string residual; numerics stay canonical until compaction) |
+//! | 3 | rich light: dictionaries + cheap numeric schemes (`For`, `BitPacking`, `ZigZag`, `RunEnd`, `Sequence`) + `Zstd` |
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
-//! `auto` (the default) size-gates: a delta smaller than a quarter of the
-//! target file size — or of unknown size (a transient staged stream that
-//! compaction rewrites) — encodes at [`AUTO_LIGHT_LEVEL`]; only a known-large
-//! write uses the full default. Level `7` is the explicit opt-out
-//! (byte-for-byte the pre-feature behavior). Maintenance writes
-//! ([`WriteClass::Maintenance`]) always use the full default regardless of
-//! the configured level.
+//! `auto` (the default) encodes every delta at [`AUTO_LIGHT_LEVEL`]: a delta is
+//! a transient staged stream (e.g. the off-fence mem-tier checkpoint) that
+//! compaction rewrites, so it skips the full cascade regardless of size. Level
+//! `7` is the explicit opt-out (byte-for-byte the pre-feature behavior).
+//! Maintenance writes ([`WriteClass::Maintenance`]) always use the full default
+//! regardless of the configured level.
 
 use vortex::file::WriteStrategyBuilder;
 use vortex_btrblocks::schemes::{float, integer, string};
@@ -121,56 +120,42 @@ pub(crate) enum WriteClass {
     Maintenance,
 }
 
-/// Level used for every [`WriteClass::Maintenance`] write and for large
-/// known-size deltas under `auto`: the full default `BtrBlocks` cascade.
-/// Aliases the metadata constant so the config default and the mapping
-/// boundary can't drift apart.
+/// Level used for every [`WriteClass::Maintenance`] write: the full default
+/// `BtrBlocks` cascade. Aliases the metadata constant so the config default
+/// and the mapping boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
-/// Level chosen by `auto` for small deltas. `Constant + Sparse + Dict` keeps
-/// the big repetitive-CDC wins (often 3-5×) while skipping the per-file
-/// strategy search and FSST training that dominate small-write encode cost.
+/// Level chosen by `auto` for every delta write: string `Zstd` only. A single
+/// entropy-coding pass over the string residual captures most of the
+/// transient-file byte win (417k-row harness, release: 103.1 MB vs 172.5 MB
+/// for the prior Sparse+Dict set and 115.8 MB for the FULL cascade) at equal
+/// light-path encode wall time, while skipping the per-file strategy search
+/// and FSST training that dominates small-write encode cost. Every delta is
+/// transient — compaction re-encodes it at [`FULL_LEVEL`] — so the light
+/// scheme set trades a larger transient file (compaction folds it) for
+/// materially cheaper CDC-hot-path encode. Numeric columns stay canonical on
+/// this path; the full cascade is reserved for the durable
+/// [`WriteClass::Maintenance`] artifacts whose encoding quality pays for scan
+/// throughput.
 pub(crate) const AUTO_LIGHT_LEVEL: u8 = 2;
-
-/// Under `auto`, a delta is "small" when its estimated bytes are below
-/// `target_file_size / AUTO_LIGHT_DENOMINATOR` — the same quarter-of-a-target
-/// classification the compaction picker uses for "small" files, on the
-/// rationale that a write smaller than a target file is transient by
-/// definition (compaction exists to fold it).
-pub(crate) const AUTO_LIGHT_DENOMINATOR: u64 = 4;
 
 /// Resolve the effective encoding level for one snapshot write.
 ///
-/// `estimated_bytes` is the caller's pre-encode size estimate (`None` when
-/// the stream size is unknown, e.g. opaque staged streams). Under `auto`, an
-/// unknown size resolves to [`AUTO_LIGHT_LEVEL`]: it is a transient staged
-/// stream (e.g. the off-fence mem-tier checkpoint) that compaction rewrites,
-/// so only a known-large delta takes [`FULL_LEVEL`].
-pub(crate) fn effective_level(
-    encoding: DeltaEncoding,
-    write_class: WriteClass,
-    estimated_bytes: Option<u64>,
-    target_size_bytes: usize,
-) -> u8 {
+/// Under `auto`, every [`WriteClass::Delta`] write encodes LIGHT
+/// ([`AUTO_LIGHT_LEVEL`]): deltas are transient staged CDC streams (e.g. the
+/// off-fence mem-tier checkpoint) that compaction rewrites at [`FULL_LEVEL`],
+/// so paying the full `BtrBlocks` cascade (incl. the FSST symbol-table
+/// double-train) on the CDC hot path is wasted work — the file is re-encoded
+/// before it becomes long-lived. Only durable [`WriteClass::Maintenance`]
+/// writes take [`FULL_LEVEL`] under `auto`; an explicit
+/// [`DeltaEncoding::Level`] overrides the delta path with a fixed level.
+pub(crate) fn effective_level(encoding: DeltaEncoding, write_class: WriteClass) -> u8 {
     if write_class == WriteClass::Maintenance {
         return FULL_LEVEL;
     }
     match encoding {
         DeltaEncoding::Level(level) => level.min(DELTA_ENCODING_MAX_LEVEL),
-        DeltaEncoding::Auto => {
-            let threshold =
-                u64::try_from(target_size_bytes).unwrap_or(u64::MAX) / AUTO_LIGHT_DENOMINATOR;
-            match estimated_bytes {
-                Some(bytes) if bytes < threshold.max(1) => AUTO_LIGHT_LEVEL,
-                // Unknown size means an opaque staged CDC stream (e.g. the
-                // off-fence mem-tier checkpoint) — transient and rewritten by
-                // compaction, so encode it LIGHT rather than paying the full
-                // BtrBlocks cascade (incl. the FSST symbol-table double-train)
-                // on the CDC hot path. Only a known-large delta takes FULL.
-                None => AUTO_LIGHT_LEVEL,
-                Some(_) => FULL_LEVEL,
-            }
-        }
+        DeltaEncoding::Auto => AUTO_LIGHT_LEVEL,
     }
 }
 
@@ -195,30 +180,25 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
     let builder = match level {
         // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
         0 => BtrBlocksCompressorBuilder::empty(),
-        // 1: + constant / sparse detection (near-free; common CDC shapes).
+        // 1: + sparse detection (near-free; common CDC shapes). Constant
+        // detection is built into the cascading compressor as of Vortex 0.79.
         1 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
         ]),
-        // 2: + dictionary (cheap, high-value on repetitive CDC data).
-        2 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
-            &integer::SparseScheme,
-            &integer::IntDictScheme,
-            &float::FloatConstantScheme,
-            &float::NullDominatedSparseScheme,
-            &float::FloatDictScheme,
-            &string::StringConstantScheme,
-            &string::NullDominatedSparseScheme,
-            &string::StringDictScheme,
-        ]),
-        // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
+        // 2 (the `auto` light level): string Zstd only. One entropy-coding
+        // pass over the string residual captures most of the transient-file
+        // byte win at light-path encode cost — measured on the 417k-row
+        // round-trip harness (release): zstd-only 103.1 MB vs Sparse+Dict
+        // 172.5 MB vs the FULL cascade 115.8 MB, at statistically equal
+        // encode wall time (~100 ms; FULL 126 ms). Numeric columns stay
+        // canonical here; compaction's FULL re-encode optimizes them for the
+        // long-lived artifact. Dict+numeric light sets remain at level 3 as
+        // the explicit A/B rung (dict+zstd measured only ~4% smaller).
+        2 => builder_with_schemes(&[&string::ZstdScheme]),
+        // 3: rich light — dictionaries + cheap numeric schemes + Zstd.
         3 => builder_with_schemes(&[
-            &integer::IntConstantScheme,
             &integer::SparseScheme,
             &integer::IntDictScheme,
             &integer::FoRScheme,
@@ -226,13 +206,12 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
             &integer::ZigZagScheme,
             &integer::RunEndScheme,
             &integer::SequenceScheme,
-            &float::FloatConstantScheme,
             &float::NullDominatedSparseScheme,
             &float::FloatDictScheme,
             &float::FloatRLEScheme,
-            &string::StringConstantScheme,
             &string::NullDominatedSparseScheme,
             &string::StringDictScheme,
+            &string::ZstdScheme,
         ]),
         // 4-6: everything in the default set except FSST — the symbol-table
         // training is the profiled dominant fixed cost on small string-bearing
@@ -246,8 +225,6 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TARGET: usize = 256 * 1024 * 1024; // 256 MiB target file size
 
     #[test]
     fn parse_accepts_auto_and_levels() {
@@ -265,101 +242,64 @@ mod tests {
     }
 
     #[test]
-    fn default_is_auto_with_light_small_deltas_and_full_opt_out() {
-        // Product decision: `auto` ships as the default — small known-size
-        // deltas and unknown-size (transient, compaction-rewritten) writes
-        // encode light; large known-size writes and maintenance stay on the
-        // full cascade. Level 7 is the explicit opt-out.
+    fn default_is_auto_with_light_deltas_and_full_opt_out() {
+        // Product decision: `auto` ships as the default — every delta (a
+        // transient, compaction-rewritten write) encodes light; maintenance
+        // stays on the full cascade. Level 7 is the explicit opt-out.
         assert_eq!(DeltaEncoding::default(), DeltaEncoding::Auto);
         assert!(
             strategy_builder_for_level(effective_level(
                 DeltaEncoding::default(),
                 WriteClass::Delta,
-                Some(1),
-                TARGET
             ))
             .is_some(),
-            "default auto must light-encode a small known-size delta"
-        );
-        assert!(
-            strategy_builder_for_level(effective_level(
-                DeltaEncoding::default(),
-                WriteClass::Delta,
-                None,
-                TARGET
-            ))
-            .is_some(),
-            "default auto must light-encode unknown-size (transient) writes"
+            "default auto must light-encode a delta write"
         );
         assert!(
             strategy_builder_for_level(effective_level(
                 DeltaEncoding::Level(FULL_LEVEL),
                 WriteClass::Delta,
-                Some(1),
-                TARGET
             ))
             .is_none(),
-            "level 7 must be the explicit opt-out (full strategy) even for tiny deltas"
+            "level 7 must be the explicit opt-out (full strategy) for a delta"
         );
     }
 
     #[test]
-    fn auto_gates_by_estimated_size() {
-        // Small delta (1 MiB << 64 MiB threshold) -> light level.
+    fn auto_lights_every_delta_regardless_of_size() {
+        // No size gate: under `auto` a delta encodes LIGHT whether it is a
+        // small fresh write or a large mem-tier checkpoint. Every delta is
+        // transient (compaction re-encodes it at FULL), so the CDC hot path
+        // never pays the full BtrBlocks + FSST cascade.
         assert_eq!(
-            effective_level(
-                DeltaEncoding::Auto,
-                WriteClass::Delta,
-                Some(1024 * 1024),
-                TARGET
-            ),
-            AUTO_LIGHT_LEVEL
+            effective_level(DeltaEncoding::Auto, WriteClass::Delta),
+            AUTO_LIGHT_LEVEL,
+            "auto must light-encode a delta write"
         );
-        // Large write (at the threshold) -> full.
+        // Maintenance is the one class that keeps the full cascade under auto.
         assert_eq!(
-            effective_level(
-                DeltaEncoding::Auto,
-                WriteClass::Delta,
-                Some(64 * 1024 * 1024),
-                TARGET
-            ),
-            FULL_LEVEL
-        );
-        // Unknown size -> light: an unknown-size staged delta is a transient
-        // CDC stream (the off-fence mem-tier checkpoint) that compaction
-        // rewrites, so it skips the full BtrBlocks cascade on the hot path.
-        assert_eq!(
-            effective_level(DeltaEncoding::Auto, WriteClass::Delta, None, TARGET),
-            AUTO_LIGHT_LEVEL
+            effective_level(DeltaEncoding::Auto, WriteClass::Maintenance),
+            FULL_LEVEL,
+            "auto maintenance must use the full cascade"
         );
     }
 
     #[test]
     fn maintenance_always_full_even_with_explicit_level() {
         assert_eq!(
-            effective_level(
-                DeltaEncoding::Level(0),
-                WriteClass::Maintenance,
-                Some(1),
-                TARGET
-            ),
+            effective_level(DeltaEncoding::Level(0), WriteClass::Maintenance),
             FULL_LEVEL
         );
     }
 
     #[test]
-    fn explicit_level_applies_to_any_delta_size() {
+    fn explicit_level_applies_to_a_delta() {
         assert_eq!(
-            effective_level(
-                DeltaEncoding::Level(3),
-                WriteClass::Delta,
-                Some(u64::MAX),
-                TARGET
-            ),
+            effective_level(DeltaEncoding::Level(3), WriteClass::Delta),
             3
         );
         assert_eq!(
-            effective_level(DeltaEncoding::Level(9), WriteClass::Delta, None, TARGET),
+            effective_level(DeltaEncoding::Level(9), WriteClass::Delta),
             9
         );
     }

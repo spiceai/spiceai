@@ -12,6 +12,8 @@ description = "NFS data connector for Spice.ai runtime"
 linkme = "0.3.35"
 paste = "1.0.15"
 runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "macros", "test-util", "time"] }
 url = "2.5"

@@ -18,7 +18,7 @@ limitations under the License.
 //! partitioned tables, creating and opening per-partition [`CayenneTableProvider`]s.
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DFSchema;
@@ -29,7 +29,6 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
-use regex::Regex;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
     encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
@@ -43,19 +42,18 @@ use crate::{
     TimeRetentionFilterBuilder, metadata,
 };
 
-/// Partition values matching `.*#\d+` (e.g. `"abcdef#123"`) are only supported
-/// on S3 Express One Zone locations, not on local filesystem paths.
-static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r".*#\d+$") {
-        Ok(compiled) => compiled,
-        Err(e) => unreachable!("Unable to compile regexp: {e}"),
-    });
-
 /// Implements [`PartitionCreator`] for Cayenne-backed partitioned tables.
 ///
 /// Creates and opens per-partition [`CayenneTableProvider`]s rooted at
 /// Hive-style subdirectories under `base_path`.
-pub(crate) struct CayennePartitionCreator {
+///
+/// Two callers construct this: `CREATE TABLE … PARTITIONED BY` in
+/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. Both
+/// run their partitions' interval compaction through the process-wide budget
+/// ([`Self::with_background_compaction`]); they differ only in that the
+/// accelerator's tables are targets for the accelerated dual-write path
+/// ([`Self::with_direct_partition_writes`]).
+pub struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
     partition_by: Vec<PartitionedBy>,
@@ -71,6 +69,14 @@ pub(crate) struct CayennePartitionCreator {
     on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
     /// Shared context (footer/segment caches) created once, shared across all partitions.
     context: Arc<CayenneContext>,
+    /// Compaction budget shared with the creating engine, if it runs one. Every
+    /// partition provider spawns its background compaction task through this
+    /// semaphore, so the whole table shares one concurrency budget. `None`
+    /// leaves partitions without an interval compactor; they still compact on
+    /// write through `schedule_post_write_compaction`.
+    compaction_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// See [`PartitionCreator::accepts_direct_partition_writes`].
+    accepts_direct_partition_writes: bool,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -93,13 +99,23 @@ impl std::fmt::Debug for CayennePartitionCreator {
             .field("primary_key", &self.primary_key)
             .field("on_conflict", &self.on_conflict.is_some())
             .field("context", &"<CayenneContext>")
-            .finish()
+            .field("compaction_semaphore", &self.compaction_semaphore.is_some())
+            .field(
+                "accepts_direct_partition_writes",
+                &self.accepts_direct_partition_writes,
+            )
+            .finish_non_exhaustive()
     }
 }
 
 impl CayennePartitionCreator {
+    /// Create a partition creator that runs no interval compaction and is not a
+    /// dual-write target. Both engines that open Cayenne tables opt into a
+    /// compaction budget with [`Self::with_background_compaction`]; only the
+    /// accelerator opts into [`Self::with_direct_partition_writes`].
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    #[must_use]
+    pub fn new(
         table_name: String,
         base_path: PathBuf,
         partition_by: Vec<PartitionedBy>,
@@ -132,7 +148,38 @@ impl CayennePartitionCreator {
             primary_key,
             on_conflict,
             context,
+            compaction_semaphore: None,
+            accepts_direct_partition_writes: false,
         }
+    }
+
+    /// Run each partition's background compaction through `semaphore`, so every
+    /// partition of this table draws on one shared concurrency budget.
+    #[must_use]
+    pub fn with_background_compaction(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.compaction_semaphore = Some(semaphore);
+        self
+    }
+
+    /// Accept writes addressed to the partition table itself, making this table
+    /// a target for the accelerated dual-write path. See
+    /// [`PartitionCreator::accepts_direct_partition_writes`].
+    #[must_use]
+    pub fn with_direct_partition_writes(mut self) -> Self {
+        self.accepts_direct_partition_writes = true;
+        self
+    }
+
+    /// Wire a freshly opened partition provider into the shared caches and, when
+    /// the creating engine runs one, the shared compaction budget.
+    fn init_partition_provider(&self, provider: &Arc<crate::CayenneTableProvider>) {
+        if let Some(semaphore) = &self.compaction_semaphore {
+            provider.spawn_background_compaction(Arc::clone(semaphore));
+        }
+        // Wire the demand scan-view cache (weak self-ref for spawn_blocking builds +
+        // the idle evictor) so a partition provider offloads its builds and releases
+        // idle cached views' pinned snapshot dirs, like the top-level provider.
+        provider.init_scan_view_cache();
     }
 
     fn partition_column_labels(&self) -> Vec<String> {
@@ -173,6 +220,16 @@ impl CayennePartitionCreator {
 
 #[async_trait]
 impl PartitionCreator for CayennePartitionCreator {
+    /// Cayenne owns its partition storage, so a partitioned Cayenne table can be
+    /// written to directly — but only the accelerator asks for that, via
+    /// [`Self::with_direct_partition_writes`]. A table created through
+    /// `CREATE TABLE … PARTITIONED BY` is not reachable from the dual-write path
+    /// at all (it is a catalog table, never an accelerator), so it keeps the
+    /// trait's conservative default.
+    fn accepts_direct_partition_writes(&self) -> bool {
+        self.accepts_direct_partition_writes
+    }
+
     async fn create_partition(
         &self,
         partition_values: Vec<ScalarValue>,
@@ -185,7 +242,7 @@ impl PartitionCreator for CayennePartitionCreator {
         if partition_values.len() != self.partition_by.len() {
             return Err(creator::Error::CreatePartition {
                 source: format!(
-                    "Expected {} partition values but got {}",
+                    "Expected {} partition values but got {} (one per partition_by expression)",
                     self.partition_by.len(),
                     partition_values.len()
                 )
@@ -202,20 +259,6 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
-        if self.object_store_config.is_none() {
-            for value in &partition_value_strings {
-                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
-                    return Err(creator::Error::CreatePartition {
-                        source: format!(
-                            "Partition value '{value}' is not supported for local filesystem. \
-                             Values matching '*#<digits>' are only supported on S3 Express One Zone."
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
         tokio::fs::create_dir_all(&partition_dir)
@@ -294,9 +337,11 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        let table_provider = Arc::new(cayenne_table);
+        self.init_partition_provider(&table_provider);
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider,
         })
     }
 
@@ -380,9 +425,11 @@ impl PartitionCreator for CayennePartitionCreator {
                 }
             };
 
+            let table_provider = Arc::new(cayenne_table);
+            self.init_partition_provider(&table_provider);
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider,
             });
         }
 
@@ -425,4 +472,325 @@ fn encode_identifier_hex(value: &str) -> String {
         let _ = write!(encoded, "{byte:02X}");
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use datafusion::execution::context::SessionContext;
+    use datafusion::prelude::col;
+    use datafusion::scalar::ScalarValue;
+    use tempfile::TempDir;
+
+    use crate::metadata::{CreateTableOptions, VortexConfig};
+    use crate::{CayenneCatalog, CayenneTableProvider};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    const TABLE: &str = "partitioned_events";
+
+    struct Fixture {
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        schema: SchemaRef,
+        base_path: PathBuf,
+        runtime_env: Arc<RuntimeEnv>,
+        _tmp: TempDir,
+    }
+
+    /// A parent table registered in a sqlite metastore, partitioned by the
+    /// `bucket` column, with its data rooted in a temp dir.
+    async fn fixture() -> Fixture {
+        let tmp = TempDir::new().expect("tempdir");
+        let base_path = tmp.path().join(TABLE);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("bucket", DataType::Utf8, false),
+        ]));
+
+        let catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", tmp.path().join("meta.db").display()))
+                .expect("catalog opens"),
+        );
+        catalog.init().await.expect("catalog schema initializes");
+
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: TABLE.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: base_path.to_string_lossy().to_string(),
+                partition_column: Some("bucket".to_string()),
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("catalog create_table");
+
+        Fixture {
+            catalog,
+            table_id,
+            schema,
+            base_path,
+            runtime_env: SessionContext::new().runtime_env(),
+            _tmp: tmp,
+        }
+    }
+
+    fn creator_for(fixture: &Fixture) -> CayennePartitionCreator {
+        CayennePartitionCreator::new(
+            TABLE.to_string(),
+            fixture.base_path.clone(),
+            vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: col("bucket"),
+            }],
+            Arc::clone(&fixture.schema),
+            Arc::clone(&fixture.catalog),
+            fixture.table_id.clone(),
+            UnsupportedTypeAction::Error,
+            Vec::new(),
+            None,
+            crate::metadata::VortexConfig::default(),
+            None,
+            Vec::new(),
+            None,
+            Arc::clone(&fixture.runtime_env),
+        )
+    }
+
+    fn bucket(value: &str) -> ScalarValue {
+        ScalarValue::Utf8(Some(value.to_string()))
+    }
+
+    /// The `CREATE TABLE … PARTITIONED BY` path is not reachable from the
+    /// accelerated dual-write path (it produces a catalog table, never an
+    /// accelerator), so it keeps the trait's conservative default; the
+    /// accelerator opts in explicitly.
+    #[tokio::test]
+    async fn only_the_accelerator_opts_into_direct_partition_writes() {
+        let fixture = fixture().await;
+
+        assert!(
+            !creator_for(&fixture).accepts_direct_partition_writes(),
+            "a DDL-created partitioned table must not be a dual-write target"
+        );
+        assert!(
+            creator_for(&fixture)
+                .with_direct_partition_writes()
+                .accepts_direct_partition_writes(),
+            "the accelerator opts in, so its partitions must be dual-write targets"
+        );
+        assert!(
+            !creator_for(&fixture)
+                .with_background_compaction(Arc::new(tokio::sync::Semaphore::new(1)))
+                .accepts_direct_partition_writes(),
+            "sharing a compaction budget must not imply accepting direct writes"
+        );
+    }
+
+    fn assert_background_compaction(partitions: &[Partition], expected: bool, context: &str) {
+        assert!(!partitions.is_empty(), "{context}: nothing to assert on");
+        for partition in partitions {
+            let provider = partition
+                .table_provider
+                .downcast_ref::<CayenneTableProvider>()
+                .expect("a Cayenne partition is backed by a CayenneTableProvider");
+            assert_eq!(
+                provider.has_background_compactor(),
+                expected,
+                "{context}: background compaction must follow the shared budget"
+            );
+        }
+    }
+
+    /// Each partition provider joins the creating engine's compaction budget
+    /// only when one was supplied — on the create path and on the reopen path
+    /// alike. Without a budget a partition still compacts on write, but runs no
+    /// interval compactor.
+    #[tokio::test]
+    async fn partitions_join_the_shared_compaction_budget_only_when_it_is_supplied() {
+        let fixture = fixture().await;
+        let plain = creator_for(&fixture);
+        let shared = creator_for(&fixture)
+            .with_background_compaction(Arc::new(tokio::sync::Semaphore::new(4)));
+
+        let created_plain = plain
+            .create_partition(vec![bucket("solo")])
+            .await
+            .expect("partition is created without a shared budget");
+        assert_background_compaction(&[created_plain], false, "created without a budget");
+
+        let created_shared = shared
+            .create_partition(vec![bucket("shared")])
+            .await
+            .expect("partition is created with a shared budget");
+        assert_background_compaction(&[created_shared], true, "created with a budget");
+
+        // Reopening the same two partitions must make the same decision.
+        let reopened_plain = plain
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred without a shared budget");
+        assert_background_compaction(&reopened_plain, false, "reopened without a budget");
+
+        let reopened_shared = shared
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred with a shared budget");
+        assert_background_compaction(&reopened_shared, true, "reopened with a budget");
+    }
+
+    /// A created partition must be recoverable: the Hive-style directory exists
+    /// on disk and re-opening the table reads back every partition value.
+    #[tokio::test]
+    async fn created_partitions_round_trip_through_inference() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+
+        for value in ["alpha", "beta"] {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .expect("partition is created");
+        }
+
+        // Partition values are encoded into the directory name, so assert the
+        // shape and the count rather than a spelling the codec owns.
+        let partition_dirs: Vec<String> = std::fs::read_dir(&fixture.base_path)
+            .expect("the table directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("the directory entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|name| name.starts_with("bucket="))
+            .collect();
+        assert_eq!(
+            partition_dirs.len(),
+            2,
+            "one Hive-style directory per created partition, got {partition_dirs:?}"
+        );
+
+        let inferred = creator
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred");
+        let mut values: Vec<String> = inferred
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// One value per `partition_by` expression, no more and no fewer.
+    #[tokio::test]
+    async fn partition_values_must_match_the_partition_by_arity() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+
+        let empty = creator
+            .create_partition(vec![])
+            .await
+            .expect_err("no partition values must be rejected");
+        assert!(
+            empty.to_string().contains("At least one partition value"),
+            "unexpected error for zero values: {empty}"
+        );
+
+        let too_many = creator
+            .create_partition(vec![bucket("alpha"), bucket("beta")])
+            .await
+            .expect_err("surplus partition values must be rejected");
+        assert!(
+            too_many
+                .to_string()
+                .contains("Expected 1 partition values but got 2"),
+            "unexpected error for surplus values: {too_many}"
+        );
+    }
+
+    /// A partition value is hex-encoded into a single path component before it
+    /// reaches the filesystem, so no character a user can write — a `#`, a path
+    /// separator, a parent-directory reference — can escape or split the
+    /// directory name. This is what makes every value legal on a local
+    /// filesystem, and it is the property to keep if the encoding ever changes.
+    #[tokio::test]
+    async fn a_path_hostile_partition_value_becomes_one_safe_directory_component() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+
+        let hostile = ["abcdef#123", "a/b", "..", "x=y", "with space"];
+        for value in hostile {
+            // The path the creator computes, before the filesystem sees it: a
+            // value that kept a separator would nest below the table directory
+            // rather than sit directly in it, and `read_dir` below could not
+            // tell the difference — it only ever reports the first component.
+            let partition_dir = creator
+                .partition_dir(&[bucket(value)])
+                .unwrap_or_else(|e| panic!("'{value}' must map to a partition directory: {e}"));
+            assert_eq!(
+                partition_dir.parent(),
+                Some(fixture.base_path.as_path()),
+                "'{value}' must name a direct child of the table directory, got {partition_dir:?}"
+            );
+
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .unwrap_or_else(|e| panic!("'{value}' must be a legal partition value: {e}"));
+        }
+
+        let partition_dirs: Vec<String> = std::fs::read_dir(&fixture.base_path)
+            .expect("the table directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("the directory entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|name| name.starts_with("bucket="))
+            .collect();
+        assert_eq!(
+            partition_dirs.len(),
+            hostile.len(),
+            "one directory per created partition, got {partition_dirs:?}"
+        );
+        for name in &partition_dirs {
+            let encoded = name
+                .strip_prefix("bucket=")
+                .expect("the directory name is Hive-style");
+            assert!(
+                encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'),
+                "'{name}' must be a single path-safe component"
+            );
+        }
+
+        let mut values: Vec<String> = creator
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        let mut expected: Vec<String> = hostile.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            values, expected,
+            "every encoded value must read back exactly as written"
+        );
+    }
 }

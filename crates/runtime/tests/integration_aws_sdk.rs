@@ -16,17 +16,23 @@ limitations under the License.
 
 #![recursion_limit = "256"]
 
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use arrow::array::RecordBatch;
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use futures::TryStreamExt;
 
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use runtime::Runtime;
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use tracing::subscriber::DefaultGuard;
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 use tracing_subscriber::EnvFilter;
 
 #[cfg(all(feature = "databricks", feature = "delta_lake"))]
 mod aws_sdk;
 mod utils;
 
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
@@ -41,6 +47,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
+#[cfg(all(feature = "databricks", feature = "delta_lake"))]
 async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
     query: &str,

@@ -8,7 +8,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 
 | Connector                        | Beta Quality | DRI Sign-off    |
 | -------------------------------- | ------------ | --------------- |
-| ADBC                             | ➖           |                 |
+| ADBC                             | ✅           | @lukekim        |
 | Azure BlobFS                     | ➖           |                 |
 | Clickhouse                       | ➖           |                 |
 | Cosmos DB (NoSQL)                | ✅           | @lukekim        |
@@ -22,13 +22,13 @@ All criteria must be met for the connector to be considered Beta, with exception
 | DuckLake                         | ✅           | @sgrebnov       |
 | DynamoDB                         | ✅           | @krinart        |
 | File                             | ✅           | @peasee         |
-| FlightSQL                        | ➖           |                 |
+| FlightSQL                        | ✅           | @lukekim        |
 | FTP/SFTP                         | ➖           |                 |
 | GCS                              | ➖           |                 |
 | Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
 | Glue                             | ➖           |                 |
-| GraphQL                          | ➖           |                 |
+| GraphQL                          | ✅           | @peasee         |
 | HTTP/HTTPS                       | ➖           |                 |
 | Iceberg                          | ✅           | @phillipleblanc |
 | IMAP                             | ➖           |                 |
@@ -38,12 +38,12 @@ All criteria must be met for the connector to be considered Beta, with exception
 | MS SQL                           | ✅           | @peasee         |
 | MySQL                            | ✅           | @peasee         |
 | NFS                              | ➖           |                 |
-| ODBC                             | ➖           |                 |
+| ODBC                             | ✅           | @lukekim        |
 | Oracle                           | ➖           |                 |
 | PostgreSQL                       | ✅           | @Sevenannn      |
 | S3                               | ✅           | @Sevenannn      |
 | ScyllaDB                         | ➖           |                 |
-| Sharepoint                       | ➖           |                 |
+| Sharepoint                       | ✅           | @lukekim        |
 | SMB                              | ➖           |                 |
 | Snowflake                        | ✅           | @phillipleblanc |
 | Spark                            | ✅           | @ewgenius       |

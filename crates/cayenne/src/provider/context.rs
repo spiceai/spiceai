@@ -55,6 +55,20 @@ pub struct CayenneContext {
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
     upload_semaphore: Arc<Semaphore>,
+    /// Bounds concurrent inline-admission attempts on the OVERWRITE path across
+    /// every table sharing this context — i.e. across the partition children of a
+    /// partitioned dataset, whose overwrites all run at once under one
+    /// coordinator. Exactly one slot, so the host-memory the runtime reserves for
+    /// a single buffered admission (`inline_max_buffer_bytes`) plus its
+    /// serialized blob (`inline_max_bytes`) per acceleration is TRUE rather than
+    /// merely bigger.
+    ///
+    /// Acquired with `try_acquire`, never awaited: partition children are coupled
+    /// writers fed by one routing demux, so parking here would stall the router
+    /// and starve the slot-holding sibling of input — the hold-and-wait deadlock
+    /// of spiceai/spiceai#11818. A child that cannot take the slot writes Vortex
+    /// files instead, which is what every overwrite did before inlining existed.
+    overwrite_inline_admission: Arc<Semaphore>,
     /// Shared `RuntimeEnv` from the main Spice runtime.
     ///
     /// Cayenne uses this `RuntimeEnv` for all internal `SessionContext`
@@ -139,10 +153,11 @@ pub struct CayenneContext {
 /// batch.
 pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
-/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
-/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
-/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
-/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+/// Hard ceiling on the configurable PK keyset cache budget. The budget bounds
+/// the exact keyset's resident growth (and caps the right-sized conversion
+/// blooms), so an out-of-range or typo'd `cayenne_pk_keyset_cache_mb` must not
+/// be able to request a near-`usize::MAX` allocation. Matches the
+/// auto-default's 8 GiB ceiling.
 pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 impl CayenneContext {
@@ -152,12 +167,12 @@ impl CayenneContext {
     /// is configured once by the owning runtime before table providers are created.
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
-        let vortex_format = Self::create_vortex_format(config, dataset);
+        let vortex_format = Self::create_vortex_format(config);
         // Seed the live actuators from the static config so every hot-path accessor
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
         // never a behavior change on its own.
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cores = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         // When `write_concurrency` is unset, seed the live actuator to the SAME value
         // the write path resolves to (`DEFAULT_WRITE_CONCURRENCY` capped by host
         // cores), not 0. The controller grows from this real current value; a 0
@@ -211,7 +226,13 @@ impl CayenneContext {
             } else {
                 inline_flush_bounds
             },
-            compaction_background_interval_ms: if pins.compaction_interval {
+            compaction_background_interval_ms: if pins.compaction_interval
+                || config.compaction_background_interval_ms == 0
+            {
+                // A 0 interval means the background compactor was never spawned
+                // (`spawn_background_compaction` returns early), so letting the
+                // controller raise it off 0 would only make the reported actuator
+                // value disagree with reality. Collapse the range instead.
                 (
                     config.compaction_background_interval_ms,
                     config.compaction_background_interval_ms,
@@ -285,6 +306,7 @@ impl CayenneContext {
             dataset: dataset.to_string(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
+            overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
@@ -353,9 +375,12 @@ impl CayenneContext {
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
         let session = VortexSession::default().set(strategy);
-        let format =
-            VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
-                .with_dataset_label(self.dataset.as_str());
+        let mut options = Self::vortex_table_options(&self.config);
+        // This format only writes files, so it has no use for a read-path cache.
+        // Clearing the size keeps it from building a private one when no
+        // process-wide segment cache is installed.
+        options.segment_cache_size_bytes = None;
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -380,12 +405,10 @@ impl CayenneContext {
         }
         let mut options = Self::vortex_table_options(&self.config);
         options.target_file_size_mb = cold_target_file_size_mb;
-        // Write-only format: it never scans, so drop the read-path segment cache
-        // and avoid constructing a `SharedSegmentCache` (moka + metrics) per
-        // promotion.
+        // Write-only format: it never scans, so drop the read-path cache size and
+        // avoid building a private `SharedSegmentCache` per promotion.
         options.segment_cache_size_bytes = None;
-        let format = VortexFormat::new_with_options(session, options)
-            .with_dataset_label(self.dataset.as_str());
+        let format = VortexFormat::new_with_options(session, options);
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,
@@ -429,9 +452,40 @@ impl CayenneContext {
     }
 
     /// Check if sorting is enabled.
+    ///
+    /// True for BOTH user-configured and inference-derived sort columns, because
+    /// every caller that asks this question is asking "will the rewrite produce
+    /// a globally sorted snapshot?" — which is a property of the write, not of
+    /// who chose the key. Callers deciding *precedence* (which key to sort by)
+    /// must use [`Self::sort_columns_are_authoritative`] instead.
     #[must_use]
     pub fn has_sort_columns(&self) -> bool {
         !self.config.sort_columns.is_empty()
+    }
+
+    /// Whether [`Self::sort_columns`] is an operator statement of intent rather
+    /// than a schema-inference guess.
+    ///
+    /// Only an authoritative sort order may shadow the hot filter columns
+    /// observed on scans. An inferred order (the `PostgreSQL` CDC default, which
+    /// resolves to the primary key) ranks *below* those observations, so the
+    /// default-on adaptive layout can correct the guess.
+    #[must_use]
+    pub fn sort_columns_are_authoritative(&self) -> bool {
+        !self.config.sort_columns.is_empty()
+            && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
+    }
+
+    /// Sort columns that schema inference supplied, if any — the lowest-priority
+    /// rung of the layout precedence chain (below observed filter columns).
+    /// Empty when the sort order is user-configured or absent.
+    #[must_use]
+    pub fn inferred_sort_columns(&self) -> &[String] {
+        if self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::Inferred {
+            &self.config.sort_columns
+        } else {
+            &[]
+        }
     }
 
     /// Get the configured intra-write shard-key columns. Empty = derive the
@@ -715,6 +769,19 @@ impl CayenneContext {
         &self.upload_semaphore
     }
 
+    /// Claim the single inline-admission slot for an overwrite, or `None` when a
+    /// sibling table on this context already holds it. Never blocks — see
+    /// [`Self::overwrite_inline_admission`]. The permit is held until the
+    /// overwrite commits and publishes, because the buffered batches and the
+    /// serialized blob stay resident for that whole span.
+    pub(crate) fn try_acquire_overwrite_inline_admission(
+        &self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.overwrite_inline_admission)
+            .try_acquire_owned()
+            .ok()
+    }
+
     /// Record one CDC write's measurements into the rolling ingest accounting.
     /// Always on (cheap: a few atomics + a short-held mutex per *batch*); feeds
     /// the dynamic controller and observability. The inter-batch arrival interval
@@ -844,9 +911,10 @@ impl CayenneContext {
         self.live_actuators.values()
     }
 
-    /// Whether closed-loop dynamic tuning is active for this table (an SLO goal is
-    /// set / `cayenne_tuning: adaptive`). Gates the per-tick query-admission reserve
-    /// report so it is a strict no-op for non-adaptive tables.
+    /// Whether closed-loop dynamic tuning is active for this table
+    /// (`cayenne_tuning: adaptive`; a `cayenne_goal_*` setpoint alone does not
+    /// enable it). Gates the per-tick query-admission reserve report so it is a
+    /// strict no-op for non-adaptive tables.
     #[must_use]
     pub(crate) fn dynamic_tuning_enabled(&self) -> bool {
         self.dynamic_tuning
@@ -881,9 +949,11 @@ impl CayenneContext {
         if !self.dynamic_tuning {
             return None;
         }
-        // Detect the environment (cgroup-aware memory usage) and fold it in, so
-        // the loop closes on memory as well as ingest/query behavior.
-        tuning::sample_mem_pressure(&self.ingest_stats);
+        // Memory pressure is sampled once per tick by `observe_environment`, which
+        // the same tick body runs first: re-sampling here would re-read the cgroup
+        // files microseconds later for no new information, and would let the
+        // controller act on a different reading than the one the tick already
+        // exported as a gauge.
         let now = std::time::Instant::now();
         let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
             now.saturating_duration_since(t)
@@ -990,7 +1060,7 @@ impl CayenneContext {
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
-    fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
+    fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings. The session's write
         // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
         // default, optionally extended with the Zstd string scheme when
@@ -1006,10 +1076,13 @@ impl CayenneContext {
             vortex_session = vortex_session.set(full_strategy);
         }
 
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
-                .with_dataset_label(dataset),
-        )
+        // Cayenne opts into the shared cache: its data files carry a uuid7 write
+        // id beneath a uuid7 snapshot directory, so a path is written once and
+        // never reused, and retirement invalidates it explicitly.
+        Arc::new(VortexFormat::new_with_process_segment_cache(
+            vortex_session,
+            Self::vortex_table_options(config),
+        ))
     }
 
     /// Table options shared by the base format and any per-write format
@@ -1032,6 +1105,7 @@ impl CayenneContext {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
+            scan_concurrency: config.scan_concurrency,
             ..VortexTableOptions::default()
         }
     }

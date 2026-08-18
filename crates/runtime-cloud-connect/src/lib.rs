@@ -18,34 +18,58 @@ limitations under the License.
 //!
 //! Outbound control-plane client that lets a standalone `spiced` runtime be
 //! discovered and managed by Spice Cloud (or any compatible control plane)
-//! using an adoption flow:
+//! using the enroll-first flow shipped for BYOC (DR-025):
 //!
-//! 1. Admin in Spice Cloud generates a single-use adoption code.
-//! 2. User runs `spice connect <code>` (or sets `SPICE_ADOPT_CODE`).
-//! 3. `spiced` opens an outbound TLS gRPC stream and sends `Hello`. The
-//!    client authenticates at the application layer via `Hello.credential`
-//!    — either the adoption code (first contact) or the persisted identity
-//!    cert PEM. Once an identity is held, that identity (cert + ed25519
-//!    key) is also presented as a TLS client certificate, so the transport
-//!    is mutually authenticated; before adoption the connection is
-//!    server-authenticated only and bootstraps with the adoption code.
-//! 4. Admin clicks "Adopt"; cloud sends an `Adopt` command.
-//! 5. `spiced` generates an ed25519 keypair, stores identity at
-//!    `$SPICE_CONFIG_DIR/identity.json`, and replies with `AdoptAck`.
-//! 6. On future starts, identity is reused; no code needed.
+//! 1. Enrollment happens **before the runtime exists**, driven by exactly
+//!    one [`enroll::EnrollmentAuthority`]: a one-time `spice-enroll-`
+//!    enrollment key (`spiced --token`, parsed by
+//!    [`enrollment_key::EnrollmentKey`]), or a logged-in session enrolling
+//!    directly through a caller-provided authenticated-session authority.
+//! 2. **State plane (out-of-band enroll)**: [`enroll::enroll_now`] loads or
+//!    creates the per-directory [`draft::EnrollmentDraft`] — provisional
+//!    ECDSA P-256 + X25519 key material and a stable enrollment operation
+//!    ID — and presents the authority, the CSR, and the host facts to the
+//!    cloud enroll endpoint over plain HTTPS under that operation's
+//!    `Idempotency-Key`. The cloud consumes the authority, provisions the
+//!    instance registry row, signs the CSR with the cloud KMS CA, and
+//!    returns the leaf certificate, the CA bundle, the gateway address,
+//!    and the stable `instance_id` — atomically promoted to
+//!    `$SPICE_CONFIG_DIR/identity.json`. A lost response is safe: an exact
+//!    operation replay returns the same instance instead of a sibling.
+//! 3. **Control plane (mTLS stream)**: with the issued identity as its
+//!    TLS client certificate, `spiced` connects to the stateless gateway
+//!    and holds the long-lived `CloudConnect` stream. The gateway never
+//!    signs and holds no state; certless connections are rejected.
+//! 4. On future starts, the identity alone activates the client — no flag
+//!    and no key. A valid identity always wins: a `--token` supplied
+//!    beside one is not redeemed. The identity is renewed on a ~12h
+//!    cadence against the cloud `/renew` endpoint (dual
+//!    proof-of-possession; every renewal rotates the keypair) and remains
+//!    renewable up to 30 days past expiry.
 //!
-//! The client is **default off**: with no adoption code and no identity it
-//! does nothing — existing OSS users see no change.
+//! The client is **default off**: with no identity on disk it does
+//! nothing — existing OSS users see no change.
 //!
-//! ## Public entry point
+//! ## Public entry points
 //!
-//! Call [`CloudConnect::start`] from the runtime bootstrap. It returns a
-//! handle whose tokio task crashes/disconnects are isolated from the rest
-//! of the process; the runtime stays up.
+//! Call [`enroll::enroll_now`] before runtime construction to redeem an
+//! enrollment authority, then [`CloudConnect::start`] from the runtime
+//! bootstrap. `start` returns a handle whose tokio task
+//! crashes/disconnects are isolated from the rest of the process; the
+//! runtime stays up.
 
+pub mod clock_skew;
 pub mod config;
+pub mod draft;
+pub mod enroll;
+pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
+pub mod mutation_lock;
+pub mod release;
+pub mod sealed_secrets;
+pub mod secret_cache;
+pub mod supervisor;
 
 mod client;
 mod fingerprint;
@@ -75,8 +99,31 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use config::CloudConnectConfig;
-pub use handlers::RuntimeHandle;
-pub use identity::{Identity, IdentityStore};
+pub use draft::{EnrollmentDraft, EnrollmentTransactionLock};
+pub use enroll::{
+    EnrollNowError, EnrollNowOutcome, EnrollmentAuthority, EnrollmentMetadata, RetryPolicy,
+    SessionToken, enroll_now, enroll_now_with_token,
+};
+pub use enrollment_key::{EnrollmentKey, InvalidEnrollmentKey};
+pub use handlers::{
+    ApplyOutcome, Capability, CommandError, MAX_QUERY_RESULT_BYTES, MAX_QUERY_ROWS, PostApply,
+    QueryOutcome, RestartMode, RuntimeHandle, RuntimePhase, SpicepodDeployment, StatusReport,
+    effective_max_rows,
+};
+pub use identity::{AppAttachment, AttachmentState, Identity, IdentityStore};
+pub use mutation_lock::{MUTATION_LOCK_FILE, MutationLock};
+pub use supervisor::Supervisor;
+
+/// Revision of the `spice.cloud.v1` contract this client implements,
+/// announced in `Hello.protocol_version`.
+///
+/// Bump it only for a change neither absent-oneof tolerance nor
+/// `Hello.capabilities` can carry — a peer that would misread the stream
+/// without knowing. A purely additive command does not qualify: an older peer
+/// decodes it as an absent body and answers unsupported, and `capabilities`
+/// already says self-descriptively what this instance answers. The package
+/// name changes only for a break this number cannot bridge.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 use shutdown::Shutdown;
 
@@ -88,6 +135,20 @@ pub enum Error {
         path: std::path::PathBuf,
         source: identity::Error,
     },
+
+    #[snafu(display(
+        "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice connect remove --yes` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
+        path.display()
+    ))]
+    IdentityUnusable {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    #[snafu(display(
+        "Failed to retire the completed Cloud Connect enrollment draft before startup: {source}. The durable identity remains authoritative; fix the config-directory permissions and restart without minting another enrollment key"
+    ))]
+    DraftCleanup { source: draft::Error },
 
     #[snafu(display("Invalid Cloud Connect endpoint: {endpoint}: {source}"))]
     InvalidEndpoint {
@@ -119,57 +180,109 @@ pub struct CloudConnect {
 impl CloudConnect {
     /// Start the Cloud Connect client.
     ///
-    /// Behavior depends on the contents of [`CloudConnectConfig`] and on
-    /// state on disk:
+    /// Activation is driven purely by the per-directory identity:
     ///
-    /// - If `identity_path` contains a valid identity, the client reconnects
-    ///   using the stored identity token.
-    /// - Otherwise, if `adoption_code` is `Some`, the client sends the code
-    ///   as the first-contact credential and waits to be adopted.
-    /// - If both are absent, this function returns `Ok(None)` and the client
-    ///   is **not started** — i.e. `CloudConnect` is disabled.
+    /// - If `identity_path` contains a valid identity, the client connects
+    ///   to the gateway over mTLS using the stored identity (renewing it
+    ///   first when due). No flag opts in — the identity is the signal.
+    /// - Otherwise this function returns `Ok(None)` and the client is
+    ///   **not started** — i.e. `CloudConnect` is disabled. Enrollment is
+    ///   an explicit, pre-runtime step ([`enroll::enroll_now`]); the
+    ///   running client never enrolls.
     ///
     /// # Errors
     ///
     /// Returns [`Error::IdentityLoad`] if an identity file exists at
-    /// `config.identity_path` but cannot be read or parsed.
-    #[expect(
-        clippy::unused_async,
-        reason = "spawns a background tokio task, so it must be called from within a tokio runtime context"
-    )]
+    /// `config.identity_path` but cannot be read or parsed, or
+    /// [`Error::IdentityUnusable`] if its reconnect credentials are
+    /// internally inconsistent.
     pub async fn start(
-        config: CloudConnectConfig,
+        mut config: CloudConnectConfig,
         runtime: Arc<dyn RuntimeHandle>,
     ) -> Result<Option<Self>> {
+        // Acquire the cross-process transaction before the authoritative read
+        // and retain it until the driver task has captured the same identity.
+        // Otherwise a concurrent release can clear the file after this read
+        // and the stale in-memory credential can reconnect the removed host.
+        let requested_config_dir = config.config_dir.clone();
+        let transaction = tokio::task::spawn_blocking(move || {
+            EnrollmentTransactionLock::acquire(&requested_config_dir)
+        })
+        .await
+        .map_err(|source| Error::DraftCleanup {
+            source: draft::Error::DeleteTaskPanicked { source },
+        })?
+        .map_err(|source| Error::DraftCleanup { source })?;
+        let pinned_config_dir = transaction
+            .config_dir()
+            .map_err(|source| Error::DraftCleanup { source })?
+            .to_path_buf();
+        config.pin_config_dir(pinned_config_dir);
         let identity_path = config.identity_path.clone();
-        let identity = match IdentityStore::load_optional(&identity_path) {
-            Ok(identity) => identity,
-            // A corrupt/unreadable identity file must not wedge re-adoption:
-            // when an adoption code is available, proceed without the stored
-            // identity (a successful adoption rewrites identity.json). Only
-            // surface the load error when there is no code to fall back to.
-            Err(source) if config.adoption_code.is_some() => {
-                tracing::warn!(
-                    "Cloud Connect: identity at {} is unreadable ({source}); proceeding with the adoption code",
-                    identity_path.display()
-                );
-                None
-            }
-            Err(source) => {
-                return Err(Error::IdentityLoad {
-                    path: identity_path,
-                    source,
-                });
-            }
-        };
 
-        if identity.is_none() && config.adoption_code.is_none() {
+        let load_path = identity_path.clone();
+        let (transaction, identity) = tokio::task::spawn_blocking(move || {
+            let identity = IdentityStore::load_optional(&load_path);
+            (transaction, identity)
+        })
+        .await
+        .map_err(|source| Error::IdentityLoad {
+            path: identity_path.clone(),
+            source: identity::Error::Io {
+                path: identity_path.clone(),
+                source: std::io::Error::other(format!("identity load task panicked: {source}")),
+            },
+        })?;
+        let identity = identity.map_err(|source| Error::IdentityLoad {
+            path: identity_path.clone(),
+            source,
+        })?;
+
+        let Some(identity) = identity else {
             tracing::debug!(
-                "Cloud Connect disabled: no identity at {} and no adoption code",
+                "Cloud Connect disabled: no identity at {}",
                 identity_path.display()
             );
             return Ok(None);
+        };
+        if let Some(endpoint) = identity.control_plane_endpoint.as_deref() {
+            config.enroll_endpoint =
+                config::normalize_control_plane_endpoint(endpoint).map_err(|source| {
+                    Error::IdentityUnusable {
+                        path: identity_path.clone(),
+                        reason: format!("the stored control-plane endpoint is invalid: {source}"),
+                    }
+                })?;
         }
+        if let Some(reason) =
+            identity.reconnect_validation_error(config.gateway_endpoint.as_deref())
+        {
+            return Err(Error::IdentityUnusable {
+                path: identity_path,
+                reason: reason.to_string(),
+            });
+        }
+        if let Err(reason) = client::validate_stream_endpoint(&config, &identity) {
+            return Err(Error::IdentityUnusable {
+                path: identity_path,
+                reason,
+            });
+        }
+
+        // Promotion is not complete until its retry operation ID is gone. A
+        // previous cleanup may have failed after the identity became durable;
+        // scrub that stale draft on every valid-identity startup so it can
+        // never be replayed if the identity is later explicitly removed.
+        let (transaction, deletion) = tokio::task::spawn_blocking(move || {
+            let deletion = transaction.delete();
+            (transaction, deletion)
+        })
+        .await
+        .map_err(|source| Error::DraftCleanup {
+            source: draft::Error::DeleteTaskPanicked { source },
+        })?;
+        deletion.map_err(|source| Error::DraftCleanup { source })?;
+        let identity = Some(identity);
 
         let shutdown = Shutdown::new();
         let shutdown_for_task = Arc::clone(&shutdown);
@@ -182,6 +295,7 @@ impl CloudConnect {
                 tracing::error!("Cloud Connect driver exited with error: {err}");
             }
         });
+        drop(transaction);
 
         Ok(Some(Self {
             task: Mutex::new(Some(task)),
@@ -210,36 +324,28 @@ impl CloudConnect {
     }
 }
 
-/// Validate an adoption code shape.
+/// Validate an instance region label (`--region`).
 ///
-/// Format: `SPICE-ADOPT-XXXXX-XXXXX-...` where each `XXXXX` segment is 5
-/// uppercase ASCII alphanumeric characters (the portal mints RFC4648 base32,
-/// A-Z2-7), and there are between 2 and 5 segments (the portal mints 4). The
-/// actual code may be looser server-side; this is the client-side sanity check.
+/// This is a **charset and length check only** — deliberately not a lookup
+/// against the AWS region catalog. A standalone host may sit in a region newer
+/// than any catalog the CLI shipped with, or in no cloud region at all
+/// (`on-prem-syd`), and both must enroll. The catalog is used cloud-side for
+/// display and gateway-stamp selection, which fall back to the home stamp for
+/// a label it does not recognise.
+///
+/// The rule mirrors the cloud's own enroll validation (2–64 lowercase letters,
+/// digits, and hyphens, starting and ending alphanumeric) so the CLI never
+/// accepts a label the cloud would reject — and never rejects one it would
+/// accept.
 #[must_use]
-pub fn is_valid_adoption_code(code: &str) -> bool {
-    let mut parts = code.split('-');
-    if parts.next() != Some("SPICE") {
+pub fn is_valid_instance_region(region: &str) -> bool {
+    if !(2..=64).contains(&region.len()) {
         return false;
     }
-    if parts.next() != Some("ADOPT") {
-        return false;
-    }
-    let mut segments = 0_usize;
-    for part in parts {
-        if part.len() != 5
-            || !part
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
-            return false;
-        }
-        segments += 1;
-        if segments > 5 {
-            return false;
-        }
-    }
-    (2..=5).contains(&segments)
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    region.chars().all(|c| alnum(c) || c == '-')
+        && region.chars().next().is_some_and(alnum)
+        && region.chars().last().is_some_and(alnum)
 }
 
 #[cfg(test)]
@@ -247,32 +353,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_codes_with_wrong_prefix() {
-        assert!(!is_valid_adoption_code("FOO-BAR-AAAAA-BBBBB"));
-        assert!(!is_valid_adoption_code("SPICE-CONNECT-AAAAA-BBBBB"));
+    fn accepts_catalog_and_non_catalog_regions() {
+        // A region the CLI's catalog knows nothing about must still enroll:
+        // an on-prem label, and an AWS region newer than this build.
+        for region in [
+            "us-west-2",
+            "eu-central-1",
+            "on-prem-syd",
+            "ap-southeast-7",
+            "xx",
+            "rack42",
+        ] {
+            assert!(is_valid_instance_region(region), "{region} must be valid");
+        }
     }
 
     #[test]
-    fn accepts_canonical_adoption_code() {
-        // The portal mints four 5-char base32 segments.
-        assert!(is_valid_adoption_code(
-            "SPICE-ADOPT-7K2PX-9XYZ2-A1B2C-D3E4F"
-        ));
-        assert!(is_valid_adoption_code("SPICE-ADOPT-AAAAA-BBBBB"));
-        assert!(is_valid_adoption_code(
-            "SPICE-ADOPT-11111-22222-33333-44444-55555"
-        ));
-    }
-
-    #[test]
-    fn rejects_codes_with_lowercase_or_wrong_length() {
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-aaaaa-BBBBB"));
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAA-BBBBB")); // 4-char segment
-        assert!(!is_valid_adoption_code("SPICE-ADOPT-AAAAAA-BBBBB")); // 6-char segment
-        assert!(!is_valid_adoption_code("SPICE-ADOPT"));
-        // 6 segments — too many.
-        assert!(!is_valid_adoption_code(
-            "SPICE-ADOPT-11111-22222-33333-44444-55555-66666"
-        ));
+    fn rejects_malformed_regions() {
+        for region in [
+            "",              // empty
+            "u",             // shorter than the cloud's 2-char minimum
+            "US-WEST-2",     // uppercase
+            "us_west_2",     // underscore
+            "-us-west-2",    // leading hyphen
+            "us-west-2-",    // trailing hyphen
+            "us west 2",     // whitespace
+            "us-west-2\n",   // trailing newline (an unnoticed shell artifact)
+            &"a".repeat(65), // past the cloud's 64-char ceiling
+        ] {
+            assert!(
+                !is_valid_instance_region(region),
+                "{region:?} must be rejected"
+            );
+        }
     }
 }

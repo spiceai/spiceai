@@ -38,7 +38,7 @@ jobs:
     name: Test Search Integration
     runs-on: spiceai-macos
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
@@ -57,6 +57,9 @@ jobs:
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
+          # ARN of the pre-seeded, long-lived S3 Vectors index the S3VectorsFallback permutation
+          # falls back to (its zero-row acceleration never populates the index itself).
+          AWS_S3_VECTORS_FALLBACK_INDEX_ARN: ${{ vars.AWS_S3_VECTORS_FALLBACK_INDEX_ARN }}
         run: |
           if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
             echo "Error: OpenAI API key is not defined."

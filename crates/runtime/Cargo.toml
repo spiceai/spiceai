@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+cpu-budget = { path = "../cpu-budget" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
 adbc_driver_manager = { workspace = true, optional = true }
 app = { path = "../app" }
@@ -26,7 +28,6 @@ async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
-aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
@@ -44,6 +45,9 @@ chunking = { path = "../chunking" }
 clap.workspace = true
 csv = "1.3.0"
 dashmap = "6.1.0"
+data-accelerator-api = { path = "../data-accelerator-api" }
+data-connector-api = { path = "../data-connector-api" }
+data-http-rate-control = { path = "../data-http-rate-control" }
 data_components = { path = "../data_components", features = ["flightsql"] }
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
@@ -59,6 +63,7 @@ datafusion-spark.workspace = true
 datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
+spice-table = { path = "../spice-table" }
 tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
@@ -66,7 +71,6 @@ duckdb = { workspace = true, features = [
     "r2d2",
     "extensions-full",
 ], optional = true }
-dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
@@ -78,7 +82,6 @@ headers-accept = "0.3.0"
 http.workspace = true
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-humantime = { workspace = true, optional = true }
 hyper = "1.7.0"
 hyper-util = { version = "0.1.20", features = ["service"] }
 iceberg.workspace = true
@@ -135,21 +138,32 @@ rmcp = { workspace = true, optional = true, features = [
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
+runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
+runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
+runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
+runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
 runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-drasi = { path = "../runtime-drasi" }
 runtime-query-engine = { path = "../runtime-query-engine" }
 runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-table = { path = "../runtime-table" }
+runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
@@ -159,7 +173,6 @@ s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
 scopeguard = "1.2.0"
-scylla = { workspace = true, optional = true }
 search = { path = "../search", default-features = false, features = [
     "text_search",
 ], optional = false }
@@ -176,6 +189,7 @@ telemetry = { path = "../telemetry" }
 tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
+tokenizers.workspace = true
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
@@ -188,6 +202,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
@@ -216,6 +231,10 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc
 aws-credential-types = { workspace = true, features = [
     "hardcoded-credentials",
 ] }
+# Used directly by the `tests/dynamodb` integration suite (table setup via the AWS
+# SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
+# the `restricted_deps` driver-confinement guard.
+aws-sdk-dynamodb.workspace = true
 azure_core = "0.31.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
@@ -229,6 +248,7 @@ connector-abfs = { path = "../data-connectors/connector-abfs" }
 connector-adbc = { path = "../data-connectors/connector-adbc" }
 connector-clickhouse = { path = "../data-connectors/connector-clickhouse" }
 connector-cosmosdb = { path = "../data-connectors/connector-cosmosdb" }
+connector-dynamodb = { path = "../data-connectors/connector-dynamodb" }
 connector-databricks = { path = "../data-connectors/connector-databricks" }
 connector-delta-lake = { path = "../data-connectors/connector-delta-lake" }
 connector-dremio = { path = "../data-connectors/connector-dremio" }
@@ -278,7 +298,6 @@ test-framework = { path = "../test-framework" }
 tiberius.workspace = true
 tokio = { workspace = true, features = ["time", "test-util"] }
 rusqlite = { workspace = true }
-tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 yaml = { path = "../yaml" }
 
@@ -288,10 +307,10 @@ aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 azure-keyvault = ["runtime-secrets/azure-keyvault"]
 hashicorp_vault = ["runtime-secrets/hashicorp_vault"]
 bedrock = []
-cosmosdb = ["data_components/cosmosdb"]
+cosmosdb = []
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks", "dep:duration-parse"]
-debezium = ["kafka", "data_components/debezium"]
+debezium = ["kafka", "data_components/debezium", "runtime-table/debezium"]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
@@ -304,6 +323,7 @@ elasticsearch = [
 ]
 duckdb = [
     "dep:duckdb",
+    "dep:runtime-checkpoint-duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",
@@ -311,12 +331,12 @@ duckdb = [
     "search/duckdb",
     "runtime-search/duckdb",
 ]
-dynamodb = [
-    "dep:aws-sdk-dynamodb",
-    "data_components/dynamodb",
-    "dep:dynamodb-streams",
-    "dep:humantime",
-]
+# Test-only marker: the DynamoDB connector now lives in `connector-dynamodb` (a
+# dev-dependency, registered unconditionally by `do_register_test_connectors`).
+# This gates the `tests/dynamodb` integration suite; the AWS SDK it uses directly is
+# a dev-dependency, so the shipped runtime lib carries no DynamoDB code or driver
+# (the driver-free `spice_sys/dynamodb` checkpoint sidecar is always compiled).
+dynamodb = []
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
@@ -325,8 +345,8 @@ rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
 wasm-functions-compile = ["runtime-datafusion-udfs/wasm-functions-compile"]
 iceberg-write = []
-imap = ["data_components/imap"]
-kafka = ["data_components/kafka"]
+imap = []
+kafka = ["data_components/kafka", "runtime-table/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "runtime-tools/mcp", "tools/mcp"]
 metal = ["llms/metal"]
@@ -339,8 +359,9 @@ models = [
     "llms/local_llm",
     "llms/local_embed",
 ]
-mongodb = ["data_components/mongodb"]
+mongodb = [] # marker: gates the driver-free spice_sys/mongodb resume-token checkpoint; connector lives in connector-mongodb
 mssql = ["dep:tiberius", "data_components/mssql"]
+mssql-kerberos-unix = ["data_components/mssql-kerberos-unix"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 nfs = ["runtime-object-store/nfs"]
 odbc = []
@@ -349,6 +370,7 @@ openapi = [
     "dep:utoipa",
     "mcp",
     "runtime-acceleration/openapi",
+    "runtime-table/openapi",
     "runtime-api-types/openapi",
     "runtime-search/openapi",
     "runtime-tools/openapi",
@@ -360,7 +382,7 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres", "dep:tokio-postgres"]
+postgres-accel = ["postgres", "dep:tokio-postgres", "dep:runtime-checkpoint-postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",
@@ -368,9 +390,9 @@ s3_vectors = [
     "search/s3_vectors",
     "runtime-search/s3_vectors",
 ]
-scylladb = ["db_connection_pool/scylladb", "data_components/scylladb"]
+scylladb = []
 sftp = ["runtime-object-store/sftp"]
-sharepoint = ["data_components/sharepoint"]
+sharepoint = []
 smb = ["runtime-object-store/smb"]
 client_tls = []
 snapshots = ["runtime-acceleration/snapshots"]
@@ -385,6 +407,7 @@ spark = ["data_components/spark_connect"]
 spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-sqlite",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "dep:rusqlite",
@@ -393,6 +416,7 @@ sqlite = [
 turso = [
     "dep:turso",
     "dep:tokio-rusqlite",
+    "dep:runtime-checkpoint-turso",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "data_components/turso",
@@ -423,3 +447,10 @@ name = "cdc_delete_burst"
 
 [lints]
 workspace = true
+
+# Spice accelerators vs out-of-Spice standalone DuckDB/SQLite — exact SQL results.
+# Separate binary so we do not rebuild the full integration suite.
+[[test]]
+name = "result_correctness"
+path = "tests/result_correctness.rs"
+required-features = ["duckdb", "sqlite"]

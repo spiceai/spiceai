@@ -23,19 +23,26 @@ limitations under the License.
 //! incremental builds - changes to this connector only require rebuilding
 //! this crate, not the entire runtime.
 
+// The scylladb provider module is exported (as it was in data_components) so that its
+// public API items are treated as exported API by clippy's avoid-breaking-exported-api,
+// matching the original crate. The missing_errors_doc relaxation mirrors data_components
+// and connector-git for the moved provider code.
+#![allow(clippy::missing_errors_doc)]
+
+pub mod scylladb;
+
+use crate::scylladb::ScyllaDbTableFactory;
+use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
-use data_components::scylladb::ScyllaDbTableFactory;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::scylladbpool::ScyllaDbConnectionPool;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
-use runtime::parameters::ParameterSpec;
-use runtime_parameters::Parameters;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use snafu::prelude::*;
@@ -305,7 +312,7 @@ impl DataConnector for ScyllaDb {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.scylladb_factory, dataset.path().into())
@@ -659,3 +666,13 @@ mod tests {
         assert_eq!(factory.prefix(), "scylladb");
     }
 }
+
+// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// should see this connector must force-link the crate (`use connector_scylladb as _;`) -- a plain
+// Cargo dependency won't link the slice static. See `register_data_connector!` docs.
+runtime::register_data_connector!(
+    register_scylladb_connector,
+    SCYLLADB_CONNECTOR_REGISTRATION,
+    CONNECTOR_NAME,
+    ScyllaDbFactory
+);

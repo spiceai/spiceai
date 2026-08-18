@@ -409,6 +409,22 @@ baseline](#measured-compile-time-baseline)):
    `pgwire-replication` folds into `data-postgres` rather than staying a foundation
    dependency.
 
+> **In-flight example — PostgreSQL (temporary `shared-utility` override).**
+> `connector-postgres-common` lives under `crates/data-connectors/` (which the
+> path rule would place in `extension`) but is pinned to `shared-utility` via a
+> `[override]` in `layers.toml`. It is a leaf helper — its workspace-internal dep
+> closure is empty — holding the PostgreSQL catalog/CDC-support queries
+> (`list_schemas`/`list_tables`/`primary_key_columns`/`check_cdc_prerequisites`),
+> which `data_components::postgres::provider` re-exports so `runtime` reaches them
+> without a direct `connector-*` dependency. The override keeps the
+> `data_components -> connector-postgres-common` edge a legal *same-tier* dep in
+> the interim. Under move #3 the goal is to fold **all** PostgreSQL functionality —
+> `data_components::postgres`, `connector-postgres-common`, and
+> `runtime::catalogconnector::postgres_accelerated` (the CDC/catalog-acceleration
+> glue) — into a single `connector-postgres` (`data-postgres`) crate that owns the
+> CDC mechanisms. Once `runtime` no longer reaches these queries (even transitively
+> via the re-export), drop the override so the crate returns to `extension`.
+
 ### Method: inverting one seam
 
 Each seam (connector, catalog, checkpoint, …) follows the same mechanical, reviewable
@@ -457,6 +473,27 @@ three); each is a separate `-api` crate a `data-<source>` implements as applicab
   `mysql_replication`, `debezium`).
 - **Catalog** (`data-catalog-api`) — discover datasets/schemas rather than serve
   rows (`runtime/src/catalogconnector`, `unity_catalog`, iceberg/glue).
+
+### How finely to split a family: on dependencies, not on capabilities
+
+Once a family is inverted behind a contract, the next question is how many crates it becomes. The
+axis that looks natural is the trait surface — one crate per capability per vendor. The axis that
+pays is the **dependency set**.
+
+A crate boundary earns its keep by taking something out of a prerequisite closure. If two
+capabilities of one vendor are built on the same client library, splitting them yields two crates
+that pull the same heavy dependency: nothing is shed, and the vendor's client construction now has
+two homes that can drift apart. If two capabilities are built on *different* stacks, splitting them
+lets a deployment take one and shed the other entirely.
+
+> **The test:** would the split remove a dependency from somebody's build? If not, it is a module,
+> not a crate.
+
+This is the same judgement as [interface vs. implementation](#worked-example-interface-vs-implementation-dependency-cdc-checkpoints),
+applied to granularity rather than direction. Note what it does *not* say: crate count is not a
+function of vendors, or of backends, or of traits. It is a function of **distinct dependency
+sets** — which usually lands on one crate per vendor, but splits a single vendor in two whenever
+its capabilities are built on unrelated stacks.
 
 ### Worked example: interface vs. implementation dependency (CDC checkpoints)
 

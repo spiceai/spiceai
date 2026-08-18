@@ -15,19 +15,17 @@ limitations under the License.
 */
 
 use runtime::dataconnector::ConnectorComponent;
-use runtime::datafusion::error::find_datafusion_root;
+use runtime_datafusion::error::find_datafusion_root;
 
 use super::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
+use crate::github::error_checker;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::{
-    github::error_checker,
-    graphql::{
-        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
-    },
+use connector_graphql::graphql::{
+    ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+    client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use serde_json::Value;
@@ -341,12 +339,17 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     nodes = self.get_requested_nodes()
                 )
             }
+            // `orderBy` must name an immutable field. A GitHub `after:` cursor is a value
+            // predicate on the sort key, so ordering by a mutable field (e.g. UPDATED_AT)
+            // lets a pull request touched on the source mid-scan jump ahead of the cursor,
+            // where no remaining page will return it — silently dropping the row from the
+            // scan. CREATED_AT ASC is GitHub's own default order for this connection.
             GitHubQueryMode::Auto => {
                 format!(
                     r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: {page_size}) {{
+                    pullRequests(first: {page_size}, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -554,7 +557,7 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
-    use crate::GitHubQueryMode;
+    use crate::{GitHubQueryMode, GitHubTableArgs};
     use app::AppBuilder;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
@@ -565,7 +568,11 @@ mod tests {
     /// construction. Cache a single shared instance so the unit tests don't
     /// spin up a tokio runtime per invocation.
     fn shared_component() -> ConnectorComponent {
-        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
+        // The tokio runtime is cached alongside the component and never dropped:
+        // `RuntimeBuilder::build` defaults `io_runtime` to `Handle::current()`, so
+        // dropping the runtime that built it would leave the constructed `Runtime`
+        // holding handles to a dead tokio runtime.
+        static COMPONENT: OnceLock<(tokio::runtime::Runtime, ConnectorComponent)> = OnceLock::new();
         COMPONENT
             .get_or_init(|| {
                 let app = AppBuilder::new("test").build();
@@ -577,8 +584,9 @@ mod tests {
                     .with_runtime(Arc::new(spice_runtime))
                     .build()
                     .expect("to create dataset");
-                ConnectorComponent::from(&dataset)
+                (runtime, ConnectorComponent::from(&dataset))
             })
+            .1
             .clone()
     }
 
@@ -637,5 +645,35 @@ mod tests {
         let mut a = args(PullRequestCommentType::All, 1_000);
         a.max_comments_fetched = 2_000;
         assert!(a.check_node_limit().is_err());
+    }
+
+    #[test]
+    fn auto_mode_query_orders_by_created_at_asc() {
+        // Deterministic ordering on an immutable key: see
+        // `auto_mode_query_never_paginates_on_a_mutable_sort_key`.
+        let a = args(PullRequestCommentType::None, 25);
+        let params = a.get_graphql_values();
+        let query = params.query.as_ref();
+        assert!(
+            query.contains("orderBy: {field: CREATED_AT, direction: ASC}"),
+            "auto-mode pull_requests query must order by CREATED_AT ASC, got:\n{query}"
+        );
+    }
+
+    /// Regression test for #12067. A GitHub `after:` cursor is a value predicate on the
+    /// sort key, so a connection paginated on a mutable field silently drops any row
+    /// that is touched on the source mid-scan: the row's key moves ahead of the cursor
+    /// and no remaining page returns it. Only immutable sort keys are safe here.
+    #[test]
+    fn auto_mode_query_never_paginates_on_a_mutable_sort_key() {
+        let a = args(PullRequestCommentType::All, 25);
+        let params = a.get_graphql_values();
+        let query = params.query.as_ref();
+        // The GraphQL enum is upper-case (`UPDATED_AT`), so this cannot collide with the
+        // `updated_at: updatedAt` field alias the query also selects.
+        assert!(
+            !query.contains("UPDATED_AT"),
+            "auto-mode pull_requests query must not order by the mutable UPDATED_AT, got:\n{query}"
+        );
     }
 }

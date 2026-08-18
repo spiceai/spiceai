@@ -977,6 +977,20 @@ fn fractional_bytes(bytes: usize, fraction: f64) -> usize {
     }
 }
 
+/// Multiplier applied to the raw Arrow payload when estimating a `HashJoinExec`
+/// build-side hash table's resident bytes.
+///
+/// The raw row-width × row-count estimate under-counts badly: `DataFusion`'s hash
+/// table stores keys, values, and open-addressing slots at a load factor well
+/// below 1.0, plus per-entry pointer/tag overhead. Empirically this lands in the
+/// 2–3× range of the Arrow payload for typical fixed-width join keys; we use
+/// **2.5×** (`5/2`) as a conservative middle — under-estimating leaves the
+/// non-spillable hash join in place and can OOM, over-estimating over-fires the
+/// sort-merge rewrite (slower but safe). Integer fraction avoids `f64` on the
+/// planner hot path.
+const HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM: usize = 5;
+const HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN: usize = 2;
+
 fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Option<usize> {
     let row_width = plan
         .schema()
@@ -986,7 +1000,15 @@ fn build_side_memory_estimate(plan: &dyn ExecutionPlan, build_rows: usize) -> Op
             Some(acc.saturating_add(estimated_arrow_width(field.data_type())?))
         })?;
 
-    Some(row_width.saturating_mul(build_rows))
+    let payload_bytes = row_width.saturating_mul(build_rows);
+    // (payload * 5) / 2 ≈ 2.5× payload, computed in u128 so a saturated payload
+    // stays monotonic: a plain usize `* 5` would saturate to usize::MAX and then
+    // HALVE on `/ 2`, dropping the estimate for extreme/unknown row counts. Clamp
+    // back to usize::MAX. (`usize as u128` is always lossless; std has no
+    // `From<usize>` for the platform-dependent usize.)
+    let estimated = payload_bytes as u128 * HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM as u128
+        / HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN as u128;
+    Some(usize::try_from(estimated).unwrap_or(usize::MAX))
 }
 
 fn estimated_arrow_width(data_type: &DataType) -> Option<usize> {
@@ -1577,7 +1599,9 @@ mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
         CayenneDynamicFilterSharing, CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
-        CayenneStatsAggregateRewriter, FilterAddition, apply_filter_additions, plan_schema_fields,
+        CayenneStatsAggregateRewriter, FilterAddition, HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN,
+        HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, apply_filter_additions, build_side_memory_estimate,
+        plan_schema_fields,
     };
     use crate::maintained_aggregate::{
         MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
@@ -1585,7 +1609,7 @@ mod tests {
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
@@ -1832,6 +1856,87 @@ mod tests {
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some(),
             "AVG over an Int32 column must rewrite to the maintained aggregate"
+        );
+        Ok(())
+    }
+
+    /// `SUM`/`AVG` over a `Decimal128` money column (the CH-benCH
+    /// `SUM(ol_amount)` case, Postgres `NUMERIC(6, 2)`) must rewrite to the
+    /// maintained aggregate. Unlike the integer case, `DataFusion`'s decimal
+    /// coercion is exact (no cast over the input column), and the output types
+    /// are the widened decimal `SUM`/`AVG` return types, which the maintained
+    /// view must reproduce for the substitution to match.
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_sum_avg_over_decimal128() -> DFResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("amt", DataType::Decimal128(6, 2), true),
+        ]));
+        let amounts = Decimal128Array::from(vec![Some(150_i128), Some(999), Some(-50)])
+            .with_precision_and_scale(6, 2)
+            .expect("valid decimal precision/scale");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("decimal test batch should be valid");
+
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Sum,
+                        column: Some("amt".to_string()),
+                    },
+                    MaintainedAggregateExpr {
+                        function: MaintainedAggregateFunction::Avg,
+                        column: Some("amt".to_string()),
+                    },
+                ],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        // DataFusion's decimal SUM/AVG coercion is exact: the aggregate input
+        // is the bare column, and the builder computes the widened decimal
+        // output types.
+        let aggregate_exprs = [("sum(amt)", sum_udaf()), ("avg(amt)", avg_udaf())]
+            .into_iter()
+            .map(|(alias, udaf)| {
+                AggregateExprBuilder::new(udaf, vec![col("amt", schema.as_ref())?])
+                    .schema(Arc::clone(&schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .map(Arc::new)
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]),
+            aggregate_exprs,
+            vec![None, None],
+            cayenne_scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some(),
+            "SUM/AVG over a Decimal128 column must rewrite to the maintained aggregate"
         );
         Ok(())
     }
@@ -2989,11 +3094,37 @@ mod tests {
     /// build big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
     /// must catch this case even though the row count is below
     /// `sort_merge_min_rows`.
+    /// Direct coverage of the 2.5× HT overhead in [`build_side_memory_estimate`].
+    /// Schema is three Int64 columns (8 B each) so `row_width` is exactly 24.
+    #[test]
+    fn build_side_memory_estimate_applies_two_point_five_ht_overhead() {
+        let schema = order_line_schema();
+        let plan =
+            cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", Precision::Exact(1_000));
+        let estimated = build_side_memory_estimate(plan.as_ref(), 1_000)
+            .expect("known fixed-width schema must estimate");
+        // payload = 1000 × 24 = 24_000; with 5/2 overhead → 60_000.
+        assert_eq!(
+            estimated, 60_000,
+            "HT overhead must be exactly 2.5× the Arrow payload for Int64×3"
+        );
+        // Zero rows → zero estimate (and must not panic on divide path).
+        let zero = build_side_memory_estimate(plan.as_ref(), 0).expect("zero rows");
+        assert_eq!(zero, 0);
+        // Saturating path: huge row count must not overflow to a tiny value.
+        let huge_rows = usize::MAX / 16;
+        let huge = build_side_memory_estimate(plan.as_ref(), huge_rows).expect("huge");
+        assert!(huge > 0, "saturating estimate must stay positive");
+        // Factor itself is the documented 5/2.
+        assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_NUM, 5);
+        assert_eq!(HASH_JOIN_BUILD_SIDE_OVERHEAD_DEN, 2);
+    }
+
     #[test]
     fn rewrites_low_row_count_wide_build_when_byte_estimate_exceeds_memory_gate() {
         let schema = order_line_schema();
-        // 200K rows × ~24 bytes/row ≈ 4.8 MB, plus inflated overhead from
-        // `build_side_memory_estimate`'s hash-table overhead factor. Well below
+        // 200K rows × ~24 bytes/row ≈ 4.8 MB payload; with the 2.5× hash-table
+        // overhead factor in `build_side_memory_estimate` ≈ 12 MB. Well below
         // the 10M row threshold but well above the 64 KB byte gate below.
         let small_rows = Precision::Exact(200_000);
         let left = cayenne_file_exec_with_num_rows(&schema, "order_line.vortex", small_rows);
@@ -3031,7 +3162,11 @@ mod tests {
             JoinType::LeftAnti,
             NullEquality::NullEqualsNothing,
         ));
-        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(4 * 1024 * 1024 * 1024));
+        // 10M rows × ~24 B/row × 2.5 HT overhead ≈ 600 MiB estimated. Gate is
+        // fraction 0.125 of the pool, so 8 GiB × 0.125 = 1 GiB keeps this a hash
+        // join (was 4 GiB / 512 MiB gate before the overhead factor, which now
+        // under-fires and rewrites).
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(8 * 1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3422,8 +3557,10 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // ~240 MB build < 0.9 × 400 MiB ≈ 360 MiB gate, and below the full pool.
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // ~240 MB raw build → ~600 MB with the 2.5× HT overhead, still under the
+        // 0.9 × 1 GiB ≈ 921 MiB absolute gate (and its full-pool fair share for a
+        // lone join), so the join keeps its non-spillable hash join.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
 
@@ -3454,9 +3591,10 @@ mod tests {
             make_join("c.vortex", "d.vortex"),
         ])
         .expect("union of two same-schema joins should be valid");
-        // Same 0.9 × 400 MiB config: each ~240 MB build is under the ~360 MiB
-        // absolute gate but over its 200 MiB fair share (pool / 2 joins).
-        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(400 * 1024 * 1024));
+        // Same 0.9 × 1 GiB config: each ~600 MB build (240 MB × 2.5 HT overhead)
+        // is under the ~921 MiB absolute gate but over its 512 MiB fair share
+        // (pool / 2 joins), so only the fair-share term fires.
+        let config = config_with_cayenne_optimizer(None, Some(0.9), Some(1024 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(plan, &config);
 
