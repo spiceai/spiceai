@@ -218,12 +218,20 @@ pub fn convert_json_to_decimal(v: &Json, precision: u8, target_scale: i8) -> Res
         Json::Null => Ok(None),
         Json::String(s) => Ok(Some(decode_base64_decimal(s)?)),
         Json::Object(m) => {
-            #[expect(clippy::cast_possible_truncation)]
-            let src_scale = m
+            let raw_scale = m
                 .get("scale")
                 .context(MissingScaleSnafu)?
                 .as_i64()
-                .context(NonIntegerScaleSnafu)? as i8;
+                .context(NonIntegerScaleSnafu)?;
+            // Truncating this cast would silently reinterpret the value: a
+            // source scale of 256 lands on 0, turning `1` (i.e. 1e-256) into a
+            // whole `1` at the target scale — in range, precision-valid, and
+            // wrong. The scale is source-controlled, so it must be rejected.
+            let src_scale = i8::try_from(raw_scale).map_err(|_| Error::Invalid {
+                reason: format!(
+                    "source scale {raw_scale} is outside the representable range (-128..=127)"
+                ),
+            })?;
 
             let value = m
                 .get("value")
@@ -580,6 +588,56 @@ mod tests {
                 actual_type: "array"
             })
         ));
+    }
+
+    /// A source scale that does not fit an `i8` must be refused, not truncated.
+    /// `256` wraps to `0`, which reinterprets the unscaled value as a whole
+    /// number: `1` (meaning 1e-256) becomes `1` at the target scale — in range
+    /// and precision-valid, so no later check catches it.
+    #[test]
+    fn a_source_scale_that_does_not_fit_an_i8_is_rejected() {
+        for scale in [256_i64, 128, -129, i64::MAX, i64::MIN] {
+            let value = json!({"scale": scale, "value": b64(&1_i128.to_be_bytes())});
+            assert!(
+                matches!(
+                    convert_json_to_decimal(&value, 38, 20),
+                    Err(Error::Invalid { .. })
+                ),
+                "source scale {scale} must be rejected, not truncated"
+            );
+        }
+    }
+
+    /// 127 is the largest representable source scale, so it clears the `i8`
+    /// gate. It still cannot reach any `Decimal128` scale (`0..=38`), because
+    /// reducing a scale by more than 38 needs a power of ten past `i128`. The
+    /// error *kind* is the point: `Overflow` (an arithmetic limit) rather than
+    /// `Invalid` (the gate) is what proves the scale was carried through
+    /// instead of silently truncated. Before the fix this same message wrapped
+    /// to scale 0 and returned a confident wrong number.
+    #[test]
+    fn a_representable_source_scale_fails_on_arithmetic_not_on_the_gate() {
+        assert!(matches!(
+            convert_json_to_decimal(
+                &json!({"scale": 127, "value": b64(&1_i128.to_be_bytes())}),
+                38,
+                38
+            ),
+            Err(Error::Overflow)
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_source_scale_still_converts() {
+        assert_eq!(
+            convert_json_to_decimal(
+                &json!({"scale": 2, "value": b64(&1_i128.to_be_bytes())}),
+                38,
+                4
+            )
+            .expect("scale 2 is representable"),
+            Some(100)
+        );
     }
 
     #[test]
