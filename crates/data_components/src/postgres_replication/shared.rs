@@ -2583,6 +2583,14 @@ impl SlotReplacementBudget {
 /// On failure returns a message describing what could not be done, for the caller
 /// to surface.
 async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Result<(), String> {
+    // The same lock `attach_member` holds for slot DDL. Without it a member can
+    // register between `request_rebuild_of_attached_members`'s snapshot of the
+    // member set and `reseat_held_floors` below, and that member is then neither
+    // asked to rebuild nor reseated — it resumes on a watermark the replacement
+    // cannot reach, with every change since it missing for good. Safe to take from
+    // the pump: `attach_member` holds it only across synchronous setup and never
+    // waits on the pump, and the pump already takes it in `try_finish_if_empty`.
+    let _setup = source.setup_lock.lock().await;
     let new_lsn = slot::replace_unusable_slot(&source.params)
         .await
         .map_err(|e| e.to_string())?;
@@ -2596,17 +2604,40 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
     // ack cannot move past it until members actually commit past it.
     source.ack.seed(new_lsn);
 
+    request_rebuild_of_attached_members(source, new_lsn).await;
+    source.ack.reseat_held_floors(new_lsn);
+    Ok(())
+}
+
+/// Ask every already-attached member to rebuild from the source, because the slot
+/// their recorded positions were measured against has been replaced by one that
+/// starts at `new_lsn` and carries no history.
+///
+/// Callers must hold [`SharedSource::setup_lock`]. Both call sites replace the slot
+/// — the pump's recovery, and a joining member whose `ensure_slot` found the slot
+/// gone — and each needs the set of attached members to be stable across the walk:
+/// a member registering between the snapshot below and the caller's follow-up would
+/// be neither asked to rebuild nor reseated, and would then resume on a watermark
+/// the replacement cannot reach.
+///
+/// Ordering is carried by the member mailbox rather than by waiting here. Changes
+/// already staged for a member sit *ahead* of its request and are applied first,
+/// then the rebuild replaces the contents wholesale; that ordering matters, because
+/// a staged insert applied *after* the rebuild would resurrect a row the source has
+/// since deleted, and the replacement slot has no delete event left to correct it.
+async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn: u64) {
     for (member_key, member) in source.live_members() {
-        // Hold before enqueueing, so there is no window in which the member is
-        // routable with its rebuild still queued. Safe to do to a live member here
-        // because this runs on the pump with no connection open: nothing is routing,
-        // and nothing can be credited while the hold is in place.
+        // Hold before enqueueing, so the member is never routable with its rebuild
+        // still queued. `AckTable::credit_idle` advances a streaming member's floor
+        // to the WAL head whenever it has nothing in flight, and a queued control
+        // envelope does not count as in flight — so a member left streaming would be
+        // credited, and then recorded, past contents its rebuild had not delivered.
         source.ack.register(&member_key, true);
         let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
         if member.sender.send_control(envelope).await.is_some() {
             // The consumer is gone, so there is no acceleration left to rebuild.
-            // Detaching freezes its floor, which `reseat_held_floors` below then
-            // moves to the replacement — it has no history left to be owed.
+            // Detaching freezes its floor, which the caller's `reseat_held_floors`
+            // then moves to the replacement — it has no history left to be owed.
             source.ack.snapshot_finished(&member_key);
             source.detach_member(
                 &member_key,
@@ -2620,12 +2651,9 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
             table = %format_member(&member_key),
             slot = %source.key.slot_name,
             rebuild_as_of = %slot::format_lsn(new_lsn),
-            "this acceleration will be rebuilt from the source before further changes are applied: the replication slot it was streaming from can no longer supply changes and has been replaced, so the changes since the position it recorded as applied are no longer available to stream"
+            "this acceleration will be rebuilt from the source before further changes are applied: the replication slot it was streaming from was replaced, so the changes since the position it recorded as applied are no longer available to stream"
         );
     }
-
-    source.ack.reseat_held_floors(new_lsn);
-    Ok(())
 }
 
 /// Send a fatal error to every member and terminate the source.

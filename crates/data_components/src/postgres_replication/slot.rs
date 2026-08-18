@@ -533,6 +533,23 @@ async fn replace_slot(client: &tokio_postgres::Client, params: &ReplicationParam
     }
 
     let (consistent_lsn, _snapshot_name) = create_logical_slot(client, &params.slot_name).await?;
+    // The replacement is a new slot with its own WAL cost, so it gets the same
+    // lifetime line a slot created during setup does. Without it, the one slot an
+    // operator never sees costed is the one that appeared without them asking.
+    match retention::read_posture(client).await {
+        Ok(posture) => tracing::info!(
+            "{}",
+            retention::slot_lifetime_message(
+                &params.slot_name,
+                SlotRemoval::resolve(params.slot_is_disposable(), posture),
+            )
+        ),
+        // Recovery must not fail for want of a log line.
+        Err(e) => tracing::warn!(
+            slot = %params.slot_name,
+            "could not read the source's slot-retention settings, so this replacement slot's WAL cost and removal policy are not stated: {e}"
+        ),
+    }
     let (cause, advice) = refused.explain();
     tracing::warn!(
         slot = %params.slot_name,
@@ -582,10 +599,14 @@ impl RefusedSlot {
                     .to_string(),
                 "Spice creates its own slots and reuses them across restarts, so dropping one by hand costs a full re-read of every table on it; an idle slot is safe to leave in place, and Spice releases it itself when the acceleration it feeds does not survive a restart.",
             ),
+            // Neither cause was observed, so neither remedy may be prescribed:
+            // raising WAL retention does nothing for a slot someone dropped, and
+            // pointing at a manual drop misdirects an operator whose server ran out
+            // of retention. Name both, and what tells them apart.
             Self::Unknown => (
                 "the server refused to stream from it, and its catalog entry could not be read"
                     .to_string(),
-                RETENTION_ADVICE,
+                "Either PostgreSQL invalidated it (raise max_slot_wal_keep_size on the source, or reduce replication lag) or it was dropped while Spice was streaming from it; `SELECT slot_name, wal_status FROM pg_replication_slots` would have said which.",
             ),
         }
     }
@@ -1326,8 +1347,13 @@ mod tests {
             "raising WAL retention does not address a slot that was dropped: {advice}"
         );
 
-        // Neither shape may be asserted when the catalog could not be read.
-        let (cause, _) = RefusedSlot::Unknown.explain();
+        // Neither shape may be asserted when the catalog could not be read — and that
+        // applies to the *advice* as much as the cause, since each remedy implies a
+        // cause and misdirects when it is the wrong one.
+        let (cause, advice) = RefusedSlot::Unknown.explain();
+        assert!(advice.contains("Either"), "{advice}");
+        assert!(advice.contains("max_slot_wal_keep_size"), "{advice}");
+        assert!(advice.contains("dropped"), "{advice}");
         assert!(cause.contains("could not be read"), "{cause}");
         assert!(!cause.contains("no longer exists"), "{cause}");
         assert!(!cause.contains("wal_status="), "{cause}");

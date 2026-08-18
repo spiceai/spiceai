@@ -1378,7 +1378,7 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
     // The same stream — never restarted — must be asked to rebuild.
     let mut rebuild_requests = 0;
     let deadline = std::time::Instant::now() + Duration::from_mins(2);
-    while rebuild_requests == 0 {
+    loop {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the stream never recovered from losing its replication slot. Losing the slot must not \
@@ -1397,6 +1397,11 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
             );
         }
         envelope.commit().await?;
+        // Committing the request is what releases the member's hold, so the loop
+        // must not exit before that lands.
+        if rebuild_requests > 0 {
+            break;
+        }
     }
 
     // A replacement slot exists, and exactly one: recovery must not leave the dead
@@ -1408,18 +1413,35 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
     );
 
     // Streaming continues on the replacement, which is the half that used to need a
-    // restart. This also proves the rebuild was requested *once*: a second request
-    // would arrive ahead of this insert, and the assertion below reads the next
-    // change envelope rather than skipping to one that matches.
+    // restart — and getting there is also what proves the rebuild was requested
+    // *once*. Every envelope in between is inspected rather than skipped:
+    // `next_change_envelope` would commit and discard a second zero-row rebuild
+    // request along with the idle heartbeats, leaving a rebuild loop invisible here.
     source
         .execute("INSERT INTO public.slot_lost_live VALUES (4, 'dave')", &[])
         .await?;
-    let resumed = next_change_envelope(&mut stream, "an insert after the recovery").await?;
-    anyhow::ensure!(
-        !resumed.history_unavailable(),
-        "the acceleration must be asked to rebuild once per lost slot, not once per reconnect \
-         attempt — a rebuild loop re-reads the whole source table on a cycle"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    let resumed = loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the insert made after the recovery never arrived, so streaming did not resume on the \
+             replacement slot"
+        );
+        let envelope = next_envelope(&mut stream, "an insert after the recovery").await?;
+        if envelope.history_unavailable() {
+            rebuild_requests += 1;
+        }
+        anyhow::ensure!(
+            rebuild_requests == 1,
+            "the acceleration must be asked to rebuild once per lost slot, not once per reconnect \
+             attempt — a rebuild loop re-reads the whole source table on a cycle. Saw \
+             {rebuild_requests} requests"
+        );
+        if num_rows(&envelope) > 0 {
+            break envelope;
+        }
+        envelope.commit().await?;
+    };
     assert_eq!(ops_of(&resumed), vec!["c".to_string()]);
     assert_eq!(ids_of(&resumed), vec![4]);
     resumed.commit().await?;

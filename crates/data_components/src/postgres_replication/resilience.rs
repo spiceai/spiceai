@@ -246,6 +246,12 @@ fn is_transient_by_display(msg: &str) -> bool {
         // tokio-postgres classifier already treats 57P01 as transient by code;
         // this is the same judgement for the replication client, which only
         // exposes the rendered message.
+        //
+        // Reconnecting rather than ending the stream does make a pre-existing race
+        // reachable: a dataset joining while the slot is invalidated recreates it
+        // through `slot::ensure_slot`, and members already streaming are not told
+        // that their recorded positions no longer reach the replacement (#13229).
+        // The previous fatal classification masked that by killing the stream first.
         "sqlstate 57p01",
         "terminating connection due to administrator command",
     ];
