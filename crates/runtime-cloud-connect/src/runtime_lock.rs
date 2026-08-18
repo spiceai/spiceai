@@ -217,25 +217,15 @@ impl RuntimeLock {
 /// runtime on `open` or be locked in place of the real file.
 #[cfg(unix)]
 fn open_lock_file(directory: &File, path: &Path) -> Result<File> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    let lock_name = c"runtime.lock";
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            lock_name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::Unusable {
-            path: path.to_path_buf(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file =
+        crate::lock_file::create_or_open_lock_at(directory, c"runtime.lock").map_err(|source| {
+            Error::Unusable {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
     let metadata = validate_regular_lock_file(&file, path)?;
     if metadata.nlink() != 1 {
         return Err(Error::Unusable {
