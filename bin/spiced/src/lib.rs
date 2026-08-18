@@ -560,7 +560,8 @@ pub struct AppBundle {
 }
 
 /// Resolve the CPU entitlement from all three configuration surfaces plus host
-/// detection, log it, and install it as the process-wide budget.
+/// detection, install it as the process-wide budget, and log the budget in
+/// effect.
 ///
 /// Must run before any thread pool, `DataFusion` session, or accelerator is
 /// created: [`cpu_budget::cpu_budget`] lazily detects into the same cell, so a
@@ -589,11 +590,36 @@ pub fn install_cpu_budget(args: &Args, app: Option<&App>) -> Result<(), cpu_budg
     );
 
     let budget = cpu_budget::CpuBudget::resolve(&config, &cpu_budget::HostReadings::detect())?;
-    budget.log_summary();
     if let Err(err) = budget.install() {
         tracing::warn!("{err}");
     }
+    // Log the budget in effect, not the resolved candidate: when the install
+    // lost to an earlier one, the summary and the Vortex declaration below must
+    // still report the same numbers.
+    cpu_budget::cpu_budget().log_summary();
+    #[cfg(not(windows))]
+    declare_vortex_parallelism();
     Ok(())
+}
+
+/// Declare the effective CPU entitlement to Vortex, so its host-derived
+/// concurrency defaults (encode fan-out, per-worker scan lookahead) size
+/// against the budget rather than the machine's core count.
+///
+/// Reads [`cpu_budget::cpu_budget`] so it declares whatever is actually in
+/// effect. The declaration is first-write-wins on the Vortex side: a call
+/// arriving after anything read the parallelism fails, and the warning names
+/// the value that stayed in effect.
+#[cfg(not(windows))]
+fn declare_vortex_parallelism() {
+    let Some(cores) = std::num::NonZeroUsize::new(cpu_budget::cpu_budget().vortex_parallelism())
+    else {
+        // `CpuBudget::cores` is documented as at least 1.
+        return;
+    };
+    if let Err(err) = vortex_utils::parallelism::set_available_parallelism(cores) {
+        tracing::warn!("Failed to declare the CPU entitlement to Vortex: {err}");
+    }
 }
 
 pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
