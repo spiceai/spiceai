@@ -35,9 +35,9 @@ so the corpus data and the qrels stay portable.
 
 | File | Search |
 |---|---|
-| `full_text_search-duckdb[file].yaml` | BM25 full-text |
-| `model2vec[potion-multilingual-128M]-duckdb[file].yaml` | Vector (chunked) |
-| `hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml` | Hybrid (BM25 + vector, RRF) |
+| `full_text_search-cayenne[file].yaml` | BM25 full-text |
+| `model2vec[potion-multilingual-128M]-cayenne[file].yaml` | Vector (chunked) |
+| `hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml` | Hybrid (BM25 + vector, RRF) |
 
 The vector and hybrid variants enable chunking, because a filing page often exceeds the embedding
 token limit. Each chunk keeps its page's `_id`, so page-level relevance still scores.
@@ -51,7 +51,7 @@ testoperator run search \
   --concurrency 10 \
   --ready-wait 3600 \
   --metrics \
-  -p test/spicepods/search/financebench/full_text_search-duckdb[file].yaml
+  -p test/spicepods/search/financebench/full_text_search-cayenne[file].yaml
 ```
 
 The spicepod reads `S3_ENDPOINT`, `S3_KEY`, and `S3_SECRET` from the environment. In CI, dispatch

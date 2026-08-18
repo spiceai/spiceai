@@ -1,10 +1,10 @@
 version: v1
 kind: Spicepod
-name: full_text_search-duckdb[file]
+name: model2vec[potion-multilingual-128M]-cayenne[file]
 
-# FinanceBench PDF search benchmark (BM25 full-text variant). The corpus is one PDF per filing
-# page, staged to S3 by scripts/financebench_stage.py. See README.md for the one-time staging
-# procedure and how to run this spicepod as a custom search test.
+# FinanceBench PDF search benchmark (vector variant). The corpus is one PDF per filing page,
+# staged to S3 by scripts/financebench_stage.py. See README.md for the one-time staging procedure
+# and how to run this spicepod as a custom search test.
 
 datasets:
   # Per-page filing PDFs. `file_format: pdf` routes each *.pdf to the text table (schema:
@@ -23,7 +23,7 @@ datasets:
         s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
-      engine: duckdb
+      engine: cayenne
       mode: file
 
   - from: s3://benchmarks/financebench/queries.parquet
@@ -46,12 +46,21 @@ views:
   # The searchable corpus. Stripping everything up to and including `corpus_pages/` turns the raw
   # `location` into the portable `<doc>/pNNNN.pdf` key, so the search primary key equals the
   # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
-  # under. `content AS text` matches the column name the search harness reports on.
+  # under. Filing pages routinely exceed the embedding token limit, so chunking is enabled; each
+  # chunk keeps its page's `_id`, so page-level relevance still scores.
   - name: corpus
     sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
     columns:
       - name: text
-        full_text_search:
-          enabled: true
-          row_id:
-            - _id
+        embeddings:
+          - from: potion
+            row_id:
+              - _id
+            chunking:
+              enabled: true
+              target_chunk_size: 512
+              overlap_size: 128
+
+embeddings:
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion
