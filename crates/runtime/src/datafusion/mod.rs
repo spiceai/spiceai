@@ -139,6 +139,7 @@ pub use runtime_datafusion::composed_catalog;
 // through these aliases, but they belong to `runtime-datafusion`. Crate-visible
 // so a crate outside the runtime has to depend on `runtime-datafusion` directly
 // rather than route through here.
+#[cfg(any(feature = "duckdb", test))]
 pub(crate) use runtime_datafusion::dialect;
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
@@ -3563,13 +3564,25 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
+                // The same engine-specific override the normal creation path resolves,
+                // so the archive is in the format that engine's bootstrap consumes —
+                // a Cayenne snapshot without its per-dataset metastore slice becomes
+                // the store's current snapshot and cannot be restored.
+                let snapshot_engine_override = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                {
+                    Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                    None => None,
+                };
                 dataaccelerator::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset_name,
+                    dataset,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
-                    None,
+                    snapshot_engine_override,
                 )
                 .await;
             }

@@ -1,6 +1,6 @@
 [package]
 name = "runtime-cloud-connect"
-description = "Outbound control-plane client for Spice Cloud Connect (adoption flow for standalone spiced)"
+description = "Outbound control-plane client for Spice Cloud Connect enrollment and control"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
@@ -30,6 +30,9 @@ chrono = { workspace = true }
 getrandom = { version = "0.3", features = ["std"] }
 dirs = "6"
 gethostname = { workspace = true }
+# Advisory locks distinguish abandoned secret-bearing atomic-write temp files
+# from live concurrent writers before reclamation.
+fs4 = { workspace = true }
 # PEM → DER decoding for the renewal proof-of-possession signature (the
 # private key and CSR are held as PEM; the signer takes raw DER bytes).
 pem = { workspace = true }
@@ -40,11 +43,11 @@ rand = { workspace = true }
 # Client-side keypair + PKCS#10 CSR generation for the enrollment flow.
 # Pin the aws_lc_rs backend (matching `crates/runtime`, which forces it via
 # feature unification in the spiced build) so key generation uses the same
-# backend in every build target; cert *parsing* / signing (x509-parser) is
-# only pulled in for the integration test server.
+# backend in every build target.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 # Out-of-band HTTPS enroll/renew against the cloud control plane.
 reqwest = { workspace = true }
+spice-cloud-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -54,9 +57,19 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = "0.14"
 tracing = { workspace = true }
+# Parse the stored client leaf before honoring existing-identity precedence;
+# the leaf's public key must match the persisted private key.
+x509-parser = "0.18"
+# Enrollment operation IDs (`Idempotency-Key`) for retry-safe enrollment.
+uuid = { workspace = true, features = ["v4"] }
 # Key material and decrypted secret values are held in `Zeroizing` so a freed
 # buffer never leaves plaintext in the heap.
 zeroize = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+# Refuse symlink and special-file enrollment locks before privileged callers
+# change permissions or wait for the advisory lock.
+libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -70,12 +83,13 @@ tokio = { workspace = true, features = ["macros", "test-util"] }
 # The workspace dependency only enables `sync`, so opt-in explicitly here
 # for the integration tests.
 tokio-stream = { workspace = true, features = ["net"] }
-# The standalone-adoption e2e test stands up a real TLS control server that
+# The standalone-enrollment e2e test stands up a real TLS control server that
 # signs client CSRs, so it needs rcgen's CSR/CA parsing (x509-parser) plus a
 # rustls crypto provider to install as the process default before the tonic
 # server builds its `ServerConfig`.
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls = { workspace = true }
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true
