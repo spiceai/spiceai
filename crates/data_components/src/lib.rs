@@ -397,8 +397,16 @@ impl RefreshingCatalogProvider {
             loop {
                 tokio::time::sleep(interval).await;
                 if let Err(e) = inner.refresh().await {
+                    // Deliberately weaker than "serving the last successful
+                    // refresh": this wrapper is shared, and a provider that
+                    // refreshes its schemas concurrently (`UnityCatalogProvider`)
+                    // installs the ones that succeeded before another's failure
+                    // returns here, so the catalog can be serving a mix of fresh
+                    // and stale metadata. Claiming otherwise would be a promise
+                    // the implementation below does not make.
                     tracing::error!(
-                        "Failed to refresh catalog '{catalog_name}', so it is still serving the tables from its last successful refresh, which may now be out of date: a table added, renamed or dropped in the source since then is not reflected. It is retried in {retry_secs}s. Cause: {e}"
+                        "Failed to refresh catalog '{catalog_name}', so its tables may now be incomplete or out of date: a table added, renamed or dropped in the source since the last successful refresh may not be reflected. It is retried in {retry_secs}s. Cause: {}",
+                        util::single_line(&e.to_string())
                     );
                 }
             }

@@ -51,13 +51,16 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    // The queries this reports are Spice's own discovery queries against
-    // `information_schema` and `pg_catalog`, never anything the user wrote, so
-    // the fix is a grant -- not "check your SQL". The step being performed is
-    // named by the message reporting this, and the relation the server objected
-    // to by `source`; the query text itself is debug detail and stays out.
+    // Reports Spice's own queries -- never anything the user wrote -- so the
+    // fix is never "check your SQL". Every caller in this crate raises it,
+    // including the CDC prerequisite checks that read settings (`SHOW
+    // wal_level`) rather than catalogs, so the action has to cover both, and a
+    // query can fail after connecting (a dropped connection), so reachability
+    // stays in it. The step being performed is named by the message reporting
+    // this, and the object the server objected to by `source`; the query text
+    // itself is debug detail and stays out.
     #[snafu(display(
-        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`. Docs: {POSTGRES_CONNECTOR_DOCS}"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read the system catalogs and settings Spice inspects, and that the database is still reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 

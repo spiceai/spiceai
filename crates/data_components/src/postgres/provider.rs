@@ -34,6 +34,7 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
+use util::single_line;
 
 use crate::{
     DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
@@ -55,13 +56,14 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    // Reports Spice's own discovery queries against `information_schema`, never
-    // anything the user wrote, so the fix is a grant -- not "check your SQL". The
-    // step being performed is named by the message reporting this, and the
-    // relation the server objected to by `source`; the query text itself is
-    // debug detail and stays out.
+    // Raised only by this module's `information_schema` discovery queries --
+    // never anything the user wrote -- so the fix is a grant, not "check your
+    // SQL". A query can also fail after connecting (a dropped connection), where
+    // no grant helps, so reachability stays in it. The step being performed is
+    // named by the message reporting this, and the relation the server objected
+    // to by `source`; the query text itself is debug detail and stays out.
     #[snafu(display(
-        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`. Docs: {POSTGRES_CONNECTOR_DOCS}"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`, and that the database is still reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 
@@ -790,6 +792,7 @@ fn schema_discovery_warning(
     outcome: SchemaRefreshOutcome,
     cause: &str,
 ) -> Option<String> {
+    let cause = single_line(cause);
     match outcome {
         SchemaRefreshOutcome::InsertNew => None,
         SchemaRefreshOutcome::KeepPrevious => Some(format!(
@@ -809,6 +812,7 @@ fn schema_metadata_warning(
     metadata: SchemaMetadata,
     cause: &str,
 ) -> String {
+    let cause = single_line(cause);
     match metadata {
         SchemaMetadata::ForeignKeys => format!(
             "PostgreSQL catalog '{catalog_name}' failed to determine the foreign keys of schema '{schema_name}', so anything relying on them -- including SQL generated from natural language -- cannot see how its tables join. Cause: {cause}"
@@ -824,6 +828,7 @@ fn schema_metadata_warning(
 /// instead -- so this reports the cost, and says so rather than implying data is
 /// missing.
 fn column_types_fallback_warning(catalog_name: &str, schema_name: &str, cause: &str) -> String {
+    let cause = single_line(cause);
     format!(
         "PostgreSQL catalog '{catalog_name}' failed to describe the tables of schema '{schema_name}' in a single query, so each is described separately and this refresh is slower; the tables it registers are unaffected. Cause: {cause}"
     )
@@ -844,6 +849,7 @@ struct SchemaLocation<'a> {
 /// message carries the fix and the documentation link itself.
 fn table_skipped_warning(location: SchemaLocation<'_>, table_name: &str, cause: &str) -> String {
     let SchemaLocation { catalog, schema } = location;
+    let cause = single_line(cause);
     format!(
         "PostgreSQL catalog '{catalog}' failed to load table '{schema}.{table_name}', so it is absent from the catalog and queries against '{catalog}.{schema}.{table_name}' will not resolve. It is retried on the next refresh. Cause: {cause}. Check that the connected role has SELECT on the table, and that its column types are supported or `unsupported_type_action` permits them. Docs: {POSTGRES_CONNECTOR_DOCS}"
     )
@@ -858,6 +864,7 @@ fn table_foreign_keys_warning(
     cause: &str,
 ) -> String {
     let SchemaLocation { catalog, schema } = location;
+    let cause = single_line(cause);
     format!(
         "PostgreSQL catalog '{catalog}' failed to record the foreign keys of table '{schema}.{table_name}', so anything relying on them cannot see how it joins to other tables. Cause: {cause}. Report this bug: https://github.com/spiceai/spiceai/issues"
     )
@@ -1305,7 +1312,9 @@ mod tests {
             "pg",
             "sales",
             SchemaRefreshOutcome::Skip,
-            "Failed to connect to PostgreSQL: connection refused",
+            // The shape the pool really produces: a cause that spans lines. A
+            // tidy fixture would let a formatter that never normalizes pass.
+            "Failed to connect to PostgreSQL: PostgreSQL connection failed.\ndb error: connection refused",
         )
         .expect("a failed discovery should report");
 
@@ -1323,15 +1332,15 @@ mod tests {
             "then its impact, as one situation rather than two: {skipped}"
         );
         assert!(
-            skipped.contains("Cause: Failed to connect to PostgreSQL: connection refused"),
-            "and ends with the cause, labelled: {skipped}"
+            skipped.contains("Cause: Failed to connect to PostgreSQL: PostgreSQL connection failed. db error: connection refused"),
+            "and ends with the cause, labelled and collapsed to one line: {skipped}"
         );
 
         let kept = schema_discovery_warning(
             "pg",
             "sales",
             SchemaRefreshOutcome::KeepPrevious,
-            "Failed to connect to PostgreSQL: connection refused",
+            "Failed to connect to PostgreSQL: PostgreSQL connection failed.\ndb error: connection refused",
         )
         .expect("a failed discovery should report");
         assert!(
@@ -1359,7 +1368,10 @@ mod tests {
     /// and what is missing from it.
     #[test]
     fn degraded_refresh_warnings_name_the_catalog_and_the_loss() {
-        let fks = schema_metadata_warning("pg", "sales", SchemaMetadata::ForeignKeys, "denied");
+        // Every cause here spans lines, so a builder that stopped normalizing
+        // would fail the one-line assertion below rather than pass on a fixture.
+        let multiline = "permission denied for table pg_constraint\nCaused by: denied";
+        let fks = schema_metadata_warning("pg", "sales", SchemaMetadata::ForeignKeys, multiline);
         assert!(
             fks.contains(
                 "PostgreSQL catalog 'pg' failed to determine the foreign keys of schema 'sales'"
@@ -1368,13 +1380,13 @@ mod tests {
         );
 
         let comments =
-            schema_metadata_warning("pg", "sales", SchemaMetadata::Descriptions, "denied");
+            schema_metadata_warning("pg", "sales", SchemaMetadata::Descriptions, multiline);
         assert!(
             comments.contains("failed to read the table and column descriptions of schema 'sales'"),
             "{comments}"
         );
 
-        let fallback = column_types_fallback_warning("pg", "sales", "denied");
+        let fallback = column_types_fallback_warning("pg", "sales", multiline);
         assert!(
             fallback.contains("slower") && fallback.contains("unaffected"),
             "the fallback costs time, not tables, and must say so: {fallback}"
@@ -1384,7 +1396,8 @@ mod tests {
             catalog: "pg",
             schema: "sales",
         };
-        let skipped = table_skipped_warning(location, "orders", "unsupported type");
+        let skipped =
+            table_skipped_warning(location, "orders", "unsupported type\nCaused by: jsonb");
         assert!(
             skipped.contains("failed to load table 'sales.orders'")
                 && skipped.contains("queries against 'pg.sales.orders' will not resolve"),
@@ -1395,7 +1408,7 @@ mod tests {
             "the loader's error carries no fix, so this message must: {skipped}"
         );
 
-        let table_fks = table_foreign_keys_warning(location, "orders", "invalid json");
+        let table_fks = table_foreign_keys_warning(location, "orders", "invalid json\nat line 2");
         assert!(
             table_fks.contains("github.com/spiceai/spiceai/issues"),
             "recording foreign keys is Spice's own work, so a failure is a bug: {table_fks}"
