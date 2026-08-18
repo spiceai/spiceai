@@ -14,11 +14,11 @@ description: "Query: clickbench_q6"
 |               |     CoalescePartitionsExec                                                                                             |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(alias1)]                                                        |
 |               |         AggregateExec: mode=FinalPartitioned, gby=[alias1@0 as alias1], aggr=[]                                        |
-|               |           RepartitionExec: partitioning=Hash([alias1@0], 16), input_partitions=16                                      |
+|               |           RepartitionExec: partitioning=Hash([alias1@0], 32), input_partitions=32                                      |
 |               |             AggregateExec: mode=Partial, gby=[SearchPhrase@0 as alias1], aggr=[]                                       |
 |               |               SchemaCastScanExec                                                                                       |
 |               |                 CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                      |
 |               |                   BytesProcessedExec                                                                                   |
-|               |                     DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[SearchPhrase], file_type=vortex |
+|               |                     DataSourceExec: file_groups={32 groups: [<redacted>]}, projection=[SearchPhrase], file_type=vortex |
 |               |                                                                                                                        |
 +---------------+------------------------------------------------------------------------------------------------------------------------+
