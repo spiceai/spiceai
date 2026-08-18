@@ -36,11 +36,13 @@ so the corpus data and the qrels stay portable.
 | File | Search |
 |---|---|
 | `full_text_search-cayenne[file].yaml` | BM25 full-text |
-| `model2vec[potion-multilingual-128M]-cayenne[file].yaml` | Vector (chunked) |
+| `model2vec[potion-multilingual-128M]-cayenne[file].yaml` | Vector |
 | `hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml` | Hybrid (BM25 + vector, RRF) |
 
-The vector and hybrid variants enable chunking, because a filing page often exceeds the embedding
-token limit. Each chunk keeps its page's `_id`, so page-level relevance still scores.
+The vector and hybrid variants embed each page to one vector. `potion-multilingual-128M` is a static,
+context-free model, so a whole page never truncates and needs no chunking; one vector per page maps
+directly onto the page-level qrels. A bounded-context model (for example an `all-MiniLM-L6-v2`
+variant, ~256 tokens) would instead need chunking, because a dense filing page overflows it.
 
 ## Run
 

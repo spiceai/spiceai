@@ -47,8 +47,8 @@ views:
   # The searchable corpus. Stripping everything up to and including `corpus_pages/` turns the raw
   # `location` into the portable `<doc>/pNNNN.pdf` key, so the search primary key equals the
   # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
-  # under. Both full-text and vector indexes are built over the same page text; each embedding
-  # chunk keeps its page's `_id`, so page-level relevance still scores.
+  # under. Both full-text and vector indexes are built over the same page text; each page embeds to
+  # one vector (model2vec is static and context-free, so a whole page never truncates).
   - name: corpus
     sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
     columns:
@@ -61,10 +61,6 @@ views:
           - from: potion
             row_id:
               - _id
-            chunking:
-              enabled: true
-              target_chunk_size: 512
-              overlap_size: 128
 
 embeddings:
   - from: model2vec:minishlab/potion-multilingual-128M
