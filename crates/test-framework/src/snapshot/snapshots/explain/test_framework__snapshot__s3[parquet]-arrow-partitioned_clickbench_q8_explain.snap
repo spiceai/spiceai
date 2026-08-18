@@ -14,20 +14,20 @@ description: "Query: clickbench_q8"
 |               |   SortExec: expr=[count(*)@1 DESC], preserve_partitioning=[true]                                       |
 |               |     ProjectionExec: expr=[AdvEngineID@0 as AdvEngineID, count(Int64(1))@1 as count(*)]                 |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))] |
-|               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 16), input_partitions=80                   |
+|               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 32), input_partitions=160                  |
 |               |           AggregateExec: mode=Partial, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))]      |
 |               |             FilterExec: AdvEngineID@0 != 0                                                             |
 |               |               SchemaCastScanExec                                                                       |
 |               |                 PartitionedUnionExec                                                                   |
 |               |                   BytesProcessedExec                                                                   |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                        |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                        |
 |               |                   BytesProcessedExec                                                                   |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                        |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                        |
 |               |                   BytesProcessedExec                                                                   |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                        |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                        |
 |               |                   BytesProcessedExec                                                                   |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                        |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                        |
 |               |                   BytesProcessedExec                                                                   |
-|               |                     DataSourceExec: partitions=16, partition_sizes=[<redacted>]                        |
+|               |                     DataSourceExec: partitions=32, partition_sizes=[<redacted>]                        |
 |               |                                                                                                        |
 +---------------+--------------------------------------------------------------------------------------------------------+
