@@ -146,6 +146,8 @@ mod tests {
             fn supports(&self, capability: Capability) -> bool {
                 capability == Capability::GetStatus
             }
+            // This status-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
             async fn status(&self) -> Result<StatusReport, CommandError> {
                 Ok(StatusReport::new(RuntimePhase::Ready, "all ready"))
             }

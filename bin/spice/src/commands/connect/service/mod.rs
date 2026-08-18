@@ -14,44 +14,55 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `spice connect --install`: run `spiced --cloud-connect` as a persistent
-//! system service.
+#![cfg_attr(not(target_os = "linux"), expect(dead_code))]
+
+//! `spice connect service`: run `spiced` as a persistent service for an
+//! enrolled instance directory, and manage its lifecycle.
 //!
-//! The supervisor is not a convenience here, it is the mechanism deployments
-//! depend on: a deployment applies by having the runtime validate and persist
-//! the new spicepod and then exit 0, which only becomes a deployment if
-//! something relaunches it. Both back ends therefore restart the runtime
-//! unconditionally — systemd with `Restart=always`, launchd with `KeepAlive`.
+//! A deployment applies to the running instance and never ends its process, so
+//! the supervisor is what keeps the instance up across the things that do end
+//! it — a host reboot, an OOM kill, an unhandled failure.
+//!
+//! The supported Linux backend uses `Restart=on-failure`: a failure comes back,
+//! and an exit an operator asked for stays down.
 //!
 //! ## Support matrix
 //!
-//! `--install` is Linux with systemd and macOS with launchd, and needs root on
-//! both. Containers get the same guarantee from their runtime's restart policy
-//! (`docker run --restart unless-stopped`) and use the env-var flow instead.
-//! Windows enrolls and runs `spiced --cloud-connect` under the user's own
-//! supervisor.
-//!
-//! macOS installs a `LaunchDaemon`, not a `LaunchAgent`: an agent runs only
-//! while its user is logged in, which is not the guarantee `--install` makes.
-//! A daemon starts at boot and survives logout. Root installs and manages its
-//! definition, while the runtime itself runs as the non-root operator.
+//! Linux with systemd. Containers get the same guarantee from their runtime's restart policy
+//! (`docker run --restart unless-stopped`) and enroll directly with
+//! `spiced --token`.
 //!
 //! ## One service per instance directory
 //!
 //! Two instances on one host must produce two independently-running services,
 //! so the service name is derived deterministically from the *absolute*
 //! instance directory (see [`name_stem_for_dir`]) and the directory is baked
-//! into the definition as its working directory. A `--install` or `remove` in
-//! one instance directory can therefore never touch another instance's service.
+//! into the definition as its working directory. A command run in one instance
+//! directory can therefore never touch another instance's service.
 //!
-//! Both back ends run `spiced` as the non-root operator who invoked `sudo` (or
-//! owns the instance directory).
+//! ## Resolution is by directory, never by name
+//!
+//! Every action resolves its target from the canonical instance directory plus
+//! the per-directory manifest (`<config-dir>/service.json`). There is no name
+//! argument and no host-wide scan: both can name a service belonging to a
+//! different instance, and a lifecycle command aimed at the wrong process is a
+//! worse outcome than one that refuses.
 
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+pub(crate) mod backend;
+pub(crate) mod cli;
+// Each back end is compiled only for the host it drives: its helpers and
+// constants exist to serve one supervisor, and carrying them onto a platform
+// that has no such supervisor would be dead code the compiler is right to
+// flag. The naming, staging, manifest, and status code every platform shares
+// lives here instead, and is covered on every target.
+// The launchd implementation remains in trunk for the macOS lifecycle
+// follow-up, but this Linux-only service surface deliberately does not compile
+// or expose it yet.
+#[cfg(any())]
 mod launchd;
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "linux"), expect(dead_code))]
+pub(crate) mod manifest;
+pub(crate) mod model;
+#[cfg(target_os = "linux")]
 mod systemd;
 
 use std::path::{Path, PathBuf};
@@ -63,36 +74,30 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::{Error, Result};
 
-#[cfg(target_os = "linux")]
-use systemd as backend;
-
-#[cfg(target_os = "macos")]
-use launchd as backend;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use unsupported as backend;
+pub(crate) use backend::{InstallRequest, LogRequest, ServiceBackend, for_host as backend};
+pub(crate) use manifest::{ServiceManifest, ServiceOwner};
+pub(crate) use model::{ServiceScope, ServiceState, ServiceStatus};
 
 /// Longest directory-name fragment carried into a service name, so a deeply-named
 /// instance directory cannot produce an unwieldy name. The appended digest is
 /// what makes the name unique; the fragment only makes it legible.
 const MAX_NAME_FRAGMENT: usize = 32;
 
+/// Hex digits of the path digest appended to every service name.
+///
+/// Eight bytes of SHA-256. The digest is the whole of the uniqueness
+/// guarantee — two instance directories that share a basename are told apart
+/// by nothing else — so it is sized for a collision to be unreachable rather
+/// than merely unlikely on the hosts anyone has today.
+const NAME_DIGEST_HEX: usize = 16;
+
 /// Marks a booted systemd system. Present only when systemd is PID 1 and
 /// running, which is exactly the condition `systemctl` needs.
+#[cfg(target_os = "linux")]
 const SYSTEMD_RUNTIME_MARKER: &str = "/run/systemd/system";
 
-/// Root-owned directory the installed service's `spiced` is staged into.
-///
-/// Not under `/usr/local`: Homebrew owns that prefix on Intel Macs and makes it
-/// writable by the installing user, which is exactly what the staged runtime
-/// must not be. Not under `/Library/Application Support` either — the space in
-/// that path turns every command this module prints for the operator into two
-/// arguments.
-#[cfg(target_os = "macos")]
-const RUNTIME_STAGE_DIR: &str = "/Library/Spice";
-
-/// Root-owned directory the installed service's `spiced` is staged into.
-#[cfg(not(target_os = "macos"))]
+/// Root-owned directory holding the per-service directories a system service's
+/// `spiced` is staged into.
 const RUNTIME_STAGE_DIR: &str = "/usr/local/lib/spice";
 
 /// File name of the staged runtime inside [`RUNTIME_STAGE_DIR`].
@@ -128,7 +133,7 @@ fn service_account(instance_dir: &Path) -> Result<ServiceAccount> {
             return Ok(ServiceAccount { uid, gid });
         }
         return Err(Error::InvalidArgument {
-            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice connect --install`.".to_string(),
+            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice connect service install`.".to_string(),
         });
     }
 
@@ -147,76 +152,129 @@ fn service_account(instance_dir: &Path) -> Result<ServiceAccount> {
 
     Err(Error::InvalidArgument {
         message: format!(
-            "Failed to install the Spice Cloud Connect service: {} is root-owned and no non-root sudo caller is available. Run the command from the intended operator account with `sudo spice connect --install`.",
+            "Failed to install the Spice Cloud Connect service: {} is root-owned and no non-root sudo caller is available. Run the command from the intended operator account with `sudo spice connect service install`.",
             instance_dir.display()
         ),
     })
 }
 
-/// Give the service account access to the enrolled identity and managed state.
-/// Symlinks are rejected so a root install cannot be steered into changing the
-/// ownership of an unrelated target.
+/// Read the source runtime's version without giving an operator-controlled
+/// binary the installer's elevated privileges or environment.
+///
+/// A host-wide install is normally invoked through `sudo`, while the runtime
+/// lives under the invoking operator's home. The version probe therefore has
+/// to cross the same privilege boundary as the installed service: resolve the
+/// non-root service account first, then set its uid/gid and drop supplementary
+/// groups on the child before `exec`. Clearing the environment also keeps
+/// sudo-only credentials and dynamic-loader settings out of that untrusted
+/// process.
+fn runtime_version_for_service(spiced_path: &Path, instance_dir: &Path) -> Result<String> {
+    let mut command = std::process::Command::new(spiced_path);
+    command
+        .arg("--version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/");
+
+    #[cfg(unix)]
+    if is_root() {
+        use std::os::unix::process::CommandExt as _;
+
+        let account = service_account(instance_dir)?;
+        // `CommandExt::uid` clears supplementary groups before dropping the
+        // uid, so the child cannot retain a privileged group from sudo.
+        command.uid(account.uid).gid(account.gid);
+    }
+
+    let output = command.output().map_err(|source| Error::CloudConnectIo {
+        message: format!(
+            "read the Spice runtime version from {} as the service account: {source}",
+            spiced_path.display()
+        ),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Error::RuntimeVersion {
+            message: if stderr.is_empty() {
+                format!("{} exited with {}", spiced_path.display(), output.status)
+            } else {
+                stderr
+            },
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The local account name for a uid, when the host has one.
 #[cfg(unix)]
-fn provision_config_ownership(path: &Path, account: ServiceAccount) -> Result<()> {
+fn account_name(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+}
+
+/// Verify that the selected service account already owns its instance state.
+///
+/// A privileged installer must not recursively chown a user-controlled tree:
+/// path components can be exchanged after inspection and steer root outside
+/// the instance directory. Enrollment creates this directory as the operator,
+/// so ownership is a precondition instead of something installation mutates.
+#[cfg(unix)]
+fn verify_config_ownership(path: &Path, account: ServiceAccount) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
     let metadata = std::fs::symlink_metadata(path).map_err(|e| Error::CloudConnectIo {
         message: format!("inspect Spice config directory {}: {e}", path.display()),
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(Error::InvalidArgument {
             message: format!(
-                "Failed to install the Spice Cloud Connect service: config path {} is a symlink; use a real directory so ownership can be provisioned safely.",
+                "Failed to install the Spice Cloud Connect service: config path {} must be a real directory, not a symlink or special file.",
                 path.display()
             ),
         });
     }
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path).map_err(|e| Error::CloudConnectIo {
-            message: format!("read Spice config directory {}: {e}", path.display()),
-        })? {
-            let entry = entry.map_err(|e| Error::CloudConnectIo {
-                message: format!(
-                    "read an entry in Spice config directory {}: {e}",
-                    path.display()
-                ),
-            })?;
-            provision_config_ownership(&entry.path(), account)?;
-        }
-    }
-    std::os::unix::fs::lchown(path, Some(account.uid), Some(account.gid)).map_err(|e| {
-        Error::CloudConnectIo {
+    let mode = metadata.permissions().mode() & 0o7777;
+    if metadata.uid() != account.uid || mode & 0o700 != 0o700 || mode & 0o022 != 0 {
+        return Err(Error::InvalidArgument {
             message: format!(
-                "set ownership of Spice Cloud Connect state {} to {}:{}: {e}",
+                "Failed to install the Spice Cloud Connect service: config directory {} is owned by uid {} with mode {:04o}, but the service account is uid {}. Stop the runtime, restore this directory to that account with owner read/write/search access and no group/world write access, then retry. The installer will not recursively change ownership of user-controlled state.",
                 path.display(),
+                metadata.uid(),
+                mode,
                 account.uid,
-                account.gid
             ),
-        }
-    })
+        });
+    }
+    Ok(())
 }
 
-/// The `spiced` the installed service runs.
-fn staged_runtime_path() -> PathBuf {
-    Path::new(RUNTIME_STAGE_DIR).join(STAGED_RUNTIME_FILE)
-}
-
-/// A service installed for one instance directory.
+/// A service installed for one instance directory, as its back end describes
+/// it immediately after installing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstalledService {
     /// The name the supervisor knows this service by: a systemd unit name
-    /// including its `.service` suffix, or a launchd job label.
+    /// including its `.service` suffix.
     pub(crate) name: String,
     /// Absolute path of the service definition — the unit file or the plist.
     pub(crate) path: PathBuf,
     /// The instance directory baked in as the service's working directory.
     pub(crate) working_dir: PathBuf,
+    /// The exact Cloud Connect state directory selected by the supervisor's
+    /// effective environment. `None` means the definition cannot prove which
+    /// identity it activates and therefore cannot be adopted or managed.
+    pub(crate) config_dir: Option<PathBuf>,
     /// The `spiced` binary the service runs — the root-owned staged copy.
     pub(crate) runtime: PathBuf,
 }
 
 /// Derive the per-instance part of this directory's service name.
 ///
-/// The stem is `<fragment>-<digest>`: a legible fragment from the directory
-/// name plus the first 8 hex digits of the SHA-256 of the absolute path. The
+/// The stem is `<fragment>-<digest>`: a legible fragment of at most
+/// [`MAX_NAME_FRAGMENT`] characters from the directory name, plus the first
+/// [`NAME_DIGEST_HEX`] hex digits of the SHA-256 of the absolute path. The
 /// digest is what guarantees two directories never collide — including two
 /// directories with the same basename (`/srv/a/edge` and `/srv/b/edge`) —
 /// while the fragment keeps `systemctl status` and `launchctl print` output
@@ -228,8 +286,8 @@ pub(crate) struct InstalledService {
 /// where the command ran.
 fn name_stem_for_dir(dir: &Path) -> String {
     let digest = Sha256::digest(dir.as_os_str().as_encoded_bytes());
-    let mut short = String::with_capacity(8);
-    for byte in digest.iter().take(4) {
+    let mut short = String::with_capacity(NAME_DIGEST_HEX);
+    for byte in digest.iter().take(NAME_DIGEST_HEX / 2) {
         use std::fmt::Write as _;
         // Writing into a String is infallible; the Result exists only to
         // satisfy the `Write` trait.
@@ -273,18 +331,23 @@ fn sanitize_fragment(name: &str) -> String {
 
 /// Why a host cannot have a service installed on it.
 ///
-/// Distinguished from a generic error so the caller can run the check *before*
-/// the HTTPS enroll: a failed preflight must consume nothing, leaving the
-/// adoption code valid.
+/// Distinguished from a generic error so the caller can run the check before
+/// touching any state: a failed preflight must change nothing.
+///
+/// Each supervisor's own reasons are compiled only where that supervisor is, so
+/// a message can name a concrete fix without hedging about the host it is
+/// printed on.
 #[derive(Debug)]
 pub(crate) enum PreflightFailure {
-    /// Neither Linux nor macOS — `--install` has no supervisor to install into.
+    /// Not Linux — this release does not expose another service backend.
     UnsupportedPlatform,
     /// Linux, but systemd is not the running init.
+    #[cfg(target_os = "linux")]
     SystemdUnavailable,
-    /// Not running as root, so the service definition directory is not writable
-    /// and the supervisor cannot be asked to manage the service.
-    NotRoot,
+    /// Linux with systemd, but the account has no user manager for a user
+    /// service to live in.
+    #[cfg(target_os = "linux")]
+    SystemdUserManagerUnavailable,
 }
 
 impl PreflightFailure {
@@ -292,29 +355,29 @@ impl PreflightFailure {
     fn message(&self) -> String {
         match self {
             Self::UnsupportedPlatform => format!(
-                "Failed to install the Spice Cloud Connect service: --install requires \
-                 Linux with systemd or macOS with launchd (this host is {}). Enroll without \
-                 --install and run `spiced --cloud-connect` under your own supervisor, or run \
-                 Spice in a container with a restart policy (`docker run --restart unless-stopped`). \
+                "Failed to install the Spice Cloud Connect service: a service needs \
+                 Linux with systemd (this host is {}). Run `spiced` from \
+                 the enrolled directory under your own supervisor, or run Spice in a container \
+                 with a restart policy (`docker run --restart unless-stopped`). \
                  See: https://spiceai.org/docs",
                 std::env::consts::OS
             ),
+            #[cfg(target_os = "linux")]
             Self::SystemdUnavailable => format!(
                 "Failed to install the Spice Cloud Connect service: systemd is not running on \
                  this host ({SYSTEMD_RUNTIME_MARKER} is absent). This is normal inside a \
-                 container: set SPICE_CONNECT_ADOPT_CODE and run `spiced --cloud-connect` under \
-                 the container runtime's restart policy (`docker run --restart unless-stopped`) \
-                 instead of --install. See: https://spiceai.org/docs"
+                 container: run `spiced --token <enrollment-key>` under the container \
+                 runtime's restart policy (`docker run --restart unless-stopped`) \
+                 instead. See: https://spiceai.org/docs"
             ),
-            Self::NotRoot => format!(
-                "Failed to install the Spice Cloud Connect service: installing a {} requires \
-                 root. Re-run with sudo: `sudo spice connect --install`. \
-                 See: https://spiceai.org/docs",
-                if cfg!(target_os = "macos") {
-                    "launchd daemon"
-                } else {
-                    "systemd unit"
-                }
+            #[cfg(target_os = "linux")]
+            Self::SystemdUserManagerUnavailable => format!(
+                "Failed to install the Spice Cloud Connect service: this account has no systemd \
+                 user manager to install a user service into (no {}). Log in as the account that \
+                 will run the instance and re-run `spice connect service install`, enable one for \
+                 it (`sudo loginctl enable-linger <user>`), or install a host-wide service with \
+                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/<uid>".to_string())
             ),
         }
     }
@@ -331,84 +394,564 @@ impl From<PreflightFailure> for Error {
 /// Check that this host can have a service installed, **before** anything
 /// irreversible happens.
 ///
-/// Called ahead of the HTTPS enroll so a host with no supervisor or without
-/// root fails with nothing installed and the adoption code still redeemable.
-pub(crate) fn preflight() -> std::result::Result<(), PreflightFailure> {
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
-        return Err(PreflightFailure::UnsupportedPlatform);
-    }
-    backend::preflight()
-}
-
-/// Install (or reinstall) and start the service for `instance_dir`, preserving
-/// the resolved `config_dir` in the service environment.
-///
-/// Idempotent, and the in-place upgrade path: re-running restages the current
-/// `spiced` binary, rewrites the service definition, and restarts the service,
-/// leaving the staged identity untouched. Returns the installed service.
-///
-/// `spiced_path` is where the CLI found the runtime; it is copied to a
-/// root-owned location (see [`stage_runtime`]) rather than referenced in place.
+/// The platform check is here rather than in a back end because a host with no
+/// supported supervisor has no back end to ask. `cfg!` rather than `#[cfg]`, so
+/// the unsupported-platform branch is compiled — and its message kept
+/// truthful — on every target.
 ///
 /// # Errors
 ///
-/// Returns an error when the runtime cannot be staged, the definition cannot be
-/// written, or the supervisor rejects it. Since this runs *after* the enroll,
-/// the messages say that the identity is already staged and how to resume.
+/// Returns the reason installation is impossible on this host.
+fn preflight(
+    backend: &dyn ServiceBackend,
+    scope: ServiceScope,
+) -> std::result::Result<(), PreflightFailure> {
+    if !cfg!(target_os = "linux") {
+        return Err(PreflightFailure::UnsupportedPlatform);
+    }
+    backend.preflight(scope)
+}
+
+/// The service domain this invocation can install into.
+///
+/// Least privilege by default: an unprivileged invocation asks for a user
+/// service, and only an explicitly elevated one installs host-wide.
+pub(crate) fn scope_for_privilege() -> ServiceScope {
+    if is_root() {
+        ServiceScope::System
+    } else {
+        ServiceScope::User
+    }
+}
+
+/// Resolve the service installed for `instance_dir`, from that directory and
+/// nothing else.
+///
+/// `Ok(None)` means no service is installed for this directory. An error means
+/// something claiming to be one could not be trusted — reported rather than
+/// treated as absence, because "there is nothing here" would send `install`
+/// on to write over it.
+///
+/// # Errors
+///
+/// Returns an error when the manifest exists but does not validate.
+pub(crate) fn resolve(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    config_dir: &Path,
+) -> Result<Option<ServiceManifest>> {
+    resolve_with_state(backend, instance_dir, config_dir, config_dir)
+}
+
+/// Resolve a manifest through the retained state directory while comparing
+/// supervisor-persisted paths with their canonical values.
+pub(crate) fn resolve_with_state(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    state_config_dir: &Path,
+    service_config_dir: &Path,
+) -> Result<Option<ServiceManifest>> {
+    let loaded = if state_config_dir == service_config_dir {
+        ServiceManifest::load(state_config_dir, instance_dir, backend)?
+    } else {
+        ServiceManifest::load_from_pinned_directory(state_config_dir, instance_dir, backend)?
+    };
+    if let Some(manifest) = loaded {
+        validate_manifest_definition(backend, instance_dir, service_config_dir, &manifest)?;
+        return Ok(Some(manifest));
+    }
+    Ok(adopt_installed_definition(
+        backend,
+        instance_dir,
+        service_config_dir,
+    ))
+}
+
+/// Re-read the supervisor's effective definition before trusting a manifest.
+///
+/// A manifest records what Spice installed, but systemd drop-ins and manual
+/// edits can change the effective `WorkingDirectory`, `SPICE_CONFIG_DIR`, or
+/// `ExecStart` later. A missing definition is retained as manifest-backed state
+/// so uninstall can finish cleaning it up; an existing definition must still
+/// describe exactly the service and Cloud identity the manifest names.
+fn validate_manifest_definition(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    config_dir: &Path,
+    manifest: &ServiceManifest,
+) -> Result<()> {
+    match std::fs::symlink_metadata(&manifest.definition_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "inspect installed service definition {}: {error}",
+                    manifest.definition_path.display()
+                ),
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "The installed Spice service definition {} is a symlink. Refusing to manage it; remove the link or restore the Spice-owned definition, then retry.",
+                    manifest.definition_path.display()
+                ),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    let Some(installed) = backend.find_installed(instance_dir, manifest.scope) else {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "The supervisor's effective definition for {} no longer names {} with the recorded runtime {}. Refusing to manage it; remove the override or restore the Spice-owned definition, then retry.",
+                manifest.name,
+                manifest.directory.display(),
+                manifest.runtime_path.display()
+            ),
+        });
+    };
+    if installed.name != manifest.name
+        || installed.path != manifest.definition_path
+        || installed.working_dir != manifest.directory
+        || installed.config_dir.as_deref() != Some(config_dir)
+        || installed.runtime != manifest.runtime_path
+    {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "The supervisor's effective definition for {} differs from the Spice service manifest in its runtime, working directory, or SPICE_CONFIG_DIR identity binding. Refusing to manage it; remove the override or restore the Spice-owned definition, then retry.",
+                manifest.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Describe a service that is installed for `instance_dir` but has no
+/// manifest, by reading the supervisor's own definition.
+///
+/// A directory can lose its manifest — deleted by hand, or restored from a
+/// backup that skipped it — while the definition is still installed and the
+/// service still running. Reading the definition is what keeps that service
+/// reportable and removable instead of invisible. It is not a fallback search:
+/// the name is still derived from the canonical directory, and the definition
+/// is accepted only if it names that same directory as its working directory.
+///
+/// Both domains are asked, because either can hold this directory's service.
+/// The least-privileged one is asked first: an operator's own user service is
+/// the common case, and a host-wide definition under the same derived name is
+/// the one that needs elevation to act on.
+fn adopt_installed_definition(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    config_dir: &Path,
+) -> Option<ServiceManifest> {
+    let (scope, installed) = [ServiceScope::User, ServiceScope::System]
+        .into_iter()
+        .find_map(|scope| Some((scope, backend.find_installed(instance_dir, scope)?)))?;
+    if installed.config_dir.as_deref() != Some(config_dir) {
+        return None;
+    }
+    let owner = installed_owner(instance_dir);
+    Some(ServiceManifest {
+        schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+        directory: instance_dir.to_path_buf(),
+        name: installed.name.clone(),
+        scope,
+        supervisor: backend.supervisor(),
+        owner,
+        definition_path: installed.path,
+        runtime_path: installed.runtime,
+        log_source: backend.log_source(&installed.name, scope),
+        // Not recoverable from the definition, and not computed here: hashing
+        // the runtime on every `status` would read a gigabyte to answer a
+        // question nobody asked. The next `service install` records it.
+        runtime_digest: String::new(),
+        runtime_version: String::new(),
+        health_url: crate::context::DEFAULT_HTTP_ENDPOINT.to_string() + "/health",
+    })
+}
+
+/// The account an adopted service runs as, taken from the instance directory
+/// it was installed for — the same signal the installer uses when there is no
+/// `sudo` caller to name.
+#[cfg(unix)]
+fn installed_owner(instance_dir: &Path) -> ServiceOwner {
+    let (uid, gid) =
+        std::fs::metadata(instance_dir).map_or((0, 0), |metadata| (metadata.uid(), metadata.gid()));
+    ServiceOwner {
+        uid,
+        gid,
+        name: account_name(uid),
+    }
+}
+
+#[cfg(not(unix))]
+fn installed_owner(_instance_dir: &Path) -> ServiceOwner {
+    ServiceOwner {
+        uid: 0,
+        gid: 0,
+        name: None,
+    }
+}
+
+/// The complete service half of the status contract for one instance
+/// directory.
+///
+/// Never fails: `status` has to render something, and a supervisor that could
+/// not be asked is a state in the vocabulary rather than an error that
+/// suppresses the rest of the report. The caller decides the exit code from
+/// [`model::ServiceState::is_degraded`].
+pub(crate) fn status(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    config_dir: &Path,
+) -> ServiceStatus {
+    let manifest = match resolve(backend, instance_dir, config_dir) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return ServiceStatus::not_installed(),
+        Err(err) => return ServiceStatus::unavailable(err.to_string()),
+    };
+
+    let observed = backend.observe(&manifest);
+    ServiceStatus {
+        installed: true,
+        state: observed.state,
+        scope: Some(manifest.scope),
+        supervisor: Some(manifest.supervisor),
+        starts: observed.starts,
+        owner: Some(manifest.owner.describe()),
+        name: Some(manifest.name.clone()),
+        working_dir: Some(manifest.directory.clone()),
+        definition_path: Some(manifest.definition_path.clone()),
+        runtime_path: Some(manifest.runtime_path.clone()),
+        log_source: manifest.log_source,
+        diagnostic: observed.diagnostic,
+        starts_action: observed.starts_action,
+    }
+}
+
+/// Install (or reinstall) the service for `instance_dir` and record what was
+/// installed in the per-directory manifest.
+///
+/// Idempotent, and the in-place upgrade path: re-running restages the current
+/// `spiced` binary, rewrites the service definition, restarts the service, and
+/// rewrites the manifest, leaving the enrolled identity untouched.
+///
+/// # Errors
+///
+/// Returns an error when the host cannot host a service, when the derived
+/// service name is already taken by something that does not belong to this
+/// directory, when the runtime cannot be staged, or when the supervisor
+/// rejects the definition. Every one of those is checked or reported before
+/// the manifest is written, so a failed install never leaves a manifest
+/// describing a service that is not there.
+#[cfg(test)]
 pub(crate) fn install(
+    backend: &dyn ServiceBackend,
     instance_dir: &Path,
     config_dir: &Path,
     spiced_path: &Path,
-) -> Result<InstalledService> {
-    backend::install(instance_dir, config_dir, spiced_path)
+    runtime_version: &str,
+    health_url: &str,
+) -> Result<ServiceManifest> {
+    install_with_state(
+        backend,
+        instance_dir,
+        config_dir,
+        config_dir,
+        spiced_path,
+        runtime_version,
+        health_url,
+    )
 }
 
-/// Stop and delete the service for `instance_dir`.
+pub(crate) fn install_with_state(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    service_config_dir: &Path,
+    state_config_dir: &Path,
+    spiced_path: &Path,
+    runtime_version: &str,
+    health_url: &str,
+) -> Result<ServiceManifest> {
+    let scope = scope_for_privilege();
+    preflight(backend, scope)?;
+
+    // Reading the existing state first is what makes the pre-existing-name
+    // check meaningful: an invalid manifest, or a definition under this
+    // directory's derived name that belongs to somewhere else, has to fail
+    // before anything is written.
+    let existing = resolve_with_state(backend, instance_dir, state_config_dir, service_config_dir)?;
+    match &existing {
+        Some(existing) => ensure_same_domain(existing, scope, instance_dir)?,
+        None => ensure_name_unclaimed(backend, instance_dir, scope)?,
+    }
+    if let Some(conflict) = backend.find_conflicting_installation(instance_dir)? {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service for {instance}: the managed \
+                 service {name} is already installed for {other} at {definition}. Managed \
+                 services in this release use the same default HTTP and Flight listeners, so \
+                 only one can be installed on a host. Keep that service, or uninstall it before \
+                 installing this one; run additional instances in the foreground or under your \
+                 own supervisor with unique endpoints. Nothing was changed. \
+                 See: https://spiceai.org/docs",
+                instance = instance_dir.display(),
+                name = conflict.name,
+                other = conflict.working_dir.display(),
+                definition = conflict.path.display(),
+            ),
+        });
+    }
+
+    // Resolve the service account before the back end mutates supervisor
+    // state. A sudo environment or directory-owner failure must not leave a
+    // newly installed service that cannot be described durably.
+    let owner = install_owner(instance_dir)?;
+    let installed = backend.install(&InstallRequest {
+        instance_dir,
+        config_dir: service_config_dir,
+        spiced_path,
+        scope,
+        health_url,
+    })?;
+
+    let manifest = ServiceManifest {
+        schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+        directory: instance_dir.to_path_buf(),
+        name: installed.name.clone(),
+        scope,
+        supervisor: backend.supervisor(),
+        owner,
+        definition_path: installed.path,
+        runtime_path: installed.runtime.clone(),
+        log_source: backend.log_source(&installed.name, scope),
+        runtime_digest: file_digest(&installed.runtime).unwrap_or_default(),
+        runtime_version: runtime_version.to_string(),
+        health_url: health_url.to_string(),
+    };
+    if let Err(write_error) = manifest.write(state_config_dir) {
+        // A first install without its manifest is an orphan: later lifecycle
+        // commands cannot prove that the supervisor definition belongs to
+        // this directory. Roll that new service back. During an upgrade an
+        // existing, validated manifest still accounts for the service, so
+        // preserve availability and leave it in place for a retry.
+        if existing.is_none()
+            && let Err(rollback_error) = backend.uninstall(&manifest)
+        {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "{write_error}; additionally failed to roll back the newly installed service {}: {rollback_error}. Recovery: {}",
+                    manifest.name,
+                    backend.recovery_hints(&manifest).join(" ; "),
+                ),
+            });
+        }
+        return Err(write_error);
+    }
+    Ok(manifest)
+}
+
+/// The account the freshly installed service runs as.
+#[cfg(unix)]
+fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
+    let account = service_account(instance_dir)?;
+    Ok(ServiceOwner {
+        uid: account.uid,
+        gid: account.gid,
+        name: account_name(account.uid),
+    })
+}
+
+#[cfg(not(unix))]
+fn install_owner(instance_dir: &Path) -> Result<ServiceOwner> {
+    Ok(installed_owner(instance_dir))
+}
+
+/// Refuse to install a service into a different domain from the one this
+/// directory already has a service in.
 ///
-/// Returns the service that was removed, or `None` when none was installed for
-/// this directory.
+/// The domain follows the privilege of the invocation, so an unprivileged
+/// re-install of a host-wide service would otherwise install a *second*
+/// service — a user one — for the same directory, leave the system one running,
+/// and rewrite the manifest to describe only the new one. The elevation is the
+/// operator's to give, so this names it instead.
+fn ensure_same_domain(
+    existing: &ServiceManifest,
+    scope: ServiceScope,
+    instance_dir: &Path,
+) -> Result<()> {
+    if existing.scope == scope {
+        return Ok(());
+    }
+    let retry = match existing.scope {
+        ServiceScope::System => format!(
+            "Re-run it as `sudo spice connect service install --dir {}`",
+            instance_dir.display()
+        ),
+        ServiceScope::User => format!("Run it as {} without sudo", existing.owner.describe()),
+    };
+    Err(Error::InvalidArgument {
+        message: format!(
+            "Failed to install the Spice Cloud Connect service for {instance}: a {existing_scope} \
+             service ({name}) is already installed for this directory, and this invocation would \
+             install a {scope} one alongside it. {retry}, or remove the installed service first \
+             with `spice connect service uninstall`. Nothing was changed. \
+             See: https://spiceai.org/docs",
+            instance = instance_dir.display(),
+            existing_scope = existing.scope,
+            name = existing.name,
+        ),
+    })
+}
+
+/// Refuse to install over a definition that already carries this directory's
+/// derived name but does not describe this directory's service.
+///
+/// The derived name is a function of the path, so the only way this happens is
+/// a definition written by hand, left behind by a directory that has since
+/// moved, or belonging to another operator. Overwriting any of those would
+/// take over a service this directory does not own, so it fails before the
+/// installer touches anything.
+fn ensure_name_unclaimed(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    scope: ServiceScope,
+) -> Result<()> {
+    let name = backend.name_for_dir(instance_dir);
+    let path = backend.definition_path(&name, scope);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "inspect the service definition {} before installation: {source}",
+                    path.display()
+                ),
+            });
+        }
+    };
+
+    let claim = if metadata.file_type().is_symlink() {
+        Some("is a symlink".to_string())
+    } else if backend.find_installed(instance_dir, scope).is_none() {
+        Some("belongs to another instance directory".to_string())
+    } else {
+        definition_ownership_problem(&metadata, scope)
+    };
+
+    match claim {
+        Some(reason) => Err(Error::InvalidArgument {
+            message: format!(
+                "Failed to install the Spice Cloud Connect service for {instance}: the service \
+                 definition {definition} already exists and {reason}. Remove or repair it, then \
+                 re-run `spice connect service install`. Nothing was changed. \
+                 See: https://spiceai.org/docs",
+                instance = instance_dir.display(),
+                definition = path.display(),
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Whether an existing definition's ownership disqualifies it from being
+/// rewritten in `scope`.
+#[cfg(unix)]
+fn definition_ownership_problem(
+    metadata: &std::fs::Metadata,
+    scope: ServiceScope,
+) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let uid = metadata.uid();
+    let mode = metadata.permissions().mode() & 0o7777;
+    match scope {
+        // A host-wide definition tells the supervisor what to run as whom. A
+        // non-root owner, or write access for anyone but root, means someone
+        // else already decides that.
+        ServiceScope::System if uid != 0 || mode & 0o022 != 0 => Some(format!(
+            "is owned by uid {uid} with mode {mode:04o}, so it is not a definition only root controls"
+        )),
+        ServiceScope::User if uid != nix::unistd::Uid::effective().as_raw() => {
+            Some(format!("is owned by uid {uid} rather than by this account"))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn definition_ownership_problem(
+    _metadata: &std::fs::Metadata,
+    _scope: ServiceScope,
+) -> Option<String> {
+    None
+}
+
+/// Stop and remove the service for `instance_dir`, and forget it.
+///
+/// Idempotent: a directory with no service succeeds and returns `None`. This
+/// is the one primitive both `spice connect service uninstall` and
+/// `spice connect remove` use, so they cannot diverge on which assets a
+/// removal touches. What they do *not* share is identity: uninstall preserves
+/// the Cloud identity, and `remove` is the command that releases it.
 ///
 /// # Errors
 ///
-/// Returns an error when the definition cannot be deleted, or when the
-/// supervisor is left holding a job that the deleted definition can no longer
-/// account for.
-pub(crate) fn uninstall(instance_dir: &Path) -> Result<Option<InstalledService>> {
-    backend::uninstall(instance_dir)
+/// Returns an error when the supervisor or the definition file cannot be
+/// removed. The manifest is deleted only after the back end reports the
+/// service gone, so a partial failure leaves a directory that still knows what
+/// it is trying to remove.
+#[cfg(test)]
+pub(crate) fn uninstall(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    config_dir: &Path,
+) -> Result<Option<ServiceManifest>> {
+    uninstall_with_state(backend, instance_dir, config_dir, config_dir)
 }
 
-/// The service installed for `instance_dir`, if any.
-///
-/// Matches on the derived name rather than by scanning working directories, so
-/// the lookup is exact and cannot pick up another instance's service.
-pub(crate) fn find_for_dir(instance_dir: &Path) -> Option<InstalledService> {
-    backend::find_for_dir(instance_dir)
+pub(crate) fn uninstall_with_state(
+    backend: &dyn ServiceBackend,
+    instance_dir: &Path,
+    state_config_dir: &Path,
+    service_config_dir: &Path,
+) -> Result<Option<ServiceManifest>> {
+    let Some(manifest) =
+        resolve_with_state(backend, instance_dir, state_config_dir, service_config_dir)?
+    else {
+        return Ok(None);
+    };
+    uninstall_resolved(backend, &manifest, state_config_dir)?;
+    Ok(Some(manifest))
 }
 
-/// Every service this command installed on the host, sorted by name.
-///
-/// This is what lets `spice connect status` report against installed services
-/// when the resolved directory holds no instance state, instead of printing a
-/// misleading "not connected" for a host that is in fact connected from
-/// somewhere else.
-pub(crate) fn discover_all() -> Vec<InstalledService> {
-    backend::discover_all()
+/// Uninstall a manifest that the caller already resolved and authorized while
+/// holding the instance mutation boundary. This is the irreversible half used
+/// by `connect remove`: it must not reopen a pathname after Cloud deletion and
+/// accidentally select a replacement manifest.
+pub(crate) fn uninstall_resolved(
+    backend: &dyn ServiceBackend,
+    manifest: &ServiceManifest,
+    state_config_dir: &Path,
+) -> Result<()> {
+    backend.uninstall(manifest)?;
+    manifest.remove(state_config_dir)
 }
 
-/// The service's current state as the supervisor reports it, or `None` when it
-/// cannot be determined.
-pub(crate) fn is_active(name: &str) -> Option<String> {
-    backend::is_active(name)
-}
-
-/// The commands an operator inspects and follows this service with, in the
-/// vocabulary of the supervisor that owns it.
-pub(crate) fn manage_hints(name: &str) -> Vec<String> {
-    backend::manage_hints(name)
+/// SHA-256 (lowercase hex) of a file, or `None` when it cannot be read.
+fn file_digest(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// `true` when this process runs with root's effective user id — the id that
-/// governs writing the service definition and directing the supervisor.
+/// governs writing a host-wide service definition and directing the
+/// supervisor.
 #[cfg(unix)]
 fn is_root() -> bool {
     nix::unistd::Uid::effective().is_root()
@@ -419,53 +962,16 @@ fn is_root() -> bool {
     false
 }
 
-/// Stage `source` as the root-owned `spiced` the installed service runs.
-///
-/// The runtime is commonly installed under an operator's `~/.spice/bin`.
-/// Copying it into a root-owned directory (0755, and created by a root process)
-/// prevents later replacement behind the supervisor's back and gives every
-/// installed instance one stable executable.
-///
-/// Copying every install also makes the documented upgrade path work: re-running
-/// `--install` restages whatever `spiced` the CLI now resolves. One host has one
-/// staged runtime, shared by every instance's service — so a re-install in one
-/// instance directory does change the binary the others run at their next
-/// restart.
-///
-/// A debug `spiced` runs to about a gigabyte, so the copy is skipped when a
-/// sidecar stamp shows the destination was staged from exactly this source file.
-/// The stamp is required rather than comparing timestamps directly, because
-/// `fs::copy` gives the destination a fresh modified time — a
-/// same-length-and-mtime test would never match and would recopy every run,
-/// while a "destination is newer" test could skip a genuine upgrade and leave
-/// the service on the old runtime while the install output reported the new
-/// version.
-///
-/// `verify_staged` is given the copy before it is published, and again when an
-/// existing one is reused. The destination is the path every installed service
-/// already executes, so a runtime that turns out to be unusable must never
-/// reach it: publishing first and checking afterwards would take out the
-/// instances that were working.
-fn stage_runtime<F>(source: &Path, verify_staged: F) -> Result<PathBuf>
-where
-    F: Fn(&Path, &Path) -> Result<()> + Copy,
-{
-    let dest = staged_runtime_path();
-    ensure_root_only_dir(Path::new(RUNTIME_STAGE_DIR))?;
-    stage_runtime_at(source, &dest, verify_staged)?;
-    Ok(dest)
-}
-
-/// [`stage_runtime`] against an explicit destination.
+/// Stage `source` at an explicit destination.
 fn stage_runtime_at<F>(source: &Path, dest: &Path, verify_staged: F) -> Result<()>
 where
     F: Fn(&Path, &Path) -> Result<()> + Copy,
 {
     let stamp_path = dest.with_extension("stamp");
-    let stamp = source_stamp(source);
+    let stamp = file_digest(source);
 
     // A staged runtime that no longer works is restaged, not refused:
-    // re-running `--install` is the documented way to put a good binary back on
+    // re-running the install is the documented way to put a good binary back on
     // the path every service executes, and short-circuiting the failure here
     // would make that the one thing it could not do.
     if let Some(ref stamp) = stamp
@@ -569,7 +1075,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                  The runtime staging is managed by root, so it must use a real, root-owned \
                  directory. Replace the symlink with a directory owned by root \
                  (`chown root {dir}`, `chmod 755 {dir}`) and re-run \
-                 `sudo spice connect --install`.",
+                 `sudo spice connect service install`.",
                 dir = dir.display()
             ),
         });
@@ -591,7 +1097,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                     "Failed to install the Spice Cloud Connect service: {component} is owned by uid {uid} with mode {mode:04o}, \
                      so a non-root user can change what the service executes as root. Restrict it \
                      (`sudo chown root {component}` and `sudo chmod go-w {component}`) and re-run \
-                     `sudo spice connect --install`.",
+                     `sudo spice connect service install`.",
                     component = component.display(),
                     uid = meta.uid(),
                     mode = mode & 0o7777,
@@ -665,27 +1171,9 @@ fn copy_as_root_only_executable(source: &Path, dest: &Path) -> Result<()> {
         })
 }
 
-/// Identity of the source binary: length and modified time, which together
-/// change on any rebuild. `None` when the source cannot be described, in which
-/// case the caller always restages.
-fn source_stamp(source: &Path) -> Option<String> {
-    let meta = source.metadata().ok()?;
-    let modified = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    Some(format!(
-        "{} {} {}",
-        meta.len(),
-        modified.as_nanos(),
-        source.display()
-    ))
-}
-
 /// `true` when `dest` exists and `stamp_path` records that it was staged from
-/// exactly this source. Anything else restages, so the check can only ever skip
-/// work that has already been done.
+/// exactly these source bytes. Anything else restages, so the check can only
+/// ever skip work that has already been done.
 fn runtime_is_already_staged(dest: &Path, stamp_path: &Path, stamp: &str) -> bool {
     if !dest.is_file() {
         return false;
@@ -693,52 +1181,47 @@ fn runtime_is_already_staged(dest: &Path, stamp_path: &Path, stamp: &str) -> boo
     std::fs::read_to_string(stamp_path).is_ok_and(|recorded| recorded == stamp)
 }
 
-/// Stubs for a host with no supported supervisor. [`preflight`] rejects such a
-/// host before any of these can be reached; they exist so the CLI still builds
-/// for it.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod unsupported {
-    use std::path::Path;
-
-    use super::{InstalledService, PreflightFailure};
-    use crate::error::Result;
-
-    pub(super) fn preflight() -> std::result::Result<(), PreflightFailure> {
-        Err(PreflightFailure::UnsupportedPlatform)
-    }
-
-    pub(super) fn install(
-        _instance_dir: &Path,
-        _config_dir: &Path,
-        _spiced_path: &Path,
-    ) -> Result<InstalledService> {
-        Err(PreflightFailure::UnsupportedPlatform.into())
-    }
-
-    pub(super) fn uninstall(_instance_dir: &Path) -> Result<Option<InstalledService>> {
-        Ok(None)
-    }
-
-    pub(super) fn find_for_dir(_instance_dir: &Path) -> Option<InstalledService> {
-        None
-    }
-
-    pub(super) fn discover_all() -> Vec<InstalledService> {
-        Vec::new()
-    }
-
-    pub(super) fn is_active(_name: &str) -> Option<String> {
-        None
-    }
-
-    pub(super) fn manage_hints(_name: &str) -> Vec<String> {
-        Vec::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::backend::fake::FakeBackend;
+    use super::model::{ServiceStarts, ServiceState};
     use super::*;
+
+    /// The exact stems the naming algorithm must produce.
+    ///
+    /// Golden, not derived: the service name is the identity of an installed
+    /// service, so a change here silently orphans every service already
+    /// installed on every host. Changing these values is a migration, not a
+    /// refactor.
+    #[test]
+    fn name_stem_algorithm_is_golden() {
+        for (dir, expected) in [
+            ("/opt/edge-1", "edge-1-2962fca679ae993a"),
+            ("/srv/edge-analytics", "edge-analytics-59e8c853e76c15ba"),
+            ("/srv/a/edge", "edge-ee40c5935182e518"),
+            ("/srv/b/edge", "edge-80faba57766c7bb4"),
+            // No usable directory name: the digest alone names it.
+            ("/", "8a5edab282632443"),
+        ] {
+            assert_eq!(name_stem_for_dir(Path::new(dir)), expected, "{dir}");
+        }
+
+        // A 120-character directory name keeps exactly 32 characters of
+        // fragment, then the 16-hex digest.
+        let long = format!("/opt/{}", "a".repeat(120));
+        assert_eq!(
+            name_stem_for_dir(Path::new(&long)),
+            format!("{}-0aca36d818e38f1d", "a".repeat(MAX_NAME_FRAGMENT))
+        );
+    }
+
+    #[test]
+    fn name_stem_digest_is_sixteen_hex_digits() {
+        let stem = name_stem_for_dir(Path::new("/opt/edge-1"));
+        let digest = stem.rsplit('-').next().expect("a stem always has a digest");
+        assert_eq!(digest.len(), NAME_DIGEST_HEX, "{stem}");
+        assert!(digest.chars().all(|ch| ch.is_ascii_hexdigit()), "{stem}");
+    }
 
     #[test]
     fn name_stem_is_deterministic() {
@@ -758,7 +1241,8 @@ mod tests {
     #[test]
     fn same_basename_in_different_parents_does_not_collide() {
         // The legible fragment is identical here, so only the path digest keeps
-        // these apart — a `remove` in one must never touch the other's service.
+        // these apart — an uninstall in one must never touch the other's
+        // service.
         let a = name_stem_for_dir(Path::new("/srv/a/edge"));
         let b = name_stem_for_dir(Path::new("/srv/b/edge"));
         assert_ne!(a, b);
@@ -768,56 +1252,50 @@ mod tests {
 
     #[test]
     fn name_stem_sanitizes_and_bounds_the_fragment() {
-        let stem = name_stem_for_dir(Path::new("/opt/My Edge_Site!!/"));
+        let stem = name_stem_for_dir(Path::new("/opt/My Edge_Site!!"));
         assert!(stem.starts_with("my-edge-site-"), "{stem}");
 
         // A long directory name is truncated, not carried whole.
         let long = name_stem_for_dir(Path::new(&format!("/opt/{}", "a".repeat(120))));
-        assert!(long.len() <= MAX_NAME_FRAGMENT + 9, "{long}");
-    }
-
-    #[test]
-    fn name_stem_handles_a_directory_with_no_usable_name() {
-        // Only the digest names it, and it is still 8 hex digits.
-        let stem = name_stem_for_dir(Path::new("/"));
-        assert_eq!(stem.len(), 8, "{stem}");
-        assert!(stem.chars().all(|ch| ch.is_ascii_hexdigit()), "{stem}");
-    }
-
-    #[test]
-    fn staged_runtime_is_not_under_a_user_home() {
-        // The service runs it as root, so it must never be a path its operator
-        // could later replace.
-        let staged = staged_runtime_path();
-        let staged = staged.to_string_lossy();
-        assert!(!staged.contains("/home/"), "{staged}");
-        assert!(!staged.contains("/Users/"), "{staged}");
-    }
-
-    #[test]
-    fn staged_runtime_path_has_no_whitespace() {
-        // Every remedy this module prints names this path, and a
-        // `sudo chown root <path>` with a space in it is two arguments and the
-        // wrong instruction. systemd's `ExecStart` splits on it too.
-        let staged = staged_runtime_path();
-        let staged = staged.to_string_lossy();
         assert!(
-            !staged.contains(char::is_whitespace),
-            "the staged runtime path must be usable verbatim in a command: {staged}"
+            long.len() <= MAX_NAME_FRAGMENT + 1 + NAME_DIGEST_HEX,
+            "{long}"
         );
     }
 
     #[test]
+    fn the_root_owned_staging_directory_is_not_under_a_user_home() {
+        // A system service runs its staged runtime as root, so the directory it
+        // is staged into must never be a path its operator could later replace.
+        assert!(!RUNTIME_STAGE_DIR.contains("/home/"), "{RUNTIME_STAGE_DIR}");
+        assert!(
+            !RUNTIME_STAGE_DIR.contains("/Users/"),
+            "{RUNTIME_STAGE_DIR}"
+        );
+    }
+
+    #[test]
+    fn the_staging_paths_have_no_whitespace() {
+        // Every remedy this module prints names this path, and a
+        // `sudo chown root <path>` with a space in it is two arguments and the
+        // wrong instruction. systemd's `ExecStart` splits on it too.
+        for path in [RUNTIME_STAGE_DIR, STAGED_RUNTIME_FILE] {
+            assert!(
+                !path.contains(char::is_whitespace),
+                "a staging path must be usable verbatim in a command: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn staging_skips_only_an_exact_restage_and_never_a_rebuild() {
-        let dir = std::env::temp_dir().join(format!("spice-stage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let source = dir.join("spiced");
-        let dest = dir.join("staged");
-        let stamp_path = dir.join("staged.stamp");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("spiced");
+        let dest = dir.path().join("staged");
+        let stamp_path = dir.path().join("staged.stamp");
 
         std::fs::write(&source, b"runtime-v1").expect("write source");
-        let stamp = source_stamp(&source).expect("stamp the source");
+        let stamp = file_digest(&source).expect("digest the source");
 
         // Nothing staged yet.
         assert!(!runtime_is_already_staged(&dest, &stamp_path, &stamp));
@@ -835,15 +1313,13 @@ mod tests {
         // failure that would leave the service on an old runtime while the
         // install output reported the new version.
         std::fs::write(&source, b"runtime-v2").expect("rebuild source");
-        let rebuilt = source_stamp(&source).expect("stamp the rebuild");
+        let rebuilt = file_digest(&source).expect("digest the rebuild");
         assert_ne!(rebuilt, stamp, "a rebuild must produce a different stamp");
         assert!(!runtime_is_already_staged(&dest, &stamp_path, &rebuilt));
 
         // A missing binary with a leftover stamp also restages.
         std::fs::remove_file(&dest).expect("remove staged binary");
         assert!(!runtime_is_already_staged(&dest, &stamp_path, &stamp));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -852,11 +1328,9 @@ mod tests {
         // restarts, so a runtime that turns out to be unusable must not land on
         // it — a rejected upgrade in one instance directory would otherwise
         // take out every other instance on the host.
-        let dir = std::env::temp_dir().join(format!("spice-publish-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let source = dir.join("spiced");
-        let dest = dir.join("staged");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("spiced");
+        let dest = dir.path().join("staged");
         std::fs::write(&source, b"unusable").expect("write source");
         std::fs::write(&dest, b"the runtime already in service").expect("write dest");
 
@@ -883,8 +1357,6 @@ mod tests {
         // everything.
         publish_runtime(&source, &dest, |_, _| Ok(())).expect("publish");
         assert_eq!(std::fs::read(&dest).expect("read dest"), b"unusable");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A verifier standing in for the real one: it rejects a candidate that
@@ -900,14 +1372,12 @@ mod tests {
 
     #[test]
     fn a_staged_runtime_that_stopped_working_is_replaced_rather_than_refused() {
-        // Re-running `--install` is the documented way to put a good binary
+        // Re-running the install is the documented way to put a good binary
         // back on the path every service executes. Refusing on the strength of
         // the stamp would make that the one repair it could not perform.
-        let dir = std::env::temp_dir().join(format!("spice-restage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let source = dir.join("spiced");
-        let dest = dir.join("staged");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("spiced");
+        let dest = dir.path().join("staged");
         std::fs::write(&source, b"working").expect("write source");
 
         stage_runtime_at(&source, &dest, reject_a_broken_runtime).expect("first stage");
@@ -921,18 +1391,14 @@ mod tests {
             b"working",
             "a staged runtime that fails verification must be restaged from source"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_staged_runtime_that_still_works_is_not_copied_again() {
-        // The other half: a gigabyte is not recopied on every `--install`.
-        let dir = std::env::temp_dir().join(format!("spice-reuse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let source = dir.join("spiced");
-        let dest = dir.join("staged");
+        // The other half: a gigabyte is not recopied on every install.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("spiced");
+        let dest = dir.path().join("staged");
         std::fs::write(&source, b"working").expect("write source");
 
         stage_runtime_at(&source, &dest, reject_a_broken_runtime).expect("first stage");
@@ -945,31 +1411,32 @@ mod tests {
             b"reused",
             "an unchanged source must not be copied again"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn source_stamp_distinguishes_length_and_mtime() {
-        let dir = std::env::temp_dir().join(format!("spice-stamp-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let a = dir.join("a");
-        let b = dir.join("b");
+    fn source_digest_distinguishes_same_length_contents() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
         std::fs::write(&a, b"same-length").expect("write a");
-        std::fs::write(&b, b"same-length").expect("write b");
+        std::fs::write(&b, b"same-lengtb").expect("write b");
 
-        let stamp_a = source_stamp(&a).expect("stamp a");
-        // The path is part of the stamp, so two equal-length files never
-        // masquerade as each other.
-        assert_ne!(stamp_a, source_stamp(&b).expect("stamp b"));
-        assert!(
-            stamp_a.starts_with("11 "),
-            "length leads the stamp: {stamp_a}"
+        let digest_a = file_digest(&a).expect("digest a");
+        assert_ne!(digest_a, file_digest(&b).expect("digest b"));
+        assert_eq!(file_digest(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn file_digest_is_stable_and_absent_for_a_missing_file() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("runtime");
+        std::fs::write(&path, b"spiced").expect("write");
+        assert_eq!(
+            file_digest(&path).as_deref(),
+            Some("677e903199916067c479594e77308560145a863b94342cc471f0043403c92d0e"),
+            "the recorded runtime digest must be a plain SHA-256 of the staged file"
         );
-        assert_eq!(source_stamp(&dir.join("missing")), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(file_digest(&dir.path().join("missing")), None);
     }
 
     #[test]
@@ -977,11 +1444,9 @@ mod tests {
         // On macOS this is what keeps `com.apple.quarantine` off the copy
         // launchd executes: the stage writes bytes into a new file rather than
         // cloning the original.
-        let dir = std::env::temp_dir().join(format!("spice-xattr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let source = dir.join("spiced");
-        let dest = dir.join("staged");
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let source = dir.path().join("spiced");
+        let dest = dir.path().join("staged");
         std::fs::write(&source, b"runtime").expect("write source");
 
         let set = std::process::Command::new("xattr")
@@ -990,7 +1455,6 @@ mod tests {
             .status();
         if !set.is_ok_and(|status| status.success()) {
             // No `xattr` (any non-macOS host): nothing to prove here.
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
 
@@ -1005,33 +1469,487 @@ mod tests {
             !read.success(),
             "the staged copy must not carry com.apple.quarantine"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_systemd_preflight_failures_name_their_fixes() {
+        assert!(
+            PreflightFailure::SystemdUnavailable
+                .message()
+                .contains("restart policy"),
+            "the no-systemd failure must point containers at the --token flow"
+        );
+        assert!(
+            PreflightFailure::SystemdUnavailable
+                .message()
+                .contains("spiced --token"),
+            "containers enroll directly with the runtime, not this installer"
+        );
+        // A host with no user manager still has a way to install: say which.
+        let no_manager = PreflightFailure::SystemdUserManagerUnavailable.message();
+        assert!(
+            no_manager.contains("sudo spice connect service install"),
+            "{no_manager}"
+        );
+        assert!(no_manager.contains("enable-linger"), "{no_manager}");
     }
 
     #[test]
     fn preflight_failures_name_the_fix() {
         assert!(
-            PreflightFailure::NotRoot.message().contains("sudo"),
-            "the root failure must name sudo"
-        );
-        assert!(
-            PreflightFailure::SystemdUnavailable
-                .message()
-                .contains("restart policy"),
-            "the no-systemd failure must point containers at the env-var flow"
-        );
-        assert!(
             PreflightFailure::UnsupportedPlatform
                 .message()
-                .contains("spiced --cloud-connect"),
+                .contains("spiced"),
             "an unsupported host must be told the supported way to run"
         );
         assert!(
             PreflightFailure::UnsupportedPlatform
                 .message()
-                .contains("launchd"),
-            "macOS is supported, so the message must not read as Linux-only"
+                .contains("Linux with systemd"),
+            "the message must state the lifecycle support shipped in this release"
+        );
+    }
+
+    #[test]
+    fn a_directory_with_no_service_resolves_to_nothing() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+
+        assert_eq!(
+            resolve(&fake, &instance_dir, &config_dir).expect("resolve"),
+            None
+        );
+        assert_eq!(
+            status(&fake, &instance_dir, &config_dir),
+            ServiceStatus::not_installed()
+        );
+    }
+
+    #[test]
+    fn install_records_what_it_installed_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+
+        let manifest = install(
+            &fake,
+            &instance_dir,
+            &config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.2.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect("install");
+        assert_eq!(manifest.name, fake.name_for_dir(&instance_dir));
+        assert_eq!(manifest.directory, instance_dir);
+        assert_eq!(manifest.runtime_version, "v2.2.0");
+        assert_eq!(
+            ServiceManifest::load(&config_dir, &instance_dir, &fake)
+                .expect("load")
+                .as_ref(),
+            Some(&manifest)
+        );
+
+        // Re-running is the upgrade path: it installs again over its own
+        // service rather than refusing because the definition is there.
+        let again = install(
+            &fake,
+            &instance_dir,
+            &config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.3.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect("reinstall");
+        assert_eq!(again.runtime_version, "v2.3.0");
+        assert_eq!(
+            fake.calls(),
+            vec!["install".to_string(), "install".to_string()]
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_second_managed_service_that_would_share_listeners() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let first_dir = dir.path().join("edge-1");
+        let second_dir = dir.path().join("edge-2");
+        std::fs::create_dir_all(&first_dir).expect("create first instance dir");
+        std::fs::create_dir_all(&second_dir).expect("create second instance dir");
+        let first_config_dir = first_dir.join(".spice");
+        let second_config_dir = second_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+
+        let first = install(
+            &fake,
+            &first_dir,
+            &first_config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.2.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect("install first managed service");
+
+        let error = install(
+            &fake,
+            &second_dir,
+            &second_config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.2.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect_err("a second managed service would collide on the fixed listeners");
+
+        let message = error.to_string();
+        assert!(message.contains("only one can be installed on a host"));
+        assert!(message.contains(&first.name));
+        assert!(message.contains(&first_dir.display().to_string()));
+        assert_eq!(fake.calls(), vec!["install".to_string()]);
+        assert!(!ServiceManifest::path_in(&second_config_dir).exists());
+    }
+
+    #[test]
+    fn a_first_install_is_rolled_back_when_its_manifest_cannot_be_written() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        let config_dir = instance_dir.join(".spice");
+        let mut fake = FakeBackend::new(dir.path());
+        fake.block_manifest_write = true;
+
+        let error = install(
+            &fake,
+            &instance_dir,
+            &config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.2.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect_err("a manifestless first install must fail");
+
+        assert!(error.to_string().contains("service manifest"), "{error}");
+        assert_eq!(
+            fake.calls(),
+            vec!["install".to_string(), "uninstall".to_string()]
+        );
+        let definition =
+            fake.definition_path(&fake.name_for_dir(&instance_dir), scope_for_privilege());
+        assert!(
+            !definition.exists(),
+            "the supervisor definition must be removed during rollback"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_name_already_claimed_by_another_directory() {
+        // The pre-existing-name check: a definition under this directory's
+        // derived name that names somewhere else must fail before the
+        // installer writes anything.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+        fake.plant_foreign_definition(&instance_dir);
+
+        let error = install(
+            &fake,
+            &instance_dir,
+            &config_dir,
+            Path::new("/usr/bin/spiced"),
+            "v2.2.0",
+            "http://127.0.0.1:8090/health",
+        )
+        .expect_err("a foreign definition under the derived name must not be taken over");
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to another instance directory"),
+            "{error}"
+        );
+        assert!(fake.calls().is_empty(), "nothing may be installed");
+        assert!(
+            !ServiceManifest::path_in(&config_dir).exists(),
+            "no manifest may be written"
+        );
+    }
+
+    #[test]
+    fn install_refuses_to_add_a_second_service_in_the_other_domain() {
+        // The domain follows the privilege of the invocation, so without this
+        // an unprivileged re-install of a host-wide service would install a
+        // user service beside it, leave the system one running, and rewrite the
+        // manifest to describe only the new one.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let fake = FakeBackend::new(dir.path());
+        let mut installed = manifest_for(&fake, &instance_dir);
+
+        for (existing, invoked) in [
+            (ServiceScope::System, ServiceScope::User),
+            (ServiceScope::User, ServiceScope::System),
+        ] {
+            installed.scope = existing;
+            let error = ensure_same_domain(&installed, invoked, &instance_dir)
+                .expect_err("a domain switch must be refused");
+            assert!(error.to_string().contains("already installed"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("spice connect service uninstall"),
+                "{error}"
+            );
+            // The retry is the operator's to run, never an elevation Spice
+            // performs for them.
+            let expected_retry = match existing {
+                ServiceScope::System => "sudo spice connect service install",
+                ServiceScope::User => "without sudo",
+            };
+            assert!(error.to_string().contains(expected_retry), "{error}");
+        }
+
+        installed.scope = ServiceScope::User;
+        ensure_same_domain(&installed, ServiceScope::User, &instance_dir)
+            .expect("re-installing in the same domain is the upgrade path");
+    }
+
+    /// The manifest a fake back end would write for `instance_dir`.
+    fn manifest_for(backend: &FakeBackend, instance_dir: &Path) -> ServiceManifest {
+        let scope = ServiceScope::System;
+        let name = backend.name_for_dir(instance_dir);
+        ServiceManifest {
+            schema_version: manifest::MANIFEST_SCHEMA_VERSION,
+            directory: instance_dir.to_path_buf(),
+            name: name.clone(),
+            scope,
+            supervisor: backend.supervisor(),
+            owner: ServiceOwner {
+                uid: 1000,
+                gid: 1000,
+                name: Some("alice".to_string()),
+            },
+            definition_path: backend.definition_path(&name, scope),
+            runtime_path: PathBuf::from("/usr/local/lib/spice/edge-1/spiced"),
+            log_source: backend.log_source(&name, scope),
+            runtime_digest: "0".repeat(64),
+            runtime_version: "v2.2.0".to_string(),
+            health_url: "http://127.0.0.1:8090/health".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_service_installed_without_a_manifest_is_still_resolved() {
+        // A directory that lost its manifest must not lose the service it
+        // still has installed — resolution is still by canonical directory,
+        // not by a host-wide search.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+        fake.install(&InstallRequest {
+            instance_dir: &instance_dir,
+            config_dir: &config_dir,
+            spiced_path: Path::new("/usr/bin/spiced"),
+            scope: ServiceScope::System,
+            health_url: "http://127.0.0.1:8090/health",
+        })
+        .expect("install without writing a manifest");
+
+        let resolved = resolve(&fake, &instance_dir, &config_dir)
+            .expect("resolve")
+            .expect("the definition describes this directory's service");
+        assert_eq!(resolved.name, fake.name_for_dir(&instance_dir));
+        assert_eq!(resolved.directory, instance_dir);
+        assert!(
+            resolved.runtime_digest.is_empty(),
+            "an adopted service records no digest rather than hashing a gigabyte"
+        );
+        assert_eq!(
+            status(&fake, &instance_dir, &config_dir).state,
+            ServiceState::Running
+        );
+    }
+
+    #[test]
+    fn a_definition_for_another_directory_is_not_adopted() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+        fake.plant_foreign_definition(&instance_dir);
+
+        assert_eq!(
+            resolve(&fake, &instance_dir, &config_dir).expect("resolve"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_manifest_reports_unavailable_rather_than_absent() {
+        // "Nothing is installed here" would send `install` on to write over
+        // whatever the unreadable manifest describes.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(ServiceManifest::path_in(&config_dir), "{").expect("write manifest");
+
+        let fake = FakeBackend::new(dir.path());
+        let status = status(&fake, &instance_dir, &config_dir);
+        assert_eq!(status.state, ServiceState::Unavailable);
+        assert!(status.diagnostic.is_some());
+        assert!(
+            status.installed,
+            "unreadable service state must not invite automation to install over it"
+        );
+    }
+
+    #[test]
+    fn status_reports_every_normalized_state_the_backend_observes() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+
+        for state in [
+            ServiceState::Starting,
+            ServiceState::Running,
+            ServiceState::Stopping,
+            ServiceState::Stopped,
+            ServiceState::Failed,
+            ServiceState::Unavailable,
+        ] {
+            let fake = FakeBackend::in_state(dir.path(), state);
+            write_manifest_for(&fake, &instance_dir, &config_dir);
+            let status = status(&fake, &instance_dir, &config_dir);
+            assert!(status.installed, "{state}");
+            assert_eq!(status.state, state);
+            assert_eq!(
+                status.name.as_deref(),
+                Some(fake.name_for_dir(&instance_dir).as_str())
+            );
+            assert_eq!(status.working_dir.as_deref(), Some(instance_dir.as_path()));
+            assert!(status.definition_path.is_some(), "{state}");
+            assert!(status.runtime_path.is_some(), "{state}");
+            assert!(status.log_source.is_some(), "{state}");
+        }
+    }
+
+    #[test]
+    fn uninstall_is_idempotent_and_forgets_the_manifest() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+        write_manifest_for(&fake, &instance_dir, &config_dir);
+
+        let removed = uninstall(&fake, &instance_dir, &config_dir)
+            .expect("uninstall")
+            .expect("a service was installed");
+        assert_eq!(removed.name, fake.name_for_dir(&instance_dir));
+        assert!(!ServiceManifest::path_in(&config_dir).exists());
+        assert_eq!(fake.calls(), vec!["uninstall".to_string()]);
+
+        // Running it again changes nothing and does not call the back end.
+        let fake = FakeBackend::new(dir.path());
+        assert_eq!(
+            uninstall(&fake, &instance_dir, &config_dir).expect("second uninstall"),
+            None
+        );
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn a_failed_uninstall_keeps_the_manifest() {
+        // The directory has to keep knowing what it is trying to remove:
+        // forgetting the manifest while the service is still installed would
+        // strand it.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::failing(dir.path(), "uninstall", "the supervisor refused");
+        write_manifest_for(&fake, &instance_dir, &config_dir);
+
+        let error = uninstall(&fake, &instance_dir, &config_dir)
+            .expect_err("a supervisor refusal must fail the uninstall");
+        assert!(
+            error.to_string().contains("the supervisor refused"),
+            "{error}"
+        );
+        assert!(
+            ServiceManifest::path_in(&config_dir).exists(),
+            "the manifest must survive a failed uninstall"
+        );
+    }
+
+    /// Install through the fake back end so the shared code around it — the
+    /// manifest write, the owner, the log source — is exercised without a
+    /// supervisor.
+    fn write_manifest_for(backend: &FakeBackend, instance_dir: &Path, config_dir: &Path) {
+        manifest_for(backend, instance_dir)
+            .write(config_dir)
+            .expect("write manifest");
+    }
+
+    #[test]
+    fn status_carries_the_backends_diagnostic_and_remediation() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let mut fake = FakeBackend::in_state(dir.path(), ServiceState::Running);
+        fake.observation.starts = ServiceStarts::LoginOnly;
+        fake.observation.starts_action = Some("loginctl enable-linger alice".to_string());
+        write_manifest_for(&fake, &instance_dir, &config_dir);
+
+        let status = status(&fake, &instance_dir, &config_dir);
+        assert_eq!(status.starts, ServiceStarts::LoginOnly);
+        assert_eq!(
+            status.starts_action.as_deref(),
+            Some("loginctl enable-linger alice")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn locked_uninstall_cannot_be_redirected_by_config_path_replacement() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        let fake = FakeBackend::new(dir.path());
+        write_manifest_for(&fake, &instance_dir, &config_dir);
+
+        let mutation_lock = runtime_cloud_connect::MutationLock::acquire(
+            &config_dir,
+            "service-uninstall-path-replacement-test",
+        )
+        .await
+        .expect("acquire mutation lock");
+        let state_config_dir = mutation_lock
+            .descriptor_relative_config_dir()
+            .expect("pin state directory");
+        let moved_config_dir = instance_dir.join("locked-spice");
+        std::fs::rename(&config_dir, &moved_config_dir).expect("rename locked directory");
+        std::fs::create_dir_all(&config_dir).expect("create replacement directory");
+        let replacement_manifest = ServiceManifest::path_in(&config_dir);
+        std::fs::write(&replacement_manifest, b"replacement manifest")
+            .expect("write replacement manifest");
+
+        uninstall_with_state(&fake, &instance_dir, &state_config_dir, &config_dir)
+            .expect("descriptor-rooted uninstall succeeds")
+            .expect("the locked manifest is installed");
+
+        assert!(
+            !ServiceManifest::path_in(&moved_config_dir).exists(),
+            "the manifest in the locked directory must be removed"
+        );
+        assert_eq!(
+            std::fs::read(&replacement_manifest).expect("read replacement manifest"),
+            b"replacement manifest",
+            "path replacement must not redirect manifest deletion"
         );
     }
 }

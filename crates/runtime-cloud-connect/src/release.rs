@@ -44,6 +44,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 
@@ -54,6 +55,7 @@ pub const RELEASE_PATH: &str = "/v1/cloud-connect/release";
 
 /// Domain-separation prefix of the release proof-of-possession payload.
 const POP_DOMAIN: &str = "spice-cloud-connect/release/v1";
+const MAX_RELEASE_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Errors from the host-initiated release call.
 #[derive(Debug, Snafu)]
@@ -236,31 +238,64 @@ async fn release_to_base(
 
     let status = response.status();
     if !status.is_success() {
-        let message = match response.text().await {
-            Ok(text) => serde_json::from_str::<ErrorBody>(&text)
-                .map_or_else(|_| bounded(&text, 256), |body| body.error),
+        let message = match bounded_response_body(response).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                serde_json::from_str::<ErrorBody>(&text)
+                    .map_or_else(|_| bounded(&text, 256), |body| body.error)
+            }
             Err(_) => String::new(),
         };
         return Err(Error::Rejected {
             status: status.as_u16(),
-            message,
+            message: sanitize_terminal_text(&message),
         });
     }
 
     // A control plane that answers 2xx with no body (or an unexpected one) has
     // still accepted the release, so treat an undecodable body as success with
     // nothing extra to report rather than failing a completed operation.
-    let wire = response
-        .json::<ReleaseResponseWire>()
+    let wire = bounded_response_body(response)
         .await
+        .ok()
+        .and_then(|body| serde_json::from_slice::<ReleaseResponseWire>(&body).ok())
         .unwrap_or(ReleaseResponseWire {
             status: String::new(),
             app_name: None,
         });
     Ok(ReleaseOutcome {
-        status: wire.status,
-        app_name: wire.app_name,
+        status: sanitize_terminal_text(&wire.status),
+        app_name: wire.app_name.map(|name| sanitize_terminal_text(&name)),
     })
+}
+
+fn sanitize_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .take(1024)
+        .collect()
+}
+
+async fn bounded_response_body(response: reqwest::Response) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(std::io::Error::other)?;
+        if body.len().saturating_add(chunk.len()) > MAX_RELEASE_RESPONSE_BYTES {
+            return Err(std::io::Error::other(
+                "release response exceeded the 64 KiB limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Longest prefix of `s` no longer than `max` bytes on a char boundary.
@@ -322,6 +357,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -485,6 +521,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         };
         let public_key_pem = key_pair.public_key_pem();
         (identity, public_key_pem)
