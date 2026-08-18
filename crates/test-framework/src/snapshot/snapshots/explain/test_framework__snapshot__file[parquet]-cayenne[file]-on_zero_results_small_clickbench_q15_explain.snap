@@ -14,10 +14,10 @@ description: "Query: clickbench_q15"
 |               |   SortExec: TopK(fetch=10), expr=[c@2 DESC], preserve_partitioning=[true]                                                                    |
 |               |     ProjectionExec: expr=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase, count(Int64(1))@2 as c]                        |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))] |
-|               |         RepartitionExec: partitioning=Hash([SearchEngineID@0, SearchPhrase@1], 16), input_partitions=16                                      |
+|               |         RepartitionExec: partitioning=Hash([SearchEngineID@0, SearchPhrase@1], 32), input_partitions=32                                      |
 |               |           AggregateExec: mode=Partial, gby=[SearchEngineID@0 as SearchEngineID, SearchPhrase@1 as SearchPhrase], aggr=[count(Int64(1))]      |
 |               |             FilterExec: SearchPhrase@1 !=                                                                                                    |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                          |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                          |
 |               |                 SchemaCastScanExec                                                                                                           |
 |               |                   FallbackOnZeroResultsScanExec                                                                                              |
 |               |                     CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                                        |

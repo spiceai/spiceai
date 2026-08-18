@@ -14,9 +14,9 @@ description: "Query: clickbench_q5"
 |               |     CoalescePartitionsExec                                                            |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(alias1)]                       |
 |               |         AggregateExec: mode=FinalPartitioned, gby=[alias1@0 as alias1], aggr=[]       |
-|               |           RepartitionExec: partitioning=Hash([alias1@0], 16), input_partitions=16     |
+|               |           RepartitionExec: partitioning=Hash([alias1@0], 32), input_partitions=32     |
 |               |             AggregateExec: mode=Partial, gby=[UserID@0 as alias1], aggr=[]            |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1   |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1   |
 |               |                 SchemaCastScanExec                                                    |
 |               |                   FallbackOnZeroResultsScanExec                                       |
 |               |                     CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N> |
