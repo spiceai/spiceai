@@ -1,0 +1,68 @@
+version: v1
+kind: Spicepod
+name: hybrid[model2vec[potion-multilingual-128M]]-duckdb[file]
+
+# FinanceBench PDF search benchmark (hybrid variant: BM25 full-text + vector, fused with RRF).
+# The corpus is one PDF per filing page, staged to S3 by scripts/financebench_stage.py. See
+# README.md for the one-time staging procedure and how to run this spicepod as a custom search
+# test.
+
+datasets:
+  # Per-page filing PDFs. With no file_format, the object-store listing connector routes every
+  # *.pdf under the prefix to the text table (schema: location, content), one row per page-PDF.
+  # `location` is the full in-bucket key, e.g. financebench/corpus_pages/<doc>/pNNNN.pdf.
+  - from: s3://benchmarks/financebench/corpus_pages/
+    name: corpus_pdfs
+    params: &s3_params
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+
+  - from: s3://benchmarks/financebench/queries.parquet
+    name: test_queries
+    params:
+      file_format: parquet
+      <<: *s3_params
+    acceleration:
+      enabled: true
+
+  - from: s3://benchmarks/financebench/relevance_data.parquet
+    name: relevance_data
+    params:
+      file_format: parquet
+      <<: *s3_params
+    acceleration:
+      enabled: true
+
+views:
+  # The searchable corpus. Stripping everything up to and including `corpus_pages/` turns the raw
+  # `location` into the portable `<doc>/pNNNN.pdf` key, so the search primary key equals the
+  # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
+  # under. Both full-text and vector indexes are built over the same page text; each embedding
+  # chunk keeps its page's `_id`, so page-level relevance still scores.
+  - name: corpus
+    sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
+    columns:
+      - name: text
+        full_text_search:
+          enabled: true
+          row_id:
+            - _id
+        embeddings:
+          - from: potion
+            row_id:
+              - _id
+            chunking:
+              enabled: true
+              target_chunk_size: 512
+              overlap_size: 128
+
+embeddings:
+  - from: model2vec:minishlab/potion-multilingual-128M
+    name: potion
