@@ -41,7 +41,9 @@ use tei_core::{
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
+use super::util::{
+    LoadedTokenization, download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str,
+};
 
 #[derive(Debug)]
 pub struct TeiEmbed {
@@ -151,8 +153,11 @@ impl TeiEmbed {
     ) -> Result<Self> {
         // Reads config.json / the sentence-transformers config and parses
         // tokenizer.json on a blocking thread (see `load_tokenization`).
-        let (tokenizer, config, token) =
-            load_tokenization(root, max_seq_length_overwrite).await?;
+        let LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization: token,
+        } = load_tokenization(root, max_seq_length_overwrite).await?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174

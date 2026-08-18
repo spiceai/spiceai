@@ -130,12 +130,13 @@ impl TeiRerank {
     ) -> Result<Self> {
         let name = name.into();
 
-        let (_, _, token) = load_tokenization(root, max_seq_length_overwrite)
+        let loaded = load_tokenization(root, max_seq_length_overwrite)
             .await
             .boxed()
             .context(LocalModelLoadFailedSnafu {
                 model: name.clone(),
             })?;
+        let token = loaded.tokenization;
 
         // A cross-encoder reranker is a sequence-classification model: load it
         // with `Classifier` (no pooling) so `Infer::predict` — gated on

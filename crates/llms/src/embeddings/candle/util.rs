@@ -71,6 +71,14 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Result of [`load_tokenization`]: the parsed tokenizer, the model config, and
+/// the derived [`Tokenization`] settings needed to build a TEI `Infer` pipeline.
+pub(crate) struct LoadedTokenization {
+    pub tokenizer: Tokenizer,
+    pub config: ModelConfig,
+    pub tokenization: Tokenization,
+}
+
 /// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
 /// `Infer` pipeline from a directory of model artifacts. Shared by
 /// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
@@ -85,7 +93,7 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
 pub(crate) async fn load_tokenization(
     root: &Path,
     max_seq_length_overwrite: Option<usize>,
-) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
+) -> Result<LoadedTokenization> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let tokenizer = load_tokenizer(&root)?;
@@ -107,7 +115,7 @@ pub(crate) async fn load_tokenization(
             }
         };
 
-        let token = Tokenization::new(
+        let tokenization = Tokenization::new(
             1,
             tokenizer.clone(),
             max_input_length,
@@ -116,7 +124,11 @@ pub(crate) async fn load_tokenization(
             None,
         );
 
-        Ok((tokenizer, config, token))
+        Ok(LoadedTokenization {
+            tokenizer,
+            config,
+            tokenization,
+        })
     })
     .await
     .boxed()
