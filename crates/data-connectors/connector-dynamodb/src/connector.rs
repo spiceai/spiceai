@@ -19,8 +19,8 @@ use crate::provider::DynamoDBTableProvider;
 use crate::stream::StreamError as DynamoDBStreamError;
 use async_trait::async_trait;
 use data_components::cdc::{
-    ChangeEnvelope, ChangesStream, CommitChange, CommitError, InitialSnapshotMode,
-    InvalidCheckpointBehavior, NoOpCommitter,
+    AccelerationContents, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
+    InitialSnapshotMode, InvalidCheckpointBehavior, NoOpCommitter,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::schema_projection::{ProjectionPolicy, parse_schema_projection};
@@ -29,7 +29,6 @@ use datafusion::sql::TableReference;
 use dynamodb_streams::{Checkpoint, Metrics, MetricsCollector};
 use futures::stream::{self, StreamExt};
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -37,6 +36,7 @@ use runtime::dataconnector::{
 };
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
 use snafu::ResultExt;
@@ -267,14 +267,14 @@ impl DataConnector for DynamoDB {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<Result<Arc<dyn TableProvider>, DataConnectorError>> {
         Some(self.read_provider(dataset).await)
     }
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         if let Some(acceleration) = &dataset.acceleration
             && let Some(refresh_mode) = acceleration.refresh_mode
@@ -472,7 +472,8 @@ impl DataConnector for DynamoDB {
     fn changes_stream(
         &self,
         federated_table: Arc<dyn FederatedTableProvider>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         let dataset = dataset.clone();
 
@@ -1195,6 +1196,7 @@ impl CommitChange for DynamoDBStreamCommitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::component::dataset::Dataset;
     use runtime::component::dataset::builder::DatasetBuilder;
     use serde_json::json;
     use spicepod::semantic::Column;

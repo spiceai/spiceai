@@ -29,7 +29,7 @@ use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use runtime::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
+    component::dataset::acceleration::RefreshMode,
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
         DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
@@ -42,6 +42,7 @@ use runtime_checkpoint_api::{
     CheckpointError,
     kafka::{KafkaCheckpoint, KafkaCheckpointStore},
 };
+use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
@@ -193,7 +194,7 @@ impl Kafka {
     /// Resolve the offset store over this dataset's accelerator.
     async fn offset_store(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
         let context = self
             .context
@@ -371,7 +372,7 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -483,7 +484,7 @@ impl DataConnector for Kafka {
 }
 
 async fn init_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
@@ -621,7 +622,7 @@ impl KafkaOffsetCommitHook for SidecarOffsetCommitHook {
 }
 
 async fn bootstrap_new_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
@@ -36,10 +36,10 @@ use data_connector_api::federated::FederatedTableProvider;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -69,7 +69,7 @@ const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
 /// for one to describe.
 async fn resolve_watermark_store(
     context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
     context?
         .blob_checkpoint_store(dataset, WATERMARK_TABLE)
@@ -168,10 +168,11 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 
 pub fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     context: Option<Arc<dyn ConnectorContext>>,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -202,6 +203,9 @@ pub fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -942,6 +946,7 @@ fn replication_params_from_connector_params(
         // Derived from the dataset's accelerator, which this function does not
         // see; `build_changes_stream` sets it right after.
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -951,6 +956,10 @@ fn replication_params_from_connector_params(
         // formatting. Not a user-facing parameter; the per-column text fallback
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
     })
 }
 

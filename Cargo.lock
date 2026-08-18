@@ -463,6 +463,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28f6098a1e8ab66ff91324cce8fea6643101882cf7d09c85acdb1485ecf61e29"
 
 [[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3773,6 +3779,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "futures",
+ "rand 0.10.1",
+ "serde_json",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+]
+
+[[package]]
 name = "chbench-driver"
 version = "2.2.0-unstable"
 dependencies = [
@@ -4133,7 +4156,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
+ "futures-core",
  "memchr",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4207,6 +4234,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4233,6 +4261,7 @@ dependencies = [
  "linkme",
  "parking_lot",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "sha2 0.10.9",
@@ -4260,6 +4289,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -4283,6 +4313,7 @@ dependencies = [
  "opentelemetry",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
@@ -4307,6 +4338,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4331,6 +4363,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4354,6 +4387,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4372,6 +4406,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
@@ -4388,6 +4423,7 @@ dependencies = [
  "duckdb",
  "linkme",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "snafu",
@@ -4423,6 +4459,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "serde_json",
@@ -4444,6 +4481,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "snafu",
@@ -4463,6 +4501,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4475,6 +4514,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4489,6 +4529,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "secrecy",
@@ -4514,6 +4555,7 @@ dependencies = [
  "reqwest 0.13.4",
  "runtime",
  "runtime-api-types",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "secrecy",
@@ -4545,6 +4587,7 @@ dependencies = [
  "linkme",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4588,6 +4631,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",
@@ -4619,6 +4663,7 @@ dependencies = [
  "paste",
  "regex",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "snafu",
@@ -4643,6 +4688,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4676,6 +4722,7 @@ dependencies = [
  "paste",
  "runtime",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-parameters",
  "secrecy",
  "serde_json",
@@ -4695,6 +4742,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tiberius",
@@ -4721,6 +4769,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-metrics",
  "runtime-parameters",
  "runtime-udfs-api",
@@ -4737,6 +4786,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4760,6 +4810,7 @@ dependencies = [
  "odbc-api",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "secrecy",
@@ -4782,6 +4833,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tracing",
@@ -4804,6 +4856,7 @@ dependencies = [
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-metrics",
  "runtime-parameters",
@@ -4841,6 +4894,7 @@ dependencies = [
  "ns_lookup",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "scylla",
  "snafu",
@@ -4854,6 +4908,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4883,6 +4938,7 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.13.4",
  "runtime",
+ "runtime-component",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
@@ -4902,6 +4958,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
  "tokio",
@@ -4921,6 +4978,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "runtime-udfs-api",
  "snafu",
@@ -4937,6 +4995,7 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "runtime-component",
  "runtime-parameters",
  "snafu",
 ]
@@ -7743,6 +7802,21 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "embed-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-openai",
+ "async-trait",
+ "cache",
+ "chunking",
+ "hf-hub",
+ "runtime-rate-control",
+ "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -11511,10 +11585,12 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "cache",
+ "chat-api",
  "chunking",
  "cudarc 0.19.8",
  "dotenv 2.2.0-unstable",
  "either",
+ "embed-api",
  "futures",
  "google-genai",
  "governor",
@@ -11531,6 +11607,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
+ "rerank-api",
  "rstest 0.26.1",
  "runtime-rate-control",
  "schemars 1.2.1",
@@ -16099,6 +16176,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
+name = "redis"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3257df217f7eab0044627a268c9cc6cdb60c0c421c88f83ac41c4e31520b6b84"
+dependencies = [
+ "arc-swap",
+ "arcstr",
+ "async-lock",
+ "backon",
+ "bytes",
+ "cfg-if",
+ "combine",
+ "futures-channel",
+ "futures-util",
+ "itoa",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2 0.6.4",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16568,6 +16674,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rerank-api"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "snafu",
+]
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16973,6 +17087,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-drasi",
  "runtime-metrics",
  "runtime-object-store",
  "runtime-parameters",
@@ -17191,8 +17306,10 @@ dependencies = [
  "chrono",
  "cloud-connect-crypto",
  "dirs",
+ "fs4",
  "gethostname",
  "getrandom 0.3.4",
+ "libc",
  "pem",
  "prost",
  "prost-types",
@@ -17204,13 +17321,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snafu",
+ "spice-cloud-client",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "uuid 1.23.2",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 
@@ -17386,6 +17507,26 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-drasi"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "chrono",
+ "percent-encoding",
+ "redis",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -19353,6 +19494,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-cloud-connect",
  "rustyline",
+ "secrecy",
  "semver",
  "serde",
  "serde_json",
@@ -19502,6 +19644,7 @@ dependencies = [
  "otel-arrow",
  "parking_lot",
  "prometheus",
+ "rcgen",
  "repl",
  "reqwest 0.13.4",
  "runtime",
@@ -19528,6 +19671,7 @@ dependencies = [
  "tracing-subscriber",
  "util",
  "yaml",
+ "zeroize",
 ]
 
 [[package]]
@@ -24724,6 +24868,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+
+[[package]]
 name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25095,3 +25245,8 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "datafusion-federation"
+version = "0.4.2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=eba20fd9f539b8c1bb993e29373b2a644d3bcea8#eba20fd9f539b8c1bb993e29373b2a644d3bcea8"

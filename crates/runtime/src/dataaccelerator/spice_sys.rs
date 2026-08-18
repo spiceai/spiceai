@@ -454,6 +454,10 @@ pub async fn checkpoint_store(
     feature = "postgres-accel",
     feature = "turso"
 )))]
+#[expect(
+    clippy::unused_async,
+    reason = "async for signature parity with the accelerator-backed variant"
+)]
 pub async fn checkpoint_store(
     dataset: &crate::component::dataset::Dataset,
     table_name: &'static str,

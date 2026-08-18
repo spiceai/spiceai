@@ -66,6 +66,11 @@ pub enum Error {
     #[snafu(display("Invalid CA certificate PEM for the Spice Cloud release request: {source}"))]
     CaCert { source: reqwest::Error },
 
+    #[snafu(display("Invalid Spice Cloud release endpoint: {source}"))]
+    Endpoint {
+        source: crate::config::InvalidControlPlaneEndpoint,
+    },
+
     #[snafu(display("Failed to reach the Spice Cloud endpoint {url}: {source}"))]
     Http { url: String, source: reqwest::Error },
 
@@ -159,7 +164,23 @@ pub async fn release(
     identity: &Identity,
     ca_cert_pem: Option<&str>,
 ) -> Result<ReleaseOutcome> {
-    let base = enroll_endpoint.trim_end_matches('/');
+    let enroll_endpoint = identity
+        .control_plane_endpoint
+        .as_deref()
+        .unwrap_or(enroll_endpoint);
+    let base =
+        crate::config::normalize_control_plane_endpoint(enroll_endpoint).context(EndpointSnafu)?;
+    release_to_base(&base, identity, ca_cert_pem).await
+}
+
+/// Send a release to an already-vetted base URL. Keeping normalization at the
+/// public boundary lets the unit test use an in-process HTTP fixture without
+/// making plaintext a production endpoint policy.
+async fn release_to_base(
+    base: &str,
+    identity: &Identity,
+    ca_cert_pem: Option<&str>,
+) -> Result<ReleaseOutcome> {
     let url = format!("{base}{RELEASE_PATH}");
 
     // The body carries the credential: the leaf names the instance (its SPIFFE
@@ -295,8 +316,12 @@ mod tests {
             public_key_pem: String::new(),
             ca_bundle_pem: String::new(),
             gateway_addr: String::new(),
+            control_plane_endpoint: None,
             not_after_unix: None,
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -304,9 +329,21 @@ mod tests {
         }
     }
 
-    // A scheme-less endpoint. The send fails on the URL itself and never opens
+    // An unroutable HTTPS endpoint. The send fails on the URL itself and never opens
     // a socket, so no listener that happens to be up can answer in its place.
-    const UNSENDABLE_ENDPOINT: &str = "not-a-url";
+    const UNSENDABLE_ENDPOINT: &str = "https://127.0.0.1:0";
+
+    #[tokio::test]
+    async fn release_rejects_an_unsafe_stored_endpoint_before_sending_credentials() {
+        let mut identity = self_signed_identity();
+        identity.control_plane_endpoint = Some("http://control.example".to_string());
+
+        let error = release("https://api.spice.ai", &identity, None)
+            .await
+            .expect_err("plaintext non-loopback control planes must fail closed");
+
+        assert!(matches!(error, Error::Endpoint { .. }), "{error}");
+    }
 
     #[tokio::test]
     async fn release_does_not_use_the_leaf_as_a_tls_client_identity() {
@@ -438,12 +475,16 @@ mod tests {
             public_key_pem: key_pair.public_key_pem(),
             ca_bundle_pem: String::new(),
             gateway_addr: String::new(),
+            control_plane_endpoint: None,
             not_after_unix: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
             cache_key_b64: String::new(),
             app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
         };
         let public_key_pem = key_pair.public_key_pem();
         (identity, public_key_pem)
@@ -485,7 +526,7 @@ mod tests {
         });
 
         let (identity, public_key_pem) = test_identity("inst_release_1");
-        let outcome = release(&format!("http://{addr}"), &identity, None)
+        let outcome = release_to_base(&format!("http://{addr}"), &identity, None)
             .await
             .expect("release must succeed against the mock endpoint");
         assert_eq!(outcome.status, "removed");

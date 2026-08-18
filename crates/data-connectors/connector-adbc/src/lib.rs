@@ -24,19 +24,17 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
+use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
-use runtime::component::dataset::{Dataset, DatasetSpec};
-#[cfg(test)]
+use runtime_component::dataset::DatasetSpec;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
-#[cfg(test)]
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
@@ -385,6 +383,18 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
+        // Identity used to decide whether two ADBC-backed tables can be joined
+        // in one federated pushdown: DataFusion's federation optimizer only
+        // merges sub-plans whose `compute_context()` strings match, and
+        // `SqlTable::compute_context()` derives that string from this pool's
+        // `join_push_down()`.
+        let join_context = build_join_context(
+            &uri_str,
+            username,
+            connection_namespace.catalog.as_deref(),
+            connection_namespace.schema.as_deref(),
+        );
+
         is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
@@ -470,7 +480,8 @@ impl AdbcFactory {
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
-                .with_min_idle(pool_min_idle);
+                .with_min_idle(pool_min_idle)
+                .with_join_push_down(JoinPushDown::AllowedFor(join_context));
 
             if let Some(conn_opts) = conn_options {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
@@ -1071,7 +1082,6 @@ fn build_conn_options(
 ///   enabling federated join pushdown
 /// - Different usernames, catalogs, or schemas produce different hashes,
 ///   preventing incorrect cross-credential pushdown
-#[cfg(test)]
 fn build_join_context(
     uri: &str,
     username: Option<&str>,
@@ -1137,7 +1147,7 @@ fn auth_permission_hint(driver_name: &str) -> &'static str {
 fn classify_adbc_error(
     error: Box<dyn std::error::Error + Send + Sync>,
     driver_name: &str,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     fallback_variant: fn(
         String,
         ConnectorComponent,
@@ -1165,7 +1175,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
             self.factory
@@ -1201,7 +1211,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
             self.factory
@@ -1270,6 +1280,7 @@ pub fn factory() -> std::sync::Arc<dyn DataConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime::component::dataset::Dataset;
     use secrecy::SecretString;
 
     #[test]
@@ -1810,7 +1821,7 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")
         }
