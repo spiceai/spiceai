@@ -14,10 +14,10 @@ description: "Query: clickbench_q8"
 |               |   SortExec: expr=[count(*)@1 DESC], preserve_partitioning=[true]                                       |
 |               |     ProjectionExec: expr=[AdvEngineID@0 as AdvEngineID, count(Int64(1))@1 as count(*)]                 |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))] |
-|               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 16), input_partitions=16                   |
+|               |         RepartitionExec: partitioning=Hash([AdvEngineID@0], 32), input_partitions=32                   |
 |               |           AggregateExec: mode=Partial, gby=[AdvEngineID@0 as AdvEngineID], aggr=[count(Int64(1))]      |
 |               |             FilterExec: AdvEngineID@0 != 0                                                             |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                    |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                    |
 |               |                 SchemaCastScanExec                                                                     |
 |               |                   FallbackOnZeroResultsScanExec                                                        |
 |               |                     CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                  |

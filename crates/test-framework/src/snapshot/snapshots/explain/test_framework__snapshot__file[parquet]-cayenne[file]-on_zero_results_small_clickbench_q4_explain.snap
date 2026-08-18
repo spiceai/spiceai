@@ -10,7 +10,7 @@ description: "Query: clickbench_q4"
 | physical_plan | AggregateExec: mode=Final, gby=[], aggr=[avg(hits.UserID)]                    |
 |               |   CoalescePartitionsExec                                                      |
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[avg(hits.UserID)]              |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1   |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1   |
 |               |         SchemaCastScanExec                                                    |
 |               |           FallbackOnZeroResultsScanExec                                       |
 |               |             CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N> |
