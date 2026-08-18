@@ -162,7 +162,13 @@ jobs:
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
-          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
+          shopt -s globstar nullglob
+          for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
+            case "$file" in
+              *dynamodb-arrow.yaml|*dynamodb-duckdb\[file\].yaml|*federated/dynamodb.yaml) continue ;;
+            esac
+            testoperator dispatch "$file" --workflow bench
+          done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -410,4 +416,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
-
