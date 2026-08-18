@@ -5253,6 +5253,44 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Move write-time footer-cache entries along with staged files.
+    ///
+    /// The Vortex sink caches each written file's footer under the path it
+    /// wrote — for staged writes, the staging directory — while scans look up
+    /// the post-move location, so without this the entries are unreachable and
+    /// the first post-publish scan pays the cold footer read anyway. Each
+    /// `(source, dst_meta)` pair removes the staging-keyed entry and, when the
+    /// post-move listing meta is known (`Some`), re-inserts the same footer
+    /// under the moved location with exactly the meta the delta-applied
+    /// listing will present (`is_valid_for` compares size and mtime exactly).
+    /// Best-effort in every direction: a missing source entry, or a `None`
+    /// meta, degrades to the cold footer read the scan always paid.
+    pub(super) fn rekey_moved_footer_cache_entries(
+        &self,
+        moves: Vec<(object_store::path::Path, Option<ObjectMeta>)>,
+    ) {
+        use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
+
+        let cache = self
+            .context
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
+        for (source, dst_meta) in moves {
+            let Some(entry) = cache.remove(&source) else {
+                continue;
+            };
+            let Some(dst_meta) = dst_meta else {
+                continue;
+            };
+            let dst = dst_meta.location.clone();
+            cache.put(
+                &dst,
+                CachedFileMetadataEntry::new(dst_meta, entry.file_metadata),
+            );
+        }
+    }
+
     fn record_current_snapshot_files_added(&self, file_count: usize) {
         if file_count == 0 {
             return;
@@ -5339,36 +5377,64 @@ impl CayenneTableProvider {
             Self::sync_snapshot_dir(&target_dir).await?;
             self.record_current_snapshot_files_added(moved_count);
 
-            // Record the moved files' ObjectMeta in the side-channel so the
-            // caller's `publish_current_snapshot_files_changed_under_held_fence`
-            // can delta-apply them onto the list-files cache instead of evicting
-            // the whole directory listing. Best-effort: if stat fails for any
-            // file we skip the side-channel entirely (leaving `None`), so the
-            // publish falls back to a full eviction + re-LIST — never wrong, just
-            // not incremental.
+            // Stat the moved files for the list-files-cache delta-apply below.
+            // Best-effort: if stat fails for any file this stays `None`, so the
+            // publish falls back to a full eviction + re-LIST — never wrong,
+            // just not incremental.
             //
             // ONLY when the move target is the live current snapshot. A
             // compaction/overwrite move targets a not-yet-current snapshot and is
             // followed by `refresh_listing_table_under_held_fence` (which evicts),
             // NOT this delta path — recording its files would let a later
             // current-snapshot publish apply the WRONG snapshot's additions.
-            if self.get_current_snapshot_id() == current_snapshot {
+            let delta_metas = if self.get_current_snapshot_id() == current_snapshot {
                 let snapshot_dir_url = Self::snapshot_dir_url(
                     &self.table_metadata.path,
                     &self.table_metadata.table_id,
                     current_snapshot,
                 );
-                if let Some(metas) = self
-                    .stat_moved_files_as_object_metas(
-                        &snapshot_dir_url,
-                        &target_dir,
-                        &moved_file_names,
-                    )
-                    .await
-                {
-                    *self.last_moved_snapshot_files.lock() =
-                        Some((current_snapshot.to_string(), metas));
-                }
+                self.stat_moved_files_as_object_metas(
+                    &snapshot_dir_url,
+                    &target_dir,
+                    &moved_file_names,
+                )
+                .await
+            } else {
+                None
+            };
+
+            // Move the write-time footer-cache entries along with the files
+            // (see `rekey_moved_footer_cache_entries`). `delta_metas` is
+            // index-aligned with `moved_file_names` when present.
+            let staging_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                staging_snapshot_id,
+            ))
+            .ok()
+            .map(|url| url.prefix().clone());
+            if let Some(staging_prefix) = staging_prefix {
+                let moves = moved_file_names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| {
+                        let name = name.to_str()?;
+                        Some((
+                            staging_prefix.clone().join(name),
+                            delta_metas.as_ref().and_then(|metas| metas.get(i).cloned()),
+                        ))
+                    })
+                    .collect();
+                self.rekey_moved_footer_cache_entries(moves);
+            }
+
+            // Record the moved files' ObjectMeta in the side-channel so the
+            // caller's `publish_current_snapshot_files_changed_under_held_fence`
+            // can delta-apply them onto the list-files cache instead of evicting
+            // the whole directory listing.
+            if let Some(metas) = delta_metas {
+                *self.last_moved_snapshot_files.lock() =
+                    Some((current_snapshot.to_string(), metas));
             }
         }
 
@@ -5553,6 +5619,17 @@ impl CayenneTableProvider {
         );
 
         self.record_current_snapshot_files_added(file_moves.len());
+
+        // Move the write-time footer-cache entries along with the objects (see
+        // `rekey_moved_footer_cache_entries`). `moved_metas` is index-aligned
+        // with `file_moves` when the cache prefix parsed; otherwise this
+        // degrades to removing the now-stale staging-keyed entries.
+        let footer_cache_moves = file_moves
+            .iter()
+            .enumerate()
+            .map(|(i, (source, _))| (source.clone(), moved_metas.get(i).cloned()))
+            .collect();
+        self.rekey_moved_footer_cache_entries(footer_cache_moves);
 
         // Record the moved files for the list-files-cache delta-apply (see
         // `last_moved_snapshot_files`). Only when (a) the move target is the live
@@ -27506,13 +27583,10 @@ impl CayenneTableProvider {
             if object_store_url.is_none() {
                 object_store_url = Some(listing_url.clone());
             }
-            let object_meta = ObjectMeta {
-                location: listing_url.prefix().clone(),
-                last_modified: chrono::DateTime::UNIX_EPOCH,
-                size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                e_tag: None,
-                version: None,
-            };
+            let object_meta = vortex_datafusion::synthetic_object_meta(
+                listing_url.prefix().clone(),
+                u64::try_from(file.file_size_bytes).unwrap_or(0),
+            );
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
@@ -27651,16 +27725,14 @@ impl CayenneTableProvider {
             // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
             .map(|file| {
-                let object_meta = ObjectMeta {
-                    location: prefix.clone().join(file.file_path.as_str()),
-                    // `last_modified` is unused by the Vortex scan (it reads
-                    // footer stats by location/size); a fixed epoch keeps the
-                    // value deterministic without an extra stat round-trip.
-                    last_modified: chrono::DateTime::UNIX_EPOCH,
-                    size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                    e_tag: None,
-                    version: None,
-                };
+                // `synthetic_object_meta` stamps the epoch mtime the Vortex
+                // write path also stamps on its footer-cache entries, so
+                // `is_valid_for` matches and post-write scans reuse the
+                // just-written footers instead of re-reading them cold.
+                let object_meta = vortex_datafusion::synthetic_object_meta(
+                    prefix.clone().join(file.file_path.as_str()),
+                    u64::try_from(file.file_size_bytes).unwrap_or(0),
+                );
                 // Same conversion `pruned_partition_list` uses for the
                 // unpartitioned case (`object_meta.into()`).
                 PartitionedFile::from(object_meta)
