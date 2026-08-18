@@ -34,12 +34,12 @@ use tantivy::schema::{
     TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
-use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
+use tantivy_datafusion_filter::{array_to_terms, is_tokenized, set_document_values, text_tokenizer};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
-use crate::generation::text_search::util::with_json_subset_column;
+use crate::generation::text_search::util::{with_json_subset_column, without_columns};
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
@@ -528,11 +528,43 @@ impl FullTextDatabaseIndex {
         // Prepare documents to insert/delete with read lock.
         let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
+
+        // Primary-key columns are excluded from the generic JSON pipeline below and set
+        // directly on the parsed documents afterwards, through the same encoding used to build
+        // `terms_to_delete` above. Arrow-json's JSON representation for Float32/Float16, Binary,
+        // and view types does not always parse back through tantivy's JSON deserializer into the
+        // same value `array_to_terms` produces for the delete term, so an update on those types
+        // could delete nothing (stale duplicate) or fail to parse at all (#12235).
+        let non_pk_rb = rb
+            .iter()
+            .map(|r| without_columns(r, &self.primary_key))
+            .collect::<Result<Vec<RecordBatch>, _>>()
+            .map_err(|e| super::Error::FailedToRetrieveDataFromSource {
+                source: DataFusionError::ArrowError(Box::new(e), None),
+            })?;
+        let doc_json = write_to_json_string(&non_pk_rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&index_schema, doc_json.as_str())
+        let mut docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
+
+        for pk in &self.primary_key {
+            let Some((pk_field, _)) = index_schema.find_field(pk.as_str()) else {
+                return Err(super::Error::FailedToRetrieveDataFromIndex {
+                    source: TantivyError::FieldNotFound(pk.clone()),
+                });
+            };
+            let mut offset = 0;
+            for r in &rb {
+                if let Some(arr) = r.column_by_name(pk.as_str()) {
+                    set_document_values(pk_field, arr, &mut docs[offset..offset + r.num_rows()])
+                        .map_err(|e| super::Error::FailedToRetrieveDataFromSource {
+                            source: DataFusionError::ArrowError(Box::new(e), None),
+                        })?;
+                }
+                offset += r.num_rows();
+            }
+        }
 
         let mut index_writer = self.writer.lock().await;
         // Read the deferral flag while holding the writer lock so the decision to
