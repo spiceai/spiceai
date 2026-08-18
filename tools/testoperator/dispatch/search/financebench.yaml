@@ -1,9 +1,5 @@
 tests:
   search:
-    # FinanceBench runs as a custom search test: `benchmark_dataset` is omitted, so the workflow
-    # tests the spicepod as-is against the corpus staged at s3://benchmarks/financebench/ (see
-    # test/spicepods/search/financebench/README.md). ready_wait is higher than MTEB because the
-    # corpus is thousands of page-PDFs that Spice must parse with PDFium before search is ready.
     - spicepod_path: test/spicepods/search/financebench/full_text_search-cayenne[file].yaml
       runner_type: spiceai-dev-runners
       ready_wait: 3600

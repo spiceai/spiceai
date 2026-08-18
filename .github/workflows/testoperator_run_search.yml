@@ -104,9 +104,6 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
-          # A custom spicepod (e.g. financebench) reads its corpus from the shared bench MinIO via
-          # ${secrets:S3_ENDPOINT}/S3_KEY/S3_SECRET; built-in MTEB runs download to local files and
-          # ignore these.
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
