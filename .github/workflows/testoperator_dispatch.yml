@@ -166,7 +166,7 @@ jobs:
           failed=0
           for file in ./tools/testoperator/dispatch/tpch/sf1/**/*.yaml; do
             case "$file" in
-              *dynamodb-arrow.yaml|*dynamodb-duckdb\[file\].yaml|*federated/dynamodb.yaml) continue ;;
+              ./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-arrow.yaml|./tools/testoperator/dispatch/tpch/sf1/accelerated/dynamodb-duckdb\[file\].yaml|./tools/testoperator/dispatch/tpch/sf1/federated/dynamodb.yaml) continue ;;
             esac
             if ! testoperator dispatch "$file" --workflow bench; then
               failed=1
