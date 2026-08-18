@@ -109,8 +109,13 @@ pub(crate) struct ConnectionStatus {
     /// Cloud-assigned instance identifier.
     pub(crate) identifier: Option<String>,
     pub(crate) org_name: Option<String>,
+    /// The attached project's cloud id. This is the attachment itself, so an
+    /// instance holding one is attached whether or not the control plane also
+    /// supplied the name and monitor URL below.
+    pub(crate) app_id: Option<String>,
     pub(crate) app_name: Option<String>,
-    /// Cloud-constructed portal monitor URL, when the instance is attached.
+    /// Cloud-constructed portal monitor URL, when the instance is attached and
+    /// the control plane supplied one.
     pub(crate) monitor_url: Option<String>,
     /// The gateway the control stream dials.
     pub(crate) gateway_addr: Option<String>,
@@ -225,6 +230,7 @@ impl ConnectStatus {
             endpoint: endpoint.to_string(),
             identifier: None,
             org_name: None,
+            app_id: None,
             app_name: None,
             monitor_url: None,
             gateway_addr: None,
@@ -265,6 +271,7 @@ impl ConnectStatus {
                 (!id.gateway_addr.is_empty()).then(|| id.gateway_addr.clone());
             connection.identifier = Some(id.identifier.clone());
             connection.org_name.clone_from(&id.org_name);
+            connection.app_id.clone_from(&id.app_id);
             connection.app_name.clone_from(&id.app_name);
             connection.monitor_url.clone_from(&id.monitor_url);
 
@@ -520,8 +527,14 @@ fn render_connection(connection: &ConnectionStatus) {
         ConnectionState::Enrolled => {
             println!(
                 "Spice Cloud Connect: connected{}",
-                match (&connection.org_name, &connection.app_name) {
-                    (Some(org), Some(app)) => format!(" — {org} / {app}"),
+                // The attachment is `app_id`; the name only labels it. An
+                // instance holding a project it has no name for is still
+                // attached, and saying otherwise is wrong.
+                match (&connection.org_name, &connection.app_id) {
+                    (Some(org), Some(_)) => format!(
+                        " — {org} / {}",
+                        connection.app_name.as_deref().unwrap_or("attached project")
+                    ),
                     (Some(org), None) => format!(" — {org} (no app attached)"),
                     _ => String::new(),
                 }
@@ -897,6 +910,7 @@ mod tests {
                 endpoint: "https://api.spice.ai".to_string(),
                 identifier: Some("inst_0123456789".to_string()),
                 org_name: Some("acme".to_string()),
+                app_id: Some("14034".to_string()),
                 app_name: Some("edge-analytics".to_string()),
                 monitor_url: Some("https://spice.ai/acme/edge-analytics/monitor".to_string()),
                 gateway_addr: Some("connect.aws.spiceai.io:443".to_string()),

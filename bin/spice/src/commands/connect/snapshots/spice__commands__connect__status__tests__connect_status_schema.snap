@@ -11,6 +11,7 @@ expression: json
     "endpoint": "https://api.spice.ai",
     "identifier": "inst_0123456789",
     "org_name": "acme",
+    "app_id": "14034",
     "app_name": "edge-analytics",
     "monitor_url": "https://spice.ai/acme/edge-analytics/monitor",
     "gateway_addr": "connect.aws.spiceai.io:443",
