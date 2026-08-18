@@ -202,11 +202,6 @@ pub use data_connector_api::*;
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-// Every factory here is a stateless, zero-field struct (`S3Factory`,
-// `FileFactory`, ...), safe to leave registered for the process's lifetime.
-// `Runtime::shutdown()` must not clear this — a future factory that holds a
-// live resource (a cached connection pool) needs its own instance-scoped
-// registry, like `AcceleratorEngineRegistry`, not an `unregister_all()` here.
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -267,6 +262,8 @@ pub async fn create_new_connector(
     Some(result)
 }
 
+// [`DataConnectorFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     for registration in DATA_CONNECTOR_REGISTRATIONS {
         register_connector_factory(registration.name, (registration.constructor)()).await;

@@ -171,11 +171,6 @@ pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
-// `CatalogConnectorFactory` wraps only a `fn` pointer and `&'static`
-// metadata, safe to leave registered for the process's lifetime.
-// `Runtime::shutdown()` must not clear this — a future factory that holds a
-// live resource (a cached connection pool) needs its own instance-scoped
-// registry, like `AcceleratorEngineRegistry`, not an `unregister_all()` here.
 pub(crate) static CATALOG_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, CatalogConnectorFactory>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -222,6 +217,8 @@ pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_catalog_names().await)
 }
 
+// [`CatalogConnectorFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
 

@@ -2039,9 +2039,9 @@ impl Runtime {
         }
 
         // `dataconnector`, `catalogconnector`, and `document_parse` hold only
-        // stateless factories (see the comments atop their registries) —
-        // clearing them here would strip connectors/parsers out from under
-        // every other `Runtime` in this process, so shutdown skips them.
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
 
