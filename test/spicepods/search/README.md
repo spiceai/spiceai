@@ -24,3 +24,26 @@ Examples of full spicepod names:
 * `huggingface[all-minilm-l6-v2]-arrow` - a HuggingFace `all-MiniLM-L6-v2` embedding model with Arrow acceleration.
 * `model2vec[potion-multilingual-128M[chunking]]-duckdb[file]` - a Model2Vec `potion-multilingual-128M` embedding model with chunking enabled, using DuckDB file-mode acceleration.
 * `huggingface[all-minilm-l6-v2]-arrow-hybrid_limit_2000` - a HuggingFace `all-MiniLM-L6-v2` embedding model with Arrow acceleration and hybrid search (vector + full-text search) enabled, with a test corpus data limit of 2000 records.
+
+## Custom datasets
+
+`testoperator run search` also runs against your own search-configured spicepod. Omit
+`--benchmark-dataset` and the tool skips all MTEB data preparation, testing the spicepod at
+`--spicepod-path` as-is:
+
+```console
+testoperator run search --spicepod-path ./my-spicepod.yaml
+```
+
+A custom spicepod must define three tables with a fixed schema:
+
+Each table may be a dataset or a view.
+
+| Name | Kind | Required columns | Notes |
+|---|---|---|---|
+| `corpus` | dataset or view | the column(s) set up for `embeddings:` and/or `full_text_search:` | Must declare `row_id:` (a source-system primary key is not discovered automatically). |
+| `test_queries` | dataset or view | `_id` (query id), `text` (query text) | Read as `SELECT _id as id, text FROM test_queries`. |
+| `relevance_data` | dataset or view | `"query-id"`, `"corpus-id"`, `score` | Read as `SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data`. `score` must be a whole-number grade (0, 1, 2, ...); NDCG uses it as a weight. |
+
+Id columns may be `Utf8`, `LargeUtf8`, or an integer type. Use `views:` to map real column names
+onto these names. See [`custom/example.yaml`](./custom/example.yaml) for a template.

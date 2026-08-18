@@ -97,6 +97,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
+pub(crate) mod drasi;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
@@ -134,6 +135,7 @@ pub mod resource_monitor {
 pub(crate) use runtime_parameters as parameters;
 
 pub mod podswatcher;
+pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
 pub(crate) use runtime_component::schema_evolution;
@@ -318,6 +320,14 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} (drasi): Drasi forwarding publishes the dataset's change stream, but this dataset has no change stream to publish — it is {reason}. Set 'acceleration.refresh_mode: changes' on a source that supports change data capture, or remove the 'drasi' block. See: https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+    ))]
+    DrasiWithoutChangeStream {
+        dataset_name: String,
+        reason: String,
+    },
+
+    #[snafu(display(
         "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
@@ -370,7 +380,9 @@ pub enum Error {
         reason: String,
     },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    #[snafu(display(
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadCatalogConnector {
         catalog: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -392,6 +404,17 @@ pub enum Error {
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration did not complete a refresh within {timeout_secs}s of being recreated. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable, and for 'refresh_mode: changes' that its change stream is producing data. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshTimedOut {
+        dataset: TableReference,
+        timeout_secs: u64,
+    },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -1276,6 +1299,13 @@ impl Runtime {
         }
     }
 
+    /// Publishes the component counters at zero. Must be called after
+    /// `init_metrics` in spiced, for the same reason as
+    /// [`Runtime::init_cache_metrics`].
+    pub fn init_component_metrics(&self) {
+        runtime_metrics::publish_component_counters_at_zero();
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
     pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
@@ -1678,6 +1708,50 @@ impl Runtime {
         }
     }
 
+    /// Installs the `runtime.drasi` forwarders for the runtime's own tables.
+    ///
+    /// A misconfiguration disables forwarding with a loud warning rather than
+    /// failing startup. These tables carry telemetry, and refusing to start the
+    /// runtime because a downstream reaction engine was misconfigured trades a
+    /// much larger outage for a smaller one.
+    async fn init_drasi_forwarders(self: &Arc<Self>) {
+        let Some(app) = self.read_app().await else {
+            return;
+        };
+        let Some(spec) = app.runtime.drasi.as_ref() else {
+            return;
+        };
+
+        if spec.forwarding == spicepod::drasi::DrasiForwarding::Disabled {
+            tracing::debug!("'runtime.drasi' is present but disabled; not forwarding.");
+            return;
+        }
+
+        if spec.tables.is_empty() {
+            tracing::warn!(
+                "'runtime.drasi' is configured but names no tables, so nothing is forwarded to Drasi. Add entries under 'runtime.drasi.tables'."
+            );
+            return;
+        }
+
+        match crate::drasi::internal::InternalForwarders::try_new(spec).await {
+            Ok(forwarders) => {
+                tracing::warn!(
+                    "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+                );
+                tracing::info!(
+                    "Forwarding {} runtime table(s) to the Drasi source {}",
+                    spec.tables.len(),
+                    spec.source_id
+                );
+                self.df.set_drasi_forwarders(Arc::new(forwarders));
+            }
+            Err(e) => {
+                tracing::warn!("Not forwarding runtime tables to Drasi: {e}");
+            }
+        }
+    }
+
     /// Abandon the initial component load.
     ///
     /// The load has no deadline — `load_dataset` retries a transient failure for
@@ -1734,6 +1808,13 @@ impl Runtime {
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
+
+        // Installed before anything can write: the forwarders resolve a table's
+        // key lazily from the constraints handed to them at write time, so they
+        // do not need the runtime tables to exist yet — and installing them here
+        // rather than alongside `task_history` keeps `runtime.drasi` working
+        // when task history itself is disabled.
+        self.init_drasi_forwarders().await;
 
         // Spawned before `load_embeddings`/`load_rerankers` so the table is registered as early as
         // possible: it depends only on the app config, not on embeddings/rerankers being loaded, and

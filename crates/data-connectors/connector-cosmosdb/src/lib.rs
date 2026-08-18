@@ -19,6 +19,7 @@ limitations under the License.
 
 pub mod cosmosdb;
 
+use data_connector_api::ConnectorContext;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,11 +39,11 @@ use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction
 use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
 };
 use runtime_api_types::v1::ComponentType;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
 
@@ -192,10 +193,11 @@ impl DataConnectorFactory for CosmosDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -223,7 +225,7 @@ impl DataConnectorFactory for CosmosDBFactory {
 impl CosmosDB {
     fn build_credential(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Result<CosmosDBCredential, DataConnectorError> {
         if let Some(conn_str) = self.params.get("connection_string").expose().ok() {
             return Ok(CosmosDBCredential::ConnectionString(conn_str.to_string()));
@@ -334,7 +336,7 @@ fn parse_database_and_container(
 }
 
 fn resolve_database_and_container(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     database_param: Option<&str>,
 ) -> Result<(String, String), DataConnectorError> {
     parse_database_and_container(dataset.path(), database_param).map_err(|message| {
@@ -354,7 +356,8 @@ impl DataConnector for CosmosDB {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let credential = self.build_credential(dataset)?;
 
@@ -444,10 +447,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     CosmosDBFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_cosmosdb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_cosmosdb_connector,
     COSMOSDB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

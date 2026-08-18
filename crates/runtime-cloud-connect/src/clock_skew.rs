@@ -202,7 +202,7 @@ pub fn looks_like_certificate_validity_failure(err: &(dyn std::error::Error + 's
 /// request therefore disables verification — and is safe to do so because it
 /// is *only* a clock probe:
 ///
-/// - it is a bare `GET` on the base URL that sends no adoption code, no
+/// - it is a bare `GET` on the base URL that sends no enrollment authority, no
 ///   identity, no bearer token, and no body;
 /// - the response body is discarded unread — only the `Date` header is used;
 /// - the result feeds a diagnostic message and nothing else. A hostile `Date`

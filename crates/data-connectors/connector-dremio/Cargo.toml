@@ -9,6 +9,7 @@ description = "Dremio data connector for Spice.ai runtime"
 [dependencies]
 arrow.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 datafusion-federation.workspace = true
@@ -16,11 +17,14 @@ flight_client = { path = "../../flight_client" }
 linkme.workspace = true
 ns_lookup = { path = "../../ns_lookup" }
 paste.workspace = true
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-udfs-api = { path = "../../runtime-udfs-api" }
 snafu.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

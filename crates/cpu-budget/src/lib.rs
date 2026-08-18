@@ -720,6 +720,8 @@ impl CpuBudget {
                 self.dedicated_runtime_worker_threads(),
             ),
             ("target_partitions", self.target_partitions()),
+            ("scan_split_concurrency", self.scan_split_concurrency()),
+            ("vortex_parallelism", self.vortex_parallelism()),
             ("max_concurrent_queries", self.max_concurrent_queries()),
             ("cayenne_encode_permits", self.cayenne_encode_permits()),
             (
@@ -1007,6 +1009,18 @@ impl CpuBudget {
     /// default.
     #[must_use]
     pub const fn scan_split_concurrency(&self) -> usize {
+        self.cores
+    }
+
+    /// The parallelism spiced declares to Vortex at startup
+    /// (`vortex_utils::parallelism::set_available_parallelism`).
+    ///
+    /// Vortex sizes its remaining concurrency defaults — encode fan-out and
+    /// per-worker scan lookahead — from that declaration; undeclared, it reads
+    /// the machine's core count instead of the entitlement. This is a default
+    /// Vortex derives fan-outs from, not an enforced ceiling.
+    #[must_use]
+    pub const fn vortex_parallelism(&self) -> usize {
         self.cores
     }
 

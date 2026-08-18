@@ -23,16 +23,19 @@ tracked separately (a working plan, not part of these rules).
   ┌──────────────────────────────────────────────────────────────────────┐
   │  binary            bin/spiced, bin/spice, tools/*                      │  stitch everything
   ├──────────────────────────────────────────────────────────────────────┤
-  │  extension         connector-* (~30), spice-cloud, tpc-extension       │  plug-ins that
-  │                                                                        │  register with the runtime
+  │  extension         spice-cloud, tpc-extension, connector-databricks,   │  plug-ins that
+  │                    connector-glue, connector-spiceai                   │  still need the runtime
   ├──────────────────────────────────────────────────────────────────────┤
   │  extension-utility (target slot; empty today)                          │  connector-only building
   │                                                                        │  blocks — runtime can't use
   ├──────────────────────────────────────────────────────────────────────┤
-  │  runtime           runtime                                             │  orchestration daemon
+  │  runtime           runtime, runtime-table                              │  orchestration daemon
+  ├──────────────────────────────────────────────────────────────────────┤
+  │  connector         connector-* (30)                                    │  data sources — compile
+  │                                                                        │  in parallel with runtime
   ├──────────────────────────────────────────────────────────────────────┤
   │  shared-utility    data_components, cayenne, llms, search, app, cache, │  always-shipped libraries
-  │                    runtime-datafusion, runtime-cluster, workers…       │  runtime is built from
+  │                    data-connector-api, runtime-datafusion, workers…    │  runtime is built from
   ├──────────────────────────────────────────────────────────────────────┤
   │  foundation        util, arrow_tools, arrow_sql_gen, spicepod,         │  near-dependency-free
   │                    db_connection_pool, token_provider, flight_client … │  utilities + primitives
@@ -44,15 +47,30 @@ tracked separately (a working plan, not part of these rules).
 |------|---------|---------------|
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
 | **shared-utility** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. Sits *below* `runtime`, so `runtime` may build on it. *Optional* / connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, shared-utility |
-| **runtime** | The `runtime` crate: orchestration, component lifecycle, HTTP/Flight servers, and (today) the connector/accelerator/catalog trait definitions + registries. May **not** depend on `extension-utility`. | foundation, shared-utility |
+| **connector** | The `connector-*` data-source crates. They implement the `DataConnector` contract, which lives in `data-connector-api` *below* `runtime`, so a connector names the contract and never the orchestrator. Being below `runtime` is what lets all 30 compile **in parallel with** it rather than behind it. `runtime` may **not** depend on one — see the `forbid` rule below. | foundation, shared-utility, connector |
+| **runtime** | The `runtime` crate and `runtime-table`: orchestration, component lifecycle, HTTP/Flight servers, and the accelerator/catalog trait definitions + registries. May **not** depend on `extension-utility` or on `connector`. | foundation, shared-utility |
 | **extension-utility** | Connector-specific building blocks that only *extensions* depend on — never `runtime`. It is a low-level *building block*, so it must itself depend **only** on `foundation`/`shared-utility` (at most the `runtime-*-api` interface crates, which sit low) — **not on the `runtime` crate**; pulling in the orchestrator would defeat the point. Sits *above* `runtime` so an accidental `runtime → connector-utility` edge is caught as upward. **Empty today** (a target slot): every such crate — `pgwire-replication`, the `elasticsearch`/`dynamodb-streams`/`smb`/`libnfs` clients, `s3_vectors` — is still pulled in by the `data_components` monolith or `runtime` itself, so it can't move up yet. Populates as the monolith dissolves. | foundation, shared-utility (+ `runtime-*-api`) |
-| **extension** | **Everything optional** — plug-ins that *register with* the runtime: the ~30 `connector-*` crates, `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only they use** (`extension-utility`). Thin wiring over a `shared-utility` impl today; the target folds each source's utilities in alongside it. | foundation, shared-utility, runtime, extension-utility |
+| **extension** | Optional plug-ins that genuinely need the orchestrator: `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only extensions use** (`extension-utility`). Three connectors are still here — `connector-glue` and `connector-spiceai` are registration shims over connector bodies that still live inside `runtime`, and `connector-databricks` reaches `runtime::catalogconnector::databricks` + `runtime::token_providers::databricks`. Each joins `connector` when its remaining `runtime` reference is evacuated. | foundation, shared-utility, connector, runtime, extension-utility |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
 
 The two utility tiers encode a single rule: **`runtime-*` may depend only on
 `shared-utility`, while extensions may depend on both.** `shared-utility` is what
 we always ship and the runtime builds on; `extension-utility` is connector-only
 code the runtime must never pull in.
+
+**`runtime` must not depend on a `connector` either.** The linear order permits
+it — `connector` sits below `runtime` — but that edge is exactly what the
+inversion removed: one such dependency puts every connector back on `runtime`'s
+prerequisite path and the parallelism is gone. A second **`forbid`** rule
+(`["runtime", "connector"]`) rejects it. The connectors are linked only by the
+binaries and by `tools/spicepodschema`, which sit at the top.
+
+A corollary the guard cannot see: **`runtime` must not publicly re-export the
+connector contract.** `runtime::dataconnector`'s `pub use data_connector_api::*`
+is `pub(crate)` for that reason — a public re-export is a second path to every
+contract item, and a connector reaching one through `runtime` re-acquires the
+orchestrator dependency while the guard sees only a legal `connector -> runtime`
+dev-dep or nothing at all.
 
 **`extension-utility` must not depend on `runtime` either.** It is a low-level
 building block for extensions, not a consumer of the orchestrator: its only
@@ -250,12 +268,14 @@ python3 scripts/check_crate_layers.py --mermaid   # tier-level DAG
 Reads `layers.toml` + `cargo metadata --no-deps` (no compilation) and exits
 non-zero on any upward *normal* dependency, plus any edge listed in `layers.toml`'s
 `forbid` (specific `[from_tier, to_tier]` pairs the linear order can't express,
-e.g. `extension-utility -> runtime` — rejected even though it points down). Wired
+e.g. `extension-utility -> runtime` and `runtime -> connector` — rejected even
+though they point down). Wired
 into `make lint-rust` (fail-fast, before clippy) so a PR that adds a bad edge fails
 before merge. Only `kind = "normal"` edges are checked; dev- and build-dependencies
 are exempt — they never ship in the library graph, so they cannot create a real
 cycle (this is why `runtime` may dev-depend on every `connector-*` for its
-integration tests). Requires Python 3.11+ (stdlib `tomllib`).
+integration tests, and why each `connector-*` may dev-depend on `runtime` for
+the `Dataset`/`Runtime` its own unit tests build). Requires Python 3.11+ (stdlib `tomllib`).
 
 Because the manifest encodes *what is true today*, the check is a **ratchet**: it
 cannot force an improvement, but it prevents backsliding, and it tightens as crates
@@ -348,35 +368,33 @@ The intuition we are aiming for is a clean bottom-up stack:
   foundation -> interface (*-api) -> data (connectors) -> runtime -> binary
 ```
 
-The workspace does **not** match that yet, in one important way:
+**The connector edge is inverted.** The `DataConnector` / `DataConnectorFactory`
+traits, the link-time registry, the `ConnectorParams`/`ConnectorContext` a
+connector is handed, and the listing-table connector all live in
+`data-connector-api`, *below* `runtime`. 30 of the 33 `connector-*` crates
+therefore have no `runtime` dependency at all and compile concurrently with it;
+three still do, for reasons listed in the tier table.
 
-> **Connectors currently sit ABOVE the runtime, not below it.** Every `connector-*`
-> crate has a *normal* dependency on `runtime`, because the `DataConnector` /
-> `DataConnectorFactory` traits, the connector registry, and the acceleration glue
-> live inside `crates/runtime` (`runtime/src/dataconnector/mod.rs`). A connector
-> depends on `runtime` just to implement the trait it exists to implement.
-
-So the enforced tiers put connectors in `extension` (above `runtime`) — the truth
-today. The target **inverts** that edge:
+What is left is the other half of the target: splitting `runtime` itself, and
+dissolving `data_components` into the source crates.
 
 ```
-  TODAY (serial: extensions build          TARGET (data-<source> & runtime-* impl
-   AFTER the whole runtime monolith)         crates build IN PARALLEL)
-  ───────────────────────────────────      ─────────────────────────────────────────
-  binary                                    binary  ── the only crate that sees both
-    │                                          │       interfaces AND concrete impls;
-  extension (connector-*)                      │       selects + wires extensions
-    │        depends on ▼                 ┌────┴─────────────┐
-  runtime  ◄── the monolith            runtime-* impl      data-<source>
-    │                                  (runtime-query,      (data-postgres, …;
-  shared-utility                        runtime-serving,     absorb data_components/<src>)
-    │                                   runtime-accel, …)        │ implement / use
-  foundation                                 │ use / implement   │
-                                             └──► interface ◄─────┘
-                                        data-connector-api · data-cdc-api ·
-                                        data-catalog-api · runtime-checkpoint-api · …
-                                             │
-                                        foundation
+  TARGET (data-<source> & runtime-* impl crates build IN PARALLEL)
+  ─────────────────────────────────────────
+   binary  ── the only crate that sees both
+      │       interfaces AND concrete impls;
+      │       selects + wires extensions
+ ┌────┴─────────────┐
+ runtime-* impl   data-<source>
+ (runtime-query,   (data-postgres, …;
+  runtime-serving,  absorb data_components/<src>)
+  runtime-accel, …)      │ implement / use
+      │ use / implement  │
+      └──► interface ◄────┘
+   data-connector-api · data-cdc-api ·
+   data-catalog-api · runtime-checkpoint-api · …
+      │
+   foundation
 ```
 
 The target has two sibling subtrees — `runtime-*` impl crates and `data-<source>`
@@ -395,7 +413,9 @@ Three moves, in order (the priority is set by the [measured
 baseline](#measured-compile-time-baseline)):
 
 1. **Extract the `-api` interface crates** below `runtime` (per the naming rule).
-   This inverts the ~30 `connector-* -> runtime` edges into `data-<source> -> *-api`.
+   This inverted the `connector-* -> runtime` edges into `connector-* -> *-api`;
+   `data-connector-api` (contract + `listing` + connector parameters) and
+   `data-connector-types` (the vocabulary its building blocks share) are done.
 2. **Split `runtime`** along its module seams into `runtime-*` impl crates that *use*
    the interfaces (`runtime-query`, `runtime-serving`, `runtime-acceleration`, …).
    This is where the compile-time win is.
@@ -411,7 +431,7 @@ baseline](#measured-compile-time-baseline)):
 
 > **In-flight example — PostgreSQL (temporary `shared-utility` override).**
 > `connector-postgres-common` lives under `crates/data-connectors/` (which the
-> path rule would place in `extension`) but is pinned to `shared-utility` via a
+> path rule places in `connector`) but is pinned to `shared-utility` via a
 > `[override]` in `layers.toml`. It is a leaf helper — its workspace-internal dep
 > closure is empty — holding the PostgreSQL catalog/CDC-support queries
 > (`list_schemas`/`list_tables`/`primary_key_columns`/`check_cdc_prerequisites`),
@@ -473,6 +493,27 @@ three); each is a separate `-api` crate a `data-<source>` implements as applicab
   `mysql_replication`, `debezium`).
 - **Catalog** (`data-catalog-api`) — discover datasets/schemas rather than serve
   rows (`runtime/src/catalogconnector`, `unity_catalog`, iceberg/glue).
+
+### How finely to split a family: on dependencies, not on capabilities
+
+Once a family is inverted behind a contract, the next question is how many crates it becomes. The
+axis that looks natural is the trait surface — one crate per capability per vendor. The axis that
+pays is the **dependency set**.
+
+A crate boundary earns its keep by taking something out of a prerequisite closure. If two
+capabilities of one vendor are built on the same client library, splitting them yields two crates
+that pull the same heavy dependency: nothing is shed, and the vendor's client construction now has
+two homes that can drift apart. If two capabilities are built on *different* stacks, splitting them
+lets a deployment take one and shed the other entirely.
+
+> **The test:** would the split remove a dependency from somebody's build? If not, it is a module,
+> not a crate.
+
+This is the same judgement as [interface vs. implementation](#worked-example-interface-vs-implementation-dependency-cdc-checkpoints),
+applied to granularity rather than direction. Note what it does *not* say: crate count is not a
+function of vendors, or of backends, or of traits. It is a function of **distinct dependency
+sets** — which usually lands on one crate per vendor, but splits a single vendor in two whenever
+its capabilities are built on unrelated stacks.
 
 ### Worked example: interface vs. implementation dependency (CDC checkpoints)
 

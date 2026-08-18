@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Data connector that reads from datasets already registered in the current Spicepod.
 
+use crate::dataconnector::ConnectorContext;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -27,7 +28,7 @@ use datafusion::sql::TableReference;
 
 use crate::DataConnector;
 use crate::datafusion::DataFusion;
-use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+use crate::{component::dataset::DatasetSpec, parameters::ParameterSpec};
 
 use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
@@ -53,10 +54,11 @@ impl DataConnectorFactory for LocalPodFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Err(Box::new(super::DataConnectorError::Internal {
                 dataconnector: LOCALPOD_DATACONNECTOR.to_string(),
@@ -96,7 +98,8 @@ impl DataConnector for LocalPodConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path();
         let path_table_ref = TableReference::parse_str(path);
@@ -110,4 +113,4 @@ impl DataConnector for LocalPodConnector {
     }
 }
 
-register_data_connector!("localpod", LocalPodFactory);
+data_connector_api::register_data_connector!("localpod", LocalPodFactory);
