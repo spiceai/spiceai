@@ -385,3 +385,463 @@ pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash
         provider
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        UpsertDedupExec, UpsertDedupTableProvider, extract_upsert_options,
+        wrap_with_upsert_dedup_if_needed,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::catalog::MemTable;
+    use datafusion::common::{Constraint, Constraints};
+    use datafusion::datasource::TableProvider;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::physical_plan::{ExecutionPlan, collect};
+    use datafusion::prelude::SessionContext;
+    use datafusion_table_providers::util::constraints::UpsertOptions;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, true),
+        ]))
+    }
+
+    fn batch(rows: &[(i32, &str)]) -> RecordBatch {
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<&str> = rows.iter().map(|(_, v)| *v).collect();
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(vals)),
+            ],
+        )
+        .expect("build batch")
+    }
+
+    fn source(batches: &[Vec<RecordBatch>]) -> Arc<dyn ExecutionPlan> {
+        let src = MemorySourceConfig::try_new(batches, schema(), None).expect("memory source");
+        Arc::new(DataSourceExec::new(Arc::new(src)))
+    }
+
+    /// `id` is the primary key.
+    fn pk_constraints() -> Constraints {
+        Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])])
+    }
+
+    fn last_write_wins() -> UpsertOptions {
+        UpsertOptions::default().with_last_write_wins(true)
+    }
+
+    fn remove_duplicates() -> UpsertOptions {
+        UpsertOptions::default().with_remove_duplicates(true)
+    }
+
+    /// Sorted `(id, v)` pairs of everything the plan produced.
+    async fn rows_of(plan: Arc<dyn ExecutionPlan>) -> Vec<(i32, String)> {
+        let ctx = Arc::new(TaskContext::default());
+        let batches = collect(plan, ctx).await.expect("plan executes");
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id is Int32");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), vals.value(row).to_string()));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    fn plan_contains(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        if plan.name() == name {
+            return true;
+        }
+        plan.children()
+            .iter()
+            .any(|child| plan_contains(child, name))
+    }
+
+    #[test]
+    fn extract_upsert_options_defaults_to_no_deduplication() {
+        let options: HashMap<String, String> = HashMap::new();
+        let extracted = extract_upsert_options(&options);
+
+        assert!(!extracted.remove_duplicates);
+        assert!(!extracted.last_write_wins);
+    }
+
+    #[test]
+    fn extract_upsert_options_reads_both_flags_case_insensitively() {
+        let options: HashMap<String, String> = [
+            ("upsert_remove_duplicates".to_string(), "TRUE".to_string()),
+            ("upsert_last_write_wins".to_string(), "True".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let extracted = extract_upsert_options(&options);
+        assert!(extracted.remove_duplicates);
+        assert!(extracted.last_write_wins);
+    }
+
+    /// Only a literal `true` turns deduplication on. Anything else — including
+    /// `1` and `yes` — leaves it off, so a typo cannot silently start dropping
+    /// rows the caller expected to be written.
+    #[test]
+    fn extract_upsert_options_treats_any_non_true_value_as_off() {
+        for value in ["false", "1", "yes", "", "trueish"] {
+            let options: HashMap<String, String> =
+                [("upsert_remove_duplicates".to_string(), value.to_string())]
+                    .into_iter()
+                    .collect();
+
+            assert!(
+                !extract_upsert_options(&options).remove_duplicates,
+                "{value:?} must not enable deduplication"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_with_upsert_dedup_if_needed_leaves_the_provider_alone_when_off() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let options: HashMap<String, String> = HashMap::new();
+
+        let wrapped = wrap_with_upsert_dedup_if_needed(inner, &options, pk_constraints());
+        assert!(
+            !wrapped.is::<UpsertDedupTableProvider>(),
+            "no dedup requested, so no wrapper"
+        );
+    }
+
+    #[test]
+    fn wrap_with_upsert_dedup_if_needed_wraps_for_either_flag() {
+        for key in ["upsert_remove_duplicates", "upsert_last_write_wins"] {
+            let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+            let options: HashMap<String, String> = [(key.to_string(), "true".to_string())]
+                .into_iter()
+                .collect();
+
+            let wrapped = wrap_with_upsert_dedup_if_needed(inner, &options, pk_constraints());
+            assert!(
+                wrapped.is::<UpsertDedupTableProvider>(),
+                "{key} must install the dedup wrapper"
+            );
+        }
+    }
+
+    /// The wrapper reports its own constraints (the inner accelerator provider
+    /// may not expose them), and reports `None` — not an empty set — when there
+    /// are none, matching what `TableProvider` callers expect.
+    #[test]
+    fn constraints_are_reported_from_the_wrapper_and_none_when_empty() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let keyed = UpsertDedupTableProvider::new(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            last_write_wins(),
+            pk_constraints(),
+        );
+        assert_eq!(keyed.constraints(), Some(&pk_constraints()));
+
+        let keyless = UpsertDedupTableProvider::new(
+            inner as Arc<dyn TableProvider>,
+            last_write_wins(),
+            Constraints::default(),
+        );
+        assert!(keyless.constraints().is_none());
+    }
+
+    /// Deduplication is a *write*-side transform: reads must pass straight
+    /// through, schema and statistics included, or the optimizer would plan
+    /// against numbers the wrapper invented.
+    #[tokio::test]
+    async fn reads_pass_through_to_the_inner_provider() {
+        let inner = Arc::new(
+            MemTable::try_new(schema(), vec![vec![batch(&[(1, "a"), (2, "b")])]])
+                .expect("memtable"),
+        );
+        let provider = UpsertDedupTableProvider::new(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            last_write_wins(),
+            pk_constraints(),
+        );
+
+        assert_eq!(provider.schema(), inner.schema());
+        assert_eq!(provider.table_type(), inner.table_type());
+        assert_eq!(provider.statistics(), inner.statistics());
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(
+            rows_of(plan).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// With `last_write_wins`, the *last* row for a key is the one written.
+    /// Keeping the first would resurrect a value the source already replaced.
+    #[tokio::test]
+    async fn last_write_wins_keeps_the_final_row_for_each_key() {
+        let input = source(&[vec![batch(&[
+            (1, "first"),
+            (2, "only"),
+            (1, "second"),
+            (1, "third"),
+        ])]]);
+        let dedup = Arc::new(UpsertDedupExec::new(
+            input,
+            pk_constraints(),
+            last_write_wins(),
+        ));
+
+        assert_eq!(
+            rows_of(dedup).await,
+            vec![(1, "third".to_string()), (2, "only".to_string())]
+        );
+    }
+
+    /// `remove_duplicates` collapses rows that are identical in *every* column.
+    #[tokio::test]
+    async fn remove_duplicates_collapses_fully_identical_rows() {
+        let input = source(&[vec![batch(&[(1, "a"), (1, "a"), (2, "b")])]]);
+        let dedup = Arc::new(UpsertDedupExec::new(
+            input,
+            pk_constraints(),
+            remove_duplicates(),
+        ));
+
+        assert_eq!(
+            rows_of(dedup).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// Two different rows sharing a primary key are a genuine constraint
+    /// violation that `remove_duplicates` alone cannot resolve. It must surface
+    /// as an error rather than silently picking a winner.
+    #[tokio::test]
+    async fn remove_duplicates_errors_on_a_conflicting_key() {
+        let input = source(&[vec![batch(&[(1, "a"), (1, "b")])]]);
+        let dedup = Arc::new(UpsertDedupExec::new(
+            input,
+            pk_constraints(),
+            remove_duplicates(),
+        ));
+
+        let ctx = Arc::new(TaskContext::default());
+        assert!(
+            collect(dedup, ctx).await.is_err(),
+            "conflicting rows for one key must not be silently deduplicated"
+        );
+    }
+
+    /// A batch with no conflicts must come through byte-for-byte, in order.
+    #[tokio::test]
+    async fn a_conflict_free_batch_is_passed_through_unchanged() {
+        let input = source(&[vec![batch(&[(1, "a"), (2, "b"), (3, "c")])]]);
+        let dedup = Arc::new(UpsertDedupExec::new(
+            input,
+            pk_constraints(),
+            last_write_wins(),
+        ));
+
+        assert_eq!(
+            rows_of(dedup).await,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string())
+            ]
+        );
+    }
+
+    /// Deduplication is scoped to one batch: each batch is a separate write
+    /// statement, and the accelerator's own `ON CONFLICT` resolves a key that
+    /// reappears in a later batch. Both batches must therefore reach the sink.
+    #[tokio::test]
+    async fn deduplication_is_scoped_to_a_single_batch() {
+        let input = source(&[vec![
+            batch(&[(1, "first"), (1, "second")]),
+            batch(&[(1, "third")]),
+        ]]);
+        let dedup = Arc::new(UpsertDedupExec::new(
+            input,
+            pk_constraints(),
+            last_write_wins(),
+        ));
+
+        assert_eq!(
+            rows_of(dedup).await,
+            vec![(1, "second".to_string()), (1, "third".to_string())],
+            "each batch deduplicates independently"
+        );
+    }
+
+    /// The dedup node must sit between the input and the accelerator's sink, or
+    /// duplicate keys reach an `ON CONFLICT DO UPDATE` that cannot touch the
+    /// same row twice in one statement.
+    #[tokio::test]
+    async fn insert_into_installs_the_dedup_node_above_the_inner_sink() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let provider = UpsertDedupTableProvider::new(
+            inner as Arc<dyn TableProvider>,
+            last_write_wins(),
+            pk_constraints(),
+        );
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                source(&[vec![batch(&[(1, "a")])]]),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        assert!(
+            plan_contains(&plan, "UpsertDedupExec"),
+            "dedup node missing from the write plan"
+        );
+    }
+
+    /// Without a key there is nothing to deduplicate *by*. Installing the node
+    /// anyway would be a no-op at best; the wrapper must hand the write
+    /// straight to the accelerator.
+    #[tokio::test]
+    async fn insert_into_skips_the_dedup_node_when_there_are_no_constraints() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let provider = UpsertDedupTableProvider::new(
+            inner as Arc<dyn TableProvider>,
+            last_write_wins(),
+            Constraints::default(),
+        );
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                source(&[vec![batch(&[(1, "a")])]]),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        assert!(!plan_contains(&plan, "UpsertDedupExec"));
+    }
+
+    /// A wrapper built with both flags off must not alter the write path at
+    /// all, even though it is still in the provider chain.
+    #[tokio::test]
+    async fn insert_into_skips_the_dedup_node_when_both_flags_are_off() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let provider = UpsertDedupTableProvider::new(
+            inner as Arc<dyn TableProvider>,
+            UpsertOptions::default(),
+            pk_constraints(),
+        );
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                source(&[vec![batch(&[(1, "a")])]]),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+
+        assert!(!plan_contains(&plan, "UpsertDedupExec"));
+    }
+
+    /// End-to-end: the rows that land in the accelerator are the deduplicated
+    /// ones, and the dedup node's output schema still matches the table's (a
+    /// mismatch would fail the write instead of just dropping duplicates).
+    #[tokio::test]
+    async fn an_insert_through_the_wrapper_lands_only_the_winning_rows() {
+        let inner = Arc::new(MemTable::try_new(schema(), vec![vec![]]).expect("memtable"));
+        let provider = UpsertDedupTableProvider::new(
+            Arc::clone(&inner) as Arc<dyn TableProvider>,
+            last_write_wins(),
+            pk_constraints(),
+        );
+
+        let ctx = SessionContext::new();
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                source(&[vec![batch(&[(1, "old"), (2, "keep"), (1, "new")])]]),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+        collect(plan, ctx.task_ctx()).await.expect("insert runs");
+
+        let scan = inner
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        assert_eq!(
+            rows_of(scan).await,
+            vec![(1, "new".to_string()), (2, "keep".to_string())]
+        );
+    }
+
+    /// `with_new_children` must carry the constraints and options across, or a
+    /// plan rewrite (repartitioning, coalescing) would quietly disable
+    /// deduplication.
+    #[tokio::test]
+    async fn with_new_children_preserves_the_dedup_configuration() {
+        let dedup = Arc::new(UpsertDedupExec::new(
+            source(&[vec![batch(&[(1, "a")])]]),
+            pk_constraints(),
+            last_write_wins(),
+        ));
+
+        let rebuilt = Arc::clone(&dedup)
+            .with_new_children(vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])])
+            .expect("rebuild with one child");
+
+        assert_eq!(rows_of(rebuilt).await, vec![(1, "second".to_string())]);
+    }
+
+    #[test]
+    fn with_new_children_rejects_the_wrong_child_count() {
+        let dedup = Arc::new(UpsertDedupExec::new(
+            source(&[vec![batch(&[(1, "a")])]]),
+            pk_constraints(),
+            last_write_wins(),
+        ));
+
+        Arc::clone(&dedup)
+            .with_new_children(vec![])
+            .expect_err("no children must be rejected");
+        dedup
+            .with_new_children(vec![
+                source(&[vec![batch(&[(1, "a")])]]),
+                source(&[vec![batch(&[(2, "b")])]]),
+            ])
+            .expect_err("two children must be rejected");
+    }
+}
