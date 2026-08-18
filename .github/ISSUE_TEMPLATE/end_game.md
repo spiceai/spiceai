@@ -60,7 +60,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
        - Workflow to execute: `bench`
        - All other values left empty.
-     - [ ] Manually run the DynamoDB benchmarks with the [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) workflow:
+     - [ ] If the full dispatch did not include DynamoDB, manually run these benchmarks with the [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) workflow (do not run them twice):
        - [ ] `accelerated/dynamodb-arrow.yaml` (`tpch`, scale factor `1`, ready wait `600`)
        - [ ] `accelerated/dynamodb-duckdb[file].yaml` (`tpch`, scale factor `1`, query overrides `duckdb`, ready wait `600`)
        - [ ] `federated/dynamodb.yaml` (`tpch`, scale factor `1`, query overrides `dynamodb`, validate results)
