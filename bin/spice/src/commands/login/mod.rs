@@ -475,7 +475,7 @@ fn credentialed_client() -> Result<reqwest::Client> {
 }
 
 /// Get the Spice.ai base URL.
-fn get_spice_base_url() -> String {
+pub(crate) fn spice_base_url() -> String {
     if let Ok(url) = std::env::var("SPICE_BASE_URL") {
         return url;
     }

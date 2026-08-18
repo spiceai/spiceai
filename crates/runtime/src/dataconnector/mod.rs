@@ -14,139 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
-use crate::component::dataset::DatasetSpec;
-use crate::component::dataset::acceleration::RefreshMode;
 // A second alias for the `runtime-parameters` types, kept crate-visible for the
 // same reason as the `parameters` alias itself: it would otherwise be a way for
 // a connector to name them without depending on the crate that owns them.
 pub(crate) use crate::parameters::ParameterSpec;
 pub(crate) use crate::parameters::Parameters;
-use arrow_schema::SchemaRef;
-use async_trait::async_trait;
-use data_components::cdc::{AccelerationContents, ChangesStream};
-use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
-use data_connector_api::federated::FederatedTableProvider;
-use datafusion::datasource::TableProvider;
-use linkme::distributed_slice;
-pub use parameters::ConnectorParams;
-use runtime_metrics::component::MetricsProvider;
-use std::any::Any;
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
-
-use std::future::Future;
-use std::time::Duration;
 
 pub mod client_identity;
 // Re-exports `data-http-rate-control`; crate-visible so a connector outside the
 // runtime depends on that crate directly instead of routing through here.
 pub(crate) mod http_rate_control;
-pub mod listing;
-
-/// Creates a default reqwest client with standard Spice settings.
-///
-/// # Errors
-///
-/// Returns an error if the client cannot be built.
-pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
-    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-
-    let mut headers = HeaderMap::new();
-    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
-
-    reqwest::Client::builder()
-        .user_agent(util::spiceai_user_agent())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .default_headers(headers)
-        .build()
-}
-
-#[derive(Clone, Copy)]
-pub struct DataConnectorRegistration {
-    pub name: &'static str,
-    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
-}
-
-impl DataConnectorRegistration {
-    pub const fn new(
-        name: &'static str,
-        constructor: fn() -> Arc<dyn DataConnectorFactory>,
-    ) -> Self {
-        Self { name, constructor }
-    }
-}
-
-/// Distributed slice that automatically collects all data connector registrations at link time
-/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
-#[distributed_slice]
-pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
-
-/// Registers a data connector factory by name.
-///
-/// This macro creates a constructor function for the specified connector factory type and
-/// registers it in the global distributed slice of data connectors. This allows
-/// the runtime to discover and instantiate connectors without updating a central registry.
-///
-/// # Example (simple form)
-///
-/// ```
-/// register_data_connector!("file", FileFactory);
-/// ```
-///
-/// # Example (explicit form)
-///
-/// ```
-/// register_data_connector!(
-///     register_file_connector,
-///     FILE_CONNECTOR_REGISTRATION,
-///     "file",
-///     FileFactory
-/// );
-/// ```
-///
-/// Using this macro automatically adds the connector to the distributed slice,
-/// making it available for discovery by the runtime.
-///
-/// # Linking (connectors in their own crate)
-///
-/// The registration this generates is a `#[linkme::distributed_slice]` static, and a static
-/// is included only when its crate is actually linked — merely being a Cargo dependency is
-/// **not** enough, because the linker drops the unreferenced static. So a connector defined in
-/// its own crate (e.g. a `connector-*` crate) must be **force-linked** in every binary/tool that
-/// should see it, via `use <crate> as _;`: currently `bin/spiced` (so `register_all()` registers
-/// it) and `tools/spicepodschema` (so it appears in the generated schema). Miss that line and the
-/// connector silently vanishes from both. Connectors defined inside `runtime` itself need nothing
-/// extra, since `runtime` is always linked.
-#[macro_export]
-macro_rules! register_data_connector {
-    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
-        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
-            <$factory>::new_arc()
-        }
-
-        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
-        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
-            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
-    };
-
-    ($name:expr, $factory:ident) => {
-        ::paste::paste! {
-            $crate::register_data_connector!(
-                [<__register_data_connector_fn_ $factory:snake>],
-                [<__REGISTER_DATA_CONNECTOR_ $factory:upper>],
-                $name,
-                $factory
-            );
-        }
-    };
-}
 
 // abfs: moved to crates/data-connectors/connector-abfs
 // #[deprecated] pub mod abfs;
@@ -181,26 +63,19 @@ pub mod parameters;
 pub mod refresh_source;
 pub mod s3;
 // Re-exports `data-connector-api`'s projection parser; crate-visible so a
-// connector outside the runtime depends on that crate directly. Shadowing the
-// same-named module the `data_connector_api::*` glob below would otherwise
-// re-export is the point: it is what withdraws `runtime::dataconnector::
-// schema_projection` from the public API, and a glob cannot exclude a name.
-#[expect(
-    hidden_glob_reexports,
-    reason = "deliberately withdraws the path so connectors name `data-connector-api` directly"
-)]
+// connector outside the runtime depends on that crate directly.
 pub(crate) mod schema_projection;
 pub mod sink;
 // spiceai: registration moved to crates/data-connectors/connector-spiceai; module kept for catalog connector
 pub mod spiceai;
 
-// The connector contract — the component configuration a connector is built for
-// and the errors it reports — lives in `data-connector-api`, below `runtime`, so
-// connector crates can name it without depending on the orchestrator. Re-exported
-// here so existing `crate::dataconnector::…` paths keep resolving.
-pub use data_connector_api::*;
-
-pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
+// The connector contract lives in `data-connector-api`, below `runtime`.
+// Crate-visible, not public: a public re-export would be a second path to every
+// contract item, and anything reached through `runtime` re-acquires the
+// dependency on the orchestrator that the inversion just removed — invisibly to
+// the layering guard, which only sees the `runtime` edge. Everything outside
+// this crate names `data-connector-api` directly.
+pub(crate) use data_connector_api::*;
 
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
@@ -229,6 +104,7 @@ pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFa
 pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
+    context: &dyn ConnectorContext,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let factory = {
         let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
@@ -258,7 +134,7 @@ pub async fn create_new_connector(
         .into()));
     }
 
-    let result = factory.create(params).await;
+    let result = factory.create(params, context).await;
     Some(result)
 }
 
@@ -549,7 +425,13 @@ impl From<&Catalog> for ConnectorComponent {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use datafusion::datasource::TableProvider;
     use datafusion_table_providers::UnsupportedTypeAction;
+    use runtime_component::dataset::DatasetSpec;
+    use std::any::Any;
+    use std::future::Future;
+    use std::pin::Pin;
     use tokio::runtime::Handle;
     use tokio::sync::{Barrier, RwLock};
     use tokio::time::{Duration, timeout};
@@ -598,10 +480,11 @@ mod tests {
             fn as_any(&self) -> &dyn Any {
                 self
             }
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 unimplemented!("static_schema must not require create()")
             }
             fn prefix(&self) -> &'static str {
@@ -642,10 +525,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 Box::pin(async {
                     let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
                     Ok(connector)
@@ -676,6 +560,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
+                _context: &dyn ConnectorContext,
                 _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
@@ -721,10 +606,11 @@ mod tests {
                 self
             }
 
-            fn create(
-                &self,
+            fn create<'a>(
+                &'a self,
                 _params: ConnectorParams,
-            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                _context: &'a dyn ConnectorContext,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
                 let barrier = Arc::clone(&self.barrier);
 
                 Box::pin(async move {
@@ -755,6 +641,7 @@ mod tests {
 
             async fn read_provider(
                 &self,
+                _context: &dyn ConnectorContext,
                 _dataset: &DatasetSpec,
             ) -> DataConnectorResult<Arc<dyn TableProvider>> {
                 unimplemented!()
@@ -781,13 +668,20 @@ mod tests {
             Arc::clone(&secrets),
         )
         .await;
-        let params_two =
-            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
+        let params_two = build_test_connector_params(
+            "test_concurrent",
+            "second",
+            Arc::clone(&app),
+            Arc::clone(&runtime),
+            secrets,
+        )
+        .await;
+        let context = parameters::RuntimeConnectorContext::new(app, runtime);
 
-        let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
+        let (result_one, result_two) = timeout(Duration::from_secs(5), async {
             tokio::join!(
-                create_new_connector("test_concurrent", params_one),
-                create_new_connector("test_concurrent", params_two),
+                create_new_connector("test_concurrent", params_one, &context),
+                create_new_connector("test_concurrent", params_two, &context),
             )
         })
         .await
@@ -818,6 +712,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("capability-forwarding test never reads")
@@ -862,7 +757,6 @@ mod tests {
             Arc::clone(&inner),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
             Arc::new(RwLock::new(Secrets::default())),
-            std::sync::Weak::new(),
         );
         assert!(
             embedding.supports_durable_write_back_delivery(),

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::dataconnector::ConnectorComponent;
+use data_connector_api::ConnectorComponent;
 use runtime_datafusion::error::find_datafusion_root;
 
 use super::{
@@ -559,9 +559,9 @@ mod tests {
     use super::{PullRequestCommentType, PullRequestTableArgs};
     use crate::{GitHubQueryMode, GitHubTableArgs};
     use app::AppBuilder;
+    use data_connector_api::ConnectorComponent;
     use runtime::builder::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
-    use runtime::dataconnector::ConnectorComponent;
     use std::sync::{Arc, OnceLock};
 
     /// Building a `ConnectorComponent` requires a full runtime + app

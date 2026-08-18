@@ -27,6 +27,7 @@ arrow.workspace = true
 arrow-odbc.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 datafusion.workspace = true
 data_components = { path = "../../data_components", features = ["federation"] }
 datafusion-table-providers.workspace = true
@@ -35,7 +36,6 @@ futures.workspace = true
 linkme.workspace = true
 odbc-api.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-udfs-api = { path = "../../runtime-udfs-api" }
@@ -49,6 +49,9 @@ util.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true
