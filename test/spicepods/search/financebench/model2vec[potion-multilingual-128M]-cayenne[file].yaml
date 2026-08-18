@@ -21,10 +21,6 @@ datasets:
         s3_endpoint: ${secrets:S3_ENDPOINT}
         s3_key: ${secrets:S3_KEY}
         s3_secret: ${secrets:S3_SECRET}
-    acceleration:
-      enabled: true
-      engine: cayenne
-      mode: file
 
   - from: s3://benchmarks/financebench/queries.parquet
     name: test_queries
@@ -48,8 +44,15 @@ views:
   # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
   # under. Each page embeds to one vector — model2vec is a static, context-free model, so a whole
   # page never truncates, and one vector per page maps directly onto the page-level qrels.
+  # Acceleration lives here, not on corpus_pdfs: the embeddings are a column of this view, so only
+  # a refresh against the view itself scans through them and materializes the vectors before
+  # readiness.
   - name: corpus
     sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
     columns:
       - name: text
         embeddings:

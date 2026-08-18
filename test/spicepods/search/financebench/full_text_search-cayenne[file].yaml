@@ -21,10 +21,6 @@ datasets:
         s3_endpoint: ${secrets:S3_ENDPOINT}
         s3_key: ${secrets:S3_KEY}
         s3_secret: ${secrets:S3_SECRET}
-    acceleration:
-      enabled: true
-      engine: cayenne
-      mode: file
 
   - from: s3://benchmarks/financebench/queries.parquet
     name: test_queries
@@ -46,9 +42,15 @@ views:
   # The searchable corpus. Stripping everything up to and including `corpus_pages/` turns the raw
   # `location` into the portable `<doc>/pNNNN.pdf` key, so the search primary key equals the
   # `corpus-id` that relevance_data carries — independent of the bucket or prefix the PDFs live
-  # under. `content AS text` matches the column name the search harness reports on.
+  # under. `content AS text` matches the column name the search harness reports on. Acceleration
+  # lives here, not on corpus_pdfs: the full-text index is a column of this view, so only a refresh
+  # against the view itself scans through it and populates the index before readiness.
   - name: corpus
     sql: SELECT regexp_replace(location, '^.*corpus_pages/', '') AS _id, content AS text FROM corpus_pdfs
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
     columns:
       - name: text
         full_text_search:
