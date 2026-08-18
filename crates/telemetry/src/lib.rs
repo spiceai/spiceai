@@ -1196,7 +1196,9 @@ pub mod cayenne {
     /// Counts compaction passes that failed because the dedicated compaction memory
     /// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
     /// means the carve fraction is too small for the rewrite working set.
-    /// `dimensions` should carry `table` and `kind` (`"full"` | `"subset"`).
+    /// `dimensions` should carry `table` and `kind`, using the same values as
+    /// [`track_compaction_duration`] — the pass kinds that reserve from the pool
+    /// are `"full"`, `"subset"`, `"datalake"` and `"bake"`.
     pub fn track_compaction_memory_exhausted(dimensions: &[KeyValue]) {
         compaction_memory_exhausted().add(1, dimensions);
     }
