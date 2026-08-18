@@ -1353,7 +1353,7 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
     source
         .execute("INSERT INTO public.slot_lost_live VALUES (3, 'carol')", &[])
         .await?;
-    expect_single_change(&mut stream, "the pre-loss insert", "Insert", 3).await?;
+    expect_single_change(&mut stream, "the pre-loss insert", "c", 3).await?;
     // The recorded position is what the replacement slot will be unable to reach,
     // so the loss has to happen after one exists. Written by a background task
     // after the commit above proved durable, so poll for it rather than assuming
@@ -1420,7 +1420,7 @@ async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<()
         "the acceleration must be asked to rebuild once per lost slot, not once per reconnect \
          attempt — a rebuild loop re-reads the whole source table on a cycle"
     );
-    assert_eq!(ops_of(&resumed), vec!["Insert".to_string()]);
+    assert_eq!(ops_of(&resumed), vec!["c".to_string()]);
     assert_eq!(ids_of(&resumed), vec![4]);
     resumed.commit().await?;
 

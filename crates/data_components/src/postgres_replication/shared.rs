@@ -2919,6 +2919,9 @@ async fn run_pump(source: Arc<SharedSource>) {
     // Declared outside the reconnect loop so the bound is over the pump's life,
     // not per attempt.
     let mut slot_replacements = SlotReplacementBudget::new();
+    // Set when a connection reports the slot unusable, and acted on at the top of
+    // the reconnect loop — see there for why the two are separated.
+    let mut slot_unusable = false;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
@@ -2955,6 +2958,41 @@ async fn run_pump(source: Arc<SharedSource>) {
             write_published_positions(&source).await;
             drop_slot_if_ephemeral(&source).await;
             return;
+        }
+        // Replace a slot the previous connection reported unusable, before building
+        // a config that would ask the same dead slot for changes.
+        //
+        // Deliberately here rather than where the refusal surfaces.
+        // `ReplicationClient::connect` only spawns a worker — `START_REPLICATION`
+        // runs inside it, so the refusal always arrives through `recv`, with that
+        // connection still live. `PostgreSQL` refuses to drop a slot an active
+        // walsender holds, and the client is dropped when the recv loop exits, so
+        // this is the first point at which the drop can succeed.
+        if std::mem::take(&mut slot_unusable) {
+            disconnect_at.get_or_insert_with(std::time::Instant::now);
+            if slot_replacements.admit(std::time::Instant::now()) {
+                if let Err(reason) = recover_unusable_slot(&source).await {
+                    fatal_broadcast(
+                        &source,
+                        format!(
+                            "Failed to replace PostgreSQL replication slot `{slot_name}` after the server stopped streaming from it: {reason}. The slot cannot supply changes and cannot be replaced, so this dataset has no source of changes. Check that the replication user may drop and create replication slots, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres"
+                        ),
+                    )
+                    .await;
+                    break 'reconnect;
+                }
+                backoff.reset();
+            } else {
+                fatal_broadcast(
+                    &source,
+                    format!(
+                        "Failed to stream changes from PostgreSQL replication slot `{slot_name}`: it has stopped supplying changes {MAX_SLOT_REPLACEMENTS} times within {window_minutes} minutes, so the source is not retaining enough WAL to cover this dataset and replacing the slot again would only repeat. Raise max_slot_wal_keep_size on the source, or reduce replication lag, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres",
+                        window_minutes = SLOT_INVALIDATION_WINDOW.as_secs() / 60,
+                    ),
+                )
+                .await;
+                break 'reconnect;
+            }
         }
         source.reap_closed_members();
         if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
@@ -2995,35 +3033,6 @@ async fn run_pump(source: Arc<SharedSource>) {
                 // promote them to routable + creditable.
                 source.ack.promote_ready_members();
                 c
-            }
-            // The slot can no longer supply changes — invalidated, or dropped out
-            // from under us. Neither a retry nor the end of the dataset: the slot
-            // can be replaced and every acceleration on it rebuilt from the source.
-            Err(e) if resilience::is_slot_unusable(&e) => {
-                disconnect_at.get_or_insert_with(std::time::Instant::now);
-                if !slot_replacements.admit(std::time::Instant::now()) {
-                    fatal_broadcast(
-                        &source,
-                        format!(
-                            "Failed to stream changes from PostgreSQL replication slot `{slot_name}`: PostgreSQL has invalidated it {MAX_SLOT_REPLACEMENTS} times within {window_minutes} minutes, so the source is not retaining enough WAL to cover this dataset and replacing the slot again would only repeat. Raise max_slot_wal_keep_size on the source, or reduce replication lag, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres",
-                            window_minutes = SLOT_INVALIDATION_WINDOW.as_secs() / 60,
-                        ),
-                    )
-                    .await;
-                    break 'reconnect;
-                }
-                if let Err(reason) = recover_unusable_slot(&source).await {
-                    fatal_broadcast(
-                        &source,
-                        format!(
-                            "Failed to replace PostgreSQL replication slot `{slot_name}` after the server invalidated it: {reason}. The slot cannot stream and cannot be replaced, so this dataset has no source of changes. Check that the replication user may drop and create replication slots, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres"
-                        ),
-                    )
-                    .await;
-                    break 'reconnect;
-                }
-                backoff.reset();
-                continue 'reconnect;
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
                 // Mark the outage start on the first failed attempt so a boot-time /
@@ -3189,15 +3198,18 @@ async fn run_pump(source: Arc<SharedSource>) {
                 Acquired::CleanClose => break 'recv,
                 Acquired::RecvError(e) => {
                     source.for_each_member_metrics(ReplicationMetricsCollector::inc_recv_error);
-                    // The slot became unusable mid-stream. Reconnect rather than
-                    // recover here:
-                    // the replacement is driven from the connect path, where
-                    // `START_REPLICATION` reports the refusal authoritatively and
-                    // nothing is routed to a member while the slot is swapped.
-                    // (`PostgreSQL` more usually kills the walsender to release the
-                    // slot, which arrives as the admin-shutdown shape that
-                    // `is_transient_pgwire` already reconnects on.)
-                    if resilience::is_slot_unusable(&e) || resilience::is_transient_pgwire(&e) {
+                    // The slot can no longer supply changes. Note it and break to
+                    // the reconnect loop, which replaces it *before* connecting
+                    // again — the replacement cannot happen here, because this
+                    // connection's walsender must be gone first and `client` is
+                    // dropped when this loop exits. Reconnecting without replacing
+                    // would ask the same dead slot for changes forever.
+                    if resilience::is_slot_unusable(&e) {
+                        slot_unusable = true;
+                        source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
+                        break 'recv;
+                    }
+                    if resilience::is_transient_pgwire(&e) {
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         reconnect_attempts = reconnect_attempts.saturating_add(1);
                         client::log_transient_reconnect(
