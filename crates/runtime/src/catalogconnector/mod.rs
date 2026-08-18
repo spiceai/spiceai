@@ -171,17 +171,11 @@ pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
 
-// Process-global and shared by every `Runtime` in the process — including,
-// in the integration test binary, many `Runtime`s built and torn down
-// concurrently. `CatalogConnectorFactory` wraps only a `fn` pointer and
-// `&'static` metadata, so entries are safe to leave registered for the life
-// of the process; there is no `unregister_all()` and `Runtime::shutdown()`
-// must not add one. If a factory is ever added that owns a live resource (a
-// cached connection pool, like `DuckDBTableProviderFactory.instances`),
-// clearing this map on one `Runtime`'s shutdown would drop that resource out
-// from under every other `Runtime` still using it — give that factory type
-// its own scoped registry, instance-scoped like `AcceleratorEngineRegistry`,
-// instead.
+// `CatalogConnectorFactory` wraps only a `fn` pointer and `&'static`
+// metadata, safe to leave registered for the process's lifetime.
+// `Runtime::shutdown()` must not clear this — a future factory that holds a
+// live resource (a cached connection pool) needs its own instance-scoped
+// registry, like `AcceleratorEngineRegistry`, not an `unregister_all()` here.
 pub(crate) static CATALOG_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, CatalogConnectorFactory>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -357,6 +351,15 @@ pub async fn register_all() {
             adbc::PARAMETERS,
         ),
     );
+}
+
+// Test-only: production never clears this registry (see the comment atop
+// `CATALOG_CONNECTOR_FACTORY_REGISTRY`). Callers run under `REGISTRY_TEST_LOCK`
+// so they don't race each other's view of the shared static.
+#[cfg(test)]
+async fn unregister_all() {
+    let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    registry.clear();
 }
 
 pub(crate) struct CatalogConnectorFactory {

@@ -61,8 +61,8 @@ static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DocumentParserFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-// [`DocumentParserFactory`] added here should not hold live resources (e.g. cached connections pools). 
-// If a factory is ever added that owns a live resource, must reimplement a `unregister_all`. 
+// [`DocumentParserFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;

@@ -202,17 +202,11 @@ pub use data_connector_api::*;
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-// Process-global and shared by every `Runtime` in the process — including,
-// in the integration test binary, many `Runtime`s built and torn down
-// concurrently. Every registered `DataConnectorFactory` today (`S3Factory`,
-// `FileFactory`, `IcebergDataConnectorFactory`, ...) is a zero-field struct,
-// so entries are safe to leave registered for the life of the process; there
-// is no `unregister_all()` and `Runtime::shutdown()` must not add one. If a
-// factory is ever added that owns a live resource (a cached connection pool,
-// like `DuckDBTableProviderFactory.instances`), clearing this map on one
-// `Runtime`'s shutdown would drop that resource out from under every other
-// `Runtime` still using it — give that factory type its own scoped registry,
-// instance-scoped like `AcceleratorEngineRegistry`, instead.
+// Every factory here is a stateless, zero-field struct (`S3Factory`,
+// `FileFactory`, ...), safe to leave registered for the process's lifetime.
+// `Runtime::shutdown()` must not clear this — a future factory that holds a
+// live resource (a cached connection pool) needs its own instance-scoped
+// registry, like `AcceleratorEngineRegistry`, not an `unregister_all()` here.
 static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -906,12 +900,10 @@ mod tests {
 
     #[tokio::test]
     async fn shutting_down_one_runtime_does_not_deregister_connectors_for_another() {
-        // `DATA_CONNECTOR_FACTORY_REGISTRY` is a process-global static shared by
-        // every `Runtime` — including, in the integration test binary, many
-        // `Runtime`s built and torn down concurrently. Regression test for the
-        // `s3` connector race that flaked `search::test_megascience_permutations`
-        // in CI: shutting one `Runtime` down must not deregister connectors a
-        // sibling `Runtime` still relies on.
+        // Regression test for the `s3` connector race that flaked
+        // `search::test_megascience_permutations` in CI: shutting one
+        // `Runtime` down must not deregister connectors a sibling `Runtime`
+        // still relies on.
         let rt_a = crate::Runtime::builder().build().await;
         let rt_b = crate::Runtime::builder().build().await;
 
