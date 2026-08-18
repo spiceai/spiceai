@@ -1,0 +1,14 @@
+# DuckDB side of the SF100 accelerator A/B against mysql-cayenne[file]-adaptive.
+# Uses the -matched pod, which holds Flight IPC compression constant with that Cayenne config;
+# the plain mysql-duckdb[file] pod leaves it at the default and is on the scheduled SF1/SF1000
+# batches, so it is left alone rather than changed under a live time series.
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-duckdb[file]-matched.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    query_overrides: duckdb
+    rate: 10000

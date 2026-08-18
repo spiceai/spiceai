@@ -1,0 +1,12 @@
+# MySQL-source counterpart to sf100/postgres-cayenne[file]-adaptive.yaml, with the
+# same inputs — so the pair isolates the CDC source (binlog vs logical replication).
+# No accelerator override, so both measure the full 22-query set.
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-cayenne[file]-adaptive.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    rate: 10000

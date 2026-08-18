@@ -22,6 +22,17 @@ not_ready phase=preparing_source phase_s=412
 
 Phases are `starting`, `preparing_source`, `waiting_for_spiced`, `running` (the only ready one), `finalizing` and `finished`. Failing to bind is a warning, never a failed run.
 
+### Query overrides across an HTAP run's two phases
+
+An HTAP run queries two different sets of engines, so it takes two override flags:
+
+- `--query-overrides` decides the **measured** query set (QPH, per-query latency). Those queries only ever run against `spiced`, so this names the accelerator under test alone. Two runs differing only in their source therefore measure the same queries and stay comparable.
+- `--source-query-overrides` (HTAP-only) adds the **source** engine's overrides, and applies solely to the analytical-correctness gate — the one phase that executes each query against the source as well as `spiced`, to diff the results. The gate takes the union of the two, so a query the source cannot serve is excluded from it without shrinking the measured set.
+
+Commands that never query a source reject `--source-query-overrides` outright rather than accepting it and doing nothing.
+
+Comparing two **accelerators** needs one more step. QPH counts completed queries, so it only compares across runs that measure the same mix — and an accelerator that can serve a query its partner cannot would otherwise measure a larger set. Give both runs the same exclusions: `chbench-duckdb-parity` is `--query-overrides` for a non-DuckDB run paired against a DuckDB baseline, excluding exactly what DuckDB excludes. The SF100 CH-benCH pairs in `dispatch/chbench/sf100/` are set up this way.
+
 ## Common Options
 
 - `-p, --spicepod-path <SPICEPOD_PATH>`: Path to the `spicepod.yaml` file.
@@ -40,7 +51,7 @@ Run standard benchmarks using the `testoperator run bench [OPTIONS]` command. In
 
 - `--query-set <QUERY_SET>`: The query set to use for the test. Possible values: `tpch`, `tpcds`, `clickbench`, `tpch[parameterized]`, `integration[http]`, `scenario`.
 - `--scenario-query-file <FILE_PATH>`: Path to a YAML file containing custom scenario queries. Required when `--query-set scenario` is specified.
-- `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides. Possible values: `sqlite`, `postgresql`, `mysql`, `dremio`, `spark`, `odbcathena`, `duckdb`.
+- `--query-overrides <QUERY_OVERRIDES>`: Optional query overrides for the engine the measured queries run against — the accelerator under test, since every measured query is served by `spiced`. This alone decides the measured query set, so two runs differing only in their source (e.g. Postgres vs MySQL feeding Cayenne) measure the same queries and stay comparable. Run `testoperator run bench --help` for the current value list.
 - `--scale-factor <SCALE_FACTOR>`: The expected scale factor for the test, used in metrics calculation.
 - `--validate`: A boolean flag to specify whether results should be validated against their expected results. Supported for `tpch`, `tpch[parameterized]` (scale factor 1 only), and `scenario` query sets (when expected results are defined in the scenario file).
 - `--metrics`: Whether to upload metrics to the Spice OSS benchmarks dashboards. By default, submits to the Production metrics endpoint using the API key specified in the `SPICEAI_BENCHMARK_METRICS_KEY` environment variable. If specified, the metrics delivery endpoint can be overridden with the `SPICEAI_TELEMETRY_ENDPOINT` environment variable.

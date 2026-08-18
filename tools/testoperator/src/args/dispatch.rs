@@ -472,9 +472,16 @@ pub struct HtapDispatchArgs {
     /// Override default number of concurrent analytical query clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u64>,
-    /// Engine-specific query overrides
+    /// Query overrides for the accelerator under test. Decides the measured
+    /// query set, which only ever runs against spiced — so runs that differ only
+    /// in their source stay comparable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_overrides: Option<QueryOverridesArg>,
+    /// Additional query overrides for the source engine, applied only to the
+    /// analytical-correctness gate (which runs each query against the source as
+    /// well as spiced). Never shrinks the measured query set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_query_overrides: Option<QueryOverridesArg>,
     /// Optional target OLTP transaction rate for the OLTP workload (txn/s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<u32>,
@@ -958,5 +965,67 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["benchmark_dataset"], "touche2020_retrieval");
+    }
+
+    /// The accelerator and source overrides must reach the dispatched workflow as
+    /// two distinct inputs, each carrying its own value: collapsing or crossing
+    /// them would shrink the measured query set by whatever the source excludes.
+    /// Distinct values on both fields are what makes a mix-up visible.
+    #[test]
+    fn test_htap_section_carries_accelerator_and_source_overrides_separately() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-duckdb[file].yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 1000
+    terminals: 100
+    duration: 900
+    ready_wait: 900
+    query_overrides: duckdb
+    source_query_overrides: chbench-skip-slow
+    rate: 9250
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let htap = &test_file.tests.htap[0];
+        assert!(matches!(
+            htap.query_overrides,
+            Some(QueryOverridesArg::Duckdb)
+        ));
+        assert!(matches!(
+            htap.source_query_overrides,
+            Some(QueryOverridesArg::ChbenchSkipSlow)
+        ));
+
+        let serialized = serde_json::to_value(htap).expect("Failed to serialize");
+        assert_eq!(serialized["query_overrides"], "duckdb");
+        assert_eq!(serialized["source_query_overrides"], "chbench-skip-slow");
+    }
+
+    /// An unset override is omitted from the payload rather than sent empty, so
+    /// the dispatched workflow falls back to its own default.
+    #[test]
+    fn test_htap_section_omits_unset_query_overrides() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file]-adaptive.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 1000
+    terminals: 100
+    duration: 900
+    ready_wait: 900
+    rate: 9250
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let htap = &test_file.tests.htap[0];
+        assert!(htap.query_overrides.is_none());
+        assert!(htap.source_query_overrides.is_none());
+
+        let serialized = serde_json::to_value(htap).expect("Failed to serialize");
+        assert!(serialized.get("query_overrides").is_none());
+        assert!(serialized.get("source_query_overrides").is_none());
     }
 }

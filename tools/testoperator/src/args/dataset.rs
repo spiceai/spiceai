@@ -83,6 +83,17 @@ pub struct DatasetTestArgs {
     #[arg(long, required_if_eq("query_set", "scenario"))]
     pub(crate) scenario_query_file: Option<PathBuf>,
 
+    /// Query overrides for the engine the measured queries run against — the
+    /// accelerator under test, since every measured query is served by spiced.
+    /// This alone decides the measured query set, so two runs that differ only
+    /// in their source (e.g. Postgres vs `MySQL` feeding Cayenne) measure the
+    /// same queries and stay comparable.
+    ///
+    /// Comparing two *accelerators* needs one more step, because throughput
+    /// counts completed queries and so only compares over an identical mix: a
+    /// run whose partner excludes a query it could serve must exclude it too.
+    /// The `chbench-duckdb-parity` value names that set for a non-DuckDB run
+    /// paired against a `DuckDB` baseline.
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
 
@@ -308,6 +319,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "chbench-skip-slow")]
     #[value(name = "chbench-skip-slow")]
     ChbenchSkipSlow,
+    #[serde(rename = "chbench-duckdb-parity")]
+    #[value(name = "chbench-duckdb-parity")]
+    ChbenchDuckdbParity,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -372,6 +386,17 @@ impl DatasetTestArgs {
     /// Load the query set, handling scenario query sets from files
     pub fn load_query_set(&self) -> anyhow::Result<QuerySet> {
         QuerySetLoader::load_query_set(self)
+    }
+
+    /// Overrides for the engine serving the measured queries (the accelerator).
+    /// Every command's measured queries run against spiced alone, so this is the
+    /// only resolver they need; the HTAP gate additionally folds in the source's
+    /// overrides via [`HtapArgs::resolved_comparison_query_overrides`].
+    ///
+    /// [`HtapArgs::resolved_comparison_query_overrides`]: super::HtapArgs::resolved_comparison_query_overrides
+    #[must_use]
+    pub fn resolved_query_overrides(&self) -> Option<QueryOverrides> {
+        self.query_overrides.clone().map(QueryOverrides::from)
     }
 
     /// The simulated client fleet, when the three fleet flags were given.
@@ -487,6 +512,7 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
             QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
             QueryOverridesArg::ChbenchSkipSlow => QueryOverrides::ChbenchSkipSlow,
+            QueryOverridesArg::ChbenchDuckdbParity => QueryOverrides::ChbenchDuckdbParity,
         }
     }
 }

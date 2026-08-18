@@ -562,14 +562,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             if let Some(reason) = skip_reason {
                 println!("\nSkipping analytical-query gate — {reason}");
             } else {
-                let query_overrides = test_args
-                    .query_overrides
-                    .clone()
-                    .map(test_framework::queries::QueryOverrides::from);
+                // The gate runs every query against the source as well as spiced,
+                // so it excludes what *either* engine cannot serve — unlike the
+                // measured phase above, which only ever queries spiced and so
+                // applies the accelerator's overrides alone.
+                let query_overrides = args.resolved_comparison_query_overrides();
                 let analytical_result = correctness::verify_analytical_results(
                     Arc::clone(&driver),
                     &spice_clients,
-                    query_overrides,
+                    &query_overrides,
                     args.analytic_gate_concurrency,
                 )
                 .await;
@@ -592,10 +593,19 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
-    // For Cayenne backend report additional metrics
+    // For Cayenne backend report additional metrics. One end-of-run scrape serves
+    // both: every series they read is cumulative for the run, so its value here is
+    // the run's total.
     match crate::spiced_metrics::MetricsScraper::scrape_once().await {
-        Ok(final_metrics) => reporting::emit_cayenne_compaction_metrics(&final_metrics),
-        Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
+        Ok(final_metrics) => {
+            reporting::emit_cayenne_compaction_metrics(&final_metrics);
+            reporting::emit_cayenne_operation_metrics(&final_metrics);
+        }
+        // Names both sections this scrape feeds, so a missing operation-counts
+        // table is attributable to the scrape rather than read as "no operations".
+        Err(e) => {
+            eprintln!("Failed to scrape final Cayenne compaction and operation metrics: {e}");
+        }
     }
 
     telemetry.emit().await?;

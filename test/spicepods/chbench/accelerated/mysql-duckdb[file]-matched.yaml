@@ -1,0 +1,210 @@
+version: v1
+kind: Spicepod
+name: mysql-duckdb[file]-matched
+
+# DuckDB baseline for A/B against mysql-cayenne[file]-adaptive, with everything outside the
+# accelerator held constant so a comparison isolates the accelerator itself. The plain
+# mysql-duckdb[file] baseline leaves Flight IPC compression at its default where that Cayenne
+# config sets `lz4_frame`, and that sits on the analytical result path — so the DuckDB side
+# would pay an uncompressed transfer for the same result set, landing in QPH and query latency,
+# the headline metrics the comparison reads.
+#
+# Held constant with that Cayenne config, beyond Flight compression:
+#   - ONE SHARED BINLOG DUMP for every `refresh_mode: changes` dataset. `server_id` is part of
+#     the dump's source key, so distinct explicit `mysql_replication_server_id`s get distinct
+#     dedicated dumps — the plain mysql-duckdb[file] baseline pins seven and pays 7x redundant
+#     server-side binlog decode. Omitting them derives the id from the connection identity, so
+#     the datasets coalesce onto one dump, exactly as the Cayenne config does.
+#   - The four CDC pump knobs pinned under `runtime.params` below. The Cayenne config sets the
+#     same values per-dataset under `acceleration.params` (Cayenne declares them as per-dataset
+#     overrides); these keys are engine-agnostic and read from `runtime.params`, which is where
+#     a DuckDB dataset can reach them.
+#
+# The measured query set must also match, and that is set at dispatch rather than here: this
+# config excludes q21 (`query_overrides: duckdb`), so its Cayenne partner runs with
+# `query_overrides: chbench-duckdb-parity` to measure the same 21 queries.
+#
+# Varying by design: the accelerator, and with it the per-table primary_key / on_conflict
+# declarations — Cayenne infers them from the source, DuckDB needs them declared.
+
+mysql_connection_params: &mysql_params
+  mysql_host: ${env:CHBENCH_MYSQL_HOST}
+  mysql_tcp_port: 3306
+  mysql_db: chbench
+  mysql_user: bench
+  mysql_pass: bench
+  mysql_sslmode: disabled
+
+runtime:
+  flight:
+    ipc_compression: lz4_frame
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+  params:
+    # Matches the values mysql-cayenne[file]-adaptive sets per-dataset: deep prefetch pinned to
+    # the runtime max (16384), plus the higher coalescing byte budget and linger window. Set
+    # here because these are CDC-layer knobs read from `runtime.params`, upstream of whichever
+    # accelerator applies the burst.
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '2000'
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: mysql:warehouse
+    name: warehouse
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+
+  - from: mysql:district
+    name: district
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: mysql:customer
+    name: customer
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+
+  - from: mysql:new_order
+    name: new_order
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: mysql:oorder
+    name: oorder
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: mysql:order_line
+    name: order_line
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: mysql:stock
+    name: stock
+    params:
+      <<: *mysql_params
+      mysql_replication_initial_snapshot: auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: mysql:item
+    name: item
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
+  - from: mysql:region
+    name: region
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+
+  - from: mysql:nation
+    name: nation
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+
+  - from: mysql:supplier
+    name: supplier
+    params:
+      <<: *mysql_params
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+

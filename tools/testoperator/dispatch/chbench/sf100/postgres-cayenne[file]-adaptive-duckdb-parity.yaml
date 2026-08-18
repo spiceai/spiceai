@@ -1,0 +1,19 @@
+# Cayenne side of the SF100 accelerator A/B against postgres-duckdb[file]-4slot.
+#
+# `chbench-duckdb-parity` restricts the measured set to the 21 queries DuckDB can serve.
+# Cayenne can serve all 22, but QPH counts completed queries and so only compares over an
+# identical mix — measuring q21 here and not on the DuckDB side would leave the pair unable
+# to isolate the accelerator, which is the only thing it varies.
+#
+# The unrestricted sf100/postgres-cayenne[file]-adaptive.yaml stays the config to run when
+# Cayenne's own SF100 numbers are what is wanted, rather than a DuckDB comparison.
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file]-adaptive.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    query_overrides: chbench-duckdb-parity
+    rate: 10000

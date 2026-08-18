@@ -36,7 +36,7 @@ on:
         type: string
         default: '4'
       query_overrides:
-        description: 'Query overrides'
+        description: 'Query overrides for the accelerator under test. Decides the measured query set (which only runs against spiced), so runs differing only in their source stay comparable.'
         required: false
         type: choice
         default: ''
@@ -44,6 +44,17 @@ on:
           - ''
           - 'duckdb'
           - 'chbench-skip-slow'
+          - 'chbench-duckdb-parity'
+      source_query_overrides:
+        description: 'Additional query overrides for the source engine, applied only to the analytical-correctness gate (which runs each query on the source as well as spiced). Never shrinks the measured query set.'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'duckdb'
+          - 'chbench-skip-slow'
+          - 'chbench-duckdb-parity'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -182,7 +193,8 @@ jobs:
             echo "| target OLTP rate | ${{ github.event.inputs.rate || 'unlimited' }} |"
             echo "| duration (s) | ${{ github.event.inputs.duration }} |"
             echo "| analytical concurrency | ${{ github.event.inputs.concurrency }} |"
-            echo "| query overrides | ${{ github.event.inputs.query_overrides || 'none' }} |"
+            echo "| query overrides (accelerator) | ${{ github.event.inputs.query_overrides || 'none' }} |"
+            echo "| query overrides (source, gate only) | ${{ github.event.inputs.source_query_overrides || 'none' }} |"
             echo "| runner | ${{ github.event.inputs.runner_type }} |"
             echo "| analytic gate | ${{ github.event.inputs.skip_analytic_gate == 'true' && 'skipped' || 'enabled' }} |"
             echo "| extra spiced env | ${extra_spiced_env} |"
@@ -348,6 +360,7 @@ jobs:
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
+            ${{ github.event.inputs.source_query_overrides != '' && format('--source-query-overrides {0}', github.event.inputs.source_query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \

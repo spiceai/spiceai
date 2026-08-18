@@ -87,10 +87,7 @@ pub(crate) async fn build_test_with_validation(
     test_builder: NotStarted,
 ) -> anyhow::Result<(QuerySet, NotStarted)> {
     let query_set = args.load_query_set()?;
-    let query_overrides = args
-        .query_overrides
-        .clone()
-        .map(test_framework::queries::QueryOverrides::from);
+    let query_overrides = args.resolved_query_overrides();
     let queries = query_set
         .get_queries(query_overrides, None, None, args.scale_factor)
         .await?;
@@ -229,12 +226,13 @@ async fn benchmark_queries(
     args: &DatasetTestArgs,
     query_set: &QuerySet,
 ) -> anyhow::Result<Vec<Query>> {
-    let query_overrides = args
-        .query_overrides
-        .clone()
-        .map(test_framework::queries::QueryOverrides::from);
     query_set
-        .get_queries(query_overrides, None, None, args.scale_factor)
+        .get_queries(
+            args.resolved_query_overrides(),
+            None,
+            None,
+            args.scale_factor,
+        )
         .await
 }
 

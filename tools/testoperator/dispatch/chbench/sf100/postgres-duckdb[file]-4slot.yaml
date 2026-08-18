@@ -1,0 +1,17 @@
+# DuckDB side of the SF100 accelerator A/B against postgres-cayenne[file]-adaptive.
+#
+# The pod holds the 4-slot CDC topology, the CDC pump knobs and Flight IPC compression constant
+# with that Cayenne config. `query_overrides: duckdb` excludes q21, which DuckDB cannot serve
+# (#11011), so the Cayenne side must run the paired
+# postgres-cayenne[file]-adaptive-duckdb-parity.yaml to measure the same 21 queries — QPH counts
+# completed queries and only compares over an identical mix.
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-duckdb[file]-4slot.yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    terminals: 100
+    duration: 600
+    ready_wait: 600
+    query_overrides: duckdb
+    rate: 10000

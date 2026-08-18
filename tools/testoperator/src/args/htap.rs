@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use super::DatasetTestArgs;
+use super::dataset::QueryOverridesArg;
+use test_framework::queries::QueryOverrides;
 
 /// Arguments for the HTAP (Hybrid Transactional/Analytical Processing) test.
 ///
@@ -34,6 +36,19 @@ use super::DatasetTestArgs;
 pub struct HtapArgs {
     #[command(flatten)]
     pub(crate) test_args: DatasetTestArgs,
+
+    /// Additional query overrides for the *source* engine, unioned with
+    /// `--query-overrides` for the analytical-correctness gate only — the one
+    /// phase that executes each query on the source as well as spiced, to diff
+    /// the results. A query the source cannot serve is excluded from the gate
+    /// without shrinking the measured query set, which stays governed by
+    /// `--query-overrides` alone.
+    ///
+    /// HTAP-only, and declared here rather than on the shared [`DatasetTestArgs`]
+    /// so the commands that never query a source reject it outright instead of
+    /// accepting it and silently doing nothing.
+    #[arg(long)]
+    pub(crate) source_query_overrides: Option<QueryOverridesArg>,
 
     /// Override the number of concurrent OLTP terminals (default: `scale_factor` * 10).
     #[arg(long)]
@@ -99,6 +114,25 @@ pub struct HtapArgs {
     pub(crate) analytic_gate_concurrency: usize,
 }
 
+impl HtapArgs {
+    /// Overrides for every engine the analytical-correctness gate touches: the
+    /// accelerator plus the source, since the gate runs each query against both.
+    ///
+    /// The measured phase must not use this — it queries spiced alone, so it
+    /// takes [`DatasetTestArgs::resolved_query_overrides`] and stays comparable
+    /// across sources.
+    #[must_use]
+    pub fn resolved_comparison_query_overrides(&self) -> Vec<QueryOverrides> {
+        self.test_args
+            .query_overrides
+            .clone()
+            .into_iter()
+            .chain(self.source_query_overrides.clone())
+            .map(QueryOverrides::from)
+            .collect()
+    }
+}
+
 /// Parse and validate `--min-phase-coverage`: a fraction in the inclusive range
 /// `0.0..=1.0`. clap only provides ranged value parsers for integer types, so
 /// float bounds are enforced here.
@@ -112,5 +146,77 @@ fn parse_phase_coverage(value: &str) -> Result<f64, String> {
         Err(format!(
             "phase coverage must be between 0.0 and 1.0 (inclusive), got {parsed}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse an `htap` invocation through clap, so the assertions run against
+    /// clap's own routing of each flag into the flattened structs rather than a
+    /// hand-built value.
+    fn parse_htap(extra: &[&str]) -> HtapArgs {
+        let mut argv = vec!["testoperator", "--query-set", "chbench"];
+        argv.extend_from_slice(extra);
+        HtapArgs::parse_from(argv)
+    }
+
+    /// The two resolvers must stay separate at the seam that decides each phase's
+    /// query set: the measured phase sees the accelerator alone, the gate sees
+    /// both. Folding the source override into the measured resolver is the exact
+    /// regression this whole split exists to prevent.
+    #[test]
+    fn the_measured_resolver_ignores_the_source_override_and_the_gate_takes_both() {
+        let args = parse_htap(&[
+            "--query-overrides",
+            "duckdb",
+            "--source-query-overrides",
+            "chbench-skip-slow",
+        ]);
+
+        assert!(matches!(
+            args.test_args.resolved_query_overrides(),
+            Some(QueryOverrides::DuckDB)
+        ));
+        assert!(matches!(
+            args.resolved_comparison_query_overrides()[..],
+            [QueryOverrides::DuckDB, QueryOverrides::ChbenchSkipSlow]
+        ));
+    }
+
+    /// A source override on its own must not reach the measured query set.
+    #[test]
+    fn a_source_only_override_leaves_the_measured_resolver_empty() {
+        let args = parse_htap(&["--source-query-overrides", "chbench-skip-slow"]);
+
+        assert!(args.test_args.resolved_query_overrides().is_none());
+        assert!(matches!(
+            args.resolved_comparison_query_overrides()[..],
+            [QueryOverrides::ChbenchSkipSlow]
+        ));
+    }
+
+    #[test]
+    fn both_resolvers_are_empty_without_overrides() {
+        let args = parse_htap(&[]);
+
+        assert!(args.test_args.resolved_query_overrides().is_none());
+        assert!(args.resolved_comparison_query_overrides().is_empty());
+    }
+
+    /// `--source-query-overrides` is HTAP-only: the commands that never query a
+    /// source must reject it rather than accept and ignore it.
+    #[test]
+    fn commands_that_never_query_a_source_reject_the_source_override() {
+        let err = DatasetTestArgs::try_parse_from([
+            "testoperator",
+            "--query-set",
+            "tpch",
+            "--source-query-overrides",
+            "chbench-skip-slow",
+        ])
+        .expect_err("bench must reject an HTAP-only flag");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }
