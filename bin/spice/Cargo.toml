@@ -36,6 +36,7 @@ reqwest = { workspace = true, features = ["stream"] }
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+secrecy.workspace = true
 
 # Environment files
 dotenv.workspace = true

@@ -130,32 +130,17 @@ pub enum Mode {
     File,
     /// Always create a new file, truncating/overwriting any existing file on startup.
     /// Use this when you want a fresh acceleration on each startup.
+    /// With `snapshots: enabled` the outgoing file is still snapshotted, but no
+    /// snapshot is bootstrapped back in — the next refresh rebuilds from the
+    /// source. Datasets whose refresh never reads a source still bootstrap,
+    /// because there the snapshot is the only copy of the data: `refresh_mode:
+    /// snapshot`, whose source is the snapshot store, and `sink:` datasets,
+    /// which never refresh at all.
     FileCreate,
     /// Open an existing file if it exists, then check schema compatibility on refresh.
     /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
     /// and recreate the acceleration file from scratch.
     FileUpdate,
-}
-
-impl Mode {
-    /// Whether a *file-backed* accelerator in this mode reopens the rows it held before a
-    /// restart.
-    ///
-    /// This answers for the mode alone, so it is only the whole answer for an engine that stores
-    /// its data in a file the mode governs. Unless the engine is already known to be one of
-    /// those, ask [`Acceleration::retains_data_across_restarts`] instead — an engine that keeps
-    /// its data somewhere the mode does not describe gets the wrong answer here.
-    ///
-    /// `Memory` is ephemeral, and so is Cayenne's memory mode — it is "fully in-RAM and
-    /// ephemeral … the dataset reloads from its federated source on startup". `FileCreate`
-    /// truncates any existing file on startup, so it also begins empty.
-    #[must_use]
-    pub fn retains_data_across_restarts(self) -> bool {
-        match self {
-            Mode::Memory | Mode::FileCreate => false,
-            Mode::File | Mode::FileUpdate => true,
-        }
-    }
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -465,27 +450,6 @@ pub struct Acceleration {
 }
 
 impl Acceleration {
-    /// Whether this acceleration still holds the rows it held before a restart.
-    ///
-    /// This is what decides whether the refresh that follows a restart reloads the whole
-    /// dataset or only the part the accelerator is missing, so a caller reasoning about what
-    /// a fresh process observes should ask this rather than matching on the mode itself.
-    ///
-    /// The mode alone does not answer it. `PostgreSQL` stores the rows in a server that outlives
-    /// the process, and `PostgresAccelerator` never reads the mode when opening its table — so
-    /// it keeps them even under the default `Mode::Memory`, which every other engine treats as
-    /// ephemeral. `DatasetSpec::is_file_accelerated` already carves it out the same way.
-    ///
-    /// Every other engine does start empty in the modes [`Mode::retains_data_across_restarts`]
-    /// reports as ephemeral, so for those the mode is the whole answer. An engine that ignores
-    /// the mode in the other direction — Arrow is in-memory whatever the mode asks for — is
-    /// only ever reported as *more* durable than it is, which costs a caller an optimization
-    /// rather than a correct answer.
-    #[must_use]
-    pub fn retains_data_across_restarts(&self) -> bool {
-        self.engine == Engine::PostgreSQL || self.mode.retains_data_across_restarts()
-    }
-
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
