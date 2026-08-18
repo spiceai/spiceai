@@ -16,6 +16,10 @@ limitations under the License.
 
 //! Tests for the `/v1/datasets` HTTP API endpoint.
 
+use data_connector_api::{
+    ConnectorComponent, ConnectorContext, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+};
 use std::{
     any::Any,
     future::Future,
@@ -32,15 +36,8 @@ use datafusion::{
 };
 use rand::RngExt;
 use runtime::{
-    Runtime,
-    auth::EndpointAuth,
-    component::dataset::DatasetSpec as RuntimeDataset,
-    config::Config,
-    dataconnector::{
-        self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-        DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
-    },
-    status::ComponentStatus,
+    Runtime, auth::EndpointAuth, component::dataset::DatasetSpec as RuntimeDataset, config::Config,
+    dataconnector, status::ComponentStatus,
 };
 use runtime_api_types::v1::{ComponentError, ComponentErrorCategory, ComponentErrorType};
 use runtime_parameters::ParameterSpec;
@@ -90,6 +87,7 @@ impl DataConnector for PermissionStatusConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &RuntimeDataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if dataset.name.table() == "permission_denied" {
@@ -124,10 +122,11 @@ impl DataConnectorFactory for PermissionStatusConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         _params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move { Ok(Arc::new(PermissionStatusConnector) as Arc<dyn DataConnector>) })
     }
 

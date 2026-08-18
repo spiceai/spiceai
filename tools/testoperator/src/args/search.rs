@@ -23,9 +23,11 @@ pub struct SearchTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
-    /// Target test dataset to run the search test against.
+    /// Built-in MTEB benchmark dataset to run the search test against. When omitted, the run is
+    /// treated as a custom run: no MTEB data is downloaded, and the search harness tests the
+    /// `corpus`, `test_queries`, and `relevance_data` tables defined in `--spicepod-path` as-is.
     #[arg(long)]
-    pub(crate) benchmark_dataset: SearchDatasetArg,
+    pub(crate) benchmark_dataset: Option<SearchDatasetArg>,
 }
 
 /// Search benchmark dataset selector. Used both as the `--benchmark-dataset` CLI value and as the

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
@@ -129,10 +130,11 @@ impl DataConnectorFactory for SinkConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             // Inherit the acceleration checkpoint schema when the dataset is accelerated, so a
             // restart re-advertises the stored (e.g. OTLP-evolved) schema instead of the bare
@@ -142,7 +144,7 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // context (connector unit tests) there is no accelerator to inherit from.
             let schema = match &params.component {
                 ConnectorComponent::Dataset(spec) => {
-                    params.accelerated_checkpoint_schema(spec).await
+                    context.accelerated_checkpoint_schema(spec).await
                 }
                 ConnectorComponent::Catalog(_) => None,
             }
@@ -173,6 +175,7 @@ impl DataConnector for SinkConnector {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
@@ -180,6 +183,7 @@ impl DataConnector for SinkConnector {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
@@ -277,4 +281,4 @@ impl DisplayAs for SinkDataSink {
     }
 }
 
-register_data_connector!("sink", SinkConnectorFactory);
+data_connector_api::register_data_connector!("sink", SinkConnectorFactory);
