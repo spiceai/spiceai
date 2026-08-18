@@ -4268,7 +4268,7 @@ mod tests {
         // budget: a source invalidating every 20 minutes stays bounded.
         let mut budget = SlotReplacementBudget::new();
         for n in 0..MAX_SLOT_REPLACEMENTS {
-            assert!(budget.admit(start + std::time::Duration::from_secs(60 * n as u64)));
+            assert!(budget.admit(start + std::time::Duration::from_mins(n as u64)));
         }
         let first_expired = start + SLOT_INVALIDATION_WINDOW;
         assert!(budget.admit(first_expired), "the oldest entry has expired");

@@ -1272,7 +1272,7 @@ async fn drop_slot_underneath_a_running_stream(
     source: &tokio_postgres::Client,
     slot: &str,
 ) -> Result<(), anyhow::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
     let mut last_error = None;
     while std::time::Instant::now() < deadline {
         source
