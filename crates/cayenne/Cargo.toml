@@ -534,4 +534,3 @@ required-features = ["result-correctness-duckdb"]
 
 [lints]
 workspace = true
-
