@@ -23,7 +23,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::component::column::full_text_search_config;
-use crate::component::dataset::{Dataset, FullTextSearchDatasetConfig, acceleration::RefreshMode};
+use crate::component::dataset::{
+    DatasetSpec, FullTextSearchDatasetConfig, acceleration::RefreshMode,
+};
 use crate::dataconnector::DataConnector;
 use crate::make_spice_data_sub_directory;
 
@@ -40,7 +42,7 @@ use search::generation::text_search::index::FullTextDatabaseIndex;
 /// determined afterwards.
 pub(crate) fn dataset_attaches_stream(
     connector: &Arc<dyn DataConnector>,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> bool {
     let refresh_mode = connector.resolve_refresh_mode(
         dataset
