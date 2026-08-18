@@ -49,7 +49,7 @@ The corpus, queries, and qrels must first be staged to the bench bucket (see bel
 ```bash
 testoperator run search \
   --concurrency 10 \
-  --ready-wait 1800 \
+  --ready-wait 3600 \
   --metrics \
   -p test/spicepods/search/financebench/full_text_search-duckdb[file].yaml
 ```

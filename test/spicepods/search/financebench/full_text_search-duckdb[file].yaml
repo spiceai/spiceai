@@ -7,17 +7,20 @@ name: full_text_search-duckdb[file]
 # procedure and how to run this spicepod as a custom search test.
 
 datasets:
-  # Per-page filing PDFs. With no file_format, the object-store listing connector routes every
-  # *.pdf under the prefix to the text table (schema: location, content), one row per page-PDF.
-  # `location` is the full in-bucket key, e.g. financebench/corpus_pages/<doc>/pNNNN.pdf.
+  # Per-page filing PDFs. `file_format: pdf` routes each *.pdf to the text table (schema:
+  # location, content), one row per page-PDF; it is required because the directory `from:` carries
+  # no extension for the listing connector to infer. `location` is the full in-bucket key, e.g.
+  # financebench/corpus_pages/<doc>/pNNNN.pdf.
   - from: s3://benchmarks/financebench/corpus_pages/
     name: corpus_pdfs
-    params: &s3_params
-      allow_http: true
-      s3_auth: key
-      s3_endpoint: ${secrets:S3_ENDPOINT}
-      s3_key: ${secrets:S3_KEY}
-      s3_secret: ${secrets:S3_SECRET}
+    params:
+      file_format: pdf
+      <<: &s3_params
+        allow_http: true
+        s3_auth: key
+        s3_endpoint: ${secrets:S3_ENDPOINT}
+        s3_key: ${secrets:S3_KEY}
+        s3_secret: ${secrets:S3_SECRET}
     acceleration:
       enabled: true
       engine: duckdb
