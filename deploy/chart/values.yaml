@@ -7,9 +7,6 @@ image:
 replicaCount: 1
 
 # Update strategy for the Deployment (used when stateful.enabled is false).
-# Defaults to the Kubernetes RollingUpdate strategy when unset.
-# Example — fully terminate the old pod before starting the new one
-# (e.g. for single-replica deployments with file-based acceleration):
 # strategy:
 #   type: Recreate
 
