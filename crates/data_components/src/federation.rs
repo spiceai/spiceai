@@ -331,10 +331,15 @@ mod tests {
     /// here, so the SQL is the default dialect's rather than any one connector's.
     /// The plan shapes, not the spelling, are what these assert.
     fn federated_sql(plan: &LogicalPlan) -> String {
+        federated_sql_result(plan).expect("plan should unparse")
+    }
+
+    /// Unparse without demanding success, so a guard can pin a refusal as well
+    /// as a rendering.
+    fn federated_sql_result(plan: &LogicalPlan) -> DataFusionResult<String> {
         Unparser::new(test_executor().dialect().as_ref())
             .plan_to_sql(plan)
-            .expect("plan should unparse")
-            .to_string()
+            .map(|statement| statement.to_string())
     }
 
     /// Assert `first` is rendered before `second`, which pins the clause order
@@ -422,14 +427,6 @@ mod tests {
         assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
     }
 
-    /// Unparse without demanding success, so a guard can pin a refusal as well
-    /// as a rendering.
-    fn federated_sql_result(plan: &LogicalPlan) -> DataFusionResult<String> {
-        Unparser::new(test_executor().dialect().as_ref())
-            .plan_to_sql(plan)
-            .map(|statement| statement.to_string())
-    }
-
     /// Two `Int32` columns, matching the schema the upstream `EXISTS` bound
     /// cases use so these plans are the same shapes.
     fn exists_fetch_fields() -> Vec<Field> {
@@ -439,21 +436,30 @@ mod tests {
         ]
     }
 
+    fn exists_scan(name: &str) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(name, table_source(exists_fetch_fields()), None)
+            .expect("scan should build")
+    }
+
+    /// The same correlation still pushes down when there is no bound to scope,
+    /// so the refusal stays gated on the bound rather than on the correlation's
+    /// shape.
+    fn assert_unbounded_exists_pushdown(plan: &LogicalPlan) {
+        let sql = federated_sql_result(plan)
+            .expect("an unbounded build side has no bound to scope, so it still unparses");
+        assert!(
+            sql.contains("EXISTS") && !sql.contains("LIMIT"),
+            "expected an unbounded EXISTS pushdown, got: {sql}"
+        );
+    }
+
     /// `LeftSemi Join: t1.c = t2.c AND t1.d = t3.d` over a `t2 INNER JOIN t3`
     /// build side, bounded only when asked — the correlation names both of the
     /// build side's inputs.
     fn a_correlation_naming_two_build_inputs(fetch: Option<usize>) -> LogicalPlan {
-        let probe = LogicalPlanBuilder::scan("t1", table_source(exists_fetch_fields()), None)
-            .expect("scan t1")
-            .build()
-            .expect("build t1");
-        let build = LogicalPlanBuilder::scan("t2", table_source(exists_fetch_fields()), None)
-            .expect("scan t2")
+        let build = exists_scan("t2")
             .join_on(
-                LogicalPlanBuilder::scan("t3", table_source(exists_fetch_fields()), None)
-                    .expect("scan t3")
-                    .build()
-                    .expect("build t3"),
+                exists_scan("t3").build().expect("build t3"),
                 JoinType::Inner,
                 [col("t2.c").eq(col("t3.c"))],
             )
@@ -467,7 +473,7 @@ mod tests {
         .build()
         .expect("build build side");
 
-        LogicalPlanBuilder::from(probe)
+        exists_scan("t1")
             .project(vec![col("t1.d")])
             .expect("project")
             .join_on(
@@ -484,10 +490,6 @@ mod tests {
     /// the probe, bounded only when asked — the correlation's only qualifier is
     /// one the probe side also answers to.
     fn a_correlation_qualified_by_the_probe(fetch: Option<usize>) -> LogicalPlan {
-        let probe = LogicalPlanBuilder::scan("t", table_source(exists_fetch_fields()), None)
-            .expect("scan probe")
-            .build()
-            .expect("build probe");
         let build = LogicalPlanBuilder::scan_with_filters_fetch(
             "t",
             table_source(exists_fetch_fields()),
@@ -499,7 +501,7 @@ mod tests {
         .build()
         .expect("build build side");
 
-        LogicalPlanBuilder::from(probe)
+        exists_scan("t")
             .project(vec![col("t.d")])
             .expect("project")
             .join_on(build, JoinType::LeftSemi, [col("t.c").eq(col("t.c"))])
@@ -529,14 +531,7 @@ mod tests {
             "expected the refusal to name the unscopable correlation, got: {err}"
         );
 
-        // The refusal is gated on the bound, not on the correlation's shape, so
-        // the same correlation still pushes down when nothing has to be scoped.
-        let unbounded = federated_sql_result(&a_correlation_naming_two_build_inputs(None))
-            .expect("an unbounded build side has no bound to scope, so it still unparses");
-        assert!(
-            unbounded.contains("EXISTS") && !unbounded.contains("LIMIT"),
-            "expected an unbounded EXISTS pushdown, got: {unbounded}"
-        );
+        assert_unbounded_exists_pushdown(&a_correlation_naming_two_build_inputs(None));
     }
 
     /// Regression test for #13277: the sibling shape, where the correlation's
@@ -560,15 +555,10 @@ mod tests {
             "expected the refusal to name the probe-qualified correlation, got: {err}"
         );
 
-        // Gated on the bound here too. That unbounded output is not correct --
-        // the shadowing still loses the correlation -- but it is the pre-existing
-        // #12840 defect rather than anything the bound introduces, so what this
-        // pins is only that the refusal does not widen to reach it.
-        let unbounded = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
-            .expect("an unbounded build side has no bound to scope, so it still unparses");
-        assert!(
-            unbounded.contains("EXISTS") && !unbounded.contains("LIMIT"),
-            "expected an unbounded EXISTS pushdown, got: {unbounded}"
-        );
+        // That unbounded output is not correct either — the shadowing still loses
+        // the correlation — but it is the pre-existing #12840 defect rather than
+        // anything the bound introduces, so what this pins is only that the
+        // refusal does not widen to reach it.
+        assert_unbounded_exists_pushdown(&a_correlation_qualified_by_the_probe(None));
     }
 }
