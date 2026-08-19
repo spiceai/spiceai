@@ -153,6 +153,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Records one `ARCHIVE_TIMING <label> <seconds>` line per archive so the cost of
+          # each `nextest archive` invocation can be read straight from the job log instead
+          # of inferred from the gaps between cargo's own output.
+          archive() {
+            local label="$1"; shift
+            local t0 rc
+            t0=$(date +%s)
+            # Capture the status rather than letting `set -e` abort at `"$@"`, so the timing
+            # line is emitted even for the invocation that failed -- then re-raise it, so a
+            # failed build still fails the step instead of inheriting `echo`'s success.
+            "$@" && rc=0 || rc=$?
+            echo "ARCHIVE_TIMING ${label} $(( $(date +%s) - t0 )) rc=${rc}"
+            return "$rc"
+          }
+
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
@@ -161,13 +176,18 @@ jobs:
             echo "Excluding extended_tests"
           fi
 
-          cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
-          cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
-          cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
-          cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
-          cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
-          cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
-          cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
+          archive integration cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
+          archive retention_oom cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
+          archive integration_aws_sdk cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
+          archive integration_snapshot_refresh cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
+          archive credential_provider cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
+          archive partition_table_provider cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
+          archive hadoop_catalog_test cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
+
+          echo "--- archive sizes ---"
+          ls -l *.tar.zst
+          echo "--- compiler cache stats ---"
+          if command -v sccache >/dev/null 2>&1; then sccache --show-stats || true; fi
 
       - name: Set up MinIO client
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET == 'true'
