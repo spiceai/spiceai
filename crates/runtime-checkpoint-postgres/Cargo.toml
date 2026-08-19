@@ -23,8 +23,11 @@ license-file.workspace = true
 description = "Per-dataset blob checkpoint store backed by a PostgreSQL accelerator (implements runtime-checkpoint-api::BlobCheckpointStore)."
 
 [dependencies]
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+arrow.workspace = true
 async-trait.workspace = true
+serde_json.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres"] }
 tokio-postgres.workspace = true
 

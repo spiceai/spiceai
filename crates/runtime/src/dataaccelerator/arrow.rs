@@ -31,7 +31,9 @@ use std::{any::Any, sync::Arc};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
 use crate::parameters::ParameterSpec;
 
-use super::{AccelerationSource, DataAccelerator};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption, unsupported_sidecar};
+use runtime_checkpoint_api::CheckpointError;
 
 pub struct ArrowAccelerator {
     arrow_factory: ArrowFactory,
@@ -131,6 +133,17 @@ impl DataAccelerator for ArrowAccelerator {
             .boxed()?;
 
         Ok(table_provider)
+    }
+
+    async fn sidecar(
+        &self,
+        _source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // In-memory: there is no database to keep sidecar tables in, and nothing would
+        // survive a restart if there were.
+        Err(unsupported_sidecar("arrow", "sidecar"))
     }
 
     fn prefix(&self) -> &'static str {

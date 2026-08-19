@@ -1421,6 +1421,10 @@ mod tests {
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
         }
+
+        async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
     }
 
     #[test]

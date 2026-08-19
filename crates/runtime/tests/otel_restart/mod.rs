@@ -49,7 +49,9 @@ use opentelemetry_proto::tonic::metrics::v1::{
     number_data_point::Value as NumberValue,
 };
 use runtime::Runtime;
-use runtime::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint};
+use runtime::dataaccelerator::spice_sys::dataset_checkpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::acceleration::{Acceleration, Mode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::{Dataset, OnSchemaChange};
@@ -183,10 +185,11 @@ async fn checkpoint_schema(rt: &Arc<Runtime>, ds: &Dataset) -> Option<Arc<Schema
             .with_runtime(Arc::clone(rt))
             .build()
             .ok()?;
-    let checkpoint = DatasetCheckpoint::try_new(
+    let checkpoint = dataset_checkpointer(
         &runtime_dataset,
         runtime_dataset.runtime.accelerator_engine_registry(),
         OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
     )
     .await
     .ok()?;
