@@ -1299,6 +1299,41 @@ fn local_spicepod_manifest(spicepod_path: &Path) -> Option<PathBuf> {
     manifest.is_file().then_some(manifest)
 }
 
+/// Render a user-supplied path for a one-line log: `--spicepod` may contain
+/// control characters that would otherwise split the warning.
+fn display_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace(['\r', '\n'], " ")
+}
+
+/// Which note a cloud-managed instance attaches when a deployment loaded.
+fn cloud_managed_deployed_note(local: Option<PathBuf>, deployed: PathBuf) -> DeploymentNote {
+    match local {
+        Some(local) => DeploymentNote::LocalSpicepodIgnored { local, deployed },
+        None => DeploymentNote::Loaded { path: deployed },
+    }
+}
+
+/// Which note a cloud-managed instance attaches when no deployment is served
+/// and the local manifest loaded.
+fn local_awaiting_note(
+    cloud_managed: bool,
+    already_noted: bool,
+    local_manifest: Option<&Path>,
+    spicepod_path: &Path,
+) -> Option<DeploymentNote> {
+    if !cloud_managed || already_noted {
+        return None;
+    }
+    Some(DeploymentNote::LocalAwaitingDeployment {
+        path: local_manifest.map_or_else(
+            || spicepod_path.to_path_buf(),
+            Path::to_path_buf,
+        ),
+    })
+}
+
 /// Pure policy behind [`tolerates_missing_spicepod`]. Configuration provenance
 /// is deliberately separate from credential activation: an unusable identity
 /// still means the instance has no local Spicepod, while it enables no Cloud
@@ -1399,17 +1434,17 @@ impl DeploymentNote {
     /// deployment, and why a deployment to the portal is what makes it stick.
     fn local_awaiting_deployment(path: &Path) -> String {
         format!(
-            "The Spicepod that is loaded will be replaced by Spice Cloud on the next deployment. Copy it to the project's Spicepod in Spice Cloud to avoid being overwritten. See: https://spiceai.org/docs",
-            path.display()
+            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. Copy it to the project's Spicepod in Spice Cloud to avoid being overwritten. See: https://spiceai.org/docs",
+            display_path(path)
         )
     }
 
     /// A local manifest that coexists with the deployed one is not read.
     fn local_spicepod_ignored(local: &Path, deployed: &Path) -> String {
         format!(
-            "The local {} is ignored: this instance serves the deployed spicepod at {}. Edit the project's Spicepod in Spice Cloud and deploy there instead. See: https://spiceai.org/docs",
-            local.display(),
-            deployed.display()
+            "The local '{}' is ignored: this instance serves the deployed spicepod at '{}'. Edit the project's Spicepod in Spice Cloud and deploy there instead. See: https://spiceai.org/docs",
+            display_path(local),
+            display_path(deployed)
         )
     }
 }
@@ -1493,15 +1528,10 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
         match AppBuilder::build_from_path(deployed.path.clone()).await {
             Ok(mut app) => {
                 app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
-                deployment_note = Some(match local_manifest {
-                    Some(local) => DeploymentNote::LocalSpicepodIgnored {
-                        local,
-                        deployed: deployed.path.clone(),
-                    },
-                    None => DeploymentNote::Loaded {
-                        path: deployed.path.clone(),
-                    },
-                });
+                deployment_note = Some(cloud_managed_deployed_note(
+                    local_manifest,
+                    deployed.path.clone(),
+                ));
                 return Ok(AppBundle {
                     app: Some(Arc::new(app)),
                     spicepod_load_error: None,
@@ -1535,10 +1565,13 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
             // Cloud to survive the first deployment. A deployment that landed
             // but did not build (`Rejected`) already says the local manifest
             // is a fallback, so no second note.
-            if cloud_managed_state && deployment_note.is_none() {
-                deployment_note = Some(DeploymentNote::LocalAwaitingDeployment {
-                    path: local_manifest.clone().unwrap_or(spicepod_path.clone()),
-                });
+            if let Some(note) = local_awaiting_note(
+                cloud_managed_state,
+                deployment_note.is_some(),
+                local_manifest.as_deref(),
+                &spicepod_path,
+            ) {
+                deployment_note = Some(note);
             }
             Some(Arc::new(app))
         }
@@ -2192,9 +2225,10 @@ mod tests {
     fn the_local_awaiting_deployment_warning_names_the_file_and_how_to_fix_it() {
         let message = DeploymentNote::local_awaiting_deployment(Path::new("/tmp/spicepod.yaml"));
         assert!(message.contains("/tmp/spicepod.yaml"));
-        assert!(message.contains("is not the Spicepod Spice Cloud manages"));
-        assert!(message.contains("Copy it into the project's Spicepod in Spice Cloud"));
+        assert!(message.contains("will be replaced by Spice Cloud"));
+        assert!(message.contains("Copy it to the project's Spicepod in Spice Cloud"));
         assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
     }
 
     #[test]
@@ -2206,8 +2240,54 @@ mod tests {
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("/tmp/config/spicepod-cloud-managed.yml"));
         assert!(message.contains("is ignored"));
-        assert!(message.contains("edit the app's Spicepod in Spice Cloud and deploy it instead"));
+        assert!(message.contains(
+            "Edit the project's Spicepod in Spice Cloud and deploy there instead"
+        ));
         assert!(message.contains("https://spiceai.org/docs"));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn a_loaded_deployment_with_a_local_manifest_is_ignored() {
+        let note = cloud_managed_deployed_note(
+            Some(PathBuf::from("/tmp/spicepod.yaml")),
+            PathBuf::from("/tmp/config/spicepod-cloud-managed.yml"),
+        );
+        assert!(matches!(note, DeploymentNote::LocalSpicepodIgnored { .. }));
+    }
+
+    #[test]
+    fn a_loaded_deployment_without_a_local_manifest_is_loaded() {
+        let note = cloud_managed_deployed_note(
+            None,
+            PathBuf::from("/tmp/config/spicepod-cloud-managed.yml"),
+        );
+        assert!(matches!(note, DeploymentNote::Loaded { .. }));
+    }
+
+    #[test]
+    fn no_deployment_with_a_local_manifest_awaits() {
+        let note = local_awaiting_note(
+            true,
+            false,
+            Some(Path::new("/tmp/spicepod.yaml")),
+            Path::new("."),
+        );
+        assert!(matches!(
+            note,
+            Some(DeploymentNote::LocalAwaitingDeployment { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rejected_deployment_does_not_add_awaiting() {
+        let note = local_awaiting_note(
+            true,
+            true,
+            Some(Path::new("/tmp/spicepod.yaml")),
+            Path::new("."),
+        );
+        assert!(note.is_none());
     }
 
     #[test]
