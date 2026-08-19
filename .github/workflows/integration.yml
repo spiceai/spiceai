@@ -292,23 +292,6 @@ jobs:
           name: integration-tests-archive
           path: ./integration_tests
 
-      - name: Download retention OOM test archive from local MinIO
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET == 'true'
-        env:
-          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download retention OOM test archive}"
-          mkdir -p ./integration_tests
-          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
-
-      - name: Download retention OOM test archive
-        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: integration-tests-archive
-          path: ./integration_tests
-
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
