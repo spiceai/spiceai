@@ -5939,10 +5939,12 @@ mod tests {
         // delivered.
         source.ack.promote_ready_members();
         for (member_key, _, rx) in &mut probes {
-            let envelope = rx
-                .next()
-                .await
-                .expect("each attached member is asked to rebuild")
+            // The request is enqueued before the join returns, so it is already
+            // there — polled rather than awaited so a missing one fails here
+            // instead of hanging on a wait that can never finish.
+            let envelope = futures::FutureExt::now_or_never(rx.next())
+                .expect("each attached member is asked to rebuild before the join returns")
+                .expect("the member's mailbox is open")
                 .expect("a valid rebuild request");
             assert!(
                 envelope.history_unavailable(),
@@ -5958,6 +5960,10 @@ mod tests {
                 source.ack.committed(member_key),
                 100,
                 "an attached member's floor moves only through its rebuild's own committer"
+            );
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "one rebuild per member: a second request would re-read the whole table"
             );
         }
 
