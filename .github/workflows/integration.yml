@@ -168,7 +168,18 @@ jobs:
             return "$rc"
           }
 
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
+          # All four `-p runtime` archives below build with this one feature set. Under
+          # resolver = "2" the resolved features of every crate in the graph depend on the
+          # feature flags given, so an invocation that changes them cannot reuse anything the
+          # previous one built and recompiles the graph from data_components up (the same
+          # reason `make nextest` uses a single selection -- spiceai/spiceai#12337).
+          #
+          # Widening the set cannot change which tests are built: `integration_aws_sdk` and
+          # `integration_snapshot_refresh` contain no `cfg(feature)` at all, and the only
+          # `turso` gate in `integration.rs` is inside an `any(...)` already satisfied by
+          # `postgres`/`duckdb`/`sqlite`. `turso` is the one feature the narrower sets needed
+          # that this set lacked; it is the combination `make test-integration` already runs.
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -178,8 +189,8 @@ jobs:
 
           archive integration cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
           archive retention_oom cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
-          archive integration_aws_sdk cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
-          archive integration_snapshot_refresh cargo nextest archive -p runtime --test integration_snapshot_refresh --features duckdb,sqlite,turso,snapshots --archive-file integration_snapshot_refresh.tar.zst
+          archive integration_aws_sdk cargo nextest archive -p runtime --test integration_aws_sdk --features ${FEATURES} --archive-file integration_aws_sdk.tar.zst
+          archive integration_snapshot_refresh cargo nextest archive -p runtime --test integration_snapshot_refresh --features ${FEATURES} --archive-file integration_snapshot_refresh.tar.zst
           archive credential_provider cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
           archive partition_table_provider cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
           archive hadoop_catalog_test cargo nextest archive -p data_components --test hadoop_catalog_test --archive-file data_components_hadoop.tar.zst
