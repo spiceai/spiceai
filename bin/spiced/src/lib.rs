@@ -1399,7 +1399,7 @@ impl DeploymentNote {
     /// deployment, and why a deployment to the portal is what makes it stick.
     fn local_awaiting_deployment(path: &Path) -> String {
         format!(
-            "Spice Cloud Connect: this instance is serving the local {} — but that file is not the Spicepod Spice Cloud manages. Copy it into the project's Spicepod in Spice Cloud before you deploy: the first deployment replaces what this instance serves, and anything that exists only in that file stops being served when it lands. See: https://spiceai.org/docs",
+            "The Spicepod that is loaded will be replaced by Spice Cloud on the next deployment. Copy it to the project's Spicepod in Spice Cloud to avoid being overwritten. See: https://spiceai.org/docs",
             path.display()
         )
     }
@@ -1407,7 +1407,7 @@ impl DeploymentNote {
     /// A local manifest that coexists with the deployed one is not read.
     fn local_spicepod_ignored(local: &Path, deployed: &Path) -> String {
         format!(
-            "Spice Cloud Connect: the local {} is ignored: this instance serves the deployed spicepod at {}. To change this instance, edit the app's Spicepod in Spice Cloud and deploy it instead. See: https://spiceai.org/docs",
+            "The local {} is ignored: this instance serves the deployed spicepod at {}. Edit the project's Spicepod in Spice Cloud and deploy there instead. See: https://spiceai.org/docs",
             local.display(),
             deployed.display()
         )
