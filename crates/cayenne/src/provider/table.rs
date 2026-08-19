@@ -9836,6 +9836,16 @@ impl CayenneTableProvider {
     /// promotion landed, and the keys it moved are in neither that bloom nor this
     /// checkpoint's warm coverage — so fail closed to the full rebuild, which folds
     /// cold exactly.
+    /// Records why an upsert validation fell back from the persisted PK-index
+    /// checkpoint to the full-table keyset rebuild. See
+    /// [`telemetry::cayenne::track_pk_index_checkpoint_miss`] for the reasons.
+    fn record_pk_index_checkpoint_miss(&self, reason: &'static str) {
+        telemetry::cayenne::track_pk_index_checkpoint_miss(&[
+            telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            telemetry::KeyValue::new("reason", reason),
+        ]);
+    }
+
     async fn try_load_persisted_pk_index(
         &self,
         pk_indices: &[usize],
@@ -9843,6 +9853,7 @@ impl CayenneTableProvider {
         cold_bloom_snapshot: Option<&str>,
     ) -> Result<Option<CachedPkIndex>> {
         if !self.upsert_bloom_eligible() {
+            self.record_pk_index_checkpoint_miss("ineligible");
             return Ok(None);
         }
         let Some((checkpoint_snapshot, bytes)) = self
@@ -9851,6 +9862,12 @@ impl CayenneTableProvider {
             .await
             .map_err(|source| Error::Catalog { source })?
         else {
+            // No checkpoint has ever been written for this table. Only the full
+            // current-snapshot compaction persists one, so a table whose
+            // maintenance is all bake/subset passes stays in this state and pays
+            // the full rebuild every time — which is why this reason is counted
+            // separately from an invalidated checkpoint.
+            self.record_pk_index_checkpoint_miss("absent");
             return Ok(None);
         };
         // Defensive read-side bound mirroring the write-side persist cap: a
@@ -9865,6 +9882,7 @@ impl CayenneTableProvider {
                 max_bytes = PK_INDEX_PERSIST_MAX_BYTES,
                 "Persisted PK-index blob exceeds the persist budget; rebuilding keyset"
             );
+            self.record_pk_index_checkpoint_miss("over_budget");
             return Ok(None);
         }
         // Capture the mem-tier shards, the protected set, and the current snapshot
@@ -9895,9 +9913,11 @@ impl CayenneTableProvider {
         if checkpoint_snapshot != current_snapshot_id
             || cold_bloom_snapshot.is_some_and(|resolved_at| resolved_at != current_snapshot_id)
         {
+            self.record_pk_index_checkpoint_miss("snapshot_mismatch");
             return Ok(None);
         }
         let Some((mut bloom, blob_snapshot)) = deserialize_pk_bloom_sidecar(&bytes) else {
+            self.record_pk_index_checkpoint_miss("deserialize_failed");
             return Ok(None);
         };
         // Defense in depth: the metastore `checkpoint_snapshot` column and the
@@ -9913,6 +9933,7 @@ impl CayenneTableProvider {
                 blob_snapshot = blob_snapshot.as_str(),
                 "PK-index sidecar snapshot mismatch (metastore column vs blob); rebuilding keyset"
             );
+            self.record_pk_index_checkpoint_miss("sidecar_mismatch");
             return Ok(None);
         }
         self.extend_bloom_with_protected_and_inline(
@@ -18932,6 +18953,18 @@ impl CayenneTableProvider {
         Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await
     }
 
+    /// Records how a seq-prefix bake pass ended. The duration histogram counts only
+    /// a committed merge or a failed attempt, so every decline below is otherwise
+    /// invisible — a trigger firing constantly and always declining looks identical
+    /// to one that never fires.
+    fn record_bake_outcome(&self, outcome: &'static str) {
+        telemetry::cayenne::track_compaction_outcome(&[
+            telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            telemetry::KeyValue::new("kind", "bake"),
+            telemetry::KeyValue::new("outcome", outcome),
+        ]);
+    }
+
     async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
@@ -18942,6 +18975,7 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 "Skipping seq-prefix bake: position-delete table (out of scope)",
             );
+            self.record_bake_outcome("skipped_out_of_scope");
             return Ok(false);
         }
 
@@ -18951,6 +18985,7 @@ impl CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 "Skipping seq-prefix bake: another compaction pass already running",
             );
+            self.record_bake_outcome("skipped_lock_busy");
             return Ok(false);
         };
 
@@ -18973,6 +19008,7 @@ impl CayenneTableProvider {
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
             if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+                self.record_bake_outcome("skipped_no_candidates");
                 return Ok(false);
             }
             let mut ids: Vec<String> = protected.keys().cloned().collect();
@@ -19086,6 +19122,7 @@ impl CayenneTableProvider {
                 "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
                  budget"
             );
+            self.record_bake_outcome("declined_over_budget");
             return Ok(false);
         }
         // `cutoff` is now the seq-prefix cutoff T (the max max_sequence over the
@@ -19128,6 +19165,7 @@ impl CayenneTableProvider {
                 "Skipping seq-prefix bake before merge: a live snapshot is not clean \
                  past T (prune would be withheld); avoiding merge write-amp"
             );
+            self.record_bake_outcome("skipped_no_clean_prefix");
             return Ok(false);
         }
 
@@ -19138,6 +19176,13 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
+        // A bake is invisible in per-phase telemetry: `write_to_snapshot` times only
+        // `encode_permit_wait` and `write`, so a pass whose p90 is minutes cannot be
+        // split into planning, merge-and-write, and publish. Time each part under
+        // `bake_*` phases so the 22-phase attribution table covers the pass instead
+        // of leaving its cost unaccounted for. Only the outer wrapper counts a pass
+        // (`kind="bake"` on the compaction histogram); these are the breakdown.
+        let bake_plan_start = Instant::now();
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
         for (snapshot_id, threshold) in &selected {
             let plan = self
@@ -19156,7 +19201,15 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // `execute_stream` collapses a multi-arm union through `CoalescePartitionsExec`
+        // (all arms are driven concurrently, then funnelled into one stream), so the
+        // merge cost lands in `bake_merge_write` below rather than here.
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_plan",
+            bake_plan_start,
+        );
 
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
@@ -19188,6 +19241,13 @@ impl CayenneTableProvider {
             state.config().target_partitions(),
             total_input_bytes,
         );
+        // Covers draining the coalesced union AND the Vortex encode, because the
+        // sink pulls the stream: the read and the write are one interleaved cost and
+        // cannot be split from outside. `write` (inside `write_to_snapshot`) is the
+        // encode-side subset, so `bake_merge_write - write` is the read-and-filter
+        // residual — which is what tells us whether the funnel or the encode
+        // dominates a minutes-long pass.
+        let bake_merge_write_start = Instant::now();
         let write_result = self
             .write_to_snapshot(
                 stream,
@@ -19198,6 +19258,11 @@ impl CayenneTableProvider {
                 super::delta_encoding::WriteClass::Maintenance,
             )
             .await;
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_merge_write",
+            bake_merge_write_start,
+        );
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
             Ok(result) => result,
             Err(e) => {
@@ -19276,6 +19341,7 @@ impl CayenneTableProvider {
             );
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
+            self.record_bake_outcome("skipped_cas_lost");
             return Ok(false);
         }
 
@@ -19330,6 +19396,7 @@ impl CayenneTableProvider {
                 );
                 self.retire_snapshot_dirs(std::iter::once(new_snapshot_id.as_str()));
                 self.sweep_retired_snapshot_dirs();
+                self.record_bake_outcome("skipped_snapshot_replaced");
                 return Ok(false);
             }
             self.protected_snapshots.rcu(|current| {
@@ -19369,6 +19436,10 @@ impl CayenneTableProvider {
                  snapshot still has min_sequence <= T (clean-prefix invariant violated). \
                  Pruning would risk resurrecting a deleted row; the index is left intact."
             );
+            // The pass paid its full merge write-amp and delivered no index shrink,
+            // which is the point of a bake — counted apart from a clean success so
+            // the two are never averaged together.
+            self.record_bake_outcome("committed_prune_skipped");
         }
 
         // Retire the merged-away inputs (whole-dir, event-anchored) and sweep
@@ -19383,6 +19454,9 @@ impl CayenneTableProvider {
             self.evict_compaction_input_pages(&old_ids).await;
         }
 
+        if clean_prefix_holds {
+            self.record_bake_outcome("committed");
+        }
         Ok(true)
     }
 

@@ -1189,6 +1189,73 @@ pub mod cayenne {
         compaction_memory_exhausted().add(1, dimensions);
     }
 
+    static PK_INDEX_CHECKPOINT_MISS: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the PK-index checkpoint-miss counter.
+    fn pk_index_checkpoint_miss() -> &'static Counter<u64> {
+        PK_INDEX_CHECKPOINT_MISS.get_or_init(|| {
+        operational_meter()
+            .u64_counter("cayenne_pk_index_checkpoint_miss_total")
+            .with_description(
+                "Times an upsert validation could not reconstruct the PK existence index from its persisted checkpoint and fell back to a full-table keyset rebuild, by reason.",
+            )
+            .build()
+    })
+    }
+
+    /// Counts a fallback from the persisted PK-index checkpoint to the full-table
+    /// keyset rebuild. `dimensions` should carry `table` and `reason`.
+    ///
+    /// The rebuild is the dominant CDC-upsert cost for a large table and runs on the
+    /// apply path, so which branch declined the checkpoint decides the fix — a
+    /// checkpoint that never existed, one too large to persist, and one invalidated
+    /// by a rewrite need three different remedies. Every branch previously returned
+    /// without a log or with only `debug!`, so the reason was unobservable in a
+    /// production run and the cost could only be seen as an unexplained stall.
+    ///
+    /// `reason` is one of:
+    /// - `"ineligible"` — the table is not upsert-bloom eligible, so no checkpoint
+    ///   is ever written (expected; distinguishes "off" from "failing")
+    /// - `"absent"` — no checkpoint row exists yet for this table
+    /// - `"over_budget"` — the persisted blob exceeds the read-side persist bound
+    /// - `"snapshot_mismatch"` — the checkpoint predates a rewrite of the current
+    ///   snapshot, or the cold bloom resolved against a different one
+    /// - `"sidecar_mismatch"` — the blob's snapshot tag disagrees with the metastore
+    ///   column (corruption; fails closed)
+    /// - `"deserialize_failed"` — the blob could not be decoded
+    pub fn track_pk_index_checkpoint_miss(dimensions: &[KeyValue]) {
+        pk_index_checkpoint_miss().add(1, dimensions);
+    }
+
+    static COMPACTION_OUTCOME: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Build-once accessor for the compaction-outcome counter.
+    fn compaction_outcome() -> &'static Counter<u64> {
+        COMPACTION_OUTCOME.get_or_init(|| {
+            operational_meter()
+                .u64_counter("cayenne_compaction_outcome_total")
+                .build()
+        })
+    }
+
+    /// Counts how a compaction or bake pass ended. `dimensions` should carry
+    /// `table`, `kind` (as [`track_compaction_duration`]), and `outcome`.
+    ///
+    /// The duration histogram counts only passes that committed a merge or failed
+    /// trying, so a trigger that fires constantly and always declines is invisible
+    /// there — it looks identical to one that never fires. This separates them, and
+    /// distinguishes a pass that did its full rewrite but could not deliver the
+    /// point of the pass (`"committed_prune_skipped"`, where the clean-prefix
+    /// invariant did not hold, so the merge is kept but the deletion index is not
+    /// shrunk) from one that succeeded outright.
+    ///
+    /// `outcome` is one of `"committed"`, `"committed_prune_skipped"`,
+    /// `"skipped_lock_busy"`, `"skipped_no_candidates"`, `"skipped_cas_lost"`,
+    /// `"skipped_snapshot_replaced"`, `"declined_over_budget"`, or `"failed"`.
+    pub fn track_compaction_outcome(dimensions: &[KeyValue]) {
+        compaction_outcome().add(1, dimensions);
+    }
+
     /// Register the Cayenne compaction instruments against the global meter so they
     /// appear in Prometheus `/metrics` from startup — and so the one-shot pool-size
     /// gauge binds to the real Prometheus meter rather than the early noop one.
