@@ -421,4 +421,151 @@ mod tests {
         // filter sits outside of.
         assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
     }
+
+    /// Unparse without demanding success, so a guard can pin a refusal as well
+    /// as a rendering.
+    fn federated_sql_result(plan: &LogicalPlan) -> DataFusionResult<String> {
+        Unparser::new(test_executor().dialect().as_ref())
+            .plan_to_sql(plan)
+            .map(|statement| statement.to_string())
+    }
+
+    /// Two `Int32` columns, matching the schema the upstream `EXISTS` bound
+    /// cases use so these plans are the same shapes.
+    fn exists_fetch_fields() -> Vec<Field> {
+        vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, false),
+        ]
+    }
+
+    /// `LeftSemi Join: t1.c = t2.c AND t1.d = t3.d` over a `t2 INNER JOIN t3`
+    /// build side, bounded only when asked — the correlation names both of the
+    /// build side's inputs.
+    fn a_correlation_naming_two_build_inputs(fetch: Option<usize>) -> LogicalPlan {
+        let probe = LogicalPlanBuilder::scan("t1", table_source(exists_fetch_fields()), None)
+            .expect("scan t1")
+            .build()
+            .expect("build t1");
+        let build = LogicalPlanBuilder::scan("t2", table_source(exists_fetch_fields()), None)
+            .expect("scan t2")
+            .join_on(
+                LogicalPlanBuilder::scan("t3", table_source(exists_fetch_fields()), None)
+                    .expect("scan t3")
+                    .build()
+                    .expect("build t3"),
+                JoinType::Inner,
+                [col("t2.c").eq(col("t3.c"))],
+            )
+            .expect("join build inputs");
+        // `limit(0, None)` still inserts a `Limit`, and the unbounded case is
+        // about a build side carrying no bound at all.
+        let build = match fetch {
+            Some(fetch) => build.limit(0, Some(fetch)).expect("limit build side"),
+            None => build,
+        }
+        .build()
+        .expect("build build side");
+
+        LogicalPlanBuilder::from(probe)
+            .project(vec![col("t1.d")])
+            .expect("project")
+            .join_on(
+                build,
+                JoinType::LeftSemi,
+                [col("t1.c").eq(col("t2.c")), col("t1.d").eq(col("t3.d"))],
+            )
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// `LeftSemi Join: t.c = t.c` where the build side is the same relation as
+    /// the probe, bounded only when asked — the correlation's only qualifier is
+    /// one the probe side also answers to.
+    fn a_correlation_qualified_by_the_probe(fetch: Option<usize>) -> LogicalPlan {
+        let probe = LogicalPlanBuilder::scan("t", table_source(exists_fetch_fields()), None)
+            .expect("scan probe")
+            .build()
+            .expect("build probe");
+        let build = LogicalPlanBuilder::scan_with_filters_fetch(
+            "t",
+            table_source(exists_fetch_fields()),
+            None,
+            vec![],
+            fetch,
+        )
+        .expect("scan build side")
+        .build()
+        .expect("build build side");
+
+        LogicalPlanBuilder::from(probe)
+            .project(vec![col("t.d")])
+            .expect("project")
+            .join_on(build, JoinType::LeftSemi, [col("t.c").eq(col("t.c"))])
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #13277: a row bound on an `EXISTS`-style build side
+    /// has to be moved into a scope of its own, and the scope can carry only one
+    /// relation name. When the correlation names both of the build side's inputs,
+    /// no name keeps every reference bound to the relation it came from.
+    ///
+    /// Leaving the bound beside the correlation is not a safe fallback: that SQL
+    /// binds — `t1` to the outer query, `t2`/`t3` to the subquery's own inputs —
+    /// so the remote engine runs it and answers from rows outside the bound. A
+    /// semi join then reports a match on a row the plan never read. Refusing
+    /// costs the pushdown instead of returning wrong rows.
+    #[test]
+    fn a_bounded_exists_refuses_a_correlation_naming_two_build_inputs() {
+        let err = federated_sql_result(&a_correlation_naming_two_build_inputs(Some(5)))
+            .expect_err("a correlation naming two build-side inputs must be refused");
+        assert!(
+            err.to_string().contains(
+                "not supported when the correlation names more than one of the build side's inputs"
+            ),
+            "expected the refusal to name the unscopable correlation, got: {err}"
+        );
+
+        // The refusal is gated on the bound, not on the correlation's shape, so
+        // the same correlation still pushes down when nothing has to be scoped.
+        let unbounded = federated_sql_result(&a_correlation_naming_two_build_inputs(None))
+            .expect("an unbounded build side has no bound to scope, so it still unparses");
+        assert!(
+            unbounded.contains("EXISTS") && !unbounded.contains("LIMIT"),
+            "expected an unbounded EXISTS pushdown, got: {unbounded}"
+        );
+    }
+
+    /// Regression test for #13277: the sibling shape, where the correlation's
+    /// only qualifier is one the probe side also answers to. Naming the scope
+    /// anything else rebinds those references to the probe, turning the
+    /// correlation into a comparison of the outer row with itself.
+    ///
+    /// Both readings are wrong — the subquery's own `FROM` already shadows the
+    /// outer relation, so the correlation is lost whatever the bound does — and
+    /// that unscoped output binds and runs, so an anti join drops a row it
+    /// should return. Emitting these correctly needs the correlation's
+    /// qualifiers rewritten to the derived scope, tracked by #12840.
+    #[test]
+    fn a_bounded_exists_refuses_a_correlation_qualified_by_the_probe() {
+        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
+            .expect_err("a correlation qualified by the probe side must be refused");
+        assert!(
+            err.to_string().contains(
+                "not supported when the correlation's only qualifier is one the probe side also answers to"
+            ),
+            "expected the refusal to name the probe-qualified correlation, got: {err}"
+        );
+
+        // Gated on the bound here too.
+        let unbounded = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
+            .expect("an unbounded build side has no bound to scope, so it still unparses");
+        assert!(
+            unbounded.contains("EXISTS") && !unbounded.contains("LIMIT"),
+            "expected an unbounded EXISTS pushdown, got: {unbounded}"
+        );
+    }
 }
