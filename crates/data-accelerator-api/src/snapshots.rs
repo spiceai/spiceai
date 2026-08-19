@@ -163,6 +163,21 @@ pub async fn snapshot_before_recreate(
         return;
     }
 
+    // A partitioned Cayenne dataset's metastore slice is incomplete: `export_dataset`
+    // selects every dependent table by the parent's table id, so the partition child
+    // `cayenne_table` rows (and each child's metadata) are not exported, and a restore
+    // fails at `infer_existing_partitions` with `TableNotFound` once the drop cascade has
+    // removed the live child rows. Publishing would make that unrestorable archive the
+    // store's `current-snapshot-id`, so skip until the slice covers child tables.
+    // `build_snapshot_creation_config` applies the same gate to the periodic publish path.
+    if engine == AccelerationEngine::Cayenne && !acceleration.partition_by.is_empty() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Skipping the pre-recreation snapshot: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return;
+    }
+
     // A Cayenne bootstrap needs the per-dataset metastore slice that only
     // `CayenneSnapshotEngine` writes, and creating a snapshot makes whatever it uploads
     // the store's `current-snapshot-id`. Publishing a default-engine archive (a raw
