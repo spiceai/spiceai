@@ -327,6 +327,8 @@ fn parse_information_schema_json(
                 .map(|raw| decimal_scale(raw, precision, col_name, table_name))
                 .transpose()?;
 
+        ensure_fixed_point_metadata(data_type_str, precision, scale, col_name, table_name)?;
+
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
         let source_type = snowflake_source_type(data_type_str, precision, scale);
 
@@ -433,6 +435,8 @@ fn parse_information_schema_arrow(
                 arrow_information_schema_integer(scales, i, "numeric_scale", col_name, table_name)?
                     .map(|raw| decimal_scale(raw, precision, col_name, table_name))
                     .transpose()?;
+
+            ensure_fixed_point_metadata(data_type_str, precision, scale, col_name, table_name)?;
 
             let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
             let source_type = snowflake_source_type(data_type_str, precision, scale);
@@ -613,6 +617,54 @@ fn integer_from_text(text: &str) -> Option<i128> {
         return None;
     }
     integer.parse::<i128>().ok()
+}
+
+/// Whether a Snowflake `information_schema` `DATA_TYPE` is fixed-point, i.e. a
+/// type whose Arrow mapping is a decimal and therefore carries `NUMBER`'s
+/// precision and scale.
+fn is_fixed_point_snowflake_type(sql_type: &str) -> bool {
+    matches!(
+        sql_type.to_uppercase().as_str(),
+        "NUMBER"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "SMALLINT"
+            | "TINYINT"
+            | "BYTEINT"
+    )
+}
+
+/// Rejects a fixed-point column whose precision or scale `information_schema`
+/// did not report.
+///
+/// Without both, [`map_snowflake_sql_type`] falls back to `Decimal128(38, 0)` —
+/// the scale-zero mapping that rounds every fraction away. Failing the probe
+/// hands discovery to `SHOW COLUMNS`, whose type descriptor carries the real
+/// precision and scale. Columns that are not fixed-point never report either
+/// value and are left alone.
+fn ensure_fixed_point_metadata(
+    sql_type: &str,
+    precision: Option<u8>,
+    scale: Option<i8>,
+    column_name: &str,
+    table_name: &str,
+) -> std::result::Result<(), String> {
+    let missing = match (precision, scale) {
+        (Some(_), Some(_)) => return Ok(()),
+        (None, Some(_)) => "`numeric_precision`",
+        (Some(_), None) => "`numeric_scale`",
+        (None, None) => "`numeric_precision` and `numeric_scale`",
+    };
+    if !is_fixed_point_snowflake_type(sql_type) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "column '{column_name}' of table '{table_name}' is a {sql_type} column, but Snowflake reported no {missing} for it, so the digits it stores after the decimal point are unknown"
+    ))
 }
 
 /// Validates a Snowflake `NUMERIC_PRECISION` as an Arrow decimal precision.
@@ -807,28 +859,19 @@ fn simple_snowflake_identifier(value: &str) -> Option<String> {
 fn map_snowflake_sql_type(sql_type: &str, precision: Option<u8>, scale: Option<i8>) -> DataType {
     let upper = sql_type.to_uppercase();
     match upper.as_str() {
-        "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
-        | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION"
-        | "REAL" => {
-            let p = precision.unwrap_or(38);
-            let s = scale.unwrap_or(0);
-            if s == 0 && upper != "NUMBER" {
-                match upper.as_str() {
-                    // Snowflake documents that FLOAT, FLOAT4, FLOAT8, REAL, DOUBLE,
-                    // and DOUBLE PRECISION are all stored internally as 64-bit
-                    // double-precision floats (see "Summary of data types"
-                    // footnote [1]). Mapping any of these to Float32 would be
-                    // lossy and would also disagree with the `SHOW COLUMNS` path
-                    // that maps "REAL" to Float64. Use Float64 for the entire
-                    // float family to keep both discovery paths consistent.
-                    "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => {
-                        DataType::Float64
-                    }
-                    _ => DataType::Decimal128(p, s),
-                }
-            } else {
-                DataType::Decimal128(p, s)
-            }
+        fixed_point if is_fixed_point_snowflake_type(fixed_point) => DataType::Decimal128(
+            precision.unwrap_or(MAX_DECIMAL_PRECISION),
+            scale.unwrap_or(0),
+        ),
+        // Snowflake documents that FLOAT, FLOAT4, FLOAT8, REAL, DOUBLE, and
+        // DOUBLE PRECISION are all stored internally as 64-bit
+        // double-precision floats (see "Summary of data types" footnote [1]).
+        // Mapping any of these to Float32 would be lossy and would also
+        // disagree with the `SHOW COLUMNS` path that maps "REAL" to Float64.
+        // Use Float64 for the entire float family to keep both discovery paths
+        // consistent.
+        "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => {
+            DataType::Float64
         }
         "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "TEXT" | "VARIANT" | "OBJECT" | "ARRAY"
         // Structured MAP collapses to JSON text here because
@@ -1585,6 +1628,96 @@ mod tests {
         assert!(
             error.contains("numeric_precision") && error.contains("'A'"),
             "error must name the metadata column and the column: {error}"
+        );
+    }
+
+    /// A fixed-point column Snowflake reported no precision or scale for cannot
+    /// be mapped without inventing a scale, so the probe must fail and let
+    /// discovery fall back to `SHOW COLUMNS` instead of registering
+    /// `Decimal128(38, 0)` and rounding every fraction away.
+    #[test]
+    fn information_schema_arrow_rejects_a_fixed_point_column_without_precision_or_scale() {
+        let cases: Vec<(&str, ArrayRef, ArrayRef, &str)> = vec![
+            (
+                "neither reported",
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                "`numeric_precision` and `numeric_scale`",
+            ),
+            (
+                "no scale",
+                Arc::new(Int64Array::from(vec![Some(12)])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                "`numeric_scale`",
+            ),
+            (
+                "no precision",
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "`numeric_precision`",
+            ),
+            (
+                "empty text",
+                Arc::new(StringArray::from(vec![Some("")])),
+                Arc::new(StringArray::from(vec![Some("  ")])),
+                "`numeric_precision` and `numeric_scale`",
+            ),
+        ];
+
+        for (case, precision, scale, expected) in cases {
+            let batch =
+                information_schema_batch(&["AMOUNT"], &["NUMBER"], &["YES"], precision, scale);
+
+            let error = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+                .expect_err(&format!("{case} must not register a schema"));
+
+            assert!(
+                error.contains(expected),
+                "{case}: error must name the missing metadata: {error}"
+            );
+            assert!(
+                error.contains("'AMOUNT'") && error.contains("'SALES.ORDERS'"),
+                "{case}: error must name the column and table: {error}"
+            );
+        }
+    }
+
+    /// Snowflake reports no numeric precision or scale for a float, a string, or
+    /// a timestamp, so the fixed-point requirement must not reject them.
+    #[test]
+    fn information_schema_arrow_accepts_non_fixed_point_columns_without_precision() {
+        let columns = &["RATING", "NAME", "CREATED_AT", "PRICE"];
+        let batch = information_schema_batch(
+            columns,
+            &["FLOAT", "VARCHAR", "TIMESTAMP_NTZ", "DOUBLE"],
+            &["YES", "YES", "YES", "YES"],
+            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
+            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+            .expect("columns without numeric metadata should parse");
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+    }
+
+    /// The JSON path applies the same requirement.
+    #[test]
+    fn information_schema_json_rejects_a_fixed_point_column_without_scale() {
+        let rows = serde_json::json!([["AMOUNT", "NUMBER", "NO", 12, null, null, null, null]]);
+
+        let error = parse_information_schema_json(&rows, "SALES.ORDERS")
+            .expect_err("a fixed-point column without a scale must not register a schema");
+
+        assert!(
+            error.contains("`numeric_scale`") && error.contains("'AMOUNT'"),
+            "error must name the missing metadata and the column: {error}"
         );
     }
 }
