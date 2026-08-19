@@ -42,6 +42,19 @@ const TOUCHE2020_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
     "mteb/touche2020",
     &["corpus/corpus/0000.parquet", "corpus/corpus/0001.parquet"],
 );
+const MSMARCO_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
+    "mteb/msmarco",
+    &[
+        "corpus/corpus/0000.parquet",
+        "corpus/corpus/0001.parquet",
+        "corpus/corpus/0002.parquet",
+        "corpus/corpus/0003.parquet",
+        "corpus/corpus/0004.parquet",
+        "corpus/corpus/0005.parquet",
+        "corpus/corpus/0006.parquet",
+    ],
+);
+const STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/stackoverflow-qa");
 
 /// The search benchmark dataset to run against. Each variant owns its own dataset
 /// preparation, search-config construction, relevance-judgment loading, and result
@@ -60,6 +73,8 @@ pub(crate) enum SearchDataset {
     ScifactRetrieval,
     NfcorpusRetrieval,
     Touche2020Retrieval,
+    MsmarcoRetrieval,
+    StackoverflowQaRetrieval,
 }
 
 impl From<SearchDatasetArg> for SearchDataset {
@@ -74,6 +89,8 @@ impl From<SearchDatasetArg> for SearchDataset {
             SearchDatasetArg::ScifactRetrieval => SearchDataset::ScifactRetrieval,
             SearchDatasetArg::NfcorpusRetrieval => SearchDataset::NfcorpusRetrieval,
             SearchDatasetArg::Touche2020Retrieval => SearchDataset::Touche2020Retrieval,
+            SearchDatasetArg::MsmarcoRetrieval => SearchDataset::MsmarcoRetrieval,
+            SearchDatasetArg::StackoverflowQaRetrieval => SearchDataset::StackoverflowQaRetrieval,
         }
     }
 }
@@ -90,6 +107,8 @@ impl SearchDataset {
             SearchDataset::ScifactRetrieval => "scifact_retrieval",
             SearchDataset::NfcorpusRetrieval => "nfcorpus_retrieval",
             SearchDataset::Touche2020Retrieval => "touche2020_retrieval",
+            SearchDataset::MsmarcoRetrieval => "msmarco_retrieval",
+            SearchDataset::StackoverflowQaRetrieval => "stackoverflow_qa_retrieval",
         }
     }
 
@@ -104,6 +123,8 @@ impl SearchDataset {
             SearchDataset::ScifactRetrieval => &SCIFACT_RETRIEVAL_REPOSITORY,
             SearchDataset::NfcorpusRetrieval => &NFCORPUS_RETRIEVAL_REPOSITORY,
             SearchDataset::Touche2020Retrieval => &TOUCHE2020_RETRIEVAL_REPOSITORY,
+            SearchDataset::MsmarcoRetrieval => &MSMARCO_RETRIEVAL_REPOSITORY,
+            SearchDataset::StackoverflowQaRetrieval => &STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY,
         };
         mteb::prepare_dataset(dataset, spicepod_dir).await
     }
@@ -124,7 +145,9 @@ impl SearchDataset {
             | SearchDataset::ScidocsRetrieval
             | SearchDataset::ScifactRetrieval
             | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => {
+            | SearchDataset::Touche2020Retrieval
+            | SearchDataset::MsmarcoRetrieval
+            | SearchDataset::StackoverflowQaRetrieval => {
                 mteb::init_search_config(spiced_instance, search_limit).await
             }
         }
@@ -143,7 +166,9 @@ impl SearchDataset {
             | SearchDataset::ScidocsRetrieval
             | SearchDataset::ScifactRetrieval
             | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => {
+            | SearchDataset::Touche2020Retrieval
+            | SearchDataset::MsmarcoRetrieval
+            | SearchDataset::StackoverflowQaRetrieval => {
                 mteb::get_query_relevance_data(spiced_instance).await
             }
         }
@@ -162,7 +187,11 @@ impl SearchDataset {
             | SearchDataset::ScidocsRetrieval
             | SearchDataset::ScifactRetrieval
             | SearchDataset::NfcorpusRetrieval
-            | SearchDataset::Touche2020Retrieval => mteb::transform_search_results_for_eval(search),
+            | SearchDataset::Touche2020Retrieval
+            | SearchDataset::MsmarcoRetrieval
+            | SearchDataset::StackoverflowQaRetrieval => {
+                mteb::transform_search_results_for_eval(search)
+            }
         }
     }
 }
