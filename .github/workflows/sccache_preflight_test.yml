@@ -22,7 +22,10 @@ on:
       - '.github/actions/setup-sccache/action.yml'
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
-      - '.github/workflows/sccache_preflight_test.yml'
+      - 'scripts/check_sccache_call_sites.py'
+      # Any workflow file: a call site that omits the cache credentials is a change here,
+      # not in the action, and the pre-flight cannot see the difference from inside.
+      - '.github/workflows/*.yml'
   push:
     branches:
       - trunk
@@ -30,7 +33,10 @@ on:
       - '.github/actions/setup-sccache/action.yml'
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
-      - '.github/workflows/sccache_preflight_test.yml'
+      - 'scripts/check_sccache_call_sites.py'
+      # Any workflow file: a call site that omits the cache credentials is a change here,
+      # not in the action, and the pre-flight cannot see the difference from inside.
+      - '.github/workflows/*.yml'
   workflow_dispatch:
 
 concurrency:
@@ -57,3 +63,8 @@ jobs:
         # Invoked through `bash` rather than as `./…` so the job does not depend
         # on the script's executable bit surviving a checkout on every platform.
         run: bash scripts/test_sccache_preflight.sh
+
+      # The pre-flight decides correctly and still leaves the cache off when a call site
+      # never supplied credentials for it to sign with; only the call sites show that.
+      - name: Check every compiler-cache call site passes credentials
+        run: python3 scripts/check_sccache_call_sites.py
