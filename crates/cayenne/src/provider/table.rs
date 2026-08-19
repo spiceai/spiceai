@@ -7412,6 +7412,21 @@ impl CayenneTableProvider {
     ///
     /// Also drives the compaction-trigger file-add heuristic, so the same count
     /// must be used both to build the write format and to report files added.
+    /// Records which branch decided a write's encode fan-out, and the shard count
+    /// it produced. A pass that ends up on one shard is otherwise unattributable:
+    /// configured sort columns, a volume below the encode-shard unit, and a
+    /// position-delete table all serialize the write for different reasons and
+    /// admit different remedies.
+    fn record_write_shape(&self, decision: &'static str, shards: usize) {
+        telemetry::cayenne::track_write_shape(
+            shards as u64,
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("decision", decision),
+            ],
+        );
+    }
+
     fn snapshot_shard_count(
         &self,
         session_target_partitions: usize,
@@ -7435,28 +7450,46 @@ impl CayenneTableProvider {
         // (the attestation in `rewrite_current_snapshot_for_compaction` declines
         // to attest whenever the effective key is not the configured one).
         if self.context.has_sort_columns() {
+            self.record_write_shape("serial_sort_columns", 1);
             return 1;
         }
         let write_concurrency = self.snapshot_write_concurrency(session_target_partitions);
-        match estimated_bytes {
-            Some(bytes) => {
-                // Encode-shard unit (see the doc comment): `target_size / 16`
-                // floored at 16 MiB and capped at `target_size`, so the count
-                // is "how many encode-efficient shards would this write fill?"
-                // rather than "how many full target files?". The estimate is
-                // (compression-blind) in-memory Arrow bytes — see the doc
-                // comment on the deliberate Arrow-vs-Vortex unit asymmetry
-                // that biases this toward more shards. `target_size_bytes` is
-                // derived from a configured MiB value and is never 0, but
-                // guard against it so a misconfiguration can't divide-by-zero.
-                const MIN_ENCODE_SHARD_BYTES: u64 = 16 * 1024 * 1024;
-                let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
-                let unit = (target / 16).clamp(MIN_ENCODE_SHARD_BYTES.min(target), target);
-                let files = (bytes / unit).max(1);
-                let upper = u64::try_from(write_concurrency).unwrap_or(u64::MAX);
-                usize::try_from(files.min(upper)).unwrap_or(write_concurrency)
-            }
-            None => write_concurrency,
+        let Some(bytes) = estimated_bytes else {
+            self.record_write_shape("parallel_unsized", write_concurrency);
+            return write_concurrency;
+        };
+        {
+            // Encode-shard unit (see the doc comment): `target_size / 16`
+            // floored at 16 MiB and capped at `target_size`, so the count
+            // is "how many encode-efficient shards would this write fill?"
+            // rather than "how many full target files?". The estimate is
+            // (compression-blind) in-memory Arrow bytes — see the doc
+            // comment on the deliberate Arrow-vs-Vortex unit asymmetry
+            // that biases this toward more shards. `target_size_bytes` is
+            // derived from a configured MiB value and is never 0, but
+            // guard against it so a misconfiguration can't divide-by-zero.
+            const MIN_ENCODE_SHARD_BYTES: u64 = 16 * 1024 * 1024;
+            let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
+            let unit = (target / 16).clamp(MIN_ENCODE_SHARD_BYTES.min(target), target);
+            let files = (bytes / unit).max(1);
+            let upper = u64::try_from(write_concurrency).unwrap_or(u64::MAX);
+            let shards = usize::try_from(files.min(upper)).unwrap_or(write_concurrency);
+            // Distinguishes "volume did not justify the fan-out" from "the CPU
+            // budget capped it": the first is answered by a bigger pass, the
+            // second only by more cores, and a pass pinned to one shard by
+            // volume is otherwise indistinguishable from the sort-column
+            // serialization above.
+            self.record_write_shape(
+                if shards == 1 {
+                    "serial_volume_below_shard_unit"
+                } else if files >= upper {
+                    "parallel_capped_by_concurrency"
+                } else {
+                    "parallel_sized_by_volume"
+                },
+                shards,
+            );
+            shards
         }
     }
 

@@ -154,6 +154,10 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
+name = "bake_partition_shape"
+
+[[bench]]
+harness = false
 name = "zorder_clustering"
 
 [[bench]]

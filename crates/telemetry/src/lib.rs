@@ -1202,6 +1202,35 @@ pub mod cayenne {
         compaction_memory_exhausted().add(1, dimensions);
     }
 
+    static WRITE_SHAPE_SHARDS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+    /// Build-once accessor for the write-shape shard-count histogram.
+    fn write_shape_shards() -> &'static Histogram<f64> {
+        WRITE_SHAPE_SHARDS.get_or_init(|| {
+            operational_meter()
+                .f64_histogram("cayenne_write_shape_shards")
+                .with_description(
+                    "Encode shards a Cayenne write fanned out to, by the branch that decided it. A write pinned to one shard is otherwise unattributable: configured sort columns, a volume below the encode-shard unit, and a position-delete table each serialize for a different reason and admit a different remedy.",
+                )
+                .with_unit("shards")
+                .build()
+        })
+    }
+
+    /// Records a write's encode fan-out and which branch chose it. `dimensions`
+    /// should carry `table` and `decision`: `"serial_sort_columns"`,
+    /// `"serial_volume_below_shard_unit"`, `"parallel_capped_by_concurrency"`,
+    /// `"parallel_sized_by_volume"`, or `"parallel_unsized"`.
+    pub fn track_write_shape(shards: u64, dimensions: &[KeyValue]) {
+        // A shard count is bounded by the CPU budget, so it is always far inside
+        // f64's exactly-representable integer range; the lossless conversion states
+        // that rather than asserting it.
+        write_shape_shards().record(
+            f64::from(u32::try_from(shards).unwrap_or(u32::MAX)),
+            dimensions,
+        );
+    }
+
     static PK_INDEX_CHECKPOINT_MISS: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Build-once accessor for the PK-index checkpoint-miss counter.
