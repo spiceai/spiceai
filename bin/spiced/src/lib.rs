@@ -1316,21 +1316,20 @@ fn cloud_managed_deployed_note(local: Option<PathBuf>, deployed: PathBuf) -> Dep
 }
 
 /// Which note a cloud-managed instance attaches when no deployment is served
-/// and the local manifest loaded.
+/// and a local filesystem manifest loaded.
+///
+/// A remote `--spicepod` URL is not a local file: there is nothing on this
+/// machine to copy into Spice Cloud, so this note stays off.
 fn local_awaiting_note(
     cloud_managed: bool,
     already_noted: bool,
     local_manifest: Option<&Path>,
-    spicepod_path: &Path,
 ) -> Option<DeploymentNote> {
     if !cloud_managed || already_noted {
         return None;
     }
     Some(DeploymentNote::LocalAwaitingDeployment {
-        path: local_manifest.map_or_else(
-            || spicepod_path.to_path_buf(),
-            Path::to_path_buf,
-        ),
+        path: local_manifest?.to_path_buf(),
     })
 }
 
@@ -1569,7 +1568,6 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                 cloud_managed_state,
                 deployment_note.is_some(),
                 local_manifest.as_deref(),
-                &spicepod_path,
             ) {
                 deployment_note = Some(note);
             }
@@ -2267,12 +2265,7 @@ mod tests {
 
     #[test]
     fn no_deployment_with_a_local_manifest_awaits() {
-        let note = local_awaiting_note(
-            true,
-            false,
-            Some(Path::new("/tmp/spicepod.yaml")),
-            Path::new("."),
-        );
+        let note = local_awaiting_note(true, false, Some(Path::new("/tmp/spicepod.yaml")));
         assert!(matches!(
             note,
             Some(DeploymentNote::LocalAwaitingDeployment { .. })
@@ -2281,13 +2274,35 @@ mod tests {
 
     #[test]
     fn a_rejected_deployment_does_not_add_awaiting() {
-        let note = local_awaiting_note(
-            true,
-            true,
-            Some(Path::new("/tmp/spicepod.yaml")),
-            Path::new("."),
-        );
+        let note = local_awaiting_note(true, true, Some(Path::new("/tmp/spicepod.yaml")));
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_remote_spicepod_url_does_not_get_the_local_awaiting_warning() {
+        assert_eq!(
+            local_spicepod_manifest(Path::new("s3://bucket/spicepod.yaml")),
+            None
+        );
+        assert!(local_awaiting_note(true, false, None).is_none());
+    }
+
+    #[test]
+    fn a_non_cloud_managed_start_does_not_await() {
+        assert!(local_awaiting_note(false, false, Some(Path::new("/tmp/spicepod.yaml"))).is_none());
+    }
+
+    #[test]
+    fn a_path_with_a_newline_stays_on_one_log_line() {
+        let path = Path::new("/tmp/spice\npod.yaml");
+        let awaiting = DeploymentNote::local_awaiting_deployment(path);
+        let ignored = DeploymentNote::local_spicepod_ignored(path, Path::new("/tmp/deployed.yml"));
+        assert!(awaiting.contains("/tmp/spice pod.yaml"));
+        assert!(ignored.contains("/tmp/spice pod.yaml"));
+        assert!(!awaiting.contains('\n'));
+        assert!(!ignored.contains('\n'));
+        assert!(awaiting.contains("'/tmp/spice pod.yaml'"));
+        assert!(ignored.contains("'/tmp/spice pod.yaml'"));
     }
 
     #[test]
