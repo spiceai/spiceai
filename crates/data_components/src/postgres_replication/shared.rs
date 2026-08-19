@@ -2084,11 +2084,21 @@ async fn apply_slot_setup(
         source.ack.seed(setup.slot.consistent_lsn);
         metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
     }
-    // This setup put a replacement in place of an invalidated slot, so the members
-    // already streaming hold positions nothing can reach any more. The condition is
-    // `history_discarded` rather than `created_fresh` for the reason given on that
-    // field.
-    if setup.slot.history_discarded {
+    // Did this setup put a different slot under the members already streaming here?
+    // Their positions were measured against the one that was there before, and a
+    // slot created at the current WAL position cannot reach them.
+    let replaced = match setup.slot.history {
+        slot::SlotHistory::ReplacedInvalidated => true,
+        // Nothing existed to create a replacement *of* until this source has a
+        // member: the first one to arrive is what creates the slot in the ordinary
+        // case, and there is no history behind it.
+        slot::SlotHistory::CreatedFromAbsent => !source.live_members().is_empty(),
+        // `FastForwarded` discards history for every member too, but keying on it
+        // needs to be measured against two held-floor tests (#12609) that this
+        // cannot run — tracked in #13305.
+        slot::SlotHistory::Kept | slot::SlotHistory::FastForwarded => false,
+    };
+    if replaced {
         install_replacement_slot(source, setup.slot.consistent_lsn).await;
     }
     // Before anything can be credited on this source, pin the floor for the
@@ -2709,10 +2719,6 @@ async fn recover_unusable_slot(
 /// Callers must hold [`SharedSource::setup_lock`], so the member set is stable
 /// across the walk below — see [`request_rebuild_of_attached_members`].
 async fn install_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
-    // Retires every observation of the slot this replaces, so a refusal the pump
-    // latched against it is not acted on a second time (see
-    // [`recover_unusable_slot`]).
-    source.slot_generation.fetch_add(1, Ordering::AcqRel);
     // The replacement carries no history, so a member joining after this cannot
     // resume either — it snapshots, exactly as it would on a slot this process had
     // just created.
@@ -2724,6 +2730,12 @@ async fn install_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
 
     request_rebuild_of_attached_members(source, new_lsn).await;
     source.ack.reseat_held_floors(new_lsn);
+    // Last, so this reads as adopted only once every member has been asked to
+    // rebuild: the join reaches here from a stream future the consumer can drop, and
+    // publishing the new generation first would let a cancellation leave members
+    // unasked while [`recover_unusable_slot`] skipped the recovery that would have
+    // asked them.
+    source.slot_generation.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Ask every already-attached member to rebuild from the source, because the slot
@@ -4399,7 +4411,7 @@ mod tests {
                 consistent_lsn,
                 snapshot_name: None,
                 created_fresh,
-                history_discarded: false,
+                history: slot::SlotHistory::Kept,
                 generated_columns: vec![],
                 retention_posture: retention::SlotRetentionPosture {
                     server_version_num: 170_000,
@@ -5964,7 +5976,7 @@ mod tests {
         source.ack.reserve(&key("unjoined"), 100);
 
         let mut setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
-        setup.slot.history_discarded = true;
+        setup.slot.history = slot::SlotHistory::ReplacedInvalidated;
         apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
 
         // The pump's next connect promotes whatever is ready. The members asked to
@@ -6040,7 +6052,7 @@ mod tests {
 
         let setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
         assert!(
-            setup.slot.created_fresh && !setup.slot.history_discarded,
+            setup.slot.created_fresh && setup.slot.history == slot::SlotHistory::Kept,
             "the outcome under test is a fresh-looking slot that discarded nothing"
         );
         apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
@@ -6061,6 +6073,60 @@ mod tests {
             source.ack.committed(&key("unjoined")),
             100,
             "the hold for an unjoined table still covers changes nobody has consumed"
+        );
+    }
+
+    /// The same replacement by a different route: an operator drops the slot while
+    /// the pump is between connections — the only time `PostgreSQL` lets them — and
+    /// the next dataset to join finds no slot and creates one.
+    ///
+    /// Nothing about that outcome says "invalidated", but the members already
+    /// streaming are in exactly the position they are after an invalidated slot is
+    /// replaced: their recorded positions were measured against a slot that is gone,
+    /// and the one created in its place starts at the current WAL position.
+    #[tokio::test]
+    async fn a_join_that_created_a_slot_under_members_already_attached_rebuilds_them() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+
+        let mut setup = shared_setup(500, true, &["t0", "t1"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_some(),
+                "a member streaming from the slot that was replaced must be rebuilt"
+            );
+            assert!(!source.ack.is_streaming(member_key));
+        }
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            1,
+            "the slot under this source was replaced, so observations of the old one are stale"
+        );
+    }
+
+    /// The ordinary first start, which reaches the same outcome and must do none of
+    /// it: creating a slot because none existed replaces nothing when nobody was
+    /// streaming from one.
+    #[tokio::test]
+    async fn the_first_member_to_create_a_slot_replaces_nothing() {
+        let (source, _) = test_source_with_members(0);
+
+        let mut setup = shared_setup(500, true, &["t0"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            0,
+            "no slot was replaced, so nothing any actor observed has been retired"
         );
     }
 

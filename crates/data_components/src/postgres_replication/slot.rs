@@ -32,6 +32,36 @@ use super::{
     retention::{self, SlotRemoval, SlotRetentionPosture},
 };
 
+/// What a setup call did to the slot's history — see [`SlotInfo::history`].
+///
+/// The caller owns the consequence, because only it knows whether anyone holds a
+/// position against the slot that was there before: a shared source must rebuild
+/// every member already attached to it before a replacement streams, since their
+/// recorded positions predate a slot created at the current WAL position and any
+/// row deleted in between has no change event left to carry the deletion (#13229).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotHistory {
+    /// The named slot was already there and keeps whatever history it had. Covers
+    /// a resume from its `confirmed_flush_lsn` and a slot the catalog has not
+    /// published one for yet — the latter has nothing to lose, having never
+    /// acknowledged anything.
+    Kept,
+    /// The named slot was found invalidated (`wal_status = 'lost'`), dropped, and
+    /// the slot described here created in its place. Every position measured
+    /// against the old one is unreachable.
+    ReplacedInvalidated,
+    /// No slot existed under that name, so this call created one — either itself or,
+    /// on a lost creation race, whichever consumer won. Whether that discards
+    /// anything is the caller's to decide: for a source whose first member is
+    /// arriving there was no history to begin with, while one with members already
+    /// attached has just had the slot they were streaming from replaced.
+    CreatedFromAbsent,
+    /// The named slot was fast-forwarded past its backlog for a re-bootstrap, which
+    /// discards its history for every member (see
+    /// [`advance_slot_for_rebootstrap`]).
+    FastForwarded,
+}
+
 /// Info about a slot after `setup_slot_and_publication` returns.
 #[derive(Clone, Debug)]
 pub struct SlotInfo {
@@ -40,23 +70,13 @@ pub struct SlotInfo {
     pub consistent_lsn: u64,
     pub snapshot_name: Option<String>,
     pub created_fresh: bool,
-    /// Whether this call *discarded* an existing slot's history: the named slot
-    /// was found invalidated (`wal_status = 'lost'`), dropped, and the slot
-    /// described here created in its place.
+    /// What this call did to the history a consumer may hold a position against.
     ///
-    /// Distinct from [`Self::created_fresh`], which is also true where nothing
-    /// was thrown away — a slot created because none existed, one that exists but
-    /// has never been acknowledged, and the fast-forward for a re-bootstrap. Only
-    /// this outcome says the positions consumers recorded against the *previous*
-    /// slot can no longer be reached, so acting on `created_fresh` instead moves
+    /// Reported instead of inferred from [`Self::created_fresh`], which does not
+    /// separate the cases: that is true both where an existing slot's history was
+    /// thrown away and where there was none to throw away, and acting on it moves
     /// floors that are still owed their changes (#12609).
-    ///
-    /// The caller owns the consequence: a shared source must rebuild every member
-    /// already attached to it before the replacement streams, because their
-    /// recorded positions predate a slot created at the current WAL position and
-    /// any row deleted in between has no change event left to carry the deletion
-    /// (#13229).
-    pub history_discarded: bool,
+    pub history: SlotHistory,
     /// `GENERATED` columns of the source table. Postgres does not publish
     /// generated columns over logical replication (they are absent from
     /// pgoutput `Relation` messages), so the WAL path must tolerate their
@@ -98,12 +118,12 @@ pub async fn setup_slot_and_publication(
     // checks. Fatal errors (permission denied, syntax) are propagated on the
     // first attempt.
     // Outside the retry: see [`ensure_slot`].
-    let history_discarded = AtomicBool::new(false);
+    let replaced_invalidated = AtomicBool::new(false);
     super::resilience::retry_async(
         "postgres_replication::setup",
         super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
         is_transient_setup_error,
-        || async { setup_once(params, schema_name, table_name, &history_discarded).await },
+        || async { setup_once(params, schema_name, table_name, &replaced_invalidated).await },
     )
     .await
 }
@@ -159,7 +179,7 @@ pub async fn setup_shared_member(
     table_name: &str,
 ) -> Result<SharedMemberSetup> {
     // Outside the retry: see [`ensure_slot`].
-    let history_discarded = AtomicBool::new(false);
+    let replaced_invalidated = AtomicBool::new(false);
     super::resilience::retry_async(
         "postgres_replication::setup_shared_member",
         super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
@@ -180,7 +200,7 @@ pub async fn setup_shared_member(
                 // root, which is the name members subscribe with.
                 let publication_tables =
                     list_publication_tables(&client, &params.publication_name).await?;
-                let slot = ensure_slot(&client, params, &history_discarded).await?;
+                let slot = ensure_slot(&client, params, &replaced_invalidated).await?;
                 let slot_restart_lsn = read_slot_restart_lsn(&client, &params.slot_name).await?;
                 Ok(SharedMemberSetup {
                     slot,
@@ -203,11 +223,18 @@ async fn setup_once(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
-    history_discarded: &AtomicBool,
+    replaced_invalidated: &AtomicBool,
 ) -> Result<SlotInfo> {
     let (client, conn_task) = connect_setup(params).await?;
 
-    let outcome = do_setup(&client, params, schema_name, table_name, history_discarded).await;
+    let outcome = do_setup(
+        &client,
+        params,
+        schema_name,
+        table_name,
+        replaced_invalidated,
+    )
+    .await;
 
     drop(client);
     let _ = conn_task.await;
@@ -261,12 +288,12 @@ async fn do_setup(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
-    history_discarded: &AtomicBool,
+    replaced_invalidated: &AtomicBool,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
     let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
-    let mut slot = ensure_slot(client, params, history_discarded).await?;
+    let mut slot = ensure_slot(client, params, replaced_invalidated).await?;
     slot.generated_columns = generated_columns;
     Ok(slot)
 }
@@ -363,17 +390,17 @@ async fn drop_slot_if_invalidated(
     }
 }
 
-/// `history_discarded` latches [`SlotInfo::history_discarded`] across the caller's
-/// *retries*, and is why it is a parameter rather than a local: the drop below is
-/// not undone by a later attempt failing. An attempt that retires the invalidated
-/// slot and then fails on a transient error further into setup leaves the
-/// replacement in place, so the next attempt finds an ordinary slot and would
-/// report that nothing was discarded — and the members already attached would
-/// never be rebuilt, which is the whole failure this signal exists to prevent.
+/// `replaced_invalidated` latches [`SlotHistory::ReplacedInvalidated`] across the
+/// caller's *retries*, and is why it is a parameter rather than a local: the drop
+/// below is not undone by a later attempt failing. An attempt that retires the
+/// invalidated slot and then fails on a transient error further into setup leaves
+/// the replacement in place, so the next attempt finds an ordinary slot and would
+/// report that nothing was discarded — and the members already attached would never
+/// be rebuilt, which is the whole failure this signal exists to prevent.
 async fn ensure_slot(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
-    history_discarded: &AtomicBool,
+    replaced_invalidated: &AtomicBool,
 ) -> Result<SlotInfo> {
     // Read once, before anything branches, so every outcome below carries it and
     // the slot-creation message can name what will remove the slot it creates.
@@ -383,14 +410,22 @@ async fn ensure_slot(
     // below, so retire it first and let the rest of this function create its
     // replacement.
     //
-    // Carried on every outcome below, including the resuming branches: reaching one
-    // of those after the drop means something recreated the slot underneath us,
-    // which does not give the discarded history back. See
-    // [`SlotInfo::history_discarded`] for what the caller owes on it.
+    // Outranks every other outcome below, including the resuming branches: reaching
+    // one of those after the drop means something recreated the slot underneath us,
+    // which does not give the discarded history back.
     if drop_slot_if_invalidated(client, &params.slot_name).await? {
-        history_discarded.store(true, Ordering::Release);
+        replaced_invalidated.store(true, Ordering::Release);
     }
-    let history_discarded = history_discarded.load(Ordering::Acquire);
+    let replaced_invalidated = replaced_invalidated.load(Ordering::Acquire);
+    // Classify a branch's own outcome, deferring to the drop above when there was
+    // one.
+    let history = |own: SlotHistory| {
+        if replaced_invalidated {
+            SlotHistory::ReplacedInvalidated
+        } else {
+            own
+        }
+    };
 
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
@@ -417,7 +452,7 @@ async fn ensure_slot(
                     snapshot_name: None,
                     generated_columns: Vec::new(),
                     retention_posture,
-                    history_discarded,
+                    history: history(SlotHistory::FastForwarded),
                     // The old history is gone, so this slot carries none for any
                     // member -- the same contract as a slot created this process.
                     created_fresh: true,
@@ -437,7 +472,7 @@ async fn ensure_slot(
                 snapshot_name: None,
                 generated_columns: Vec::new(),
                 retention_posture,
-                history_discarded,
+                history: history(SlotHistory::Kept),
                 created_fresh: false,
             });
         }
@@ -456,7 +491,7 @@ async fn ensure_slot(
                 snapshot_name: None,
                 generated_columns: Vec::new(),
                 retention_posture,
-                history_discarded,
+                history: history(SlotHistory::Kept),
                 created_fresh: true,
             });
         }
@@ -488,7 +523,7 @@ async fn ensure_slot(
                 // a bootstrap (same reasoning as the Some(0) path above).
                 generated_columns: Vec::new(),
                 retention_posture,
-                history_discarded,
+                history: history(SlotHistory::CreatedFromAbsent),
                 created_fresh: confirmed == 0,
             });
         }
@@ -518,7 +553,7 @@ async fn ensure_slot(
         snapshot_name: Some(snapshot_name),
         generated_columns: Vec::new(),
         retention_posture,
-        history_discarded,
+        history: history(SlotHistory::CreatedFromAbsent),
         created_fresh: true,
     })
 }
