@@ -318,16 +318,14 @@ fn parse_information_schema_json(
             .ok_or_else(|| format!("information_schema row {i}: invalid data type"))?;
         let is_nullable = row[2].as_str().is_none_or(|s| s.to_uppercase() == "YES");
 
-        let precision = row.get(3).and_then(|v| {
-            v.as_u64()
-                .and_then(|n| u8::try_from(n).ok())
-                .or_else(|| v.as_str().and_then(|s| s.parse::<u8>().ok()))
-        });
-        let scale = row.get(4).and_then(|v| {
-            v.as_i64()
-                .and_then(|n| i8::try_from(n).ok())
-                .or_else(|| v.as_str().and_then(|s| s.parse::<i8>().ok()))
-        });
+        let precision =
+            json_information_schema_integer(row.get(3), "numeric_precision", col_name, table_name)?
+                .map(|raw| decimal_precision(raw, col_name, table_name))
+                .transpose()?;
+        let scale =
+            json_information_schema_integer(row.get(4), "numeric_scale", col_name, table_name)?
+                .map(|raw| decimal_scale(raw, precision, col_name, table_name))
+                .transpose()?;
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
         let source_type = snowflake_source_type(data_type_str, precision, scale);
@@ -389,13 +387,16 @@ fn parse_information_schema_arrow(
             .downcast_ref::<arrow::array::StringArray>()
             .ok_or("is_nullable column is not StringArray")?;
 
-        let precisions: Option<&arrow::array::StringArray> = if batch.num_columns() > 3 {
-            batch.column(3).as_string_opt()
+        // `numeric_precision` and `numeric_scale` are read out of whatever
+        // numeric or text Arrow type Snowflake encoded them as, so keep the
+        // erased array rather than committing to one representation.
+        let precisions: Option<&dyn Array> = if batch.num_columns() > 3 {
+            Some(batch.column(3).as_ref())
         } else {
             None
         };
-        let scales: Option<&arrow::array::StringArray> = if batch.num_columns() > 4 {
-            batch.column(4).as_string_opt()
+        let scales: Option<&dyn Array> = if batch.num_columns() > 4 {
+            Some(batch.column(4).as_ref())
         } else {
             None
         };
@@ -419,12 +420,19 @@ fn parse_information_schema_arrow(
             let col_name = col_names.value(i);
             let data_type_str = data_types.value(i);
             let is_nullable = nullables.value(i).to_uppercase() == "YES";
-            let precision = precisions
-                .and_then(|p| if p.is_null(i) { None } else { Some(p.value(i)) })
-                .and_then(|s| s.parse::<u8>().ok());
-            let scale = scales
-                .and_then(|s| if s.is_null(i) { None } else { Some(s.value(i)) })
-                .and_then(|s| s.parse::<i8>().ok());
+            let precision = arrow_information_schema_integer(
+                precisions,
+                i,
+                "numeric_precision",
+                col_name,
+                table_name,
+            )?
+            .map(|raw| decimal_precision(raw, col_name, table_name))
+            .transpose()?;
+            let scale =
+                arrow_information_schema_integer(scales, i, "numeric_scale", col_name, table_name)?
+                    .map(|raw| decimal_scale(raw, precision, col_name, table_name))
+                    .transpose()?;
 
             let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
             let source_type = snowflake_source_type(data_type_str, precision, scale);
@@ -461,6 +469,185 @@ fn parse_information_schema_arrow(
     );
 
     Ok(Arc::new(Schema::new_with_metadata(fields, schema_metadata)))
+}
+
+/// The widest precision an Arrow `Decimal128` — and a Snowflake `NUMBER` — can
+/// represent.
+const MAX_DECIMAL_PRECISION: u8 = 38;
+
+/// Reads one `information_schema.columns` integer cell out of a Snowflake Arrow
+/// response, whatever type Snowflake encoded it as.
+///
+/// `NUMERIC_PRECISION` and `NUMERIC_SCALE` are declared `NUMBER(38,0)`, and
+/// Snowflake picks the Arrow encoding per result chunk: an integer of whichever
+/// width fits, a decimal, or text. Reading a single representation drops the
+/// precision and scale of every column, registering a `NUMBER(12,2)` measure as
+/// `Decimal128(38, 0)` so its fraction is rounded away — permanently, once the
+/// table is accelerated. A cell that cannot be read exactly is an error rather
+/// than an absent value, so discovery falls back to `SHOW COLUMNS` instead of
+/// registering a scale the source never declared.
+fn arrow_information_schema_integer(
+    array: Option<&dyn Array>,
+    row: usize,
+    metadata_column: &str,
+    column_name: &str,
+    table_name: &str,
+) -> std::result::Result<Option<i128>, String> {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{
+        Decimal128Type, Decimal256Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
+        UInt16Type, UInt32Type, UInt64Type,
+    };
+
+    let Some(array) = array else {
+        return Ok(None);
+    };
+    if row >= array.len() || array.is_null(row) {
+        return Ok(None);
+    }
+
+    let unusable = |rendered: &str| {
+        format!(
+            "column '{column_name}' of table '{table_name}' reported `{metadata_column}` as {rendered}, which is not a whole number"
+        )
+    };
+
+    let value = match array.data_type() {
+        DataType::Int8 => i128::from(array.as_primitive::<Int8Type>().value(row)),
+        DataType::Int16 => i128::from(array.as_primitive::<Int16Type>().value(row)),
+        DataType::Int32 => i128::from(array.as_primitive::<Int32Type>().value(row)),
+        DataType::Int64 => i128::from(array.as_primitive::<Int64Type>().value(row)),
+        DataType::UInt8 => i128::from(array.as_primitive::<UInt8Type>().value(row)),
+        DataType::UInt16 => i128::from(array.as_primitive::<UInt16Type>().value(row)),
+        DataType::UInt32 => i128::from(array.as_primitive::<UInt32Type>().value(row)),
+        DataType::UInt64 => i128::from(array.as_primitive::<UInt64Type>().value(row)),
+        DataType::Decimal128(_, scale) => {
+            let unscaled = array.as_primitive::<Decimal128Type>().value(row);
+            integer_from_decimal(unscaled, *scale)
+                .ok_or_else(|| unusable(&decimal_rendering(unscaled, *scale)))?
+        }
+        DataType::Decimal256(_, scale) => {
+            let unscaled = array.as_primitive::<Decimal256Type>().value(row);
+            unscaled
+                .to_i128()
+                .and_then(|unscaled| integer_from_decimal(unscaled, *scale))
+                .ok_or_else(|| unusable(&decimal_rendering(unscaled, *scale)))?
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            let text = match array.data_type() {
+                DataType::Utf8 => array.as_string::<i32>().value(row),
+                DataType::LargeUtf8 => array.as_string::<i64>().value(row),
+                _ => array.as_string_view().value(row),
+            }
+            .trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            integer_from_text(text).ok_or_else(|| unusable(&format!("'{text}'")))?
+        }
+        // A metadata column that is null in every row can arrive as an Arrow
+        // `Null` array, which carries no null buffer for `is_null` to read.
+        DataType::Null => return Ok(None),
+        other => return Err(unusable(&format!("Arrow type {other}"))),
+    };
+
+    Ok(Some(value))
+}
+
+/// Reads one `information_schema.columns` integer cell out of a Snowflake JSON
+/// response, which renders the value as a JSON number or as text.
+fn json_information_schema_integer(
+    value: Option<&serde_json::Value>,
+    metadata_column: &str,
+    column_name: &str,
+    table_name: &str,
+) -> std::result::Result<Option<i128>, String> {
+    let rendered = match value {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(text)) => text.trim().to_string(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(other) => {
+            return Err(format!(
+                "column '{column_name}' of table '{table_name}' reported `{metadata_column}` as {other}, which is not a whole number"
+            ));
+        }
+    };
+    if rendered.is_empty() {
+        return Ok(None);
+    }
+
+    integer_from_text(&rendered).map(Some).ok_or_else(|| {
+        format!(
+            "column '{column_name}' of table '{table_name}' reported `{metadata_column}` as '{rendered}', which is not a whole number"
+        )
+    })
+}
+
+/// Describes a decimal metadata cell for an error message, keeping the unscaled
+/// value and the scale separate so a negative scale still reads clearly.
+fn decimal_rendering(unscaled: impl std::fmt::Display, scale: i8) -> String {
+    format!("the decimal value {unscaled} with scale {scale}")
+}
+
+/// Converts a decimal-encoded metadata value into the whole number it stands
+/// for, or `None` when it carries a fraction and so is not the integer
+/// `information_schema` declares.
+fn integer_from_decimal(unscaled: i128, scale: i8) -> Option<i128> {
+    let power = 10_i128.checked_pow(u32::from(scale.unsigned_abs()))?;
+    match scale.cmp(&0) {
+        std::cmp::Ordering::Equal => Some(unscaled),
+        std::cmp::Ordering::Greater => (unscaled % power == 0).then_some(unscaled / power),
+        std::cmp::Ordering::Less => unscaled.checked_mul(power),
+    }
+}
+
+/// Parses a whole number Snowflake rendered as text, accepting the zero
+/// fraction a decimal rendering carries (`12`, `12.`, `12.00`).
+fn integer_from_text(text: &str) -> Option<i128> {
+    if let Ok(value) = text.parse::<i128>() {
+        return Some(value);
+    }
+
+    let (integer, fraction) = text.split_once('.')?;
+    if fraction.bytes().any(|digit| digit != b'0') {
+        return None;
+    }
+    integer.parse::<i128>().ok()
+}
+
+/// Validates a Snowflake `NUMERIC_PRECISION` as an Arrow decimal precision.
+fn decimal_precision(
+    raw: i128,
+    column_name: &str,
+    table_name: &str,
+) -> std::result::Result<u8, String> {
+    u8::try_from(raw)
+        .ok()
+        .filter(|precision| (1..=MAX_DECIMAL_PRECISION).contains(precision))
+        .ok_or_else(|| {
+            format!(
+                "column '{column_name}' of table '{table_name}' reported `numeric_precision` {raw}, outside the 1 to {MAX_DECIMAL_PRECISION} digits a decimal column can hold"
+            )
+        })
+}
+
+/// Validates a Snowflake `NUMERIC_SCALE` as an Arrow decimal scale, which the
+/// column's own precision bounds.
+fn decimal_scale(
+    raw: i128,
+    precision: Option<u8>,
+    column_name: &str,
+    table_name: &str,
+) -> std::result::Result<i8, String> {
+    let limit = i128::from(precision.unwrap_or(MAX_DECIMAL_PRECISION));
+    i8::try_from(raw)
+        .ok()
+        .filter(|_| (0..=limit).contains(&raw))
+        .ok_or_else(|| {
+            format!(
+                "column '{column_name}' of table '{table_name}' reported `numeric_scale` {raw}, outside the 0 to {limit} digits its `numeric_precision` allows"
+            )
+        })
 }
 
 fn optional_json_string(value: Option<&serde_json::Value>) -> Option<&str> {
@@ -770,6 +957,10 @@ impl SnowflakeTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{
+        ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        NullArray, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
 
     #[test]
     fn snowflake_dialect_unparses_at_time_zone_as_convert_timezone() {
@@ -1060,5 +1251,340 @@ mod tests {
                 "Mismatch for {sql_type}"
             );
         }
+    }
+
+    /// Builds the eight-column `information_schema.columns` Arrow response that
+    /// `probe_snowflake_information_schema` selects, with caller-supplied
+    /// precision and scale arrays so each Snowflake encoding can be exercised.
+    fn information_schema_batch(
+        names: &[&str],
+        data_types: &[&str],
+        nullables: &[&str],
+        precisions: ArrayRef,
+        scales: ArrayRef,
+    ) -> RecordBatch {
+        let rows = names.len();
+        let empty = || Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef;
+
+        RecordBatch::try_from_iter(vec![
+            (
+                "COLUMN_NAME",
+                Arc::new(StringArray::from(names.to_vec())) as ArrayRef,
+            ),
+            (
+                "DATA_TYPE",
+                Arc::new(StringArray::from(data_types.to_vec())) as ArrayRef,
+            ),
+            (
+                "IS_NULLABLE",
+                Arc::new(StringArray::from(nullables.to_vec())) as ArrayRef,
+            ),
+            ("NUMERIC_PRECISION", precisions),
+            ("NUMERIC_SCALE", scales),
+            ("COMMENT", empty()),
+            ("TABLE_COMMENT", empty()),
+            ("CLUSTERING_KEY", empty()),
+        ])
+        .expect("information_schema Arrow batch should build")
+    }
+
+    /// A `NUMBER(38,0)` metadata column carrying `values`, which is how
+    /// Snowflake encodes `NUMERIC_PRECISION` and `NUMERIC_SCALE` when the
+    /// result chunk uses a decimal representation.
+    fn metadata_decimal(values: &[Option<i128>]) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values.to_vec())
+                .with_precision_and_scale(38, 0)
+                .expect("NUMBER(38,0) metadata column should build"),
+        )
+    }
+
+    /// The `LINEITEM` columns from #13271: a scale-zero key, three
+    /// `NUMBER(12,2)` measures, and a text column with no numeric metadata.
+    const LINEITEM_COLUMNS: &[&str] = &[
+        "L_ORDERKEY",
+        "L_QUANTITY",
+        "L_DISCOUNT",
+        "L_TAX",
+        "L_SHIPMODE",
+    ];
+    const LINEITEM_TYPES: &[&str] = &["NUMBER", "NUMBER", "NUMBER", "NUMBER", "TEXT"];
+    const LINEITEM_NULLABLE: &[&str] = &["NO", "NO", "NO", "NO", "YES"];
+
+    fn assert_lineitem_schema(schema: &Schema) {
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Decimal128(38, 0),
+            "L_ORDERKEY is NUMBER(38,0)"
+        );
+        for index in 1..=3 {
+            let field = schema.field(index);
+            assert_eq!(
+                field.data_type(),
+                &DataType::Decimal128(12, 2),
+                "{} must keep Snowflake's scale, or every fraction is rounded away",
+                field.name()
+            );
+            assert_eq!(
+                field
+                    .metadata()
+                    .get(SOURCE_TYPE_METADATA_KEY)
+                    .map(String::as_str),
+                Some("NUMBER(12,2)"),
+                "{} source type",
+                field.name()
+            );
+        }
+        assert_eq!(
+            schema.field(4).data_type(),
+            &DataType::Utf8,
+            "L_SHIPMODE has no numeric precision or scale"
+        );
+        assert!(
+            !schema.field(0).is_nullable(),
+            "L_ORDERKEY is declared NOT NULL"
+        );
+        assert!(schema.field(4).is_nullable(), "L_SHIPMODE is nullable");
+    }
+
+    /// Regression test for #13271: Snowflake returns `NUMERIC_PRECISION` and
+    /// `NUMERIC_SCALE` as Arrow integers, and reading them as text only
+    /// registered every `NUMBER(12,2)` column as `Decimal128(38, 0)` —
+    /// rounding away the fraction the source stores, and permanently
+    /// materializing zeros once the table is accelerated.
+    #[test]
+    fn information_schema_arrow_keeps_scale_from_integer_metadata_columns() {
+        let batch = information_schema_batch(
+            LINEITEM_COLUMNS,
+            LINEITEM_TYPES,
+            LINEITEM_NULLABLE,
+            Arc::new(Int64Array::from(vec![
+                Some(38),
+                Some(12),
+                Some(12),
+                Some(12),
+                None,
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(0),
+                Some(2),
+                Some(2),
+                Some(2),
+                None,
+            ])),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "TPCH_SF1.LINEITEM")
+            .expect("information_schema Arrow response should parse");
+
+        assert_lineitem_schema(&schema);
+    }
+
+    /// The same metadata delivered as decimals, which is how Snowflake encodes
+    /// the `NUMBER(38,0)` `information_schema` columns when the result chunk
+    /// exceeds the width of an Arrow integer.
+    #[test]
+    fn information_schema_arrow_keeps_scale_from_decimal_metadata_columns() {
+        let batch = information_schema_batch(
+            LINEITEM_COLUMNS,
+            LINEITEM_TYPES,
+            LINEITEM_NULLABLE,
+            metadata_decimal(&[Some(38), Some(12), Some(12), Some(12), None]),
+            metadata_decimal(&[Some(0), Some(2), Some(2), Some(2), None]),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "TPCH_SF1.LINEITEM")
+            .expect("information_schema Arrow response should parse");
+
+        assert_lineitem_schema(&schema);
+    }
+
+    /// Snowflake sizes an integer metadata column to the values it holds, so
+    /// the same response can arrive as any Arrow integer width, signed or
+    /// unsigned.
+    #[test]
+    fn information_schema_arrow_keeps_scale_from_every_integer_width() {
+        let precisions: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![Some(12)])),
+            Arc::new(Int16Array::from(vec![Some(12)])),
+            Arc::new(Int32Array::from(vec![Some(12)])),
+            Arc::new(Int64Array::from(vec![Some(12)])),
+            Arc::new(UInt8Array::from(vec![Some(12)])),
+            Arc::new(UInt16Array::from(vec![Some(12)])),
+            Arc::new(UInt32Array::from(vec![Some(12)])),
+            Arc::new(UInt64Array::from(vec![Some(12)])),
+        ];
+
+        for precision in precisions {
+            let arrow_type = precision.data_type().clone();
+            let batch = information_schema_batch(
+                &["AMOUNT"],
+                &["NUMBER"],
+                &["YES"],
+                precision,
+                Arc::new(Int32Array::from(vec![Some(2)])),
+            );
+
+            let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+                .unwrap_or_else(|e| panic!("{arrow_type} precision should parse: {e}"));
+
+            assert_eq!(
+                schema.field(0).data_type(),
+                &DataType::Decimal128(12, 2),
+                "{arrow_type} precision dropped"
+            );
+        }
+    }
+
+    /// The text representation Snowflake uses in its JSON result format still
+    /// has to be read, including a decimal-rendered integer such as `12.00`.
+    #[test]
+    fn information_schema_arrow_keeps_scale_from_string_metadata_columns() {
+        let batch = information_schema_batch(
+            &["AMOUNT", "TOTAL", "NAME"],
+            &["NUMBER", "NUMBER", "VARCHAR"],
+            &["YES", "YES", "YES"],
+            Arc::new(StringArray::from(vec![Some("12"), Some("12.00"), None])),
+            Arc::new(StringArray::from(vec![Some("2"), Some(" 2 "), None])),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+            .expect("string metadata should still parse");
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(12, 2));
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(12, 2));
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+    }
+
+    /// An all-null metadata column arrives as an Arrow `Null` array, which
+    /// carries no integers to read and must not be mistaken for unreadable
+    /// metadata.
+    #[test]
+    fn information_schema_arrow_accepts_all_null_metadata_columns() {
+        let batch = information_schema_batch(
+            &["NAME"],
+            &["VARCHAR"],
+            &["YES"],
+            Arc::new(NullArray::new(1)),
+            Arc::new(NullArray::new(1)),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+            .expect("absent numeric metadata should parse");
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    }
+
+    /// Metadata Spice cannot turn into a precision and scale must fail the
+    /// probe so discovery falls back to `SHOW COLUMNS`, rather than register a
+    /// silently wrong scale. Each case names the column and the table so the
+    /// fallback warning identifies what to look at.
+    #[test]
+    fn information_schema_arrow_rejects_unusable_precision_and_scale() {
+        let cases: Vec<(&str, ArrayRef, ArrayRef, &str)> = vec![
+            (
+                "precision above the Decimal128 maximum",
+                Arc::new(Int64Array::from(vec![Some(99)])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "numeric_precision",
+            ),
+            (
+                "zero precision",
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                "numeric_precision",
+            ),
+            (
+                "negative precision",
+                Arc::new(Int64Array::from(vec![Some(-12)])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "numeric_precision",
+            ),
+            (
+                "scale wider than the precision",
+                Arc::new(Int64Array::from(vec![Some(12)])),
+                Arc::new(Int64Array::from(vec![Some(20)])),
+                "numeric_scale",
+            ),
+            (
+                "negative scale",
+                Arc::new(Int64Array::from(vec![Some(12)])),
+                Arc::new(Int64Array::from(vec![Some(-2)])),
+                "numeric_scale",
+            ),
+            (
+                "unreadable Arrow type",
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "numeric_precision",
+            ),
+            (
+                "text that is not a number",
+                Arc::new(StringArray::from(vec![Some("twelve")])),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "numeric_precision",
+            ),
+            (
+                "fractional decimal",
+                Arc::new(
+                    Decimal128Array::from(vec![Some(1250_i128)])
+                        .with_precision_and_scale(38, 2)
+                        .expect("fractional metadata column should build"),
+                ),
+                Arc::new(Int64Array::from(vec![Some(2)])),
+                "numeric_precision",
+            ),
+        ];
+
+        for (case, precision, scale, expected_column) in cases {
+            let batch =
+                information_schema_batch(&["AMOUNT"], &["NUMBER"], &["YES"], precision, scale);
+
+            let error = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+                .expect_err(&format!("{case} must not register a schema"));
+
+            assert!(
+                error.contains(expected_column),
+                "{case}: error must name the metadata column it could not read: {error}"
+            );
+            assert!(
+                error.contains("'AMOUNT'") && error.contains("'SALES.ORDERS'"),
+                "{case}: error must name the column and table: {error}"
+            );
+        }
+    }
+
+    /// The JSON result format reaches the same conversion, so a precision and
+    /// scale it renders as text, or as a whole number with a decimal point,
+    /// must survive, and unusable metadata must fail there too.
+    #[test]
+    fn information_schema_json_reads_every_precision_representation() {
+        let rows = serde_json::json!([
+            ["A", "NUMBER", "NO", 12, 2, null, null, null],
+            ["B", "NUMBER", "NO", "12", "2", null, null, null],
+            ["C", "NUMBER", "NO", 12.0, 2.0, null, null, null],
+            ["D", "VARCHAR", "YES", null, null, null, null, null]
+        ]);
+
+        let schema = parse_information_schema_json(&rows, "SALES.ORDERS")
+            .expect("every precision representation should parse");
+
+        for index in 0..3 {
+            assert_eq!(
+                schema.field(index).data_type(),
+                &DataType::Decimal128(12, 2),
+                "{} lost its scale",
+                schema.field(index).name()
+            );
+        }
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+
+        let invalid = serde_json::json!([["A", "NUMBER", "NO", 99, 2, null, null, null]]);
+        let error = parse_information_schema_json(&invalid, "SALES.ORDERS")
+            .expect_err("an out-of-range precision must not register a schema");
+        assert!(
+            error.contains("numeric_precision") && error.contains("'A'"),
+            "error must name the metadata column and the column: {error}"
+        );
     }
 }
