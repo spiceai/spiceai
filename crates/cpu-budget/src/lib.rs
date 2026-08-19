@@ -545,9 +545,7 @@ impl CpuBudget {
     /// CPU quantity or `auto`.
     pub fn resolve(cfg: &CpuConfig, host: &HostReadings) -> Result<Self, Error> {
         let detected_cores = host.affinity_cores.max(1);
-        let affinity_millicores = u64::try_from(detected_cores)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1000);
+        let affinity_millicores = cores_to_millicores(detected_cores);
 
         // Precedence is CLI > env > spicepod, with one exception. `all` says the
         // surface imposes no ceiling of its own, so it defers to an explicit
@@ -898,39 +896,38 @@ impl CpuBudget {
         if !matches!(self.source, CpuSource::Configured) {
             return None;
         }
-        let affinity_millicores = u64::try_from(self.detected_cores)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(1000);
-        // A quota under the next whole core is the wall that is either binding or
-        // indistinguishable from it, and it is exact where the floored reading is
-        // not, so it is the one to name.
-        let (ceiling, ceiling_phrase, consequence, remedy) = match self.limit_millicores {
-            Some(limit) if limit < affinity_millicores.saturating_add(1000) => (
-                limit,
+        let affinity_millicores = cores_to_millicores(self.detected_cores);
+        // Under the next whole core, the quota is the wall that is either binding or
+        // indistinguishable from it -- and exact where the floored reading is not.
+        let binding_quota = self
+            .limit_millicores
+            .filter(|limit| *limit < affinity_millicores.saturating_add(1000));
+        let ceiling = binding_quota.unwrap_or(affinity_millicores);
+        if self.millicores <= ceiling {
+            return None;
+        }
+        let (ceiling_phrase, consequence, remedy) = match binding_quota {
+            Some(limit) => (
                 format!(
                     "this container's cgroup CPU limit of {}",
                     format_millicores(limit)
                 ),
-                "the container is CFS-throttled under load instead of being given the extra CPU",
+                "the container is CFS-throttled under load",
                 "raise the container's CPU limit",
             ),
-            _ => (
-                affinity_millicores,
+            None => (
                 format!(
                     "the {} available to this process",
                     format_millicores(affinity_millicores)
                 ),
-                "its threads contend for those CPUs instead of being given the extra CPU",
+                "its threads contend for those CPUs",
                 "widen this process's CPU affinity",
             ),
         };
-        if self.millicores <= ceiling {
-            return None;
-        }
         Some(format!(
             "`{origin}` is set to {entitlement}, above {ceiling_phrase}, so every pool is sized \
-             for {entitlement} and {consequence}. Lower it to {ceiling_value} or {remedy}. \
-             See: {DOCS_URL}",
+             for {entitlement} and {consequence} instead of being given the extra CPU. \
+             Lower it to {ceiling_value} or {remedy}. See: {DOCS_URL}",
             origin = self.origin(),
             entitlement = format_millicores(self.millicores),
             ceiling_value = format_millicores(ceiling),
@@ -1299,6 +1296,17 @@ pub fn parse_cpu_quantity(value: &str) -> Option<CpuSetting> {
 
 /// Render millicores the way an operator writes them: `4 cores`, `3.5 cores`,
 /// `500m`.
+/// Whole CPUs as millicores.
+///
+/// Saturating rather than wrapping: a core count that overflows `u64` millicores
+/// is not a machine, and clamping keeps it a ceiling rather than turning it into
+/// a very low one.
+fn cores_to_millicores(cores: usize) -> u64 {
+    u64::try_from(cores)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000)
+}
+
 fn format_millicores(millicores: u64) -> String {
     if millicores.is_multiple_of(1000) {
         let cores = millicores / 1000;
@@ -1766,6 +1774,10 @@ mod tests {
             warning.contains("Lower it to 2 cores"),
             "gives an actionable fix: {warning}"
         );
+        assert!(
+            warning.contains("instead of being given the extra CPU"),
+            "names what the extra configured CPU does not buy: {warning}"
+        );
         assert!(warning.contains(DOCS_URL), "{warning}");
 
         // Warn-only: the configured value is still honoured, so an operator sizing
@@ -1801,34 +1813,6 @@ mod tests {
         assert!(
             !oversubscribed.contains("cgroup"),
             "no quota to name here: {oversubscribed}"
-        );
-
-        // A fractional quota is the case `detected_cores` cannot express: a
-        // `limits.cpu: 2500m` pod on a wide node reports 2 available cores, because
-        // `available_parallelism` floors the quota it already applied. Configuring up
-        // to the real quota must stay silent, and anything above it must be named
-        // against the quota rather than against that floored reading.
-        let fractional = quota(2, 2500);
-        for cores in ["2", "2.1", "2.5", "2500m"] {
-            assert_eq!(
-                CpuBudget::resolve(&spicepod(cores), &fractional)
-                    .expect("valid")
-                    .configured_above_ceiling_warning(),
-                None,
-                "{cores} is within a 2500m quota and must not be warned about"
-            );
-        }
-        let over_fractional = CpuBudget::resolve(&spicepod("3"), &fractional)
-            .expect("valid")
-            .configured_above_ceiling_warning()
-            .expect("3 cores above a 2500m quota must be remarked on");
-        assert!(
-            over_fractional.contains("cgroup CPU limit of 2.5 cores"),
-            "names the exact quota, not the floored core count: {over_fractional}"
-        );
-        assert!(
-            !over_fractional.contains("affinity"),
-            "a fractional quota is not an affinity problem: {over_fractional}"
         );
 
         // A quota wider than affinity cannot be used, so affinity is the tightest
@@ -1878,6 +1862,54 @@ mod tests {
                 .expect("valid")
                 .configured_above_ceiling_warning(),
             None
+        );
+    }
+
+    /// A fractional quota is the reading `detected_cores` cannot express, so the
+    /// ceiling has to come from the quota itself.
+    ///
+    /// `available_parallelism` floors the quota it has already applied, so a
+    /// `limits.cpu: 2500m` pod on a wide node reports 2 available cores. Comparing
+    /// against that floored value warns an operator who configured exactly their
+    /// quota, and sends them after an affinity limit that does not exist.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_fractional_quota_is_named_exactly_rather_than_floored() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+        let fractional = quota(2, 2500);
+        assert_eq!(
+            CpuBudget::resolve(&CpuConfig::default(), &fractional)
+                .expect("valid")
+                .detected_cores(),
+            2,
+            "the premise: 2500m floors to a 2-core reading"
+        );
+
+        // Anything up to the real quota is within the entitlement, including the
+        // 500m the floored reading cannot see.
+        for cores in ["2", "2.1", "2.5", "2500m"] {
+            assert_eq!(
+                CpuBudget::resolve(&spicepod(cores), &fractional)
+                    .expect("valid")
+                    .configured_above_ceiling_warning(),
+                None,
+                "{cores} is within a 2500m quota and must not be warned about"
+            );
+        }
+
+        // Above it, the quota is named exactly rather than as the floored count.
+        let over = CpuBudget::resolve(&spicepod("3"), &fractional)
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("3 cores above a 2500m quota must be remarked on");
+        assert!(
+            over.contains("cgroup CPU limit of 2.5 cores"),
+            "names the exact quota, not the floored core count: {over}"
+        );
+        assert!(
+            !over.contains("affinity"),
+            "a fractional quota is not an affinity problem: {over}"
         );
     }
 
