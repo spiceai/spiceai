@@ -49,13 +49,17 @@ use super::{
     get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::{
-    FilePathError, resolved_refresh_mode, snapshots::download_snapshot_if_needed,
-};
+use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
+use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
+use runtime_checkpoint_api::CheckpointError;
+#[cfg(feature = "sqlite")]
+use runtime_checkpoint_sqlite::SqliteSidecar;
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
@@ -3107,10 +3111,117 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    async fn init(
+    /// Cayenne keeps its sidecar tables in the metastore database beside the dataset's
+    /// Cayenne directory, not in the dataset's own store.
+    ///
+    /// When that metastore is Turso, the pool comes from the **Turso accelerator's**
+    /// path-keyed cache rather than one built here: `cayenne.db` is opened by every
+    /// sidecar of every Cayenne dataset in the pod, and the lock that serializes their
+    /// DDL against each other's `BEGIN CONCURRENT` writes lives on the pool instance —
+    /// a pool of our own would hold a lock no other sidecar observes.
+    async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
         registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        #[cfg(feature = "sqlite")]
+        {
+            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
+
+            // Resolving the data directory validates the acceleration configuration; the
+            // metastore path below is derived independently of it.
+            self.file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+
+            if open_option == OpenOption::OpenExisting
+                && !std::path::Path::new(&metadata_db_path).exists()
+            {
+                return Err(CheckpointError::Store {
+                    source: format!(
+                        "Cayenne metadata directory does not exist at {metadata_db_path}"
+                    )
+                    .into(),
+                });
+            }
+
+            if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|source| {
+                    CheckpointError::Store {
+                        source: Box::new(source),
+                    }
+                })?;
+            }
+
+            #[cfg(feature = "turso")]
+            {
+                let metastore_type = source
+                    .acceleration()
+                    .and_then(|a| a.params.get("cayenne_metastore"))
+                    .map_or("sqlite", String::as_str);
+                if metastore_type == "turso" {
+                    let turso_engine = registry
+                        .get_accelerator_engine(Engine::Turso)
+                        .await
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "Turso accelerator engine not available".into(),
+                        })?;
+                    let turso_accelerator = turso_engine
+                        .as_any()
+                        .downcast_ref::<crate::dataaccelerator::turso::TursoAccelerator>()
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "expected the registered Turso accelerator".into(),
+                        })?;
+                    let pool = turso_accelerator
+                        .get_shared_pool_for_path(&metadata_db_path)
+                        .await
+                        .map_err(|source| CheckpointError::Store {
+                            source: Box::new(source),
+                        })?;
+                    return Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
+                        pool,
+                        source.name().to_string(),
+                    )));
+                }
+            }
+
+            let sqlite_factory = SqliteTableProviderFactory::new();
+            let pool = sqlite_factory
+                .get_or_init_instance(
+                    Arc::from(metadata_db_path.as_str()),
+                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            Ok(Arc::new(SqliteSidecar::new(
+                Arc::new(pool),
+                source.name().to_string(),
+            )))
+        }
+
+        // The Cayenne metastore is a SQLite (or Turso) database, so without the
+        // `sqlite` engine compiled in there is nothing to open it with.
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (source, registry, open_option);
+            Err(runtime_acceleration::sidecar::unsupported_sidecar(
+                "cayenne", "sidecar",
+            ))
+        }
+    }
+
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
@@ -3272,9 +3383,9 @@ impl DataAccelerator for CayenneAccelerator {
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
                 );
-                super::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
-                    source,
+                    &source.name().to_string(),
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
@@ -3288,6 +3399,7 @@ impl DataAccelerator for CayenneAccelerator {
                     // and `snapshot_before_recreate` skips the snapshot rather than
                     // publish an archive nothing can restore.
                     self.snapshot_engine_for_source(source).await,
+                    resolved_refresh_mode(source, acceleration),
                 )
                 .await;
             }
@@ -3387,10 +3499,10 @@ impl DataAccelerator for CayenneAccelerator {
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
+                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {
@@ -5261,9 +5373,8 @@ mod tests {
             ..Default::default()
         });
 
-        let registry = Arc::new(AcceleratorEngineRegistry::new());
         let err = CayenneAccelerator::new()
-            .init(&dataset, registry)
+            .init(&dataset)
             .await
             .expect_err("init must refuse a data directory that contains the metastore");
 
