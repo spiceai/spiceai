@@ -20,7 +20,7 @@ mod write;
 
 use crate::function_support::FunctionSupport;
 use arrow::array::Array;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, i256};
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
@@ -508,9 +508,7 @@ fn arrow_information_schema_integer(
         }
         DataType::Decimal256(_, scale) => {
             let unscaled = array.as_primitive::<Decimal256Type>().value(row);
-            unscaled
-                .to_i128()
-                .and_then(|unscaled| integer_from_decimal(unscaled, *scale))
+            integer_from_wide_decimal(unscaled, *scale)
                 .ok_or_else(|| unusable(&decimal_rendering(unscaled, *scale)))?
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
@@ -578,6 +576,27 @@ fn integer_from_decimal(unscaled: i128, scale: i8) -> Option<i128> {
         std::cmp::Ordering::Equal => Some(unscaled),
         std::cmp::Ordering::Greater => (unscaled % power == 0).then_some(unscaled / power),
         std::cmp::Ordering::Less => unscaled.checked_mul(power),
+    }
+}
+
+/// Converts a 256-bit decimal metadata value into the whole number it stands
+/// for.
+///
+/// The rescaling happens at full width and only the result is narrowed: a
+/// `Decimal256(76, 38)` cell holding `12` carries a coefficient of 12 followed
+/// by 38 zeros, which no [`i128`] can hold even though the number it represents
+/// is small.
+fn integer_from_wide_decimal(unscaled: i256, scale: i8) -> Option<i128> {
+    let power = i256::from(10_i64).checked_pow(u32::from(scale.unsigned_abs()))?;
+    match scale.cmp(&0) {
+        std::cmp::Ordering::Equal => unscaled.to_i128(),
+        std::cmp::Ordering::Greater => {
+            if unscaled.checked_rem(power)? != i256::ZERO {
+                return None;
+            }
+            unscaled.checked_div(power)?.to_i128()
+        }
+        std::cmp::Ordering::Less => unscaled.checked_mul(power)?.to_i128(),
     }
 }
 
@@ -995,8 +1014,9 @@ impl SnowflakeTableFactory {
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
-        NullArray, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, NullArray, RecordBatch, StringArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
     };
 
     #[test]
@@ -1434,6 +1454,54 @@ mod tests {
             .expect("information_schema Arrow response should parse");
 
         assert_lineitem_schema(&schema);
+    }
+
+    /// A metadata cell wide enough to need 256 bits has to be rescaled before it
+    /// is narrowed: a `Decimal256(76, 38)` cell holding 12 carries a coefficient
+    /// of 12 followed by 38 zeros, which overruns an `i128` even though the
+    /// number it represents is small.
+    #[test]
+    fn information_schema_arrow_keeps_scale_from_wide_decimal_metadata_columns() {
+        let wide = |digits: &str| {
+            Arc::new(
+                Decimal256Array::from(vec![Some(
+                    i256::from_string(digits).expect("wide decimal literal"),
+                )])
+                .with_precision_and_scale(76, 38)
+                .expect("Decimal256(76,38) metadata column should build"),
+            ) as ArrayRef
+        };
+        let scaled = |value: &str| wide(&format!("{value}{}", "0".repeat(38)));
+
+        let batch = information_schema_batch(
+            &["AMOUNT"],
+            &["NUMBER"],
+            &["YES"],
+            scaled("12"),
+            scaled("2"),
+        );
+
+        let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
+            .expect("a wide decimal metadata column should parse");
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(12, 2));
+
+        // 12.5 is not the whole number `numeric_precision` declares, and must
+        // not be truncated into one.
+        let fractional = information_schema_batch(
+            &["AMOUNT"],
+            &["NUMBER"],
+            &["YES"],
+            wide(&format!("125{}", "0".repeat(37))),
+            scaled("2"),
+        );
+
+        let error = parse_information_schema_arrow(&[fractional], "SALES.ORDERS")
+            .expect_err("a fractional wide decimal must not register a schema");
+        assert!(
+            error.contains("numeric_precision") && error.contains("'AMOUNT'"),
+            "error must name the metadata column and the column: {error}"
+        );
     }
 
     /// Snowflake sizes an integer metadata column to the values it holds, so
