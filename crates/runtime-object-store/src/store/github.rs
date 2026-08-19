@@ -481,15 +481,15 @@ mod tests {
     struct StubSurface {
         seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
         status: u16,
-        body: Arc<Vec<u8>>,
+        body: bytes::Bytes,
     }
 
     impl StubSurface {
-        fn responding(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        fn responding(status: u16, body: impl Into<bytes::Bytes>) -> Self {
             Self {
                 seen: Arc::new(std::sync::Mutex::new(Vec::new())),
                 status,
-                body: Arc::new(body.into()),
+                body: body.into(),
             }
         }
 
@@ -522,7 +522,7 @@ mod tests {
                     });
                 Response::builder()
                     .status(stub.status)
-                    .body(Body::from(stub.body.as_ref().clone()))
+                    .body(Body::from(stub.body))
                     .expect("the stub response is well-formed")
             }
 
@@ -546,6 +546,14 @@ mod tests {
                 .lock()
                 .expect("the stub's request log is not poisoned")
                 .clone()
+        }
+
+        /// The paths this surface was asked for, in order.
+        fn paths(&self) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .map(|request| request.path_and_query)
+                .collect()
         }
     }
 
@@ -632,11 +640,7 @@ mod tests {
         let body = result.bytes().await.expect("the body is readable");
         assert_eq!(body.as_ref(), b"# Spice.ai");
 
-        let paths: Vec<String> = raw
-            .requests()
-            .into_iter()
-            .map(|request| request.path_and_query)
-            .collect();
+        let paths = raw.paths();
         assert!(
             paths.contains(&"/spiceai/spiceai/refs/heads/trunk/README.md".to_string()),
             "the fetch must be scoped to org/repo/revision, saw {paths:?}"
@@ -671,11 +675,7 @@ mod tests {
 
         let _entries: Vec<_> = store.list(None).collect::<Vec<_>>().await;
 
-        let paths: Vec<String> = api
-            .requests()
-            .into_iter()
-            .map(|request| request.path_and_query)
-            .collect();
+        let paths = api.paths();
         assert!(
             paths.contains(
                 &"/repos/spiceai/spiceai/git/trees/refs/heads/trunk?recursive=true".to_string()
