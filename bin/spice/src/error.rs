@@ -102,6 +102,12 @@ pub enum Error {
     #[snafu(display("The Spice runtime is not installed. Run 'spice install' to install it."))]
     RuntimeNotInstalled,
 
+    /// `SPICED_PATH` names something that cannot be run as the runtime
+    #[snafu(display(
+        "Failed to locate the Spice runtime: `SPICED_PATH` is set to '{path}', which is not an executable file. Point `SPICED_PATH` at a 'spiced' binary (and check it is executable: 'chmod +x {path}'), or unset it to use the runtime beside the CLI, on 'PATH', or from 'spice install'. See: https://spiceai.org/docs/cli"
+    ))]
+    SpicedPathOverrideNotRunnable { path: String },
+
     /// Native Windows runtime execution is unsupported
     #[snafu(display(
         "Native Windows local runtime install and run are not supported. Open WSL and run the Linux Spice CLI there instead."

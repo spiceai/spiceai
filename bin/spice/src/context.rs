@@ -19,13 +19,14 @@ limitations under the License.
 use crate::error::{
     CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
     RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
-    WindowsNativeRuntimeUnsupportedSnafu,
+    SpicedPathOverrideNotRunnableSnafu, WindowsNativeRuntimeUnsupportedSnafu,
 };
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt, ensure};
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
 use spice_cloud_client::redirect::same_origin_redirect_policy;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -38,6 +39,14 @@ pub const DEFAULT_HTTP_ENDPOINT: &str = "http://127.0.0.1:8090";
 /// Constants for Spice paths and filenames
 const DOT_SPICE: &str = ".spice";
 const SPICED_FILENAME: &str = "spiced";
+
+/// Environment variable that pins the runtime binary outright, ahead of every
+/// other candidate. The escape hatch for testing one specific build without
+/// moving files onto `PATH` or into the managed install directory.
+const SPICED_PATH_ENV: &str = "SPICED_PATH";
+
+/// The search path consulted after the sibling of the running CLI.
+const PATH_ENV: &str = "PATH";
 const SPICEPODS_DIR: &str = "spicepods";
 const WSL_ENV_KEYS: [&str; 2] = ["WSL_DISTRO_NAME", "WSL_INTEROP"];
 
@@ -469,42 +478,67 @@ impl RuntimeContext {
         self.spice_bin_dir.join(SPICED_FILENAME)
     }
 
-    /// Check if the runtime is installed, in this user's install directory or
-    /// (under `sudo`) the invoking user's — see [`Self::resolve_spiced_path`].
+    /// Whether a runtime is present in the directory `spice install` writes to.
+    ///
+    /// Deliberately *not* "is a runtime available": `spice install` and
+    /// `spice upgrade` own [`Self::spiced_path`] and nothing else, so asking
+    /// the whole ladder would let a `spiced` on `PATH` convince them their own
+    /// directory is already up to date. What will *run* is
+    /// [`Self::resolve_spiced`]; the two are different questions and this is
+    /// the one a writer of the managed install must ask.
     #[must_use]
-    pub fn is_runtime_installed(&self) -> bool {
-        self.resolve_spiced_path().is_some()
+    pub fn is_managed_runtime_installed(&self) -> bool {
+        is_runnable_binary(&self.spiced_path())
     }
 
-    /// Locate the `spiced` binary to use, tolerating `sudo`.
+    /// Locate the `spiced` binary to run, and say where it came from.
+    ///
+    /// A CLI and a runtime are a pair, and the pair has to stay together: the
+    /// managed install directory alone cannot express that, because a `spice`
+    /// built from `trunk` and run off `PATH` would drive whatever release
+    /// happened to be sitting in `~/.spice/bin`.
     ///
     /// `sudo` resets `HOME` to `/root` on most distributions, so
     /// [`Self::spiced_path`] — which is derived from `HOME` — points at
     /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
     /// invoking user actually installed. That matters because
     /// `sudo spice connect service install` is the documented way to install the
-    /// service: without this, every such run concludes the runtime is missing
-    /// and downloads the latest *release*, which on a machine tracking `trunk`
-    /// silently pairs a dev CLI with a released runtime.
+    /// service: without the last rung, every such run concludes the runtime is
+    /// missing and downloads the latest *release*.
     ///
     /// Preference order:
-    /// 1. `$HOME/.spice/bin/spiced` — the ordinary case, and a genuine root
+    /// 1. `$SPICED_PATH` — an explicit pin, honored ahead of everything.
+    /// 2. `spiced` beside the running `spice`, via `current_exe()` — the
+    ///    binary the user actually invoked, and its build partner.
+    /// 3. `spiced` on `PATH`.
+    /// 4. `$HOME/.spice/bin/spiced` — the managed install, and a genuine root
     ///    login's own install.
-    /// 2. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
+    /// 5. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
     ///    before elevating.
     ///
-    /// Returns `None` when neither exists.
-    #[must_use]
-    pub fn resolve_spiced_path(&self) -> Option<PathBuf> {
-        let own = self.spiced_path();
-        if own.exists() {
-            return Some(own);
-        }
-        let candidate = sudo_invoker_home()?
-            .join(DOT_SPICE)
-            .join("bin")
-            .join(SPICED_FILENAME);
-        candidate.exists().then_some(candidate)
+    /// Under `sudo`, every rung names a binary the invoking user already chose
+    /// or installed, which is the trust rung 5 has always extended: a runtime
+    /// in the invoker's own home has been executed as root since that rung was
+    /// added. Rung 3 does not widen that, because a `PATH` directory root would
+    /// search for `spiced` is a directory root already resolved `spice` from —
+    /// anyone who can write the one can write the other. Note this reasoning
+    /// rests on the directories, *not* on `sudo` sanitizing `PATH`: `secure_path`
+    /// is set by stock `sudoers` on most Linux distributions but not on macOS.
+    /// The commands documented to run under `sudo` — `spice connect service
+    /// install` and `spice connect remove` — do not rely on it either; the
+    /// former clears the environment and drops to the service account before it
+    /// runs anything it resolved here.
+    ///
+    /// Returns `Ok(None)` when no candidate exists — the signal to install.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SPICED_PATH` is set but names nothing runnable —
+    /// a mistyped path, or a binary that lost its execute bit — so the pin is
+    /// reported instead of falling through to a different runtime than the one
+    /// that was asked for.
+    pub fn resolve_spiced(&self) -> Result<Option<ResolvedSpiced>> {
+        resolve_spiced(&self.spiced_path(), &SpicedLookup::from_host())
     }
 
     fn is_wsl_environment<F>(mut get_env: F) -> bool
@@ -537,29 +571,32 @@ impl RuntimeContext {
         Ok(())
     }
 
-    /// Get the installed runtime version.
+    /// The version of the runtime that [`Self::resolve_spiced`] would launch.
     ///
     /// # Errors
     ///
-    /// Returns an error if the runtime is not installed or version cannot be determined.
+    /// Returns an error if no runtime resolves, `SPICED_PATH` is unusable, or
+    /// the version cannot be read.
     pub fn runtime_version(&self) -> Result<String> {
-        let Some(spiced) = self.resolve_spiced_path() else {
-            return Err(RuntimeNotInstalledSnafu.build());
-        };
+        let resolved = self.resolve_spiced()?.context(RuntimeNotInstalledSnafu)?;
+        runtime_version_at(&resolved.path)
+    }
 
-        let output = Command::new(spiced)
-            .arg("--version")
-            .output()
-            .context(RuntimeExecutionSnafu)?;
-
-        if !output.status.success() {
-            return Err(RuntimeVersionSnafu {
-                message: String::from_utf8_lossy(&output.stderr).to_string(),
-            }
-            .build());
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    /// The version of the runtime in the directory `spice install` writes to.
+    ///
+    /// The counterpart of [`Self::is_managed_runtime_installed`], and what
+    /// `spice install`/`spice upgrade` compare a release against: they replace
+    /// that one file, so a `spiced` elsewhere on the machine must not decide
+    /// whether they have work to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if that directory holds no runtime, or the version
+    /// cannot be read.
+    pub fn managed_runtime_version(&self) -> Result<String> {
+        let managed = self.spiced_path();
+        ensure!(is_runnable_binary(&managed), RuntimeNotInstalledSnafu);
+        runtime_version_at(&managed)
     }
 
     /// Create a command to run spiced with the given arguments.
@@ -573,14 +610,11 @@ impl RuntimeContext {
     /// Returns an error if the runtime is not installed.
     pub fn get_run_cmd(
         &self,
+        spiced: &ResolvedSpiced,
         args: &[String],
         http_endpoint_override: Option<&str>,
     ) -> Result<Command> {
-        let Some(spiced) = self.resolve_spiced_path() else {
-            return Err(RuntimeNotInstalledSnafu.build());
-        };
-
-        let mut cmd = Command::new(spiced);
+        let mut cmd = Command::new(&spiced.path);
         cmd.arg("--pods-watcher-enabled");
         cmd.args(args);
 
@@ -751,10 +785,287 @@ impl RuntimeContext {
     }
 }
 
+/// Warn when the runtime just written to the managed install directory is not
+/// the one [`RuntimeContext::resolve_spiced`] will select.
+///
+/// `spice install` and `spice upgrade` only ever write to `$HOME/.spice/bin`,
+/// but a `spiced` beside the CLI, on `PATH`, or pinned outranks it — so an
+/// upgrade can report success while every later `spice run` keeps starting the
+/// old binary. Silence there is the worst outcome: the user has done the thing
+/// that was supposed to fix their problem.
+pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
+    let Ok(Some(resolved)) = ctx.resolve_spiced() else {
+        return;
+    };
+    let installed = ctx.spiced_path();
+    // Compared by path rather than by source: the question here is whether the
+    // file just written is the file that will run, which is not the same
+    // question as whether the source is worth announcing at launch.
+    if resolved.path == installed {
+        return;
+    }
+    tracing::warn!("{}", shadowed_install_warning(&installed, &resolved));
+}
+
+/// The wording of [`warn_if_install_is_shadowed`].
+///
+/// A function so the text is asserted rather than eyeballed: it is the only
+/// explanation a user gets for an upgrade that appears to succeed and changes
+/// nothing, so it has to keep naming both binaries and what to do about it.
+fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> String {
+    let installed = installed.display();
+    let selected = resolved.path.display();
+    let source = resolved.source.describe();
+    format!(
+        "Wrote the runtime to '{installed}', but 'spice run' will start '{selected}' ({source}) instead, so this install will not take effect. Remove that binary, or set `SPICED_PATH` to '{installed}' to pin the one just installed. See: https://spiceai.org/docs/cli"
+    )
+}
+
+/// Read a runtime's version by running it.
+///
+/// Public so a caller that has already resolved does not walk the ladder a
+/// second time to reach the same binary — and cannot be told a version by one
+/// binary while reporting the path of another.
+///
+/// # Errors
+///
+/// Returns an error if the binary cannot be executed or reports a failure.
+pub fn runtime_version_at(spiced: &Path) -> Result<String> {
+    let output = Command::new(spiced)
+        .arg("--version")
+        .output()
+        .context(RuntimeExecutionSnafu)?;
+
+    ensure!(
+        output.status.success(),
+        RuntimeVersionSnafu {
+            message: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
+    );
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Where the `spiced` that is about to run was found.
+///
+/// Carried alongside the path so the launcher can report a runtime that came
+/// from anywhere other than the managed install — the case a user cannot
+/// otherwise see, and the one that produces a version-skewed pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpicedSource {
+    /// Pinned by `SPICED_PATH`.
+    Pinned,
+    /// Beside the running `spice`.
+    Sibling,
+    /// Found on `PATH`.
+    OnPath,
+    /// The managed install directory, `$HOME/.spice/bin`.
+    ManagedInstall,
+    /// The `sudo` invoker's managed install directory.
+    SudoInvokerInstall,
+}
+
+impl SpicedSource {
+    /// How this source reads in the line naming the runtime being launched.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned by SPICED_PATH",
+            Self::Sibling => "beside the spice CLI",
+            Self::OnPath => "found on PATH",
+            Self::ManagedInstall => "installed by spice install",
+            Self::SudoInvokerInstall => "installed by spice install, by the sudo invoker",
+        }
+    }
+
+    /// Whether this is the location `spice install` writes to for this user —
+    /// the source that needs no announcing because it is what a user expects.
+    #[must_use]
+    pub fn is_expected_default(self) -> bool {
+        matches!(self, Self::ManagedInstall)
+    }
+}
+
+/// A located `spiced` binary and where it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpiced {
+    /// Path to the binary, anchored by [`anchor_to_current_dir`].
+    pub path: PathBuf,
+    /// Which rung of the ladder supplied it.
+    pub source: SpicedSource,
+}
+
+impl ResolvedSpiced {
+    /// The one place a [`ResolvedSpiced`] is built, so anchoring covers every
+    /// rung rather than the two that happen to need it today.
+    fn at(path: PathBuf, source: SpicedSource) -> Self {
+        Self {
+            path: anchor_to_current_dir(path),
+            source,
+        }
+    }
+}
+
+/// The host facts [`resolve_spiced`] reads.
+///
+/// Injected rather than read inline so the ladder is testable: a developer
+/// machine with `spiced` on `PATH`, or a suite running under `sudo`, would
+/// otherwise decide the outcome of every test of the ordering.
+struct SpicedLookup<'a> {
+    /// `$SPICED_PATH`, as read from the environment.
+    pinned: Option<OsString>,
+    /// `$PATH`, unsplit. Not a `String`: a `PATH` entry need not be UTF-8.
+    search_path: Option<OsString>,
+    /// Path of the running executable, when the OS will say.
+    current_exe: Option<PathBuf>,
+    /// Home directory of the `sudo` invoker, when running under `sudo`.
+    ///
+    /// A callable rather than a value because answering it can cost a
+    /// subprocess — `getent` on Linux, `dscl` on macOS, which queries Directory
+    /// Services and is slow on a directory-bound host. Only the last rung needs
+    /// it, and the last rung is the one almost never reached.
+    sudo_invoker_home: &'a dyn Fn() -> Option<PathBuf>,
+    /// Whether a candidate path names a runtime binary — see
+    /// [`is_runnable_binary`].
+    is_binary: &'a dyn Fn(&Path) -> bool,
+}
+
+/// Whether `path` names something that can be run as the runtime.
+///
+/// Stricter than `exists` in two ways that the ladder depends on, because a
+/// candidate that wins a rung shadows every rung below it *and* suppresses the
+/// auto-install: a `PATH` entry holding a *directory* called `spiced`, or a
+/// half-written download left without its execute bit, must not become the
+/// answer while a working runtime sits further down. Symlinks are followed, so
+/// a symlinked install still resolves.
+fn is_runnable_binary(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && grants_execute(&metadata)
+}
+
+/// Whether the mode grants execute to anyone.
+///
+/// Any of the three bits, not the one matching this process: `spice run` under
+/// `sudo` is a different identity than the `spice install` that wrote the file,
+/// and narrowing to the caller's own bit would make the answer depend on which
+/// of them is asking.
+#[cfg(unix)]
+fn grants_execute(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows carries no execute bit, so being a file is the whole test.
+#[cfg(not(unix))]
+fn grants_execute(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// Resolve `path` against the working directory it was validated in.
+///
+/// The runtime is spawned with the child's working directory set to `--dir`,
+/// and `Command::new` re-interprets a relative program path against *that*
+/// directory — so a relative `SPICED_PATH` or `PATH` entry would be checked
+/// against one directory and executed from another. Worse, a bare name with no
+/// separator is not a path to `Command::new` at all: it is a fresh `PATH`
+/// lookup, so the file that was validated need not be the file that runs.
+/// Anchoring makes the binary that was checked the binary that runs. Best
+/// effort: if the working directory cannot be read the relative path is
+/// returned unchanged, which is no worse than not anchoring at all.
+fn anchor_to_current_dir(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+impl SpicedLookup<'static> {
+    /// The real host.
+    fn from_host() -> Self {
+        Self {
+            pinned: std::env::var_os(SPICED_PATH_ENV),
+            search_path: std::env::var_os(PATH_ENV),
+            current_exe: std::env::current_exe().ok(),
+            sudo_invoker_home: &sudo_invoker_home,
+            is_binary: &is_runnable_binary,
+        }
+    }
+}
+
+/// Walk the resolution ladder documented on [`RuntimeContext::resolve_spiced`].
+///
+/// `managed_install` is the `$HOME/.spice/bin/spiced` of the calling context.
+///
+/// # Errors
+///
+/// Returns [`Error::SpicedPathOverrideNotRunnable`] when `SPICED_PATH` is set
+/// to a path [`is_runnable_binary`] rejects.
+fn resolve_spiced(
+    managed_install: &Path,
+    lookup: &SpicedLookup<'_>,
+) -> Result<Option<ResolvedSpiced>> {
+    if let Some(pinned) = lookup.pinned.as_ref().filter(|value| !value.is_empty()) {
+        let pinned = PathBuf::from(pinned);
+        // A pin that names nothing runnable is a mistake to report, never a
+        // reason to start a different runtime than the one that was asked for.
+        ensure!(
+            (lookup.is_binary)(&pinned),
+            SpicedPathOverrideNotRunnableSnafu {
+                path: pinned.display().to_string(),
+            }
+        );
+        return Ok(Some(ResolvedSpiced::at(pinned, SpicedSource::Pinned)));
+    }
+
+    if let Some(dir) = lookup.current_exe.as_deref().and_then(Path::parent) {
+        let sibling = dir.join(SPICED_FILENAME);
+        if (lookup.is_binary)(&sibling) {
+            return Ok(Some(ResolvedSpiced::at(sibling, SpicedSource::Sibling)));
+        }
+    }
+
+    if let Some(search_path) = lookup.search_path.as_ref() {
+        for dir in std::env::split_paths(search_path) {
+            // An empty `PATH` entry means the current directory. Letting the
+            // working directory supply the runtime would make `spice run`
+            // depend on where it was run from.
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join(SPICED_FILENAME);
+            if (lookup.is_binary)(&candidate) {
+                return Ok(Some(ResolvedSpiced::at(candidate, SpicedSource::OnPath)));
+            }
+        }
+    }
+
+    if (lookup.is_binary)(managed_install) {
+        return Ok(Some(ResolvedSpiced::at(
+            managed_install.to_path_buf(),
+            SpicedSource::ManagedInstall,
+        )));
+    }
+
+    if let Some(invoker_home) = (lookup.sudo_invoker_home)() {
+        let invoker_install = invoker_home
+            .join(DOT_SPICE)
+            .join("bin")
+            .join(SPICED_FILENAME);
+        if (lookup.is_binary)(&invoker_install) {
+            return Ok(Some(ResolvedSpiced::at(
+                invoker_install,
+                SpicedSource::SudoInvokerInstall,
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
 /// The home directory of the user who invoked `sudo`, or `None` when not
 /// running under `sudo` (or the user cannot be resolved).
 ///
-/// Only consulted as a fallback by [`RuntimeContext::resolve_spiced_path`].
+/// Only consulted by the last rung of [`RuntimeContext::resolve_spiced`].
 #[cfg(unix)]
 fn sudo_invoker_home() -> Option<PathBuf> {
     let user = std::env::var("SUDO_USER").ok()?;
@@ -1021,6 +1332,28 @@ mod tests {
         }
     }
 
+    /// The context's own managed install, as `get_run_cmd` now takes it.
+    ///
+    /// These tests are about the *arguments* the command carries, not about
+    /// which binary was selected — that is what the ladder tests cover.
+    fn test_resolved(ctx: &RuntimeContext) -> ResolvedSpiced {
+        ResolvedSpiced::at(ctx.spiced_path(), SpicedSource::ManagedInstall)
+    }
+
+    /// Write a stand-in `spiced` that [`is_runnable_binary`] will accept.
+    ///
+    /// The execute bit is the point: a runtime without one is a half-written
+    /// download, and the ladder is required to walk past it.
+    fn write_mock_runtime(path: &Path) {
+        std::fs::write(path, "mock").expect("create mock spiced");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the mock spiced executable");
+        }
+    }
+
     /// Create a test context with a mocked spiced binary in an isolated temp directory.
     /// Returns the context and the `TempDir` (which must be kept alive for the test).
     fn create_test_context_with_runtime() -> (RuntimeContext, TempDir) {
@@ -1028,7 +1361,7 @@ mod tests {
         let bin_dir = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).expect("create bin dir");
         let spiced_path = bin_dir.join(SPICED_FILENAME);
-        std::fs::write(&spiced_path, "mock").expect("create mock spiced");
+        write_mock_runtime(&spiced_path);
 
         let ctx = RuntimeContext {
             spice_runtime_dir: temp_dir.path().to_path_buf(),
@@ -1136,25 +1469,432 @@ mod tests {
         assert!(PathBuf::from(&home).is_dir(), "{home}");
     }
 
+    /// The runtime the CLI ships beside, on `PATH`, or in the managed install
+    /// directory: whichever of them exists, the context must find one.
+    ///
+    /// Deliberately asserts *that* a runtime resolves rather than which rung
+    /// supplied it — the host running this suite has a `PATH` and a
+    /// `current_exe` of its own, and pinning the rung here would make the test
+    /// a statement about the developer's machine. The ordering is tested
+    /// against [`resolve_spiced`] directly, where every rung is injected.
+    #[test]
+    fn a_context_with_an_install_in_its_own_bin_dir_finds_a_runtime() {
+        let (ctx, _temp) = create_test_context_with_runtime();
+        assert!(
+            ctx.resolve_spiced()
+                .expect("no SPICED_PATH is set")
+                .is_some(),
+            "an install in this context's own bin dir must resolve"
+        );
+        assert!(ctx.is_managed_runtime_installed());
+    }
+
+    /// Build a [`SpicedLookup`] over an invented host: `present` is the set of
+    /// paths that name a binary, and nothing else exists.
+    ///
+    /// Every rung is injected, so these tests describe the ladder and not the
+    /// machine they run on — a developer with `spiced` on `PATH`, or a suite
+    /// running under `sudo`, would otherwise decide the outcome.
+    fn ladder(
+        env: &[(&str, &str)],
+        current_exe: Option<&str>,
+        sudo_home: Option<&str>,
+        present: &[&str],
+        managed_install: &str,
+    ) -> Result<Option<ResolvedSpiced>> {
+        let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
+        let is_binary = |path: &Path| present.iter().any(|known| known == path);
+        ladder_with(env, current_exe, sudo_home, managed_install, &is_binary)
+    }
+
+    /// [`ladder`] with the real filesystem predicate, for the two behaviours
+    /// only a real file can express: a directory named `spiced`, and a runtime
+    /// with no execute bit.
+    fn ladder_with(
+        env: &[(&str, &str)],
+        current_exe: Option<&str>,
+        sudo_home: Option<&str>,
+        managed_install: &str,
+        is_binary: &dyn Fn(&Path) -> bool,
+    ) -> Result<Option<ResolvedSpiced>> {
+        let env: HashMap<&str, OsString> = env
+            .iter()
+            .map(|(key, value)| (*key, OsString::from(*value)))
+            .collect();
+        let sudo_home = sudo_home.map(PathBuf::from);
+        let read_sudo_home = || sudo_home.clone();
+
+        resolve_spiced(
+            Path::new(managed_install),
+            &SpicedLookup {
+                pinned: env.get(SPICED_PATH_ENV).cloned(),
+                search_path: env.get(PATH_ENV).cloned(),
+                current_exe: current_exe.map(PathBuf::from),
+                sudo_invoker_home: &read_sudo_home,
+                is_binary,
+            },
+        )
+    }
+
+    /// Join directories the way the platform writes `PATH`, through the stdlib
+    /// inverse of the `split_paths` the ladder itself uses — so the test's
+    /// notion of how `PATH` is encoded cannot drift from the code's.
+    fn search_path(dirs: &[&str]) -> String {
+        std::env::join_paths(dirs)
+            .expect("join a PATH")
+            .into_string()
+            .expect("the test PATH is UTF-8")
+    }
+
+    fn expect_resolved(found: Result<Option<ResolvedSpiced>>) -> ResolvedSpiced {
+        found
+            .expect("the ladder must not error")
+            .expect("the ladder must resolve a runtime")
+    }
+
+    /// The pin exists so a specific build can be tested without moving files
+    /// onto `PATH`, which means it has to outrank every rung below it.
+    #[test]
+    fn a_spiced_path_pin_outranks_every_other_candidate() {
+        let path = search_path(&["/usr/local/bin"]);
+        let found = expect_resolved(ladder(
+            &[("SPICED_PATH", "/builds/pinned/spiced"), ("PATH", &path)],
+            Some("/usr/local/bin/spice"),
+            Some("/home/operator"),
+            &[
+                "/builds/pinned/spiced",
+                "/usr/local/bin/spiced",
+                "/home/me/.spice/bin/spiced",
+                "/home/operator/.spice/bin/spiced",
+            ],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/builds/pinned/spiced"));
+        assert_eq!(found.source, SpicedSource::Pinned);
+    }
+
+    /// A mistyped pin must not quietly start a *different* runtime — the whole
+    /// point of pinning is that the binary is not in doubt. Every other rung is
+    /// available here, so falling through would look like success.
+    #[test]
+    fn a_spiced_path_pin_that_names_nothing_is_an_error_not_a_fallthrough() {
+        let path = search_path(&["/usr/local/bin"]);
+        let error = ladder(
+            &[("SPICED_PATH", "/builds/typo/spiced"), ("PATH", &path)],
+            Some("/usr/local/bin/spice"),
+            Some("/home/operator"),
+            &[
+                "/usr/local/bin/spiced",
+                "/home/me/.spice/bin/spiced",
+                "/home/operator/.spice/bin/spiced",
+            ],
+            "/home/me/.spice/bin/spiced",
+        )
+        .expect_err("a pin naming nothing must be reported");
+        let message = error.to_string();
+        assert!(
+            message.contains("/builds/typo/spiced"),
+            "the message must name the pin that failed: {message}"
+        );
+        assert!(
+            message.contains("SPICED_PATH"),
+            "the message must name the variable to fix: {message}"
+        );
+    }
+
+    /// An unset variable and an empty one read the same from a shell.
+    #[test]
+    fn an_empty_spiced_path_is_not_a_pin() {
+        let found = expect_resolved(ladder(
+            &[("SPICED_PATH", ""), ("PATH", "")],
+            None,
+            None,
+            &["/home/me/.spice/bin/spiced"],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(found.source, SpicedSource::ManagedInstall);
+    }
+
+    /// The reported bug: a `spice` and `spiced` built together and run off a
+    /// build directory must pair with each other, not with whatever release is
+    /// sitting in the managed install directory.
+    #[test]
+    fn the_sibling_of_the_running_cli_outranks_path_and_the_managed_install() {
+        let path = search_path(&["/usr/local/bin"]);
+        let found = expect_resolved(ladder(
+            &[("PATH", &path)],
+            Some("/builds/trunk/spice"),
+            Some("/home/operator"),
+            &[
+                "/builds/trunk/spiced",
+                "/usr/local/bin/spiced",
+                "/home/me/.spice/bin/spiced",
+                "/home/operator/.spice/bin/spiced",
+            ],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/builds/trunk/spiced"));
+        assert_eq!(found.source, SpicedSource::Sibling);
+    }
+
+    /// The second half of the same bug: a pair installed into a prefix on
+    /// `PATH` must not be shadowed by the managed install directory.
+    #[test]
+    fn path_outranks_the_managed_install() {
+        let path = search_path(&["/opt/spice/bin", "/usr/local/bin"]);
+        let found = expect_resolved(ladder(
+            &[("PATH", &path)],
+            Some("/builds/trunk/spice"),
+            None,
+            &[
+                "/opt/spice/bin/spiced",
+                "/usr/local/bin/spiced",
+                "/home/me/.spice/bin/spiced",
+            ],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(
+            found.path,
+            PathBuf::from("/opt/spice/bin/spiced"),
+            "PATH is searched in order, and the CLI has no sibling here"
+        );
+        assert_eq!(found.source, SpicedSource::OnPath);
+    }
+
+    /// An empty `PATH` entry means the working directory. Honouring it would
+    /// make `spice run` start a different runtime depending on where it was
+    /// run from, which is the failure mode `.` on `PATH` is notorious for.
+    #[test]
+    fn an_empty_path_entry_does_not_supply_the_runtime() {
+        let path = search_path(&["", "/usr/local/bin"]);
+        let found = expect_resolved(ladder(
+            &[("PATH", &path)],
+            None,
+            None,
+            &["spiced", "/usr/local/bin/spiced"],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/usr/local/bin/spiced"));
+    }
+
     /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
     /// home must still be found — otherwise `sudo spice connect service install`
     /// concludes the runtime is missing and downloads a release over the
-    /// operator's build.
+    /// operator's build. It stays the *last* rung: this context's own install
+    /// is the one this user asked for.
     #[test]
-    fn resolve_spiced_path_prefers_the_contexts_own_install() {
-        let (ctx, _temp) = create_test_context_with_runtime();
-        assert_eq!(
-            ctx.resolve_spiced_path(),
-            Some(ctx.spiced_path()),
-            "an install in this context's own bin dir wins outright"
-        );
-        assert!(ctx.is_runtime_installed());
+    fn the_managed_install_outranks_the_sudo_invokers() {
+        let found = expect_resolved(ladder(
+            &[("PATH", "")],
+            None,
+            Some("/home/operator"),
+            &[
+                "/root/.spice/bin/spiced",
+                "/home/operator/.spice/bin/spiced",
+            ],
+            "/root/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/root/.spice/bin/spiced"));
+        assert_eq!(found.source, SpicedSource::ManagedInstall);
     }
 
     #[test]
-    fn resolve_spiced_path_is_none_when_nothing_is_installed() {
-        // A context whose bin dir holds no runtime, and (in CI) no SUDO_USER
-        // install to fall back to.
+    fn the_sudo_invokers_install_is_the_last_resort() {
+        let found = expect_resolved(ladder(
+            &[("PATH", "")],
+            None,
+            Some("/home/operator"),
+            &["/home/operator/.spice/bin/spiced"],
+            "/root/.spice/bin/spiced",
+        ));
+        assert_eq!(
+            found.path,
+            PathBuf::from("/home/operator/.spice/bin/spiced")
+        );
+        assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
+    }
+
+    /// `Ok(None)` — and not an error — is what tells the launcher to install.
+    #[test]
+    fn nothing_anywhere_resolves_to_none_so_the_launcher_installs() {
+        let path = search_path(&["/usr/local/bin", "/usr/bin"]);
+        assert_eq!(
+            ladder(
+                &[("PATH", &path)],
+                Some("/builds/trunk/spice"),
+                Some("/home/operator"),
+                &[],
+                "/home/me/.spice/bin/spiced",
+            )
+            .expect("an absent runtime is not an error"),
+            None
+        );
+    }
+
+    /// `current_exe()` is allowed to fail; the ladder must carry on down it.
+    #[test]
+    fn an_unknown_current_exe_falls_through_to_the_lower_rungs() {
+        let path = search_path(&["/usr/local/bin"]);
+        let found = expect_resolved(ladder(
+            &[("PATH", &path)],
+            None,
+            None,
+            &["/usr/local/bin/spiced"],
+            "/home/me/.spice/bin/spiced",
+        ));
+        assert_eq!(found.source, SpicedSource::OnPath);
+    }
+
+    /// A directory named `spiced` on `PATH` must not shadow the real binary.
+    /// Runs against the real filesystem predicate, which is the thing under
+    /// test here — the injected one cannot tell a directory from a file.
+    #[test]
+    fn a_directory_named_spiced_on_path_does_not_shadow_the_runtime() {
+        let temp = TempDir::new().expect("create temp dir");
+        let decoy = temp.path().join("decoy");
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(decoy.join(SPICED_FILENAME)).expect("create decoy directory");
+        std::fs::create_dir_all(&real).expect("create real bin dir");
+        write_mock_runtime(&real.join(SPICED_FILENAME));
+
+        assert!(
+            !is_runnable_binary(&decoy.join(SPICED_FILENAME)),
+            "a directory does not name a runtime binary"
+        );
+        let path = search_path(&[&decoy.to_string_lossy(), &real.to_string_lossy()]);
+        let found = ladder_with(
+            &[("PATH", &path)],
+            None,
+            None,
+            "/home/me/.spice/bin/spiced",
+            &is_runnable_binary,
+        )
+        .expect("no SPICED_PATH is set")
+        .expect("the real binary must still resolve");
+        assert_eq!(found.path, real.join(SPICED_FILENAME));
+    }
+
+    /// Only the managed install is silent at launch. Every other source is a
+    /// pairing the user cannot otherwise see, so it has to be announced.
+    #[test]
+    fn only_the_managed_install_launches_without_announcing_itself() {
+        for source in [
+            SpicedSource::Pinned,
+            SpicedSource::Sibling,
+            SpicedSource::OnPath,
+            SpicedSource::SudoInvokerInstall,
+        ] {
+            assert!(
+                !source.is_expected_default(),
+                "{source:?} must be announced at launch"
+            );
+        }
+        assert!(SpicedSource::ManagedInstall.is_expected_default());
+    }
+
+    /// A file without an execute bit is a half-written download, not a runtime.
+    /// It must not win a rung — winning would both shadow a working binary
+    /// further down and suppress the auto-install that would repair it.
+    #[test]
+    fn a_non_executable_file_does_not_win_the_ladder() {
+        let temp = TempDir::new().expect("create temp dir");
+        let broken = temp.path().join("broken");
+        let working = temp.path().join("working");
+        std::fs::create_dir_all(&broken).expect("create broken bin dir");
+        std::fs::create_dir_all(&working).expect("create working bin dir");
+        std::fs::write(broken.join(SPICED_FILENAME), "half a download")
+            .expect("create the unusable runtime");
+        write_mock_runtime(&working.join(SPICED_FILENAME));
+
+        assert!(
+            !is_runnable_binary(&broken.join(SPICED_FILENAME)),
+            "a file with no execute bit is not a runnable runtime"
+        );
+
+        let path = search_path(&[&broken.to_string_lossy(), &working.to_string_lossy()]);
+        let found = ladder_with(
+            &[("PATH", &path)],
+            None,
+            None,
+            "/home/me/.spice/bin/spiced",
+            &is_runnable_binary,
+        )
+        .expect("no SPICED_PATH is set")
+        .expect("the working runtime must still resolve");
+        assert_eq!(found.path, working.join(SPICED_FILENAME));
+    }
+
+    /// The runtime is spawned with the child's working directory set to
+    /// `--dir`, so a relative candidate checked here and handed to
+    /// `Command::new` unchanged would be re-interpreted against a different
+    /// directory — and a bare name would become a fresh `PATH` lookup, which is
+    /// not the file that was checked at all.
+    #[test]
+    fn a_relative_candidate_is_anchored_to_the_directory_it_was_checked_in() {
+        let is_binary = |candidate: &Path| candidate == Path::new("build/spiced");
+        let found = ladder_with(
+            &[("SPICED_PATH", "build/spiced")],
+            None,
+            None,
+            "/home/me/.spice/bin/spiced",
+            &is_binary,
+        )
+        .expect("the pin names a binary")
+        .expect("the pin must resolve");
+        assert!(
+            found.path.is_absolute(),
+            "a relative pin must be anchored, got {}",
+            found.path.display()
+        );
+        assert!(
+            found.path.ends_with("build/spiced"),
+            "anchoring must not change which file was chosen, got {}",
+            found.path.display()
+        );
+    }
+
+    /// `spice install` and `spice upgrade` only ever write to the managed
+    /// directory, so when something outranks it the warning is the only
+    /// explanation a user gets for an install that changes nothing.
+    #[test]
+    fn the_shadowed_install_warning_names_both_binaries_and_the_way_out() {
+        let warning = shadowed_install_warning(
+            Path::new("/home/me/.spice/bin/spiced"),
+            &ResolvedSpiced {
+                path: PathBuf::from("/usr/local/bin/spiced"),
+                source: SpicedSource::OnPath,
+            },
+        );
+        assert!(
+            warning.contains("/home/me/.spice/bin/spiced"),
+            "the warning must name what was written: {warning}"
+        );
+        assert!(
+            warning.contains("/usr/local/bin/spiced"),
+            "the warning must name what will actually run: {warning}"
+        );
+        assert!(
+            warning.contains("found on PATH"),
+            "the warning must say where the shadowing binary came from: {warning}"
+        );
+        assert!(
+            warning.contains("SPICED_PATH"),
+            "the warning must give a way out: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs"),
+            "the warning must link the docs: {warning}"
+        );
+    }
+
+    /// The public entry points over a real, empty install directory.
+    ///
+    /// Asserts the *managed* question, which is hermetic: whatever the host's
+    /// `PATH` and `current_exe` hold, an empty bin dir holds no runtime. The
+    /// ladder's own outcome depends on the machine, so it is asserted against
+    /// [`resolve_spiced`] with every rung injected instead.
+    #[test]
+    fn an_empty_bin_dir_holds_no_managed_runtime() {
         let temp = TempDir::new().expect("create temp dir");
         let ctx = RuntimeContext {
             spice_runtime_dir: temp.path().to_path_buf(),
@@ -1173,17 +1913,9 @@ mod tests {
             tls_root_certificate_file: None,
         };
         assert!(!ctx.spiced_path().exists());
-        // Without SUDO_USER there is no second place to look. (When the suite
-        // itself runs under sudo the fallback may legitimately find one, so
-        // assert the invariant rather than a bare `None`.)
-        match ctx.resolve_spiced_path() {
-            None => {}
-            Some(found) => assert_ne!(
-                found,
-                ctx.spiced_path(),
-                "a resolved path must come from the sudo fallback, not the empty bin dir"
-            ),
-        }
+        assert!(!ctx.is_managed_runtime_installed());
+        ctx.managed_runtime_version()
+            .expect_err("an empty bin dir has no version to report");
     }
 
     /// Convert Command args to a Vec<String> for testing.
@@ -1206,7 +1938,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1221,7 +1953,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1240,7 +1972,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], Some("http://0.0.0.0:9999"))
+            .get_run_cmd(&test_resolved(&ctx), &[], Some("http://0.0.0.0:9999"))
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1264,7 +1996,7 @@ mod tests {
 
         // Test with http:// prefix
         let cmd = ctx
-            .get_run_cmd(&[], Some("http://192.168.1.1:8080"))
+            .get_run_cmd(&test_resolved(&ctx), &[], Some("http://192.168.1.1:8080"))
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
         assert!(
@@ -1274,7 +2006,11 @@ mod tests {
 
         // Test with https:// prefix
         let cmd = ctx
-            .get_run_cmd(&[], Some("https://secure.example.com:443"))
+            .get_run_cmd(
+                &test_resolved(&ctx),
+                &[],
+                Some("https://secure.example.com:443"),
+            )
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
         assert!(
@@ -1289,7 +2025,7 @@ mod tests {
         ctx.api_key = Some("test-api-key-12345".to_string());
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1309,7 +2045,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1326,7 +2062,7 @@ mod tests {
         ctx.tls_root_certificate_file = Some("/path/to/cert.pem".to_string());
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1345,7 +2081,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1361,7 +2097,7 @@ mod tests {
         ctx.user_agent = "spice/1.0.0 (macos; arm64)".to_string();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1380,7 +2116,7 @@ mod tests {
         let (ctx, _temp_dir) = create_test_context_with_runtime();
 
         let cmd = ctx
-            .get_run_cmd(&[], None)
+            .get_run_cmd(&test_resolved(&ctx), &[], None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1404,7 +2140,7 @@ mod tests {
             "0.0.0.0:50051".to_string(),
         ];
         let cmd = ctx
-            .get_run_cmd(&extra_args, None)
+            .get_run_cmd(&test_resolved(&ctx), &extra_args, None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1432,7 +2168,7 @@ mod tests {
 
         let extra_args = vec!["-vv".to_string()];
         let cmd = ctx
-            .get_run_cmd(&extra_args, None)
+            .get_run_cmd(&test_resolved(&ctx), &extra_args, None)
             .expect("get_run_cmd should succeed");
         let args = get_cmd_args(&cmd);
 
@@ -1462,13 +2198,26 @@ mod tests {
         );
     }
 
+    /// The command runs the binary it was handed, not one it re-derives.
+    ///
+    /// Resolution happens once, above this, and its answer is what the launcher
+    /// reports — so re-resolving here could announce one runtime and start
+    /// another. An absent runtime is now caught there, before the install
+    /// decision, rather than by this function failing to find one.
     #[test]
-    fn test_get_run_cmd_fails_when_runtime_not_installed() {
-        let ctx = create_test_context();
-        // spice_bin_dir points to /test/.spice/bin which doesn't exist
-        let result = ctx.get_run_cmd(&[], None);
+    fn get_run_cmd_runs_the_runtime_it_was_given() {
+        let (ctx, _temp) = create_test_context_with_runtime();
+        let elsewhere =
+            ResolvedSpiced::at(PathBuf::from("/opt/spice/bin/spiced"), SpicedSource::OnPath);
+        let cmd = ctx
+            .get_run_cmd(&elsewhere, &[], None)
+            .expect("building the command must not re-resolve");
 
-        assert!(result.is_err(), "Should fail when runtime not installed");
+        assert_eq!(
+            Path::new(cmd.get_program()),
+            elsewhere.path,
+            "the command must run the resolved binary, not the managed install"
+        );
     }
 
     #[test]

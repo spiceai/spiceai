@@ -62,11 +62,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
     tracing::info!("Current CLI version: v{current_cli_version}");
 
     // Get current runtime version if installed
-    let current_runtime_version = if ctx.is_runtime_installed() {
-        ctx.runtime_version().ok()
-    } else {
-        None
-    };
+    // The managed install specifically: `spice upgrade` replaces that one file,
+    // so a `spiced` beside the CLI or on `PATH` must not decide whether it has
+    // work to do — see `RuntimeContext::managed_runtime_version`.
+    let current_runtime_version = ctx.managed_runtime_version().ok();
     if let Some(ref runtime_version) = current_runtime_version {
         tracing::info!("Current runtime version: {runtime_version}");
     } else {
@@ -175,6 +174,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         std::fs::write(&version_file, format!("{target_version}\n")).ok();
 
         tracing::info!("Spice runtime upgraded to {target_version} successfully.");
+        crate::context::warn_if_install_is_shadowed(ctx);
     } else {
         tracing::info!("Runtime is already at {target_version}.");
     }

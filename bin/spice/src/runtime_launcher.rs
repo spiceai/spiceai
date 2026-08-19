@@ -32,7 +32,8 @@ use std::process::Stdio;
 
 use snafu::{OptionExt, ResultExt, ensure};
 
-use crate::context::RuntimeContext;
+use crate::context::{ResolvedSpiced, RuntimeContext};
+use crate::error::RuntimeNotInstalledSnafu;
 use crate::error::{
     ChildProcessIdSnafu, InvalidArgumentSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu,
 };
@@ -131,18 +132,40 @@ async fn start_runtime(
     start_runtime_process(ctx, config).await
 }
 
+/// Name the runtime about to be launched, and where it came from.
+///
+/// Announced at `info` whenever it is anything other than the binary
+/// `spice install` manages, because that is the case a user cannot otherwise
+/// see: a CLI and a runtime from different builds start without a word, and the
+/// symptoms surface much later as unexplained behaviour. The expected default
+/// stays at `debug` rather than adding a line to every ordinary `spice run`.
+fn report_resolved_runtime(resolved: &ResolvedSpiced) {
+    let path = resolved.path.display();
+    let source = resolved.source.describe();
+    if resolved.source.is_expected_default() {
+        tracing::debug!("Using the Spice.ai runtime at '{path}' ({source}).");
+    } else {
+        tracing::info!("Using the Spice.ai runtime at '{path}' ({source}).");
+    }
+}
+
 async fn start_runtime_process(
     ctx: &RuntimeContext,
     config: &RunConfig,
 ) -> Result<std::process::ExitStatus> {
     ctx.ensure_local_runtime_supported()?;
 
-    // Auto-install runtime if not present
-    if !ctx.is_runtime_installed() {
+    // Resolve before installing, so a `SPICED_PATH` that names nothing is
+    // reported rather than answered with a download of the latest release.
+    let resolved = if let Some(resolved) = ctx.resolve_spiced()? {
+        resolved
+    } else {
         tracing::info!("Spice.ai runtime is not installed. Installing now...");
         crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
             .await?;
-    }
+        ctx.resolve_spiced()?.context(RuntimeNotInstalledSnafu)?
+    };
+    report_resolved_runtime(&resolved);
     // Route --endpoint to the appropriate endpoint based on scheme
     let (http_endpoint, flight_endpoint) = resolve_endpoint(
         config.endpoint.as_deref(),
@@ -153,7 +176,7 @@ async fn start_runtime_process(
     tracing::info!("Spice.ai runtime starting...");
 
     let spiced_args = spiced_args(config, flight_endpoint.as_deref());
-    let std_cmd = ctx.get_run_cmd(&spiced_args, http_endpoint.as_deref())?;
+    let std_cmd = ctx.get_run_cmd(&resolved, &spiced_args, http_endpoint.as_deref())?;
 
     // Convert std::process::Command to tokio::process::Command
     let mut cmd = tokio::process::Command::from(std_cmd);

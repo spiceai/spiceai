@@ -161,26 +161,54 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
 /// Returns an error if the runtime version cannot be determined.
 pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     let cli = cli_version();
-    let runtime = if args.cli_only {
+    // Printed before the runtime is resolved so it survives a resolution that
+    // fails: a broken `SPICED_PATH` is propagated rather than reported as "not
+    // installed" — this is the command people run to find out which runtime is
+    // selected, and an absence would send them to `spice install`, which cannot
+    // fix a pin — and the CLI version is worth having either way.
+    if matches!(args.output, OutputFormat::Table) {
+        println!("CLI version:     {cli}");
+    }
+
+    // Resolved once and reused: asking twice could report the path of one
+    // binary beside the version of another.
+    let resolved = if args.cli_only {
         None
     } else {
-        ctx.runtime_version().ok()
+        ctx.resolve_spiced()?
     };
+    let runtime = resolved
+        .as_ref()
+        .and_then(|found| crate::context::runtime_version_at(&found.path).ok());
 
     match args.output {
         OutputFormat::Table => {
-            println!("CLI version:     {cli}");
             if !args.cli_only {
                 println!(
                     "Runtime version: {}",
                     runtime.as_deref().unwrap_or("not installed")
                 );
+                // Where the runtime came from belongs beside its version: this
+                // is where people look when the CLI and the runtime disagree,
+                // and the answer is usually that they are from different
+                // directories.
+                if let Some(resolved) = &resolved {
+                    println!(
+                        "Runtime path:    {} ({})",
+                        resolved.path.display(),
+                        resolved.source.describe()
+                    );
+                }
             }
         }
         OutputFormat::Json => {
             write_json(&serde_json::json!({
                 "cli": cli,
                 "runtime": runtime,
+                "runtime_path": resolved.as_ref().map(|found| found.path.display().to_string()),
+                // The enum, not `describe()`: that phrasing is prose for a
+                // human, and rewording it must not change a machine schema.
+                "runtime_source": resolved.as_ref().map(|found| found.source),
             }))?;
         }
     }

@@ -794,6 +794,9 @@ fn write_machine_error(error: &spice::error::Error) {
 fn machine_error_code(error: &spice::error::Error) -> &'static str {
     match error {
         spice::error::Error::RuntimeNotInstalled => "runtime_not_installed",
+        spice::error::Error::SpicedPathOverrideNotRunnable { .. } => {
+            "spiced_path_override_not_runnable"
+        }
         spice::error::Error::WindowsNativeRuntimeUnsupported => {
             "windows_native_runtime_unsupported"
         }

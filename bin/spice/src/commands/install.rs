@@ -102,8 +102,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
 
     // Check if already installed (unless force)
     if !args.force
-        && ctx.is_runtime_installed()
-        && let Ok(installed_version) = ctx.runtime_version()
+        && let Ok(installed_version) = ctx.managed_runtime_version()
         && installed_version.contains(&release.tag_name)
     {
         tracing::info!("Spice.ai runtime {} already installed", release.tag_name);
@@ -142,6 +141,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         "Spice.ai runtime {} installed successfully",
         release.tag_name
     );
+    crate::context::warn_if_install_is_shadowed(ctx);
 
     // Write version file for caching
     let version_file = ctx.spice_runtime_dir().join("runtime_version.txt");
