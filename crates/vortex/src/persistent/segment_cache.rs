@@ -538,7 +538,7 @@ impl SharedSegmentCache {
                     count = paths.len(),
                     paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
-                return;
+                Vec::new()
             }
             Err(_) => {
                 // Give up the queue slot as well as the wait. A search that
@@ -554,17 +554,27 @@ impl SharedSegmentCache {
                     count = paths.len(),
                     paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
-                return;
+                Vec::new()
             }
         };
-        for key in keys {
-            self.cache.invalidate(&key).await;
+        // Both give-up arms above fall through here with nothing to invalidate
+        // rather than returning: the registry cleanup below has to run whichever
+        // way this ends. An opener that dropped while this call held its state
+        // could not unregister it — `PathSegmentCache::drop` saw the extra
+        // strong reference — so returning early would strand an expired entry
+        // that nothing will ever revisit, the paths here being unique per
+        // snapshot.
+        if !keys.is_empty() {
+            for key in &keys {
+                self.cache.invalidate(key).await;
+            }
+            // Direct invalidation removes the hash-table entries immediately,
+            // but Moka's queued policy-removal records still retain the removed
+            // values until housekeeping drains them. Unlike predicate scanning,
+            // this pass only has to consume the already-enqueued exact-key
+            // removals.
+            self.run_pending_tasks().await;
         }
-        // Direct invalidation removes the hash-table entries immediately, but
-        // Moka's queued policy-removal records still retain the removed values
-        // until housekeeping drains them. Unlike predicate scanning, this pass
-        // only has to consume the already-enqueued exact-key removals.
-        self.run_pending_tasks().await;
 
         drop(states);
         if let Some(path_states) = self.path_states.as_ref() {
@@ -757,6 +767,15 @@ impl SegmentCache for PathSegmentCache {
         // drain in `invalidate_paths` safe: giving up on a put costs a moment of
         // residency rather than a retired file's segment staying cached until
         // capacity evicts it.
+        //
+        // Reachable only once that drain has given up. While it is still
+        // waiting, this put's guard holds it, so the enumeration follows the
+        // insert and finds the key — including when the put is dropped
+        // mid-flight, which releases the guard but leaves the entry for the
+        // enumeration. Past the deadline both this line and a cancellation
+        // between the insert and it leave the entry resident until capacity
+        // evicts it; closing that needs the retirement tombstone tracked in
+        // spiceai/spiceai#12963.
         if self.is_retired() {
             self.shared.cache.invalidate(&self.key(id)).await;
         }
@@ -1631,6 +1650,68 @@ mod tests {
             assert!(
                 file.get(id).await.expect("get should not error").is_some(),
                 "a scan that never ran cannot have evicted anything"
+            );
+
+            drop(release);
+            blocker.await.expect("the blocking task should not panic");
+        });
+    }
+
+    /// Giving up on the key scan must not strand the path's registry entry. An
+    /// opener that drops while retirement holds its state cannot unregister it —
+    /// `PathSegmentCache::drop` sees retirement's own reference — so the
+    /// give-up path has to do the cleanup the success path does.
+    #[test]
+    fn giving_up_on_the_scan_still_unregisters_the_retired_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build a runtime with a one-thread blocking pool");
+
+        runtime.block_on(async {
+            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let path = Path::from("snapshot-a/stranded.vortex");
+            let file = shared.for_path(test_store(), path.clone());
+            file.put(SegmentId::from(1), ByteBuffer::from(vec![1u8, 2, 3, 4]))
+                .await
+                .expect("put should not error");
+
+            let occupied = Arc::new(AtomicBool::new(false));
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let signal = Arc::clone(&occupied);
+            let blocker = tokio::task::spawn_blocking(move || {
+                signal.store(true, Ordering::SeqCst);
+                let _ = released.recv();
+            });
+            while !occupied.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            // Retirement parks on the scan it will never get, holding the path
+            // state; the opener then drops underneath it.
+            let retiring = Arc::clone(&shared);
+            let retired_path = path.clone();
+            let invalidation = tokio::spawn(async move {
+                retiring
+                    .invalidate_paths(HashSet::from([retired_path]))
+                    .await
+            });
+            tokio::task::yield_now().await;
+            drop(file);
+
+            tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT * 3, invalidation)
+                .await
+                .expect("retirement must not wait on a saturated blocking pool")
+                .expect("the retirement task should not panic");
+
+            assert!(
+                !shared
+                    .path_states
+                    .as_ref()
+                    .expect("retirement tracking enabled")
+                    .contains_key(&path),
+                "the registry entry must be removed even when the scan is given up on"
             );
 
             drop(release);
