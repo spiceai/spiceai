@@ -549,12 +549,6 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "ef
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
 
-# datafusion-table-providers v0.11.0 pulls crates.io datafusion-federation, while the rest of the
-# workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
-# graph shares one `SQLExecutor`/federation crate; otherwise `SqlTable: SQLExecutor` (impl'd in
-# table-providers against crates.io federation) fails to satisfy fork-typed bounds in data_components.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "eba20fd9f539b8c1bb993e29373b2a644d3bcea8" } # spiceai-54
-
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "7229b20daf24765c84d294c52cf4b4165ca79073" } # branch: spiceai-1.5.5
