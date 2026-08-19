@@ -383,12 +383,10 @@ async fn ensure_slot(
     // below, so retire it first and let the rest of this function create its
     // replacement.
     //
-    // Whether that happened is carried on every outcome below: it is the only one
-    // of them that destroys history someone may already be streaming against, and
-    // the caller has to rebuild those consumers before the replacement streams. It
-    // is set on the resuming branches too — reaching one after the drop means
-    // something recreated the slot underneath us, which does not give the
-    // discarded history back.
+    // Carried on every outcome below, including the resuming branches: reaching one
+    // of those after the drop means something recreated the slot underneath us,
+    // which does not give the discarded history back. See
+    // [`SlotInfo::history_discarded`] for what the caller owes on it.
     if drop_slot_if_invalidated(client, &params.slot_name).await? {
         history_discarded.store(true, Ordering::Release);
     }
