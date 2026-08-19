@@ -884,6 +884,14 @@ impl CpuBudget {
     /// affinity is provably what got floored and is exact, since a CPU mask is always
     /// a whole number of CPUs.
     ///
+    /// One case stays out of reach until the two readings are separated (#13283): a
+    /// reading of 2 with a 2500m quota is also what a genuine 2-CPU mask under that
+    /// quota looks like, and there the real ceiling is 2 cores rather than 2.5. This
+    /// stays silent for the 500m in between, which is the safer of the two errors —
+    /// the alternative warns every ordinary deployment that configured exactly its
+    /// fractional quota, and a warning that fires at correct configuration is one
+    /// operators learn to ignore.
+    ///
     /// `None` unless an explicit quantity won this budget — `all` and `auto` name
     /// no quantity of their own, and both already resolve through the clamp — and
     /// `None` while that quantity sits at or below every ceiling.
