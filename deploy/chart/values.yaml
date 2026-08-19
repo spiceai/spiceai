@@ -2,7 +2,7 @@
 additionalLabels: {}
 
 image:
-  repository: ghcr.io/spiceai/spiceai-nightly
+  repository: spiceai/spiceai
   tag: 2.2.0
 replicaCount: 1
 
