@@ -560,7 +560,10 @@ mod tests {
             "expected the refusal to name the probe-qualified correlation, got: {err}"
         );
 
-        // Gated on the bound here too.
+        // Gated on the bound here too. That unbounded output is not correct --
+        // the shadowing still loses the correlation -- but it is the pre-existing
+        // #12840 defect rather than anything the bound introduces, so what this
+        // pins is only that the refusal does not widen to reach it.
         let unbounded = federated_sql_result(&a_correlation_qualified_by_the_probe(None))
             .expect("an unbounded build side has no bound to scope, so it still unparses");
         assert!(
