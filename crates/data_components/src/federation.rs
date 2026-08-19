@@ -448,6 +448,11 @@ mod tests {
     /// The same correlation still pushes down when there is no bound to scope,
     /// so the refusal stays gated on the bound rather than on the correlation's
     /// shape.
+    ///
+    /// Only sound where the unbounded rendering is correct in its own right. It
+    /// is for a correlation naming several build inputs — every qualifier binds
+    /// to the relation it came from — and it is not for the probe-qualified
+    /// self-join, whose unbounded form loses the correlation to shadowing.
     fn assert_unbounded_exists_pushdown(plan: &LogicalPlan) {
         let sql = federated_sql_result(plan)
             .expect("an unbounded build side has no bound to scope, so it still unparses");
@@ -564,10 +569,11 @@ mod tests {
             "expected the refusal to name the probe-qualified correlation, got: {err}"
         );
 
-        // That unbounded output is not correct either — the shadowing still loses
-        // the correlation — but it is the pre-existing #12840 defect rather than
-        // anything the bound introduces, so what this pins is only that the
-        // refusal does not widen to reach it.
-        assert_unbounded_exists_pushdown(&a_correlation_qualified_by_the_probe(None));
+        // The unbounded sibling is deliberately left unpinned. Unlike the
+        // multi-relation shape, its rendering is *itself* wrong — the inner
+        // `FROM` shadows the outer relation, so the `EXISTS` reduces to "this
+        // table has a row" with or without a bound — so asserting that it still
+        // unparses would pin a defect and stand in the way of #12840's rewrite,
+        // which should be free to refuse this shape at any bound.
     }
 }
