@@ -318,16 +318,10 @@ fn parse_information_schema_json(
             .ok_or_else(|| format!("information_schema row {i}: invalid data type"))?;
         let is_nullable = row[2].as_str().is_none_or(|s| s.to_uppercase() == "YES");
 
-        let precision =
-            json_information_schema_integer(row.get(3), "numeric_precision", col_name, table_name)?
-                .map(|raw| decimal_precision(raw, col_name, table_name))
-                .transpose()?;
-        let scale =
-            json_information_schema_integer(row.get(4), "numeric_scale", col_name, table_name)?
-                .map(|raw| decimal_scale(raw, precision, col_name, table_name))
-                .transpose()?;
-
-        ensure_fixed_point_metadata(data_type_str, precision, scale, col_name, table_name)?;
+        let (precision, scale) =
+            precision_and_scale(data_type_str, col_name, table_name, |column, metadata| {
+                json_information_schema_integer(row.get(column), metadata, col_name, table_name)
+            })?;
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
         let source_type = snowflake_source_type(data_type_str, precision, scale);
@@ -389,19 +383,6 @@ fn parse_information_schema_arrow(
             .downcast_ref::<arrow::array::StringArray>()
             .ok_or("is_nullable column is not StringArray")?;
 
-        // `numeric_precision` and `numeric_scale` are read out of whatever
-        // numeric or text Arrow type Snowflake encoded them as, so keep the
-        // erased array rather than committing to one representation.
-        let precisions: Option<&dyn Array> = if batch.num_columns() > 3 {
-            Some(batch.column(3).as_ref())
-        } else {
-            None
-        };
-        let scales: Option<&dyn Array> = if batch.num_columns() > 4 {
-            Some(batch.column(4).as_ref())
-        } else {
-            None
-        };
         let comments: Option<&arrow::array::StringArray> = if batch.num_columns() > 5 {
             batch.column(5).as_string_opt()
         } else {
@@ -422,21 +403,16 @@ fn parse_information_schema_arrow(
             let col_name = col_names.value(i);
             let data_type_str = data_types.value(i);
             let is_nullable = nullables.value(i).to_uppercase() == "YES";
-            let precision = arrow_information_schema_integer(
-                precisions,
-                i,
-                "numeric_precision",
-                col_name,
-                table_name,
-            )?
-            .map(|raw| decimal_precision(raw, col_name, table_name))
-            .transpose()?;
-            let scale =
-                arrow_information_schema_integer(scales, i, "numeric_scale", col_name, table_name)?
-                    .map(|raw| decimal_scale(raw, precision, col_name, table_name))
-                    .transpose()?;
-
-            ensure_fixed_point_metadata(data_type_str, precision, scale, col_name, table_name)?;
+            let (precision, scale) =
+                precision_and_scale(data_type_str, col_name, table_name, |column, metadata| {
+                    // `numeric_precision` and `numeric_scale` arrive in whatever
+                    // numeric or text Arrow type Snowflake encoded them as, so
+                    // hand the reader the erased array rather than committing to
+                    // one representation.
+                    let array =
+                        (batch.num_columns() > column).then(|| batch.column(column).as_ref());
+                    arrow_information_schema_integer(array, i, metadata, col_name, table_name)
+                })?;
 
             let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
             let source_type = snowflake_source_type(data_type_str, precision, scale);
@@ -637,30 +613,48 @@ fn is_fixed_point_snowflake_type(sql_type: &str) -> bool {
     )
 }
 
-/// Rejects a fixed-point column whose precision or scale `information_schema`
-/// did not report.
+/// Position of `NUMERIC_PRECISION` in the `information_schema.columns` row
+/// [`probe_snowflake_information_schema`] selects.
+const PRECISION_COLUMN: usize = 3;
+/// Position of `NUMERIC_SCALE` in that same row.
+const SCALE_COLUMN: usize = 4;
+
+/// Reads the precision and scale a column's Arrow mapping needs out of one
+/// `information_schema.columns` row, where `read` fetches a raw metadata cell by
+/// its position in the row.
 ///
-/// Without both, [`map_snowflake_sql_type`] falls back to `Decimal128(38, 0)` —
-/// the scale-zero mapping that rounds every fraction away. Failing the probe
-/// hands discovery to `SHOW COLUMNS`, whose type descriptor carries the real
-/// precision and scale. Columns that are not fixed-point never report either
-/// value and are left alone.
-fn ensure_fixed_point_metadata(
+/// Only a fixed-point type consults these two columns, so they are left unread
+/// for every other type. Snowflake does not report a decimal's digits there for
+/// a float, a string, or a timestamp, and rejecting whatever it does report
+/// would fail the preferred probe over metadata that nothing goes on to use.
+///
+/// A fixed-point column must report both. Without them [`map_snowflake_sql_type`]
+/// falls back to `Decimal128(38, 0)`, the scale-zero mapping that rounds every
+/// fraction away; failing the probe instead hands discovery to `SHOW COLUMNS`,
+/// whose type descriptor carries the real precision and scale.
+fn precision_and_scale(
     sql_type: &str,
-    precision: Option<u8>,
-    scale: Option<i8>,
     column_name: &str,
     table_name: &str,
-) -> std::result::Result<(), String> {
+    read: impl Fn(usize, &str) -> std::result::Result<Option<i128>, String>,
+) -> std::result::Result<(Option<u8>, Option<i8>), String> {
+    if !is_fixed_point_snowflake_type(sql_type) {
+        return Ok((None, None));
+    }
+
+    let precision = read(PRECISION_COLUMN, "numeric_precision")?
+        .map(|raw| decimal_precision(raw, column_name, table_name))
+        .transpose()?;
+    let scale = read(SCALE_COLUMN, "numeric_scale")?
+        .map(|raw| decimal_scale(raw, precision, column_name, table_name))
+        .transpose()?;
+
     let missing = match (precision, scale) {
-        (Some(_), Some(_)) => return Ok(()),
+        (Some(_), Some(_)) => return Ok((precision, scale)),
         (None, Some(_)) => "`numeric_precision`",
         (Some(_), None) => "`numeric_scale`",
         (None, None) => "`numeric_precision` and `numeric_scale`",
     };
-    if !is_fixed_point_snowflake_type(sql_type) {
-        return Ok(());
-    }
 
     Err(format!(
         "column '{column_name}' of table '{table_name}' is a {sql_type} column, but Snowflake reported no {missing} for it, so the digits it stores after the decimal point are unknown"
@@ -1682,29 +1676,104 @@ mod tests {
         }
     }
 
-    /// Snowflake reports no numeric precision or scale for a float, a string, or
-    /// a timestamp, so the fixed-point requirement must not reject them.
+    /// A float, string, or timestamp column carries no decimal digits, so
+    /// whatever `information_schema` reports in the numeric columns for it must
+    /// neither be required nor rejected.
+    ///
+    /// Snowflake does not report a decimal's precision for these types, and what
+    /// it does report is not one: holding those values to the 1-38 digits a
+    /// decimal can hold would fail the preferred probe for any table with a
+    /// `FLOAT` column and silently drop to `SHOW COLUMNS`, losing the
+    /// nullability, comments, and clustering metadata this probe exists to read.
     #[test]
-    fn information_schema_arrow_accepts_non_fixed_point_columns_without_precision() {
-        let columns = &["RATING", "NAME", "CREATED_AT", "PRICE"];
-        let batch = information_schema_batch(
-            columns,
-            &["FLOAT", "VARCHAR", "TIMESTAMP_NTZ", "DOUBLE"],
-            &["YES", "YES", "YES", "YES"],
-            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
-            Arc::new(Int64Array::from(vec![None::<i64>; 4])),
-        );
+    fn information_schema_arrow_accepts_non_fixed_point_columns_whatever_the_numeric_columns_say() {
+        let columns = &["RATING", "NAME", "CREATED_AT", "PRICE", "ACTIVE", "SHIPPED"];
+        let types = &[
+            "FLOAT",
+            "VARCHAR",
+            "TIMESTAMP_NTZ",
+            "DOUBLE",
+            "BOOLEAN",
+            "DATE",
+        ];
+        let nullable = &["YES", "YES", "YES", "YES", "YES", "YES"];
+        // A zero precision, a binary-radix precision that overruns a decimal's
+        // 38 digits, and an absent one — none of which describe these types.
+        let precisions: Vec<Option<i64>> = vec![Some(0), Some(99), None, Some(53), Some(0), None];
+        let scales: Vec<Option<i64>> = vec![None, None, Some(9), Some(-2), None, None];
 
-        let schema = parse_information_schema_arrow(&[batch], "SALES.ORDERS")
-            .expect("columns without numeric metadata should parse");
+        for precision_kind in ["integer", "text"] {
+            let (precision, scale): (ArrayRef, ArrayRef) = if precision_kind == "integer" {
+                (
+                    Arc::new(Int64Array::from(precisions.clone())),
+                    Arc::new(Int64Array::from(scales.clone())),
+                )
+            } else {
+                let render = |values: &Vec<Option<i64>>| {
+                    Arc::new(StringArray::from(
+                        values
+                            .iter()
+                            .map(|value| value.map(|value| value.to_string()))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef
+                };
+                (render(&precisions), render(&scales))
+            };
+            let batch = information_schema_batch(columns, types, nullable, precision, scale);
+
+            let schema =
+                parse_information_schema_arrow(&[batch], "SALES.ORDERS").unwrap_or_else(|e| {
+                    panic!("{precision_kind} metadata on non-fixed-point columns should parse: {e}")
+                });
+
+            assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+            assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+            assert_eq!(
+                schema.field(2).data_type(),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None)
+            );
+            assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+            assert_eq!(schema.field(4).data_type(), &DataType::Boolean);
+            assert_eq!(schema.field(5).data_type(), &DataType::Date32);
+            for field in schema.fields() {
+                assert_eq!(
+                    field
+                        .metadata()
+                        .get(SOURCE_TYPE_METADATA_KEY)
+                        .map(String::as_str),
+                    Some(types[schema.index_of(field.name()).expect("field present")]),
+                    "{} source type must not gain decimal digits",
+                    field.name()
+                );
+            }
+        }
+    }
+
+    /// The same rule on the JSON path: a `FLOAT` column's numeric metadata is
+    /// not a decimal's, so it cannot fail the probe.
+    #[test]
+    fn information_schema_json_accepts_non_fixed_point_columns_whatever_the_numeric_columns_say() {
+        let rows = serde_json::json!([
+            ["RATING", "FLOAT", "YES", 0, null, null, null, null],
+            ["PRICE", "DOUBLE", "YES", 53, -2, null, null, null],
+            [
+                "NAME",
+                "VARCHAR",
+                "YES",
+                "not a number",
+                "",
+                null,
+                null,
+                null
+            ]
+        ]);
+
+        let schema = parse_information_schema_json(&rows, "SALES.ORDERS")
+            .expect("non-fixed-point numeric metadata should parse");
 
         assert_eq!(schema.field(0).data_type(), &DataType::Float64);
-        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
-        assert_eq!(
-            schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
     }
 
     /// The JSON path applies the same requirement.
