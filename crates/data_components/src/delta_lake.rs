@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{Array, ArrayData, make_array};
+use arrow::array::{Array, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_tools::map_entries::relabel_array_data;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge;
 use chrono::TimeZone;
@@ -566,49 +567,6 @@ fn build_column_mapping_projection(
     Ok(Arc::new(ProjectionExec::try_new(projection_expr, exec)?))
 }
 
-/// Recursively rebuilds `data` so its (possibly nested) field names match
-/// `target_type`, without touching any values, buffers, or null masks.
-///
-/// Delta column mapping stores nested struct/list/map field names under opaque
-/// physical names; the logical schema uses the logical names. Field names live
-/// in the Arrow `DataType`, so renaming is a metadata-only operation: relabel
-/// each child to the matching target nested type (positionally — column mapping
-/// preserves field order), then rebuild this level carrying `target_type`.
-fn relabel_array_data(
-    data: ArrayData,
-    target_type: &DataType,
-) -> std::result::Result<ArrayData, DataFusionError> {
-    if data.data_type() == target_type {
-        return Ok(data);
-    }
-
-    let target_child_types: Vec<DataType> = match target_type {
-        DataType::Struct(fields) => fields.iter().map(|f| f.data_type().clone()).collect(),
-        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            vec![field.data_type().clone()]
-        }
-        DataType::Map(field, _) => vec![field.data_type().clone()],
-        _ => Vec::new(),
-    };
-
-    let old_children = data.child_data().to_vec();
-    let new_children = if target_child_types.len() == old_children.len() {
-        old_children
-            .into_iter()
-            .zip(target_child_types.iter())
-            .map(|(child, child_target)| relabel_array_data(child, child_target))
-            .collect::<std::result::Result<Vec<_>, DataFusionError>>()?
-    } else {
-        old_children
-    };
-
-    data.into_builder()
-        .data_type(target_type.clone())
-        .child_data(new_children)
-        .build()
-        .map_err(DataFusionError::from)
-}
-
 /// Physical expression that renames the (possibly nested) field names of its
 /// input array to `target_type` without changing any values. Used by Delta
 /// column mapping to map physical field names back to logical names; replaces a
@@ -656,7 +614,10 @@ impl PhysicalExpr for RelabelFieldsExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> std::result::Result<ColumnarValue, DataFusionError> {
         let array = self.arg.evaluate(batch)?.into_array(batch.num_rows())?;
-        let relabeled = make_array(relabel_array_data(array.to_data(), &self.target_type)?);
+        let relabeled = make_array(
+            relabel_array_data(array.to_data(), &self.target_type)
+                .map_err(DataFusionError::from)?,
+        );
         Ok(ColumnarValue::Array(relabeled))
     }
 

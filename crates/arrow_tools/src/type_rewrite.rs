@@ -43,6 +43,27 @@ impl TypeRewriteRule for DictionaryUnwrap {
     }
 }
 
+/// Rewrites `DataType::Map(entries, _)` so the `entries` field is non-nullable.
+///
+/// The Arrow specification requires it, and `MapArray::try_new` refuses a nullable
+/// `entries` field outright — so a map declared this way decodes from IPC without
+/// complaint and then fails in the first kernel that rebuilds it, reporting
+/// `MapArray entries cannot contain nulls` even when no null is involved. Nullability is
+/// part of the type and not of any buffer, so the correction is metadata-only.
+#[derive(Debug)]
+pub struct MapEntriesNonNullable;
+impl TypeRewriteRule for MapEntriesNonNullable {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Map(entries, sorted) if entries.is_nullable() => Some(DataType::Map(
+                Arc::new(entries.as_ref().clone().with_nullable(false)),
+                *sorted,
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Rewrites `DataType::Null` → `DataType::Int32`.
 ///
 /// `DuckDB` has no Null type and silently coerces it to INT32 when creating tables.
