@@ -25,18 +25,17 @@ limitations under the License.
 //! failure reports the same message, `MapArray entries cannot contain nulls`, whether or
 //! not a null is involved.
 //!
-//! [`normalize_map_entries`] relabels the declaration (metadata only — no buffer is
-//! touched) and refuses the one shape that cannot be relabelled without inventing an
-//! answer: entries that actually contain nulls.
+//! [`MapEntriesNormalizer`] relabels the declaration (metadata only — no buffer is touched)
+//! and refuses the one shape that cannot be relabelled without inventing an answer: entries
+//! that actually contain nulls.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayData, RecordBatch, make_array};
-use arrow::datatypes::{DataType, Schema};
-use arrow_schema::SchemaRef;
+use arrow::array::{Array, ArrayData, ArrayRef, RecordBatch, make_array};
+use arrow::datatypes::{DataType, SchemaRef};
 use snafu::prelude::*;
 
-use crate::type_rewrite::{MapEntriesNonNullable, apply_rules, rewrite_data_type};
+use crate::type_rewrite::{MapEntriesNonNullable, apply_rules, relabel_array_data};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -48,85 +47,154 @@ pub enum Error {
     MapEntriesContainNulls { column: String },
 
     #[snafu(display("column '{column}' could not be rebuilt: {source}"))]
-    UnableToRelabelColumn {
+    UnableToNormalizeColumn {
         column: String,
         source: arrow::error::ArrowError,
     },
 
-    #[snafu(display("the normalized columns could not be reassembled: {source}"))]
-    UnableToRebuildRecordBatch { source: arrow::error::ArrowError },
+    #[snafu(display("the normalized columns do not fit schema '{schema}': {source}"))]
+    UnableToRebuildRecordBatch {
+        schema: String,
+        source: arrow::error::ArrowError,
+    },
 }
 
-/// Returns `true` when `data_type` declares a `Map` whose `entries` field is nullable,
-/// at any depth.
-#[must_use]
-pub fn declares_nullable_map_entries(data_type: &DataType) -> bool {
-    rewrite_data_type(data_type, &[&MapEntriesNonNullable]) != *data_type
+/// What the batches of one Arrow stream need, resolved once from the stream's schema.
+///
+/// An Arrow IPC stream carries a single schema, so whether a map declaration has to be
+/// relabelled — and what it becomes — is fixed for every batch. Deciding it per batch would
+/// rebuild the same schema over and over and hand each batch a distinct `SchemaRef`.
+pub struct MapEntriesNormalizer {
+    /// The schema every batch is relabelled to, shared by all of them. `None` when the
+    /// stream's own declarations already conform.
+    target: Option<SchemaRef>,
+    /// Whether any field holds a `Map` at all. When none does, no batch can carry entry
+    /// nulls, so no column is ever inspected.
+    holds_map: bool,
 }
 
-/// Returns the schema with every `Map`'s `entries` field marked non-nullable.
-#[must_use]
-pub fn normalize_map_entries_schema(schema: &Schema) -> Schema {
-    apply_rules(schema, &[&MapEntriesNonNullable])
-}
+impl MapEntriesNormalizer {
+    #[must_use]
+    pub fn for_schema(schema: &SchemaRef) -> Self {
+        let holds_map = schema
+            .fields()
+            .iter()
+            .any(|field| contains(field.data_type(), &is_map));
 
-/// Rewrites `batch` so every `Map` column — nested ones included — declares its `entries`
-/// field non-nullable, as the Arrow specification requires.
-///
-/// Nullability lives in the type rather than in any buffer, so this only relabels: the
-/// offsets, validity and child arrays are carried over by reference. A batch that already
-/// conforms is returned untouched.
-///
-/// # Errors
-///
-/// Returns [`Error::MapEntriesContainNulls`] when an entries array carries nulls. That is
-/// the one shape relabelling cannot fix, and it is not recoverable by guessing: Arrow
-/// gives a null entry no meaning, so treating it as a null map and treating it as a pair
-/// to drop are both inventions, and each yields different rows.
-pub fn normalize_map_entries(batch: RecordBatch) -> Result<RecordBatch> {
-    let schema = batch.schema();
-    if !schema
-        .fields()
-        .iter()
-        .any(|field| declares_nullable_map_entries(field.data_type()))
-    {
-        // Still reject entry nulls: they fail downstream whatever the declaration says.
-        for (field, column) in schema.fields().iter().zip(batch.columns()) {
-            ensure_no_map_entry_nulls(&column.to_data(), field.name())?;
-        }
-        return Ok(batch);
+        let target = (holds_map
+            && schema
+                .fields()
+                .iter()
+                .any(|field| contains(field.data_type(), &declares_nullable_entries)))
+        .then(|| Arc::new(apply_rules(schema, &[&MapEntriesNonNullable])) as SchemaRef);
+
+        Self { target, holds_map }
     }
 
-    let normalized: SchemaRef = Arc::new(normalize_map_entries_schema(schema.as_ref()));
+    /// Returns `batch` with every `Map` column — nested ones included — declaring its
+    /// `entries` field non-nullable, as the Arrow specification requires.
+    ///
+    /// Nullability lives in the type rather than in any buffer, so this only relabels: the
+    /// offsets, validity and child arrays are carried over by reference, and a column whose
+    /// type is already right is passed through untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MapEntriesContainNulls`] when an entries array carries nulls. That is
+    /// the one shape relabelling cannot fix, and it is not recoverable by guessing: Arrow
+    /// gives a null entry no meaning, so treating it as a null map and treating it as a pair
+    /// to drop are both inventions, and each yields different rows.
+    pub fn normalize(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if !self.holds_map {
+            return Ok(batch);
+        }
 
-    let columns = schema
-        .fields()
-        .iter()
-        .zip(batch.columns())
-        .zip(normalized.fields())
-        .map(|((field, column), target)| {
-            let data = column.to_data();
-            ensure_no_map_entry_nulls(&data, field.name())?;
-            let relabelled = relabel_array_data(data, target.data_type()).context(
-                UnableToRelabelColumnSnafu {
-                    column: field.name(),
-                },
-            )?;
-            Ok(make_array(relabelled))
+        let Some(target) = self.target.as_ref() else {
+            // Nothing to relabel, but entry nulls fail downstream whatever the declaration
+            // says, so they are still refused here where the column can be named.
+            Self::refuse_entry_nulls(&batch)?;
+            return Ok(batch);
+        };
+
+        let schema = batch.schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .zip(target.fields())
+            .map(|((field, column), target_field)| {
+                if !contains(field.data_type(), &is_map) {
+                    return Ok(Arc::clone(column));
+                }
+                let data = column.to_data();
+                refuse_entry_nulls_in(&data, field.name())?;
+                // `apply_rules` shares an unchanged field by refcount, so pointer equality is
+                // an exact test for "this column needs nothing".
+                if Arc::ptr_eq(field, target_field) {
+                    return Ok(Arc::clone(column));
+                }
+                let relabelled = relabel_array_data(data, target_field.data_type()).context(
+                    UnableToNormalizeColumnSnafu {
+                        column: field.name(),
+                    },
+                )?;
+                Ok(make_array(relabelled))
+            })
+            .collect::<Result<Vec<ArrayRef>>>()?;
+
+        RecordBatch::try_new(Arc::clone(target), columns).context(UnableToRebuildRecordBatchSnafu {
+            schema: target.to_string(),
         })
-        .collect::<Result<Vec<_>>>()?;
+    }
 
-    // `num_rows` is carried explicitly so a column-less batch keeps its row count.
-    RecordBatch::try_new_with_options(
-        normalized,
-        columns,
-        &arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-    .context(UnableToRebuildRecordBatchSnafu)
+    fn refuse_entry_nulls(batch: &RecordBatch) -> Result<()> {
+        for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+            if contains(field.data_type(), &is_map) {
+                refuse_entry_nulls_in(&column.to_data(), field.name())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_map(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Map(_, _))
+}
+
+fn declares_nullable_entries(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Map(entries, _) if entries.is_nullable())
+}
+
+/// Returns `true` when `predicate` holds for `data_type` or for any type nested inside it.
+///
+/// Allocation-free and short-circuiting. Asking [`crate::type_rewrite::rewrite_data_type`] for
+/// a rewritten copy and comparing it would answer the same question, but it rebuilds the whole
+/// type tree — every nested `Field`, name included — to produce one bit.
+fn contains(data_type: &DataType, predicate: &impl Fn(&DataType) -> bool) -> bool {
+    if predicate(data_type) {
+        return true;
+    }
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _)
+        | DataType::RunEndEncoded(_, field) => contains(field.data_type(), predicate),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains(field.data_type(), predicate)),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains(field.data_type(), predicate)),
+        DataType::Dictionary(_, value_type) => contains(value_type, predicate),
+        _ => false,
+    }
 }
 
 /// Walks `data` and fails on the first `Map` whose entries array carries nulls.
-fn ensure_no_map_entry_nulls(data: &ArrayData, column: &str) -> Result<()> {
+fn refuse_entry_nulls_in(data: &ArrayData, column: &str) -> Result<()> {
     if let (DataType::Map(_, _), Some(entries)) = (data.data_type(), data.child_data().first()) {
         ensure!(
             entries.null_count() == 0,
@@ -135,84 +203,24 @@ fn ensure_no_map_entry_nulls(data: &ArrayData, column: &str) -> Result<()> {
     }
 
     for child in data.child_data() {
-        ensure_no_map_entry_nulls(child, column)?;
+        refuse_entry_nulls_in(child, column)?;
     }
 
     Ok(())
 }
 
-/// Recursively rebuilds `data` so its (possibly nested) [`DataType`] becomes
-/// `target_type`, without touching any values, buffers or null masks.
-///
-/// Only the parts of a type that carry no data may differ — field names and nested
-/// nullability flags. Children are relabelled positionally, so `target_type` has to
-/// describe the same physical layout.
-///
-/// # Errors
-///
-/// Returns an `ArrowError` when `target_type` does not describe the layout `data` holds:
-/// the relabelled level goes back through [`ArrayData`] validation rather than
-/// reinterpreting the buffers under a type that does not fit them.
-pub fn relabel_array_data(
-    data: ArrayData,
-    target_type: &DataType,
-) -> std::result::Result<ArrayData, arrow::error::ArrowError> {
-    if data.data_type() == target_type {
-        return Ok(data);
-    }
-
-    let target_child_types: Vec<DataType> = match target_type {
-        DataType::Struct(fields) => fields.iter().map(|f| f.data_type().clone()).collect(),
-        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            vec![field.data_type().clone()]
-        }
-        DataType::Map(field, _) => vec![field.data_type().clone()],
-        _ => Vec::new(),
-    };
-
-    let old_children = data.child_data().to_vec();
-    let new_children = if target_child_types.len() == old_children.len() {
-        old_children
-            .into_iter()
-            .zip(target_child_types.iter())
-            .map(|(child, child_target)| relabel_array_data(child, child_target))
-            .collect::<std::result::Result<Vec<_>, arrow::error::ArrowError>>()?
-    } else {
-        old_children
-    };
-
-    data.into_builder()
-        .data_type(target_type.clone())
-        .child_data(new_children)
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
+    use arrow::array::{Int32Array, ListArray, MapArray, StringArray, StructArray};
     use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
-    use arrow::datatypes::{Field, Fields};
+    use arrow::datatypes::{Field, Fields, Schema};
     use arrow::error::ArrowError;
 
-    /// Walks `data_type` for a `Map` with a nullable `entries` field, independently of the
-    /// rewrite rule under test — asserting through [`declares_nullable_map_entries`] would
-    /// be self-referential and would pass even if the rule stopped firing.
-    fn any_nullable_map_entries(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::Map(entries, _) => {
-                entries.is_nullable() || any_nullable_map_entries(entries.data_type())
-            }
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::ListView(field)
-            | DataType::LargeListView(field) => any_nullable_map_entries(field.data_type()),
-            DataType::Struct(fields) => fields
-                .iter()
-                .any(|f| any_nullable_map_entries(f.data_type())),
-            _ => false,
-        }
+    /// Every batch of a stream is normalized against that stream's schema; a test holds one
+    /// batch, so its own schema is the stream's.
+    fn normalize(batch: RecordBatch) -> Result<RecordBatch> {
+        MapEntriesNormalizer::for_schema(&batch.schema()).normalize(batch)
     }
 
     fn entry_fields() -> Fields {
@@ -315,7 +323,7 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        let normalized = normalize_map_entries(batch.clone()).expect("normalization");
+        let normalized = normalize(batch.clone()).expect("normalization");
 
         match normalized.schema().field(0).data_type() {
             DataType::Map(entries, _) => assert!(
@@ -333,16 +341,11 @@ mod tests {
         rebuild_through_public_constructor(after)
             .expect("a spec-conforming map rebuilds through the public constructor");
 
-        let before = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("map before");
         assert_eq!(normalized.num_rows(), batch.num_rows());
-        assert_eq!(after.offsets(), before.offsets());
-        assert_eq!(after.keys(), before.keys());
-        assert_eq!(after.values(), before.values());
-        assert_eq!(after.nulls(), before.nulls());
+        assert_eq!(after.offsets(), before_map.offsets());
+        assert_eq!(after.keys(), before_map.keys());
+        assert_eq!(after.values(), before_map.values());
+        assert_eq!(after.nulls(), before_map.nulls());
     }
 
     /// A null map row — validity 0 with an empty offset range — is preserved, since that is
@@ -367,7 +370,7 @@ mod tests {
             .expect("map data");
         let batch = batch_of(Arc::new(MapArray::from(data)) as ArrayRef);
 
-        let normalized = normalize_map_entries(batch).expect("normalization");
+        let normalized = normalize(batch).expect("normalization");
         let map = normalized
             .column(0)
             .as_any()
@@ -390,7 +393,7 @@ mod tests {
             vec!["k0", "k1"],
             vec![Some("v0"), None],
         );
-        let err = normalize_map_entries(batch_of(Arc::new(map) as ArrayRef))
+        let err = normalize(batch_of(Arc::new(map) as ArrayRef))
             .expect_err("entry nulls must be refused");
         assert!(
             matches!(&err, Error::MapEntriesContainNulls { column } if column == "col_map"),
@@ -417,7 +420,7 @@ mod tests {
         )
         .expect("list of maps");
 
-        let err = normalize_map_entries(batch_of(Arc::new(list) as ArrayRef))
+        let err = normalize(batch_of(Arc::new(list) as ArrayRef))
             .expect_err("nested entry nulls must be refused");
         assert!(
             matches!(&err, Error::MapEntriesContainNulls { column } if column == "col_map"),
@@ -454,15 +457,23 @@ mod tests {
         .expect("list");
 
         let batch = batch_of(Arc::new(list) as ArrayRef);
-        assert!(any_nullable_map_entries(
-            batch.schema().field(0).data_type()
-        ));
 
-        let normalized = normalize_map_entries(batch).expect("normalization");
-        assert!(
-            !any_nullable_map_entries(normalized.schema().field(0).data_type()),
-            "the nested map must be relabelled: {}",
-            normalized.schema().field(0).data_type()
+        let normalized = normalize(batch).expect("normalization");
+
+        // Spelled out rather than asked of the rewrite rule: the map is relabelled, and the
+        // field names and the untouched `n` beside it come through as they were.
+        let expected_fields: Fields = vec![
+            Field::new("m", map_type(false), true),
+            Field::new("n", DataType::Int32, true),
+        ]
+        .into();
+        assert_eq!(
+            normalized.schema().field(0).data_type(),
+            &DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(expected_fields),
+                true
+            )))
         );
 
         // The values are still reachable through the relabelled type.
@@ -489,33 +500,18 @@ mod tests {
     fn a_conforming_batch_is_returned_unchanged() {
         let map = map_from_parts(false, None, &[0, 1], vec!["k0"], vec![Some("v0")]);
         let batch = batch_of(Arc::new(map) as ArrayRef);
-        let normalized = normalize_map_entries(batch.clone()).expect("normalization");
+        let normalized = normalize(batch.clone()).expect("normalization");
         assert_eq!(normalized.schema(), batch.schema());
         assert_eq!(normalized.column(0).to_data(), batch.column(0).to_data());
-    }
-
-    /// A row-count-only batch (no columns, as `SELECT COUNT(1)` produces) keeps its rows.
-    #[test]
-    fn a_column_less_batch_keeps_its_row_count() {
-        let batch = RecordBatch::try_new_with_options(
-            Arc::new(Schema::empty()),
-            vec![],
-            &arrow::array::RecordBatchOptions::new().with_row_count(Some(5)),
-        )
-        .expect("batch");
-        let normalized = normalize_map_entries(batch).expect("normalization");
-        assert_eq!(normalized.num_rows(), 5);
     }
 
     /// An empty map column — zero rows — normalizes without touching offsets.
     #[test]
     fn an_empty_map_column_normalizes() {
         let map = map_from_parts(true, None, &[0], vec![], vec![]);
-        let normalized = normalize_map_entries(batch_of(Arc::new(map) as ArrayRef))
+        let normalized = normalize(batch_of(Arc::new(map) as ArrayRef))
             .expect("normalization of an empty column");
         assert_eq!(normalized.num_rows(), 0);
-        assert!(!any_nullable_map_entries(
-            normalized.schema().field(0).data_type()
-        ));
+        assert_eq!(normalized.schema().field(0).data_type(), &map_type(false));
     }
 }

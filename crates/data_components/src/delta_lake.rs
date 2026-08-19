@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::array::{Array, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use arrow_tools::map_entries::relabel_array_data;
+use arrow_tools::type_rewrite::relabel_array_data;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge;
 use chrono::TimeZone;

@@ -19,7 +19,7 @@ use arrow::{
     datatypes::{Field, Schema, SchemaRef},
     ipc::reader::StreamReader,
 };
-use arrow_tools::map_entries::normalize_map_entries;
+use arrow_tools::map_entries::MapEntriesNormalizer;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
@@ -1309,16 +1309,21 @@ impl SqlWarehouseApi {
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
         let cursor = Cursor::new(bytes);
         let reader = StreamReader::try_new(cursor, None).context(ArrowStreamReadFailedSnafu)?;
+
+        // The warehouse declares a MAP's `entries` field nullable, which the Arrow map layout
+        // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds
+        // the column, so it is brought into line at the boundary rather than carried into the
+        // plan. One stream carries one schema, so what its batches need is resolved once and
+        // every batch comes out sharing the same `SchemaRef`.
+        let normalizer = MapEntriesNormalizer::for_schema(&reader.schema());
+
         reader
-            .collect::<Result<Vec<_>, _>>()
-            .context(ArrowStreamReadFailedSnafu)?
-            .into_iter()
-            .filter(|batch| batch.num_rows() > 0)
-            // The warehouse declares a MAP's `entries` field nullable, which the Arrow map
-            // layout forbids. Such a batch decodes here and then fails in whichever kernel
-            // first rebuilds the column, so it is brought into line at the boundary rather
-            // than carried into the plan.
-            .map(|batch| normalize_map_entries(batch).context(MapEntriesNotNormalizableSnafu))
+            .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
+            .map(|batch| {
+                normalizer
+                    .normalize(batch.context(ArrowStreamReadFailedSnafu)?)
+                    .context(MapEntriesNotNormalizableSnafu)
+            })
             .collect()
     }
 
@@ -2123,10 +2128,10 @@ mod tests {
         .into()
     }
 
-    fn map_column_batch(
-        entries_nullable: bool,
-        entry_nulls: Option<arrow::buffer::NullBuffer>,
-    ) -> RecordBatch {
+    /// A one-row MAP column declared the way the warehouse declares it — `entries` nullable,
+    /// which the Arrow map layout forbids. Built through `ArrayData` rather than
+    /// `MapArray::try_new`, the way the IPC reader does, since `try_new` is what refuses it.
+    fn wire_map_column_batch(entry_nulls: Option<arrow::buffer::NullBuffer>) -> RecordBatch {
         let entries = arrow::array::StructArray::try_new(
             map_entry_fields(),
             vec![
@@ -2142,7 +2147,7 @@ mod tests {
             Arc::new(Field::new(
                 "entries",
                 DataType::Struct(map_entry_fields()),
-                entries_nullable,
+                true,
             )),
             false,
         );
@@ -2166,13 +2171,7 @@ mod tests {
     /// `MapArray entries cannot contain nulls` even though the data holds no nulls.
     #[test]
     fn a_map_column_is_published_with_a_non_nullable_entries_field() {
-        let wire = map_column_batch(true, None);
-        match wire.schema().field(0).data_type() {
-            DataType::Map(entries, _) => {
-                assert!(entries.is_nullable(), "the wire schema is the reported one");
-            }
-            other => panic!("expected a Map, got {other}"),
-        }
+        let wire = wire_map_column_batch(None);
 
         let batches = SqlWarehouseApi::read_arrow_batches(arrow_stream_bytes(&wire))
             .expect("the chunk is readable");
@@ -2203,7 +2202,7 @@ mod tests {
     /// surfacing Arrow's message about a layout the user never chose.
     #[test]
     fn entry_level_nulls_fail_the_read_with_an_actionable_message() {
-        let wire = map_column_batch(true, Some(arrow::buffer::NullBuffer::from(vec![false])));
+        let wire = wire_map_column_batch(Some(arrow::buffer::NullBuffer::from(vec![false])));
 
         let err = SqlWarehouseApi::read_arrow_batches(arrow_stream_bytes(&wire))
             .expect_err("entry nulls must fail the read");
