@@ -149,8 +149,8 @@ mod tests {
     use datafusion::prelude::{col, lit};
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
-        BigQueryDialect, DefaultDialect, DuckDBDialect, MySqlDialect, PostgreSqlDialect,
-        SnowflakeDialect, SqliteDialect,
+        BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
+        MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
@@ -333,24 +333,22 @@ mod tests {
     /// fix.
     ///
     /// This unparses through the federation executor, whose dialect a connector
-    /// supplies; the one built here supplies none, so the SQL is the default
-    /// dialect's. [`federation_dialects`] sweeps the connector dialects instead.
+    /// supplies; the one built here supplies none, which resolves to the default
+    /// dialect. [`federation_dialects`] sweeps the rest.
     /// The plan shapes, not the spelling, are what these assert.
     fn federated_sql(plan: &LogicalPlan) -> String {
-        Unparser::new(test_executor().dialect().as_ref())
-            .plan_to_sql(plan)
-            .expect("plan should unparse")
-            .to_string()
+        unparse_with(
+            "federation executor",
+            test_executor().dialect().as_ref(),
+            plan,
+        )
     }
 
     /// Assert `first` is rendered before `second`, which pins the clause order
     /// without pinning the formatting around it.
     fn assert_precedes(sql: &str, first: &str, second: &str) {
-        let (Some(at_first), Some(at_second)) = (sql.find(first), sql.find(second)) else {
-            panic!("expected both `{first}` and `{second}` in: {sql}");
-        };
         assert!(
-            at_first < at_second,
+            first_offset_of(sql, first) < first_offset_of(sql, second),
             "expected `{first}` before `{second}` in: {sql}"
         );
     }
@@ -428,29 +426,41 @@ mod tests {
         assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
     }
 
-    /// The unparser dialects Spice federates through: a connector supplies its own,
-    /// and they disagree on identifier quoting, on whether a derived table has to be
-    /// aliased, on whether an empty select list is legal, and on whether a column
-    /// renders fully qualified — each of which the scoping asserted below has to
-    /// survive.
+    /// The unparser dialects this workspace hands to the unparser, plus a
+    /// `CustomDialect` standing in for the family its connectors build — Snowflake,
+    /// Oracle, Spark and ODBC each construct one with `CustomDialectBuilder`, and
+    /// upstream's `SnowflakeDialect` is not used anywhere here.
     ///
-    /// The dialect is the dimension this boundary adds. Upstream pins these fixes
-    /// against its own default dialect, so a guard here that asserted the same
-    /// spelling would restate an upstream assertion and pass by construction. What
-    /// this repo needs to know is that the fix holds for the dialects it federates
-    /// to, which is why every guard below sweeps this set and names the dialect in
-    /// its failure message.
+    /// Across this set the renderings differ in identifier quoting and in whether
+    /// `NULLS LAST` is emitted, which is why the guards below match bare relation
+    /// names and nesting depth instead of a rendered string. They do *not* differ in
+    /// the derived-table alias, the empty select list, or fully qualified columns:
+    /// the scope-introducing paths alias unconditionally, and no dialect in this
+    /// workspace enables `full_qualified_col`.
+    ///
+    /// The three fixes are each decided in dialect-free code, so this sweep guards
+    /// the rendering rather than the decision. It is still the dimension this
+    /// boundary adds: upstream pins these fixes against its own default dialect, so
+    /// asserting that spelling here would restate an upstream assertion and pass by
+    /// construction.
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
-        let dialects: Vec<(&'static str, Arc<dyn Dialect>)> = vec![
+        vec![
             ("default", Arc::new(DefaultDialect {})),
             ("postgres", Arc::new(PostgreSqlDialect {})),
             ("mysql", Arc::new(MySqlDialect {})),
             ("sqlite", Arc::new(SqliteDialect {})),
             ("duckdb", Arc::new(DuckDBDialect::new())),
-            ("bigquery", Arc::new(BigQueryDialect {})),
-            ("snowflake", Arc::new(SnowflakeDialect {})),
-        ];
-        dialects
+            ("bigquery", Arc::new(BigQueryDialect::new())),
+            ("connector-custom", Arc::new(connector_style_dialect())),
+        ]
+    }
+
+    /// A `CustomDialect` shaped like the ones this crate's connectors build: a quote
+    /// style, and nothing that moves a clause.
+    fn connector_style_dialect() -> CustomDialect {
+        CustomDialectBuilder::new()
+            .with_identifier_quote_style('"')
+            .build()
     }
 
     fn unparse_with(dialect_name: &str, dialect: &dyn Dialect, plan: &LogicalPlan) -> String {
@@ -470,9 +480,7 @@ mod tests {
         at
     }
 
-    /// Byte offset of the last `needle`. A correlated reference to the outer
-    /// relation is found this way: the probe table is named in the outer select list
-    /// too, and that first mention is not the correlation.
+    /// Byte offset of the last `needle`.
     fn last_offset_of(sql: &str, needle: &str) -> usize {
         let Some(at) = sql.rfind(needle) else {
             panic!("expected `{needle}` in: {sql}");
@@ -484,13 +492,33 @@ mod tests {
     /// landed rather than how a dialect spelled the identifiers around it. Depth 0
     /// is the statement itself; deeper means inside a derived table or subquery.
     fn paren_depth_at(sql: &str, at: usize) -> usize {
-        sql[..at]
-            .chars()
-            .fold(0usize, |depth, character| match character {
-                '(' => depth + 1,
-                ')' => depth.saturating_sub(1),
-                _ => depth,
-            })
+        sql[..at].bytes().fold(0usize, |depth, byte| match byte {
+            b'(' => depth + 1,
+            b')' => depth.saturating_sub(1),
+            _ => depth,
+        })
+    }
+
+    /// A `Sort` sandwiched between two `Projection`s, which is the shape the hoist
+    /// applies to.
+    fn sorted_between_projections(sort_key: Expr) -> LogicalPlan {
+        LogicalPlanBuilder::scan(
+            "person",
+            table_source(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("age", DataType::Int32, true),
+            ]),
+            None,
+        )
+        .expect("scan person")
+        .project(vec![col("person.id"), col("person.age")])
+        .expect("inner projection")
+        .sort(vec![sort_key.sort(false, false)])
+        .expect("sort")
+        .project(vec![col("person.id")])
+        .expect("outer projection")
+        .build()
+        .expect("build")
     }
 
     /// Regression test for the sort-key hoist carried by fork PR #191: a `Sort`
@@ -501,40 +529,31 @@ mod tests {
     ///
     /// SQL does not require an enclosing query to preserve a derived table's
     /// ordering, so a buried ORDER BY lets the remote engine return the rows in any
-    /// order — silently, with no error. The bare-column arm sorts the same plan
-    /// shape by a plain column, which always worked, so a later pin cannot keep one
-    /// arm and lose the other.
+    /// order — silently, with no error. The bare-column arm sorts the same shape by a
+    /// plain column, which always worked, so a later pin cannot keep one arm and lose
+    /// the other. Each arm also asserts the key it sorted by still reaches the
+    /// rendered ORDER BY: hoisting replaces the inner projection's expressions, and
+    /// the fix has to substitute references it drops rather than emit a different key.
     #[test]
     fn a_computed_sort_key_keeps_order_by_at_the_top_level() {
-        for (dialect_name, dialect) in federation_dialects() {
-            for (key_kind, sort_key) in [
-                ("bare-column", col("person.age")),
-                ("computed", col("person.age") + lit(1)),
-            ] {
-                let plan = LogicalPlanBuilder::scan(
-                    "person",
-                    table_source(vec![
-                        Field::new("id", DataType::Int32, false),
-                        Field::new("age", DataType::Int32, true),
-                    ]),
-                    None,
-                )
-                .expect("scan person")
-                .project(vec![col("person.id"), col("person.age")])
-                .expect("inner projection")
-                .sort(vec![sort_key.sort(false, false)])
-                .expect("sort")
-                .project(vec![col("person.id")])
-                .expect("outer projection")
-                .build()
-                .expect("build");
-
+        for (key_kind, sort_key, rendered_key) in [
+            ("bare-column", col("person.age"), "age"),
+            ("computed", col("person.age") + lit(1), "+ 1"),
+        ] {
+            let plan = sorted_between_projections(sort_key);
+            for (dialect_name, dialect) in federation_dialects() {
                 let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
-                let order_by = paren_depth_at(&sql, first_offset_of(&sql, "ORDER BY"));
+                let ordering_at = first_offset_of(&sql, "ORDER BY");
                 assert_eq!(
-                    order_by, 0,
+                    paren_depth_at(&sql, ordering_at),
+                    0,
                     "{dialect_name}/{key_kind}: ORDER BY landed inside a derived table, which the \
                      remote engine is free to ignore, so the rows can come back in any order: {sql}"
+                );
+                assert!(
+                    sql[ordering_at..].contains(rendered_key),
+                    "{dialect_name}/{key_kind}: the ORDER BY no longer sorts by the key the plan \
+                     asked for, so the rows come back in a different order: {sql}"
                 );
             }
         }
@@ -546,41 +565,51 @@ mod tests {
     /// skipped instead, and its GROUP BY never reached the emitted SQL.
     ///
     /// The optimizer builds exactly this shape for `count(DISTINCT c)` — an outer
-    /// `count` over an inner grouping by `c` — and a federating consumer unparses
-    /// the optimized plan. Losing the inner GROUP BY either fails to bind against
-    /// the remote engine, because the inner alias is not a column of the base table,
-    /// or binds where such a column happens to exist and counts every row instead of
-    /// the distinct ones.
+    /// `count` over an inner grouping by `c` — and a federating consumer unparses the
+    /// optimized plan. Losing the inner GROUP BY either fails to bind against the
+    /// remote engine, because the inner alias is not a column of the base table, or
+    /// binds where such a column happens to exist and counts every row instead of the
+    /// distinct ones.
     #[test]
     fn a_stacked_aggregate_keeps_its_inner_group_by() {
-        for (dialect_name, dialect) in federation_dialects() {
-            let plan = LogicalPlanBuilder::scan(
-                "hits",
-                table_source(vec![Field::new("user_id", DataType::Int32, false)]),
-                None,
-            )
-            .expect("scan hits")
-            .aggregate(
-                vec![col("hits.user_id").alias("alias1")],
-                Vec::<Expr>::new(),
-            )
-            .expect("inner aggregate")
-            .aggregate(Vec::<Expr>::new(), vec![count(col("alias1"))])
-            .expect("outer aggregate")
-            .build()
-            .expect("build");
+        let plan = LogicalPlanBuilder::scan(
+            "hits",
+            table_source(vec![Field::new("user_id", DataType::Int32, false)]),
+            None,
+        )
+        .expect("scan hits")
+        .aggregate(
+            vec![col("hits.user_id").alias("alias1")],
+            Vec::<Expr>::new(),
+        )
+        .expect("inner aggregate")
+        .aggregate(Vec::<Expr>::new(), vec![count(col("alias1"))])
+        .expect("outer aggregate")
+        .build()
+        .expect("build");
 
+        for (dialect_name, dialect) in federation_dialects() {
             let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
             assert!(
                 sql.contains("GROUP BY"),
                 "{dialect_name}: the inner grouping vanished, so this counts every row rather than \
                  the distinct ones, over an alias the base table does not have: {sql}"
             );
-            let grouping = paren_depth_at(&sql, first_offset_of(&sql, "GROUP BY"));
+            let grouping_at = first_offset_of(&sql, "GROUP BY");
             assert!(
-                grouping >= 1,
+                paren_depth_at(&sql, grouping_at) >= 1,
                 "{dialect_name}: the inner grouping has to be a scope of its own, since one SELECT \
                  expresses one grouping: {sql}"
+            );
+            assert!(
+                sql[grouping_at..].contains("user_id"),
+                "{dialect_name}: the surviving GROUP BY has to group by the column the inner \
+                 aggregate grouped by: {sql}"
+            );
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "count(")) == 0,
+                "{dialect_name}: the outer aggregate has to stay in the enclosing SELECT, over the \
+                 grouped scope: {sql}"
             );
         }
     }
@@ -628,36 +657,38 @@ mod tests {
     /// semi, anti or mark join unparses its build side as a correlated `EXISTS`, and
     /// a row bound on that side used to be emitted beside the correlation predicate.
     /// SQL applies the bound after the `WHERE`, so it chose among the rows the
-    /// correlation had already matched instead of choosing which rows the
-    /// correlation could see, and the subquery searched the whole relation.
+    /// correlation had already matched instead of choosing which rows the correlation
+    /// could see, and the subquery searched the whole relation.
     ///
     /// That is a wrong-rows defect rather than a too-many-rows one: a semi or mark
     /// join reports a match on a row the plan never read, and an anti join is the
     /// mirror image and drops a row it should have returned. The bound therefore has
-    /// to be rendered in a scope the correlation sits outside of.
+    /// to be rendered in a derived table the correlation sits outside of.
     #[test]
     fn a_bounded_exists_build_side_is_scoped_outside_the_correlation() {
-        for (dialect_name, dialect) in federation_dialects() {
-            let sql = unparse_with(
-                dialect_name,
-                dialect.as_ref(),
-                &semi_join_with_build_side_fetch(Some(5)),
-            );
+        let plan = semi_join_with_build_side_fetch(Some(5));
 
-            // The last mention of the probe relation is the correlation; the first
-            // is the outer query's own FROM. Matching the bare name keeps this
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+            // The last mention of the probe relation is the correlation; the first is
+            // the outer query's own FROM. Matching the bare name keeps this
             // independent of how each dialect quotes it.
             let bound = first_offset_of(&sql, "LIMIT");
-            let correlation = last_offset_of(&sql, "probe");
             assert!(
-                bound < correlation,
+                bound < last_offset_of(&sql, "probe"),
                 "{dialect_name}: the bound is applied after the correlation, so it selects among \
                  the rows already matched and the subquery searches the whole relation: {sql}"
             );
+
+            // Two levels below the EXISTS, not one: the bound sitting directly in the
+            // EXISTS body is the defect above, and that is still deeper than the
+            // EXISTS itself.
+            let exists = paren_depth_at(&sql, first_offset_of(&sql, "EXISTS"));
             assert!(
-                paren_depth_at(&sql, bound) > paren_depth_at(&sql, first_offset_of(&sql, "EXISTS")),
-                "{dialect_name}: the bound has to sit in a scope nested inside the EXISTS, not \
-                 alongside it: {sql}"
+                paren_depth_at(&sql, bound) >= exists + 2,
+                "{dialect_name}: the bound has to sit in a derived table of its own inside the \
+                 EXISTS body, not directly in that body beside the correlation: {sql}"
             );
         }
     }
@@ -669,26 +700,22 @@ mod tests {
     /// costing every unbounded semi join its federation.
     #[test]
     fn an_unbounded_exists_build_side_is_left_unscoped() {
+        let plan = semi_join_with_build_side_fetch(None);
+
         for (dialect_name, dialect) in federation_dialects() {
-            let sql = unparse_with(
-                dialect_name,
-                dialect.as_ref(),
-                &semi_join_with_build_side_fetch(None),
-            );
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
             assert!(
                 !sql.contains("LIMIT"),
                 "{dialect_name}: an unbounded build side must not acquire a bound: {sql}"
             );
 
-            // Carrying no bound is not the invariant — scoping every build side
-            // would satisfy that too, since a scope with nothing to bound emits no
-            // LIMIT either. What has to hold is that the build relation is still
-            // named directly in the EXISTS body's own FROM, one level inside the
-            // EXISTS rather than behind a derived table of its own.
+            // Carrying no bound is not the invariant — scoping every build side would
+            // satisfy that too, since a scope with nothing to bound emits no LIMIT
+            // either. What has to hold is that the build relation is still named
+            // directly in the EXISTS body's own FROM.
             let exists = paren_depth_at(&sql, first_offset_of(&sql, "EXISTS"));
-            let build = paren_depth_at(&sql, first_offset_of(&sql, "build"));
             assert_eq!(
-                build,
+                paren_depth_at(&sql, first_offset_of(&sql, "build")),
                 exists + 1,
                 "{dialect_name}: an unbounded build side has to stay in the EXISTS body's own FROM, \
                  not move behind a derived table that costs the join its pushdown: {sql}"
