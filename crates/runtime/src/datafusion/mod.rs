@@ -5245,6 +5245,20 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // A partitioned Cayenne dataset must not publish snapshots: its exported
+    // metastore slice omits the partition child tables, so the uploaded archive
+    // could not be restored, yet `create_snapshot` would still make it the
+    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.engine == Engine::Cayenne
+        && !acceleration_settings.partition_by.is_empty()
+    {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
