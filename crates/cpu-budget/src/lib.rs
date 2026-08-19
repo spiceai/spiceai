@@ -900,13 +900,23 @@ impl CpuBudget {
         if !matches!(self.source, CpuSource::Configured) {
             return None;
         }
-        let affinity_millicores = cores_to_millicores(self.detected_cores);
+        // A one-core reading is not a ceiling this can prove: `HostReadings::detect`
+        // collapses an `available_parallelism` failure to 1, so it means either a
+        // single-CPU host or a host that could not answer — and the override exists
+        // for deployments the host cannot describe, which is exactly where claiming a
+        // one-core affinity limit would be both wrong and loudest.
+        let affinity_ceiling =
+            (self.detected_cores > 1).then(|| cores_to_millicores(self.detected_cores));
         // Under the next whole core, the quota is the wall that is either binding or
-        // indistinguishable from it — and exact where the floored reading is not.
-        let binding_quota = self
-            .limit_millicores
-            .filter(|limit| *limit < affinity_millicores.saturating_add(1000));
-        let ceiling = binding_quota.unwrap_or(affinity_millicores);
+        // indistinguishable from it — and exact where a floored reading is not. With no
+        // usable affinity reading it is the only wall left.
+        let binding_quota = match (self.limit_millicores, affinity_ceiling) {
+            (Some(limit), Some(affinity)) if limit >= affinity.saturating_add(1000) => None,
+            (Some(limit), _) => Some(limit),
+            (None, _) => None,
+        };
+        // Nothing provable: no quota, and a core count that may just be a failed read.
+        let ceiling = binding_quota.or(affinity_ceiling)?;
         if self.millicores <= ceiling {
             return None;
         }
@@ -922,7 +932,7 @@ impl CpuBudget {
             None => (
                 format!(
                     "the {} available to this process",
-                    format_millicores(affinity_millicores)
+                    format_millicores(ceiling)
                 ),
                 "its threads contend for those CPUs",
                 "widen this process's CPU affinity",
@@ -1880,6 +1890,47 @@ mod tests {
                 .expect("valid")
                 .configured_above_ceiling_warning(),
             None
+        );
+    }
+
+    /// A one-core reading may be a failed detection, so it cannot be reported as an
+    /// affinity ceiling — and the override exists for exactly those hosts.
+    ///
+    /// `HostReadings::detect` maps an `available_parallelism` error to 1, which is
+    /// indistinguishable from a genuine single-CPU host. Naming it would tell an
+    /// operator in a sandbox to cut every pool to one core.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn an_undetectable_cpu_count_is_not_reported_as_a_ceiling() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        // Detection failed (or a real 1-CPU host): nothing here is provable, so the
+        // override is honoured in silence rather than argued with.
+        for host in [host(0), host(1), bare_metal(1)] {
+            let resolved = CpuBudget::resolve(&spicepod("4"), &host).expect("valid");
+            assert_eq!(resolved.detected_cores(), 1, "the premise");
+            assert_eq!(resolved.cores(), 4, "the override is still honoured");
+            assert_eq!(
+                resolved.configured_above_ceiling_warning(),
+                None,
+                "an unprovable core count must not be named as a ceiling"
+            );
+        }
+
+        // A cgroup quota is read independently of the CPU count, so it stays namable
+        // even when the CPU count is not.
+        let with_quota = CpuBudget::resolve(&spicepod("4"), &quota(1, 500))
+            .expect("valid")
+            .configured_above_ceiling_warning()
+            .expect("an exact quota is still a ceiling when the CPU count is not");
+        assert!(
+            with_quota.contains("cgroup CPU limit of 500m"),
+            "{with_quota}"
+        );
+        assert!(
+            !with_quota.contains("available to this process"),
+            "must not fall back to the unprovable reading: {with_quota}"
         );
     }
 
