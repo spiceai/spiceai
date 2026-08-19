@@ -526,7 +526,7 @@ async fn start_instance(ctx: &RuntimeContext, dir: Option<&Path>, verbosity: u8)
     let Some(manifest) = service::resolve_with_state(
         backend,
         &instance_dir,
-        &state_config_dir,
+        &service::PinnedConfigDir::unlocked(&state_config_dir),
         &service_config_dir,
     )?
     else {
@@ -735,6 +735,14 @@ async fn remove_identity(
         .map_err(|source| Error::CloudConnectIo {
             message: format!("pin locked Cloud Connect state for removal: {source}"),
         })?;
+    // The service manifest is resolved and removed through the descriptor the
+    // lock retains, not through a name (see `PinnedConfigDir`). The identity,
+    // journals, endpoint binding and cache below are still derived from
+    // `config_dir`, which on a platform without Linux's descriptor-rooted
+    // traversal is a pathname re-resolved on each use, so one removal can still
+    // span two directories. Closing that is #13291.
+    let manifest_config_dir =
+        service::PinnedConfigDir::for_lock(display_config_dir.clone(), &mutation_lock)?;
     let _instance_lock =
         runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
             Error::CloudConnectIo {
@@ -776,8 +784,12 @@ async fn remove_identity(
                 });
             }
         };
-    let installed =
-        service::resolve_with_state(backend, instance_dir, &config_dir, &display_config_dir)?;
+    let installed = service::resolve_with_state(
+        backend,
+        instance_dir,
+        &manifest_config_dir,
+        &display_config_dir,
+    )?;
 
     // `symlink_metadata` observes the directory entry itself. A dangling link
     // is state that `--force` must remove, not an absent file that can be left
@@ -968,13 +980,15 @@ async fn remove_identity(
     // `spice connect service uninstall`, while identity cleanup belongs only to
     // this command.
     let uninstall_failure = match installed.as_ref() {
-        Some(manifest) => match service::uninstall_resolved(backend, manifest, &config_dir) {
-            Ok(()) => {
-                println!("Stopped and uninstalled {}.", manifest.name);
-                None
+        Some(manifest) => {
+            match service::uninstall_resolved(backend, manifest, &manifest_config_dir) {
+                Ok(()) => {
+                    println!("Stopped and uninstalled {}.", manifest.name);
+                    None
+                }
+                Err(err) => Some(err),
             }
-            Err(err) => Some(err),
-        },
+        }
         None => None,
     };
 
