@@ -1989,7 +1989,7 @@ impl Runtime {
         }
     }
 
-    // Closes and deallocates all resources (including the static registries)
+    // Closes and deallocates all resources, including this runtime's accelerator engines.
     pub async fn shutdown(&self) {
         if self.status.is_shutdown() {
             return;
@@ -2074,12 +2074,12 @@ impl Runtime {
             }
         }
 
-        dataconnector::unregister_all().await;
-        catalogconnector::unregister_all().await;
+        // `dataconnector`, `catalogconnector`, and `document_parse` hold only
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
-
-        document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics endpoints.
