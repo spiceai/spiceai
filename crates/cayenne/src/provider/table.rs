@@ -18875,8 +18875,9 @@ impl CayenneTableProvider {
     /// selection variant of the subset compaction but reports its own `kind` — the
     /// two are triggered independently and shrink different things (a bake targets
     /// the deletion index), so a shared label would make neither rate readable.
-    /// Unlike the subset path it emits no `cayenne_compaction_merged_bytes`, so the
-    /// merged-bytes series has no `kind="bake"` member.
+    /// It also records `cayenne_compaction_merged_bytes` on a committed merge, as
+    /// the subset path does, so a pass reports volume alongside duration and its
+    /// throughput is computable.
     /// Resurrect-rows-critical clean-prefix gate for the seq-prefix bake. Pruning
     /// the deletion index at/below `prefix_cutoff` (T) is sound iff EVERY live
     /// snapshot — the current snapshot ∪ the protected snapshots NOT being baked
@@ -19499,6 +19500,36 @@ impl CayenneTableProvider {
         if !is_s3 {
             self.evict_compaction_input_pages(&old_ids).await;
         }
+
+        // Record the merged output size, as the size-tier path does. Without it a
+        // bake reports duration with no volume, so its throughput cannot be computed
+        // and a pass cannot be compared against the subset path or sized against a
+        // microbenchmark — a pass taking minutes is indistinguishable from one moving
+        // a hundred times the data. The new snapshot's on-disk Vortex bytes are the
+        // meaningful figure (deletions and re-encoding make the output materially
+        // smaller than the summed inputs); best-effort, falling back to the input sum
+        // only if sizing the output fails.
+        let merged_output_bytes = match self.list_snapshot_files_with_sizes(&new_snapshot_id).await
+        {
+            Ok(files) => files.iter().map(|(_, size)| *size).sum(),
+            Err(e) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to size seq-prefix bake output snapshot for the merged-bytes \
+                     metric; falling back to total input bytes: {e}"
+                );
+                total_input_bytes
+            }
+        };
+        telemetry::cayenne::track_compaction_merged_bytes(
+            merged_output_bytes,
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "bake"),
+            ],
+        );
 
         if clean_prefix_holds {
             self.record_bake_outcome("committed");

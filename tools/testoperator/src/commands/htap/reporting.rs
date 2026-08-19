@@ -789,9 +789,9 @@ pub(super) fn emit_cayenne_compaction_metrics(metrics: &crate::spiced_metrics::S
             crate::metrics::CAYENNE_COMPACTION_DURATION_P90_MS.record(p90, &attributes);
             crate::metrics::CAYENNE_COMPACTION_DURATION_P99_MS.record(p99, &attributes);
         }
-        // merged_bytes is only populated for kinds that emit the merged-bytes
-        // histogram (currently `subset`); skip recording a misleading zero for
-        // series that never report it.
+        // Not every kind reports merged bytes on every pass, so skip recording a
+        // misleading zero for a (table, kind) that has no entry rather than
+        // reporting it as having moved nothing.
         if merged_bytes.contains_key(*key) {
             crate::metrics::CAYENNE_COMPACTION_MERGED_BYTES.record(to_u64(b), &attributes);
         }

@@ -1098,8 +1098,7 @@ pub mod cayenne {
     /// - `"subset_current"` — current-snapshot subset merge
     /// - `"datalake"` — datalake-tier merge
     /// - `"bake"` — seq-prefix bake, which consolidates the settled protected
-    ///   prefix to shrink the deletion index. Unlike the others it records no
-    ///   [`track_compaction_merged_bytes`], so that series has no `bake` member.
+    ///   prefix to shrink the deletion index.
     ///
     /// Keep this list and the instrument description above in step with the call
     /// sites: the description is the exported HELP text, so a `kind` missing from
