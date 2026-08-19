@@ -1656,6 +1656,13 @@ struct SharedSource {
     /// later must snapshot even if their table already sat in the publication:
     /// a fresh slot has no history for anyone.
     slot_created_fresh: AtomicBool,
+    /// How many times the slot behind this source has been replaced, so an actor
+    /// holding an observation of the *previous* slot can tell that it is stale.
+    ///
+    /// Only the pump reads it, and only to decide whether the refusal it is about
+    /// to act on still describes the slot that is there — see
+    /// [`recover_unusable_slot`].
+    slot_generation: AtomicU64,
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
@@ -1696,6 +1703,7 @@ impl SharedSource {
             watermark_notify: Arc::new(Notify::new()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
+            slot_generation: AtomicU64::new(0),
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
             retention_posture: Mutex::new(None),
@@ -2654,7 +2662,10 @@ impl SlotReplacementBudget {
 ///
 /// On failure returns a message describing what could not be done, for the caller
 /// to surface.
-async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Result<(), String> {
+async fn recover_unusable_slot(
+    source: &Arc<SharedSource>,
+    refused_generation: u64,
+) -> std::result::Result<(), String> {
     // The same lock `attach_member` holds for slot DDL. Without it a member can
     // register between `request_rebuild_of_attached_members`'s snapshot of the
     // member set and `reseat_held_floors` below, and that member is then neither
@@ -2663,6 +2674,22 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
     // the pump: `attach_member` holds it only across synchronous setup and never
     // waits on the pump, and the pump already takes it in `try_finish_if_empty`.
     let _setup = source.setup_lock.lock().await;
+    // The refusal describes the slot as it was when this connection ended, and a
+    // join can replace an invalidated slot during the reconnect backoff that
+    // follows — the only window in which it can, since `PostgreSQL` refuses to drop
+    // a slot an active walsender holds. That join adopts its replacement through
+    // the same path below, so replacing again would drop a healthy slot and leave
+    // every member holding *two* rebuild requests against one
+    // [`AckSlot::rebuild_pending`] flag: the first to commit would clear the hold
+    // the second still needs, and the member would be credited and its position
+    // recorded for contents that rebuild has not delivered.
+    if source.slot_generation.load(Ordering::Acquire) != refused_generation {
+        tracing::info!(
+            slot = %source.key.slot_name,
+            "the replication slot was replaced while this stream was reconnecting, and every acceleration on it was already asked to rebuild; streaming resumes on the replacement"
+        );
+        return Ok(());
+    }
     let new_lsn = slot::replace_unusable_slot(&source.params)
         .await
         .map_err(|e| e.to_string())?;
@@ -2686,6 +2713,10 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
 /// Callers must hold [`SharedSource::setup_lock`], so the member set is stable
 /// across the walk below — see [`request_rebuild_of_attached_members`].
 async fn adopt_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
+    // Retires every observation of the slot this replaces, so a refusal the pump
+    // latched against it is not acted on a second time (see
+    // [`recover_unusable_slot`]).
+    source.slot_generation.fetch_add(1, Ordering::AcqRel);
     // The replacement carries no history, so a member joining after this cannot
     // resume either — it snapshots, exactly as it would on a slot this process had
     // just created.
@@ -3040,8 +3071,10 @@ async fn run_pump(source: Arc<SharedSource>) {
     // not per attempt.
     let mut slot_replacements = SlotReplacementBudget::new();
     // Set when a connection reports the slot unusable, and acted on at the top of
-    // the reconnect loop — see there for why the two are separated.
-    let mut slot_unusable = false;
+    // the reconnect loop — see there for why the two are separated. Carries the
+    // slot generation the refusal was observed at, so a slot replaced in between is
+    // not replaced again.
+    let mut slot_unusable: Option<u64> = None;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
@@ -3088,10 +3121,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         // connection still live. `PostgreSQL` refuses to drop a slot an active
         // walsender holds, and the client is dropped when the recv loop exits, so
         // this is the first point at which the drop can succeed.
-        if std::mem::take(&mut slot_unusable) {
+        if let Some(refused_generation) = slot_unusable.take() {
             disconnect_at.get_or_insert_with(std::time::Instant::now);
             if slot_replacements.admit(std::time::Instant::now()) {
-                if let Err(reason) = recover_unusable_slot(&source).await {
+                if let Err(reason) = recover_unusable_slot(&source, refused_generation).await {
                     fatal_broadcast(
                         &source,
                         format!(
@@ -3336,7 +3369,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // dropped when this loop exits. Reconnecting without replacing
                     // would ask the same dead slot for changes forever.
                     if resilience::is_slot_unusable(&e) {
-                        slot_unusable = true;
+                        slot_unusable = Some(source.slot_generation.load(Ordering::Acquire));
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         break 'recv;
                     }
@@ -6027,6 +6060,51 @@ mod tests {
             source.ack.committed(&key("unjoined")),
             100,
             "the hold for an unjoined table still covers changes nobody has consumed"
+        );
+    }
+
+    /// The pump latches a refusal against the slot it was streaming, then waits out
+    /// its reconnect backoff — the one window in which a joining dataset can replace
+    /// that slot, because `PostgreSQL` will not drop one an active walsender holds.
+    ///
+    /// By the time the pump acts, the slot its refusal describes is gone and every
+    /// member has already been asked to rebuild. Replacing again would drop a
+    /// healthy slot and leave each member holding two rebuild requests against one
+    /// `rebuild_pending` flag, so the first to commit would release the hold the
+    /// second still needs — crediting the member, and recording its position, for
+    /// contents that rebuild has not delivered.
+    #[tokio::test]
+    async fn a_refusal_of_an_already_replaced_slot_does_not_replace_it_again() {
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _, rx) = &mut probes[0];
+        source.ack.register(member_key, false);
+        source.ack.commit(member_key, 100);
+        source.ack.promote_ready_members();
+
+        // What the pump holds: the slot generation as of the connection that was
+        // refused.
+        let refused_generation = source.slot_generation.load(Ordering::Acquire);
+
+        // A join replaces the slot and adopts the replacement, which is what asks
+        // this member to rebuild.
+        adopt_replacement_slot(&source, 500).await;
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_some(),
+            "the join's replacement is what asks the member to rebuild"
+        );
+
+        recover_unusable_slot(&source, refused_generation)
+            .await
+            .expect("a refusal of a slot that is already gone is not a failure");
+
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_none(),
+            "the member must not be asked to rebuild a second time for one replacement"
+        );
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            refused_generation + 1,
+            "one replacement happened, so the generation moved exactly once"
         );
     }
 

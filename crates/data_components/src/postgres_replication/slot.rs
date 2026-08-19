@@ -20,6 +20,8 @@ limitations under the License.
 //! PUBLICATION` is not allowed on replication connections and the slot state
 //! queries live in normal catalog tables.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use snafu::ResultExt;
 use tokio_postgres::NoTls;
 
@@ -95,11 +97,13 @@ pub async fn setup_slot_and_publication(
     // are idempotent and slot/publication creation is guarded by `IF EXISTS`
     // checks. Fatal errors (permission denied, syntax) are propagated on the
     // first attempt.
+    // Outside the retry: see [`ensure_slot`].
+    let history_discarded = AtomicBool::new(false);
     super::resilience::retry_async(
         "postgres_replication::setup",
         super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
         is_transient_setup_error,
-        || async { setup_once(params, schema_name, table_name).await },
+        || async { setup_once(params, schema_name, table_name, &history_discarded).await },
     )
     .await
 }
@@ -154,6 +158,8 @@ pub async fn setup_shared_member(
     schema_name: &str,
     table_name: &str,
 ) -> Result<SharedMemberSetup> {
+    // Outside the retry: see [`ensure_slot`].
+    let history_discarded = AtomicBool::new(false);
     super::resilience::retry_async(
         "postgres_replication::setup_shared_member",
         super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
@@ -174,7 +180,7 @@ pub async fn setup_shared_member(
                 // root, which is the name members subscribe with.
                 let publication_tables =
                     list_publication_tables(&client, &params.publication_name).await?;
-                let slot = ensure_slot(&client, params).await?;
+                let slot = ensure_slot(&client, params, &history_discarded).await?;
                 let slot_restart_lsn = read_slot_restart_lsn(&client, &params.slot_name).await?;
                 Ok(SharedMemberSetup {
                     slot,
@@ -197,10 +203,11 @@ async fn setup_once(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
+    history_discarded: &AtomicBool,
 ) -> Result<SlotInfo> {
     let (client, conn_task) = connect_setup(params).await?;
 
-    let outcome = do_setup(&client, params, schema_name, table_name).await;
+    let outcome = do_setup(&client, params, schema_name, table_name, history_discarded).await;
 
     drop(client);
     let _ = conn_task.await;
@@ -254,11 +261,12 @@ async fn do_setup(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
+    history_discarded: &AtomicBool,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
     let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
-    let mut slot = ensure_slot(client, params).await?;
+    let mut slot = ensure_slot(client, params, history_discarded).await?;
     slot.generated_columns = generated_columns;
     Ok(slot)
 }
@@ -355,9 +363,17 @@ async fn drop_slot_if_invalidated(
     }
 }
 
+/// `history_discarded` latches [`SlotInfo::history_discarded`] across the caller's
+/// *retries*, and is why it is a parameter rather than a local: the drop below is
+/// not undone by a later attempt failing. An attempt that retires the invalidated
+/// slot and then fails on a transient error further into setup leaves the
+/// replacement in place, so the next attempt finds an ordinary slot and would
+/// report that nothing was discarded — and the members already attached would
+/// never be rebuilt, which is the whole failure this signal exists to prevent.
 async fn ensure_slot(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
+    history_discarded: &AtomicBool,
 ) -> Result<SlotInfo> {
     // Read once, before anything branches, so every outcome below carries it and
     // the slot-creation message can name what will remove the slot it creates.
@@ -373,7 +389,10 @@ async fn ensure_slot(
     // is set on the resuming branches too — reaching one after the drop means
     // something recreated the slot underneath us, which does not give the
     // discarded history back.
-    let history_discarded = drop_slot_if_invalidated(client, &params.slot_name).await?;
+    if drop_slot_if_invalidated(client, &params.slot_name).await? {
+        history_discarded.store(true, Ordering::Release);
+    }
+    let history_discarded = history_discarded.load(Ordering::Acquire);
 
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
