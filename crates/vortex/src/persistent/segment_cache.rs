@@ -1692,7 +1692,11 @@ mod tests {
     /// bounding the drain safe. Regression test for spiceai/spiceai#12964.
     #[tokio::test]
     async fn a_put_trimming_when_the_path_retires_does_not_repopulate_it() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "test");
+        // Capacity well above the segment below, so that a segment which does
+        // get inserted stays resident: sized under it, Moka would evict the
+        // entry on weight alone and the assertion would hold with or without the
+        // code it exists to check.
+        let shared = SharedSegmentCache::new(64 << 20, true, "test");
         let path = Path::from("snapshot-a/trimming.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
