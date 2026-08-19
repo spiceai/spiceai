@@ -185,6 +185,60 @@ pub fn compaction_budget_permits() -> usize {
     cpu_budget::cpu_budget().cayenne_compaction_permits()
 }
 
+/// Scan fan-out and encoder-shard ceiling for a single compaction pass,
+/// resolved once per process.
+///
+/// `SessionConfig::default()` resolves `target_partitions` to
+/// `available_parallelism()`, which reports the node's cores whenever a pod sets
+/// `requests.cpu` without `limits.cpu`. Compaction would then size itself for
+/// the whole node while queries size to the entitlement, so this resolves from
+/// the CPU budget — the same source the query path uses.
+///
+/// `SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS` overrides it so a benchmark
+/// sweep can vary the fan-out per run without a rebuild: the HTAP workflow
+/// forwards `SPICE_*` variables to the spiced process under test.
+static COMPACTION_TARGET_PARTITIONS: LazyLock<usize> = LazyLock::new(|| {
+    resolve_compaction_target_partitions(
+        std::env::var("SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS")
+            .ok()
+            .as_deref(),
+        cpu_budget::cpu_budget().target_partitions(),
+    )
+});
+
+/// Partitions a compaction pass plans its scan and encoder fan-out across.
+#[must_use]
+pub(crate) fn compaction_target_partitions() -> usize {
+    *COMPACTION_TARGET_PARTITIONS
+}
+
+/// Pure resolution behind [`COMPACTION_TARGET_PARTITIONS`], separated so the
+/// override parsing is testable without mutating the process environment
+/// (which is `unsafe` in edition 2024 and racy across parallel tests).
+///
+/// A value that is absent, unparseable, or zero falls back to the budget: an
+/// experiment knob must never be able to stop compaction from running.
+fn resolve_compaction_target_partitions(override_value: Option<&str>, budget: usize) -> usize {
+    let budget = budget.max(1);
+    let Some(raw) = override_value else {
+        return budget;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(partitions) if partitions > 0 => {
+            tracing::info!(
+                "Cayenne compaction is planning across {partitions} partitions from `SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS` instead of the {budget} its CPU budget derives."
+            );
+            partitions
+        }
+        _ => {
+            tracing::warn!(
+                "Ignoring `SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS={raw}`: expected a whole number above zero, so Cayenne compaction keeps planning across the {budget} partitions its CPU budget derives."
+            );
+            budget
+        }
+    }
+}
+
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.
 /// Existing pass guards remain counted and can be drained via
 /// [`drain_compaction_tasks`].
@@ -1349,5 +1403,37 @@ mod tests {
             Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         assert!(BackgroundCompactor::spawn(weak, Duration::ZERO, semaphore).is_none());
+    }
+
+    #[test]
+    fn compaction_fan_out_defaults_to_the_cpu_budget() {
+        assert_eq!(resolve_compaction_target_partitions(None, 64), 64);
+    }
+
+    #[test]
+    fn compaction_fan_out_honors_the_sweep_override() {
+        assert_eq!(resolve_compaction_target_partitions(Some("1"), 64), 1);
+        assert_eq!(resolve_compaction_target_partitions(Some("8"), 64), 8);
+        // Above the budget too: a sweep has to be able to probe oversubscription.
+        assert_eq!(resolve_compaction_target_partitions(Some("256"), 64), 256);
+        assert_eq!(resolve_compaction_target_partitions(Some(" 4 "), 64), 4);
+    }
+
+    #[test]
+    fn an_unusable_override_falls_back_rather_than_stalling_compaction() {
+        for raw in ["0", "-1", "", "auto", "4.5"] {
+            assert_eq!(
+                resolve_compaction_target_partitions(Some(raw), 64),
+                64,
+                "override {raw:?} should fall back to the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_budget_still_plans_one_partition() {
+        // A zero would propagate into the encoder shard cap as "no writers".
+        assert_eq!(resolve_compaction_target_partitions(None, 0), 1);
+        assert_eq!(resolve_compaction_target_partitions(Some("0"), 0), 1);
     }
 }

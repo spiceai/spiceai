@@ -6922,8 +6922,11 @@ impl CayenneTableProvider {
     /// * `stream` - The stream of record batches to write
     /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
-    /// * `target_partitions` - Upper bound on intra-write shard writers (the
-    ///   host's logical-core count); also the ceiling the Vortex sink clamps to.
+    /// * `target_partitions` - Upper bound on intra-write shard writers; also the
+    ///   ceiling the Vortex sink clamps to. Sourced from the caller's session
+    ///   config, so a maintenance write carries the compaction fan-out
+    ///   ([`super::compaction::compaction_target_partitions`]) and a CDC delta
+    ///   write carries the query fan-out.
     /// * `estimated_bytes` - Caller's estimate of the total bytes this write will
     ///   produce, used to size the intra-write shard count (small writes stay a
     ///   single file). `None` ⇒ unknown size ⇒ shard across the full write
@@ -19497,7 +19500,8 @@ impl CayenneTableProvider {
             })?;
 
         Ok(SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            SessionConfig::default()
+                .with_target_partitions(super::compaction::compaction_target_partitions()),
             runtime_env,
         ))
     }
@@ -20043,6 +20047,10 @@ impl CayenneTableProvider {
     /// bounded pool carved from `runtime.query.memory_limit`, so a large
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
+    ///
+    /// Fan-out comes from [`super::compaction::compaction_target_partitions`]
+    /// rather than `SessionConfig`'s default, which would read the host's cores
+    /// instead of the CPU the runtime is entitled to.
     fn create_compaction_session_context(&self) -> SessionContext {
         self.create_compaction_session_context_with_config(SessionConfig::default())
     }
@@ -20057,7 +20065,10 @@ impl CayenneTableProvider {
     ) -> SessionContext {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
-        SessionContext::new_with_config_rt(config, runtime_env)
+        SessionContext::new_with_config_rt(
+            config.with_target_partitions(super::compaction::compaction_target_partitions()),
+            runtime_env,
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
