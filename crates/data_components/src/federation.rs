@@ -679,6 +679,20 @@ mod tests {
                 !sql.contains("LIMIT"),
                 "{dialect_name}: an unbounded build side must not acquire a bound: {sql}"
             );
+
+            // Carrying no bound is not the invariant — scoping every build side
+            // would satisfy that too, since a scope with nothing to bound emits no
+            // LIMIT either. What has to hold is that the build relation is still
+            // named directly in the EXISTS body's own FROM, one level inside the
+            // EXISTS rather than behind a derived table of its own.
+            let exists = paren_depth_at(&sql, first_offset_of(&sql, "EXISTS"));
+            let build = paren_depth_at(&sql, first_offset_of(&sql, "build"));
+            assert_eq!(
+                build,
+                exists + 1,
+                "{dialect_name}: an unbounded build side has to stay in the EXISTS body's own FROM, \
+                 not move behind a derived table that costs the join its pushdown: {sql}"
+            );
         }
     }
 }
