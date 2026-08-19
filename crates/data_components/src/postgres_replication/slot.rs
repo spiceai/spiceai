@@ -38,6 +38,23 @@ pub struct SlotInfo {
     pub consistent_lsn: u64,
     pub snapshot_name: Option<String>,
     pub created_fresh: bool,
+    /// Whether this call *discarded* an existing slot's history: the named slot
+    /// was found invalidated (`wal_status = 'lost'`), dropped, and the slot
+    /// described here created in its place.
+    ///
+    /// Distinct from [`Self::created_fresh`], which is also true where nothing
+    /// was thrown away — a slot created because none existed, one that exists but
+    /// has never been acknowledged, and the fast-forward for a re-bootstrap. Only
+    /// this outcome says the positions consumers recorded against the *previous*
+    /// slot can no longer be reached, so acting on `created_fresh` instead moves
+    /// floors that are still owed their changes (#12609).
+    ///
+    /// The caller owns the consequence: a shared source must rebuild every member
+    /// already attached to it before the replacement streams, because their
+    /// recorded positions predate a slot created at the current WAL position and
+    /// any row deleted in between has no change event left to carry the deletion
+    /// (#13229).
+    pub history_discarded: bool,
     /// `GENERATED` columns of the source table. Postgres does not publish
     /// generated columns over logical replication (they are absent from
     /// pgoutput `Relation` messages), so the WAL path must tolerate their
@@ -349,7 +366,14 @@ async fn ensure_slot(
     // A slot the server has invalidated still looks present to every check
     // below, so retire it first and let the rest of this function create its
     // replacement.
-    drop_slot_if_invalidated(client, &params.slot_name).await?;
+    //
+    // Whether that happened is carried on every outcome below: it is the only one
+    // of them that destroys history someone may already be streaming against, and
+    // the caller has to rebuild those consumers before the replacement streams. It
+    // is set on the resuming branches too — reaching one after the drop means
+    // something recreated the slot underneath us, which does not give the
+    // discarded history back.
+    let history_discarded = drop_slot_if_invalidated(client, &params.slot_name).await?;
 
     // Distinguish three catalog states for the named slot:
     //   * None            — no slot exists; we create one and need a bootstrap.
@@ -376,6 +400,7 @@ async fn ensure_slot(
                     snapshot_name: None,
                     generated_columns: Vec::new(),
                     retention_posture,
+                    history_discarded,
                     // The old history is gone, so this slot carries none for any
                     // member -- the same contract as a slot created this process.
                     created_fresh: true,
@@ -395,6 +420,7 @@ async fn ensure_slot(
                 snapshot_name: None,
                 generated_columns: Vec::new(),
                 retention_posture,
+                history_discarded,
                 created_fresh: false,
             });
         }
@@ -413,6 +439,7 @@ async fn ensure_slot(
                 snapshot_name: None,
                 generated_columns: Vec::new(),
                 retention_posture,
+                history_discarded,
                 created_fresh: true,
             });
         }
@@ -444,6 +471,7 @@ async fn ensure_slot(
                 // a bootstrap (same reasoning as the Some(0) path above).
                 generated_columns: Vec::new(),
                 retention_posture,
+                history_discarded,
                 created_fresh: confirmed == 0,
             });
         }
@@ -473,6 +501,7 @@ async fn ensure_slot(
         snapshot_name: Some(snapshot_name),
         generated_columns: Vec::new(),
         retention_posture,
+        history_discarded,
         created_fresh: true,
     })
 }
