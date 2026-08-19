@@ -127,7 +127,7 @@ license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.96.1"
-version = "2.2.0-unstable"
+version = "2.2.0"
 
 # Clippy lint levels for the workspace. Each member crate opts in with
 # `[lints]\nworkspace = true` so scoped `cargo clippy -p <crate>` and rust-analyzer
