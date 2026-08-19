@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
@@ -629,7 +630,7 @@ fn describe_paths(paths: &[&Path]) -> String {
     if let Some(remaining) = paths.len().checked_sub(DESCRIBED_PATHS_MAX)
         && remaining > 0
     {
-        described.push_str(&format!(" and {remaining} more"));
+        let _ = write!(described, " and {remaining} more");
     }
     described
 }
@@ -1695,7 +1696,7 @@ mod tests {
             let invalidation = tokio::spawn(async move {
                 retiring
                     .invalidate_paths(HashSet::from([retired_path]))
-                    .await
+                    .await;
             });
             tokio::task::yield_now().await;
             drop(file);
@@ -1724,7 +1725,7 @@ mod tests {
     /// batch size. Regression test for spiceai/spiceai#12964.
     #[tokio::test(start_paused = true)]
     async fn stuck_puts_on_many_paths_share_one_drain_deadline() {
-        const STUCK_PATHS: usize = 8;
+        const STUCK_PATHS: u32 = 8;
 
         let shared = SharedSegmentCache::new(1 << 20, true, "test");
         let mut files = Vec::new();
@@ -1742,7 +1743,7 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         tokio::time::timeout(
-            ACTIVE_PUT_DRAIN_TIMEOUT * (STUCK_PATHS as u32 + 2),
+            ACTIVE_PUT_DRAIN_TIMEOUT * (STUCK_PATHS + 2),
             shared.invalidate_paths(paths),
         )
         .await
