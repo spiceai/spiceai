@@ -2754,16 +2754,22 @@ async fn install_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
 /// a staged insert applied *after* the rebuild would resurrect a row the source has
 /// since deleted, and the replacement slot has no delete event left to correct it.
 async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn: u64) {
-    for (member_key, member) in source.live_members() {
-        // Hold before enqueueing, so the member is never routable with its rebuild
-        // still queued. `AckTable::credit_idle` advances a streaming member's floor
-        // to the WAL head whenever it has nothing in flight, and a queued control
-        // envelope does not count as in flight — so a member left streaming would be
-        // credited, and then recorded, past contents its rebuild had not delivered.
-        source.ack.register(&member_key, true);
+    let members = source.live_members();
+    // Every member is held before *any* request is enqueued, and without an await in
+    // between. `AckTable::credit_idle` advances a streaming member's floor to the WAL
+    // head whenever it has nothing in flight, and a queued control envelope does not
+    // count as in flight — so a member still streaming would be credited, and then
+    // recorded, past contents its rebuild had not delivered. The send below can park
+    // on a full mailbox, and the pump reconnects without taking `setup_lock`, so
+    // holding as each member's turn came would leave the ones later in the walk
+    // promotable and creditable for the length of that park.
+    for (member_key, _) in &members {
+        source.ack.register(member_key, true);
         // Claim the hold as the rebuild's, so the member's own initial-snapshot
         // completion cannot release it out from under the rebuild.
-        source.ack.mark_rebuild_pending(&member_key);
+        source.ack.mark_rebuild_pending(member_key);
+    }
+    for (member_key, member) in members {
         let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
         if member.sender.send_control(envelope).await.is_some() {
             // The consumer is gone, so there is no acceleration left to rebuild.
@@ -3078,10 +3084,13 @@ async fn run_pump(source: Arc<SharedSource>) {
     // Declared outside the reconnect loop so the bound is over the pump's life,
     // not per attempt.
     let mut slot_replacements = SlotReplacementBudget::new();
-    // Set to [`SharedSource::slot_generation`] when a connection reports the slot
-    // unusable, and acted on at the top of the reconnect loop — see there for why
-    // the two are separated, and `recover_unusable_slot` for why the generation
-    // rather than a bare flag.
+    // Set to the slot generation *this connection* was streaming when it reports the
+    // slot unusable, and acted on at the top of the reconnect loop — see there for
+    // why the two are separated, and `recover_unusable_slot` for why the generation
+    // rather than a bare flag. Read at connect rather than when the refusal is
+    // dequeued: the error can sit in the client's queue while a join replaces the
+    // slot, and tagging it with the generation of the replacement would make a stale
+    // refusal look current and drop a healthy slot.
     let mut unusable_slot_generation: Option<u64> = None;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
@@ -3176,6 +3185,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Joins that happened before this (re)connect are picked up by it.
         source.restart_requested.store(false, Ordering::Release);
 
+        // The slot epoch this connection streams, read before the config is built
+        // from it: a replacement installed after this point is one this connection
+        // never saw, and a refusal it reports must not be attributed to it.
+        let connection_generation = source.slot_generation.load(Ordering::Acquire);
         let config = client::build_replication_config(
             &params,
             &slot_name,
@@ -3381,8 +3394,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // dropped when this loop exits. Reconnecting without replacing
                     // would ask the same dead slot for changes forever.
                     if resilience::is_slot_unusable(&e) {
-                        unusable_slot_generation =
-                            Some(source.slot_generation.load(Ordering::Acquire));
+                        unusable_slot_generation = Some(connection_generation);
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         break 'recv;
                     }
