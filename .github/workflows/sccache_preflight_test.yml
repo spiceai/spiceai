@@ -23,9 +23,12 @@ on:
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
       - 'scripts/check_sccache_call_sites.py'
-      # Any workflow file: a call site that omits the cache credentials is a change here,
-      # not in the action, and the pre-flight cannot see the difference from inside.
+      # Any workflow or action manifest: a call site that omits the cache credentials is a
+      # change there, not in the pre-flight, which cannot tell from inside whether a caller
+      # ever supplied any. Composite actions count -- four of them were forwarding the
+      # endpoint to `setup-sccache` while dropping the credentials their callers passed.
       - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
   push:
     branches:
       - trunk
@@ -34,9 +37,12 @@ on:
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
       - 'scripts/check_sccache_call_sites.py'
-      # Any workflow file: a call site that omits the cache credentials is a change here,
-      # not in the action, and the pre-flight cannot see the difference from inside.
+      # Any workflow or action manifest: a call site that omits the cache credentials is a
+      # change there, not in the pre-flight, which cannot tell from inside whether a caller
+      # ever supplied any. Composite actions count -- four of them were forwarding the
+      # endpoint to `setup-sccache` while dropping the credentials their callers passed.
       - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
   workflow_dispatch:
 
 concurrency:

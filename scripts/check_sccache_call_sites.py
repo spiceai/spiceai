@@ -1,38 +1,67 @@
 #!/usr/bin/env python3
-"""Every `setup-sccache` call site must pass the cache credentials.
+"""A call site that configures the compiler cache must also supply its credentials.
 
-The action writes a cache config that signs its requests on every path except macOS via
-`spiceio_endpoint`, and it probes the cache before wrapping rustc. A call site that omits
-the credentials therefore gets a probe that cannot sign, and the pre-flight disables the
-cache for the whole job -- which surfaces as nothing louder than a `::warning::` while
-every build in that job compiles uncached. That is how three jobs ran uncached unnoticed.
+`setup-sccache` writes a cache config that signs its requests on every path except macOS
+via `spiceio_endpoint`, and it probes the cache before wrapping rustc. A call site that
+names an endpoint but no credentials therefore gets a probe that cannot sign, and the
+pre-flight disables the cache for the whole job -- surfacing as nothing louder than a
+`::warning::` while every build in that job compiles uncached. Three jobs ran that way
+unnoticed, and four composite actions were dropping credentials their own callers passed.
 
-Passing the keys everywhere also covers the latent case: callers that pass both endpoints
-fall back to the signing minio path whenever the spiceio endpoint resolves empty.
+The invariant, applied to `setup-sccache` and to any local action that declares the same
+credential inputs (so a forwarding action is held to it too):
+
+    a call site passing `minio_endpoint` must also pass `minio_access_key`
+    and `minio_secret_key`
+
+A call site that names no endpoint configures no cache and is left alone -- credentials
+without an endpoint would do nothing.
 """
 
 import pathlib
 import re
 import sys
 
-WORKFLOWS = pathlib.Path(".github/workflows")
-REQUIRED = ("minio_access_key", "minio_secret_key")
+ROOTS = (pathlib.Path(".github/workflows"), pathlib.Path(".github/actions"))
+CREDS = ("minio_access_key", "minio_secret_key")
 
 
-def call_sites(text):
-    """Yield (line_no, step_body) for each setup-sccache usage.
+def forwards_to_setup_sccache(action_yml):
+    """True if this action calls `setup-sccache` and takes the credential inputs to forward.
 
-    `uses:` and `with:` are sibling keys of the same step, so they share an indent --
-    collecting only *more*-indented lines would stop before `with:` and see nothing.
-    Collect everything at or deeper than the `uses:` indent, and stop at the dedent that
-    ends the step (the next list item sits two columns further out).
+    Deliberately not "declares the inputs": `setup-minio` and `upload-to-minio` take the
+    same key names for the `mc` client and have nothing to do with the compiler cache.
+    """
+    try:
+        text = action_yml.read_text(encoding="utf8")
+    except OSError:
+        return False
+    if "./.github/actions/setup-sccache" not in text:
+        return False
+    return all(re.search(rf"^  {c}\s*:", text, re.M) for c in CREDS)
+
+
+def guarded_actions():
+    names = {"setup-sccache"}
+    for action_yml in pathlib.Path(".github/actions").glob("*/action.yml"):
+        if forwards_to_setup_sccache(action_yml):
+            names.add(action_yml.parent.name)
+    return names
+
+
+def call_sites(text, names):
+    """Yield (line_no, action_name, step_body) for each call of a guarded action.
+
+    `uses:` and `with:` are sibling keys of the same step, so collect everything at or
+    deeper than the `uses:` indent and stop at the dedent that ends the step.
     """
     lines = text.split("\n")
     for i, line in enumerate(lines):
-        if "setup-sccache" not in line or "uses:" not in line:
+        m = re.search(r"uses:\s*\./\.github/actions/([A-Za-z0-9_-]+)", line)
+        if not m or m.group(1) not in names:
             continue
         indent = len(line) - len(line.lstrip())
-        block, j = [], i + 1
+        body, j = [], i + 1
         while j < len(lines):
             nxt = lines[j]
             if not nxt.strip():
@@ -41,38 +70,45 @@ def call_sites(text):
             ind = len(nxt) - len(nxt.lstrip())
             if ind < indent or (ind == indent and nxt.lstrip().startswith("- ")):
                 break
-            block.append(nxt)
+            body.append(nxt)
             j += 1
-        yield i + 1, "\n".join(block)
+        yield i + 1, m.group(1), "\n".join(body)
 
 
 def main():
-    if not WORKFLOWS.is_dir():
-        print("no .github/workflows directory; run from the repository root", file=sys.stderr)
+    if not all(r.is_dir() for r in ROOTS):
+        print("run from the repository root", file=sys.stderr)
         return 1
-    failures = []
-    checked = 0
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    names = guarded_actions()
+    failures, checked, skipped = [], 0, 0
+    files = sorted(ROOTS[0].glob("*.yml")) + sorted(ROOTS[1].glob("*/action.yml"))
+    for path in files:
         text = path.read_text(encoding="utf8")
-        for line_no, block in call_sites(text):
+        for line_no, action, body in call_sites(text, names):
+            # No endpoint means no cache is being configured here.
+            if not re.search(r"^\s*minio_endpoint\s*:\s*\S", body, re.M):
+                skipped += 1
+                continue
             checked += 1
-            missing = [k for k in REQUIRED if not re.search(rf"^\s*{k}\s*:", block, re.M)]
+            missing = [c for c in CREDS if not re.search(rf"^\s*{c}\s*:\s*\S", body, re.M)]
             if missing:
-                failures.append(f"{path}:{line_no}: setup-sccache is missing {', '.join(missing)}")
+                failures.append(f"{path}:{line_no}: `{action}` is missing {', '.join(missing)}")
     if failures:
-        print("Compiler-cache call sites missing credentials:\n", file=sys.stderr)
+        print("Compiler-cache call sites that configure a cache without credentials:\n", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         print(
-            "\nAdd both to that step's `with:`:\n"
-            "          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}\n"
-            "          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}\n"
-            "\nWithout them the cache probe cannot sign its request, so the pre-flight\n"
-            "disables the cache and the job compiles uncached with only a warning.",
+            "\nPass both alongside `minio_endpoint` (`secrets.` in a workflow,\n"
+            "`inputs.` when forwarding from a composite action). Without them the cache\n"
+            "probe cannot sign its request, so the pre-flight disables the cache and the\n"
+            "job compiles uncached with only a warning.",
             file=sys.stderr,
         )
         return 1
-    print(f"All {checked} setup-sccache call site(s) pass the cache credentials.")
+    print(
+        f"All {checked} compiler-cache call site(s) across {len(names)} guarded action(s) "
+        f"pass credentials ({skipped} configure no endpoint)."
+    )
     return 0
 
 
