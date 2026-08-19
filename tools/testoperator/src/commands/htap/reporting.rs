@@ -605,6 +605,102 @@ pub(super) fn emit_cayenne_operation_metrics(metrics: &crate::spiced_metrics::Sp
     println!();
 }
 
+/// Sums a cumulative counter per value of one label, keyed `(table, value)`.
+///
+/// The operation report totals a series to one number; these two counters exist to
+/// say *which* branch fired, so collapsing their label would discard the answer.
+fn cumulative_by_label(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    name: &str,
+    label: &str,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    use std::collections::BTreeMap;
+
+    // Fingerprint the full label set first: a cumulative series' run value is its
+    // maximum, and two series sharing a (table, value) pair must be summed, not
+    // max'd, or one would mask the other.
+    let mut series_max: BTreeMap<String, (String, String, f64)> = BTreeMap::new();
+    for sample in metrics.samples.get(name).into_iter().flatten() {
+        let table = sample
+            .labels
+            .get("table")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let value = sample
+            .labels
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut fingerprint: Vec<String> = sample
+            .labels
+            .iter()
+            .map(|(key, val)| format!("{key}={val}"))
+            .collect();
+        fingerprint.sort();
+        let entry = series_max
+            .entry(fingerprint.join(","))
+            .or_insert((table, value, f64::MIN));
+        if sample.value > entry.2 {
+            entry.2 = sample.value;
+        }
+    }
+    let mut out: BTreeMap<(String, String), f64> = BTreeMap::new();
+    for (_, (table, value, total)) in series_max {
+        *out.entry((table, value)).or_insert(0.0) += total;
+    }
+    out
+}
+
+/// Emits why a PK-index checkpoint was declined, and how each compaction pass
+/// ended.
+///
+/// Both answer questions the aggregate cannot. The full-table keyset rebuild runs
+/// on the apply path and costs minutes on a large table, and which branch declined
+/// the checkpoint decides the remedy — a checkpoint that never existed, one too
+/// large to persist, and one invalidated by a rewrite are different bugs. The
+/// compaction duration histogram counts only a committed merge or a failed
+/// attempt, so a trigger that fires constantly and always declines is invisible
+/// there; `committed_prune_skipped` in particular is a bake that paid full
+/// write-amplification and delivered no deletion-index shrink.
+///
+/// Silent when neither series was scraped, so a non-Cayenne run prints nothing.
+pub(super) fn emit_cayenne_path_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
+    let misses = cumulative_by_label(metrics, "cayenne_pk_index_checkpoint_miss_total", "reason");
+    let outcomes = cumulative_by_label(metrics, "cayenne_compaction_outcome_total", "outcome");
+
+    if !misses.is_empty() {
+        println!("\nCayenne PK-Index Checkpoint Misses (full keyset rebuild fallbacks)");
+        println!("  {:<20} {:<22} {:>10}", "table", "reason", "count");
+        for ((table, reason), count) in &misses {
+            println!("  {table:<20} {reason:<22} {count:>10.0}");
+            crate::metrics::CAYENNE_PK_INDEX_CHECKPOINT_MISSES.record(
+                to_u64(*count),
+                &[
+                    KeyValue::new("table", table.clone()),
+                    KeyValue::new("reason", reason.clone()),
+                ],
+            );
+        }
+        println!();
+    }
+
+    if !outcomes.is_empty() {
+        println!("\nCayenne Compaction Outcomes");
+        println!("  {:<20} {:<28} {:>10}", "table", "outcome", "count");
+        for ((table, outcome), count) in &outcomes {
+            println!("  {table:<20} {outcome:<28} {count:>10.0}");
+            crate::metrics::CAYENNE_COMPACTION_OUTCOMES.record(
+                to_u64(*count),
+                &[
+                    KeyValue::new("table", table.clone()),
+                    KeyValue::new("outcome", outcome.clone()),
+                ],
+            );
+        }
+        println!();
+    }
+}
+
 /// Emits Cayenne compaction metrics scraped from spiced's `/metrics` endpoint,
 /// reported per `table` and compaction `kind`
 ///
@@ -1407,6 +1503,55 @@ mod tests {
                 "{label} missing: the ratio needs both halves"
             );
         }
+    }
+
+    /// A cumulative counter's run value is its per-series maximum, and two series
+    /// sharing a reported `(table, value)` pair must be summed — max'ing them would
+    /// let one branch's count mask another's, which is the whole point of the label.
+    #[test]
+    fn cumulative_by_label_maxes_within_a_series_and_sums_across_them() {
+        let m = metrics(vec![
+            // one series (table=t, reason=absent) scraped three times
+            sample("miss", &[("table", "t"), ("reason", "absent")], 2.0, 1),
+            sample("miss", &[("table", "t"), ("reason", "absent")], 6.0, 2),
+            // a distinct series that maps to the SAME (table, reason) pair
+            sample(
+                "miss",
+                &[("table", "t"), ("reason", "absent"), ("shard", "1")],
+                4.0,
+                2,
+            ),
+            // a different reason must stay separate
+            sample("miss", &[("table", "t"), ("reason", "over_budget")], 1.0, 2),
+        ]);
+        let got = cumulative_by_label(&m, "miss", "reason");
+        assert_eq!(
+            got.get(&("t".to_string(), "absent".to_string())),
+            Some(&10.0),
+            "6 (series max) + 4 (second series) = 10"
+        );
+        assert_eq!(
+            got.get(&("t".to_string(), "over_budget".to_string())),
+            Some(&1.0)
+        );
+    }
+
+    /// An unscraped counter yields nothing, so a non-Cayenne run prints no section.
+    #[test]
+    fn cumulative_by_label_is_empty_for_an_unscraped_series() {
+        assert!(cumulative_by_label(&metrics(vec![]), "miss", "reason").is_empty());
+    }
+
+    /// A sample missing the label is reported rather than dropped — a silently
+    /// discarded fallback would understate the very cost this section exists for.
+    #[test]
+    fn cumulative_by_label_keeps_a_sample_missing_the_label() {
+        let m = metrics(vec![sample("miss", &[("table", "t")], 3.0, 1)]);
+        let got = cumulative_by_label(&m, "miss", "reason");
+        assert_eq!(
+            got.get(&("t".to_string(), "unknown".to_string())),
+            Some(&3.0)
+        );
     }
 
     /// Housekeeping is what the section exists to surface, so at least the

@@ -599,6 +599,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Ok(final_metrics) => {
             reporting::emit_cayenne_compaction_metrics(&final_metrics);
             reporting::emit_cayenne_operation_metrics(&final_metrics);
+            reporting::emit_cayenne_path_metrics(&final_metrics);
         }
         // Names both sections this scrape feeds, so a missing operation-counts
         // table is attributable to the scrape rather than read as "no operations".

@@ -654,6 +654,26 @@ pub static CAYENNE_COMPACTION_PASSES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static CAYENNE_PK_INDEX_CHECKPOINT_MISSES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_pk_index_checkpoint_misses")
+        .with_description(
+            "Times an upsert validation fell back from the persisted PK-index checkpoint to a full-table keyset rebuild during the test, by table and reason. The rebuild runs on the apply path and costs minutes on a large table, so a non-zero count here explains apply stalls and freshness spikes that no other metric attributes; the reason decides the remedy.",
+        )
+        .with_unit("fallbacks")
+        .build()
+});
+
+pub static CAYENNE_COMPACTION_OUTCOMES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_compaction_outcomes")
+        .with_description(
+            "How each Cayenne compaction or bake pass ended during the test, by table and outcome. cayenne_compaction_passes counts only a committed merge or a failed attempt, so a trigger that fires constantly and always declines is invisible there; committed_prune_skipped is a bake that paid full write amplification and delivered no deletion-index shrink.",
+        )
+        .with_unit("passes")
+        .build()
+});
+
 pub static CAYENNE_OPERATION_COUNTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     meter()
         .u64_gauge("cayenne_operation_counts")
