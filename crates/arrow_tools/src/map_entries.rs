@@ -495,6 +495,159 @@ mod tests {
         assert_eq!(inner.len(), 1);
     }
 
+    /// A map nested under each wrapper type the rewrite descends into is relabelled, children
+    /// included.
+    ///
+    /// The rewrite rule reaches a map through `ListView`, `Union`, `Dictionary` and
+    /// `RunEndEncoded` as readily as through `List` and `Struct`, so the relabel has to rebuild
+    /// those children too. Where it does not, the wrapper is rebuilt carrying the new type over
+    /// children that still hold the old one, and Arrow rejects the mismatch — the query returns
+    /// an error rather than rows.
+    #[test]
+    fn a_map_under_every_traversed_wrapper_is_relabelled() {
+        // Every wrapper is reported, not just the first to break: a loop that panics on wrapper
+        // one leaves the rest unproven.
+        let mut failures: Vec<String> = Vec::new();
+        for (name, wrapped) in wrapped_maps() {
+            let expected = crate::type_rewrite::rewrite_data_type(
+                wrapped.data_type(),
+                &[&MapEntriesNonNullable],
+            );
+            assert!(
+                holds_nullable_entries(wrapped.data_type()) && !holds_nullable_entries(&expected),
+                "{name}: the fixture must start non-conforming and have a conforming rewrite"
+            );
+
+            match normalize(batch_of(Arc::clone(&wrapped))) {
+                Err(e) => failures.push(format!("{name}: {e}")),
+                Ok(normalized) => {
+                    let schema = normalized.schema();
+                    let published = schema.field(0).data_type();
+                    if published != &expected {
+                        failures.push(format!("{name}: published {published}, want {expected}"));
+                    }
+                    // The child array carries the relabelled type too — a parent-only rewrite
+                    // is what Arrow rejects.
+                    if normalized.column(0).data_type() != &expected {
+                        failures.push(format!(
+                            "{name}: column type {}, want {expected}",
+                            normalized.column(0).data_type()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "wrappers not normalized: {failures:#?}"
+        );
+    }
+
+    /// Independent of the rewrite rule: walks the type for a nullable `entries` field.
+    fn holds_nullable_entries(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Map(entries, _) => {
+                entries.is_nullable() || holds_nullable_entries(entries.data_type())
+            }
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::ListView(f)
+            | DataType::LargeListView(f)
+            | DataType::RunEndEncoded(_, f) => holds_nullable_entries(f.data_type()),
+            DataType::Struct(fields) => {
+                fields.iter().any(|f| holds_nullable_entries(f.data_type()))
+            }
+            DataType::Union(fields, _) => fields
+                .iter()
+                .any(|(_, f)| holds_nullable_entries(f.data_type())),
+            DataType::Dictionary(_, value) => holds_nullable_entries(value),
+            _ => false,
+        }
+    }
+
+    /// One single-element array per wrapper type, each holding a map whose `entries` field is
+    /// declared nullable.
+    fn wrapped_maps() -> Vec<(&'static str, ArrayRef)> {
+        use arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int32Array, ListViewArray, RunArray, UnionArray,
+        };
+        use arrow::buffer::ScalarBuffer;
+        use arrow::datatypes::{Int32Type, UnionFields};
+
+        let map = || {
+            Arc::new(map_from_parts(
+                true,
+                None,
+                &[0, 1],
+                vec!["k0"],
+                vec![Some("v0")],
+            ))
+        };
+        let item = |array: &ArrayRef| Arc::new(Field::new("item", array.data_type().clone(), true));
+
+        let mut out: Vec<(&'static str, ArrayRef)> = Vec::new();
+
+        let m = map() as ArrayRef;
+        out.push((
+            "FixedSizeList",
+            Arc::new(FixedSizeListArray::new(item(&m), 1, Arc::clone(&m), None)),
+        ));
+
+        let m = map() as ArrayRef;
+        out.push((
+            "ListView",
+            Arc::new(
+                ListViewArray::try_new(
+                    item(&m),
+                    ScalarBuffer::from(vec![0]),
+                    ScalarBuffer::from(vec![1]),
+                    Arc::clone(&m),
+                    None,
+                )
+                .expect("list view of a map"),
+            ),
+        ));
+
+        let m = map() as ArrayRef;
+        out.push((
+            "Dictionary",
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0]), Arc::clone(&m))
+                    .expect("dictionary of maps"),
+            ),
+        ));
+
+        let m = map() as ArrayRef;
+        out.push((
+            "RunEndEncoded",
+            Arc::new(
+                RunArray::try_new(&Int32Array::from(vec![1]), m.as_ref())
+                    .expect("run-end encoded maps"),
+            ),
+        ));
+
+        let m = map() as ArrayRef;
+        let union_fields: UnionFields =
+            [(0_i8, Arc::new(Field::new("m", m.data_type().clone(), true)))]
+                .into_iter()
+                .collect();
+        out.push((
+            "Union",
+            Arc::new(
+                UnionArray::try_new(
+                    union_fields,
+                    ScalarBuffer::from(vec![0_i8]),
+                    Some(ScalarBuffer::from(vec![0_i32])),
+                    vec![Arc::clone(&m)],
+                )
+                .expect("union of maps"),
+            ),
+        ));
+
+        out
+    }
+
     /// A batch that already conforms is handed back as-is, so the common case pays nothing.
     #[test]
     fn a_conforming_batch_is_returned_unchanged() {

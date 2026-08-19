@@ -315,22 +315,17 @@ pub fn relabel_array_data(
         return Ok(data);
     }
 
-    let target_child_types: Vec<&DataType> = match target_type {
-        DataType::Struct(fields) => fields.iter().map(|f| f.data_type()).collect(),
-        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            vec![field.data_type()]
-        }
-        DataType::Map(field, _) => vec![field.data_type()],
-        _ => Vec::new(),
-    };
+    let targets = target_child_types(target_type);
 
     // Usually a flag changes at one level and every child below it is already correct, so the
-    // child spine is carried over by move instead of cloned.
-    let children_change = target_child_types.len() == data.child_data().len()
+    // child spine is carried over by move instead of cloned. A child count that disagrees with
+    // the target is a layout disagreement, and `build` refuses it below rather than leaving a
+    // rebuilt parent over children still carrying the old type.
+    let children_change = targets.len() == data.child_data().len()
         && data
             .child_data()
             .iter()
-            .zip(&target_child_types)
+            .zip(&targets)
             .any(|(child, target)| child.data_type() != *target);
 
     if !children_change {
@@ -340,7 +335,7 @@ pub fn relabel_array_data(
     let children = data
         .child_data()
         .iter()
-        .zip(&target_child_types)
+        .zip(&targets)
         .map(|(child, target)| relabel_array_data(child.clone(), target))
         .collect::<Result<Vec<_>, ArrowError>>()?;
 
@@ -348,6 +343,29 @@ pub fn relabel_array_data(
         .data_type(target_type.clone())
         .child_data(children)
         .build()
+}
+
+/// The types `target_type`'s children must carry, in the order [`ArrayData`] holds them.
+///
+/// This mirrors `ArrayData`'s own `validate_child_data`, and it has to cover every
+/// child-bearing type [`rewrite_data_type`] descends into: a type this misses is one whose
+/// parent gets rebuilt while its children keep the old type, which `build` then rejects.
+fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
+    match target_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => vec![field.data_type()],
+        DataType::Struct(fields) => fields.iter().map(|f| f.data_type()).collect(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, f)| f.data_type()).collect(),
+        DataType::RunEndEncoded(run_ends, values) => {
+            vec![run_ends.data_type(), values.data_type()]
+        }
+        DataType::Dictionary(_, value_type) => vec![value_type.as_ref()],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
