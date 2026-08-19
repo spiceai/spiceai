@@ -13,7 +13,6 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Meter, ObservableCounter, ObservableGauge};
 use parking_lot::Mutex;
-use tokio::time::error::Elapsed;
 use twox_hash::XxHash3_64;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
@@ -56,37 +55,39 @@ type StoreKey = Arc<str>;
 /// coalescing ceiling — are trimmed on the blocking pool instead.
 const INLINE_TRIM_MAX_BYTES: usize = 256 * 1024;
 
-/// How long retirement waits for the puts already registered against a path to
-/// finish before it enumerates that path's keys.
+/// How long retirement waits for the puts registered before the retirement mark
+/// to finish, across the whole batch, before it enumerates keys.
 ///
 /// A registered put has only a bounded copy (at most the 16 MiB coalescing
 /// ceiling) and one Moka insert left to do, so reaching this deadline means the
-/// runtime or the blocking pool is starved rather than that the put is doing
-/// work. Waiting forever there would hold every caller of
-/// [`SharedSegmentCache::invalidate_paths`] — including the delete and overwrite
-/// paths, which await it inline — for as long as the starvation lasts.
-#[cfg(not(test))]
+/// host is starved rather than that the put is doing work. Waiting forever there
+/// would hold every caller of [`SharedSegmentCache::invalidate_paths`] —
+/// including the delete and overwrite paths, which await it inline — for as long
+/// as the starvation lasts.
 const ACTIVE_PUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Shortened under test. Both deadlines here are only ever reached when
-/// something is already wedged, and the tests that reach them assert against the
-/// constant rather than a literal — so a short value tests the same behaviour
-/// without a wedged test taking ten seconds to say so.
-#[cfg(test)]
-const ACTIVE_PUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Polling interval for the drain above. Short enough that the common case (no
 /// registered put, or one about to finish) returns promptly.
 const ACTIVE_PUT_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// How long retirement waits for its key scan to run on the blocking pool.
+/// How many paths a log line names before it summarizes the rest.
+const DESCRIBED_PATHS_MAX: usize = 5;
+
+/// How long retirement waits for its key scan to run on the blocking pool and
+/// return.
 ///
-/// Separate from the drain's deadline rather than shared with it, so a slow
-/// drain cannot consume the budget the scan needs: with one deadline for both, a
-/// batch that spent it waiting would then skip the invalidation entirely, which
-/// is the worse of the two outcomes.
+/// A budget of its own rather than a share of [`ACTIVE_PUT_DRAIN_TIMEOUT`]: with
+/// one deadline for both, a batch that spent it draining would then skip the
+/// invalidation entirely, which is the worse of the two outcomes. The price is
+/// that a wedged host can hold `invalidate_paths` for the sum of the two before
+/// it gives up on both.
 #[cfg(not(test))]
 const INVALIDATION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Shortened under test; see [`ACTIVE_PUT_DRAIN_TIMEOUT`].
+/// Shortened under test, because the one test that reaches this deadline needs a
+/// real clock — Tokio will not auto-advance a paused one while a blocking task
+/// is outstanding, which is that test's premise. Note the shortening applies to
+/// this crate's unit tests only; an integration test linking the normal build
+/// gets the value above.
 #[cfg(test)]
 const INVALIDATION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -453,51 +454,44 @@ impl SharedSegmentCache {
         // marker installed under the same shard lock and kept until no stale
         // opener can appear — tracked in spiceai/spiceai#12963, since it changes
         // the no-permanent-tombstones property this design was built around.
-        let states: Vec<(&Path, Arc<PathCacheState>)> =
-            self.path_states
-                .as_ref()
-                .map_or_else(Vec::new, |path_states| {
-                    paths
-                        .iter()
-                        .filter_map(|path| {
-                            path_states
-                                .get(path)
-                                .and_then(|state| state.upgrade())
-                                .map(|state| (path, state))
-                        })
-                        .collect()
-                });
-        for (_, state) in &states {
+        let mut retiring: Vec<&Path> = Vec::new();
+        let mut states: Vec<Arc<PathCacheState>> = Vec::new();
+        if let Some(path_states) = self.path_states.as_ref() {
+            for path in &paths {
+                if let Some(state) = path_states.get(path).and_then(|state| state.upgrade()) {
+                    retiring.push(path);
+                    states.push(state);
+                }
+            }
+        }
+        for state in &states {
             state.retired.store(true, Ordering::SeqCst);
         }
-        // One deadline for the whole batch, not one per path. A cleanup pass
-        // retires every file it swept, so a per-path deadline would multiply by
-        // the batch size — and the cause a timeout indicates is global (a
-        // starved pool stalls every path at once), which is exactly when the
-        // batch is largest.
-        if drain_active_puts(&states).await.is_err() {
-            let stalled: Vec<&Path> = states
-                .iter()
-                .filter(|(_, state)| state.active_puts.load(Ordering::SeqCst) > 0)
-                .map(|(path, _)| *path)
-                .collect();
+        if !drain_active_puts(&states, ACTIVE_PUT_DRAIN_TIMEOUT).await {
             // Proceeding is the lesser harm, and what it costs is bounded: a put
             // that inserts into a retired path removes its own entry once the
             // insert lands (see `put`), so a straggler leaves nothing behind
             // even when it finishes after the enumeration below. Reads are
             // unaffected either way — every caller has already deleted the file.
-            tracing::warn!(
-                target: "vortex::segment_cache",
-                stalled_paths = stalled.len(),
-                "Gave up after {timeout_secs}s waiting for in-flight cache writes on {count} retiring file(s) — {paths} — so their segments may stay cached a moment longer than the retirement itself; queries are unaffected because those files are already deleted. Writes this slow mean the Tokio blocking pool that copies segments is starved.",
-                timeout_secs = ACTIVE_PUT_DRAIN_TIMEOUT.as_secs(),
-                count = stalled.len(),
-                paths = stalled
-                    .iter()
-                    .map(|path| format!("'{path}'"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
+            let stalled: Vec<&Path> = retiring
+                .iter()
+                .zip(&states)
+                .filter(|(_, state)| state.active_puts.load(Ordering::SeqCst) > 0)
+                .map(|(path, _)| *path)
+                .collect();
+            // The recount can come back empty when the last straggler finished
+            // inside the deadline's own shadow. Nothing was left behind, so
+            // there is nothing to report.
+            if !stalled.is_empty() {
+                let stalled_paths = stalled.len();
+                tracing::warn!(
+                    target: "vortex::segment_cache",
+                    stalled_paths,
+                    "Gave up after {timeout_secs}s waiting for in-flight cache writes on {stalled_paths} retiring file(s) — {paths} — so their segments may stay cached a moment longer than the retirement itself; queries are unaffected because those files are already deleted. Writes this slow mean the host cannot keep up with the work already queued on it.",
+                    timeout_secs = ACTIVE_PUT_DRAIN_TIMEOUT.as_secs(),
+                    paths = describe_paths(&stalled),
+                );
+            }
         }
 
         // Enumerate the exact keys and use Moka's direct async invalidation so
@@ -510,7 +504,7 @@ impl SharedSegmentCache {
         // compaction would otherwise occupy a runtime worker scanning entries
         // belonging to every other table. Run it on the blocking pool.
         // A reverse index from path to resident keys would remove the scan
-        // entirely; see spiceai/spiceai#12964.
+        // entirely; see spiceai/spiceai#13294.
         //
         // Bound the join as well as the drain above. The pool that runs this
         // scan is the same one the large-segment copies use, so the starvation
@@ -519,7 +513,7 @@ impl SharedSegmentCache {
         // two statements down rather than remove it.
         let scan_cache = self.cache.clone();
         let scan_paths = paths.clone();
-        let scan = tokio::task::spawn_blocking(move || {
+        let mut scan = tokio::task::spawn_blocking(move || {
             scan_cache
                 .iter()
                 .filter_map(|(key, _)| {
@@ -529,27 +523,36 @@ impl SharedSegmentCache {
                 })
                 .collect()
         });
-        let keys: Vec<SegmentKey> = match tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT, scan)
+        let keys: Vec<SegmentKey> = match tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT, &mut scan)
             .await
         {
             Ok(Ok(keys)) => keys,
             Ok(Err(error)) => {
-                // The scan is the only way to find the retired keys, so a failed
-                // join leaves them cached. Report it rather than pretending the
-                // retirement completed.
+                // The scan is the only way to find the retired keys, so a
+                // failed join leaves them cached. Report it rather than
+                // pretending the retirement completed.
                 tracing::error!(
                     target: "vortex::segment_cache",
                     %error,
-                    "Segment-cache invalidation scan failed to run, so segments of the files just retired stay cached until capacity evicts them"
+                    "Failed to search cached data for the {count} file(s) just retired — {paths} — so their segments stay cached until capacity evicts them. Cause: {error}",
+                    count = paths.len(),
+                    paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
                 return;
             }
             Err(_) => {
+                // Give up the queue slot as well as the wait. A search that
+                // has not started yet is dropped outright; one already
+                // running is not interruptible, but it was the wait, not the
+                // work, that was holding the caller.
+                scan.abort();
+                let timeout_secs = INVALIDATION_SCAN_TIMEOUT.as_secs();
                 tracing::error!(
                     target: "vortex::segment_cache",
-                    timeout_secs = INVALIDATION_SCAN_TIMEOUT.as_secs(),
-                    "Segment-cache invalidation scan did not start within {timeout_secs}s, so segments of the files just retired stay cached until capacity evicts them; the Tokio blocking pool is saturated.",
-                    timeout_secs = INVALIDATION_SCAN_TIMEOUT.as_secs(),
+                    timeout_secs,
+                    "Gave up after {timeout_secs}s searching cached data for the {count} file(s) just retired — {paths} — so their segments stay cached until capacity evicts them. Cause: the host cannot keep up with the work already queued on it.",
+                    count = paths.len(),
+                    paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
                 return;
             }
@@ -583,14 +586,16 @@ impl SharedSegmentCache {
     }
 }
 
-/// Wait for the puts registered against every `state` before retirement to
-/// finish, under a single [`ACTIVE_PUT_DRAIN_TIMEOUT`] for the whole batch.
+/// Wait for the puts registered before the retirement mark to finish, under a
+/// single `timeout` for the whole batch.
 ///
-/// `Err` when the deadline expired with puts still registered, so the caller can
-/// report the anomaly rather than wait on it forever.
-async fn drain_active_puts(states: &[(&Path, Arc<PathCacheState>)]) -> Result<(), Elapsed> {
-    tokio::time::timeout(ACTIVE_PUT_DRAIN_TIMEOUT, async {
-        for (_, state) in states {
+/// Returns `true` when every one of them finished. One deadline for the batch
+/// rather than one per path: a cleanup pass retires every file it swept, so a
+/// per-path deadline would multiply by the batch size — and the cause a timeout
+/// indicates is global, which is exactly when the batch is largest.
+async fn drain_active_puts(states: &[Arc<PathCacheState>], timeout: std::time::Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        for state in states {
             while state.active_puts.load(Ordering::SeqCst) > 0 {
                 // Back off instead of spinning on a Moka insert.
                 tokio::time::sleep(ACTIVE_PUT_DRAIN_POLL).await;
@@ -598,6 +603,25 @@ async fn drain_active_puts(states: &[(&Path, Arc<PathCacheState>)]) -> Result<()
         }
     })
     .await
+    .is_ok()
+}
+
+/// Render up to [`DESCRIBED_PATHS_MAX`] paths for a log line, then say how many
+/// were left out. A retirement batch can hold every file a sweep sacrificed, and
+/// a warning that lists them all becomes the incident.
+fn describe_paths(paths: &[&Path]) -> String {
+    let mut described: String = paths
+        .iter()
+        .take(DESCRIBED_PATHS_MAX)
+        .map(|path| format!("'{path}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(remaining) = paths.len().checked_sub(DESCRIBED_PATHS_MAX)
+        && remaining > 0
+    {
+        described.push_str(&format!(" and {remaining} more"));
+    }
+    described
 }
 
 struct PathSegmentCache {
@@ -621,6 +645,21 @@ struct ActivePutGuard<'a>(&'a PathCacheState);
 impl Drop for ActivePutGuard<'_> {
     fn drop(&mut self) {
         self.0.active_puts.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl PathSegmentCache {
+    fn key(&self, id: SegmentId) -> SegmentKey {
+        (Arc::clone(&self.store), Arc::clone(&self.path), id)
+    }
+
+    /// Whether this path has been retired since the file was opened. Always
+    /// `false` for a cache built without retirement tracking, which has no state
+    /// to mark.
+    fn is_retired(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.retired.load(Ordering::SeqCst))
     }
 }
 
@@ -689,6 +728,12 @@ impl SegmentCache for PathSegmentCache {
             })
             .await
             {
+                // Re-check retirement: this arm awaited, so a retirement marked
+                // while the copy ran is covered by neither check above, and the
+                // drain in `invalidate_paths` only waits for this put while its
+                // own deadline holds. Skipping the insert is cheaper than
+                // inserting and then undoing it below.
+                Ok(_) if self.is_retired() => return Ok(()),
                 Ok(trimmed) => trimmed,
                 Err(error) => {
                     // Caching the untrimmed view would pin its whole read block
@@ -703,30 +748,17 @@ impl SegmentCache for PathSegmentCache {
             }
         };
 
-        // Re-check retirement once the trim is done. The trim awaits for a large
-        // segment — it runs on the blocking pool — so a retirement marked during
-        // it is not covered by either check above, and the drain in
-        // `invalidate_paths` only waits for this put while its own deadline
-        // holds. Skipping the insert here is what keeps a retired path from
-        // being repopulated in the common case.
-        if let Some(state) = self.state.as_ref()
-            && state.retired.load(Ordering::SeqCst)
-        {
-            return Ok(());
-        }
+        self.shared.cache.insert(self.key(id), buffer).await;
 
-        let key = (Arc::clone(&self.store), Arc::clone(&self.path), id);
-        self.shared.cache.insert(key.clone(), buffer).await;
-
-        // Backstop for the one window the check above cannot cover: retirement
-        // marked between it and the insert landing. `invalidate_paths` has
-        // already enumerated by then, so nothing else will remove this entry —
-        // clean up after ourselves instead of leaving a retired file's segment
-        // resident until capacity evicts it.
-        if let Some(state) = self.state.as_ref()
-            && state.retired.load(Ordering::SeqCst)
-        {
-            self.shared.cache.invalidate(&key).await;
+        // The insert can land after a concurrent retirement enumerated this
+        // path's keys — the checks above narrow that window but cannot close it,
+        // and by then nothing else will remove this entry. Removing it here is
+        // what makes a straggler self-correcting, and so what makes the bounded
+        // drain in `invalidate_paths` safe: giving up on a put costs a moment of
+        // residency rather than a retired file's segment staying cached until
+        // capacity evicts it.
+        if self.is_retired() {
+            self.shared.cache.invalidate(&self.key(id)).await;
         }
         Ok(())
     }
@@ -989,6 +1021,25 @@ mod tests {
 
     async fn settle_cache_bookkeeping(cache: &SharedSegmentCache) {
         cache.cache.run_pending_tasks().await;
+    }
+
+    /// The registered state for `path`, which an open file cache keeps alive.
+    fn path_state(shared: &SharedSegmentCache, path: &Path) -> Arc<PathCacheState> {
+        shared
+            .path_states
+            .as_ref()
+            .expect("retirement tracking enabled")
+            .get(path)
+            .and_then(|state| state.upgrade())
+            .expect("an open file registered a path state")
+    }
+
+    /// Register a put against `path` and never finish it, the way a put stalled
+    /// on a starved host looks to retirement.
+    fn stick_a_put(shared: &SharedSegmentCache, path: &Path) {
+        path_state(shared, path)
+            .active_puts
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// Regression test: one cache serves every table, and `Path` is
@@ -1485,9 +1536,9 @@ mod tests {
         );
     }
 
-    /// Regression test for spiceai/spiceai#12964: a put that never completes
-    /// used to hold every caller of `invalidate_paths` forever, and the delete
-    /// and overwrite paths await it inline.
+    /// Retirement gives up on a put that never completes rather than waiting on
+    /// it, because the delete and overwrite paths await `invalidate_paths`
+    /// inline. Regression test for spiceai/spiceai#12964.
     #[tokio::test(start_paused = true)]
     async fn a_stuck_put_bounds_the_retirement_drain_instead_of_holding_it() {
         let shared = SharedSegmentCache::new(1 << 20, true, "test");
@@ -1498,16 +1549,7 @@ mod tests {
             .await
             .expect("put should not error");
 
-        // Stand in for a put that registered and then stopped making progress:
-        // `active_puts` is what retirement waits on, and nothing will clear it.
-        let state = shared
-            .path_states
-            .as_ref()
-            .expect("retirement tracking enabled")
-            .get(&path)
-            .and_then(|state| state.upgrade())
-            .expect("the open file registered a path state");
-        state.active_puts.fetch_add(1, Ordering::SeqCst);
+        stick_a_put(&shared, &path);
 
         let started = tokio::time::Instant::now();
         // Bounded from the outside too, so an unbounded drain fails this test
@@ -1537,10 +1579,10 @@ mod tests {
         );
     }
 
-    /// Regression test for spiceai/spiceai#12964: bounding only the drain would
-    /// have moved the unbounded wait two statements down, onto the key scan's
-    /// own `spawn_blocking` — which queues behind the very pool starvation the
-    /// drain gives up on.
+    /// The key scan's own `spawn_blocking` is bounded too: it queues behind the
+    /// same starvation the drain gives up on, so leaving that join unbounded
+    /// would move the unbounded wait two statements down rather than remove it.
+    /// Regression test for spiceai/spiceai#12964.
     #[test]
     fn a_saturated_blocking_pool_cannot_hold_retirement_open() {
         // Real time, not a paused clock: Tokio does not auto-advance while a
@@ -1596,9 +1638,9 @@ mod tests {
         });
     }
 
-    /// Regression test for spiceai/spiceai#12964: the drain deadline covers the
-    /// whole retiring batch. A cleanup pass retires every file it swept, so a
-    /// per-path deadline would multiply by the batch size.
+    /// The drain deadline covers the whole retiring batch. A cleanup pass
+    /// retires every file it swept, so a per-path deadline would multiply by the
+    /// batch size. Regression test for spiceai/spiceai#12964.
     #[tokio::test(start_paused = true)]
     async fn stuck_puts_on_many_paths_share_one_drain_deadline() {
         const STUCK_PATHS: usize = 8;
@@ -1612,15 +1654,7 @@ mod tests {
             file.put(SegmentId::from(1), ByteBuffer::from(vec![1u8, 2, 3, 4]))
                 .await
                 .expect("put should not error");
-            shared
-                .path_states
-                .as_ref()
-                .expect("retirement tracking enabled")
-                .get(&path)
-                .and_then(|state| state.upgrade())
-                .expect("the open file registered a path state")
-                .active_puts
-                .fetch_add(1, Ordering::SeqCst);
+            stick_a_put(&shared, &path);
             paths.insert(path);
             files.push(file);
         }
@@ -1634,6 +1668,10 @@ mod tests {
         .expect("retirement must not wait on stuck puts indefinitely");
         let waited = started.elapsed();
 
+        assert!(
+            waited >= ACTIVE_PUT_DRAIN_TIMEOUT,
+            "retirement must wait for the stuck puts before giving up, waited {waited:?}"
+        );
         assert!(
             waited < ACTIVE_PUT_DRAIN_TIMEOUT * 2,
             "{STUCK_PATHS} stuck paths must share one deadline, not take one each: waited {waited:?}"
@@ -1649,23 +1687,16 @@ mod tests {
         }
     }
 
-    /// Regression test for spiceai/spiceai#12964: the trim before the insert can
-    /// await, so retirement marked during it has to be observed before the
-    /// insert — otherwise bounding the drain would let a straggler repopulate a
-    /// retired path.
+    /// A put whose trim was still running when its path retired leaves nothing
+    /// resident — whether it skips the insert or undoes it. That is what makes
+    /// bounding the drain safe. Regression test for spiceai/spiceai#12964.
     #[tokio::test]
     async fn a_put_trimming_when_the_path_retires_does_not_repopulate_it() {
         let shared = SharedSegmentCache::new(1 << 20, true, "test");
         let path = Path::from("snapshot-a/trimming.vortex");
         let file = shared.for_path(test_store(), path.clone());
         let id = SegmentId::from(1);
-        let state = shared
-            .path_states
-            .as_ref()
-            .expect("retirement tracking enabled")
-            .get(&path)
-            .and_then(|state| state.upgrade())
-            .expect("the open file registered a path state");
+        let state = path_state(&shared, &path);
 
         // Larger than the inline threshold, so the trim goes to the blocking
         // pool and the put parks on it. This test runs on the current-thread
@@ -1683,11 +1714,10 @@ mod tests {
             .expect("the put task should not panic")
             .expect("a put racing retirement is ignored, not an error");
 
-        shared.run_pending_tasks().await;
         assert_eq!(
-            shared.cache.entry_count(),
+            shared.entry_count().await,
             0,
-            "a put that finished trimming after retirement must not insert"
+            "a put that finished trimming after retirement must leave nothing resident"
         );
     }
 
