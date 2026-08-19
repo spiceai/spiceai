@@ -174,11 +174,16 @@ jobs:
           # previous one built and recompiles the graph from data_components up (the same
           # reason `make nextest` uses a single selection -- spiceai/spiceai#12337).
           #
-          # Widening the set cannot change which tests are built: `integration_aws_sdk` and
-          # `integration_snapshot_refresh` contain no `cfg(feature)` at all, and the only
-          # `turso` gate in `integration.rs` is inside an `any(...)` already satisfied by
-          # `postgres`/`duckdb`/`sqlite`. `turso` is the one feature the narrower sets needed
-          # that this set lacked; it is the combination `make test-integration` already runs.
+          # Widening the set preserves each target's test selection because this set is a
+          # superset of what that target was already built with -- not because the targets
+          # are ungated. They are gated: `integration_aws_sdk` gates on
+          # `all(databricks, delta_lake)`, and `snapshot_refresh` gates each backend on
+          # `duckdb`/`sqlite`/`turso`. Every one of those features is in this set, so every
+          # gate that was satisfied before is still satisfied, and `turso` is the only one
+          # this set previously lacked. `integration` itself is unaffected: its lone `turso`
+          # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
+          # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
+          # combination `make test-integration` runs.
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
