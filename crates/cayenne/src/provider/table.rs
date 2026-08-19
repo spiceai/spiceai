@@ -7452,10 +7452,7 @@ impl CayenneTableProvider {
                 // that biases this toward more shards. `target_size_bytes` is
                 // derived from a configured MiB value and is never 0, but
                 // guard against it so a misconfiguration can't divide-by-zero.
-                const MIN_ENCODE_SHARD_BYTES: u64 = 16 * 1024 * 1024;
-                let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
-                let unit = (target / 16).clamp(MIN_ENCODE_SHARD_BYTES.min(target), target);
-                let files = (bytes / unit).max(1);
+                let files = super::compaction::estimated_output_files(bytes, target_size_bytes);
                 let upper = u64::try_from(write_concurrency).unwrap_or(u64::MAX);
                 usize::try_from(files.min(upper)).unwrap_or(write_concurrency)
             }
@@ -18499,7 +18496,7 @@ impl CayenneTableProvider {
         // partial deletion filter exactly as the read path does, then stream
         // the merged rows into a fresh snapshot dir.
         let phase2_start = std::time::Instant::now();
-        let ctx = self.create_compaction_session_context();
+        let ctx = self.create_compaction_session_context_for_output(total_input_bytes);
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
@@ -19137,7 +19134,7 @@ impl CayenneTableProvider {
         // --- Phase 2: rewrite outside the lock (identical to the size-tier
         // path): union over selected inputs, each with its own partial deletion
         // filter, streamed into one fresh snapshot whose dead rows are removed. ---
-        let ctx = self.create_compaction_session_context();
+        let ctx = self.create_compaction_session_context_for_output(selected_input_bytes);
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
@@ -19501,7 +19498,7 @@ impl CayenneTableProvider {
 
         Ok(SessionContext::new_with_config_rt(
             SessionConfig::default()
-                .with_target_partitions(super::compaction::compaction_target_partitions()),
+                .with_target_partitions(super::compaction::internal_target_partitions()),
             runtime_env,
         ))
     }
@@ -20059,6 +20056,20 @@ impl CayenneTableProvider {
     /// the carry-forward promotion attaches its
     /// [`super::cold_partition::ColdScanFiles`] extension here so its private
     /// session's cold branch reads only the dirty files being rewritten.
+    /// [`Self::create_compaction_session_context`] sized from the bytes this pass
+    /// will merge, so `PerOutputFile` plans one partition per output file the
+    /// write is estimated to produce. `estimated_bytes` of 0 means the caller
+    /// could not price its inputs and keeps the unsized fan-out.
+    fn create_compaction_session_context_for_output(&self, estimated_bytes: u64) -> SessionContext {
+        let partitions = super::compaction::internal_target_partitions_for_output(
+            estimated_bytes,
+            self.context.target_file_size_bytes(),
+        );
+        self.create_compaction_session_context_with_config(
+            SessionConfig::default().with_target_partitions(partitions),
+        )
+    }
+
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
@@ -20066,7 +20077,7 @@ impl CayenneTableProvider {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
         SessionContext::new_with_config_rt(
-            config.with_target_partitions(super::compaction::compaction_target_partitions()),
+            config.with_target_partitions(super::compaction::internal_target_partitions()),
             runtime_env,
         )
     }
