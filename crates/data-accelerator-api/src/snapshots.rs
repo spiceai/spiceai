@@ -89,9 +89,10 @@ pub async fn download_snapshot_if_needed(
     }
 
     let dataset_name = source.name().to_string();
-    // The source opens its own checkpoint: the concrete `DatasetCheckpoint` carries
-    // per-engine sidecar SQL and stays in `runtime`, so it reaches here as a factory
-    // behind the `AccelerationSource` contract rather than as a type this crate names.
+    // The source opens its own checkpoint: each engine's checkpointer carries that
+    // engine's sidecar SQL and lives in its own `runtime-checkpoint-*` crate, so it
+    // reaches here as a factory behind the `AccelerationSource` contract rather than
+    // as a type this crate names.
     let checkpoint_factory = source.checkpointer_factory(acceleration.snapshot_behavior.clone());
     if let Some(manager) = SnapshotManager::try_new(
         dataset_name.clone(),
