@@ -78,6 +78,7 @@ pub mod session;
 mod client;
 mod fingerprint;
 mod heartbeat;
+mod lock_file;
 mod shutdown;
 
 /// Generated gRPC types for `spice.cloud.v1.CloudConnect`.

@@ -4,6 +4,7 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+pub use cache::synthetic_object_meta;
 mod format;
 pub mod metrics;
 mod opener;

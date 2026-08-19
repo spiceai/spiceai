@@ -408,22 +408,12 @@ fn open_unix_lock_file(config_dir: &Path, path: &Path) -> Result<(File, File)> {
         }
     }
 
-    let lock_name = c"connect.lock";
-    let lock_fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            lock_name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if lock_fd < 0 {
-        return Err(Error::Io {
+    let lock = crate::lock_file::create_or_open_lock_at(&directory, c"connect.lock").map_err(
+        |source| Error::Io {
             path: path.to_path_buf(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let lock = unsafe { File::from_raw_fd(lock_fd) };
+            source,
+        },
+    )?;
     Ok((lock, directory))
 }
 

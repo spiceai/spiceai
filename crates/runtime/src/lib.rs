@@ -380,7 +380,9 @@ pub enum Error {
         reason: String,
     },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    #[snafu(display(
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadCatalogConnector {
         catalog: String,
         source: Box<dyn std::error::Error + Send + Sync>,

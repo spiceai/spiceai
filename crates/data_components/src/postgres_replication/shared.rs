@@ -147,7 +147,8 @@ use bytes::Bytes;
 use super::{
     AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
     Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
-    config::ReplicationParams, pgoutput, resilience, schema_evolution::RelationSchemaTracker, slot,
+    config::ReplicationParams, pgoutput, resilience, retention,
+    schema_evolution::RelationSchemaTracker, slot,
 };
 use rustc_hash::FxHashMap;
 
@@ -554,6 +555,17 @@ struct AckSlot {
     /// Still within the one 64-byte line this type is aligned to (33 of 64 bytes
     /// used), so it adds no false sharing.
     recorded: AtomicU64,
+    /// Whether a mid-stream rebuild request is outstanding for this member.
+    ///
+    /// [`SNAPSHOTTING`] is the *hold*, and two independent things take it: a
+    /// member's initial snapshot, and a rebuild requested after the slot was
+    /// replaced. One bit cannot say who holds it, so the snapshot's completion hook
+    /// would release a hold the rebuild still needs — and a member released early
+    /// is credited to the WAL head by [`AckTable::credit_idle`] and then *recorded*
+    /// there by [`publish_idle_positions`], for contents its rebuild has not
+    /// delivered. This distinguishes the two: while it is set, only the rebuild's
+    /// own completion may release the hold.
+    rebuild_pending: AtomicBool,
     /// Highest position *proven durable and eligible to record*, published by
     /// whichever producer established it — an envelope commit, a snapshot/rebuild
     /// boundary, or the idle carry-forward sweep — and drained by the single
@@ -576,6 +588,7 @@ impl AckSlot {
             state: AtomicU8::new(LIVE | if snapshotting { SNAPSHOTTING } else { 0 }),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -590,6 +603,7 @@ impl AckSlot {
             state: AtomicU8::new(0),
             recorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
+            rebuild_pending: AtomicBool::new(false),
         }
     }
 
@@ -724,6 +738,39 @@ impl AckTable {
     /// that reconnect.
     fn snapshot_finished(&self, key: &MemberKey) {
         if let Some(slot) = write_lock(&self.members).get(key) {
+            // A rebuild requested after the slot was replaced holds the same bit,
+            // and its contents are not in the acceleration until *it* commits. A
+            // member whose initial snapshot finishes in that window must stay held:
+            // releasing here would let the next connect promote it, `credit_idle`
+            // carry its floor to the WAL head, and `publish_idle_positions` record
+            // a position for rows the rebuild has not delivered. See
+            // [`AckSlot::rebuild_pending`].
+            if slot.rebuild_pending.load(Ordering::Acquire) {
+                return;
+            }
+            slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
+        }
+    }
+
+    /// Take the rebuild's hold on `key`, so only [`Self::rebuild_finished`] can
+    /// release it. Idempotent, and safe on a member that is already holding for its
+    /// initial snapshot — that snapshot's completion then becomes a no-op.
+    fn mark_rebuild_pending(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(true, Ordering::Release);
+        }
+    }
+
+    /// Release the hold taken by [`Self::mark_rebuild_pending`], once the consumer
+    /// has committed the rebuild and its contents are durable.
+    ///
+    /// Clears the marker *before* the hold, so a concurrent `snapshot_finished`
+    /// either sees the marker and defers (this call then does the release) or sees
+    /// it clear and releases a hold this call has already given up. Neither order
+    /// leaves the member held with nothing left to release it.
+    fn rebuild_finished(&self, key: &MemberKey) {
+        if let Some(slot) = write_lock(&self.members).get(key) {
+            slot.rebuild_pending.store(false, Ordering::Release);
             slot.state.fetch_and(!SNAPSHOTTING, Ordering::AcqRel);
         }
     }
@@ -783,6 +830,35 @@ impl AckTable {
                 prev & SNAPSHOTTING != 0
             }
             None => false,
+        }
+    }
+
+    /// Move every *held* floor — an unclaimed reservation, or a detached member's
+    /// frozen position — up to `at`, after the slot those floors were holding
+    /// history in has been replaced.
+    ///
+    /// A held floor exists to stop the slot acknowledging changes nobody has
+    /// consumed yet. A replacement slot has no such changes: everything before its
+    /// creation point is gone from the source, and whatever claims the floor later
+    /// has a watermark the slot cannot reach, so it is rebuilt from the source
+    /// rather than replayed to. Leaving these floors where they were would pin
+    /// [`Self::flush_lsn`] below the replacement for good, so the new slot would
+    /// never acknowledge anything and would retain WAL without bound — trading the
+    /// invalidation this just recovered from for a slow version of the same
+    /// problem.
+    ///
+    /// Live members are deliberately untouched: their floors are still the
+    /// authority on what they have applied, and their rebuild's committer is what
+    /// moves them.
+    fn reseat_held_floors(&self, at: u64) {
+        for slot in write_lock(&self.members).values() {
+            if slot.state.load(Ordering::Acquire) & (LIVE | STREAMING) != 0 {
+                continue;
+            }
+            // `committed` before `delivered`, per [`AckSlot`]: a torn read must
+            // never be able to show `delivered > committed`.
+            advance_monotonic(&slot.committed, at);
+            advance_monotonic(&slot.delivered, at);
         }
     }
 
@@ -936,11 +1012,47 @@ fn snapshot_watermark_envelope(
             slot,
             lsn,
             dataset,
+            // The join path chains a stream hook for this instead; see `live_flip`.
+            live_flip: None,
         }),
         batch,
         // Readiness stays lag-based: an acceleration being loaded is not ready.
         false,
         history_unavailable,
+    ))
+}
+
+/// [`snapshot_watermark_envelope`] for a rebuild requested *mid-stream*, whose
+/// committer also releases the hold the request was enqueued behind.
+///
+/// The join path decides a rebuild before the member's stream exists, so it chains
+/// a completion hook after the request. There is no such chaining point once the
+/// member is streaming, and the mailbox is the only channel to it — so the hook
+/// lives in the committer instead. See [`SnapshotWatermarkCommitter::live_flip`].
+fn rebuild_request_envelope(
+    source: &Arc<SharedSource>,
+    member_key: &MemberKey,
+    member: &Arc<MemberHandle>,
+    lsn: u64,
+) -> std::result::Result<ChangeEnvelope, StreamError> {
+    let (_, batch, _, _) = crate::cdc::build_heartbeat_envelope(&member.schema, None, false)
+        .map_err(|e| StreamError::External(e.to_string()))?
+        .into_parts()
+        .map_err(|e| StreamError::External(e.to_string()))?;
+    Ok(ChangeEnvelope::from_parts(
+        Box::new(SnapshotWatermarkCommitter {
+            watermark_notify: Arc::clone(&source.watermark_notify),
+            slot: source.ack.slot(member_key),
+            lsn,
+            dataset: member.dataset_name.clone(),
+            live_flip: Some((Arc::clone(source), member_key.clone())),
+        }),
+        batch,
+        // Readiness stays lag-based: an acceleration being reloaded is not ready.
+        false,
+        // The whole point of the envelope: the consumer replaces the acceleration's
+        // contents from the source rather than applying anything onto them.
+        true,
     ))
 }
 
@@ -973,6 +1085,20 @@ struct SnapshotWatermarkCommitter {
     /// whereas a later LSN could skip a change the snapshot did not see.
     lsn: u64,
     dataset: String,
+    /// Set only for a rebuild requested *mid-stream*, where there is no head
+    /// stream to chain a completion hook onto. Releases the hold the request was
+    /// enqueued behind and asks the pump to reconnect, so the member is promoted
+    /// and its replay resumes.
+    ///
+    /// Later than the join path's equivalent hook, which fires when the consumer
+    /// *polls* the request rather than when it commits it — deliberately, because
+    /// the hold is what keeps the recorded position from running ahead of the
+    /// rebuild, and only the commit proves the rebuild durable.
+    ///
+    /// A rebuild that never commits leaves the member held, which is the same
+    /// conservative outcome a failed initial snapshot gets: it is not routed to
+    /// and not credited until it detaches and rejoins from scratch.
+    live_flip: Option<(Arc<SharedSource>, MemberKey)>,
 }
 
 #[async_trait]
@@ -985,6 +1111,12 @@ impl CommitChange for SnapshotWatermarkCommitter {
             slot.note_pending(self.lsn);
         }
         self.watermark_notify.notify_one();
+        // After the position is published, so a member that becomes routable cannot
+        // be credited before the position covering its rebuild exists.
+        if let Some((source, member_key)) = &self.live_flip {
+            source.ack.rebuild_finished(member_key);
+            source.restart_requested.store(true, Ordering::Release);
+        }
         crate::cdc::log_committer_progress(
             "postgres",
             &self.dataset,
@@ -1540,6 +1672,14 @@ struct SharedSource {
     /// exist only between a resume and the last member joining) instead of a
     /// lock acquisition.
     outstanding_reservations: AtomicUsize,
+    /// What the source server does on its own about this slot, as read during the
+    /// first member's setup.
+    ///
+    /// Kept here so the shutdown message can state what removes the slot without
+    /// connecting to ask. A retained slot is not dropped at shutdown, so that path
+    /// opens no connection at all — and shutdown must never wait on the source for
+    /// a log line.
+    retention_posture: Mutex<Option<retention::SlotRetentionPosture>>,
 }
 
 impl SharedSource {
@@ -1558,6 +1698,7 @@ impl SharedSource {
             slot_created_fresh: AtomicBool::new(false),
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
+            retention_posture: Mutex::new(None),
             reservations_installed: AtomicBool::new(false),
             outstanding_reservations: AtomicUsize::new(0),
         }
@@ -1996,6 +2137,9 @@ async fn attach_member(
 
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
+    // Whichever member set the slot up read this; keep it for the shutdown
+    // message, which has no connection of its own to ask on.
+    *lock(&source.retention_posture) = Some(setup.slot.retention_posture);
     if setup.slot.created_fresh {
         source.slot_created_fresh.store(true, Ordering::Release);
     }
@@ -2410,6 +2554,157 @@ fn connection_params_mismatch(
     None
 }
 
+/// How many times one pump will replace an invalidated slot inside
+/// [`SLOT_INVALIDATION_WINDOW`] before giving up on the source.
+const MAX_SLOT_REPLACEMENTS: usize = 3;
+/// The window [`MAX_SLOT_REPLACEMENTS`] is counted over.
+const SLOT_INVALIDATION_WINDOW: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Bounds automatic replacement of an unusable slot.
+///
+/// Rate-limited rather than counted for the pump's lifetime. A process running for
+/// months may legitimately be invalidated more than a handful of times — each one a
+/// genuine recovery — whereas three inside an hour says the source cannot retain
+/// enough WAL to cover this dataset, and replacing the slot again would only
+/// repeat. That distinction matters because every replacement costs a full re-read
+/// of every table on the slot, so an unbounded cycle turns a retention limit into
+/// sustained load on the source it was protecting.
+#[derive(Debug)]
+struct SlotReplacementBudget {
+    /// When each replacement inside the window happened, oldest first. Bounded by
+    /// [`MAX_SLOT_REPLACEMENTS`].
+    at: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl SlotReplacementBudget {
+    fn new() -> Self {
+        Self {
+            at: std::collections::VecDeque::with_capacity(MAX_SLOT_REPLACEMENTS),
+        }
+    }
+
+    /// Whether another replacement is within budget, recording it when it is.
+    fn admit(&mut self, now: std::time::Instant) -> bool {
+        while self
+            .at
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= SLOT_INVALIDATION_WINDOW)
+        {
+            self.at.pop_front();
+        }
+        if self.at.len() >= MAX_SLOT_REPLACEMENTS {
+            return false;
+        }
+        self.at.push_back(now);
+        true
+    }
+}
+
+/// Replace a slot that can no longer supply changes, and ask every acceleration on
+/// it to rebuild.
+///
+/// Called from the pump's connect path, which is what makes the ordering below
+/// safe: nothing routes to a member until this returns and the pump reconnects, so
+/// the rebuild request is the first thing each member sees, and the WAL that
+/// follows lands on top of it in mailbox order. This is the same ordering the join
+/// path relies on for a rebuild decided at startup — back-pressure in the member
+/// mailbox, not a wait here.
+///
+/// Each member is *held* before its request is enqueued — not routed to, never
+/// credited, floor pinned — and released only when the consumer commits the
+/// rebuild. That is load-bearing rather than tidy. [`AckTable::credit_idle`]
+/// advances a streaming member's floor to the WAL head whenever it has nothing in
+/// flight, and a queued control envelope is not in flight by that measure, so a
+/// member left streaming would be credited past the replacement's start while its
+/// rebuild was still sitting in its mailbox. [`publish_idle_positions`] would then
+/// *record* that position, and a crash in the window would resume on a watermark
+/// describing contents the acceleration never received — every row deleted while
+/// the slot was gone surviving for good, which is the failure this whole path
+/// exists to prevent.
+///
+/// Members' `committed` floors are otherwise left where they are. The recorded
+/// position only moves forward through the rebuild's own committer, which runs
+/// after the consumer has made those contents durable.
+///
+/// On failure returns a message describing what could not be done, for the caller
+/// to surface.
+async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Result<(), String> {
+    // The same lock `attach_member` holds for slot DDL. Without it a member can
+    // register between `request_rebuild_of_attached_members`'s snapshot of the
+    // member set and `reseat_held_floors` below, and that member is then neither
+    // asked to rebuild nor reseated — it resumes on a watermark the replacement
+    // cannot reach, with every change since it missing for good. Safe to take from
+    // the pump: `attach_member` holds it only across synchronous setup and never
+    // waits on the pump, and the pump already takes it in `try_finish_if_empty`.
+    let _setup = source.setup_lock.lock().await;
+    let new_lsn = slot::replace_unusable_slot(&source.params)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The replacement carries no history, so a member joining after this cannot
+    // resume either — it snapshots, exactly as it would on a slot this process had
+    // just created.
+    source.slot_created_fresh.store(true, Ordering::Release);
+    // Pin the shared flush at the replacement's start: the pump must not ask for a
+    // position the new slot cannot honour, and `flush_lsn` only ever raises, so the
+    // ack cannot move past it until members actually commit past it.
+    source.ack.seed(new_lsn);
+
+    request_rebuild_of_attached_members(source, new_lsn).await;
+    source.ack.reseat_held_floors(new_lsn);
+    Ok(())
+}
+
+/// Ask every already-attached member to rebuild from the source, because the slot
+/// their recorded positions were measured against has been replaced by one that
+/// starts at `new_lsn` and carries no history.
+///
+/// Callers must hold [`SharedSource::setup_lock`]. Both call sites replace the slot
+/// — the pump's recovery, and a joining member whose `ensure_slot` found the slot
+/// gone — and each needs the set of attached members to be stable across the walk:
+/// a member registering between the snapshot below and the caller's follow-up would
+/// be neither asked to rebuild nor reseated, and would then resume on a watermark
+/// the replacement cannot reach.
+///
+/// Ordering is carried by the member mailbox rather than by waiting here. Changes
+/// already staged for a member sit *ahead* of its request and are applied first,
+/// then the rebuild replaces the contents wholesale; that ordering matters, because
+/// a staged insert applied *after* the rebuild would resurrect a row the source has
+/// since deleted, and the replacement slot has no delete event left to correct it.
+async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn: u64) {
+    for (member_key, member) in source.live_members() {
+        // Hold before enqueueing, so the member is never routable with its rebuild
+        // still queued. `AckTable::credit_idle` advances a streaming member's floor
+        // to the WAL head whenever it has nothing in flight, and a queued control
+        // envelope does not count as in flight — so a member left streaming would be
+        // credited, and then recorded, past contents its rebuild had not delivered.
+        source.ack.register(&member_key, true);
+        // Claim the hold as the rebuild's, so the member's own initial-snapshot
+        // completion cannot release it out from under the rebuild.
+        source.ack.mark_rebuild_pending(&member_key);
+        let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
+        if member.sender.send_control(envelope).await.is_some() {
+            // The consumer is gone, so there is no acceleration left to rebuild.
+            // Detaching freezes its floor, which the caller's `reseat_held_floors`
+            // then moves to the replacement — it has no history left to be owed.
+            source.ack.rebuild_finished(&member_key);
+            source.detach_member(
+                &member_key,
+                "receiver gone while replacing an unusable replication slot",
+                true,
+            );
+            continue;
+        }
+        tracing::warn!(
+            dataset = %member.dataset_name,
+            table = %format_member(&member_key),
+            slot = %source.key.slot_name,
+            rebuild_as_of = %slot::format_lsn(new_lsn),
+            "this acceleration will be rebuilt from the source before further changes are applied: the replication slot it was streaming from was replaced, so the changes since the position it recorded as applied are no longer available to stream"
+        );
+    }
+}
+
 /// Send a fatal error to every member and terminate the source.
 async fn fatal_broadcast(source: &Arc<SharedSource>, message: String) {
     tracing::error!(
@@ -2578,18 +2873,43 @@ fn finish_pump(source: &Arc<SharedSource>) {
     }
 }
 
-/// Drop the shared slot when the pump stops for runtime shutdown and no member
-/// needs it to survive.
+/// State what removes the shared slot, and drop it when the pump stops for runtime
+/// shutdown and no member needs it to survive.
 ///
 /// Reading the source's own params is authoritative for every member: a member
 /// whose accelerator durability disagrees is rejected at join time with
 /// [`Error::SharedSlotDurabilityMismatch`], so all members of a live slot share
 /// this value.
 ///
-/// Best-effort and time-bounded — shutdown never blocks on the source, and a
-/// surviving slot costs retained WAL, not correctness.
+/// The drop is best-effort and time-bounded — shutdown never blocks on the source,
+/// and a surviving slot costs retained WAL, not correctness.
+///
+/// The lifetime message is repeated here because this is the moment it is
+/// actionable: at creation an operator can do least about the slot, and by the time
+/// Spice is being decommissioned — which is exactly when an abandoned slot starts
+/// costing disk — the creation-time line is behind log rotation. It is emitted even
+/// for a slot about to be dropped, precisely because that drop is best-effort: an
+/// unreachable source or a missing privilege leaves the slot behind, and the
+/// operator then needs to know what it is and how to find it.
 async fn drop_slot_if_ephemeral(source: &Arc<SharedSource>) {
-    if source.params.slot_is_disposable() {
+    let disposable = source.params.slot_is_disposable();
+    // A source whose first member never finished setup has no posture recorded.
+    // Assume the server does nothing for us rather than claim a timeout that may
+    // not exist: the resulting message tells the operator how to find and drop
+    // the slot, which is true regardless.
+    let recorded = *lock(&source.retention_posture);
+    let posture = recorded.unwrap_or(retention::SlotRetentionPosture {
+        server_version_num: 0,
+        idle_timeout_seconds: None,
+    });
+    tracing::info!(
+        "{}",
+        retention::slot_lifetime_message(
+            &source.key.slot_name,
+            retention::SlotRemoval::resolve(disposable, posture),
+        )
+    );
+    if disposable {
         slot::drop_slot_after_shutdown(&source.params).await;
     }
 }
@@ -2673,6 +2993,12 @@ async fn run_pump(source: Arc<SharedSource>) {
     };
     let mut backoff = resilience::Backoff::default_for_stream();
     let mut reconnect_attempts: u32 = 0;
+    // Declared outside the reconnect loop so the bound is over the pump's life,
+    // not per attempt.
+    let mut slot_replacements = SlotReplacementBudget::new();
+    // Set when a connection reports the slot unusable, and acted on at the top of
+    // the reconnect loop — see there for why the two are separated.
+    let mut slot_unusable = false;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
@@ -2710,12 +3036,53 @@ async fn run_pump(source: Arc<SharedSource>) {
             drop_slot_if_ephemeral(&source).await;
             return;
         }
+        // Replace a slot the previous connection reported unusable, before building
+        // a config that would ask the same dead slot for changes.
+        //
+        // Deliberately here rather than where the refusal surfaces.
+        // `ReplicationClient::connect` only spawns a worker — `START_REPLICATION`
+        // runs inside it, so the refusal always arrives through `recv`, with that
+        // connection still live. `PostgreSQL` refuses to drop a slot an active
+        // walsender holds, and the client is dropped when the recv loop exits, so
+        // this is the first point at which the drop can succeed.
+        if std::mem::take(&mut slot_unusable) {
+            disconnect_at.get_or_insert_with(std::time::Instant::now);
+            if slot_replacements.admit(std::time::Instant::now()) {
+                if let Err(reason) = recover_unusable_slot(&source).await {
+                    fatal_broadcast(
+                        &source,
+                        format!(
+                            "Failed to replace PostgreSQL replication slot `{slot_name}` after the server stopped streaming from it: {reason}. The slot cannot supply changes and cannot be replaced, so this dataset has no source of changes. Check that the replication user may drop and create replication slots, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres"
+                        ),
+                    )
+                    .await;
+                    break 'reconnect;
+                }
+                backoff.reset();
+            } else {
+                fatal_broadcast(
+                    &source,
+                    format!(
+                        "Failed to stream changes from PostgreSQL replication slot `{slot_name}`: it has stopped supplying changes {MAX_SLOT_REPLACEMENTS} times within {window_minutes} minutes, so the source is not retaining enough WAL to cover this dataset and replacing the slot again would only repeat. Raise max_slot_wal_keep_size on the source, or reduce replication lag, then reload the dataset. See: https://spiceai.org/docs/components/data-connectors/postgres",
+                        window_minutes = SLOT_INVALIDATION_WINDOW.as_secs() / 60,
+                    ),
+                )
+                .await;
+                break 'reconnect;
+            }
+        }
         source.reap_closed_members();
         if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
             tracing::info!(
                 slot = %slot_name,
                 "all members detached; shutting down shared replication stream"
             );
+            // Same release as a runtime shutdown. This source is finished and about
+            // to leave the registry, so nothing later can do it: without this, a
+            // slot whose acceleration does not survive a restart keeps retaining WAL
+            // on the source from the moment its dataset is removed, which is exactly
+            // what the lifetime message promises it will not do.
+            drop_slot_if_ephemeral(&source).await;
             return;
         }
         // Joins that happened before this (re)connect are picked up by it.
@@ -2838,6 +3205,11 @@ async fn run_pump(source: Arc<SharedSource>) {
                     slot = %slot_name,
                     "all members detached; shutting down shared replication stream"
                 );
+                // Drop the connection first: `PostgreSQL` refuses to drop a slot an
+                // active walsender still holds, and this exit is the one that still
+                // has one open.
+                drop(client);
+                drop_slot_if_ephemeral(&source).await;
                 return;
             }
             source.release_unclaimed_reservations(params.unclaimed_reservation_grace);
@@ -2914,6 +3286,17 @@ async fn run_pump(source: Arc<SharedSource>) {
                 Acquired::CleanClose => break 'recv,
                 Acquired::RecvError(e) => {
                     source.for_each_member_metrics(ReplicationMetricsCollector::inc_recv_error);
+                    // The slot can no longer supply changes. Note it and break to
+                    // the reconnect loop, which replaces it *before* connecting
+                    // again — the replacement cannot happen here, because this
+                    // connection's walsender must be gone first and `client` is
+                    // dropped when this loop exits. Reconnecting without replacing
+                    // would ask the same dead slot for changes forever.
+                    if resilience::is_slot_unusable(&e) {
+                        slot_unusable = true;
+                        source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
+                        break 'recv;
+                    }
                     if resilience::is_transient_pgwire(&e) {
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         reconnect_attempts = reconnect_attempts.saturating_add(1);
@@ -3249,6 +3632,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         member.sender.close();
     }
     finish_pump(&source);
+    // A slot left behind by a source that died is the mystery slot this is all meant
+    // to prevent, so release it on this path too. The connection is already gone —
+    // it lived inside the reconnect loop.
+    drop_slot_if_ephemeral(&source).await;
 }
 
 /// Validate a (re)decoded Relation against its subscribed dataset and (re)build
@@ -3936,11 +4323,106 @@ mod tests {
                 snapshot_name: None,
                 created_fresh,
                 generated_columns: vec![],
+                retention_posture: retention::SlotRetentionPosture {
+                    server_version_num: 170_000,
+                    idle_timeout_seconds: None,
+                },
             },
             table_added: false,
             generated_columns: vec![],
             publication_tables: tables.iter().map(|t| key(t)).collect(),
         }
+    }
+
+    /// A member can be mid-initial-snapshot when the slot is replaced, and then two
+    /// independent things hold it: its snapshot, and its rebuild. They share one
+    /// [`SNAPSHOTTING`] bit, so whichever finishes first would release the other's
+    /// hold — and a member released before its rebuild commits is credited to the
+    /// WAL head by `credit_idle` and then recorded there by
+    /// `publish_idle_positions`, for rows the rebuild has not delivered.
+    #[test]
+    fn a_snapshot_finishing_does_not_release_a_pending_rebuilds_hold() {
+        let ack = AckTable::default();
+        let member = key("orders");
+
+        // The member joins and starts its initial snapshot: held.
+        ack.register(&member, true);
+        assert!(!ack.is_streaming(&member));
+
+        // The slot is replaced mid-snapshot, so the member is also asked to rebuild.
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        // Its snapshot completes. That must NOT release the hold, because the
+        // rebuild's contents are not in the acceleration yet.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            !ack.is_streaming(&member),
+            "the snapshot's completion released the rebuild's hold: the member is routable and \
+             creditable while the rows its rebuild will deliver are still in its mailbox"
+        );
+
+        // Only the rebuild's own commit releases it.
+        ack.rebuild_finished(&member);
+        ack.promote_ready_members();
+        assert!(
+            ack.is_streaming(&member),
+            "a committed rebuild must release the hold, or the member never streams again"
+        );
+    }
+
+    /// The reverse order has to work too: nothing may leave a member held with no
+    /// remaining path to release it.
+    #[test]
+    fn a_rebuild_finishing_first_still_lets_the_member_stream() {
+        let ack = AckTable::default();
+        let member = key("orders");
+        ack.register(&member, true);
+        ack.mark_rebuild_pending(&member);
+
+        ack.rebuild_finished(&member);
+        // A late snapshot hook now finds no rebuild pending and releases a hold that
+        // is already given up — a no-op, not a re-hold.
+        ack.snapshot_finished(&member);
+        ack.promote_ready_members();
+        assert!(ack.is_streaming(&member));
+    }
+
+    /// Every replacement costs a full re-read of every table on the slot, so the
+    /// bound is what keeps a source that cannot retain enough WAL from turning
+    /// into sustained load on itself.
+    #[test]
+    fn slot_replacement_is_bounded_per_window_not_per_lifetime() {
+        let mut budget = SlotReplacementBudget::new();
+        let start = std::time::Instant::now();
+        for n in 0..MAX_SLOT_REPLACEMENTS {
+            assert!(budget.admit(start), "replacement {n} is within budget");
+        }
+        assert!(
+            !budget.admit(start),
+            "the replacement past the bound must be refused rather than rebuilding on a cycle"
+        );
+
+        // Once the window has passed, the source has demonstrably been healthy
+        // across it, so a later invalidation is a fresh recovery rather than a
+        // continuation. Counting for the pump's lifetime instead would eventually
+        // fail a long-running process for being long-running.
+        let later = start + SLOT_INVALIDATION_WINDOW;
+        assert!(budget.admit(later));
+
+        // Entries expiring one at a time must free exactly one slot, not reset the
+        // budget: a source invalidating every 20 minutes stays bounded.
+        let mut budget = SlotReplacementBudget::new();
+        for n in 0..MAX_SLOT_REPLACEMENTS {
+            assert!(budget.admit(start + std::time::Duration::from_mins(n as u64)));
+        }
+        let first_expired = start + SLOT_INVALIDATION_WINDOW;
+        assert!(budget.admit(first_expired), "the oldest entry has expired");
+        assert!(
+            !budget.admit(first_expired),
+            "only the expired entry was freed"
+        );
     }
 
     /// The two slot lifetimes must render as distinguishable prose -- the
