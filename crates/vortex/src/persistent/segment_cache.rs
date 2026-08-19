@@ -65,7 +65,14 @@ const INLINE_TRIM_MAX_BYTES: usize = 256 * 1024;
 /// work. Waiting forever there would hold every caller of
 /// [`SharedSegmentCache::invalidate_paths`] — including the delete and overwrite
 /// paths, which await it inline — for as long as the starvation lasts.
+#[cfg(not(test))]
 const ACTIVE_PUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shortened under test. Both deadlines here are only ever reached when
+/// something is already wedged, and the tests that reach them assert against the
+/// constant rather than a literal — so a short value tests the same behaviour
+/// without a wedged test taking ten seconds to say so.
+#[cfg(test)]
+const ACTIVE_PUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Polling interval for the drain above. Short enough that the common case (no
 /// registered put, or one about to finish) returns promptly.
@@ -77,7 +84,11 @@ const ACTIVE_PUT_DRAIN_POLL: std::time::Duration = std::time::Duration::from_mil
 /// drain cannot consume the budget the scan needs: with one deadline for both, a
 /// batch that spent it waiting would then skip the invalidation entirely, which
 /// is the worse of the two outcomes.
+#[cfg(not(test))]
 const INVALIDATION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shortened under test; see [`ACTIVE_PUT_DRAIN_TIMEOUT`].
+#[cfg(test)]
+const INVALIDATION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Cache key: the store, the file within it, and the segment within the file.
 type SegmentKey = (StoreKey, Arc<Path>, SegmentId);
@@ -1524,6 +1535,65 @@ mod tests {
                 .is_none(),
             "the already-cached segment must still be evicted once the drain gives up"
         );
+    }
+
+    /// Regression test for spiceai/spiceai#12964: bounding only the drain would
+    /// have moved the unbounded wait two statements down, onto the key scan's
+    /// own `spawn_blocking` — which queues behind the very pool starvation the
+    /// drain gives up on.
+    #[test]
+    fn a_saturated_blocking_pool_cannot_hold_retirement_open() {
+        // Real time, not a paused clock: Tokio does not auto-advance while a
+        // blocking task is outstanding, and an outstanding blocking task is this
+        // test's whole premise. `INVALIDATION_SCAN_TIMEOUT` is short under test
+        // so the wait is a fraction of a second.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .expect("build a runtime with a one-thread blocking pool");
+
+        runtime.block_on(async {
+            let shared = SharedSegmentCache::new(1 << 20, true, "test");
+            let path = Path::from("snapshot-a/saturated.vortex");
+            let file = shared.for_path(test_store(), path.clone());
+            let id = SegmentId::from(1);
+            file.put(id, ByteBuffer::from(vec![1u8, 2, 3, 4]))
+                .await
+                .expect("put should not error");
+
+            // Occupy the only blocking thread, so the key scan can be queued but
+            // never run. Poll the flag the thread sets rather than sleeping a
+            // fixed amount, so saturation is a fact before retirement starts.
+            let occupied = Arc::new(AtomicBool::new(false));
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let signal = Arc::clone(&occupied);
+            let blocker = tokio::task::spawn_blocking(move || {
+                signal.store(true, Ordering::SeqCst);
+                let _ = released.recv();
+            });
+            while !occupied.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            tokio::time::timeout(
+                INVALIDATION_SCAN_TIMEOUT * 3,
+                shared.invalidate_paths(HashSet::from([path])),
+            )
+            .await
+            .expect("retirement must not wait on a saturated blocking pool");
+
+            // The scan never ran, so the entry is still resident — that is the
+            // stated cost of giving up, and asserting it keeps the bound from
+            // being confused with a successful retirement.
+            assert!(
+                file.get(id).await.expect("get should not error").is_some(),
+                "a scan that never ran cannot have evicted anything"
+            );
+
+            drop(release);
+            blocker.await.expect("the blocking task should not panic");
+        });
     }
 
     /// Regression test for spiceai/spiceai#12964: the drain deadline covers the
