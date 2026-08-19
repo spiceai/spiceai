@@ -709,19 +709,20 @@ impl DataAccelerator for DuckDBAccelerator {
         _registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
-        if source.is_file_accelerated() {
-            let duckdb_file =
-                self.duckdb_file_path(source)
-                    .map_err(|source| CheckpointError::Store {
-                        source: Box::new(source),
-                    })?;
-            if open_option == OpenOption::OpenExisting
-                && !std::path::Path::new(&duckdb_file).exists()
-            {
-                return Err(CheckpointError::Store {
-                    source: format!("DuckDB file does not exist at {duckdb_file}").into(),
-                });
-            }
+        // Resolved unconditionally, and that is load-bearing: `duckdb_file_path`
+        // fails for an acceleration that is not file-backed, which is what stops a
+        // `mode: memory` acceleration from acquiring a checkpoint. A memory
+        // acceleration holds nothing across a restart, so a checkpoint for it would
+        // let a reload restore superseded rows instead of re-reading the source.
+        let duckdb_file =
+            self.duckdb_file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("DuckDB file does not exist at {duckdb_file}").into(),
+            });
         }
 
         let pool = self
@@ -2717,8 +2718,12 @@ mod tests {
         std::fs::remove_file(&path).expect("file should be removed");
     }
 
+    /// A `mode: memory` acceleration must NOT resolve a checkpointing sidecar: it holds
+    /// nothing across a restart, so a checkpoint would let a reload restore superseded
+    /// rows rather than re-read the source (regression test for the reload path in
+    /// `acceleration::file_create_duckdb::test_file_create_reload_keeps_unchanged_datasets`).
     #[tokio::test]
-    async fn duckdb_memory_sidecar_does_not_require_a_file() {
+    async fn duckdb_memory_mode_resolves_no_sidecar() {
         let app = app::AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
         let mut dataset =
@@ -2734,14 +2739,20 @@ mod tests {
             ..Default::default()
         });
 
-        DuckDBAccelerator::new()
+        // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so assert on `is_err` rather
+        // than `expect_err`.
+        let resolved = DuckDBAccelerator::new()
             .sidecar(
                 &dataset,
                 Arc::new(AcceleratorEngineRegistry::new()),
                 OpenOption::OpenExisting,
             )
             .await
-            .expect("memory-mode sidecar should use the shared in-memory pool");
+            .is_err();
+        assert!(
+            resolved,
+            "a memory-mode acceleration must not resolve a checkpointing sidecar"
+        );
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
