@@ -321,21 +321,25 @@ mod tests {
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
     }
 
-    /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
-    /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
-    /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
-    /// it; these stay. Extend them whenever a pin bump carries another unparser
-    /// fix — #13081 tracks the three this bump left unguarded.
-    ///
-    /// This unparses through the federation executor, which supplies no dialect
-    /// here, so the SQL is the default dialect's rather than any one connector's.
-    /// The plan shapes, not the spelling, are what these assert.
+    /// Unparse a plan the way a federated connector would, and demand it
+    /// succeed. See `federated_sql_result` for what these guards are for.
     fn federated_sql(plan: &LogicalPlan) -> String {
         federated_sql_result(plan).expect("plan should unparse")
     }
 
-    /// Unparse without demanding success, so a guard can pin a refusal as well
-    /// as a rendering.
+    /// The seam every guard below unparses through, fallible so a guard can pin
+    /// a refusal as well as a rendering.
+    ///
+    /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
+    /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
+    /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
+    /// it; these stay. Extend them whenever a pin bump carries another unparser
+    /// fix — #13081 tracks the three the `edd8861e` → `b5cb7bb3` bump left
+    /// unguarded, and the two below arrived with `b5cb7bb3` → `8e881090`.
+    ///
+    /// This unparses through the federation executor, which supplies no dialect
+    /// here, so the SQL is the default dialect's rather than any one connector's.
+    /// The plan shapes, not the spelling, are what these assert.
     fn federated_sql_result(plan: &LogicalPlan) -> DataFusionResult<String> {
         Unparser::new(test_executor().dialect().as_ref())
             .plan_to_sql(plan)
@@ -464,8 +468,10 @@ mod tests {
                 [col("t2.c").eq(col("t3.c"))],
             )
             .expect("join build inputs");
-        // `limit(0, None)` still inserts a `Limit`, and the unbounded case is
-        // about a build side carrying no bound at all.
+        // Applied only when asked, so the unbounded plan carries no `Limit` node
+        // at all — the shape a plan with no bound actually has, and the one
+        // upstream's own fixture builds. The unparser reads `limit(0, None)` as
+        // no bound either, so this is fidelity rather than a change of outcome.
         let build = match fetch {
             Some(fetch) => build.limit(0, Some(fetch)).expect("limit build side"),
             None => build,
@@ -541,9 +547,12 @@ mod tests {
     ///
     /// Both readings are wrong — the subquery's own `FROM` already shadows the
     /// outer relation, so the correlation is lost whatever the bound does — and
-    /// that unscoped output binds and runs, so an anti join drops a row it
-    /// should return. Emitting these correctly needs the correlation's
-    /// qualifiers rewritten to the derived scope, tracked by #12840.
+    /// that unscoped output binds and runs. The `EXISTS` then reduces to "this
+    /// table has a row", so the semi join this builds keeps every probe row,
+    /// including the rows that match nothing (an anti join over the same SQL
+    /// drops every row instead). Emitting these correctly needs the
+    /// correlation's qualifiers rewritten to the derived scope, tracked by
+    /// #12840.
     #[test]
     fn a_bounded_exists_refuses_a_correlation_qualified_by_the_probe() {
         let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
