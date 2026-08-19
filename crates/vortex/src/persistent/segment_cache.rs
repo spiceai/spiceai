@@ -1698,14 +1698,31 @@ mod tests {
         let id = SegmentId::from(1);
         let state = path_state(&shared, &path);
 
-        // Larger than the inline threshold, so the trim goes to the blocking
-        // pool and the put parks on it. This test runs on the current-thread
-        // runtime, so the put can only resume when this task yields.
-        let buffer = ByteBuffer::from(vec![7u8; INLINE_TRIM_MAX_BYTES + 1]);
+        // Well above the inline threshold, so the trim goes to the blocking pool
+        // and takes long enough that the put is reliably still parked on it when
+        // this task looks. On the current-thread runtime the put can only make
+        // progress while this task yields, so yielding is also how we let it
+        // reach the trim in the first place.
+        let buffer = ByteBuffer::from(vec![7u8; 8 << 20]);
         let put = tokio::spawn(async move { file.put(id, buffer).await });
-        while state.active_puts.load(Ordering::SeqCst) == 0 {
+        let mut in_flight = false;
+        // Bounded, and it escapes the moment the put is done: a loop that only
+        // watched `active_puts` would spin forever on the run where the trim
+        // finished before this task looked.
+        for _ in 0..10_000 {
+            if state.active_puts.load(Ordering::SeqCst) > 0 {
+                in_flight = true;
+                break;
+            }
+            if put.is_finished() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(
+            in_flight,
+            "the put has to still be trimming for this test to exercise anything"
+        );
 
         // The put is past both of its pre-trim retirement checks. Retire the
         // path underneath it, the way a concurrent compaction would.
