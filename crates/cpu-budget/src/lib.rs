@@ -868,19 +868,15 @@ impl CpuBudget {
     /// override is the only one that can name a quantity the host will not honour.
     /// It stays unclamped on purpose: an operator may be sizing for a ceiling they
     /// are about to raise, and silently shrinking a value someone wrote is its own
-    /// surprise. The mismatch is already computed for the summary line, though, so
-    /// leaving it unremarked means a throttled deployment whose own logs never name
-    /// the cause.
+    /// surprise. Both readings are already in the summary line, though, so leaving
+    /// the gap between them unremarked means a throttled deployment whose own logs
+    /// never name the cause.
     ///
-    /// Names the tightest ceiling, since that is the one the sizing has to clear,
-    /// and the two differ in what they do to an oversized pool: a cgroup quota is a
-    /// hard CFS wall, while affinity bounds how many CPUs those threads can spread
-    /// across. Lowering the configured value is the remedy for either.
-    ///
-    /// Which of the two is binding cannot be read off `detected_cores` alone.
+    /// Names the tightest ceiling, since that is the one the sizing has to clear.
+    /// Which of the two that is cannot be read off `detected_cores` alone.
     /// `available_parallelism` already returns `min(quota, affinity)` floored to
     /// whole cores, so under a fractional quota it under-reports the real ceiling by
-    /// up to a core -- a `limits.cpu: 2500m` pod reports 2 -- and treating that as an
+    /// up to a core — a `limits.cpu: 2500m` pod reports 2 — and treating that as an
     /// exact affinity reading would warn an operator who configured exactly their
     /// quota, and send them after an affinity limit that does not exist. A quota can
     /// only be the binding constraint while it is under the next whole core, because
@@ -888,8 +884,8 @@ impl CpuBudget {
     /// affinity is provably what got floored and is exact, since a CPU mask is always
     /// a whole number of CPUs.
     ///
-    /// `None` unless an explicit quantity won this budget -- `all` and `auto` name
-    /// no quantity of their own, and both already resolve through the clamp -- and
+    /// `None` unless an explicit quantity won this budget — `all` and `auto` name
+    /// no quantity of their own, and both already resolve through the clamp — and
     /// `None` while that quantity sits at or below every ceiling.
     #[must_use]
     pub fn configured_above_ceiling_warning(&self) -> Option<String> {
@@ -898,7 +894,7 @@ impl CpuBudget {
         }
         let affinity_millicores = cores_to_millicores(self.detected_cores);
         // Under the next whole core, the quota is the wall that is either binding or
-        // indistinguishable from it -- and exact where the floored reading is not.
+        // indistinguishable from it — and exact where the floored reading is not.
         let binding_quota = self
             .limit_millicores
             .filter(|limit| *limit < affinity_millicores.saturating_add(1000));
@@ -1294,8 +1290,6 @@ pub fn parse_cpu_quantity(value: &str) -> Option<CpuSetting> {
     (millicores > 0).then_some(CpuSetting::Cores(millicores))
 }
 
-/// Render millicores the way an operator writes them: `4 cores`, `3.5 cores`,
-/// `500m`.
 /// Whole CPUs as millicores.
 ///
 /// Saturating rather than wrapping: a core count that overflows `u64` millicores
@@ -1307,6 +1301,8 @@ fn cores_to_millicores(cores: usize) -> u64 {
         .saturating_mul(1000)
 }
 
+/// Render millicores the way an operator writes them: `4 cores`, `3.5 cores`,
+/// `500m`.
 fn format_millicores(millicores: u64) -> String {
     if millicores.is_multiple_of(1000) {
         let cores = millicores / 1000;
@@ -1743,17 +1739,17 @@ mod tests {
         assert!(!under_quota.contains("minimum"), "{under_quota}");
     }
 
-    /// The explicit override is the one rung that can name more CPU than the host
-    /// will hand over, so the mismatch has to be said out loud.
+    /// The explicit override is the one rung that can name more CPU than a cgroup
+    /// quota will hand over, so the mismatch has to be said out loud.
     ///
     /// Regression test for #13275.
     #[test]
-    fn a_configured_value_above_the_real_ceiling_is_remarked_on() {
+    fn a_configured_value_above_the_cgroup_quota_is_remarked_on() {
         let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
 
         // The reported deployment: `limits.cpu: 2` with `runtime.cpu.cores: 6`. Both
-        // readings are 2 here, and the quota takes the tie because it is the wall
-        // that throttles.
+        // readings are 2 here, and the quota is named because it is the wall that
+        // throttles.
         let throttled = CpuBudget::resolve(&spicepod("6"), &quota(2, 2000)).expect("valid");
         let warning = throttled
             .configured_above_ceiling_warning()
@@ -1795,9 +1791,17 @@ mod tests {
             on_a_big_node.contains("cgroup CPU limit of 2 cores"),
             "{on_a_big_node}"
         );
+    }
 
-        // The second door, which no quota reading covers: more configured cores than
-        // the process may run on at all.
+    /// The second door, which no quota reading covers: more configured cores than
+    /// the process may run on at all.
+    ///
+    /// Regression test for #13275.
+    #[test]
+    fn a_configured_value_above_the_available_cpus_is_remarked_on() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
+        // A bare-metal or `taskset` deployment: no quota exists to compare against.
         let oversubscribed = CpuBudget::resolve(&spicepod("6"), &bare_metal(2))
             .expect("valid")
             .configured_above_ceiling_warning()
@@ -1816,7 +1820,7 @@ mod tests {
         );
 
         // A quota wider than affinity cannot be used, so affinity is the tightest
-        // ceiling and the one worth naming -- `docker run --cpus=100` on 16 CPUs.
+        // ceiling and the one worth naming — `docker run --cpus=100` on 16 CPUs.
         let wide_quota = CpuBudget::resolve(&spicepod("32"), &quota(16, 100_000))
             .expect("valid")
             .configured_above_ceiling_warning()
@@ -1825,8 +1829,14 @@ mod tests {
             wide_quota.contains("the 16 cores available to this process"),
             "{wide_quota}"
         );
+    }
 
-        // Silent at or below every ceiling.
+    /// Nothing to say while the sizing fits, so an ordinary deployment gains no
+    /// warning it would learn to ignore.
+    #[test]
+    fn a_configured_value_within_every_ceiling_stays_silent() {
+        let spicepod = |cores: &str| CpuConfig::from_sources(None, None, Some(cores));
+
         for (cores, host) in [
             ("2", quota(2, 2000)),
             ("1", quota(2, 2000)),
@@ -1843,8 +1853,8 @@ mod tests {
             );
         }
 
-        // Nothing to say for the settings that name no quantity: both resolve
-        // through the clamp already, so their value is the ceiling by construction.
+        // The settings that name no quantity resolve through the clamp already, so
+        // their value is the ceiling by construction.
         for setting in ["all", "auto"] {
             let resolved = CpuBudget::resolve(&spicepod(setting), &quota(64, 2000)).expect("valid");
             assert_eq!(resolved.cores(), 2, "{setting} must clamp to the quota");
