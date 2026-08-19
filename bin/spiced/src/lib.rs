@@ -1302,9 +1302,7 @@ fn local_spicepod_manifest(spicepod_path: &Path) -> Option<PathBuf> {
 /// Render a user-supplied path for a one-line log: `--spicepod` may contain
 /// control characters that would otherwise split the warning.
 fn display_path(path: &Path) -> String {
-    path.display()
-        .to_string()
-        .replace(['\r', '\n'], " ")
+    path.display().to_string().replace(['\r', '\n'], " ")
 }
 
 /// Which note a cloud-managed instance attaches when a deployment loaded.
@@ -1389,10 +1387,7 @@ enum DeploymentNote {
     LocalAwaitingDeployment { path: PathBuf },
     /// A cloud-managed instance serves the deployed spicepod while a local
     /// spicepod.yaml also exists: the local file is on disk but not read.
-    LocalSpicepodIgnored {
-        local: PathBuf,
-        deployed: PathBuf,
-    },
+    LocalSpicepodIgnored { local: PathBuf, deployed: PathBuf },
 }
 
 impl DeploymentNote {
@@ -2238,9 +2233,9 @@ mod tests {
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("/tmp/config/spicepod-cloud-managed.yml"));
         assert!(message.contains("is ignored"));
-        assert!(message.contains(
-            "Edit the project's Spicepod in Spice Cloud and deploy there instead"
-        ));
+        assert!(
+            message.contains("Edit the project's Spicepod in Spice Cloud and deploy there instead")
+        );
         assert!(message.contains("https://spiceai.org/docs"));
         assert!(!message.contains('\n'));
     }
@@ -2314,7 +2309,10 @@ mod tests {
         assert_eq!(local_spicepod_manifest(dir.path()), Some(manifest.clone()));
 
         // A path that is neither a file nor a directory holds no manifest.
-        assert_eq!(local_spicepod_manifest(dir.path().join("absent").as_ref()), None);
+        assert_eq!(
+            local_spicepod_manifest(dir.path().join("absent").as_ref()),
+            None
+        );
 
         // A manifest file path resolves to itself when it exists.
         assert_eq!(local_spicepod_manifest(&manifest), Some(manifest));
