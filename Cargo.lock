@@ -6070,6 +6070,7 @@ name = "data-accelerator-api"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "arrow_tools",
  "async-trait",
  "datafusion",
@@ -6078,11 +6079,14 @@ dependencies = [
  "linkme",
  "paste",
  "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "sysinfo 0.38.4",
  "tokio",
  "tracing",
 ]
@@ -17253,6 +17257,7 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
@@ -17322,25 +17327,38 @@ dependencies = [
  "async-trait",
  "serde",
  "snafu",
+ "tracing",
+ "util",
 ]
 
 [[package]]
 name = "runtime-checkpoint-duckdb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow_tools",
  "async-trait",
+ "chrono",
  "datafusion-table-providers",
+ "duckdb",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "runtime-checkpoint-postgres"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
  "datafusion-table-providers",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
  "tokio-postgres",
 ]
 
@@ -17348,19 +17366,30 @@ dependencies = [
 name = "runtime-checkpoint-sqlite"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow_tools",
  "async-trait",
+ "chrono",
  "datafusion-table-providers",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
  "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "runtime-checkpoint-turso"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "chrono",
  "data_components",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
  "turso",
 ]
 

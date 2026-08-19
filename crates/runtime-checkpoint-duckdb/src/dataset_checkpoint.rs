@@ -1,0 +1,787 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The dataset schema / refresh-SQL checkpoint table.
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use runtime_acceleration::{
+    dataset_checkpoint::{DatasetCheckpointer, deserialize_schema, serialize_schema},
+    snapshot::SnapshotBehavior,
+};
+use runtime_checkpoint_api::CheckpointError;
+
+use crate::{spawn_checkpoint_blocking, store_error};
+
+const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
+const SCHEMA_MIGRATION_01_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
+const REFRESH_SQL_MIGRATION_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS refresh_sql TEXT";
+
+/// Dataset schema/refresh-SQL checkpoint backed by a `DuckDB` accelerator.
+pub struct DuckDbDatasetCheckpointer {
+    pool: Arc<DuckDbConnectionPool>,
+    dataset_name: String,
+    snapshot_behavior: SnapshotBehavior,
+}
+
+impl DuckDbDatasetCheckpointer {
+    /// Opens the checkpoint table for `dataset_name`, creating and migrating it if
+    /// needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Store`] when the table cannot be created or migrated.
+    pub async fn try_new(
+        pool: Arc<DuckDbConnectionPool>,
+        dataset_name: String,
+        snapshot_behavior: SnapshotBehavior,
+    ) -> Result<Self, CheckpointError> {
+        let init_pool = Arc::clone(&pool);
+        spawn_checkpoint_blocking(move || {
+            Self::init_duckdb(&init_pool)?;
+            Self::migrate_duckdb(&init_pool)
+        })
+        .await?;
+        Ok(Self::new(pool, dataset_name, snapshot_behavior))
+    }
+
+    /// The checkpointer over an already-initialized table.
+    ///
+    /// [`Self::try_new`] is the constructor callers want; this one exists for the
+    /// migration tests, which have to observe a pre-migration table.
+    fn new(
+        pool: Arc<DuckDbConnectionPool>,
+        dataset_name: String,
+        snapshot_behavior: SnapshotBehavior,
+    ) -> Self {
+        Self {
+            pool,
+            dataset_name,
+            snapshot_behavior,
+        }
+    }
+
+    fn init_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<(), CheckpointError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let create_table = format!(
+            "CREATE TABLE IF NOT EXISTS {CHECKPOINT_TABLE_NAME} (
+                dataset_name TEXT PRIMARY KEY,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )"
+        );
+        duckdb_conn
+            .execute(&create_table, [])
+            .map_err(store_error)?;
+
+        Ok(())
+    }
+
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn exists_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<bool, CheckpointError> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let query = format!("SELECT 1 FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1");
+        let mut stmt = duckdb_conn.prepare(&query).map_err(store_error)?;
+        let mut rows = stmt.query([dataset_name]).map_err(store_error)?;
+
+        Ok(rows.next().map_err(store_error)?.is_some())
+    }
+
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn last_checkpoint_time_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<SystemTime>, CheckpointError> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT epoch_us(timezone('UTC', updated_at::TIMESTAMPTZ)) FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(store_error)?;
+        let mut rows = stmt.query([dataset_name]).map_err(store_error)?;
+
+        let checkpoint_time_micros: Option<i64> = rows
+            .next()
+            .map_err(store_error)?
+            .map(|row| row.get(0))
+            .transpose()
+            .map_err(store_error)?;
+
+        if let Some(checkpoint_time_micros) = checkpoint_time_micros {
+            let micros = u64::try_from(checkpoint_time_micros).map_err(store_error)?;
+            let duration = Duration::from_micros(micros);
+            Ok(Some(UNIX_EPOCH + duration))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Blocking: takes the pool's write gate. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn checkpoint_duckdb(
+        dataset_name: &str,
+        create_snapshot: bool,
+        pool: &Arc<DuckDbConnectionPool>,
+        schema: &SchemaRef,
+        refresh_sql: Option<&str>,
+    ) -> Result<(), CheckpointError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let schema_json = serialize_schema(schema).map_err(store_error)?;
+        let upsert = format!(
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at, schema_json, refresh_sql)
+             VALUES (?, now(), now(), ?, ?)
+             ON CONFLICT (dataset_name) DO UPDATE
+             SET updated_at = now(), schema_json = excluded.schema_json, refresh_sql = excluded.refresh_sql"
+        );
+        duckdb_conn
+            .execute(
+                &upsert,
+                duckdb::params![dataset_name, &schema_json, refresh_sql],
+            )
+            .map_err(store_error)?;
+
+        if create_snapshot {
+            // Force a DuckDB checkpoint so the WAL and database pages are flushed to disk before the snapshot is taken.
+            duckdb_conn.execute("CHECKPOINT", []).map_err(store_error)?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_duckdb(pool: &Arc<DuckDbConnectionPool>) -> Result<(), CheckpointError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        duckdb_conn
+            .execute(SCHEMA_MIGRATION_01_STMT, [])
+            .map_err(store_error)?;
+
+        duckdb_conn
+            .execute(REFRESH_SQL_MIGRATION_STMT, [])
+            .map_err(store_error)?;
+
+        Ok(())
+    }
+
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn get_schema_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<SchemaRef>, CheckpointError> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT schema_json FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(store_error)?;
+        let mut rows = stmt.query([dataset_name]).map_err(store_error)?;
+
+        if let Some(row) = rows.next().map_err(store_error)? {
+            let schema_json: Option<String> = row.get(0).map_err(store_error)?;
+            match schema_json {
+                Some(json) => Ok(Some(deserialize_schema(&json).map_err(store_error)?)),
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Blocking `DuckDB` I/O. Callers must reach this through
+    /// `spawn_duckdb_blocking`, never directly from an async worker.
+    fn get_refresh_sql_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<String>, CheckpointError> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(store_error)?;
+        let mut rows = stmt.query([dataset_name]).map_err(store_error)?;
+
+        if let Some(row) = rows.next().map_err(store_error)? {
+            let refresh_sql: Option<String> = row.get(0).map_err(store_error)?;
+            Ok(refresh_sql)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn delete_duckdb(
+        dataset_name: &str,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<(), CheckpointError> {
+        let write_gate = pool.write_gate();
+        let _write_guard = write_gate
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(store_error)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(store_error)?
+            .get_underlying_conn_mut();
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        duckdb_conn
+            .execute(&delete, [dataset_name])
+            .map_err(store_error)?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DatasetCheckpointer for DuckDbDatasetCheckpointer {
+    async fn exists(&self) -> bool {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::exists_duckdb(&dataset_name, &pool))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn checkpoint(
+        &self,
+        schema: &SchemaRef,
+        refresh_sql: Option<&str>,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        let create_snapshot = self.snapshot_behavior.create_enabled();
+        let schema = Arc::clone(schema);
+        let refresh_sql = refresh_sql.map(ToString::to_string);
+        spawn_checkpoint_blocking(move || {
+            Self::checkpoint_duckdb(
+                &dataset_name,
+                create_snapshot,
+                &pool,
+                &schema,
+                refresh_sql.as_deref(),
+            )
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn get_schema(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SchemaRef>> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::get_schema_duckdb(&dataset_name, &pool))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn last_checkpoint_time(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SystemTime>> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::last_checkpoint_time_duckdb(&dataset_name, &pool))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_refresh_sql(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::get_refresh_sql_duckdb(&dataset_name, &pool))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn delete(&self) -> runtime_acceleration::dataset_checkpoint::Result<()> {
+        let pool = Arc::clone(&self.pool);
+        let dataset_name = self.dataset_name.clone();
+        spawn_checkpoint_blocking(move || Self::delete_duckdb(&dataset_name, &pool))
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use runtime_acceleration::snapshot::SnapshotBehavior;
+
+    use super::*;
+    use std::sync::Arc;
+
+    fn create_in_memory_duckdb_checkpoint() -> (DuckDbDatasetCheckpointer, Arc<DuckDbConnectionPool>)
+    {
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
+        );
+        DuckDbDatasetCheckpointer::init_duckdb(&pool).expect("Failed to initialize DuckDB");
+        DuckDbDatasetCheckpointer::migrate_duckdb(&pool).expect("Failed to migrate DuckDB");
+        (
+            DuckDbDatasetCheckpointer::new(
+                Arc::clone(&pool),
+                "test_dataset".to_string(),
+                SnapshotBehavior::Disabled,
+            ),
+            pool,
+        )
+    }
+
+    fn create_legacy_table(pool: &Arc<DuckDbConnectionPool>) {
+        let mut db_conn = Arc::clone(pool).connect_sync().expect("Failed to connect");
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .expect("Failed to get conn")
+            .get_underlying_conn_mut();
+
+        // Create table without schema_json column
+        duckdb_conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {CHECKPOINT_TABLE_NAME} (
+                dataset_name TEXT PRIMARY KEY,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )"
+                ),
+                [],
+            )
+            .expect("Failed to create legacy table");
+
+        // Insert some test data
+        duckdb_conn
+            .execute(
+                &format!(
+                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at) 
+             VALUES ('legacy_dataset', now(), now())"
+                ),
+                [],
+            )
+            .expect("Failed to insert legacy data");
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_schema_roundtrip() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        // Create a test schema
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref = std::sync::Arc::new(schema.clone());
+
+        // Save the schema
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to save schema");
+
+        // Retrieve the schema
+        let retrieved_schema = checkpoint
+            .get_schema()
+            .await
+            .expect("Failed to get schema")
+            .expect("Schema should exist");
+
+        assert_eq!(&schema, retrieved_schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_migration() {
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_memory().expect("Failed to create in-memory DuckDB database"),
+        );
+
+        // Create legacy table format
+        create_legacy_table(&pool);
+
+        // Create checkpoint which should trigger migration
+        let checkpoint = DuckDbDatasetCheckpointer::new(
+            Arc::clone(&pool),
+            "legacy_dataset".to_string(),
+            SnapshotBehavior::Disabled,
+        );
+
+        // Run migration
+        DuckDbDatasetCheckpointer::migrate_duckdb(&pool).expect("Migration failed");
+
+        // Verify schema column exists by trying to use it
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema.clone());
+
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to save schema after migration");
+
+        let retrieved_schema = checkpoint
+            .get_schema()
+            .await
+            .expect("Failed to get schema")
+            .expect("Schema should exist");
+
+        assert_eq!(&schema, retrieved_schema.as_ref());
+
+        // Verify old data still exists
+        assert!(checkpoint.exists().await);
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_checkpoint_exists() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        // Initially, the checkpoint should not exist
+        assert!(!checkpoint.exists().await);
+
+        // Create a test schema
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref = std::sync::Arc::new(schema.clone());
+
+        // Create the checkpoint with schema
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to create checkpoint");
+
+        // Now the checkpoint should exist
+        assert!(checkpoint.exists().await);
+
+        // Verify schema was saved
+        let retrieved_schema = checkpoint
+            .get_schema()
+            .await
+            .expect("Failed to get schema")
+            .expect("Schema should exist");
+        assert_eq!(&schema, retrieved_schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_checkpoint_update() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        // Create initial schema
+        let schema1 = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref1 = std::sync::Arc::new(schema1.clone());
+
+        // Create the initial checkpoint
+        checkpoint
+            .checkpoint(&schema_ref1, None)
+            .await
+            .expect("Failed to create initial checkpoint");
+
+        // Sleep for a short time to ensure the timestamp changes
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Create updated schema
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref2 = std::sync::Arc::new(schema2.clone());
+
+        // Update the checkpoint with new schema
+        checkpoint
+            .checkpoint(&schema_ref2, None)
+            .await
+            .expect("Failed to update checkpoint");
+
+        // Verify the schema was updated
+        let retrieved_schema = checkpoint
+            .get_schema()
+            .await
+            .expect("Failed to get schema")
+            .expect("Schema should exist");
+        assert_eq!(&schema2, retrieved_schema.as_ref());
+
+        // Verify that the updated_at timestamp has changed
+        let pool = &checkpoint.pool;
+        let mut db_conn = Arc::clone(pool)
+            .connect_sync()
+            .expect("Failed to connect to DuckDB");
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .expect("Failed to get DuckDB connection")
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+        );
+        let mut stmt = duckdb_conn
+            .prepare(&query)
+            .expect("Failed to prepare SQL statement");
+        let mut rows = stmt
+            .query([&checkpoint.dataset_name])
+            .expect("Failed to execute query");
+
+        if let Some(row) = rows.next().expect("Failed to fetch row") {
+            let created_at: duckdb::types::Value = row.get(0).expect("Failed to get created_at");
+            let duckdb::types::Value::Timestamp(_, created_at) = created_at else {
+                panic!("created_at is not a timestamp");
+            };
+            let updated_at: duckdb::types::Value = row.get(1).expect("Failed to get updated_at");
+            let duckdb::types::Value::Timestamp(_, updated_at) = updated_at else {
+                panic!("updated_at is not a timestamp");
+            };
+            assert_ne!(
+                created_at, updated_at,
+                "created_at and updated_at should be different"
+            );
+        } else {
+            panic!("No checkpoint found");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_refresh_sql_roundtrip() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Store a refresh_sql
+        checkpoint
+            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"))
+            .await
+            .expect("Failed to store checkpoint with refresh_sql");
+
+        let stored = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get refresh_sql")
+            .expect("refresh_sql should be Some");
+        assert_eq!(stored, "SELECT * FROM source_table");
+
+        // Update to a different refresh_sql
+        checkpoint
+            .checkpoint(
+                &schema_ref,
+                Some("SELECT id FROM source_table WHERE id > 10"),
+            )
+            .await
+            .expect("Failed to update refresh_sql");
+
+        let updated = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get updated refresh_sql")
+            .expect("refresh_sql should still be Some");
+        assert_eq!(updated, "SELECT id FROM source_table WHERE id > 10");
+
+        // Clear refresh_sql by passing None — should overwrite (no COALESCE)
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to clear refresh_sql");
+
+        let cleared = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get cleared refresh_sql");
+        assert!(
+            cleared.is_none(),
+            "refresh_sql should be None after passing None (no COALESCE)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_last_checkpoint_time() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        // Initially, there should be no checkpoint time
+        assert!(
+            checkpoint
+                .last_checkpoint_time()
+                .await
+                .expect("Unexpected checkpoint failure")
+                .is_none()
+        );
+
+        // Create a test schema
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Create the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to create checkpoint");
+
+        // Now there should be a checkpoint time
+        let checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get checkpoint time")
+            .expect("Checkpoint time should exist");
+
+        // Verify the checkpoint time is recent
+        let now = SystemTime::now();
+        let time_diff = now
+            .duration_since(checkpoint_time)
+            .expect("Time difference should be positive");
+        assert!(time_diff.as_secs() < 5, "Checkpoint time should be recent");
+
+        // Sleep for a short time to ensure the timestamp changes
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Update the checkpoint
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to update checkpoint");
+
+        // Get the new checkpoint time
+        let new_checkpoint_time = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get new checkpoint time")
+            .expect("New checkpoint time should exist");
+
+        // Verify the new checkpoint time is more recent than the old one
+        assert!(
+            new_checkpoint_time > checkpoint_time,
+            "New checkpoint time should be more recent"
+        );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12175>.
+    ///
+    /// A `duckdb_on_full_refresh: replace_file` swap holds the pool's write gate
+    /// **exclusively** while it copies every co-resident table and checkpoints the
+    /// file. A `spice_sys` write that waits on that gate from an async worker parks
+    /// the worker for the whole window, which starves every other task on it —
+    /// including `/health`, so Kubernetes kills the pod.
+    ///
+    /// The runtime has one worker thread and the gate is held exclusively for the
+    /// duration, so the probe task can only run if the checkpoint's gate wait is
+    /// off the worker. `block_on` drives the test body on the calling thread, so
+    /// the assertion still reports rather than hanging when it regresses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_duckdb_checkpoint_waits_for_the_write_gate_off_the_async_worker() {
+        use std::sync::PoisonError;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (checkpoint, pool) = create_in_memory_duckdb_checkpoint();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // Stand in for the exclusive phase of a file swap. The guard lives on its
+        // own thread, both because a real swap holds it off the async runtime and
+        // so no lock guard is held across an `.await` here.
+        let write_gate = pool.write_gate();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let swap = std::thread::spawn(move || {
+            let guard = write_gate.write().unwrap_or_else(PoisonError::into_inner);
+            held_tx.send(()).expect("the test should await the gate");
+            release_rx.recv().expect("the test should release the gate");
+            drop(guard);
+        });
+        held_rx
+            .recv()
+            .expect("the swap thread should take the write gate exclusively");
+
+        let checkpointing = tokio::spawn(async move { checkpoint.checkpoint(&schema, None).await });
+
+        let probe_ran = Arc::new(AtomicBool::new(false));
+        let probe = tokio::spawn({
+            let probe_ran = Arc::clone(&probe_ran);
+            async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                probe_ran.store(true, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), probe)
+            .await
+            .expect(
+                "an unrelated task made no progress while a spice_sys DuckDB write waited on the write gate: the wait is parking the async worker",
+            )
+            .expect("the probe task should not panic");
+        assert!(
+            probe_ran.load(Ordering::SeqCst),
+            "the probe task should have completed while the gate was held"
+        );
+
+        // Releasing the gate lets the checkpoint finish, proving it really was
+        // blocked on the gate and not skipped.
+        release_tx
+            .send(())
+            .expect("the swap thread should still be holding the gate");
+        swap.join().expect("the swap thread should not panic");
+        checkpointing
+            .await
+            .expect("the checkpoint task should not panic")
+            .expect("the checkpoint should succeed once the gate is released");
+    }
+}

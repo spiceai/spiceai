@@ -71,4 +71,24 @@ pub trait AccelerationSource: Send + Sync {
     fn initialized_sources(&self) -> InitializedSourcesFuture<'_> {
         Box::pin(async { vec![] })
     }
+
+    /// Opens this source's acceleration checkpoint, read-only, for the snapshot
+    /// bootstrap to compare a downloaded snapshot against.
+    ///
+    /// Returns a factory rather than the checkpointer itself because opening one
+    /// touches the accelerator, which the caller may decide not to do.
+    ///
+    /// The source resolves the accelerator itself instead of taking a registry
+    /// parameter, and that is load-bearing rather than stylistic: the registry type
+    /// lives in `data-accelerator-api`, which sits **above** this crate, so a
+    /// signature naming it would not compile. Keeping the resolution on the impl
+    /// side is what lets the snapshot bootstrap live below `runtime`.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default returning a no-op checkpointer would
+    /// silently disable snapshot-vs-checkpoint reconciliation for any new source.
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: crate::snapshot::SnapshotBehavior,
+    ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
 }
