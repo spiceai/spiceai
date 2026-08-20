@@ -181,14 +181,17 @@ fn unkeyable_predicate_message(table: &str, unkeyable: &[String], keyable: &[Str
 ///
 /// `DataFusion` lists `Exists` and `ScalarSubquery` among the *leaves* of an
 /// expression tree, and treats `OuterReferenceColumn` as one too, so neither the
-/// column check nor the volatility check sees anything inside a subquery.
-/// `WHERE EXISTS (SELECT 1 FROM r WHERE r.cap < t.price)` therefore names no
-/// column and calls nothing volatile as far as those walks are concerned, while
-/// being a function of `price` — a float, which no key can carry. The same hole
-/// hides `random()` inside `WHERE id IN (SELECT id FROM t WHERE random() < 0.5)`.
+/// column check nor the volatility check sees anything inside a subquery: a
+/// condition that is a function of `price` — a float, which no key can carry —
+/// would name no column at all, and a `random()` buried in a subquery would
+/// look deterministic.
 ///
-/// Rather than reason about what a subquery might read, refuse it: what cannot
-/// be inspected cannot be proven exact.
+/// A subquery does not normally reach this far. The planner decorrelates it
+/// into a join, and `runtime_datafusion::dml_guard` refuses the statement
+/// there, because a join restricts the affected rows in a way the filter list
+/// handed to a provider cannot express. This remains as a backstop for a
+/// subquery expression that survives into a filter: what cannot be inspected
+/// cannot be proven exact.
 fn reaches_outside_the_row(filters: &[datafusion::logical_expr::Expr]) -> bool {
     use datafusion::logical_expr::Expr;
 
