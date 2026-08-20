@@ -336,6 +336,16 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column primary key is supported today, but this dataset declares a {pk_columns}-column key ({primary_key}). Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackCompositePrimaryKey {
+        dataset_name: String,
+        connector: String,
+        primary_key: String,
+        pk_columns: usize,
+    },
+
+    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
