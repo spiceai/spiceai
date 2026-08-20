@@ -1748,11 +1748,12 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_seal_age_ms,
             );
 
-            // Widening schema evolution at table open is gated on the dataset's
-            // `on_schema_change` policy. The policy lives on the Dataset
-            // component (not on Acceleration), so downcast the source;
-            // non-Dataset sources (views, DDL) and `block`/`fail` keep the
-            // default Disabled = legacy pin-stored-schema behavior verbatim.
+            // Widening schema evolution at table open is gated on the source's
+            // `on_schema_change` policy. The policy is a source-level fact rather
+            // than part of `Acceleration`, so it comes from the accelerator
+            // contract (`AccelerationSource::on_schema_change`); a source that
+            // states none (a view, DDL) and `block`/`fail` keep the default
+            // Disabled = pin the stored schema.
             // `refresh_mode: caching` is excluded from in-place evolution in
             // v1: its hidden `__spice_cache_namespace` column is appended LAST
             // and evolution also appends at the end — the positional
