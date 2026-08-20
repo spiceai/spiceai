@@ -347,6 +347,8 @@ fn main() {
     if let Err(e) = run_cli(cli) {
         if machine {
             write_machine_error(&e);
+        } else if matches!(e, spice::error::Error::ServiceNotInstalled { .. }) {
+            eprintln!("{e}");
         } else {
             tracing::error!("{e}");
         }
