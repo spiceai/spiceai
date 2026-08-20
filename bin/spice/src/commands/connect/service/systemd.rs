@@ -1862,6 +1862,10 @@ impl ServiceBackend for SystemdBackend {
         install(&ProcessHost, request)
     }
 
+    fn authorize_uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
+        ensure_authorized(manifest, "uninstall")
+    }
+
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
         uninstall(&ProcessHost, manifest)
     }

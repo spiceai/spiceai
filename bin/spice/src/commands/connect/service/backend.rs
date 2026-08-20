@@ -153,6 +153,14 @@ pub(crate) trait ServiceBackend {
     /// supervisor rejects it.
     fn install(&self, request: &InstallRequest<'_>) -> Result<InstalledService>;
 
+    /// Validate that this invocation may uninstall `manifest` without changing
+    /// supervisor or filesystem state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this process lacks the required local authority.
+    fn authorize_uninstall(&self, manifest: &ServiceManifest) -> Result<()>;
+
     /// Stop and remove exactly the service the manifest describes.
     ///
     /// # Errors
@@ -283,6 +291,10 @@ mod unsupported {
         }
 
         fn install(&self, _request: &InstallRequest<'_>) -> Result<InstalledService> {
+            Err(PreflightFailure::UnsupportedPlatform.into())
+        }
+
+        fn authorize_uninstall(&self, _manifest: &ServiceManifest) -> Result<()> {
             Err(PreflightFailure::UnsupportedPlatform.into())
         }
 
@@ -537,6 +549,10 @@ pub(crate) mod fake {
                 config_dir: Some(request.config_dir.to_path_buf()),
                 runtime: PathBuf::from(FAKE_RUNTIME),
             })
+        }
+
+        fn authorize_uninstall(&self, _manifest: &ServiceManifest) -> Result<()> {
+            Ok(())
         }
 
         fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {

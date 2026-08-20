@@ -619,6 +619,8 @@ impl LogLevelFilter {
     }
 }
 
+const MAX_LOG_LINES: u32 = 100_000;
+
 #[derive(Args, Debug)]
 pub struct LogsArgs {
     /// Project name in org/project format (uses the enrolled instance's project if omitted)
@@ -626,8 +628,13 @@ pub struct LogsArgs {
     pub project: Option<String>,
 
     /// Maximum number of log entries to request per runtime instance
-    #[arg(long, visible_alias = "tail", default_value = "100")]
-    pub limit: usize,
+    #[arg(
+        long,
+        visible_alias = "tail",
+        default_value = "100",
+        value_parser = parse_log_limit,
+    )]
+    pub limit: u32,
 
     /// Only show entries at or above this severity
     #[arg(long, value_enum, default_value = "all")]
@@ -1253,6 +1260,7 @@ async fn execute_status(
         .iter()
         .filter(|dataset| dataset_needs_attention(dataset.status.as_deref()))
         .collect();
+    let status_degradation = cloud_status_degradation(local_degradation, runtime_error.as_deref());
 
     if args.output == OutputFormat::Json {
         write_json(&serde_json::json!({
@@ -1264,14 +1272,14 @@ async fn execute_status(
             "instances": instances,
             "datasets_total": datasets.len(),
             "datasets_unhealthy": unhealthy,
-            "runtime_error": runtime_error,
+            "runtime_error": &runtime_error,
             "link": {
                 "connection": local.connection,
                 "service": local.service,
                 "deployment": local.deployment,
             },
         }))?;
-        return match local_degradation {
+        return match status_degradation {
             Some(message) => Err(Error::ServiceUnavailable { message }),
             None => Ok(()),
         };
@@ -1363,10 +1371,17 @@ async fn execute_status(
     println!();
     println!("Local enrolled-instance state:");
     crate::commands::connect::status::render(&local, OutputFormat::Table)?;
-    match local_degradation {
+    match status_degradation {
         Some(message) => Err(Error::ServiceUnavailable { message }),
         None => Ok(()),
     }
+}
+
+fn cloud_status_degradation(
+    local_degradation: Option<String>,
+    runtime_error: Option<&str>,
+) -> Option<String> {
+    local_degradation.or_else(|| runtime_error.map(str::to_string))
 }
 
 async fn execute_datasets(
@@ -2169,34 +2184,27 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
             org::clear_keychain_orgs()?;
             org::clear_active_org()?;
         }
-        LogoutScope::Active => match resolve_org(flag_org)? {
-            // An org with its own credential loses only that credential; the
-            // personal-org session in the same directory survives.
-            Some(org) if org::has_org_token(&org) => {
-                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
-                    cleared.push(org.clone());
+        LogoutScope::Active => {
+            if let Some(org) = resolve_org(flag_org)? {
+                ensure_active_org_logout_is_isolated(&org, org::default_token().is_some())?;
+                if org::has_org_token(&org) {
+                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                        cleared.push(org.clone());
+                    }
+                    org::forget_keychain_org(&org)?;
+                } else {
+                    already_logged_out = Some(org.clone());
                 }
-                org::forget_keychain_org(&org)?;
                 if resolve_org(None)?.is_some_and(|active| active.eq_ignore_ascii_case(&org)) {
                     org::clear_active_org()?;
                 }
-            }
-            // An org was named but holds no credential of its own. It is
-            // already logged out. Falling through to the default credentials
-            // here would destroy a *different* organization's session — the
-            // default credential belongs to whichever org minted it, and named
-            // orgs deliberately never fall back to it.
-            Some(org) => {
-                already_logged_out = Some(org);
-            }
-            // No org named: clear the default session.
-            None => {
+            } else {
                 if remove_env_keys(&default_credential_keys())? {
                     cleared.push("default".to_string());
                 }
                 org::clear_active_org()?;
             }
-        },
+        }
     }
 
     // Say exactly what was discarded. "Logged out" over a no-op would leave a
@@ -2233,6 +2241,19 @@ fn default_credential_keys() -> Vec<String> {
     ]
 }
 
+fn ensure_active_org_logout_is_isolated(org: &str, default_token_present: bool) -> Result<()> {
+    if default_token_present {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "Cannot log out only of organization '{org}' while a default user credential is stored, because it may authenticate to every organization the user belongs to."
+            ),
+            "Run `spice cloud logout --scope all` to clear the shared credential and every organization-specific credential.",
+        ));
+    }
+    Ok(())
+}
+
 /// Drop `keys` from the env file, and from the platform keychain.
 ///
 /// Returns whether anything was removed. Uses the writer's own parser rather
@@ -2250,25 +2271,19 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
     // The keychain is consulted before the env file when reading a credential,
     // so clearing only the file would leave a working credential behind.
     //
-    // A failure here must not abort: aborting would skip the env file too and
-    // leave *more* credentials live than before. Instead keep going and report
-    // what could not be cleared, so the user knows to remove it by hand rather
-    // than believing a clean logout. `NoEntry` and an unavailable backend both
-    // mean there is nothing stored to clear — headless and containerized hosts
-    // legitimately have no keychain at all.
+    // A failure here must not abort immediately: aborting would skip the env
+    // file too and leave more credentials live than before. Instead keep going
+    // and report what could not be cleared, so the user never receives a false
+    // successful logout.
     let mut keychain_failures = Vec::new();
     for key in keys {
-        match keyring::Entry::new(key, "spice").map(|entry| entry.delete_credential()) {
-            Ok(Ok(())) => removed = true,
-            // Nothing stored to clear: either no entry, or no usable keychain
-            // at all — headless and containerized hosts legitimately have none.
-            Ok(Err(
-                keyring::Error::NoEntry
-                | keyring::Error::NoStorageAccess(_)
-                | keyring::Error::PlatformFailure(_),
-            ))
-            | Err(_) => {}
-            Ok(Err(err)) => keychain_failures.push(format!("{key} ({err})")),
+        match keyring::Entry::new(key, "spice") {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) => removed = true,
+                Err(keyring::Error::NoEntry) => {}
+                Err(err) => keychain_failures.push(format!("{key} ({err})")),
+            },
+            Err(err) => keychain_failures.push(format!("{key} ({err})")),
         }
     }
 
@@ -2680,7 +2695,10 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
     let target = if let Some(project) = args.project.as_deref() {
         resolve_project_target(Some(project), flag_org).await?
     } else {
-        let token = user_token_for_cloud_connect(&endpoint, None, "Linking", "link").await?;
+        let (requested_org, requested_source) = resolve_org_with_source(flag_org)?;
+        let token =
+            user_token_for_cloud_connect(&endpoint, requested_org.as_deref(), "Linking", "link")
+                .await?;
         let attach_client = crate::commands::connect::project::ProjectClient::new(&endpoint)
             .map_err(|error| Error::CloudConnectIo {
                 message: error.to_string(),
@@ -2691,7 +2709,16 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
             .map_err(|error| Error::CloudConnectIo {
                 message: error.to_string(),
             })?;
-        choose_attachable_project(projects).await?
+        let selected = choose_attachable_project(projects).await?;
+        if let Some(selected_org) = selected.org.as_deref() {
+            ensure_orgs_agree(
+                selected_org,
+                "the selected project",
+                requested_org.as_deref(),
+                requested_source,
+            )?;
+        }
+        selected
     };
     let org = target.org.as_deref().ok_or_else(|| {
         Error::cloud_with_hint(
@@ -3027,6 +3054,9 @@ async fn execute_unlink() -> Result<()> {
                 "Run `spice cloud status` to inspect the current directory.",
             )
         })?;
+    if let Some(manifest) = installed_service.as_ref() {
+        service_backend.authorize_uninstall(manifest)?;
+    }
 
     let configured_endpoint = client::get_base_url();
     let endpoint = release_endpoint(
@@ -3339,7 +3369,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
 }
 
 async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
-    let tail_lines = runtime_log_tail_lines(args.limit)?;
+    let tail_lines = args.limit;
     let since = args
         .since
         .as_deref()
@@ -3349,8 +3379,10 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
             message: format!("Invalid --since timestamp: {source}. Expected RFC 3339."),
         })?;
     let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
-    let client = connect_for_target(&target).await?;
-    let cloud_result = fetch_runtime_logs(ctx, &client, &target, tail_lines).await;
+    let cloud_result = match connect_for_target(&target).await {
+        Ok(client) => fetch_runtime_logs(ctx, &client, &target, tail_lines).await,
+        Err(error) => Err(error),
+    };
 
     let mut cloud_error = None;
     let mut empty_cloud_response = None;
@@ -3384,8 +3416,24 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
                 ),
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
-    let number = u32::try_from(args.limit).unwrap_or(u32::MAX);
-    if args.follow {
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let local_identity = IdentityStore::load_optional_async(identity_path.clone())
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!(
+                "read the enrolled identity at {} before using local logs: {source}",
+                identity_path.display()
+            ),
+        })?;
+    let local_fallback_allowed = local_identity.as_ref().is_some_and(|identity| {
+        local_attachment_matches_target(
+            identity.org_name.as_deref(),
+            identity.app_name.as_deref(),
+            &target,
+        )
+    });
+    let number = args.limit;
+    if local_fallback_allowed && args.follow {
         if args.output == OutputFormat::Json {
             return Err(Error::InvalidArgument {
                 message: "`--follow` cannot produce one bounded JSON document. Omit `--follow` or use table output for local service logs.".to_string(),
@@ -3419,7 +3467,7 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
             }
             return Ok(());
         }
-    } else {
+    } else if local_fallback_allowed {
         let local_instance_dir = instance_dir.clone();
         let local_config_dir = config_dir.clone();
         let local = tokio::task::spawn_blocking(move || {
@@ -3462,14 +3510,16 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
 
 const STANDALONE_LOG_POD_PLACEHOLDER: &str = "standalone";
 
-fn runtime_log_tail_lines(limit: usize) -> Result<u32> {
-    if limit == 0 {
-        return InvalidArgumentSnafu {
-            message: "--limit must be greater than zero".to_string(),
-        }
-        .fail();
+fn parse_log_limit(value: &str) -> std::result::Result<u32, String> {
+    let limit = value
+        .parse::<u32>()
+        .map_err(|_| format!("expected an integer from 1 through {MAX_LOG_LINES}"))?;
+    if !(1..=MAX_LOG_LINES).contains(&limit) {
+        return Err(format!(
+            "expected an integer from 1 through {MAX_LOG_LINES}"
+        ));
     }
-    Ok(u32::try_from(limit).unwrap_or(u32::MAX))
+    Ok(limit)
 }
 
 async fn fetch_runtime_logs(
@@ -3615,6 +3665,19 @@ fn parse_local_log_lines(lines: Vec<String>) -> spice_cloud_client::types::LogsR
             .map(|line| parse_runtime_log_line(&line, "local"))
             .collect(),
     }
+}
+
+fn local_attachment_matches_target(
+    local_org: Option<&str>,
+    local_project: Option<&str>,
+    target: &ProjectTarget,
+) -> bool {
+    let (Some(local_org), Some(local_project), Some(target_org)) =
+        (local_org, local_project, target.org.as_deref())
+    else {
+        return false;
+    };
+    local_org.eq_ignore_ascii_case(target_org) && local_project == target.project
 }
 
 fn ensure_cloud_logs_follow_supported(follow: bool) -> Result<()> {
@@ -5284,6 +5347,19 @@ mod tests {
         assert!(!dataset_needs_attention(None));
     }
 
+    #[test]
+    fn runtime_health_failures_make_cloud_status_degraded() {
+        assert_eq!(
+            cloud_status_degradation(None, Some("runtime unavailable")),
+            Some("runtime unavailable".to_string())
+        );
+        assert_eq!(
+            cloud_status_degradation(Some("local state unreadable".to_string()), None),
+            Some("local state unreadable".to_string())
+        );
+        assert_eq!(cloud_status_degradation(None, None), None);
+    }
+
     // ========================================================================
     // Deploy and logs
     // ========================================================================
@@ -5358,8 +5434,9 @@ mod tests {
             runtime_logs_path("pod/name", 250),
             "/v1/spice_runtime/pods/pod%2Fname/logs?tailLines=250"
         );
-        runtime_log_tail_lines(0).expect_err("zero limit must be rejected");
-        assert_eq!(runtime_log_tail_lines(42).expect("valid limit"), 42);
+        parse_log_limit("0").expect_err("zero limit must be rejected");
+        parse_log_limit("100001").expect_err("unbounded history must be rejected");
+        assert_eq!(parse_log_limit("42").expect("valid limit"), 42);
     }
 
     #[test]
@@ -5439,6 +5516,26 @@ mod tests {
     }
 
     #[test]
+    fn local_logs_fall_back_only_for_the_enrolled_project() {
+        let target = ProjectTarget::new(Some("acme".to_string()), "analytics");
+        assert!(local_attachment_matches_target(
+            Some("ACME"),
+            Some("analytics"),
+            &target
+        ));
+        assert!(!local_attachment_matches_target(
+            Some("acme"),
+            Some("other"),
+            &target
+        ));
+        assert!(!local_attachment_matches_target(
+            None,
+            Some("analytics"),
+            &target
+        ));
+    }
+
+    #[test]
     fn cloud_logs_reject_follow_instead_of_returning_a_one_shot_response() {
         let error = ensure_cloud_logs_follow_supported(true)
             .expect_err("a successful Cloud response cannot honor follow");
@@ -5452,6 +5549,15 @@ mod tests {
             .expect_err("a usable keychain credential must fail logout");
 
         assert!(error.to_string().contains("may still be usable"));
+    }
+
+    #[test]
+    fn active_org_logout_refuses_a_membership_wide_default_credential() {
+        let error = ensure_active_org_logout_is_isolated("acme", true)
+            .expect_err("a shared default credential prevents isolated logout");
+        assert!(error.to_string().contains("--scope all"));
+        ensure_active_org_logout_is_isolated("acme", false)
+            .expect("an org-specific credential can be removed in isolation");
     }
 
     #[test]
