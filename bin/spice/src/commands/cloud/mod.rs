@@ -126,7 +126,7 @@ pub enum CloudCommands {
     #[command(subcommand)]
     Secrets(SecretsCommands),
 
-    /// View deployment logs
+    /// View runtime logs
     Logs(LogsArgs),
 
     // `about`/`long_about` live on `DeployArgs`; a doc comment here would
@@ -595,7 +595,7 @@ pub struct ImagesArgs {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum LogLevelFilter {
-    /// Every entry the deployment emitted (default).
+    /// Every entry the runtime emitted (default).
     #[default]
     All,
     /// Warnings and errors.
@@ -625,11 +625,7 @@ pub struct LogsArgs {
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
-    /// Deployment ID (uses latest if not specified)
-    #[arg(long)]
-    pub deployment: Option<i64>,
-
-    /// Maximum number of log entries to show
+    /// Maximum number of log entries to request per runtime instance
     #[arg(long, visible_alias = "tail", default_value = "100")]
     pub limit: usize,
 
@@ -1065,7 +1061,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Images(images_args) => execute_images(images_args, org).await,
         CloudCommands::Project(project_cmd) => execute_project(project_cmd, org).await,
         CloudCommands::Secrets(secrets_cmd) => execute_secrets(secrets_cmd, org).await,
-        CloudCommands::Logs(logs_args) => execute_logs(logs_args, org).await,
+        CloudCommands::Logs(logs_args) => execute_logs(ctx, logs_args, org).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args, org).await,
         CloudCommands::Status(status_args) => execute_status(ctx, status_args, org).await,
         CloudCommands::Service(service_args) => execute_service(ctx, service_args).await,
@@ -3323,20 +3319,19 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
     Ok(())
 }
 
-async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
+async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
+    let tail_lines = runtime_log_tail_lines(args.limit)?;
+    let since = args
+        .since
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|source| Error::InvalidArgument {
+            message: format!("Invalid --since timestamp: {source}. Expected RFC 3339."),
+        })?;
     let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
-    let cloud_result: Result<spice_cloud_client::types::LogsResponse> = async {
-        let deployment_id = if let Some(id) = args.deployment {
-            id
-        } else {
-            client.get_latest_deployment(&target).await?.id
-        };
-        client
-            .get_deployment_logs(&target, deployment_id, args.limit, args.since.as_deref())
-            .await
-    }
-    .await;
+    let cloud_result = fetch_runtime_logs(ctx, &client, &target, tail_lines).await;
 
     let mut cloud_error = None;
     let mut empty_cloud_response = None;
@@ -3345,7 +3340,7 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
             if logs.logs.is_empty() {
                 empty_cloud_response = Some(logs);
             } else {
-                let logs = filter_cloud_logs(logs, args.level);
+                let logs = filter_cloud_logs_since(logs, args.level, since.as_ref());
                 if args.output == OutputFormat::Json {
                     return write_json(&logs);
                 }
@@ -3434,12 +3429,151 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn filter_cloud_logs(
+const STANDALONE_LOG_POD_PLACEHOLDER: &str = "standalone";
+
+fn runtime_log_tail_lines(limit: usize) -> Result<u32> {
+    if limit == 0 {
+        return InvalidArgumentSnafu {
+            message: "--limit must be greater than zero".to_string(),
+        }
+        .fail();
+    }
+    Ok(u32::try_from(limit).unwrap_or(u32::MAX))
+}
+
+async fn fetch_runtime_logs(
+    ctx: &RuntimeContext,
+    client: &CloudClient,
+    target: &ProjectTarget,
+    tail_lines: u32,
+) -> Result<spice_cloud_client::types::LogsResponse> {
+    let runtime_ctx = project_runtime_context(ctx, client, target, None).await?;
+    let status: serde_json::Value =
+        fetch_instance_json(&runtime_ctx, "/v1/spice_runtime", target).await?;
+    let pods = runtime_log_pods(&status, target)?;
+    let mut logs = Vec::new();
+
+    for pod in pods {
+        let path = runtime_logs_path(&pod, tail_lines);
+        let response = runtime_ctx.get(&path).await.map_err(|source| {
+            Error::cloud_with_hint(
+                CloudErrorCode::NotFound,
+                format!("Could not reach runtime logs for project {target}: {source}"),
+                format!("Check it with 'spice cloud status --project {target}'."),
+            )
+        })?;
+        let response = crate::error::check_response(response, runtime_ctx.http_endpoint()).await?;
+        let text =
+            response
+                .text()
+                .await
+                .map_err(|source| crate::error::Error::InvalidResponse {
+                    message: format!(
+                        "Failed to read runtime logs for project {target} from {path}: {source}"
+                    ),
+                })?;
+        let source = if pod == STANDALONE_LOG_POD_PLACEHOLDER {
+            "standalone"
+        } else {
+            pod.as_str()
+        };
+        logs.extend(parse_runtime_log_text(&text, source));
+    }
+
+    Ok(spice_cloud_client::types::LogsResponse { logs })
+}
+
+fn runtime_log_pods(status: &serde_json::Value, target: &ProjectTarget) -> Result<Vec<String>> {
+    let Some(hosted_status) = status.get("status") else {
+        return Ok(vec![STANDALONE_LOG_POD_PLACEHOLDER.to_string()]);
+    };
+    let hosted: SpicepodStatus =
+        serde_json::from_value(hosted_status.clone()).map_err(|source| {
+            crate::error::Error::InvalidResponse {
+                message: format!("Failed to read runtime instances for project {target}: {source}"),
+            }
+        })?;
+    let mut pods: Vec<String> = hosted
+        .pod_statuses
+        .into_iter()
+        .map(|pod| pod.name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    pods.sort();
+    pods.dedup();
+    if pods.is_empty() {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::NotFound,
+            format!("Project {target} has no running instances whose logs can be read."),
+            format!("Check it with 'spice cloud status --project {target}'."),
+        ));
+    }
+    Ok(pods)
+}
+
+fn runtime_logs_path(pod: &str, tail_lines: u32) -> String {
+    format!(
+        "/v1/spice_runtime/pods/{}/logs?tailLines={tail_lines}",
+        urlencoding::encode(pod)
+    )
+}
+
+fn parse_runtime_log_text(text: &str, source: &str) -> Vec<spice_cloud_client::types::LogEntry> {
+    text.lines()
+        .map(|line| parse_runtime_log_line(line.trim_end_matches('\r'), source))
+        .collect()
+}
+
+fn parse_runtime_log_line(line: &str, source: &str) -> spice_cloud_client::types::LogEntry {
+    let (first, after_first) = split_log_field(line);
+    let (timestamp, remainder) = if chrono::DateTime::parse_from_rfc3339(first).is_ok() {
+        (Some(first.to_string()), after_first)
+    } else {
+        (None, line)
+    };
+    let (candidate_level, after_level) = split_log_field(remainder);
+    let normalized_level = candidate_level.to_ascii_lowercase();
+    let (level, message) = if matches!(
+        normalized_level.as_str(),
+        "trace" | "debug" | "info" | "warn" | "error"
+    ) {
+        (Some(normalized_level), after_level)
+    } else {
+        (None, remainder)
+    };
+
+    spice_cloud_client::types::LogEntry {
+        timestamp,
+        level,
+        message: message.to_string(),
+        source: Some(source.to_string()),
+    }
+}
+
+fn split_log_field(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start();
+    match trimmed.find(char::is_whitespace) {
+        Some(index) => (&trimmed[..index], trimmed[index..].trim_start()),
+        None => (trimmed, ""),
+    }
+}
+
+fn filter_cloud_logs_since(
     mut logs: spice_cloud_client::types::LogsResponse,
     level: LogLevelFilter,
+    since: Option<&chrono::DateTime<chrono::FixedOffset>>,
 ) -> spice_cloud_client::types::LogsResponse {
-    logs.logs
-        .retain(|entry| level.admits(entry.level.as_deref()));
+    logs.logs.retain(|entry| {
+        level.admits(entry.level.as_deref())
+            && since.is_none_or(|since| {
+                entry.timestamp.as_deref().is_none_or(|timestamp| {
+                    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+                        Ok(timestamp) => timestamp >= *since,
+                        Err(_) => true,
+                    }
+                })
+            })
+    });
     logs
 }
 
@@ -3847,10 +3981,7 @@ async fn wait_for_deployment(
                     "Deployment {} for app {target} finished with status '{}'{detail}",
                     deployment.id, deployment.status
                 ),
-                format!(
-                    "Inspect it with 'spice cloud logs --project {target} --deployment {} --level error'.",
-                    deployment.id
-                ),
+                format!("Inspect it with 'spice cloud logs --project {target} --level error'."),
             ));
         }
 
@@ -5150,8 +5281,78 @@ mod tests {
             }],
         };
 
-        let filtered = filter_cloud_logs(logs, LogLevelFilter::Error);
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::Error, None);
         assert!(filtered.logs.is_empty());
+    }
+
+    #[test]
+    fn runtime_log_route_maps_limit_and_escapes_the_pod_segment() {
+        assert_eq!(
+            runtime_logs_path("pod/name", 250),
+            "/v1/spice_runtime/pods/pod%2Fname/logs?tailLines=250"
+        );
+        runtime_log_tail_lines(0).expect_err("zero limit must be rejected");
+        assert_eq!(runtime_log_tail_lines(42).expect("valid limit"), 42);
+    }
+
+    #[test]
+    fn runtime_log_pods_use_a_placeholder_only_for_standalone_status() {
+        let target = ProjectTarget::new(Some("acme".to_string()), "analytics");
+        let standalone = serde_json::json!({
+            "phase": "Ready",
+            "reason": "runtime is ready"
+        });
+        assert_eq!(
+            runtime_log_pods(&standalone, &target).expect("standalone status"),
+            vec![STANDALONE_LOG_POD_PLACEHOLDER.to_string()]
+        );
+
+        let hosted = serde_json::json!({
+            "status": {
+                "podStatuses": [
+                    {"name": "analytics-b", "phase": "Running"},
+                    {"name": "analytics-a", "phase": "Running"},
+                    {"name": "analytics-a", "phase": "Running"}
+                ]
+            }
+        });
+        assert_eq!(
+            runtime_log_pods(&hosted, &target).expect("hosted status"),
+            vec!["analytics-a".to_string(), "analytics-b".to_string()]
+        );
+
+        let hosted_without_pods = serde_json::json!({"status": {"podStatuses": []}});
+        runtime_log_pods(&hosted_without_pods, &target)
+            .expect_err("hosted status without pods must be rejected");
+    }
+
+    #[test]
+    fn raw_runtime_logs_are_parsed_and_filtered_since_client_side() {
+        let raw = concat!(
+            "2026-08-20T00:00:00Z  INFO runtime: old\n",
+            "2026-08-20T00:00:02+00:00 ERROR runtime: new\n",
+            "panic continuation without a timestamp\n"
+        );
+        let logs = spice_cloud_client::types::LogsResponse {
+            logs: parse_runtime_log_text(raw, "analytics-a"),
+        };
+        assert_eq!(logs.logs.len(), 3);
+        assert_eq!(logs.logs[0].level.as_deref(), Some("info"));
+        assert_eq!(logs.logs[0].message, "runtime: old");
+        assert_eq!(logs.logs[0].source.as_deref(), Some("analytics-a"));
+
+        let since =
+            chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:01Z").expect("valid timestamp");
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::All, Some(&since));
+        let messages: Vec<&str> = filtered
+            .logs
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["runtime: new", "panic continuation without a timestamp"]
+        );
     }
 
     #[test]

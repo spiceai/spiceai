@@ -765,27 +765,14 @@ fn test_cloud_deployment_logs() {
         .assert()
         .success();
 
-    let deployment: serde_json::Value = serde_json::from_slice(&dep_assert.get_output().stdout)
+    let _deployment: serde_json::Value = serde_json::from_slice(&dep_assert.get_output().stdout)
         .expect("create deployment should produce valid JSON");
-    let dep_id = deployment
-        .get("id")
-        .and_then(serde_json::Value::as_i64)
-        .expect("deployment should have an id");
 
     // Fetch logs (may be empty for a fresh deployment, but command must succeed)
     let mut cmd = spice_cloud_cmd().expect("credentials required");
-    cmd.args([
-        "cloud",
-        "logs",
-        "--app",
-        &org_app,
-        "--deployment",
-        &dep_id.to_string(),
-        "-o",
-        "json",
-    ])
-    .assert()
-    .success();
+    cmd.args(["cloud", "logs", "--app", &org_app, "-o", "json"])
+        .assert()
+        .success();
 
     cleanup_app(&org_app);
 }
@@ -1048,7 +1035,7 @@ fn test_cloud_logs_help_documents_filters() {
         .success()
         .stdout(predicate::str::contains("--level"))
         .stdout(predicate::str::contains("--since"))
-        .stdout(predicate::str::contains("--deployment"));
+        .stdout(predicate::str::contains("--deployment").not());
 }
 
 #[test]
