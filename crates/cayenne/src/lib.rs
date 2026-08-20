@@ -78,6 +78,7 @@ pub mod __bench_zorder {
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
+pub(crate) mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
 pub mod row_converter;
@@ -116,4 +117,4 @@ pub use provider::{
     set_global_pk_keyset_bytes, set_query_admission_governor, try_reserve_global_mem_tier_bytes,
     update_global_mem_tier_total,
 };
-pub use schema::transform_schema_for_vortex;
+pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};

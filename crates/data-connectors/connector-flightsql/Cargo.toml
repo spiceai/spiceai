@@ -10,15 +10,19 @@ description = "FlightSQL data connector for Spice.ai runtime"
 arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["flightsql"] }
 datafusion.workspace = true
 flight_client = { path = "../../flight_client" }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 runtime-udfs-api = { path = "../../runtime-udfs-api" }
 snafu.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

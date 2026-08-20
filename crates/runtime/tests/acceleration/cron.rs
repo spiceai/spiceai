@@ -122,7 +122,7 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names".into(),
+                Arc::<str>::from("names"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -380,7 +380,7 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "decimal".into(),
+                Arc::<str>::from("decimal"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -414,7 +414,7 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "decimal".into(),
+                Arc::<str>::from("decimal"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -483,7 +483,7 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names".into(),
+                Arc::<str>::from("names"),
                 "Expected schedule name to match dataset name"
             );
 
@@ -581,7 +581,7 @@ async fn test_cron_view() -> Result<(), anyhow::Error> {
                 .expect("Expected a schedule to be present");
             assert_eq!(
                 schedule.name(),
-                "names_view".into(),
+                Arc::<str>::from("names_view"),
                 "Expected schedule name to match dataset name"
             );
 

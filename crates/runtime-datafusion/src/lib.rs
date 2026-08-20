@@ -18,6 +18,7 @@ pub mod analyzer_rule;
 pub mod composed_catalog;
 pub mod config;
 pub mod dialect;
+pub mod dml_guard;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;

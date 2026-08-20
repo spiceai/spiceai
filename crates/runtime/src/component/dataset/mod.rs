@@ -88,6 +88,7 @@ impl std::fmt::Debug for Dataset {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
+            .field("drasi", &self.drasi)
             .field("check_availability", &self.check_availability)
             .field(
                 "check_availability_interval",
@@ -231,6 +232,17 @@ impl AccelerationSource for Dataset {
             #[cfg(not(feature = "duckdb"))]
             datasets
         })
+    }
+
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        crate::dataaccelerator::spice_sys::checkpointer_factory(
+            self,
+            self.runtime.accelerator_engine_registry(),
+            snapshot_behavior,
+        )
     }
 }
 

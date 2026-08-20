@@ -28,8 +28,6 @@ use super::{
 use crate::accelerated::AcceleratedTable;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-#[cfg(not(windows))]
-use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::{config::ClusterRole, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -46,6 +44,8 @@ use cayenne::{
         CayennePushDownSemiJoin, CayenneReassociateCrossJoin,
     },
 };
+#[cfg(not(windows))]
+use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 #[cfg(not(windows))]
 use data_components::poly::PolyTableProvider;
 #[cfg(not(windows))]
@@ -1269,6 +1269,7 @@ impl DataFusionBuilder {
             pending_initializations_count: std::sync::atomic::AtomicUsize::new(0),
             query_cancel_registry: Arc::new(super::query::registry::QueryCancelRegistry::new()),
             plan_capture: OnceLock::new(),
+            drasi_forwarders: OnceLock::new(),
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             dataset_placements: dashmap::DashMap::new(),

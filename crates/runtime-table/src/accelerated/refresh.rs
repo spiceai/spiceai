@@ -571,6 +571,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
@@ -629,6 +631,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             cdc_param_overrides: None,
         }
     }
@@ -733,6 +736,15 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Declare the acceleration engine's own type rewrites.
+    pub fn with_engine_type_rewrites(
+        &mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> &mut Self {
+        self.engine_type_rewrites = rules;
         self
     }
 
@@ -906,6 +918,9 @@ impl Refresher {
 
         refresh_task_runner =
             refresh_task_runner.with_s3_express_acceleration(self.is_s3_express_acceleration);
+
+        refresh_task_runner =
+            refresh_task_runner.with_engine_type_rewrites(self.engine_type_rewrites);
 
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
@@ -1181,6 +1196,7 @@ impl Refresher {
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
+        .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
         .with_cdc_param_overrides(self.cdc_param_overrides.clone());
 
@@ -1404,6 +1420,10 @@ mod tests {
             &self,
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
+        }
+
+        async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
         }
     }
 

@@ -23,7 +23,6 @@ use std::{
 #[cfg(feature = "http")]
 pub mod cancel_guard_body;
 pub mod fibonacci_backoff;
-pub mod glob;
 pub mod home_dir;
 pub mod levenshtein;
 pub mod retry_strategy;
@@ -36,7 +35,7 @@ pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
-pub use tracing_util::{in_tracing_context, in_tracing_context_async};
+pub use tracing_util::{in_tracing_context, in_tracing_context_async, single_line};
 pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod expr;

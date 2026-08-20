@@ -245,6 +245,25 @@ impl RuntimeContext {
         }
     }
 
+    /// Create a context whose runtime binary is `<spice_bin_dir>/spiced`.
+    ///
+    /// This is how a test drives the parts of the CLI that *run* the runtime —
+    /// the launcher's working directory, exit status, and signal handling —
+    /// against a stub executable, without an installed Spice runtime and
+    /// without mutating this process's environment.
+    #[cfg(test)]
+    pub(crate) fn with_bin_dir_for_test(spice_bin_dir: PathBuf) -> Self {
+        Self {
+            spice_runtime_dir: spice_bin_dir.clone(),
+            spice_bin_dir,
+            ..Self::with_deadlines_for_test(
+                DEFAULT_HTTP_ENDPOINT,
+                CONTROL_PLANE_DEADLINE,
+                INFERENCE_DEADLINE,
+            )
+        }
+    }
+
     /// Create a runtime context from CLI arguments.
     ///
     /// `cloud` is `None` when cloud mode is not enabled, or `Some("region")` with
@@ -324,9 +343,8 @@ impl RuntimeContext {
     ///
     /// The first matching entry wins, exactly as before -- .env.local outranks .env,
     /// and within a file the earlier line wins. A blank value is authoritative but is
-    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
-    /// that has no key, so a blank resolves to `None` rather than falling through to
-    /// an older key in a lower-precedence file.
+    /// never a credential, so it resolves to `None` rather than falling through to an
+    /// older key in a lower-precedence file.
     fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
@@ -463,7 +481,7 @@ impl RuntimeContext {
     /// [`Self::spiced_path`] — which is derived from `HOME` — points at
     /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
     /// invoking user actually installed. That matters because
-    /// `sudo spice connect --install` is the documented way to install the
+    /// `sudo spice cloud service install` is the documented way to install the
     /// service: without this, every such run concludes the runtime is missing
     /// and downloads the latest *release*, which on a machine tracking `trunk`
     /// silently pairs a dev CLI with a released runtime.
@@ -584,6 +602,16 @@ impl RuntimeContext {
 
         // Add TLS root certificate file if present
         if let Some(tls_cert) = &self.tls_root_certificate_file {
+            let tls_cert = PathBuf::from(tls_cert);
+            let tls_cert = if tls_cert.is_absolute() {
+                tls_cert
+            } else {
+                // Preserve the CLI caller's path semantics even when a caller
+                // selects a different child working directory before spawn.
+                std::env::current_dir()
+                    .context(RuntimeExecutionSnafu)?
+                    .join(tls_cert)
+            };
             cmd.arg("--tls-root-certificate-file");
             cmd.arg(tls_cert);
         }
@@ -744,7 +772,7 @@ fn sudo_invoker_home() -> Option<PathBuf> {
 /// Absolute paths `getent` ships at, in the order they are tried.
 ///
 /// Resolving it through `PATH` would be a privilege-escalation hole: this runs
-/// under `sudo` on the documented `spice connect --install` path, so a `PATH`
+/// under `sudo` on the documented `spice cloud service install` path, so a `PATH`
 /// entry the invoking user controls would have this process execute their binary
 /// as root. Only these known locations are accepted, and a host with `getent`
 /// somewhere else falls through to reading `/etc/passwd`.
@@ -1090,7 +1118,7 @@ mod tests {
     #[test]
     fn passwd_home_resolves_a_user_macos_keeps_out_of_etc_passwd() {
         // Every ordinary macOS account lives in Directory Services only, so
-        // without the `dscl` step `sudo spice connect --install` cannot find the
+        // without the `dscl` step `sudo spice cloud service install` cannot find the
         // runtime the invoking user installed.
         let Ok(user) = std::env::var("USER") else {
             return;
@@ -1107,7 +1135,7 @@ mod tests {
     }
 
     /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
-    /// home must still be found — otherwise `sudo spice connect --install`
+    /// home must still be found — otherwise `sudo spice cloud service install`
     /// concludes the runtime is missing and downloads a release over the
     /// operator's build.
     #[test]

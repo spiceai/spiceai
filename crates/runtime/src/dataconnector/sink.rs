@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::component::dataset::{Dataset, acceleration::RefreshMode};
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -34,6 +34,8 @@ use datafusion::{
     },
 };
 use futures::Future;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -68,9 +70,14 @@ pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<S
         return None;
     }
     let registry = dataset.runtime.accelerator_engine_registry();
-    let checkpoint = DatasetCheckpoint::try_new(dataset, registry, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+    let checkpoint = dataset_checkpointer(
+        dataset,
+        registry,
+        OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
+    )
+    .await
+    .ok()?;
     checkpoint.get_schema().await.ok().flatten()
 }
 
@@ -129,10 +136,11 @@ impl DataConnectorFactory for SinkConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             // Inherit the acceleration checkpoint schema when the dataset is accelerated, so a
             // restart re-advertises the stored (e.g. OTLP-evolved) schema instead of the bare
@@ -142,7 +150,7 @@ impl DataConnectorFactory for SinkConnectorFactory {
             // context (connector unit tests) there is no accelerator to inherit from.
             let schema = match &params.component {
                 ConnectorComponent::Dataset(spec) => {
-                    params.accelerated_checkpoint_schema(spec).await
+                    context.accelerated_checkpoint_schema(spec).await
                 }
                 ConnectorComponent::Catalog(_) => None,
             }
@@ -173,14 +181,16 @@ impl DataConnector for SinkConnector {
 
     async fn read_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
     }
@@ -277,4 +287,4 @@ impl DisplayAs for SinkDataSink {
     }
 }
 
-register_data_connector!("sink", SinkConnectorFactory);
+data_connector_api::register_data_connector!("sink", SinkConnectorFactory);

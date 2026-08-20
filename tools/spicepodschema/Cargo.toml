@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+data-connector-api = { path = "../../crates/data-connector-api" }
 schemars.workspace = true
 serde.workspace = true
 serde_json = "1"
@@ -80,6 +81,7 @@ connector-smb = { path = "../../crates/data-connectors/connector-smb" }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
 connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 
+data-accelerator-api = { path = "../../crates/data-accelerator-api" }
 runtime-parameters = { path = "../../crates/runtime-parameters" }
 
 [lints]

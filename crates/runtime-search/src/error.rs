@@ -95,6 +95,15 @@ pub enum Error {
         "Invalid additional column was specified: '{additional_column}'. Verify the column exists in the data source and try again."
     ))]
     InvalidAdditionalColumns { additional_column: String },
+
+    #[snafu(display(
+        "The additional column '{column}' was specified but does not exist in dataset '{data_source}'. Available columns: {available_columns}"
+    ))]
+    AdditionalColumnNotFound {
+        column: String,
+        data_source: TableReference,
+        available_columns: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

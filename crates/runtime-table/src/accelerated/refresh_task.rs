@@ -31,8 +31,11 @@ use arrow::{
     error::ArrowError,
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
+use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
+use data_components::cdc::AccelerationContents;
 use data_components::poly::PolyTableProvider;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::catalog::MemoryCatalogProvider;
@@ -236,6 +239,9 @@ pub struct RefreshTaskBuilder {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the sink so an
+    /// engine-imposed type is not reported as a stale acceleration schema.
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
@@ -272,6 +278,7 @@ impl RefreshTaskBuilder {
             last_updated_at: Arc::new(AtomicI64::new(0)),
             initial_load_completed: None,
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             cdc_param_overrides: None,
         }
@@ -342,6 +349,16 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Declare the acceleration engine's own type rewrites.
+    #[must_use]
+    pub fn with_engine_type_rewrites(
+        mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> RefreshTaskBuilder {
+        self.engine_type_rewrites = rules;
+        self
+    }
+
     /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
     #[must_use]
     pub fn with_snapshot_refresh_state(
@@ -389,8 +406,9 @@ impl RefreshTaskBuilder {
         // lifecycle hooks without needing to be manually plumbed through as sink_indexes.
         let federated_indexes = indexes_from_federated(&self.federated);
         let sink = Arc::new(RwLock::new(
-            AccelerationSink::new(Arc::clone(&self.accelerator))
-                .with_sink_indexes(federated_indexes),
+            AccelerationSink::new(Arc::clone(&self.accelerator), self.dataset_name.to_string())
+                .with_sink_indexes(federated_indexes)
+                .with_engine_type_rewrites(self.engine_type_rewrites),
         ));
 
         let dataset_metric_labels = DatasetMetricLabels::new(&self.dataset_name);
@@ -422,6 +440,7 @@ impl RefreshTaskBuilder {
             last_updated_at: self.last_updated_at,
             initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
+            engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
             cdc_param_overrides: self.cdc_param_overrides,
@@ -491,6 +510,11 @@ pub struct RefreshTask {
     initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own creation-time type rewrites. The CDC
+    /// schema-evolution check normalizes the incoming schema with these so an
+    /// engine-imposed type is not classified as drift.
+    pub(crate) engine_type_rewrites:
+        &'static [&'static dyn arrow_tools::type_rewrite::TypeRewriteRule],
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
@@ -1987,9 +2011,48 @@ impl RefreshTask {
         }
 
         // Use the update stream's schema for dedup comparison, not the full federated
-        // provider schema.  When `refresh_sql` selects a column subset, the incoming
-        // batches and accelerated table only contain those columns.
-        let filter_schema = update.data.schema();
+        // provider schema. When `refresh_sql` selects a column subset, the incoming
+        // batches and accelerated table only contain those columns. Reconcile the stream with
+        // the accelerator engine's stored representation where the engine applies type rewrites
+        // (such as DuckDB's TIMESTAMPTZ -> Microsecond, Float16 -> Float32, or legacy Cayenne
+        // tables created with microsecond timestamps), so comparing incoming rows with stored
+        // rows does not reject a valid overlap as a schema change.
+        //
+        // This is deliberately limited to the engine's declared rewrites that match the stored
+        // target fields. Any other difference between the normalized source schema and stored
+        // rows remains an error in `dedup_predicates`, rather than silently treating an actual
+        // source schema change as compatible.
+        let output_schema = update.data.schema();
+        let accelerator_schema = self.accelerator.schema();
+        let filter_fields: Vec<std::sync::Arc<arrow::datatypes::Field>> = output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if let Some((_, acc_field)) = accelerator_schema.fields().find(field.name()) {
+                    if field.data_type() == acc_field.data_type() {
+                        Arc::clone(field)
+                    } else if !self.engine_type_rewrites.is_empty()
+                        && rewrite_data_type(field.data_type(), self.engine_type_rewrites)
+                            == *acc_field.data_type()
+                    {
+                        Arc::new(
+                            field
+                                .as_ref()
+                                .clone()
+                                .with_data_type(acc_field.data_type().clone()),
+                        )
+                    } else {
+                        Arc::clone(field)
+                    }
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect();
+        let filter_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            filter_fields,
+            output_schema.metadata().clone(),
+        ));
         let update_type = update.update_type.clone();
 
         // The dedup subtracts the accelerator's overlap window from the source's as a
@@ -2002,18 +2065,30 @@ impl RefreshTask {
             .map(|existing| vec![false; existing.num_rows()])
             .collect();
 
-        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&update.data.schema()),
-            {
-                stream! {
-                    while let Some(batch) = update.data.next().await {
-                        let batch =
-                            filter_records(&batch?, &existing_records, &filter_schema, &mut used);
-                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
-                    }
+        // The sink must receive the source schema so it can report engine-imposed narrowing
+        // and account for it. The normalized batches exist only for comparison: use their
+        // de-duplication predicate to filter the original batch, then let the ordinary write
+        // path perform its normal source-to-engine cast.
+        let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
+            stream! {
+                while let Some(batch) = update.data.next().await {
+                    let source_batch = batch?;
+                    let normalized_batch = try_cast_to(source_batch.clone(), Arc::clone(&filter_schema))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let predicates = dedup_predicates(
+                        &normalized_batch,
+                        &existing_records,
+                        &filter_schema,
+                        &mut used,
+                    )
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let batch = filter_record_batch(&source_batch, &predicates.into())
+                        .context(super::FailedToFilterUpdatesSnafu)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    yield Ok(batch);
                 }
-            },
-        ));
+            }
+        }));
 
         Ok(StreamingDataUpdate::new(filtered_data, update_type))
     }
@@ -2644,6 +2719,60 @@ fn accelerator_df(
     Ok(DataFrame::new(ctx.state(), logical_plan))
 }
 
+/// Observe whether the acceleration currently holds any rows.
+///
+/// A CDC source that cannot prove where an acceleration left off must rebuild it
+/// from the source, because a row deleted while the acceleration was away
+/// produces no change row and only a re-read removes it. An acceleration holding
+/// no rows has nothing that could be stale, which makes emptiness the one thing
+/// that settles the question by observation instead of inference — see
+/// [`AccelerationContents`].
+///
+/// Never returns an error: a probe that cannot answer returns
+/// [`AccelerationContents::Unknown`], which callers must treat as
+/// [`AccelerationContents::NonEmpty`]. Failing to read the acceleration is
+/// grounds for doing the safe, expensive thing, not for skipping it.
+///
+/// Called once per dataset while the accelerated table is being registered,
+/// before its changes stream starts, so the answer cannot be raced by the CDC
+/// writer — which is the only writer on this path.
+pub async fn probe_acceleration_contents(
+    accelerator: &Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+) -> AccelerationContents {
+    // A bare context is enough: the scan never leaves the accelerator, so none of
+    // the source-federation wiring a refresh needs applies. `accelerator_df`
+    // still normalizes the provider chain, and a `FederatedTableProviderAdaptor`
+    // left un-federated scans its inner provider directly.
+    let ctx = SessionContext::new();
+    let batches = async {
+        accelerator_df(accelerator, &ctx)
+            .and_then(|df| df.limit(0, Some(1)))?
+            .collect()
+            .await
+    }
+    .await
+    .map_err(find_datafusion_root);
+
+    match batches {
+        Ok(batches) => {
+            if batches.iter().any(|batch| batch.num_rows() > 0) {
+                AccelerationContents::NonEmpty
+            } else {
+                AccelerationContents::Empty
+            }
+        }
+        Err(e) => {
+            // Debug, not warn: the conservative fallback is the same work the
+            // caller would have done anyway, so this costs time, not correctness.
+            tracing::debug!(
+                "Dataset {dataset_name}: could not read the acceleration to check whether it is empty, so it will be treated as populated: {e}"
+            );
+            AccelerationContents::Unknown
+        }
+    }
+}
+
 pub fn accelerator_table_provider(accelerator: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     match spice_table::find_layer::<PolyTableProvider>(
         accelerator.as_ref(),
@@ -2716,12 +2845,26 @@ fn ensure_dedup_column_type(
 /// stored rows are NULL-backfilled while the source re-emits them with real values in
 /// the new column - those rows compare unequal here and are appended once more for
 /// the overlap window. This is a documented one-time effect, not a defect.
+#[cfg(test)]
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &[RecordBatch],
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
+    let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
+
+    filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
+/// each matching existing row at most once across the append overlap stream.
+fn dedup_predicates(
+    update_data: &RecordBatch,
+    existing_records: &[RecordBatch],
+    filter_schema: &SchemaRef,
+    used: &mut [Vec<bool>],
+) -> super::Result<Vec<bool>> {
     let mut predicates = vec![];
     let mut comparators = vec![];
 
@@ -2808,7 +2951,7 @@ fn filter_records(
         predicates.push(not_matched);
     }
 
-    filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
+    Ok(predicates)
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
@@ -2871,10 +3014,11 @@ mod tests {
     use super::*;
     use crate::federated::FederatedTable;
     use arrow::array::{
-        Date32Array, Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-        StringViewArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
+        Date32Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, UInt32Array, UInt64Array,
     };
-    use arrow::datatypes::TimeUnit;
+    use arrow::datatypes::{ArrowPrimitiveType, TimeUnit};
     use arrow_schema::{DataType, Field, Schema};
     use data_components::MetadataEnrichedTableProvider;
     use data_components::arrow::write::MemTable;
@@ -3003,8 +3147,8 @@ mod tests {
         let vector_scan: Arc<dyn TableProvider> =
             Arc::new(search::index::VectorScanTableProvider {
                 table_provider: indexed_mem_table(),
-                vector_index_list: Arc::new(plan),
                 primary_key: vec![],
+                index_list_plans: vec![Arc::new(plan)],
             })
             .into_table();
 
@@ -3159,6 +3303,50 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("`id`"), "{message}");
         assert!(message.contains("type mismatch"), "{message}");
+    }
+
+    /// The probe answers about *contents*, not about whether a table exists or
+    /// how it was configured. A CDC source relaxes an expensive rebuild on this
+    /// answer, so a table holding rows must never read as empty.
+    #[tokio::test]
+    async fn probe_reports_acceleration_contents() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let dataset_name = TableReference::bare("probe");
+
+        let empty = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("empty mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&empty, &dataset_name).await,
+            AccelerationContents::Empty
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .expect("batch should be created");
+        let populated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("populated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&populated, &dataset_name).await,
+            AccelerationContents::NonEmpty
+        );
+
+        // A partition holding an empty batch is still an empty acceleration: the
+        // answer must come from the rows, not from the presence of a batch.
+        let empty_batch = RecordBatch::new_empty(Arc::clone(&schema));
+        let empty_batches = Arc::new(
+            MemTable::try_new(schema, vec![vec![empty_batch]])
+                .expect("mem table with an empty batch should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            probe_acceleration_contents(&empty_batches, &dataset_name).await,
+            AccelerationContents::Empty
+        );
     }
 
     #[tokio::test]
@@ -4162,6 +4350,222 @@ mod tests {
             total_rows, 1,
             "one copy is already stored, so exactly one of the two must be appended"
         );
+    }
+
+    /// Regression test for append refreshes from `PostgreSQL` into Cayenne.
+    ///
+    /// `PostgreSQL` `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
+    /// at microseconds. Cayenne also promotes Float16 to Float32. Both engine rewrites must
+    /// happen before the overlap comparison so the already-stored row is removed rather than
+    /// rejected as a schema mismatch.
+    #[tokio::test]
+    async fn test_except_existing_records_from_normalizes_cayenne_timestamp_before_dedup() {
+        type F16 = <arrow::datatypes::Float16Type as ArrowPrimitiveType>::Native;
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float16, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let accelerator_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&accelerator_schema),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![1_i64]).with_timezone("UTC")),
+                Arc::new(Float32Array::from(vec![1.5_f32])),
+                Arc::new(Int32Array::from(vec![1_i32])),
+            ],
+        )
+        .expect("existing Cayenne batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&accelerator_schema), vec![vec![existing_batch]])
+                .expect("Cayenne-like accelerator table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&source_schema), vec![vec![]])
+                .expect("PostgreSQL-like source table"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("events_partitioned"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            Some("postgres".to_string()),
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_engine_type_rewrites(cayenne::CAYENNE_TYPE_REWRITE_RULES)
+        .build();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("timestamp".to_string());
+
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                // 1µs is already in the accelerator; 2µs is a new source row.
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![1_000_i64, 2_000]).with_timezone("UTC"),
+                ),
+                Arc::new(Float16Array::from(vec![
+                    F16::from_f32(1.5),
+                    F16::from_f32(2.5),
+                ])),
+                Arc::new(Int32Array::from(vec![1_i32, 2])),
+            ],
+        )
+        .expect("PostgreSQL update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&source_schema), None)
+                .expect("PostgreSQL update stream"),
+        );
+
+        let result = task
+            .except_existing_records_from(
+                &refresh,
+                StreamingDataUpdate::new(update_stream, UpdateType::Append),
+                Some(0),
+            )
+            .await
+            .expect("Cayenne timestamp normalization should allow append de-duplication");
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collect filtered append update");
+
+        assert_eq!(collected.data.len(), 1, "one update batch should remain");
+        assert_eq!(collected.data[0].num_rows(), 1, "the stored row is removed");
+        assert_eq!(
+            collected.data[0].schema(),
+            source_schema,
+            "the deduplicated stream retains the source schema for the sink diagnostic"
+        );
+        let ids = collected.data[0]
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id column");
+        assert_eq!(ids.values(), &[2], "the new row survives de-duplication");
+    }
+
+    /// Regression test for current Cayenne tables: timestamps are stored at the source's
+    /// nanosecond unit (not normalized to microseconds), while Float16 is rewritten to Float32.
+    /// Deduplication must reconcile the engine's Float16 rewrite without falsely down-converting
+    /// the nanosecond timestamp.
+    #[tokio::test]
+    async fn test_except_existing_records_from_preserves_nanosecond_cayenne_timestamp_before_dedup()
+    {
+        type F16 = <arrow::datatypes::Float16Type as ArrowPrimitiveType>::Native;
+
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float16, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let accelerator_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("score", DataType::Float32, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&accelerator_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000_i64]).with_timezone("UTC")),
+                Arc::new(Float32Array::from(vec![1.5_f32])),
+                Arc::new(Int32Array::from(vec![1_i32])),
+            ],
+        )
+        .expect("existing Cayenne batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&accelerator_schema), vec![vec![existing_batch]])
+                .expect("Cayenne-like accelerator table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&source_schema), vec![vec![]])
+                .expect("PostgreSQL-like source table"),
+        ) as Arc<dyn TableProvider>;
+
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("events_partitioned"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            Some("postgres".to_string()),
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .with_engine_type_rewrites(cayenne::CAYENNE_TYPE_REWRITE_RULES)
+        .build();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("timestamp".to_string());
+
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![1_000_i64, 2_000]).with_timezone("UTC"),
+                ),
+                Arc::new(Float16Array::from(vec![
+                    F16::from_f32(1.5),
+                    F16::from_f32(2.5),
+                ])),
+                Arc::new(Int32Array::from(vec![1_i32, 2])),
+            ],
+        )
+        .expect("PostgreSQL update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&source_schema), None)
+                .expect("PostgreSQL update stream"),
+        );
+
+        let result = task
+            .except_existing_records_from(
+                &refresh,
+                StreamingDataUpdate::new(update_stream, UpdateType::Append),
+                Some(0),
+            )
+            .await
+            .expect("Cayenne nanosecond deduplication should succeed");
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collect filtered append update");
+
+        assert_eq!(collected.data.len(), 1, "one update batch should remain");
+        assert_eq!(collected.data[0].num_rows(), 1, "the stored row is removed");
+        assert_eq!(
+            collected.data[0].schema(),
+            source_schema,
+            "the deduplicated stream retains the source schema for the sink diagnostic"
+        );
+        let ids = collected.data[0]
+            .column_by_name("id")
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 id column");
+        assert_eq!(ids.values(), &[2], "the new row survives de-duplication");
     }
 
     /// Regression test for the schema-mismatch half of #12492.

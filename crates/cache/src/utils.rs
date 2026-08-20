@@ -215,8 +215,23 @@ pub fn to_cached_record_batch_stream(
 
         while let Some(batch_result) = stream.next().await {
             if records_size < raw_size_limit && let Ok(batch) = &batch_result {
-                records.push(batch.clone());
-                records_size = records_size.saturating_add(batch.get_array_memory_size());
+                // Accumulate compacted batches, not the batches as they arrive.
+                // A `LIMIT`/`OFFSET` plan yields zero-copy slices, so holding
+                // one keeps its whole scan batch alive until the stream drains
+                // — and `records_size` would then bound a figure unrelated to
+                // what is actually retained.
+                //
+                // Measure before copying, so the copy is only paid for a result
+                // that can still be cached: `compacted_memory_size` is what the
+                // batch will occupy, computed without allocating.
+                records_size = records_size
+                    .saturating_add(arrow_tools::record_batch::compacted_memory_size(batch));
+                if records_size < raw_size_limit {
+                    records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                } else {
+                    records.clear();
+                    records.shrink_to_fit();
+                }
             } else if !records.is_empty() && records_size >= raw_size_limit {
                 // The result can no longer fit in the cache: eagerly drop the
                 // accumulated batches. Caching must be abandoned entirely —
@@ -327,6 +342,32 @@ pub(crate) mod tests {
     use datafusion::execution::config::SessionConfig;
     use datafusion::execution::context::SessionContext;
     use std::collections::HashSet;
+
+    /// A batch of wide strings, large enough that slicing one row out of it
+    /// retains far more than that row needs. Shared with the `result::query`
+    /// tests, which assert against the same premise.
+    pub(crate) fn wide_string_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let payloads: Vec<String> = (0..rows)
+            .map(|row| {
+                std::iter::repeat_n(
+                    char::from(b'a' + u8::try_from(row % 26).unwrap_or_default()),
+                    4_096,
+                )
+                .collect()
+            })
+            .collect();
+
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(payloads))],
+        )
+        .expect("should create batch")
+    }
 
     pub(crate) async fn parse_sql_to_logical_plan(sql: &str) -> LogicalPlan {
         let ctx = create_session_context();
@@ -1506,6 +1547,102 @@ pub(crate) mod tests {
         assert!(
             cached.is_none(),
             "Unencoded oversized result should NOT be cached"
+        );
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    ///
+    /// A `LIMIT`/`OFFSET` plan emits `batch.slice(..)`, which keeps its
+    /// parent's buffers alive. A one-row result carved out of a large scan
+    /// batch must be stored — and billed — as one row, not as the scan batch
+    /// it came from. Before the fix the entry was billed the whole parent,
+    /// which is larger than this cache's `max_size`, so it was never stored at
+    /// all and every repeat of the query re-executed.
+    #[tokio::test]
+    async fn a_sliced_result_is_stored_and_billed_as_its_own_rows() {
+        use arrow::array::StringArray;
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("1MiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::None,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        // 2,000 rows x 4 KiB is ~8 MiB of payload — well past the 1 MiB budget.
+        let scan_batch = wide_string_batch(2_000);
+        let schema = scan_batch.schema();
+        assert!(
+            scan_batch.get_array_memory_size() > 1024 * 1024,
+            "the scan batch must exceed the cache budget for this test to mean anything"
+        );
+
+        // What `LimitStream` yields for `LIMIT 1 OFFSET 1000`.
+        let sliced = scan_batch.slice(1_000, 1);
+        let expected_payload = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(0)
+            .to_string();
+
+        let raw_cache_key =
+            crate::key::CacheKey::Query("sliced-result", None).as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(sliced)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["docs".into()])),
+            std::time::Instant::now(),
+        );
+
+        let output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].num_rows(), 1);
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed")
+            .expect("a one-row result must fit in a 1 MiB cache");
+
+        assert!(
+            cached.get_memory_size() < 64 * 1024,
+            "a one-row entry should be billed its own row, got {} bytes",
+            cached.get_memory_size()
+        );
+
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert_eq!(cached_batches.len(), 1);
+        assert_eq!(cached_batches[0].num_rows(), 1);
+        assert_eq!(
+            cached_batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload is a StringArray")
+                .value(0),
+            expected_payload,
+            "compacting the entry must not change the row it holds"
         );
     }
 }

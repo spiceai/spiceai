@@ -45,6 +45,13 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "pingora")]
 use crate::backend::PingoraBackend;
 
+/// Message shown when the Pingora cache engine is configured but the `pingora`
+/// cargo feature is not compiled into this build of Spice.
+///
+/// In OSS default builds the `pingora` cargo feature is disabled and the Pingora
+/// cache engine is shipped only in the Spice.ai enterprise build.
+pub const PINGORA_ENTERPRISE_ONLY_MESSAGE: &str = "The Pingora cache engine is included in the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise";
+
 /// Internal enum to hold either backend type, enabling runtime backend selection.
 enum CacheBackendEnum<V, T>
 where
@@ -366,7 +373,7 @@ impl<
                 #[cfg(not(feature = "pingora"))]
                 {
                     tracing::warn!(
-                        "Pingora cache engine requested but 'pingora' feature is not enabled. Falling back to Moka."
+                        "{PINGORA_ENTERPRISE_ONLY_MESSAGE} Falling back to the Moka cache engine."
                     );
                     let cache =
                         build_moka_cache(cache_max_size, ttl, hasher.clone(), caching_policy);
@@ -1078,6 +1085,49 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
+    }
+
+    /// Without the `pingora` feature — the OSS default build — a configured
+    /// Pingora engine degrades to Moka rather than failing, and the operator is
+    /// pointed at the Enterprise distribution.
+    #[cfg(not(feature = "pingora"))]
+    #[tokio::test]
+    async fn test_pingora_engine_falls_back_to_moka_without_feature() {
+        let hasher = RandomState::default();
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            1024 * 1024, // 1 MB
+            Duration::from_mins(1),
+            hasher,
+            CachingPolicy::Lru,
+            CacheEngine::Pingora,
+        );
+
+        assert_eq!(
+            cache.engine,
+            CacheEngine::Moka,
+            "Pingora engine should degrade to Moka when the feature is not compiled in"
+        );
+        assert!(
+            PINGORA_ENTERPRISE_ONLY_MESSAGE.contains("Enterprise distribution of Spice.ai"),
+            "fallback message should use the standard enterprise-only wording"
+        );
+
+        // The fallback must still serve as a cache, not silently drop entries.
+        let key = CacheKey::Query("pingora_fallback_query", None).as_raw_key(cache.hasher());
+        let result = create_test_cached_result().await;
+        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.checkpoint().await;
+
+        let retrieved = cache
+            .get_raw_key(&key.as_u64())
+            .await
+            .expect("Moka fallback should contain the key");
+        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
+        let result_len = result.records().await.expect("Failed to decode").len();
+        assert_eq!(
+            retrieved_len, result_len,
+            "retrieved and result should have same length"
+        );
     }
 
     /// Test that Pingora backend works correctly when the feature is enabled.
