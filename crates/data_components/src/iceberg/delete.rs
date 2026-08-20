@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn a_volatile_condition_is_detected() {
         let volatile = datafusion::prelude::random().lt(lit(0.5));
-        assert!(has_volatile_expression(&[volatile.clone()]));
+        assert!(has_volatile_expression(std::slice::from_ref(&volatile)));
 
         // Also when it hides beside a perfectly keyable comparison.
         assert!(has_volatile_expression(&[col("id")
