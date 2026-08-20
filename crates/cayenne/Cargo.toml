@@ -113,6 +113,7 @@ result-correctness-duckdb = ["dep:duckdb"]
 result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
 # longer depends on arrow-row's (unstable) row format.
