@@ -20,14 +20,15 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::flightsql::FlightSQLFactory as DataComponentFlightSQLFactory;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::tls::{ClientIdentity, ClientTlsOptions, new_tls_flight_channel_with_options};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::ParameterSpec;
 use runtime_udfs_api::deny_spice_specific_functions;
@@ -171,10 +172,11 @@ impl DataConnectorFactory for FlightSQLFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let endpoint: String = params
                 .parameters
@@ -235,7 +237,7 @@ impl DataConnectorFactory for FlightSQLFactory {
                 .context(UnableToConstructTlsChannelSnafu)?;
             let flight_channel = CookieService::new(flight_channel, Arc::clone(&cookie_store));
 
-            let app = params.app();
+            let app = Some(context.app());
             let max_message_size =
                 match app.as_ref().and_then(|app| app.runtime.flight.as_ref()) {
                     Some(flight) => flight.max_message_size_bytes().map_err(|err| {
@@ -292,6 +294,7 @@ impl DataConnector for FlightSQL {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match Read::table_provider(&self.flightsql_factory, dataset.path().into()).await {
@@ -314,10 +317,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     FlightSQLFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_flightsql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_flightsql_connector,
     FLIGHTSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

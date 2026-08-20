@@ -103,14 +103,7 @@ pub const SPICEAI_PREFIXES: [&str; 2] = ["spice.ai", "spiceai"];
 impl ModelSource {
     pub fn parse_from(&self, from: &str) -> Option<String> {
         match self {
-            ModelSource::HuggingFace => HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
-                let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                if let Some(revision) = caps.name("revision") {
-                    format!("{}:{}", model, revision.as_str())
-                } else {
-                    model
-                }
-            }),
+            ModelSource::HuggingFace => huggingface_model_id(from),
             // A bare prefix (`spice.ai:`, `spice.ai/`) carries no model id. Report that as absent
             // rather than as an empty id, so the caller raises "no model provided" instead of
             // dialing the endpoint with an empty model name.
@@ -161,6 +154,22 @@ pub static HUGGINGFACE_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         }
     }
 });
+
+/// Recovers a `HuggingFace` repo id (and optional pinned `:revision`) from a `from` value via
+/// [`HUGGINGFACE_PATH_REGEX`]. Shared by [`ModelSource::parse_from`], `Embeddings::get_model_id`,
+/// and `Reranker::get_model_id` since all three encode the same
+/// `huggingface:huggingface.co/<org>/<model>[:rev]` convention and must not drift apart.
+#[must_use]
+pub fn huggingface_model_id(from: &str) -> Option<String> {
+    HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
+        let model = format!("{}/{}", &caps["org"], &caps["model"]);
+        if let Some(revision) = caps.name("revision") {
+            format!("{}:{}", model, revision.as_str())
+        } else {
+            model
+        }
+    })
+}
 
 /// Splits a `HuggingFace` model id back into its repo id and optional revision.
 ///

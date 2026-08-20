@@ -35,9 +35,10 @@ limitations under the License.
 //!
 //! # Format
 //!
-//! One JSON document. The header fields are plaintext so `spice connect status`
-//! can report *which* secrets are cached — and diagnose a dangling reference —
-//! without holding the key. The values are in the sealed body and nowhere else.
+//! One JSON document. The header fields are plaintext for bounded inspection,
+//! but `spice cloud status` reports their names only after opening the body
+//! with the identity's cache key. The values are in the sealed body and nowhere
+//! else.
 //!
 //! ```json
 //! {
@@ -87,6 +88,17 @@ const NONCE_LEN: usize = 24;
 /// an unbounded allocation on the read side. Matches the wire format's plaintext
 /// ceiling, since the same payload arrived through it.
 pub const MAX_CACHE_PLAINTEXT: usize = cloud_connect_crypto::MAX_SECRET_PLAINTEXT_SIZE;
+
+/// Maximum serialized cache size accepted by both writer and reader.
+///
+/// Secret names appear once in the encrypted plaintext and again in the JSON
+/// header, where one control byte may expand to a six-byte `\u00xx` escape. The
+/// ciphertext then expands by four-thirds in base64. Eight times the plaintext
+/// ceiling covers those worst-case representations plus per-name JSON syntax;
+/// the fixed allowance covers the remaining fields. The writer also checks the
+/// actual encoded length, so no cache it accepts can be rejected by this bound
+/// on restart.
+const MAX_CACHE_FILE_BYTES: u64 = (MAX_CACHE_PLAINTEXT as u64) * 8 + 64 * 1024;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -144,6 +156,13 @@ pub enum Error {
          redeploy. Reduce the number or size of the app's secrets."
     ))]
     TooLarge { size: usize },
+
+    #[snafu(display(
+        "The serialized delivered-secrets cache is {size} bytes, over the {limit}-byte file \
+         limit. The secrets are applied to this running instance but not cached, so a restart \
+         needs a redeploy. Reduce unusually long secret names or deployment metadata."
+    ))]
+    SerializedTooLarge { size: usize, limit: u64 },
 
     #[snafu(display("Failed to encode the secrets cache: {source}"))]
     Encode { source: serde_json::Error },
@@ -272,10 +291,12 @@ fn nonce_from(bytes: &[u8; NONCE_LEN]) -> XNonce {
 ///
 /// # Errors
 ///
-/// Returns [`Error::TooLarge`] when the payload exceeds
-/// [`MAX_CACHE_PLAINTEXT`], and the I/O and encoding variants on failure. A
-/// caller treats every one as non-fatal: the secrets are already applied to the
-/// running instance, and a failed cache only costs a redeploy after a restart.
+/// Returns [`Error::TooLarge`] when the plaintext exceeds
+/// [`MAX_CACHE_PLAINTEXT`], [`Error::SerializedTooLarge`] when its JSON
+/// representation exceeds the reader's file bound, and the I/O and encoding
+/// variants on failure. A caller treats every one as non-fatal: the secrets are
+/// already applied to the running instance, and a failed cache only costs a
+/// redeploy after a restart.
 pub fn write(
     path: &Path,
     key: &[u8],
@@ -319,6 +340,13 @@ pub fn write(
         ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
     };
     let bytes = serde_json::to_vec_pretty(&file).context(EncodeSnafu)?;
+    snafu::ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_CACHE_FILE_BYTES,
+        SerializedTooLargeSnafu {
+            size: bytes.len(),
+            limit: MAX_CACHE_FILE_BYTES,
+        }
+    );
     crate::identity::atomic_write_owner_only(path, &bytes).context(WriteSnafu {
         path: path.to_path_buf(),
     })
@@ -333,16 +361,17 @@ pub fn write(
 /// tampered header — is an error the caller *discards the cache* on rather than
 /// crashing over; the messages say so and name the recovery (deploy again).
 pub fn read(path: &Path, key: &[u8]) -> Result<Option<CachedSecrets>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(Error::Read {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
+    let bytes =
+        match crate::identity::read_regular_file_optional_bounded(path, MAX_CACHE_FILE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(source) => {
+                return Err(Error::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
 
     let file: CacheFile = serde_json::from_slice(&bytes).context(MalformedSnafu {
         path: path.to_path_buf(),
@@ -411,13 +440,45 @@ pub fn read(path: &Path, key: &[u8]) -> Result<Option<CachedSecrets>> {
 
 /// Delete the cache file. A missing file is success.
 ///
+/// Success means the file is absent and its directory entry has been
+/// synchronized as far as the platform allows. A release deletes this cache
+/// before the identity holding its key, so an unlink that is acknowledged but
+/// not durable lets the entry come back after a crash, beside a durably-deleted
+/// identity — exactly the stranded cache this function exists to prevent.
+///
+/// That includes the already-missing case, which is what a retry sees. Returning
+/// success there without synchronizing would let a caller whose earlier unlink
+/// went unsynced go on to clear the identity, and a crash could then roll the
+/// cache back with no key left to open it.
+///
+/// **Unix only.** [`crate::identity::sync_parent_directory`] cannot flush a
+/// directory entry through `std::fs` on other platforms and is a no-op there, so
+/// on those the absence is only as durable as the filesystem's own metadata
+/// ordering. Every removal in this crate shares that limit; it is stated here
+/// because this is the one whose result a caller uses to decide it may clear the
+/// identity.
+///
 /// # Errors
 ///
-/// Returns [`Error::Write`] when the file exists but cannot be removed — the
-/// caller must know, since leaving it behind leaves secrets on a host that was
-/// meant to be released.
+/// Returns [`Error::Write`] when the file exists but cannot be removed, or when
+/// its absence cannot be made durable — the caller must know, since leaving it
+/// behind leaves secrets on a host that was meant to be released.
 pub fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
+        Ok(()) => sync_absence(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => sync_absence(path),
+        Err(source) => Err(Error::Write {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Synchronize the directory that held `path`, so far as the platform allows, so
+/// its absence survives a crash. A directory that is itself gone needs nothing:
+/// the entry cannot come back.
+fn sync_absence(path: &Path) -> Result<()> {
+    match crate::identity::sync_parent_directory(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(Error::Write {
@@ -429,12 +490,13 @@ pub fn remove(path: &Path) -> Result<()> {
 
 /// Read only the plaintext header, without the key.
 ///
-/// This is what lets `spice connect status` say which secrets are cached, and
+/// This is what lets `spice cloud status` say which secrets are cached, and
 /// from which deployment, on a host where it holds no key at all. Returns `None`
 /// when there is no cache or it cannot be parsed.
 #[must_use]
 pub fn read_header(path: &Path) -> Option<CacheHeader> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes =
+        crate::identity::read_regular_file_optional_bounded(path, MAX_CACHE_FILE_BYTES).ok()??;
     let file: CacheFile = serde_json::from_slice(&bytes).ok()?;
     Some(CacheHeader {
         format_version: file.format_version,
@@ -502,6 +564,48 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A retry sees the file already gone. Reporting success there without
+    /// synchronizing would let a caller whose earlier unlink went unsynced go on
+    /// to clear the identity, and a crash could roll the cache back with no key
+    /// left to open it — so removal has to establish durable absence, not just
+    /// absence.
+    #[test]
+    fn removing_an_already_missing_cache_still_synchronizes_its_absence() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(SECRET_CACHE_FILE);
+
+        super::remove(&path).expect("a missing cache is success");
+
+        // A directory that is gone too needs nothing: the entry cannot return.
+        let vanished = dir.path().join("gone").join(SECRET_CACHE_FILE);
+        super::remove(&vanished).expect("a missing directory is success as well");
+    }
+
+    /// That the sync actually happens, which a successful one cannot show. A
+    /// directory the process may traverse and write but not open for reading
+    /// lets the unlink report the file missing and the synchronization fail, so
+    /// success here would mean the absence was never made durable.
+    #[cfg(unix)]
+    #[test]
+    fn an_absence_that_cannot_be_synchronized_is_not_reported_as_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let holder = dir.path().join("write-only");
+        std::fs::create_dir(&holder).expect("create the directory");
+        let path = holder.join(SECRET_CACHE_FILE);
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o311))
+            .expect("make the directory traversable and writable but not readable");
+
+        let removed = super::remove(&path);
+
+        // Restore before asserting, so a failure cannot leave the tempdir
+        // undeletable.
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the directory");
+        removed.expect_err("an absence that cannot be made durable is not a removal");
+    }
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -677,6 +781,32 @@ mod tests {
             .expect_err("over the cap must be refused");
         assert!(matches!(err, Error::TooLarge { .. }), "{err}");
         assert!(!path.exists(), "nothing should have been written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_maximum_plaintext_with_worst_case_json_names_remains_readable() {
+        let dir = scratch("worst-case-name-expansion");
+        let path = dir.join(SECRET_CACHE_FILE);
+        // One control character becomes six JSON bytes in the duplicated
+        // plaintext header. With the entry's two length prefixes and one-byte
+        // value, this still fills the plaintext allowance exactly.
+        let name = "\u{0001}".repeat(MAX_CACHE_PLAINTEXT - 9);
+        let mut input = BTreeMap::new();
+        input.insert(name.clone(), Zeroizing::new(vec![7]));
+
+        write(&path, &key(), "largest-header", &input)
+            .expect("every accepted maximum plaintext must produce a readable file");
+        assert!(std::fs::metadata(&path).expect("cache metadata").len() <= MAX_CACHE_FILE_BYTES);
+        let header = read_header(&path).expect("writer output must pass the header bound");
+        assert_eq!(header.names, vec![name.clone()]);
+        let opened = read(&path, &key())
+            .expect("writer output must pass the full reader bound")
+            .expect("cache exists");
+        assert_eq!(
+            opened.get(&name).map(|value| value.as_slice()),
+            Some(&[7][..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

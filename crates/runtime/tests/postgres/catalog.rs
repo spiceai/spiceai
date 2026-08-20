@@ -1209,6 +1209,109 @@ async fn test_refresh_sees_a_rename_as_a_removal_and_an_addition() -> Result<(),
         .await
 }
 
+/// A table the catalog selected but cannot load is skipped with a warning, and
+/// that warning is what a user gets instead of the table -- so this drives the
+/// real refresh and asserts what it logged.
+///
+/// The seam is the catalog's table creator: discovery runs against the live
+/// server (so the catalog and schema in the message are the ones a refresh
+/// really propagates), and every table then fails to load. Fault injection is
+/// what makes it deterministic -- revoking privileges makes
+/// `information_schema` return no rows rather than fail, and dropping the
+/// connection fails schema listing first, which aborts the whole refresh
+/// instead of one table.
+///
+/// The wording itself is unit-tested; what this pins is that the path emits it,
+/// with the catalog, schema and table filled in, and on one line. It would fail
+/// if `refresh` stopped reporting a skipped table, or reported it without the
+/// resource names.
+#[tokio::test]
+async fn test_refresh_reports_a_table_it_cannot_load() -> Result<(), anyhow::Error> {
+    // No `init_tracing` here: this test installs its own capturing subscriber.
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let _container = common::start_postgres_docker_container(port).await?;
+
+            source_exec(port, "CREATE TABLE orders (id INT PRIMARY KEY)").await?;
+
+            let pool = Arc::new(
+                PostgresConnectionPool::new(to_secret_map(
+                    get_pg_params(port)
+                        .into_iter()
+                        .map(|(k, v)| (k, v.expose_secret().to_string()))
+                        .collect::<HashMap<String, String>>(),
+                ))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            );
+            let provider = PostgresCatalogProvider::new(
+                CATALOG_NAME.to_string(),
+                pool,
+                Arc::new(UnloadableTables) as Arc<dyn Read>,
+                TableSelector::select_all(),
+            );
+
+            let (result, logs) = capture_logs(provider.refresh()).await;
+            result.map_err(|e| anyhow::anyhow!("refresh: {e}"))?;
+
+            assert!(
+                catalog_tables(&provider, "public").is_empty(),
+                "a table that cannot be loaded must not be registered"
+            );
+
+            let reported = logs
+                .lines()
+                .find(|line| line.contains("failed to load table"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the refresh should report the table it skipped: {logs}")
+                })?;
+            assert!(
+                reported.contains(&format!("PostgreSQL catalog '{CATALOG_NAME}'")),
+                "the report should name the catalog: {reported}"
+            );
+            assert!(
+                reported.contains("table 'public.orders'"),
+                "the report should name the schema and table: {reported}"
+            );
+            assert!(
+                reported.contains(&format!(
+                    "queries against '{CATALOG_NAME}.public.orders' will not resolve"
+                )),
+                "the report should say what the user will observe: {reported}"
+            );
+            // The message is one log record, so the whole of it is on the line
+            // the cause ends: a cause spanning lines would split it.
+            assert!(
+                reported.contains("Cause: ") && reported.trim_end().ends_with("/postgres"),
+                "the report should be a single line ending in its documentation link: {reported}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// A table creator that fails every table, for the test above. The failure is
+/// the point: what it returns is never registered.
+struct UnloadableTables;
+
+#[async_trait::async_trait]
+impl Read for UnloadableTables {
+    async fn table_provider(
+        &self,
+        table_reference: datafusion::sql::TableReference,
+    ) -> Result<
+        Arc<dyn datafusion::datasource::TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        // Multiline on purpose: a real loader's cause spans lines, and the
+        // emitted record must still be one line.
+        Err(format!("cannot load {table_reference}\nCaused by: unsupported column type").into())
+    }
+}
+
 /// A catalog whose `include` matches nothing registers no tables and says so,
 /// rather than loading silently and answering every query with "table not
 /// found".

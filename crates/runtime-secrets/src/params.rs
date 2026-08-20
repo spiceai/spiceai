@@ -41,8 +41,9 @@ use std::collections::HashMap;
 #[cfg(feature = "hashicorp_vault")]
 use std::path::PathBuf;
 
+use secrecy::ExposeSecret;
 #[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use snafu::prelude::*;
 
 use crate::SecretStore;

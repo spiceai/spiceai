@@ -33,7 +33,12 @@ use crate::{
     datafusion::udf::deny_spice_functions_for_postgres_table_providers, parameters::ParameterSpec,
 };
 
-use super::{AccelerationSource, DataAccelerator, upsert_dedup};
+use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator, upsert_dedup};
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::secrets::to_secret_map;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_postgres::PostgresSidecar;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -188,6 +193,34 @@ impl DataAccelerator for PostgresAccelerator {
             Arc::new(PolyTableProvider::new(write_provider, read_provider)).into_table();
 
         Ok(table_provider)
+    }
+
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        _open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // Unlike the file engines there is nothing to "open existing": the sidecar
+        // tables live in the same PostgreSQL database the acceleration already targets,
+        // so the connection is built from the acceleration parameters either way.
+        let acceleration = source
+            .acceleration()
+            .ok_or_else(|| CheckpointError::Store {
+                source: "Acceleration is not enabled".into(),
+            })?;
+        let secret_map = to_secret_map(acceleration.params.clone());
+
+        let pool = PostgresConnectionPool::new(secret_map)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(PostgresSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
     }
 
     fn prefix(&self) -> &'static str {

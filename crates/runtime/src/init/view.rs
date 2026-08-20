@@ -300,12 +300,11 @@ impl Runtime {
                 }
             };
 
-            match accelerator
-                .init(view.as_ref(), Arc::clone(&self.accelerator_engine_registry))
-                .await
-                .context(AcceleratorInitializationFailedSnafu {
+            match accelerator.init(view.as_ref()).await.context(
+                AcceleratorInitializationFailedSnafu {
                     name: acceleration_settings.engine.to_string(),
-                }) {
+                },
+            ) {
                 Ok(_) => {
                     // Initialization successful, continue to next view
                 }

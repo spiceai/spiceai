@@ -120,10 +120,15 @@ impl TypeRewriteRule for Float16ToFloat32 {
 /// `DataType::Timestamp(Microsecond, tz)`, preserving the timezone (including its
 /// absence).
 ///
-/// Vortex stores every timestamp at microsecond precision, so Cayenne normalizes the
-/// unit at table creation. This differs from [`TimestampTzToMicrosecond`] in covering
-/// timezone-naive timestamps too: `DuckDB` has a native nanosecond `TIMESTAMP` and
-/// keeps that precision when there is no zone, whereas Vortex does not.
+/// Cayenne applied this at table creation before it stored the source's own unit, so
+/// a table created by one of those builds holds microseconds for the life of that
+/// table. The rule is retained for the acceleration write path, which must recognize
+/// that stored type as one the engine produced rather than as the acceleration having
+/// fallen behind its source — see `cayenne::CAYENNE_TYPE_REWRITE_RULES`. It is not a
+/// creation rewrite: a table created now keeps the unit its source reports.
+///
+/// This differs from [`TimestampTzToMicrosecond`] in covering timezone-naive
+/// timestamps too, because the rewrite it describes did.
 #[derive(Debug)]
 pub struct TimestampToMicrosecond;
 impl TypeRewriteRule for TimestampToMicrosecond {

@@ -19,6 +19,7 @@ limitations under the License.
 
 pub mod cosmosdb;
 
+use data_connector_api::ConnectorContext;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,7 +39,7 @@ use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction
 use opentelemetry::KeyValue;
 use tokio::sync::Semaphore;
 
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
 };
 use runtime_api_types::v1::ComponentType;
@@ -192,10 +193,11 @@ impl DataConnectorFactory for CosmosDBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -354,6 +356,7 @@ impl DataConnector for CosmosDB {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let credential = self.build_credential(dataset)?;
@@ -444,10 +447,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     CosmosDBFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_cosmosdb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_cosmosdb_connector,
     COSMOSDB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

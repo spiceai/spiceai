@@ -18,7 +18,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
@@ -29,7 +29,7 @@ use crate::component::{
     ComponentInitialization,
     dataset::{DatasetSpec, acceleration::RefreshMode},
 };
-use crate::dataconnector::{DataConnector, DataConnectorResult};
+use crate::dataconnector::{ConnectorContext, DataConnector, DataConnectorResult};
 use crate::drasi::{DeliveryMode, forward_change_envelope};
 
 /// A [`DataConnector`] middleware that publishes the wrapped connector's change
@@ -72,16 +72,20 @@ impl DataConnector for DrasiConnector {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        self.inner_connector.read_provider(dataset).await
+        self.inner_connector.read_provider(context, dataset).await
     }
 
     async fn read_write_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        self.inner_connector.read_write_provider(dataset).await
+        self.inner_connector
+            .read_write_provider(context, dataset)
+            .await
     }
 
     async fn metadata_provider(
@@ -145,14 +149,17 @@ impl DataConnector for DrasiConnector {
         self.inner_connector.supports_changes_stream()
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         self.with_forwarded_stream(
             self.inner_connector
-                .changes_stream(federated_table, dataset),
+                .changes_stream(context, federated_table, dataset, acceleration)
+                .await,
         )
     }
 
