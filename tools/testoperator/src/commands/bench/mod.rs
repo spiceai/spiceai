@@ -33,6 +33,7 @@ use test_framework::{
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
+    snapshot::SnapshotMode,
     spiced::SpicedInstance,
     spicepod::acceleration::Mode,
     spicetest::{
@@ -306,6 +307,8 @@ async fn run_inner(
 
 /// List of query results that should not be snapshotted because they don't return deterministic results
 const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
+    "tpcds_q65", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
+    "tpcds_q71", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
     "tpcds_q77", // The ORDER BY clause specifies columns that have multiple matches, so the order is unspecified between those rows
 ];
 
@@ -320,11 +323,12 @@ const DISABLED_SNAPSHOT_QUERIES: &[&str] = &[
 /// record a plan detail rather than an answer.
 ///
 /// `AVG` rules out two more. `avg` coerces its integer argument to `Float64` before
-/// aggregating — the plan for q4 is `avg(CAST(hits.UserID AS Float64))` — so the
-/// partial sums are floats combined in partition-completion order, and float
-/// addition is not associative. Repartitioning the scan moves the low bits, and the
-/// partition count follows the runner's cores, so q3 and q4 would record the shape
-/// of the machine that ran them.
+/// aggregating — the plan for q4 is `avg(CAST(hits.UserID AS Float64))` — and the
+/// summed `UserID` magnitudes exceed 2^53, so the partial sums round, and combining
+/// them in partition-completion order moves the low bits with the runner's core
+/// count. `ClickBench` scenarios assert exact rendered results (they are not in
+/// [`FLOAT_SOURCE_SCENARIO_PREFIXES`]), so q3 and q4 would record the shape of the
+/// machine that ran them.
 ///
 /// What is left still answers the question a result snapshot is here to ask — did
 /// the table load, and do the aggregates over it come out right. Every query below
@@ -342,16 +346,48 @@ const SNAPSHOTTED_CLICKBENCH_QUERIES: &[&str] = &[
     "clickbench_q30", // 90 integer SUMs
 ];
 
+/// Scenario-name prefixes whose data sources surface numeric columns as floats
+/// (`DynamoDB` has no decimal type; Glue CSV and Iceberg Hadoop schema inference
+/// yield doubles), so their aggregates sum `Float64` partial sums across
+/// partitions and the low bits differ per machine. Result snapshots for these
+/// scenarios round float columns to a fixed number of significant digits
+/// ([`SnapshotMode::RoundedFloats`]); every other scenario asserts exact rendered
+/// results. Scenarios whose sources keep exact numerics (parquet → `Decimal128`)
+/// derive their float output columns from exact aggregates in a single division,
+/// which is deterministic — a scenario belongs on this list only when its float
+/// *inputs* are summed, the signature being result snapshots that re-record with
+/// last-digit float drift on a different machine.
+const FLOAT_SOURCE_SCENARIO_PREFIXES: &[&str] = &[
+    "dynamodb",
+    "glue[csv]",
+    "iceberg[hadoop]",
+    "iceberg[hadoop[catalog]]",
+];
+
 /// Only snapshot query sets whose recorded rows are reproducible: the official TPC-H
 /// and TPC-DS queries — not the "simple" extensions, which don't return consistent
 /// results — and the `ClickBench` queries listed in [`SNAPSHOTTED_CLICKBENCH_QUERIES`].
-fn snapshot_predicate(query_name: &str) -> bool {
-    if query_name.starts_with("clickbench_q") {
-        return SNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name);
+/// Scenarios listed in [`FLOAT_SOURCE_SCENARIO_PREFIXES`] snapshot with float
+/// columns rounded; all others assert the exact rendered results.
+fn snapshot_predicate(scenario_name: &str, query_name: &str) -> SnapshotMode {
+    let snapshotted = if query_name.starts_with("clickbench_q") {
+        SNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name)
+    } else {
+        (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
+            && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+    };
+    if !snapshotted {
+        return SnapshotMode::Skip;
     }
 
-    (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
-        && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
+    if FLOAT_SOURCE_SCENARIO_PREFIXES
+        .iter()
+        .any(|prefix| scenario_name.starts_with(prefix))
+    {
+        SnapshotMode::RoundedFloats
+    } else {
+        SnapshotMode::Exact
+    }
 }
 
 /// Build CH-benCH Postgres source config from environment variables.
@@ -491,45 +527,138 @@ pub(crate) async fn prepare_chbench_source(
 
 #[cfg(test)]
 mod tests {
-    use super::{SNAPSHOTTED_CLICKBENCH_QUERIES, snapshot_predicate};
+    use super::{SNAPSHOTTED_CLICKBENCH_QUERIES, SnapshotMode, snapshot_predicate};
+
+    /// A decimal-source scenario: asserts exact rendered results.
+    const EXACT_SCENARIO: &str = "s3[parquet]-federated";
 
     #[test]
     fn snapshots_the_official_tpch_and_tpcds_queries() {
-        assert!(snapshot_predicate("tpch_q1"));
-        assert!(snapshot_predicate("tpcds_q1"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpch_q1"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpcds_q1"),
+            SnapshotMode::Exact
+        );
         // The "simple" extensions are not part of either spec.
-        assert!(!snapshot_predicate("tpch_simple_q4"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpch_simple_q4"),
+            SnapshotMode::Skip
+        );
         // Deny-listed for an unspecified order between equal rows.
-        assert!(!snapshot_predicate("tpcds_q77"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "tpcds_q77"),
+            SnapshotMode::Skip
+        );
+    }
+
+    #[test]
+    fn float_source_scenarios_round_their_float_columns() {
+        for scenario in [
+            "dynamodb-arrow",
+            "dynamodb-federated",
+            "dynamodb-duckdb[file]",
+            "dynamodb-scylladb-alternator-federated",
+            "glue[csv]-federated",
+            "iceberg[hadoop]-federated",
+            "iceberg[hadoop[catalog]]-federated",
+        ] {
+            assert_eq!(
+                snapshot_predicate(scenario, "tpch_q1"),
+                SnapshotMode::RoundedFloats,
+                "{scenario} sums float source columns and must round"
+            );
+        }
+        // The deny-list still wins over rounding.
+        assert_eq!(
+            snapshot_predicate("dynamodb-arrow", "tpcds_q77"),
+            SnapshotMode::Skip
+        );
+    }
+
+    /// Parquet-backed variants of the same connectors keep exact numerics, so
+    /// the prefix list must not swallow them.
+    #[test]
+    fn decimal_source_scenarios_assert_exact_results() {
+        for scenario in [
+            "glue[parquet]-federated",
+            "glue[catalog]-federated",
+            "iceberg[catalog]-federated",
+            "iceberg-duckdb[file]",
+            "s3[parquet]-duckdb[file]",
+        ] {
+            assert_eq!(
+                snapshot_predicate(scenario, "tpch_q1"),
+                SnapshotMode::Exact,
+                "{scenario} has exact numeric sources and must assert exactly"
+            );
+        }
     }
 
     #[test]
     fn snapshots_only_the_reproducible_clickbench_queries() {
         for query in SNAPSHOTTED_CLICKBENCH_QUERIES {
-            assert!(snapshot_predicate(query), "{query} should be snapshotted");
+            assert_eq!(
+                snapshot_predicate(EXACT_SCENARIO, query),
+                SnapshotMode::Exact,
+                "{query} should be snapshotted"
+            );
         }
         // Ranks by a metric with no unique tiebreaker.
-        assert!(!snapshot_predicate("clickbench_q13"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q13"),
+            SnapshotMode::Skip
+        );
         // No ORDER BY at all.
-        assert!(!snapshot_predicate("clickbench_q18"));
-        // Averages in Float64, so the low bits follow the partition count.
-        assert!(!snapshot_predicate("clickbench_q3"));
-        assert!(!snapshot_predicate("clickbench_q4"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q18"),
+            SnapshotMode::Skip
+        );
+        // Averages in Float64 whose sums exceed 2^53, so the low bits follow
+        // the partition count.
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q3"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q4"),
+            SnapshotMode::Skip
+        );
     }
 
     /// The allow-list matches whole names, so a listed query must not also enable
     /// the queries it is a prefix of.
     #[test]
     fn clickbench_allow_list_matches_whole_query_names() {
-        assert!(snapshot_predicate("clickbench_q1"));
-        assert!(!snapshot_predicate("clickbench_q11"));
-        assert!(snapshot_predicate("clickbench_q2"));
-        assert!(!snapshot_predicate("clickbench_q22"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q1"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q11"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q2"),
+            SnapshotMode::Exact
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "clickbench_q22"),
+            SnapshotMode::Skip
+        );
     }
 
     #[test]
     fn does_not_snapshot_other_query_sets() {
-        assert!(!snapshot_predicate("chbench_q1"));
-        assert!(!snapshot_predicate("scenario_q1"));
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "chbench_q1"),
+            SnapshotMode::Skip
+        );
+        assert_eq!(
+            snapshot_predicate(EXACT_SCENARIO, "scenario_q1"),
+            SnapshotMode::Skip
+        );
     }
 }
