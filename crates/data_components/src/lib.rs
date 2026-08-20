@@ -308,6 +308,26 @@ pub trait Read: Send + Sync {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+
+    /// A provider for a table whose schema the caller has already resolved.
+    ///
+    /// Lets a caller holding many schemas at once -- a catalog that resolved a
+    /// whole namespace in one query, say -- build providers without a round trip
+    /// per table.
+    ///
+    /// The default delegates to [`Read::table_provider`], discarding `schema`
+    /// and resolving it from the source instead: correct, and as costly as not
+    /// having asked. An implementation that overrides this must return a
+    /// provider indistinguishable from [`Read::table_provider`]'s -- same
+    /// wrappers, same pushdown -- since a table that plans differently depending
+    /// on how it was discovered is a bug the caller cannot see.
+    async fn table_provider_with_schema(
+        &self,
+        table_reference: TableReference,
+        _schema: SchemaRef,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        self.table_provider(table_reference).await
+    }
 }
 
 #[async_trait]
@@ -338,14 +358,19 @@ pub trait RefreshableCatalogProvider: CatalogProvider {
 /// explicitly — see [`RefreshingCatalogProvider::inner_catalog`].
 #[derive(Debug)]
 pub struct RefreshingCatalogProvider {
+    /// Named by the refresh failure this logs. A runtime serving several
+    /// catalogs refreshes them all on the same loop, so a message that does not
+    /// name one says only that something, somewhere, is out of date.
+    catalog_name: String,
     inner: Arc<dyn RefreshableCatalogProvider>,
     refresh_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RefreshingCatalogProvider {
     #[must_use]
-    pub fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
+    pub fn new(catalog_name: String, inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
         Self {
+            catalog_name,
             inner,
             refresh_task: None,
         }
@@ -366,11 +391,23 @@ impl RefreshingCatalogProvider {
     pub fn start_refresh(mut self, interval: Option<std::time::Duration>) -> Self {
         let interval = interval.unwrap_or(std::time::Duration::from_mins(1));
         let inner = Arc::clone(&self.inner);
+        let catalog_name = self.catalog_name.clone();
+        let retry_secs = interval.as_secs();
         self.refresh_task = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 if let Err(e) = inner.refresh().await {
-                    tracing::error!("Failed to refresh catalog: {e}");
+                    // Deliberately weaker than "serving the last successful
+                    // refresh": this wrapper is shared, and a provider that
+                    // refreshes its schemas concurrently (`UnityCatalogProvider`)
+                    // installs the ones that succeeded before another's failure
+                    // returns here, so the catalog can be serving a mix of fresh
+                    // and stale metadata. Claiming otherwise would be a promise
+                    // the implementation below does not make.
+                    tracing::error!(
+                        "Failed to refresh catalog '{catalog_name}', so its tables may now be incomplete or out of date: a table added, renamed or dropped in the source since the last successful refresh may not be reflected. It is retried in {retry_secs}s. Cause: {}",
+                        util::single_line(&e.to_string())
+                    );
                 }
             }
         }));

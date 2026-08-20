@@ -48,11 +48,11 @@ use crate::{
 /// Hive-style subdirectories under `base_path`.
 ///
 /// Two callers construct this: `CREATE TABLE … PARTITIONED BY` in
-/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. They
-/// differ in exactly two ways, and both are opt-in on top of the DDL defaults:
-/// the accelerator shares one background-compaction budget across every
-/// partition ([`Self::with_background_compaction`]), and its tables are targets
-/// for the accelerated dual-write path ([`Self::with_direct_partition_writes`]).
+/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. Both
+/// run their partitions' interval compaction through the process-wide budget
+/// ([`Self::with_background_compaction`]); they differ only in that the
+/// accelerator's tables are targets for the accelerated dual-write path
+/// ([`Self::with_direct_partition_writes`]).
 pub struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
@@ -109,10 +109,10 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    /// Create a partition creator with the `CREATE TABLE … PARTITIONED BY`
-    /// defaults: no shared compaction budget, and not a dual-write target.
-    /// The accelerator opts into both with [`Self::with_background_compaction`]
-    /// and [`Self::with_direct_partition_writes`].
+    /// Create a partition creator that runs no interval compaction and is not a
+    /// dual-write target. Both engines that open Cayenne tables opt into a
+    /// compaction budget with [`Self::with_background_compaction`]; only the
+    /// accelerator opts into [`Self::with_direct_partition_writes`].
     #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -193,15 +193,14 @@ impl CayennePartitionCreator {
     }
 
     fn partition_table_name(&self, partition_key: &str) -> String {
-        format!(
-            "{}_p{}",
-            self.table_name,
-            encode_identifier_hex(partition_key)
-        )
+        crate::partition_naming::partition_child_table_name(&self.table_name, partition_key)
     }
 
     fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        format!("{}_{}", self.table_name, partition_values.join("_"))
+        crate::partition_naming::legacy_partition_child_table_name(
+            &self.table_name,
+            partition_values,
+        )
     }
 
     fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
@@ -464,16 +463,6 @@ impl PartitionCreator for CayennePartitionCreator {
     }
 }
 
-fn encode_identifier_hex(value: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        let _ = write!(encoded, "{byte:02X}");
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +546,29 @@ mod tests {
             None,
             Arc::clone(&fixture.runtime_env),
         )
+    }
+
+    /// A table registered in the same metastore as `fixture`'s, rooted outside
+    /// its data directory — the shape an operator gets by accelerating a second
+    /// dataset into one metastore.
+    async fn unrelated_table(fixture: &Fixture, table_name: &str, dir: &str) {
+        fixture
+            .catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&fixture.schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture
+                    .base_path
+                    .with_file_name(dir)
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the table {table_name} is created: {error}"));
     }
 
     fn bucket(value: &str) -> ScalarValue {
@@ -791,6 +803,133 @@ mod tests {
         assert_eq!(
             values, expected,
             "every encoded value must read back exactly as written"
+        );
+    }
+
+    /// Dropping a partitioned table must drop its per-partition child tables
+    /// with it. A surviving child keeps its own stored schema and file manifest,
+    /// so a later recreate of the parent silently reattaches to the old schema
+    /// and to a manifest whose data files were deleted (#12999).
+    #[tokio::test]
+    async fn dropping_the_parent_drops_its_partition_child_tables() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+        for value in ["a", "b"] {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .unwrap_or_else(|error| panic!("partition {value} is created: {error}"));
+        }
+
+        let before = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed before the drop");
+        let children_before = before.iter().filter(|name| name.as_str() != TABLE).count();
+        assert_eq!(
+            children_before, 2,
+            "the fixture must actually register a child table per partition, got {before:?}"
+        );
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops"),
+            "the parent table existed, so the drop reports it was dropped"
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert!(
+            after.is_empty(),
+            "no table may outlive the parent drop, found {after:?}"
+        );
+    }
+
+    /// An unpartitioned table has no `cayenne_partition` rows, so the cascade
+    /// must be a no-op rather than matching a same-prefixed sibling table.
+    #[tokio::test]
+    async fn dropping_a_table_leaves_an_unrelated_same_prefix_table_alone() {
+        let fixture = fixture().await;
+        let sibling = format!("{TABLE}_p0000");
+        unrelated_table(&fixture, &sibling, "sibling").await;
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops")
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert_eq!(
+            after,
+            vec![sibling],
+            "a table that is not a partition of the dropped table must survive"
+        );
+    }
+
+    /// The legacy child-name convention (`{parent}_{values}`) can also spell a
+    /// table an operator accelerated separately into the same metastore —
+    /// partitioning `events` by year spells `events_2024`. Dropping the parent
+    /// must not take that table with it, so a name match only counts when the row
+    /// is rooted at the partition's own directory.
+    #[tokio::test]
+    async fn a_table_colliding_with_the_legacy_partition_name_is_not_dropped() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+        creator
+            .create_partition(vec![bucket("a")])
+            .await
+            .expect("partition a is created");
+
+        // Exactly the legacy name this partition would carry, rooted elsewhere.
+        // Derived from the catalog's own partition row rather than spelled by
+        // hand: the recorded values are encoded, so a hand-written name would
+        // collide with nothing and the test would pass without exercising the
+        // guard at all.
+        let partitions = fixture
+            .catalog
+            .get_partitions(&fixture.table_id)
+            .await
+            .expect("the partition is recorded");
+        let [partition] = partitions.as_slice() else {
+            panic!("expected exactly one partition, got {partitions:?}");
+        };
+        let impostor = crate::partition_naming::legacy_partition_child_table_name(
+            TABLE,
+            &partition.partition_values,
+        );
+        unrelated_table(&fixture, &impostor, "unrelated").await;
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops")
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert_eq!(
+            after,
+            vec![impostor],
+            "the real partition child must go and the name-alike must stay"
         );
     }
 }

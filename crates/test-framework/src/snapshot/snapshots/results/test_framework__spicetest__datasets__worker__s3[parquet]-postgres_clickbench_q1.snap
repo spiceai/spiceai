@@ -1,0 +1,9 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: clickbench_q1"
+---
++----------+
+| count(*) |
++----------+
+| 5000000  |
++----------+

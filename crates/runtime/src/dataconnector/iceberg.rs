@@ -17,6 +17,7 @@ limitations under the License.
 //! The Iceberg Data Connector is a thin layer over the Iceberg Catalog Connector.
 //! It takes the same parameters as the Catalog Connector.
 
+use crate::dataconnector::ConnectorContext;
 use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
@@ -36,7 +37,7 @@ use crate::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
         parameters::aws::initiate_config_with_credentials,
@@ -81,10 +82,11 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let iceberg = IcebergDataConnector {
                 params: params.parameters,
@@ -130,7 +132,7 @@ impl IcebergDataConnector {
     /// identity, used to build read, read-write, and distributed providers.
     async fn create_iceberg_table_parts(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
 
@@ -272,7 +274,7 @@ impl IcebergDataConnector {
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         source: &str,
         metadata_mode: MetadataMode,
     ) -> super::DataConnectorResult<IcebergTableParts> {
@@ -355,7 +357,8 @@ impl DataConnector for IcebergDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let parts = self.create_iceberg_table_parts(dataset).await?;
 
@@ -372,7 +375,8 @@ impl DataConnector for IcebergDataConnector {
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Create the table parts which include catalog + identity for delete support
         let parts = match self.create_iceberg_table_parts(dataset).await {
@@ -399,4 +403,4 @@ impl DataConnector for IcebergDataConnector {
     }
 }
 
-register_data_connector!("iceberg", IcebergDataConnectorFactory);
+data_connector_api::register_data_connector!("iceberg", IcebergDataConnectorFactory);

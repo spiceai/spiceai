@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::AcceleratorEngineRegistry;
+use data_connector_api::DataConnectorError;
+use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -34,14 +37,13 @@ use runtime::{
             replication::Replication,
         },
     },
-    dataaccelerator::{self, AcceleratorEngineRegistry},
-    dataconnector::{DataConnectorError, create_new_connector, parameters::ConnectorParamsBuilder},
+    dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
-    secrets::{ExposeSecret, Secrets},
     spice_metrics::get_metrics_table_reference,
     status,
 };
+use runtime_secrets::{ExposeSecret, Secrets};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -67,7 +69,7 @@ pub enum Error {
     UnableToCreateSourceTableProvider { source: DataConnectorError },
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
-    UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+    UnableToCreateAcceleratedTableProvider { source: data_accelerator_api::Error },
 
     #[snafu(display("Unable to get Spice Cloud secret: {source}"))]
     UnableToGetSpiceSecret {
@@ -332,13 +334,14 @@ async fn get_spiceai_table_provider(
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
-    let data_connector = create_new_connector("spice.ai", params)
+    let context = RuntimeConnectorContext::for_dataset(&dataset);
+    let data_connector = create_new_connector("spice.ai", params, &context)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&context, &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateSourceTableProviderSnafu)?;

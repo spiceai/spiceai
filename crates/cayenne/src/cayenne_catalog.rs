@@ -1120,17 +1120,23 @@ impl CayenneCatalog {
         Ok(rows.into_iter().next().unwrap_or(0))
     }
 
-    /// Reconcile the datalake (cold tier) fields of a reopened table's stored
-    /// `VortexConfig` with the currently configured options.
+    /// Reconcile a reopened table's stored `VortexConfig` with the currently
+    /// configured options, for the fields that describe how the table is RUN
+    /// rather than how its data is written: the datalake (cold tier) settings
+    /// and the scan concurrency.
     ///
-    /// The cold fields are deliberately excluded from [`configuration_matches`]
-    /// (toggling the tier never recreates the table), and the provider runs
-    /// with the STORED config — so a spicepod change must be persisted here to
-    /// take effect on reopen. One change is rejected instead of persisted:
-    /// moving (or unsetting) the location while cold files exist, because the
-    /// cold manifest's absolute file URLs point at the old location and the
-    /// next promotion's replace-all would strand them.
-    async fn reconcile_cold_tier_config(
+    /// These are deliberately excluded from [`configuration_matches`] (changing
+    /// them never recreates the table), and the provider runs with the STORED
+    /// config — so a spicepod change must be persisted here to take effect on
+    /// reopen. Without that, `cayenne_scan_concurrency` would be inert on every
+    /// table that already exists, which is exactly when an operator reaches for
+    /// it: lowering it under memory pressure would silently keep the old value.
+    ///
+    /// One change is rejected instead of persisted: moving (or unsetting) the
+    /// cold location while cold files exist, because the cold manifest's
+    /// absolute file URLs point at the old location and the next promotion's
+    /// replace-all would strand them.
+    async fn reconcile_runtime_only_config(
         &self,
         stored: &mut TableMetadata,
         options: &CreateTableOptions,
@@ -1158,7 +1164,8 @@ impl CayenneCatalog {
 
         let stored_vc = &stored.vortex_config;
         let new_vc = &options.vortex_config;
-        let cold_fields_differ = stored_vc.cold_tier_location != new_vc.cold_tier_location
+        let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
+            || stored_vc.cold_tier_location != new_vc.cold_tier_location
             || stored_vc.cold_clustering_columns != new_vc.cold_clustering_columns
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
@@ -1166,9 +1173,11 @@ impl CayenneCatalog {
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
                 != new_vc.cold_tier_background_interval_ms;
-        if !cold_fields_differ {
+        if !runtime_fields_differ {
             return Ok(());
         }
+
+        stored.vortex_config.scan_concurrency = new_vc.scan_concurrency;
 
         stored
             .vortex_config
@@ -1188,7 +1197,7 @@ impl CayenneCatalog {
         let vortex_config_json = serde_json::to_string(&stored.vortex_config).map_err(|e| {
             CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to serialize updated datalake configuration for table {}.",
+                    "Failed to serialize updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
@@ -1205,14 +1214,14 @@ impl CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: format!(
-                    "Failed to persist updated datalake configuration for table {}.",
+                    "Failed to persist updated runtime configuration for table {}.",
                     stored.table_name
                 ),
                 source: Box::new(e),
             })?;
         tracing::debug!(
             table = stored.table_name.as_str(),
-            "Reconciled datalake configuration from spicepod params on table reopen"
+            "Reconciled runtime configuration from spicepod params on table reopen"
         );
         Ok(())
     }
@@ -1236,7 +1245,7 @@ impl CayenneCatalog {
                 // state. Rejects a location change while cold files exist;
                 // persists any other cold-field change.
                 if configuration_matches_ignoring_schema(&stored_metadata, options) {
-                    self.reconcile_cold_tier_config(&mut stored_metadata, options)
+                    self.reconcile_runtime_only_config(&mut stored_metadata, options)
                         .await?;
                 }
 
@@ -1777,6 +1786,267 @@ impl CayenneCatalog {
                 "commit_on_conflict_deletions exhausted {max_attempts} retry attempts after retryable write conflicts"
             ),
         })
+    }
+
+    /// Resolve a table name to its `table_id`, or `None` when no such table is
+    /// registered.
+    ///
+    /// Queried as a row *set* so that "no such table" is an empty result rather
+    /// than an error to be told apart from a real one. The distinction is
+    /// load-bearing: `drop_table` reports `Ok(false)` for a table that was not
+    /// there, and its accelerator caller then deletes the dataset directory — so
+    /// a metastore error masquerading as "not found" would delete the files
+    /// while every row describing them survived. `cayenne_table(table_name)` is
+    /// unique, so at most one row can come back.
+    async fn table_id_for_name(&self, table_name: &str) -> CatalogResult<Option<String>> {
+        let mut ids: Vec<String> = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
+                    params: vec![MetastoreValue::Text(table_name.to_string())],
+                },
+                |row| row.get_string(0),
+            )
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to look up table {table_name}."),
+                source: Box::new(e),
+            })?;
+        Ok(ids.pop())
+    }
+
+    /// `table_id`s of the per-partition child tables of `table_name`.
+    ///
+    /// Matched by the same derivation the partition creator uses to open them
+    /// ([`crate::partition_naming`]), including the legacy name a partition
+    /// created by an older runtime still answers to.
+    ///
+    /// A name match alone is not enough to delete by: the legacy convention
+    /// (`{parent}_{values}`) can also spell an unrelated table an operator
+    /// happens to have accelerated into the same metastore — partitioning
+    /// `events` by year spells `events_2024`. A child is rooted at its
+    /// partition's own directory, so the row's `path` must equal the partition's
+    /// before it counts as one. A child whose path somehow differs is left
+    /// behind rather than deleted, which is the safe direction to be wrong in.
+    ///
+    /// A child never has partitions of its own, so this does not recurse. Empty
+    /// for an unpartitioned table, which has no `cayenne_partition` rows.
+    async fn partition_child_table_ids(
+        &self,
+        table_name: &str,
+        table_id: &str,
+    ) -> CatalogResult<Vec<String>> {
+        let mut child_ids = Vec::new();
+        for partition in self.get_partitions(table_id).await? {
+            let matched: Vec<String> = self
+                .metastore
+                .query_helper(
+                    QueryParams {
+                        sql: "SELECT table_id FROM cayenne_table \
+                              WHERE table_name IN (?1, ?2) AND path = ?3",
+                        params: vec![
+                            MetastoreValue::Text(
+                                crate::partition_naming::partition_child_table_name(
+                                    table_name,
+                                    &partition.composite_key(),
+                                ),
+                            ),
+                            MetastoreValue::Text(
+                                crate::partition_naming::legacy_partition_child_table_name(
+                                    table_name,
+                                    &partition.partition_values,
+                                ),
+                            ),
+                            MetastoreValue::Text(partition.path.clone()),
+                        ],
+                    },
+                    |row| row.get_string(0),
+                )
+                .await
+                .map_err(|e| CatalogError::FailedToGetPartitions {
+                    source: Box::new(e),
+                })?;
+
+            // `cayenne_table(table_name)` is unique and a partition owns its
+            // directory, so a child can match at most one partition.
+            child_ids.extend(matched);
+        }
+
+        Ok(child_ids)
+    }
+
+    /// Delete every metastore row belonging to `table_id`, ending with the
+    /// `cayenne_table` row itself.
+    ///
+    /// Runs inside a caller-supplied transaction, so a table — and, for a
+    /// partitioned table, its children with it — disappears in one step or not
+    /// at all.
+    async fn delete_table_metadata(
+        transaction: &dyn crate::metastore::MetastoreTransaction,
+        table_id: &str,
+    ) -> CatalogResult<()> {
+        // Delete all related metadata in order. `cayenne_insert_record` no
+        // longer has a foreign key (its `table_id` is a raw-bytes BLOB; see
+        // `insert_record_table_id_value`), so it must be cleared explicitly
+        // here rather than via ON DELETE CASCADE.
+        // 1. Delete insert records
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
+                params: vec![insert_record_table_id_value(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete insert records.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 1b. Delete durable write-back markers (#11838). Unlike the other
+        // tables this is never cleared at checkpoint/overwrite, so drop_table is
+        // the only place its rows are removed.
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_pending_write_back WHERE table_id = ?1",
+                params: vec![insert_record_table_id_value(table_id)],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete pending write-back markers.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 2. Delete snapshot sequences
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot sequences.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 3. Delete delete files
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_delete_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete delete files.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 4. Delete partitions
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_partition WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete partitions.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5. Delete table statistics
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete table statistics.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5b. Delete per-file snapshot statistics
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot file statistics.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5c. Delete the per-snapshot data-file manifest (manifest snapshot
+        // model). `cayenne_snapshot_file` has an ON DELETE CASCADE FK to
+        // `cayenne_table`, but it is cleared explicitly here like every sibling
+        // metadata table, so the delete order stays readable in one place rather
+        // than half here and half in the schema.
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot file manifest.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5d. Delete the cold-tier object-store manifest. Like every sibling
+        // table it is cleared explicitly rather than relying on the
+        // ON DELETE CASCADE FK, keeping the whole delete set in one place.
+        // NOTE: this removes the catalog rows only — the physical cold objects
+        // are intentionally NOT deleted on drop (the datalake location is an
+        // operator-managed, possibly shared bucket); reclaiming a dropped
+        // table's `{name}-{table_id}/` prefix is an operator action.
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete cold-tier file manifest.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 6. Delete inlined data
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete inlined data.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 7. Delete inlined deletes
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete inlined deletes.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 8. Finally delete the table itself
+        transaction
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_table WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete table.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        Ok(())
     }
 }
 
@@ -4561,183 +4831,30 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
-        // First check if the table exists and get its ID
-        let table_id: Option<String> = self
-            .metastore
-            .query_row_helper(
-                QueryRowParams {
-                    sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?1",
-                    params: vec![MetastoreValue::Text(table_name.to_string())],
-                },
-                |row| row.get_string(0),
-            )
-            .await
-            .ok();
-
-        let Some(table_id) = table_id else {
+        let Some(table_id) = self.table_id_for_name(table_name).await? else {
             return Ok(false); // Table doesn't exist
         };
 
-        // Delete all related metadata in order. `cayenne_insert_record` no
-        // longer has a foreign key (its `table_id` is a raw-bytes BLOB; see
-        // `insert_record_table_id_value`), so it must be cleared explicitly
-        // here rather than via ON DELETE CASCADE.
-        // 1. Delete insert records
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![insert_record_table_id_value(&table_id)],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete insert records.".to_string(),
-                source: Box::new(e),
-            })?;
+        // A partitioned table's partitions are catalog tables of their own, so
+        // dropping only this row would leave them behind — and because a
+        // partitioned table pins its stored schema, a later recreate finds those
+        // rows and silently reuses the OLD schema and a file manifest whose files
+        // are gone.
+        let child_ids = self
+            .partition_child_table_ids(table_name, &table_id)
+            .await?;
 
-        // 1b. Delete durable write-back markers (#11838). Unlike the other
-        // tables this is never cleared at checkpoint/overwrite, so drop_table is
-        // the only place its rows are removed.
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_pending_write_back WHERE table_id = ?1",
-                params: vec![insert_record_table_id_value(&table_id)],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete pending write-back markers.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 2. Delete snapshot sequences
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_sequence WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete snapshot sequences.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 3. Delete delete files
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_delete_file WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete delete files.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 4. Delete partitions
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_partition WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete partitions.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 5. Delete table statistics
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete table statistics.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 5b. Delete per-file snapshot statistics
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete snapshot file statistics.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 5c. Delete the per-snapshot data-file manifest (manifest snapshot
-        // model). `cayenne_snapshot_file` has an ON DELETE CASCADE FK to
-        // `cayenne_table`, but it is cleared explicitly here (like every sibling
-        // metadata table) so a crash between this and the final `cayenne_table`
-        // delete cannot leave orphan manifest rows pinning a phantom file set.
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete snapshot file manifest.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 5d. Delete the cold-tier object-store manifest. Like every sibling
-        // table it is cleared explicitly (rather than relying on the
-        // ON DELETE CASCADE FK) so a crash before the final `cayenne_table`
-        // delete cannot leave orphan cold-file rows. NOTE: this removes the
-        // catalog rows only — the physical cold objects are intentionally NOT
-        // deleted on drop (the datalake location is an operator-managed,
-        // possibly shared bucket); reclaiming a dropped table's
-        // `{name}-{table_id}/` prefix is an operator action.
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_cold_tier_file WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete cold-tier file manifest.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 6. Delete inlined data
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete inlined data.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 7. Delete inlined deletes
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete inlined deletes.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 8. Finally delete the table itself
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_table WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id)],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete table.".to_string(),
-                source: Box::new(e),
-            })?;
+        // Children and parent go in ONE transaction: a half-applied cascade is not
+        // self-healing, because a partition row whose child table is gone makes
+        // `infer_existing_partitions` propagate `TableNotFound` and the table
+        // stops opening at all. The discovery above is read outside it, so a
+        // partition created concurrently with a drop can still be missed.
+        let transaction = self.begin_transaction().await?;
+        for child_id in &child_ids {
+            Self::delete_table_metadata(transaction.as_ref(), child_id).await?;
+        }
+        Self::delete_table_metadata(transaction.as_ref(), &table_id).await?;
+        transaction.commit().await?;
 
         Ok(true)
     }

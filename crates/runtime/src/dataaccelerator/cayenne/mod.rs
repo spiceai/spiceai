@@ -24,8 +24,8 @@ pub mod snapshot_engine;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, RwLock, Weak};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow_schema::{DataType, Schema};
@@ -49,11 +49,17 @@ use super::{
     get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
+use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
+use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
+use runtime_checkpoint_api::CheckpointError;
+#[cfg(feature = "sqlite")]
+use runtime_checkpoint_sqlite::SqliteSidecar;
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
@@ -67,6 +73,13 @@ pub enum Error {
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display(
+        "Failed to configure dataset {table_name} (cayenne): Invalid 'cayenne_scan_concurrency' value '{value}'. \
+        Expected 'auto', 'off', or a positive number of splits. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    InvalidScanConcurrency { table_name: String, value: String },
 
     #[snafu(display("Acceleration creation failed: {source}"))]
     AccelerationCreationFailed {
@@ -83,6 +96,39 @@ pub enum Error {
 
     #[snafu(display("Invalid Cayenne acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display(
+        "Failed to evolve the schema of dataset {dataset} (cayenne): in-place schema evolution is not supported for a partitioned acceleration, \
+        because each partition stores its own schema. \
+        Set 'mode: file_update', or 'on_schema_change: drop_and_recreate' with 'refresh_mode: full', to rebuild the acceleration with the new schema. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PartitionedEvolutionUnsupported { dataset: Arc<str> },
+
+    #[snafu(display(
+        "Failed to configure dataset {table_name} (cayenne): The acceleration data directory '{data_dir}' contains the Cayenne metastore directory '{metadata_dir}'. \
+        Recreating this dataset deletes its data directory, which would take the metastore — the catalog for every Cayenne dataset in this instance — with it. \
+        Set 'cayenne_metadata_dir' to a directory outside the data directory, or rename the dataset. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    MetastoreInsideDataDir {
+        table_name: String,
+        data_dir: String,
+        metadata_dir: String,
+    },
+
+    #[snafu(display(
+        "Failed to configure dataset {table_name} (cayenne): Could not resolve the acceleration data directory '{data_dir}' or the Cayenne metastore directory '{metadata_dir}' against the working directory ({source}). \
+        Recreating this dataset deletes its data directory, and Spice will not do that without first proving the metastore is outside it. \
+        Set 'cayenne_file_path' and 'cayenne_metadata_dir' to absolute paths. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    CayenneDirsUnresolvable {
+        table_name: String,
+        data_dir: String,
+        metadata_dir: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
@@ -295,51 +341,27 @@ pub struct CayenneAccelerator {
     /// one in-memory database.
     instance_id: u64,
     footer_cache_mb: Option<usize>,
-    /// Shared semaphore that bounds the number of concurrent per-table
-    /// background compactions across all Cayenne tables registered with this
-    /// accelerator. Sized at the CPU budget's core count so a fleet of tables
-    /// can't oversubscribe the writer pool.
+    /// The process-wide semaphore that bounds concurrent per-table background
+    /// compactions, held here so the registration path can hand it to each
+    /// table. Sized at `cpu_budget().cayenne_compaction_permits()` so a fleet of
+    /// tables can't oversubscribe the writer pool. Every Cayenne table draws
+    /// on this one budget, including those created by `CREATE TABLE …
+    /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Initial permit count of `compaction_semaphore` (the semaphore itself only
-    /// exposes *available* permits), published for the occupancy gauge's total.
-    compaction_permits_total: usize,
 }
 
-/// A `(weak handle, total permits)` view of the fleet-wide compaction semaphore,
-/// published when a real table's background compaction is spawned (see
-/// [`Self::create_cayenne_table_provider`]) so the metrics registration
-/// ([`register_cayenne_telemetry`]) can read live occupancy at scrape
-/// time without holding the accelerator alive. Published from the spawn path
-/// rather than the constructor because `CayenneAccelerator::new()` is also called
-/// for throwaway helpers (e.g. `cayenne_data_dir`), whose semaphore is dropped
-/// immediately — capturing that one would leave a dead `Weak`. A `RwLock` (not
-/// `OnceLock`) so the live accelerator's semaphore always wins; a `Weak` never
-/// resurrects a dropped semaphore.
-static COMPACTION_SEMAPHORE_FOR_METRICS: RwLock<Option<(Weak<tokio::sync::Semaphore>, usize)>> =
-    RwLock::new(None);
-
-/// Publish the fleet-wide compaction semaphore for the occupancy gauges. Called
-/// from the real table-registration path; idempotent across a fleet of tables
-/// (they share one semaphore).
-fn publish_compaction_semaphore_for_metrics(sem: &Arc<tokio::sync::Semaphore>, total: usize) {
-    // Recover through poisoning: an unrelated panic must not permanently disable the
-    // compaction-permit gauges (the guarded Weak<Semaphore> isn't corrupted by another
-    // thread's panic).
-    let mut guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some((Arc::downgrade(sem), total));
-}
-
-/// `(available, total)` permits of the fleet-wide compaction semaphore, or `None`
-/// before a real table has registered (or after teardown).
-fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
-    let guard = COMPACTION_SEMAPHORE_FOR_METRICS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (weak, total) = guard.as_ref()?;
-    let sem = weak.upgrade()?;
-    Some((sem.available_permits() as u64, *total as u64))
+/// `(available, total)` permits of the fleet-wide compaction budget.
+///
+/// Read straight from the `cayenne` crate's process-global budget rather than
+/// from a handle the accelerator publishes, because a `CREATE TABLE …
+/// PARTITIONED BY` table draws on that same budget while belonging to no
+/// accelerator: keying the gauges off accelerator registration would leave them
+/// silent in a process whose only compaction work is DDL-created.
+fn compaction_budget_snapshot() -> (u64, u64) {
+    (
+        cayenne::compaction_budget().available_permits() as u64,
+        cayenne::compaction_budget_permits() as u64,
+    )
 }
 
 /// Register the Cayenne write-path backpressure gauges (pull-based observable
@@ -355,6 +377,12 @@ fn compaction_semaphore_snapshot() -> Option<(u64, u64)> {
 pub fn register_cayenne_telemetry() {
     use opentelemetry::global;
     let meter = global::meter("cayenne");
+
+    // Process-wide Vortex segment cache: fill vs capacity, entries, and the
+    // access/hit counters. Registered here rather than where the cache is
+    // installed, because the cache must exist before any table is registered —
+    // well before the real meter provider replaces the startup noop one.
+    vortex_datafusion::register_segment_cache_metrics();
 
     // --- Process-global encode-concurrency budget ---
     let _ = meter
@@ -426,9 +454,8 @@ pub fn register_cayenne_telemetry() {
         )
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((available, _total)) = compaction_semaphore_snapshot() {
-                obs.observe(available, &[]);
-            }
+            let (available, _total) = compaction_budget_snapshot();
+            obs.observe(available, &[]);
         })
         .build();
     let _ = meter
@@ -436,9 +463,8 @@ pub fn register_cayenne_telemetry() {
         .with_description("Total permits of the fleet-wide Cayenne compaction semaphore.")
         .with_unit("{permit}")
         .with_callback(|obs| {
-            if let Some((_available, total)) = compaction_semaphore_snapshot() {
-                obs.observe(total, &[]);
-            }
+            let (_available, total) = compaction_budget_snapshot();
+            obs.observe(total, &[]);
         })
         .build();
 }
@@ -447,29 +473,6 @@ impl Default for CayenneAccelerator {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn parse_u64_aliases_with_hint(
-    acceleration: &Acceleration,
-    keys: &[&str],
-    default: u64,
-    semantic_hint: &str,
-) -> u64 {
-    keys.iter()
-        .find_map(|&key| {
-            acceleration.params.get(key).and_then(|v| {
-                v.parse::<u64>().map_or_else(
-                    |_| {
-                        tracing::warn!(
-                            "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                        );
-                        None
-                    },
-                    Some,
-                )
-            })
-        })
-        .unwrap_or(default)
 }
 
 /// Parse a goal duration param (e.g. `"5s"`, `"1m"`, `"250ms"`) to seconds, via
@@ -524,32 +527,6 @@ fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64
             None
         }
     }
-}
-
-fn parse_optional_usize<'a>(
-    acceleration: &Acceleration,
-    keys: &'a [&'a str],
-) -> Option<(&'a str, usize)> {
-    keys.iter().find_map(|&key| {
-        acceleration.params.get(key).and_then(|v| {
-            v.parse::<usize>().map_or_else(|_| {
-                tracing::warn!(
-                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                );
-                None
-            }, |value| Some((key, value)))
-            })
-    })
-}
-
-fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
-    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
-}
-
-fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
-    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
-    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
-    i64::try_from(parsed).unwrap_or(i64::MAX)
 }
 
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
@@ -922,29 +899,6 @@ fn refresh_write_profile_for(
     RefreshWriteProfile::classify(resolved_refresh_mode, acceleration.refresh_check_interval)
 }
 
-/// The refresh mode a source actually runs with, applying the connector's fill-in
-/// for an unset `refresh_mode`.
-///
-/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
-/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
-/// `None` for a genuine `debezium:`/`cdc:` stream. Mapping the source's connector
-/// name through [`crate::builder::unset_refresh_mode_for_connector`] — the same table
-/// the runtime builder classifies the pod with — recovers it.
-///
-/// A source with no connector (a view, an Iceberg DDL table) has no default to apply
-/// and falls back to `full`, which is what those paths resolve an unset mode to.
-fn resolved_refresh_mode(
-    source: &dyn AccelerationSource,
-    acceleration: &Acceleration,
-) -> RefreshMode {
-    acceleration.refresh_mode.unwrap_or_else(|| {
-        source.connector_name().map_or(
-            RefreshMode::Full,
-            crate::builder::unset_refresh_mode_for_connector,
-        )
-    })
-}
-
 fn refresh_write_profile(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
@@ -1037,6 +991,154 @@ fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// Make a configured Cayenne directory absolute without resolving it, treating it as a
+/// filesystem path unconditionally.
+///
+/// `Err` when the path cannot be placed — a relative path whose `current_dir()` lookup
+/// fails. Everything downstream guards `remove_dir_all`, so a path this cannot place is
+/// a path whose overlap with the metastore is unknown, and the caller must refuse rather
+/// than assume.
+fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
+    let raw = Path::new(fs_probe_path(path));
+    if raw.is_absolute() {
+        Ok(raw.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(raw))
+    }
+}
+
+/// Make a configured Cayenne *data* directory absolute, or `Ok(None)` when it is an
+/// object-store location (`s3://…`) — which can never contain the metastore, since
+/// `SQLite`/Turso cannot run on object storage.
+///
+/// The exemption belongs to the data path alone, because it is the data path a recursive
+/// delete walks. It must not be applied to a metadata path: [`is_local_path`] is a
+/// substring test, so a value merely *containing* `://` would be exempted while the
+/// catalog code goes on treating it as the filesystem path it creates `cayenne.db` at —
+/// disabling the guard on a directory that never reached an object store.
+///
+/// `Err`, never the exemption, when the path cannot be placed: the exemption waves the
+/// delete through, so "cannot possibly overlap" and "cannot tell" must stay
+/// distinguishable.
+fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
+    if !is_local_path(path) {
+        return Ok(None);
+    }
+    absolute_dir(path).map(Some)
+}
+
+/// Resolve `absolute` component by component, in the order the filesystem would.
+///
+/// The order is the whole point: `..` names the parent of the directory the preceding
+/// component *resolves to*, not its lexical parent. Collapsing `..` up front and
+/// canonicalizing afterwards gets this backwards — with `link -> /data/subdir`,
+/// `link/../catalog` is `/data/catalog`, but a lexical collapse yields `/catalog` and a
+/// containment check against `/data` then passes something it must refuse. Resolving in
+/// order keeps the accumulated path symlink-free, so `..` may simply pop it.
+///
+/// A component that does not exist yet resolves to itself — neither directory
+/// necessarily exists when this runs at open time. That is the *only* `canonicalize`
+/// failure this absorbs. Any other one (`PermissionDenied`, a transient filesystem
+/// error) means the component could not be resolved, so a symlink may still be
+/// unresolved and the containment check would run against a path the delete never walks;
+/// those propagate, so the caller refuses the delete instead of comparing a lexical
+/// path.
+async fn resolve_in_filesystem_order(absolute: &Path) -> std::io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::Normal(name) => {
+                resolved.push(name);
+                match tokio::fs::canonicalize(&resolved).await {
+                    Ok(real) => resolved = real,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Every location a recursive delete of `path` could reach, or `Err` when the path
+/// cannot be resolved.
+///
+/// There is no object-store exemption here: this resolves a *metastore* directory, and
+/// the metastore is only ever local — see [`absolute_data_dir`] for why applying the
+/// exemption to this side disables the guard rather than skipping an impossible case.
+///
+/// Two forms, because a symlink is both a place and a name:
+///
+/// 1. **Fully resolved** — where the directory's contents actually live.
+/// 2. **The entry**: parent resolved, final component left literal. `remove_dir_all`
+///    unlinks the *entry* it walks onto rather than following it, so a metastore
+///    directory whose own last component is a symlink pointing out of the tree still
+///    loses its link — the catalog file survives with nothing naming it, and the
+///    connection pool keeps writing through handles nothing can reopen.
+async fn overlap_candidates(path: &str) -> std::io::Result<Vec<PathBuf>> {
+    let absolute = absolute_dir(path)?;
+
+    let mut candidates = vec![resolve_in_filesystem_order(&absolute).await?];
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+        let entry = resolve_in_filesystem_order(parent).await?.join(name);
+        if !candidates.contains(&entry) {
+            candidates.push(entry);
+        }
+    }
+    Ok(candidates)
+}
+
+/// `true` when `inner` is `outer` itself or lies beneath it — i.e. a recursive delete
+/// of `outer` takes `inner` with it. Compares whole components, so `…/meta` does not
+/// read as containing `…/metadata`.
+fn dir_contains(outer: &Path, inner: &Path) -> bool {
+    inner.starts_with(outer)
+}
+
+/// Detect the configuration in which a Cayenne recreate destroys the metastore.
+///
+/// One metastore holds the catalog — manifests, snapshot pointers, partition rows —
+/// for *every* Cayenne dataset sharing a `cayenne_metadata_dir`, and both recreate
+/// paths (`mode: file_create` in [`CayenneAccelerator::init`] and
+/// [`DataAccelerator::drop_table`] for a `file_update` schema rebuild) recursively
+/// delete a single dataset's data directory. When the metastore directory resolves
+/// onto or beneath that data directory the delete unlinks the shared catalog, and
+/// because the connection pool already holds handles to the now-unlinked file the run
+/// appears healthy while the metastore is simply gone on the next restart.
+///
+/// The stock defaults collide on their own for a dataset named `metadata`:
+/// `resolve_default_data_path` yields `{spice_data}/metadata/` and
+/// `resolve_metadata_dir` yields `{spice_data}/metadata`. An explicit
+/// `cayenne_metadata_dir` set beneath the data directory collides the same way.
+///
+/// Returns `Ok(Some((data_dir, metadata_dir)))` — resolved — when they overlap, naming
+/// whichever metastore location the delete would reach; `Ok(None)` when they provably
+/// cannot overlap — the data path is on object storage; and `Err` when either path
+/// cannot be resolved, which the caller must treat as a refusal rather than as `Ok(None)`.
+///
+/// The data directory is compared in its fully resolved form only: `remove_dir_all`
+/// refuses a final-component symlink rather than following it, so the recursive walk
+/// only ever happens at the resolved directory.
+async fn overlapping_metastore_dir(
+    data_dir: &str,
+    metadata_dir: &str,
+) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
+    let Some(absolute_data) = absolute_data_dir(data_dir)? else {
+        return Ok(None);
+    };
+    let data = resolve_in_filesystem_order(&absolute_data).await?;
+    Ok(overlap_candidates(metadata_dir)
+        .await?
+        .into_iter()
+        .find(|candidate| dir_contains(&data, candidate))
+        .map(|metadata| (data, metadata)))
+}
+
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
 /// used to name its in-memory (`memdb`) metastore so distinct instances never
 /// share one in-memory database.
@@ -1051,16 +1153,13 @@ impl CayenneAccelerator {
 
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
-        let permits = cpu_budget::cpu_budget().cayenne_compaction_permits();
-        let compaction_semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         Self {
             catalog: Arc::new(OnceCell::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
-            compaction_semaphore,
-            compaction_permits_total: permits,
+            compaction_semaphore: cayenne::compaction_budget(),
         }
     }
 
@@ -1205,6 +1304,40 @@ impl CayenneAccelerator {
         format!("{}/metadata", spice_data_base_path())
     }
 
+    /// Refuse a configuration whose recreate would delete the shared metastore — see
+    /// [`overlapping_metastore_dir`] for the shape and how the defaults reach it.
+    ///
+    /// Called at open time, where the operator can still fix the spicepod, and again
+    /// immediately before each recursive delete: at open time neither directory need
+    /// exist yet, so the resolution falls back to a lexical one, and an overlap that
+    /// only a symlink reveals appears once the directories are real.
+    ///
+    /// A path that cannot be placed refuses the recreate. The guard's whole job is to
+    /// prove the delete cannot reach the metastore, and it cannot prove that about a
+    /// path it failed to resolve.
+    async fn ensure_metastore_outside_data_dir(
+        source: &dyn AccelerationSource,
+        data_dir: &str,
+    ) -> Result<()> {
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        let overlap = overlapping_metastore_dir(data_dir, &metadata_dir)
+            .await
+            .map_err(|source_error| Error::CayenneDirsUnresolvable {
+                table_name: source.name().to_string(),
+                data_dir: data_dir.to_string(),
+                metadata_dir: metadata_dir.clone(),
+                source: source_error,
+            })?;
+        if let Some((data, metadata)) = overlap {
+            return Err(Error::MetastoreInsideDataDir {
+                table_name: source.name().to_string(),
+                data_dir: data.to_string_lossy().into_owned(),
+                metadata_dir: metadata.to_string_lossy().into_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn resolve_storage_config(&self, source: &dyn AccelerationSource) -> Result<String> {
         let paths = self
             .cayenne_data_dirs_multi_zone(source)
@@ -1252,7 +1385,7 @@ impl CayenneAccelerator {
     async fn get_vortex_config(
         table_name: &str,
         source: &dyn AccelerationSource,
-    ) -> cayenne::metadata::VortexConfig {
+    ) -> Result<cayenne::metadata::VortexConfig> {
         let small_write = source
             .acceleration()
             .is_some_and(|acceleration| uses_small_write_refresh_profile(source, acceleration));
@@ -1265,7 +1398,7 @@ impl CayenneAccelerator {
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
         workload: &autotune::WorkloadProfile,
-    ) -> cayenne::metadata::VortexConfig {
+    ) -> Result<cayenne::metadata::VortexConfig> {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
             // Default the query/scan path to native Arrow types (Utf8/Binary).
@@ -1394,13 +1527,20 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
             }
 
-            // Vortex segment cache: memory-aware `auto` default (scales up on
-            // memory-rich hosts, never below the historical 256 MiB), overridable.
-            config.segment_cache_mb = autotune::auto_or_usize(
-                acceleration,
-                &["cayenne_segment_cache_mb"],
-                hw.segment_cache_mb(),
-            );
+            // Vortex segment cache: one cache serves every table, so its budget is
+            // set once at the runtime level and a per-table value has nothing to
+            // size. This memory-aware default only reaches a process with no
+            // installed cache (an embedded host that skips the runtime builder).
+            config.segment_cache_mb = hw.segment_cache_mb();
+            // Report on the key being *present*, not on it parsing: `read_knob`
+            // folds `auto` and malformed values alike into `Knob::Auto`, so
+            // matching on `Set` would leave those operators unaware their setting
+            // no longer does anything.
+            if let Some(requested_mb) = acceleration.params.get("cayenne_segment_cache_mb") {
+                tracing::warn!(
+                    "Dataset {table_name}: acceleration.params.cayenne_segment_cache_mb={requested_mb} is ignored. The Vortex segment cache is now a single budget shared by every table instead of one cache per table, so a per-table size has nothing to size. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+            }
 
             // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
             // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
@@ -1419,6 +1559,28 @@ impl CayenneAccelerator {
                     autotune::Knob::Set(mb) => mb,
                 },
             );
+
+            // Intra-file scan concurrency: `auto` derives it from target
+            // partitions and the planned file count, `off` decodes serially, an
+            // explicit count pins it. The scan charges the query pool for every
+            // concurrent split, so this is the lever for trading resident decode
+            // memory against scan throughput without moving the whole query
+            // fan-out via `runtime.query.target_partitions`.
+            //
+            // A bad value FAILS the dataset rather than warning and continuing.
+            // The siblings below fall back to their defaults, but this one bounds
+            // memory: falling back would resolve a value meant to REDUCE the
+            // fan-out into `auto`, the widest one, and surface as pool exhaustion
+            // under load rather than as the typo it is.
+            if let Some(concurrency_str) = acceleration.params.get("cayenne_scan_concurrency") {
+                config.scan_concurrency = concurrency_str
+                    .parse::<cayenne::metadata::ScanConcurrency>()
+                    .ok()
+                    .context(InvalidScanConcurrencySnafu {
+                        table_name,
+                        value: concurrency_str,
+                    })?;
+            }
 
             // Parse compression strategy
             if let Some(strategy_str) = acceleration.params.get("cayenne_compression_strategy") {
@@ -1458,7 +1620,7 @@ impl CayenneAccelerator {
             // `cdc_durability: memory` path). Default 1 = the unchanged serial
             // path; N>1 partitions the PK space into N independent serial
             // domains. Clamped to >=1 in `Table::new_internal`.
-            config.cdc_mem_tier_shards = parse_usize_aliases(
+            config.cdc_mem_tier_shards = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_cdc_mem_tier_shards", "cdc_mem_tier_shards"],
                 config.cdc_mem_tier_shards,
@@ -1549,18 +1711,17 @@ impl CayenneAccelerator {
                 }
                 config.cdc_durability = cayenne::metadata::CdcDurability::File;
             }
-            config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
+            config.cdc_mem_tier_max_bytes = autotune::auto_or_i64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
                 config.cdc_mem_tier_max_bytes,
             );
-            config.cdc_mem_tier_max_age_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_max_age_ms = autotune::auto_or_u64(
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
                 config.cdc_mem_tier_max_age_ms,
-                " (milliseconds)",
             );
-            config.cdc_mem_tier_min_flush_bytes = parse_usize_aliases_as_i64(
+            config.cdc_mem_tier_min_flush_bytes = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_min_flush_bytes",
@@ -1568,23 +1729,21 @@ impl CayenneAccelerator {
                 ],
                 config.cdc_mem_tier_min_flush_bytes,
             );
-            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_checkpoint_interval_ms = autotune::auto_or_u64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_checkpoint_interval_ms",
                     "cdc_mem_tier_checkpoint_interval_ms",
                 ],
                 config.cdc_mem_tier_checkpoint_interval_ms,
-                " (milliseconds)",
             );
-            config.cdc_mem_tier_seal_age_ms = parse_u64_aliases_with_hint(
+            config.cdc_mem_tier_seal_age_ms = autotune::auto_or_u64(
                 acceleration,
                 &[
                     "cayenne_cdc_mem_tier_seal_age_ms",
                     "cdc_mem_tier_seal_age_ms",
                 ],
                 config.cdc_mem_tier_seal_age_ms,
-                " (milliseconds)",
             );
 
             // Widening schema evolution at table open is gated on the dataset's
@@ -1596,11 +1755,20 @@ impl CayenneAccelerator {
             // v1: its hidden `__spice_cache_namespace` column is appended LAST
             // and evolution also appends at the end — the positional
             // disagreement is unfixable via column adds.
+            // A partitioned table is excluded here, where the config is built,
+            // rather than only where the partition wrapper is: this same config
+            // opens the PARENT catalog entry, which is created first. Leaving
+            // evolution on for that open lets the catalog widen the parent's
+            // stored schema while every partition keeps its own — the accelerated
+            // table then advertises a schema its data does not have, which is the
+            // silent narrowing cast of #12999 reached through the open path
+            // instead of `evolve_table_schema`.
             let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
+            let is_partitioned = !acceleration.partition_by.is_empty();
             config.schema_evolution = source
                 .as_any()
                 .downcast_ref::<crate::component::dataset::Dataset>()
-                .filter(|_| !is_caching_mode)
+                .filter(|_| !is_caching_mode && !is_partitioned)
                 .map_or(
                     cayenne::metadata::SchemaEvolutionMode::Disabled,
                     |dataset| match dataset.on_schema_change {
@@ -1866,37 +2034,26 @@ impl CayenneAccelerator {
                 config.compaction_background_interval_ms,
             );
 
-            // Tuning mode (`cayenne_tuning`): `auto` (default) derives correct
-            // values statically from the detected environment + inferred schema;
-            // `adaptive` additionally runs the closed-feedback loop that adapts
-            // the knobs over time within the environment-derived [floor, ceiling].
-            // Independently, an explicit per-knob value always overrides the
-            // derived value — and under `adaptive` it *pins* that knob, so the
-            // loop leaves it alone (its bounds collapse to a point downstream).
-            // Normalize `cayenne_tuning` up front (see `normalize_cayenne_tuning`): an
-            // invalid value folds to `auto` so it behaves as the documented default
-            // everywhere downstream — including the goal-gate below (which tests
-            // `== "auto"`) — instead of slipping through as "not auto" and enabling
-            // adaptive.
+            // Tuning mode (`cayenne_tuning`): `auto` derives the knobs statically
+            // from the detected environment + inferred schema; `adaptive` also runs
+            // the closed-feedback loop that moves them within the environment-derived
+            // [floor, ceiling]. `adaptive` is reached ONLY by asking for it here —
+            // unset, unrecognized, and every other signal (inferred schema, a
+            // configured `cayenne_goal_*`) resolve to `auto`. Independently of the
+            // mode, an explicit per-knob value overrides the derived one, and under
+            // `adaptive` it *pins* that knob so the loop leaves it alone.
             let raw_tuning = acceleration
                 .params
                 .get("cayenne_tuning")
                 .map(String::as_str);
-            let (tuning_mode, tuning_was_invalid) = normalize_cayenne_tuning(raw_tuning);
+            let (tuning_mode, tuning_was_invalid) = autotune::TuningMode::parse(raw_tuning);
             if tuning_was_invalid {
                 tracing::warn!(
                     "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'.",
                     raw_tuning.unwrap_or_default().trim()
                 );
             }
-            // Resolve the tuning mode. An explicit `cayenne_tuning` value always
-            // wins; when it is UNSET the default is `auto` (static derivation from
-            // the detected environment and inferred schema, no closed loop). Schema
-            // inference is always attempted now, so its presence is no longer a
-            // signal to auto-enable the closed loop — opt in explicitly with
-            // `cayenne_tuning: adaptive`. Inferred metadata still sharpens the
-            // adaptive warm start when the loop is enabled.
-            config.dynamic_tuning = matches!(tuning_mode.as_deref(), Some("adaptive"));
+            config.dynamic_tuning = tuning_mode.is_adaptive();
             // Inferred schema metadata SHARPENS the adaptive warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
             // feeds the query-health surface), but it is not REQUIRED for
@@ -1922,11 +2079,10 @@ impl CayenneAccelerator {
                 config.dynamic_tuning = false;
             }
             // Goal-driven tuning: parse the high-level SLO setpoints. Times are
-            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. A configured
-            // goal IMPLIES the closed loop (a goal with tuning off is inert),
-            // unless the operator explicitly opted out with `cayenne_tuning: auto`,
-            // and provided the background compaction tick the controller rides is
-            // enabled. Query latency is stored in ms.
+            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. The goals
+            // steer the closed loop but never ENABLE it: `adaptive` is reached
+            // only by an explicit `cayenne_tuning: adaptive`, so a goal set
+            // without it is inert and warns below. Query latency is stored in ms.
             // SLO setpoints resolve a GLOBAL default (`runtime.params`) with a
             // per-dataset (`acceleration.params`) override: set an SLO once for the
             // whole runtime and sharpen it per table where needed.
@@ -1972,23 +2128,12 @@ impl CayenneAccelerator {
                 || config.goal_freshness_secs.is_some()
                 || config.goal_query_latency_ms.is_some()
                 || config.goal_qph.is_some();
-            if any_goal && tuning_mode.as_deref() == Some("auto") {
-                tracing::warn!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    "`cayenne_goal_*` set but `cayenne_tuning: auto` explicitly disables the closed loop; the goals will be ignored. Remove `cayenne_tuning: auto` (or set `adaptive`) to enable goal-seeking."
-                );
-            } else if any_goal
-                && !config.dynamic_tuning
-                && config.compaction_background_interval_ms != 0
-            {
-                config.dynamic_tuning = true;
-                tracing::info!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    "`cayenne_goal_*` set: enabling adaptive tuning (goal-seeking closed loop)."
-                );
-            }
+            // A goal never switches the mode: `adaptive` is a preview feature and
+            // is entered only by asking for it, so a goal configured while the
+            // loop is off is reported as ignored (below, under the newly-resolved
+            // guard so a dataset that keeps failing to load does not repeat it)
+            // rather than silently promoting the table into a different regime.
+            let goals_are_inert = any_goal && !config.dynamic_tuning;
             if config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
@@ -2040,11 +2185,21 @@ impl CayenneAccelerator {
             // Report the resolution once per *resolved configuration*, not once per
             // provider construction: this function runs on every
             // `create_external_table` / `create_cayenne_table_provider`, and a
-            // dataset that keeps failing to load is rebuilt on every retry. Both
-            // emits below are pure functions of `config` and `hw.cores`, so the one
-            // fingerprint covers them.
+            // dataset that keeps failing to load is rebuilt on every retry. Every
+            // emit below is a pure function of `config` and `hw.cores`, so the one
+            // fingerprint covers them all.
             let fingerprint = auto_tuned_config_fingerprint(table_name, &hw, workload, &config);
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // A `cayenne_goal_*` SLO with the closed loop off does nothing, and
+                // it is easy to set one globally and assume it took effect.
+                if goals_are_inert {
+                    tracing::warn!(
+                        target: "spiced::acceleration::cayenne",
+                        table = %table_name,
+                        "`cayenne_goal_*` is set but adaptive tuning is off, so the goals are ignored (`cayenne_tuning` defaults to 'auto'). Set `cayenne_tuning: adaptive` on this dataset to enable goal-seeking."
+                    );
+                }
+
                 // Surface cross-parameter and out-of-range issues that parse cleanly
                 // but won't behave as intended (silently clamped at use, or don't
                 // compose with each other) — see `VortexConfig::config_warnings`.
@@ -2076,8 +2231,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
-                    config.segment_cache_mb,
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2106,7 +2260,7 @@ impl CayenneAccelerator {
             }
         }
 
-        config
+        Ok(config)
     }
 
     fn transformed_arrow_schema(
@@ -2213,9 +2367,23 @@ impl CayenneAccelerator {
         config.inline_max_rows = 0;
         config.inline_max_bytes = 0;
         config.inline_max_buffer_bytes = 0;
+        // Only a number the config field can actually hold is an explicit limit.
+        // `auto` is a request for the derived default, which in memory mode is "no
+        // cap" — reading mere key presence would turn
+        // `cayenne_cdc_mem_tier_max_bytes: auto` into the file-mode host-derived
+        // cap, and memory mode has no spill path to fall back on, so crossing it
+        // fails the write. A value above `i64::MAX` is the same story: knobs parse
+        // as `usize`, so it reads as set, but `auto_or_i64` cannot represent it and
+        // has already fallen back to the derived value — treating it as explicit
+        // would pin a cap the operator never asked for.
         let explicit_limit = acceleration.is_some_and(|a| {
-            a.params.contains_key("cayenne_cdc_mem_tier_max_bytes")
-                || a.params.contains_key("cdc_mem_tier_max_bytes")
+            matches!(
+                autotune::read_knob(
+                    a,
+                    &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+                ),
+                autotune::Knob::Set(bytes) if i64::try_from(bytes).is_ok()
+            )
         });
         if !explicit_limit {
             config.cdc_mem_tier_max_bytes = 0;
@@ -2325,7 +2493,7 @@ impl CayenneAccelerator {
             self.footer_cache_mb,
             &workload,
         )
-        .await;
+        .await?;
 
         // Memory mode: make the mem-tier the permanent in-RAM store — never
         // checkpoint/seal to Vortex, no compaction/cold tier, single shard (so a
@@ -2523,12 +2691,6 @@ impl CayenneAccelerator {
         // `spawn_blocking` builds + the periodic eviction sweep that releases idle
         // cached views' pinned snapshot dirs for GC). Must run once, after `Arc::new`.
         provider.init_scan_view_cache();
-        // Publish the real, in-use compaction semaphore for the occupancy gauges
-        // (idempotent across the fleet — every table shares this one semaphore).
-        publish_compaction_semaphore_for_metrics(
-            &self.compaction_semaphore,
-            self.compaction_permits_total,
-        );
         // Memory mode never drains to Vortex (no compaction, no mem-tier
         // checkpoint/seal, no cold tier), so skip the background drain tasks
         // entirely; the provider's own guards also no-op them defensively.
@@ -2711,8 +2873,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    63,
-    { S3_PARAMS_LEN + 63 },
+    64,
+    { S3_PARAMS_LEN + 64 },
 >(
     S3_PARAMETERS,
     [
@@ -2730,7 +2892,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
+            .description("Ignored: the in-memory Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per table, so a per-table size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (unset: ~1/64 of the available memory, clamped to [256 MB, 2048 MB]; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
+        ParameterSpec::component("scan_concurrency")
+            .description("How many splits a single Vortex file scan decodes concurrently. 'auto' (default) derives it from the query fan-out and the number of files a scan plans, so a table held in few files still decodes in parallel. 'off' decodes each file serially. An explicit count pins it. Each concurrent split holds a decoded batch, and all of them are charged to 'runtime.query.memory_limit', so lowering this cuts a scan's resident decode memory without shrinking query parallelism everywhere the way 'runtime.query.target_partitions' does.")
             .default("auto"),
         ParameterSpec::component("pk_keyset_cache_mb")
             .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
@@ -2851,14 +3015,15 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'auto' — except that a configured cayenne_goal_* SLO implies 'adaptive' unless you set 'auto' explicitly. Set 'cayenne_tuning: adaptive' explicitly to enable the closed loop without a goal. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
-            .one_of(&["auto", "adaptive"]),
+            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"])
+            .default("auto"),
         ParameterSpec::component("goal_replication_lag")
-            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps."),
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps."),
         ParameterSpec::component("goal_freshness")
-            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset."),
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
         ParameterSpec::component("goal_query_latency")
-            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset."),
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
         // NOTE: there is no per-dataset `goal_qph` ParameterSpec — QPH is a
         // system-wide metric (a query/join spans datasets), so its goal is
         // configured globally only, under `runtime.params`.
@@ -2885,6 +3050,10 @@ impl DataAccelerator for CayenneAccelerator {
 
     fn name(&self) -> &'static str {
         "cayenne"
+    }
+
+    fn type_rewrite_rules(&self) -> arrow_tools::type_rewrite::TypeRewriteRules {
+        cayenne::CAYENNE_TYPE_REWRITE_RULES
     }
 
     fn valid_file_extensions(&self) -> Vec<&'static str> {
@@ -2942,10 +3111,117 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    async fn init(
+    /// Cayenne keeps its sidecar tables in the metastore database beside the dataset's
+    /// Cayenne directory, not in the dataset's own store.
+    ///
+    /// When that metastore is Turso, the pool comes from the **Turso accelerator's**
+    /// path-keyed cache rather than one built here: `cayenne.db` is opened by every
+    /// sidecar of every Cayenne dataset in the pod, and the lock that serializes their
+    /// DDL against each other's `BEGIN CONCURRENT` writes lives on the pool instance —
+    /// a pool of our own would hold a lock no other sidecar observes.
+    async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
         registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        #[cfg(feature = "sqlite")]
+        {
+            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
+
+            // Resolving the data directory validates the acceleration configuration; the
+            // metastore path below is derived independently of it.
+            self.file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+
+            if open_option == OpenOption::OpenExisting
+                && !std::path::Path::new(&metadata_db_path).exists()
+            {
+                return Err(CheckpointError::Store {
+                    source: format!(
+                        "Cayenne metadata directory does not exist at {metadata_db_path}"
+                    )
+                    .into(),
+                });
+            }
+
+            if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|source| {
+                    CheckpointError::Store {
+                        source: Box::new(source),
+                    }
+                })?;
+            }
+
+            #[cfg(feature = "turso")]
+            {
+                let metastore_type = source
+                    .acceleration()
+                    .and_then(|a| a.params.get("cayenne_metastore"))
+                    .map_or("sqlite", String::as_str);
+                if metastore_type == "turso" {
+                    let turso_engine = registry
+                        .get_accelerator_engine(Engine::Turso)
+                        .await
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "Turso accelerator engine not available".into(),
+                        })?;
+                    let turso_accelerator = turso_engine
+                        .as_any()
+                        .downcast_ref::<crate::dataaccelerator::turso::TursoAccelerator>()
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "expected the registered Turso accelerator".into(),
+                        })?;
+                    let pool = turso_accelerator
+                        .get_shared_pool_for_path(&metadata_db_path)
+                        .await
+                        .map_err(|source| CheckpointError::Store {
+                            source: Box::new(source),
+                        })?;
+                    return Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
+                        pool,
+                        source.name().to_string(),
+                    )));
+                }
+            }
+
+            let sqlite_factory = SqliteTableProviderFactory::new();
+            let pool = sqlite_factory
+                .get_or_init_instance(
+                    Arc::from(metadata_db_path.as_str()),
+                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            Ok(Arc::new(SqliteSidecar::new(
+                Arc::new(pool),
+                source.name().to_string(),
+            )))
+        }
+
+        // The Cayenne metastore is a SQLite (or Turso) database, so without the
+        // `sqlite` engine compiled in there is nothing to open it with.
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (source, registry, open_option);
+            Err(runtime_acceleration::sidecar::unsupported_sidecar(
+                "cayenne", "sidecar",
+            ))
+        }
+    }
+
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
@@ -2981,6 +3257,11 @@ impl DataAccelerator for CayenneAccelerator {
         }
 
         let dir_path = self.file_path(source)?;
+
+        // Fail here rather than at teardown, when the operator is already committed and
+        // the delete has nothing left to protect.
+        Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
+
         let is_s3_express = s3::is_s3_express_data_path(source);
 
         // Handle S3 Express One Zone configuration
@@ -3102,22 +3383,63 @@ impl DataAccelerator for CayenneAccelerator {
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
                 );
-                super::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
                     &source.name().to_string(),
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
-                    // For pre-recreate snapshots we don't have a constructed
-                    // catalog handy (the metastore directory may even be in
-                    // a transient state). Pass None and accept the default
-                    // engine; the resulting snapshot will use the legacy
-                    // archive-cayenne.db path. This is acceptable because
-                    // pre-recreate snapshots are best-effort backups, not
-                    // refresh_mode: snapshot sources.
-                    None,
+                    // The outgoing snapshot becomes the store's current snapshot, so
+                    // it has to be one a Cayenne bootstrap can consume:
+                    // `CayenneSnapshotEngine::finalize_directory_snapshot` requires the
+                    // per-dataset metastore slice, and the default engine archives a
+                    // raw `cayenne.db` without one. This exports the slice while the
+                    // dataset's table metadata is still in the catalog — the drop below
+                    // removes it. If the catalog is unavailable this resolves to `None`
+                    // and `snapshot_before_recreate` skips the snapshot rather than
+                    // publish an archive nothing can restore.
+                    self.snapshot_engine_for_source(source).await,
+                    resolved_refresh_mode(source, acceleration),
                 )
                 .await;
+            }
+
+            // Metadata before files, and its failures are fatal — the same
+            // ordering `drop_table` uses, and for the same reason. Deleting the
+            // directory first and then continuing past a failed catalog drop
+            // leaves rows describing files that are gone, and for a partitioned
+            // table leaves the per-partition children whose stale schemas this
+            // rebuild exists to discard. Failing first leaves an acceleration
+            // the operator can retry.
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            let table_name = source.name().to_string();
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            if catalog
+                .drop_table(&table_name)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
+            {
+                tracing::info!(
+                    "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
+                );
+            }
+
+            if path_buf.exists() {
+                // Re-check now that the directories exist: `snapshot_before_recreate`
+                // creates both, so an overlap only a symlink reveals is resolvable here
+                // even though the open-time check above had nothing to canonicalize.
+                Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
 
                 tracing::warn!(
                     "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
@@ -3127,37 +3449,6 @@ impl DataAccelerator for CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
-            }
-
-            // Also drop the table from metadata catalog to clean up stale metadata
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            // Get or create catalog and drop the table if it exists
-            if let Ok(catalog) = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let table_name = source.name().to_string();
-                match catalog.drop_table(&table_name).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
-                        );
-                    }
-                    Ok(false) => {
-                        // Table didn't exist in metadata, nothing to drop
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to drop Cayenne table metadata for '{table_name}': {e}. Continuing anyway."
-                        );
-                    }
-                }
             }
         }
 
@@ -3208,10 +3499,10 @@ impl DataAccelerator for CayenneAccelerator {
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
+                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {
@@ -3279,7 +3570,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .map(str::trim)
                 .filter(|sql| !sql.is_empty())
                 .map(|retention_sql| {
-                    match crate::datafusion::retention_sql::parse_retention_sql(
+                    match runtime_datafusion::retention_sql::parse_retention_sql(
                         source.name(),
                         retention_sql,
                         Arc::clone(&arrow_schema),
@@ -3445,17 +3736,24 @@ impl DataAccelerator for CayenneAccelerator {
                 self.footer_cache_mb,
                 &workload,
             )
-            .await;
+            .await?;
             // Partitioned tables are excluded from v1 schema evolution
             // (per-partition catalog tables would evolve lazily as each
-            // partition opens, leaving mixed schemas across partitions);
-            // keep the legacy pin-stored-schema behavior.
-            if !vortex_config.schema_evolution.is_disabled() {
+            // partition opens, leaving mixed schemas across partitions); keep
+            // the legacy pin-stored-schema behavior. The config already arrives
+            // Disabled for a partitioned table — see where `schema_evolution` is
+            // built, which has to exclude it there so the parent open cannot
+            // widen either — so this only tells an operator whose
+            // `on_schema_change` asked for evolution that it will not apply.
+            debug_assert!(
+                vortex_config.schema_evolution.is_disabled(),
+                "a partitioned Cayenne table must never carry an evolution mode"
+            );
+            if requests_schema_evolution(source) {
                 tracing::warn!(
                     dataset = %source.name(),
                     "on_schema_change schema evolution is not supported for partitioned Cayenne tables; schema changes will not be applied in place"
                 );
-                vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
             serialize_partition_child_writes(&mut vortex_config, &table_name);
@@ -3630,26 +3928,40 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
+
+        // A schema rebuild reaches this without going through `init`, so the
+        // open-time check is not on this path's stack. Refuse before touching
+        // the catalog: an overlapping metastore is a configuration the whole
+        // rebuild must reject, not just the delete below — opening the nested
+        // path as a catalog would fail confusingly (or worse, mutate it) first.
         if path_buf.exists() {
-            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
-            tracing::info!(
-                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
-            );
+            Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
         }
 
-        // Also drop the table from metadata catalog
+        // Metadata first, and its failures are fatal. The caller treats a
+        // successful drop as licence to clear the dataset checkpoint and
+        // recreate, so a drop that removed the files and then failed to remove
+        // the catalog rows would hand the next create a manifest of files that
+        // no longer exist and, for a partitioned table, children still pinning
+        // the old schema. Failing before anything is deleted leaves a table the
+        // operator can retry; the reverse order leaves one nothing can repair.
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
-            if let Ok(catalog) = self
+            let catalog = self
                 .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let _ = catalog.drop_table(table_name).await;
-            }
+                .await?;
+            catalog.drop_table(table_name).await.boxed()?;
+        }
+
+        if path_buf.exists() {
+            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
+            tracing::info!(
+                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+            );
         }
 
         // Recreate the data directory so the next create_external_table works
@@ -3666,6 +3978,10 @@ impl DataAccelerator for CayenneAccelerator {
     /// Idempotent: re-applying a plan whose evolved schema is already stored
     /// is a no-op, so a crash between this engine update and the checkpoint
     /// update self-heals via restart re-classification.
+    ///
+    /// Refused for a partitioned table: see [`PartitionedEvolutionUnsupported`].
+    ///
+    /// [`PartitionedEvolutionUnsupported`]: Error::PartitionedEvolutionUnsupported
     async fn evolve_table_schema(
         &self,
         table_name: &str,
@@ -3679,6 +3995,29 @@ impl DataAccelerator for CayenneAccelerator {
                 dataset: Arc::from(source.name().to_string()),
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        // A partitioned table keeps one Vortex table per partition, each with its
+        // own stored schema, and this method can only reach the parent catalog
+        // entry. Evolving the parent alone would report success while every
+        // partition still holds the old schema — so writes narrow-cast into them
+        // (silently losing precision) and the caller advances the dataset
+        // checkpoint past a change that was never applied, which makes every
+        // later restart classify source and checkpoint as identical and leaves
+        // the dataset permanently stuck. Refusing hands the change to the
+        // caller's fallback, which honors `mode: file_update` and
+        // `on_schema_change: drop_and_recreate` by recreating the table with the
+        // new schema.
+        //
+        // NOTE: this check belongs here and not in
+        // `engine_supports_in_place_evolution`, which `engine_supports_recreate`
+        // delegates to — excluding partitioned Cayenne there would also
+        // disqualify it from the recreate that makes this path work.
+        if !acceleration.partition_by.is_empty() {
+            return Err(Box::new(Error::PartitionedEvolutionUnsupported {
+                dataset: Arc::from(source.name().to_string()),
+            }));
+        }
+
         let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
         let metastore_type = acceleration
             .params
@@ -3754,6 +4093,24 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
+/// Whether the dataset's `on_schema_change` asks for in-place schema evolution.
+///
+/// The policy lives on the `Dataset` component, so a non-`Dataset` source (a
+/// view, or DDL) never asks for it.
+fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
+    source
+        .as_any()
+        .downcast_ref::<crate::component::dataset::Dataset>()
+        .is_some_and(|dataset| {
+            matches!(
+                dataset.on_schema_change,
+                crate::component::dataset::OnSchemaChange::AppendNewColumns
+                    | crate::component::dataset::OnSchemaChange::SyncAllColumns
+                    | crate::component::dataset::OnSchemaChange::DropAndRecreate
+            )
+        })
+}
+
 /// Force partition child tables to encode serially (one write shard).
 ///
 /// Two reasons, both specific to partitioned datasets:
@@ -3794,19 +4151,6 @@ fn serialize_partition_child_writes(
 }
 
 data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
-
-/// Normalize a raw `cayenne_tuning` value: trim + lowercase, mapping `auto`/`adaptive`
-/// through unchanged and any *other* value to `Some("auto")` (the documented default).
-/// Returns `(normalized_mode, was_invalid)`. Folding an invalid value to `auto` keeps
-/// it behaving as the default everywhere downstream — including the `cayenne_goal_*`
-/// gate that tests `== "auto"` — instead of slipping through as "not auto" and
-/// enabling adaptive.
-fn normalize_cayenne_tuning(raw: Option<&str>) -> (Option<String>, bool) {
-    match raw.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(mode) if mode != "auto" && mode != "adaptive" => (Some("auto".to_string()), true),
-        other => (other, false),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3867,27 +4211,67 @@ mod tests {
         assert!(mask.value(1), "2008-01-01 is after the bound");
     }
 
+    /// In memory mode an unset mem-tier cap means "no cap", and `auto` asks for
+    /// that same derived default — so it must not be mistaken for an operator's
+    /// explicit hard limit, which memory mode (no spill path) enforces by failing
+    /// the write.
     #[test]
-    fn normalize_cayenne_tuning_folds_invalid_to_auto() {
-        // Unset stays unset; `auto`/`adaptive` pass through (trim + lowercase).
-        assert_eq!(normalize_cayenne_tuning(None), (None, false));
+    fn memory_mode_treats_an_auto_mem_tier_cap_as_unset() {
+        let mut config = cayenne::metadata::VortexConfig {
+            cdc_mem_tier_max_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+        let auto = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                "AUTO".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&auto));
         assert_eq!(
-            normalize_cayenne_tuning(Some("auto")),
-            (Some("auto".to_string()), false)
+            config.cdc_mem_tier_max_bytes, 0,
+            "`auto` resolves identically to omitting the knob (no cap)"
         );
+
+        let mut config = cayenne::metadata::VortexConfig::default();
+        let pinned = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                "1048576".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&pinned));
+        assert_ne!(
+            config.cdc_mem_tier_max_bytes, 0,
+            "a number is still an explicit hard limit"
+        );
+
+        // A value the `i64` config field cannot hold reads as set (knobs parse as
+        // `usize`) but never reaches the config — `auto_or_i64` has already fallen
+        // back to the derived value — so it must not pin a cap either.
+        let mut config = cayenne::metadata::VortexConfig {
+            cdc_mem_tier_max_bytes: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+        let overflowing = Acceleration {
+            params: [(
+                "cayenne_cdc_mem_tier_max_bytes".to_string(),
+                u64::MAX.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        CayenneAccelerator::apply_memory_mode_overrides(&mut config, Some(&overflowing));
         assert_eq!(
-            normalize_cayenne_tuning(Some("  Adaptive ")),
-            (Some("adaptive".to_string()), false)
-        );
-        // An invalid value folds to `auto` (flagged invalid), so it can NEVER enable
-        // adaptive, and the `cayenne_goal_*` gate (which tests `== "auto"`) treats it
-        // as auto rather than "not auto".
-        let (mode, invalid) = normalize_cayenne_tuning(Some("nonsense"));
-        assert!(invalid, "an unrecognized value is flagged invalid");
-        assert_eq!(mode.as_deref(), Some("auto"), "invalid folds to auto");
-        assert!(
-            !matches!(mode.as_deref(), Some("adaptive")),
-            "invalid must not enable adaptive tuning"
+            config.cdc_mem_tier_max_bytes, 0,
+            "a value too large for the config field is not an explicit limit"
         );
     }
     use crate::component::dataset::acceleration::{Acceleration, Mode, RefreshMode};
@@ -4739,6 +5123,328 @@ mod tests {
         );
     }
 
+    /// The stock defaults collide with no operator error at all: a dataset literally
+    /// named `metadata` resolves its data directory onto the shared metastore
+    /// directory, so recreating it unlinks the catalog for every other Cayenne dataset
+    /// in the instance. Regression test for #13055 / #13068.
+    #[tokio::test]
+    async fn overlap_detects_the_default_collision_for_a_dataset_named_metadata() {
+        let metastore = CayenneAccelerator::resolve_metadata_dir(None);
+
+        let colliding = CayenneAccelerator::resolve_default_data_path("metadata");
+        assert!(
+            overlapping_metastore_dir(&colliding, &metastore)
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "a dataset named `metadata` puts its data directory on top of the metastore: \
+             data={colliding} metastore={metastore}"
+        );
+
+        let ordinary = CayenneAccelerator::resolve_default_data_path("orders");
+        assert!(
+            overlapping_metastore_dir(&ordinary, &metastore)
+                .await
+                .expect("the test paths resolve")
+                .is_none(),
+            "an ordinary dataset name is disjoint from the metastore: \
+             data={ordinary} metastore={metastore}"
+        );
+    }
+
+    /// The containment test compares path *components*: `…/data/meta` must not be
+    /// read as containing `…/data/metadata` just because it is a string prefix.
+    #[tokio::test]
+    async fn overlap_ignores_a_sibling_directory_sharing_a_name_prefix() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("meta");
+        let metastore = base.path().join("metadata");
+
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &metastore.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_none(),
+            "`meta` and `metadata` are siblings, not nested"
+        );
+    }
+
+    /// An explicit `cayenne_metadata_dir` may legally point anywhere, including
+    /// beneath a dataset's data directory — where the recreate deletes it.
+    #[tokio::test]
+    async fn overlap_detects_an_explicit_metadata_dir_nested_under_the_data_dir() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+
+        let nested = data.join("catalog");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &nested.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "a metadata dir beneath the data dir is deleted with it"
+        );
+
+        let outside = base.path().join("catalog");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &outside.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_none(),
+            "a metadata dir outside the data dir survives the recreate"
+        );
+    }
+
+    /// Neither `..` nor a symlinked ancestor may hide an overlap — a purely lexical
+    /// comparison misses both, and `remove_dir_all` follows neither before deleting.
+    #[tokio::test]
+    async fn overlap_resolves_dot_dot_and_symlinks_before_comparing() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+        std::fs::create_dir_all(&data).expect("data dir");
+
+        let traversed = data.join("sibling").join("..").join("catalog");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &traversed.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "`orders/sibling/../catalog` is `orders/catalog`, which the delete takes"
+        );
+
+        // A symlink to the data directory resolves onto it, so a metadata dir reached
+        // through the link is inside the tree the delete walks.
+        #[cfg(unix)]
+        {
+            let link = base.path().join("link-to-orders");
+            std::os::unix::fs::symlink(&data, &link).expect("symlink");
+            let through_link = link.join("catalog");
+            assert!(
+                overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
+                    .await
+                    .expect("the test paths resolve")
+                    .is_some(),
+                "a metadata dir reached through a symlink to the data dir is still inside it"
+            );
+        }
+    }
+
+    /// `..` names the parent of what the preceding component *resolves to*. With
+    /// `link -> {base}/data/subdir`, `link/../catalog` is `{base}/data/catalog` — inside
+    /// the data directory — but collapsing `..` before resolving `link` yields
+    /// `{base}/catalog` and lets the delete through. Raised by Copilot on #13101.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlap_applies_dot_dot_after_the_symlink_that_precedes_it() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("data");
+        std::fs::create_dir_all(data.join("subdir")).expect("data subdir");
+
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(data.join("subdir"), &link).expect("symlink");
+
+        let through_link = link.join("..").join("catalog");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "`link/../catalog` resolves inside the data dir once `link` is followed first"
+        );
+    }
+
+    /// `remove_dir_all` unlinks the directory entry it walks onto rather than following
+    /// it, so a metastore directory whose own last component is a symlink out of the
+    /// tree still loses its link — the catalog file survives with nothing naming it.
+    /// Raised by Copilot on #13101.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlap_detects_a_metastore_entry_symlinked_out_of_the_data_dir() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+        std::fs::create_dir_all(&data).expect("data dir");
+
+        // The catalog's contents live outside the data directory, but the name that
+        // reaches them is inside it.
+        let real_metastore = base.path().join("real-metastore");
+        std::fs::create_dir_all(&real_metastore).expect("metastore dir");
+        let entry = data.join("catalog");
+        std::os::unix::fs::symlink(&real_metastore, &entry).expect("symlink");
+
+        // Compare against the *returned* data path: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, so the path the test built is not the one
+        // the guard resolves to.
+        let (resolved_data, reached) =
+            overlapping_metastore_dir(&data.to_string_lossy(), &entry.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .expect("the entry inside the data dir is unlinked by the delete");
+        assert!(
+            reached.starts_with(&resolved_data),
+            "the error must name the entry the delete removes, not its target: {reached:?}"
+        );
+        assert!(
+            !reached.starts_with(&real_metastore),
+            "the target lies outside the data dir; naming it would read as a false positive"
+        );
+    }
+
+    /// Object-store data paths cannot contain the metastore — `SQLite`/Turso only run
+    /// on a local filesystem — so the guard must not reject an S3 configuration.
+    #[tokio::test]
+    async fn overlap_never_fires_for_an_object_store_data_path() {
+        assert!(
+            overlapping_metastore_dir("s3://bucket/orders/", "/var/spice/metadata")
+                .await
+                .expect("the test paths resolve")
+                .is_none(),
+            "an S3 data path is disjoint from any local metastore"
+        );
+    }
+
+    /// `Ok(None)` is what waves a recursive delete through, so it must mean "object
+    /// store" and nothing else — never "could not work out where this path is". Every
+    /// local spelling, including a relative one and a `file://` URI, resolves to a path
+    /// the overlap check can compare. Raised by Copilot on #13101.
+    #[test]
+    fn only_an_object_store_scheme_reaches_the_delete_exemption() {
+        let cwd = std::env::current_dir().expect("a working directory");
+
+        assert_eq!(
+            absolute_data_dir("relative/orders").expect("a relative path resolves"),
+            Some(cwd.join("relative/orders")),
+            "a relative local path is placed against the working directory, not exempted"
+        );
+        assert_eq!(
+            absolute_data_dir("/var/spice/orders").expect("an absolute path resolves"),
+            Some(PathBuf::from("/var/spice/orders"))
+        );
+        assert_eq!(
+            absolute_data_dir("file:///var/spice/orders").expect("a `file://` URI resolves"),
+            Some(PathBuf::from("/var/spice/orders")),
+            "a `file://` URI names a local directory, so it must be compared, not exempted"
+        );
+        assert_eq!(
+            absolute_data_dir("s3://bucket/orders/").expect("an object store is not a failure"),
+            None,
+            "only an object-store scheme may skip the overlap check"
+        );
+    }
+
+    /// The exemption belongs to the *data* path. `is_local_path` is a substring test, so
+    /// applying it to a metadata path exempts any value merely containing `://` — while
+    /// the catalog code goes on creating `cayenne.db` at that very filesystem path,
+    /// inside the directory the recreate deletes. Raised by Copilot on #13101.
+    #[tokio::test]
+    async fn a_metadata_dir_containing_a_scheme_separator_is_still_compared() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let data = base.path().join("orders");
+        std::fs::create_dir_all(&data).expect("data dir");
+
+        let nested = data.join("catalog://v1");
+        assert!(
+            overlapping_metastore_dir(&data.to_string_lossy(), &nested.to_string_lossy())
+                .await
+                .expect("the test paths resolve")
+                .is_some(),
+            "`://` inside a metadata path does not put it on object storage, and the \
+             delete still reaches it"
+        );
+    }
+
+    /// `mode: file_create` must refuse the configuration at open time, before the
+    /// recreate reaches `remove_dir_all`. Regression test for #13055 / #13068.
+    #[tokio::test]
+    async fn init_refuses_a_file_create_recreate_that_would_delete_the_metastore() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        // Named `metadata`, so the default data path resolves onto the default
+        // metastore directory with no explicit parameter involved.
+        let mut dataset = DatasetBuilder::try_new("metadata".to_string(), "metadata")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileCreate,
+            ..Default::default()
+        });
+
+        let err = CayenneAccelerator::new()
+            .init(&dataset)
+            .await
+            .expect_err("init must refuse a data directory that contains the metastore");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("contains the Cayenne metastore directory"),
+            "the error must name the overlap; got: {message}"
+        );
+        assert!(
+            message.contains("metadata"),
+            "the error must name the dataset and both resolved paths; got: {message}"
+        );
+    }
+
+    /// The `file_update` schema rebuild reaches `remove_dir_all` without going through
+    /// `init`, so it needs its own guard — and must leave the metastore on disk.
+    /// Regression test for #13055 / #13068.
+    #[tokio::test]
+    async fn drop_table_leaves_a_metastore_nested_in_the_data_directory_intact() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = DatasetBuilder::try_new("orders".to_string(), "orders")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        // `cayenne_file_path` puts the data directory at `{base}/orders/`; the
+        // metastore is configured inside it.
+        let data_dir = base.path().join("orders");
+        let metadata_dir = data_dir.join("catalog");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    base.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog_file = metadata_dir.join("cayenne.db");
+        std::fs::write(&catalog_file, b"catalog").expect("catalog file");
+
+        let err = CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect_err("drop_table must refuse to delete a data directory holding the metastore");
+        assert!(
+            err.to_string()
+                .contains("contains the Cayenne metastore directory"),
+            "the error must name the overlap; got: {err}"
+        );
+        assert!(
+            catalog_file.exists(),
+            "the metastore must survive the refused rebuild"
+        );
+    }
+
     #[tokio::test]
     async fn test_write_concurrency_is_resolved_per_dataset() {
         let app = Arc::new(AppBuilder::new("test").build());
@@ -4774,8 +5480,12 @@ mod tests {
             ..Default::default()
         });
 
-        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset).await;
-        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset).await;
+        let hot = CayenneAccelerator::get_vortex_config("hot", &hot_dataset)
+            .await
+            .expect("hot config should be valid");
+        let quiet = CayenneAccelerator::get_vortex_config("quiet", &quiet_dataset)
+            .await
+            .expect("quiet config should be valid");
 
         assert_eq!(hot.write_concurrency, Some(16));
         assert_eq!(quiet.write_concurrency, Some(2));
@@ -4964,7 +5674,9 @@ mod tests {
 
         let dataset = build(misconfigured());
         for _ in 0..3 {
-            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset).await;
+            let _ = CayenneAccelerator::get_vortex_config(TABLE, &dataset)
+                .await
+                .expect("config should be valid");
         }
         assert_eq!(
             captured.occurrences_of(LINE),
@@ -4982,7 +5694,9 @@ mod tests {
         let mut retuned_params = misconfigured();
         retuned_params.push(("cayenne_target_file_size_mb".to_string(), "512".to_string()));
         let retuned = build(retuned_params);
-        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned).await;
+        let _ = CayenneAccelerator::get_vortex_config(TABLE, &retuned)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             captured.occurrences_of(LINE),
             2,
@@ -5017,7 +5731,9 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+                .await
+                .expect("config should be valid");
 
             assert_eq!(
                 config.compaction_trigger_files,
@@ -5063,7 +5779,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("append_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(
             config.compaction_trigger_files,
@@ -5104,7 +5822,9 @@ mod tests {
                 ..Default::default()
             });
 
-            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset).await;
+            let config = CayenneAccelerator::get_vortex_config(table_name, &dataset)
+                .await
+                .expect("config should be valid");
 
             assert_eq!(config.inline_max_rows, 0);
             assert_eq!(config.inline_max_bytes, 0);
@@ -5140,7 +5860,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("append_batch_load", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.inline_max_rows, 0);
         assert_eq!(config.inline_max_bytes, 0);
@@ -5203,7 +5925,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.inline_max_rows, 123);
         assert_eq!(config.inline_max_bytes, 262_144);
@@ -5214,6 +5938,80 @@ mod tests {
         assert_eq!(
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
+        );
+    }
+
+    /// `auto` is the tuning mode unless the operator asks for `adaptive` by name.
+    /// A `cayenne_goal_*` SLO — per-dataset or global — expresses a target, not a
+    /// choice of controller, so it must leave the closed loop off.
+    #[tokio::test]
+    async fn test_goals_do_not_enable_adaptive_tuning() {
+        let app = Arc::new(
+            AppBuilder::new("test")
+                .with_runtime_params(
+                    [("cayenne_goal_replication_lag".to_string(), "5s".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build(),
+        );
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let cdc_dataset = |name: &str, params: Vec<(String, String)>| {
+            let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Changes),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        // Global goal only.
+        let global_goal = cdc_dataset("global_goal", vec![]);
+        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal)
+            .await
+            .expect("config should be valid");
+        assert!(
+            !config.dynamic_tuning,
+            "a global cayenne_goal_* must not turn on the closed loop"
+        );
+        assert!(
+            config.goal_replication_lag_secs.is_some(),
+            "the goal is still parsed so an operator who enables adaptive gets it"
+        );
+
+        // Global + per-dataset goals.
+        let dataset_goal = cdc_dataset(
+            "dataset_goal",
+            vec![("cayenne_goal_freshness".to_string(), "30s".to_string())],
+        );
+        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal)
+            .await
+            .expect("config should be valid");
+        assert!(
+            !config.dynamic_tuning,
+            "a per-dataset cayenne_goal_* must not turn on the closed loop"
+        );
+
+        // Only the explicit mode does.
+        let adaptive = cdc_dataset(
+            "adaptive",
+            vec![("cayenne_tuning".to_string(), "adaptive".to_string())],
+        );
+        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive)
+            .await
+            .expect("config should be valid");
+        assert!(
+            config.dynamic_tuning,
+            "`cayenne_tuning: adaptive` enables the closed loop"
         );
     }
 
@@ -5241,7 +6039,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
         assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
@@ -5268,7 +6068,9 @@ mod tests {
             refresh_mode: Some(RefreshMode::Changes),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc)
+            .await
+            .expect("config should be valid");
         assert!(
             (256 * MIB..=1024 * MIB).contains(&config.cdc_mem_tier_max_bytes),
             "derived cap {} outside [256 MiB, 1 GiB]",
@@ -5299,7 +6101,9 @@ mod tests {
             refresh_mode: Some(RefreshMode::Full),
             ..Default::default()
         });
-        let config = CayenneAccelerator::get_vortex_config("full_tier", &full).await;
+        let config = CayenneAccelerator::get_vortex_config("full_tier", &full)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.cdc_mem_tier_max_bytes,
             256 * MIB,
@@ -5333,7 +6137,9 @@ mod tests {
         };
 
         let full = build("full_tbl", RefreshMode::Full, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full).await;
+        let config = CayenneAccelerator::get_vortex_config("full_tbl", &full)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.compaction_background_interval_ms, 0,
             "full refresh must not spawn a background compactor"
@@ -5365,12 +6171,16 @@ mod tests {
                 "15000".to_string(),
             )],
         );
-        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned).await;
+        let config = CayenneAccelerator::get_vortex_config("full_pinned", &pinned)
+            .await
+            .expect("config should be valid");
         assert_eq!(config.compaction_background_interval_ms, 15_000);
 
         // CDC is untouched: tight cadence, inlining on.
         let cdc = build("cdc_tbl", RefreshMode::Changes, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc).await;
+        let config = CayenneAccelerator::get_vortex_config("cdc_tbl", &cdc)
+            .await
+            .expect("config should be valid");
         assert_eq!(
             config.compaction_background_interval_ms,
             SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS
@@ -5380,7 +6190,9 @@ mod tests {
         // Snapshot mode accumulates files, so it keeps the conservative cadence and
         // stays OUT of the inline tier (its entries would never be drained promptly).
         let snapshot = build("snap_tbl", RefreshMode::Snapshot, vec![]);
-        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot).await;
+        let config = CayenneAccelerator::get_vortex_config("snap_tbl", &snapshot)
+            .await
+            .expect("config should be valid");
         assert_ne!(
             config.compaction_background_interval_ms, 0,
             "snapshot mode still accumulates files to consolidate"
@@ -5433,7 +6245,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Key);
 
         // Explicit `position` on the same shape is respected.
@@ -5450,7 +6263,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(
             config.deletion_mode,
             cayenne::metadata::DeletionMode::Position
@@ -5469,7 +6283,8 @@ mod tests {
             None,
             &nopk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
         // A non-CDC profile with a PK stays Auto (position downstream).
@@ -5480,7 +6295,8 @@ mod tests {
             None,
             &pk_workload,
         )
-        .await;
+        .await
+        .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
     }
 
@@ -5624,7 +6440,8 @@ mod tests {
 
         let small_write_config =
             CayenneAccelerator::get_vortex_config("cdc_partial_override", &small_write_dataset)
-                .await;
+                .await
+                .expect("config should be valid");
 
         assert_eq!(small_write_config.inline_max_rows, 321);
         assert_eq!(
@@ -5655,7 +6472,8 @@ mod tests {
 
         let large_write_config =
             CayenneAccelerator::get_vortex_config("full_partial_override", &large_write_dataset)
-                .await;
+                .await
+                .expect("config should be valid");
 
         // Bulk-overwrite inlines too, on the same static caps as small-write, so
         // the un-overridden knobs keep those defaults rather than the zeros that
@@ -5713,7 +6531,9 @@ mod tests {
             ..Default::default()
         });
 
-        let config = CayenneAccelerator::get_vortex_config("compact", &dataset).await;
+        let config = CayenneAccelerator::get_vortex_config("compact", &dataset)
+            .await
+            .expect("config should be valid");
 
         assert_eq!(config.compaction_trigger_files, 12);
         assert_eq!(config.compaction_trigger_protected_snapshots, 9);
@@ -5738,6 +6558,155 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
+        );
+    }
+
+    /// A partitioned Cayenne table keeps one Vortex table per partition, each
+    /// with its own stored schema, and `evolve_table_schema` can only reach the
+    /// parent catalog entry. Reporting success there would advance the dataset
+    /// checkpoint past a change no partition ever applied — every later restart
+    /// then classifies source and checkpoint as identical, so the acceleration
+    /// stays on the old schema forever while writes narrow-cast into it, and the
+    /// caller's `file_update` / `drop_and_recreate` recreate never runs (#12999).
+    #[tokio::test]
+    async fn evolving_a_partitioned_table_in_place_is_refused() {
+        use arrow_tools::schema_evolution::WideningPlan;
+        use spicepod::partitioning::PartitionedBy;
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        // Keep the metastore this test may open inside a temp dir rather than the
+        // process-wide Spice data path.
+        let metadata_dir = tempfile::TempDir::new().expect("tempdir");
+        let build = |partition_by: Vec<PartitionedBy>| {
+            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::FileUpdate,
+                refresh_mode: Some(RefreshMode::Full),
+                partition_by,
+                params: [(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.path().to_string_lossy().to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        let plan = WideningPlan {
+            added_columns: vec![Arc::new(Field::new("added", DataType::Utf8, true))],
+            widened_columns: Vec::new(),
+            relaxed_nullability: Vec::new(),
+            evolved_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("added", DataType::Utf8, true),
+            ])),
+        };
+
+        let partitioned = build(vec![PartitionedBy {
+            name: "bucket".to_string(),
+            expression: "bucket".to_string(),
+        }]);
+        let error = CayenneAccelerator::new()
+            .evolve_table_schema("users", &partitioned, &plan)
+            .await
+            .expect_err("in-place evolution of a partitioned table must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not supported for a partitioned acceleration"),
+            "the refusal must name partitioning as the reason, got: {message}"
+        );
+        assert!(
+            message.contains("drop_and_recreate") && message.contains("file_update"),
+            "the refusal must point at the settings that rebuild the table, got: {message}"
+        );
+
+        // The unpartitioned path is untouched: it still reaches the metastore,
+        // which is what the refusal above must not pre-empt. `users` was never
+        // created, so it fails on the missing table rather than on partitioning.
+        let unpartitioned_error = CayenneAccelerator::new()
+            .evolve_table_schema("users", &build(Vec::new()), &plan)
+            .await
+            .expect_err("no such table exists in a fresh metastore");
+        assert!(
+            !unpartitioned_error
+                .to_string()
+                .contains("partitioned acceleration"),
+            "an unpartitioned table must not take the partitioned refusal, got: {unpartitioned_error}"
+        );
+    }
+
+    /// The vortex config built for a partitioned dataset also opens the PARENT
+    /// catalog entry, which is created before the partition wrapper exists. If
+    /// it carried an evolution mode, the catalog would widen the parent's stored
+    /// schema at open while every partition kept its own — the same silent
+    /// narrowing as #12999, reached without ever calling `evolve_table_schema`.
+    #[tokio::test]
+    async fn a_partitioned_dataset_never_carries_a_schema_evolution_mode() {
+        use spicepod::partitioning::PartitionedBy;
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let build = |partition_by: Vec<PartitionedBy>, policy| {
+            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.on_schema_change = policy;
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                partition_by,
+                ..Default::default()
+            });
+            dataset
+        };
+        let partitioned_by_bucket = || {
+            vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket".to_string(),
+            }]
+        };
+        let workload = autotune::WorkloadProfile::default();
+        let evolution_mode = async |dataset: &crate::component::dataset::Dataset| {
+            CayenneAccelerator::get_vortex_config_with_footer_cache(
+                "users", dataset, None, &workload,
+            )
+            .await
+            .expect("the vortex config is built")
+            .schema_evolution
+        };
+
+        assert!(
+            evolution_mode(&build(
+                partitioned_by_bucket(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "a partitioned dataset must not carry an evolution mode, whatever its policy asks for"
+        );
+
+        // The same policy on an unpartitioned dataset still evolves: the guard
+        // above must key on partitioning, not disable evolution outright.
+        assert!(
+            !evolution_mode(&build(
+                Vec::new(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "an unpartitioned dataset keeps in-place evolution"
         );
     }
 }

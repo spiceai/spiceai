@@ -571,6 +571,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// The acceleration engine's own type rewrites, forwarded to the refresh sink.
+    engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
@@ -629,6 +631,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            engine_type_rewrites: &[],
             cdc_param_overrides: None,
         }
     }
@@ -733,6 +736,15 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Declare the acceleration engine's own type rewrites.
+    pub fn with_engine_type_rewrites(
+        &mut self,
+        rules: arrow_tools::type_rewrite::TypeRewriteRules,
+    ) -> &mut Self {
+        self.engine_type_rewrites = rules;
         self
     }
 
@@ -908,6 +920,9 @@ impl Refresher {
             refresh_task_runner.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         refresh_task_runner =
+            refresh_task_runner.with_engine_type_rewrites(self.engine_type_rewrites);
+
+        refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
         refresh_task_runner = refresh_task_runner
@@ -916,6 +931,10 @@ impl Refresher {
         let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
+        // Handle for the refresh-completion handler below: cache invalidation
+        // must cover the live set of dataset names (self + synchronized
+        // children), which grows as children finish their initial loads.
+        let refresh_task = Arc::clone(refresh_task_runner.refresh_task());
         self.refresh_task_runner = Some(refresh_task_runner);
 
         let notifier = self.on_complete_notification.clone();
@@ -1081,10 +1100,18 @@ impl Refresher {
 
                         if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
                             // No cache provider means runtime is shutting down and cache is already cleaned up
-                            if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                    tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                // The refresh rewrote every synchronized (e.g. localpod) child's
+                                // accelerator along with this dataset's, so cached results for the
+                                // children are exactly as stale as the parent's (#12887). Children
+                                // attach after their own initial load completes, so the set is
+                                // resolved live rather than captured when this loop started.
+                                for table_name in refresh_task.get_dataset_names().await {
+                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
+                                        tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                    }
                                 }
+                            }
                         }
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
@@ -1169,6 +1196,7 @@ impl Refresher {
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
+        .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
         .with_cdc_param_overrides(self.cdc_param_overrides.clone());
 
@@ -1392,6 +1420,10 @@ mod tests {
             &self,
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
+        }
+
+        async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
         }
     }
 

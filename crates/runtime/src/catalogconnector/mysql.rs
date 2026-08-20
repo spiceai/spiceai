@@ -289,7 +289,6 @@ mod tests {
             ),
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: None,
             io_runtime: Handle::current(),
         }
     }

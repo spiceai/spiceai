@@ -30,15 +30,16 @@ use snafu::{ResultExt, ensure};
 use spice_table::{Index, WriteWindow};
 use tantivy::merge_policy::LogMergePolicy;
 use tantivy::schema::{
-    DocParsingError, FieldEntry, FieldType, IndexRecordOption, Schema, SchemaBuilder,
-    TextFieldIndexing, TextOptions, Type,
+    DocParsingError, FieldEntry, IndexRecordOption, Schema, SchemaBuilder, TextFieldIndexing,
+    TextOptions, Type,
 };
 use tantivy::{TantivyDocument, TantivyError};
+use tantivy_datafusion_filter::{array_to_terms, is_tokenized, text_tokenizer};
 use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
-use crate::generation::text_search::util::{array_to_terms, with_json_subset_column};
+use crate::generation::text_search::util::with_json_subset_column;
 use crate::generation::text_search::{
     FailedToInsertDataIntoIndexSnafu, FullTextSearchFieldIndex, IndexCreationSnafu,
     InvalidIndexingSnafu, PersistedIndexColumnChangedSnafu, PersistedIndexMissingColumnsSnafu,
@@ -145,28 +146,6 @@ fn addressing_shape(entry: &FieldEntry) -> (Type, bool, bool) {
     )
 }
 
-/// The tokenizer a text field is analyzed with, or [`None`] for any other field type.
-fn text_tokenizer(field_type: &FieldType) -> Option<&str> {
-    match field_type {
-        FieldType::Str(options) => options
-            .get_indexing_options()
-            .map(TextFieldIndexing::tokenizer),
-        _ => None,
-    }
-}
-
-/// Whether a text field is analyzed into multiple terms, rather than indexed as the single term
-/// that [`tantivy::schema::STRING`] (and so a primary-key lookup) relies on.
-fn is_tokenized(field_type: &FieldType) -> bool {
-    // Compare against tantivy's own untokenized text options rather than naming its tokenizer,
-    // which tantivy does not export.
-    let untokenized = FieldType::Str(tantivy::schema::STRING);
-    match (text_tokenizer(field_type), text_tokenizer(&untokenized)) {
-        (Some(tokenizer), Some(untokenized)) => tokenizer != untokenized,
-        _ => false,
-    }
-}
-
 /// Describes how a field is indexed, for the error naming a column whose indexing changed.
 fn describe_indexing(entry: &FieldEntry) -> String {
     let field_type = entry.field_type();
@@ -225,16 +204,18 @@ pub struct FullTextDatabaseIndex {
     /// `on_write_start` sets it; `on_write_complete`/`on_write_failed` clear it.
     defer_commit: Arc<AtomicBool>,
 
-    /// Set when this index is also fed by a change-data-capture stream, which
-    /// drives `compute_index` outside the sink write lifecycle.
+    /// True when this index is also fed by a change-data-capture or append stream, which
+    /// drives `compute_index` outside the sink write lifecycle. Fixed at construction
+    /// (see `try_new`'s `stream_attached` parameter) and shared via `Arc` with every handle
+    /// `with_new_base` derives from this index, since they all drive the same writer.
     ///
     /// A single [`tantivy::IndexWriter`] stages every pending operation together,
     /// so a commit cannot be scoped to one caller's documents: committing inside a
     /// deferred window would publish a partially-written refresh, and rolling the
-    /// window back would discard CDC documents staged alongside it. Deferral is
-    /// therefore disabled outright for a CDC-fed index — correctness over the
+    /// window back would discard the stream's documents staged alongside it. Deferral is
+    /// therefore disabled outright for a stream-attached index — correctness over the
     /// one-commit-per-refresh optimization.
-    cdc_attached: Arc<AtomicBool>,
+    stream_attached: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -300,16 +281,16 @@ impl Index for FullTextDatabaseIndex {
     }
 
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        // A CDC-fed index never defers: its change stream calls `compute_index`
-        // outside this lifecycle, and the shared writer cannot commit one caller's
-        // documents without also publishing (or, on rollback, discarding) the other's.
+        // A stream-attached index never defers: its change/append stream calls
+        // `compute_index` outside this lifecycle, and the shared writer cannot commit one
+        // caller's documents without also publishing (or, on rollback, discarding) the other's.
         //
         // That also rules out the `ReplaceAll` clear below, whose atomicity depends on the
         // deferred window: an immediately-committed clear would publish an empty index for the
-        // length of the refresh, and would discard change-stream documents staged alongside it.
-        // A CDC-fed index is told about deletions explicitly by its change stream, so it does
+        // length of the refresh, and would discard stream documents staged alongside it.
+        // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.cdc_attached.load(Ordering::Acquire) {
+        if self.stream_attached.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -407,6 +388,7 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
         store_field: &[String],
+        stream_attached: bool,
     ) -> Result<Self, super::Error> {
         let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema = Self::create_tantivy_schema(
@@ -443,7 +425,7 @@ impl FullTextDatabaseIndex {
             primary_key: pks,
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
-            cdc_attached: Arc::new(AtomicBool::new(false)),
+            stream_attached: Arc::new(AtomicBool::new(stream_attached)),
         })
     }
 
@@ -662,14 +644,6 @@ impl FullTextDatabaseIndex {
         self
     }
 
-    /// Record that a change-data-capture stream also writes to this index, which
-    /// permanently disables the deferred-commit window (see `cdc_attached`).
-    ///
-    /// Called when the change stream that includes this index is constructed.
-    pub fn mark_cdc_attached(&self) {
-        self.cdc_attached.store(true, Ordering::Release);
-    }
-
     #[must_use]
     pub fn underlying_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.base_table)
@@ -692,8 +666,39 @@ impl FullTextDatabaseIndex {
             defer_commit: Arc::clone(&self.defer_commit),
             // Shared for the same reason as `defer_commit`: both handles drive the
             // same tantivy writer and must agree on whether deferral is allowed.
-            cdc_attached: Arc::clone(&self.cdc_attached),
+            stream_attached: Arc::clone(&self.stream_attached),
         }
+    }
+
+    /// Whether `dt` can be represented as a local Tantivy field by [`Self::add_to_tantivy_schema`].
+    /// Callers deriving store/filter fields from a column's type (e.g. vector-search metadata
+    /// columns) must check this first and skip unsupported types rather than let index
+    /// construction fail — a type such as `Date32`/`Date64`/`Timestamp` may be a valid
+    /// `Filterable` metadata column for other index backends (e.g. Elasticsearch) without being
+    /// representable in the local FTS schema yet.
+    #[must_use]
+    pub fn is_field_type_supported(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+        )
     }
 
     // Adds the Arrow [`Field`] as a stored and indexed field.
@@ -998,6 +1003,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
     }
@@ -1077,7 +1083,7 @@ mod tests {
 
     async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
         let rb: Vec<RecordBatch> = idx
-            .search(query.into(), &[], 1000)
+            .search(query.into(), vec![], 1000)
             .expect("Failed to search")
             .map(|res| match res {
                 Ok(rb) => sort_columns_alphabetically(&rb)
@@ -1089,6 +1095,215 @@ mod tests {
             .expect("Failed to collect search results");
 
         format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    /// Verifies that an exact filter is included in the tantivy query before the top-K limit is
+    /// applied. With `id = 47` pushed down, the matching document remains available even when
+    /// `limit = 1`. Regression test for #12231.
+    #[tokio::test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "asserts the relevance score is bit-identical whether or not a pushed SQL filter is applied"
+    )]
+    async fn filter_pushdown_finds_row_beyond_candidate_cap() {
+        use crate::SEARCH_SCORE_COLUMN_NAME;
+        use arrow::array::{Float64Array, Int32Array};
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::prelude::{col, lit};
+
+        fn score_for_id(rows: &[RecordBatch], target: i32) -> f64 {
+            for rb in rows {
+                let ids = rb
+                    .column_by_name("id")
+                    .expect("id column present")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32");
+                let scores = rb
+                    .column_by_name(SEARCH_SCORE_COLUMN_NAME)
+                    .expect("score column present")
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("score column is Float64");
+                if let Some(row) = (0..ids.len()).find(|&row| ids.value(row) == target) {
+                    return scores.value(row);
+                }
+            }
+            panic!("id={target} must be present in the search results");
+        }
+
+        let index = new_test_index();
+        let ids: Vec<i32> = (1..=50).collect();
+        let contents: Vec<String> = ids.iter().map(|id| format!("shared token{id}")).collect();
+        let content_refs: Vec<&str> = contents.iter().map(String::as_str).collect();
+        index
+            .compute_index(vec![batch(&ids, &content_refs)])
+            .await
+            .expect("failed to compute_index");
+
+        let fts = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+
+        // The provider must advertise `id = 47` as an Exact pushdown (`id` is an indexed i64).
+        let target_id = 47_i32;
+        let target = i64::from(target_id);
+        let filter = col("id").eq(lit(target));
+        let support = fts.classify_filters(&[&filter]);
+        assert!(
+            matches!(support.as_slice(), [TableProviderFilterPushDown::Exact]),
+            "expected Exact pushdown for `id = {target}`, got {support:?}"
+        );
+
+        let unfiltered_rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), vec![], 1000)
+            .expect("failed to run unfiltered search")
+            .try_collect()
+            .await
+            .expect("failed to collect unfiltered search results");
+        let unfiltered_score = score_for_id(&unfiltered_rows, target_id);
+
+        // With the filter pushed into the index, a limit of 1 still finds the target row.
+        let queries = fts
+            .translate_filters(std::slice::from_ref(&filter))
+            .expect("failed to translate pushable filter");
+        let rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), queries, 1)
+            .expect("failed to search")
+            .try_collect()
+            .await
+            .expect("failed to collect search results");
+
+        let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            total, 1,
+            "the pushed filter must isolate exactly the target row"
+        );
+        let rb = &rows[0];
+        let id_idx = rb.schema().index_of("id").expect("id column present");
+        let ids_out = rb
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(ids_out.value(0), 47, "the filtered row must be id=47");
+        assert_eq!(
+            score_for_id(&rows, target_id),
+            unfiltered_score,
+            "SQL filters must not contribute to the full-text relevance score"
+        );
+
+        // A range predicate `id BETWEEN 10 AND 12` is likewise Exact and returns exactly that set.
+        let range = col("id").between(lit(10_i64), lit(12_i64));
+        let range_support = fts.classify_filters(&[&range]);
+        assert!(
+            matches!(
+                range_support.as_slice(),
+                [TableProviderFilterPushDown::Exact]
+            ),
+            "expected Exact pushdown for BETWEEN, got {range_support:?}"
+        );
+        let range_queries = fts
+            .translate_filters(std::slice::from_ref(&range))
+            .expect("failed to translate range filter");
+        let range_rows: Vec<RecordBatch> = fts
+            .search("shared".to_string(), range_queries, 1000)
+            .expect("failed to search")
+            .try_collect()
+            .await
+            .expect("failed to collect range results");
+        let mut got: Vec<i32> = range_rows
+            .iter()
+            .flat_map(|rb| {
+                let id_idx = rb.schema().index_of("id").expect("id column present");
+                let arr = rb
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column is Int32");
+                (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![10, 11, 12],
+            "BETWEEN must return exactly the in-range rows"
+        );
+    }
+
+    /// Search `content` for `query` and return the sorted `id`s of the matching documents.
+    /// Reloads the reader first so the searcher reflects the most recent commit (a delete
+    /// commits synchronously, so a reload after it is deterministic — no fixed sleep).
+    async fn search_ids(index: &FullTextDatabaseIndex, query: &str) -> Vec<i32> {
+        index.reader.reload().expect("failed to reload the reader");
+        let search_index = index
+            .full_text_search_field_index("content")
+            .expect("Failed to create FullTextSearchFieldIndex");
+        let batches: Vec<RecordBatch> = search_index
+            .search(query.to_string(), vec![], 1000)
+            .expect("Failed to search")
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .expect("results carry the id column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .expect("id is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A direct `delete_by_keys` removes the matching documents from the tantivy index — the
+    /// deleted row stops matching a search, and the other rows still do.
+    #[tokio::test]
+    async fn delete_by_keys_removes_matching_documents() {
+        let index = new_test_index();
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        ["apple banana", "cherry date", "elderberry fig"]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        assert_eq!(search_ids(&index, "apple").await, vec![1]);
+        assert_eq!(search_ids(&index, "cherry").await, vec![2]);
+        assert_eq!(search_ids(&index, "elderberry").await, vec![3]);
+
+        index
+            .delete_by_keys(record_batch!(("id", Int32, [2])).expect("key batch"))
+            .await
+            .expect("failed to delete_by_keys");
+
+        assert!(
+            search_ids(&index, "cherry").await.is_empty(),
+            "the deleted document must no longer match"
+        );
+        assert_eq!(search_ids(&index, "apple").await, vec![1], "id 1 stays");
+        assert_eq!(
+            search_ids(&index, "elderberry").await,
+            vec![3],
+            "id 3 stays"
+        );
     }
 
     // Regression test for #12228.
@@ -1126,6 +1341,7 @@ mod tests {
                 "subtitle".to_string(),
                 "body".to_string(),
             ],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
         index
@@ -1137,7 +1353,7 @@ mod tests {
             .full_text_search_field_index("body")
             .expect("Failed to create FullTextSearchFieldIndex");
         let batches = search_index
-            .search("matching".to_string(), &[], 100)
+            .search("matching".to_string(), vec![], 100)
             .expect("Failed to search")
             .try_collect::<Vec<_>>()
             .await
@@ -1208,6 +1424,7 @@ mod tests {
                 "subtitle".to_string(),
                 "body".to_string(),
             ],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
         index
@@ -1271,6 +1488,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1393,6 +1611,7 @@ mod tests {
             Some(vec!["id1".to_string(), "id2".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1559,6 +1778,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &[],
+            false,
         )
         .expect("Failed to create index");
 
@@ -1600,6 +1820,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1679,6 +1900,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
     }
@@ -1892,6 +2114,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1923,6 +2146,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1958,23 +2182,22 @@ mod tests {
         );
     }
 
-    /// A CDC-fed index shares one tantivy writer with the sink write path, so it must
-    /// never defer: a window commit would publish a partial refresh, and a window
-    /// rollback would discard the change stream's documents.
+    /// A stream-attached index shares one tantivy writer with the sink write path, so it
+    /// must never defer: a window commit would publish a partial refresh, and a window
+    /// rollback would discard the stream's documents.
     #[tokio::test]
-    async fn test_cdc_attached_index_never_defers_commits() {
+    async fn test_stream_attached_index_never_defers_commits() {
         let index = FullTextDatabaseIndex::try_new(
             create_test_table(),
             vec!["content".to_string()],
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            true,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.mark_cdc_attached();
-
-        // Opening a window is a no-op for a CDC-fed index.
+        // Opening a window is a no-op for a stream-attached index.
         index
             .on_write_start(WriteWindow::Append)
             .await
@@ -1996,7 +2219,7 @@ mod tests {
             let results = search_and_format(&search_index, "apple").await;
             assert!(
                 results.contains("apple banana"),
-                "a CDC-fed index must commit immediately even inside a write window, got:\n{results}"
+                "a stream-attached index must commit immediately even inside a write window, got:\n{results}"
             );
         }
 
@@ -2012,42 +2235,41 @@ mod tests {
         let results = search_and_format(&search_index, "apple").await;
         assert!(
             results.contains("apple banana"),
-            "committed CDC documents must survive a failed write window, got:\n{results}"
+            "committed stream documents must survive a failed write window, got:\n{results}"
         );
     }
 
     /// A warm full-text tier can be registered inside a
     /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex) rather than
-    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is marked
-    /// CDC-attached, it must stop deferring commits regardless of whether writes reach it
+    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is built
+    /// stream-attached, it must stop deferring commits regardless of whether writes reach it
     /// directly or through the compound, or a failed write window discards the change
     /// stream's documents for good.
     #[tokio::test]
-    async fn test_cdc_attached_compound_primary_never_defers_commits() {
+    async fn test_stream_attached_compound_primary_never_defers_commits() {
         use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
 
-        let new_tier = || {
+        let new_tier = |stream_attached: bool| {
             FullTextDatabaseIndex::try_new(
                 create_test_table(),
                 vec!["content".to_string()],
                 Some(vec!["id".to_string()]),
                 None,
                 &["content".to_string()],
+                stream_attached,
             )
             .expect("Failed to create FullTextDatabaseIndex")
         };
 
         // Keep a handle on the warm tier: it shares the tantivy writer and reader with the
         // clone held by the compound, so searching it observes the compound's writes.
-        let warm = new_tier();
+        let warm = new_tier(true);
         let compound = CompoundSearchIndex::try_new(
             Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
-            Arc::new(new_tier()) as Arc<dyn SearchIndex>,
+            Arc::new(new_tier(false)) as Arc<dyn SearchIndex>,
             CompoundReadMode::PrimaryOnly,
         )
         .expect("two full-text tiers over the same table are compatible");
-
-        warm.mark_cdc_attached();
 
         // A sink-driven refresh opens a write window on both tiers.
         compound
@@ -2109,6 +2331,7 @@ mod tests {
             Some(primary_key.iter().map(|p| (*p).to_string()).collect()),
             Some(directory.to_path_buf()),
             &[],
+            false,
         )
     }
 

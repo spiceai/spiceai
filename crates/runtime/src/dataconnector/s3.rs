@@ -23,10 +23,12 @@ use super::{
         aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
+use crate::dataconnector::ConnectorContext;
+
+use app::App;
 
 use crate::{
-    Runtime,
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 
@@ -103,21 +105,21 @@ pub enum Error {
 
 pub struct S3 {
     pub(crate) params: Parameters,
-    pub(crate) runtime: Option<Runtime>,
+    pub(crate) app: Option<Arc<App>>,
     pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl S3 {
-    /// Creates a new `S3` connector with the given parameters, runtime, and I/O runtime handle.
+    /// Creates a new `S3` connector with the given parameters, app, and I/O runtime handle.
     #[must_use]
     pub fn new(
         params: Parameters,
-        runtime: Option<Runtime>,
+        app: Option<Arc<App>>,
         tokio_io_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             params,
-            runtime,
+            app,
             tokio_io_runtime,
         }
     }
@@ -207,10 +209,11 @@ impl DataConnectorFactory for S3Factory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
@@ -281,10 +284,10 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = Some(context.app());
             let s3 = S3 {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
@@ -315,6 +318,12 @@ impl ListingTableConnector for S3 {
         Some(ObjectVersionType::Version)
     }
 
+    /// S3 returns a stable `ETag` (and, with versioning enabled, a version ID) on
+    /// `HEAD`, so an unchanged object can be served from cache.
+    fn supports_single_file_version_cache(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -329,7 +338,7 @@ impl ListingTableConnector for S3 {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -361,13 +370,13 @@ impl ListingTableConnector for S3 {
         Ok(s3_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
@@ -414,7 +423,7 @@ impl ListingTableConnector for S3 {
     }
 }
 
-register_data_connector!("s3", S3Factory);
+data_connector_api::register_data_connector!("s3", S3Factory);
 
 #[cfg(test)]
 mod tests {
@@ -431,7 +440,7 @@ mod tests {
     fn create_test_connector(params: Parameters) -> S3 {
         S3 {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: tokio::runtime::Handle::current(),
         }
     }

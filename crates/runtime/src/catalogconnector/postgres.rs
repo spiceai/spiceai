@@ -34,6 +34,7 @@ use data_components::postgres::provider::PostgresCatalogProvider;
 use datafusion_table_providers::UnsupportedTypeAction;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use snafu::Snafu;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +57,7 @@ fn parse_unsupported_type_action(
                 "warn" => Ok(UnsupportedTypeAction::Warn),
                 "ignore" => Ok(UnsupportedTypeAction::Ignore),
                 _ => Err(format!(
-                    "Invalid value '{trimmed}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string."
+                    "Invalid value '{trimmed}' for `unsupported_type_action`. Expected one of: error, warn, ignore, string. Docs: {POSTGRES_CONNECTOR_DOCS}"
                 )),
             }
         }
@@ -64,6 +65,46 @@ fn parse_unsupported_type_action(
 }
 
 pub const PREFIX: &str = "pg";
+
+/// Connection parameters and `unsupported_type_action` behave identically for a
+/// dataset using the `PostgreSQL` data connector, and are documented with the
+/// connector, so the connector's page is the one that answers them here too.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
+
+/// The connection failure reported when a catalog cannot reach its database,
+/// worded for the person who wrote the Spicepod.
+///
+/// It carries the cause as text and exposes no `source`: the catalog error that
+/// wraps it renders the whole chain, so a nested source would append the cause a
+/// second time -- after the documentation link, where it reads as part of it.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Failed to connect to PostgreSQL{server}: {cause}. Check the catalog's `pg_host`, `pg_port`, `pg_db`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
+))]
+struct ConnectionFailed {
+    /// ` at host:port`, or empty when the catalog configures no `pg_host`.
+    ///
+    /// Which server a catalog reaches is worth naming -- a secret store can
+    /// supply a host the person reading the log never typed. Only `pg_host` and
+    /// `pg_port` are ever rendered: `pg_connection_string` carries the password,
+    /// so a catalog configured that way names no server rather than risking one
+    /// character of it reaching a log.
+    server: String,
+    cause: String,
+}
+
+/// ` at host:port` for a catalog that names a host, and an empty string
+/// otherwise. See [`ConnectionFailed::server`].
+fn connection_target(params: &ConnectorParams) -> String {
+    let Some(host) = params.parameters.get("host").expose().ok() else {
+        return String::new();
+    };
+    match params.parameters.get("port").expose().ok() {
+        Some(port) => format!(" at {host}:{port}"),
+        None => format!(" at {host}"),
+    }
+}
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
@@ -122,15 +163,23 @@ impl CatalogConnector for PostgresCatalog {
             .map_err(|e| super::Error::UnableToGetCatalogProvider {
                 connector: PREFIX.to_string(),
                 connector_component: connector_component.clone(),
-                source: Box::new(e),
+                // The pool reports a connection failure in its own words, over
+                // several lines and without naming a parameter to change. Keep
+                // what it observed, and say what to do about it.
+                source: Box::new(ConnectionFailed {
+                    server: connection_target(&self.params),
+                    cause: super::error_with_causes(&e)
+                        .trim_end_matches(['.', ' '])
+                        .to_string(),
+                }),
             })?
             .with_unsupported_type_action(unsupported_type_action);
 
         let pool = Arc::new(pool);
 
         let catalog_provider: Arc<dyn RefreshableCatalogProvider> =
-            if catalog.acceleration.is_some() {
-                Arc::new(AcceleratedCatalogProvider::new(catalog, pool))
+            if let Some(acceleration) = catalog.acceleration.as_ref() {
+                Arc::new(AcceleratedCatalogProvider::new(catalog, acceleration, pool))
             } else {
                 let table_factory = Arc::new(PostgresTableFactory::new(Arc::clone(&pool)));
                 Arc::new(PostgresCatalogProvider::new(
@@ -170,5 +219,97 @@ impl CatalogConnector for PostgresCatalog {
         })?;
 
         Ok(catalog_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dataset_params(action: &str) -> HashMap<String, String> {
+        HashMap::from([("unsupported_type_action".to_string(), action.to_string())])
+    }
+
+    /// A rejected `unsupported_type_action` is a permanent configuration error,
+    /// so its message is the whole of what the user gets to work from: it has to
+    /// quote what they wrote, list what is accepted, and link the documentation.
+    #[test]
+    fn an_invalid_unsupported_type_action_names_the_value_and_the_alternatives() {
+        let message = parse_unsupported_type_action(&dataset_params("strng"))
+            .expect_err("'strng' is not a valid action");
+
+        assert!(
+            message.contains("Invalid value 'strng'"),
+            "quotes what was configured: {message}"
+        );
+        assert!(
+            message.contains("error, warn, ignore, string"),
+            "lists every accepted value: {message}"
+        );
+        assert!(
+            message.contains(POSTGRES_CONNECTOR_DOCS),
+            "links the documentation: {message}"
+        );
+        assert!(!message.contains('\n'), "stays on one line: {message:?}");
+    }
+
+    #[test]
+    fn a_valid_unsupported_type_action_is_accepted_in_any_case() {
+        for value in ["error", " ERROR ", "Error"] {
+            assert!(
+                matches!(
+                    parse_unsupported_type_action(&dataset_params(value)),
+                    Ok(UnsupportedTypeAction::Error)
+                ),
+                "'{value}' should parse as `error`"
+            );
+        }
+    }
+
+    /// The connection failure the pool reports names no parameter and spans
+    /// several lines; what reaches the user must name both, on one line.
+    #[test]
+    fn a_connection_failure_names_the_parameters_to_check() {
+        let message = ConnectionFailed {
+            server: " at db.internal:5432".to_string(),
+            cause: "PostgreSQL connection failed. db error: FATAL: password authentication failed"
+                .to_string(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("password authentication failed"),
+            "keeps what the database said: {message}"
+        );
+        assert!(
+            message.contains("`pg_user`") && message.contains("`pg_pass`"),
+            "names the parameters to check: {message}"
+        );
+        assert!(
+            message.contains("PostgreSQL at db.internal:5432"),
+            "names the server it could not reach -- a secret store can supply a host the reader never typed: {message}"
+        );
+        assert!(
+            ConnectionFailed {
+                server: String::new(),
+                cause: "connection refused".to_string(),
+            }
+            .to_string()
+            .starts_with("Failed to connect to PostgreSQL: connection refused"),
+            "a catalog configured by connection string names no server rather than risking the password reaching a log"
+        );
+        assert!(
+            message.contains(POSTGRES_CONNECTOR_DOCS),
+            "links the documentation: {message}"
+        );
+        assert!(!message.contains('\n'), "stays on one line: {message:?}");
+        assert!(
+            std::error::Error::source(&ConnectionFailed {
+                server: String::new(),
+                cause: "x".to_string()
+            })
+            .is_none(),
+            "the cause is carried as text, so the catalog error that wraps this cannot append it after the documentation link"
+        );
     }
 }

@@ -22,7 +22,8 @@ use arrow::{
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    physical_plan::EmptyRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
+    sql::TableReference,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -1123,19 +1124,14 @@ impl SqlWarehouseApi {
     async fn fetch_external_links(
         self: Arc<Self>,
         result_object: Value,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Error> {
         let token = self.token_provider.get_token();
         let initial_external_link = Self::extract_external_links(result_object)?;
 
         // If no external link, return an empty stream
         if initial_external_link.is_none() {
-            let empty_stream: Pin<
-                Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
-            > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                empty_stream,
-            )) as SendableRecordBatchStream);
+            return Ok(empty_result_stream(projected_schema));
         }
 
         let token = token.clone();
@@ -1230,13 +1226,7 @@ impl SqlWarehouseApi {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Err(e),
             None => {
-                let empty_stream: Pin<
-                    Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
-                > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::new(Schema::empty()),
-                    empty_stream,
-                )) as SendableRecordBatchStream);
+                return Ok(empty_result_stream(projected_schema));
             }
         };
 
@@ -1957,7 +1947,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         })?;
 
         let mut stream = Arc::clone(&self.api)
-            .fetch_external_links(response)
+            .fetch_external_links(response, None)
             .await
             .map_err(|e| dbconnection::Error::UnableToGetSchemas {
                 source: Box::new(e),
@@ -1999,7 +1989,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         &self,
         sql: &str,
         _: &[&'a dyn Sync],
-        _projected_schema: Option<SchemaRef>,
+        projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let token = self.api.token_provider.get_token();
         let payload = json!({
@@ -2034,7 +2024,12 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .build()
         })?;
 
-        Ok(SqlWarehouseApi::fetch_external_links(Arc::clone(&self.api), result_object).await?)
+        Ok(SqlWarehouseApi::fetch_external_links(
+            Arc::clone(&self.api),
+            result_object,
+            projected_schema,
+        )
+        .await?)
     }
 
     async fn execute(
@@ -2044,6 +2039,18 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         Ok(NotImplementedSnafu.fail()?)
     }
+}
+
+/// The stream for a statement whose result carried no chunks.
+///
+/// Every other schema on this path is read off the first batch, so when there is
+/// no batch the schema has to come from the projected schema the plan was built
+/// from. Falling back to [`Schema::empty`] would hand back a stream whose schema
+/// contradicts the columns the query selected. Callers with no plan behind them
+/// — schema discovery, for one — pass `None` and keep the empty schema.
+fn empty_result_stream(projected_schema: Option<SchemaRef>) -> SendableRecordBatchStream {
+    let schema = projected_schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+    Box::pin(EmptyRecordBatchStream::new(schema))
 }
 
 fn databricks_dialect() -> super::dialect::DatabricksDialect {
@@ -2078,6 +2085,40 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
     use serde_json::json;
+
+    /// Regression test for #13015: a statement whose result carries no chunks
+    /// must still carry the projected schema, so an empty result is an empty
+    /// table with the columns the query selected rather than no columns at all.
+    #[test]
+    fn empty_result_stream_keeps_the_projected_schema() {
+        let projected: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let mut stream = empty_result_stream(Some(Arc::clone(&projected)));
+
+        assert_eq!(
+            stream.schema().as_ref(),
+            projected.as_ref(),
+            "an empty result must carry the projected schema"
+        );
+        assert!(
+            futures::executor::block_on(stream.next()).is_none(),
+            "an empty result must not yield a batch"
+        );
+    }
+
+    #[test]
+    fn empty_result_stream_without_a_projection_has_no_columns() {
+        let stream = empty_result_stream(None);
+
+        assert_eq!(
+            stream.schema().fields().len(),
+            0,
+            "schema discovery has no plan behind it and keeps the empty schema"
+        );
+    }
 
     /// Helper to create a valid Databricks schema response JSON.
     fn make_schema_response(data_array: &Value) -> Value {

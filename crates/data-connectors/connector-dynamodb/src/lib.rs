@@ -44,16 +44,16 @@ pub const CONNECTOR_NAME: &str = "dynamodb";
 // factory registry, and the spicepod schema generator reads the slice — so a `bin/spiced`
 // that force-links this crate (`use connector_dynamodb as _;`) gets both runtime registration
 // and schema coverage with no explicit `register_connector_factory` call.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_dynamodb_connector,
     DYNAMODB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,
     DynamoDBFactory
 );
 
-/// Returns the `DynamoDB` [`DataConnectorFactory`](runtime::dataconnector::DataConnectorFactory).
+/// Returns the `DynamoDB` [`DataConnectorFactory`](data_connector_api::DataConnectorFactory).
 #[must_use]
-pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+pub fn factory() -> Arc<dyn data_connector_api::DataConnectorFactory> {
     DynamoDBFactory::new_arc()
 }
 

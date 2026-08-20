@@ -18,17 +18,18 @@ limitations under the License.
 //! for datasets configured with `full_text_search: engine: elasticsearch` in
 //! their Spicepod YAML.
 
+use crate::dataconnector::ConnectorContext;
 use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::accelerated::{self, AcceleratedTable};
 use crate::changes::{Indexes, index_change_envelope};
+use crate::component::dataset::DatasetSpec;
 use crate::component::{
     ComponentInitialization,
     dataset::{
@@ -38,7 +39,9 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
-use crate::search::full_text::table::add_compound_fts_to_table;
+use crate::search::full_text::table::{add_compound_fts_to_table, dataset_attaches_stream};
+use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
+use data_connector_api::federated::FederatedTableProvider;
 use runtime_metrics::component::MetricsProvider;
 use runtime_parameters_typed::TypedParams as _;
 use runtime_search::store_params::elasticsearch::{
@@ -118,30 +121,30 @@ impl ElasticsearchFullTextConnector {
         })
     }
 
+    /// The pieces a change/append stream needs from an indexed table: the indexes
+    /// to maintain, and the federated table *below* the index layer that the
+    /// inner connector should stream from.
+    ///
+    /// Split out from the streaming itself because `changes_stream` is `async`
+    /// while `append_stream` is not; both peel the same layer.
     #[expect(clippy::needless_pass_by_value)]
-    fn with_indexed_stream<F>(
-        &self,
-        federated_table: Arc<FederatedTable>,
-        f: F,
-    ) -> Option<ChangesStream>
-    where
-        F: Fn(&Arc<dyn DataConnector>, Arc<FederatedTable>) -> Option<ChangesStream>,
-    {
+    fn indexed_stream_inputs(
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<(Arc<Indexes>, Arc<dyn FederatedTableProvider>)> {
         let table_provider = federated_table.try_table_provider_sync()?;
         let indexed_table =
             spice_table::nodes(table_provider.as_ref(), spice_table::LayerWalk::Index)
                 .find(|node| !node.indexes().is_empty())?;
 
-        let indexes = Indexes::new(indexed_table.indexes().to_vec());
-        let underlying_table =
-            Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
+        let below = Arc::new(FederatedTable::Immediate(Arc::clone(indexed_table.below())));
+        Some((Indexes::new(indexed_table.indexes().to_vec()), below))
+    }
 
-        let stream = f(&self.inner_connector, underlying_table)?;
-        Some(
-            stream
-                .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
-                .boxed(),
-        )
+    /// Maintains `indexes` from every envelope the source stream emits.
+    fn maintaining(stream: ChangesStream, indexes: Arc<Indexes>) -> ChangesStream {
+        stream
+            .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
+            .boxed()
     }
 }
 
@@ -154,15 +157,17 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let inner = self.inner_connector.read_provider(dataset).await?;
+        let inner = self.inner_connector.read_provider(context, dataset).await?;
         add_compound_fts_to_table(
             inner,
             &dataset.columns,
             &dataset.name,
             &self.fts_params,
             &on_zero_results(dataset),
+            dataset_attaches_stream(&self.inner_connector, dataset),
         )
         .await
         .map(|idx| idx as Arc<dyn TableProvider>)
@@ -176,9 +181,14 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
-        match self.inner_connector.read_write_provider(dataset).await {
+        match self
+            .inner_connector
+            .read_write_provider(context, dataset)
+            .await
+        {
             Some(Ok(inner)) => Some(
                 add_compound_fts_to_table(
                     inner,
@@ -186,6 +196,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
                     &dataset.name,
                     &self.fts_params,
                     &on_zero_results(dataset),
+                    dataset_attaches_stream(&self.inner_connector, dataset),
                 )
                 .await
                 .map(|idx| idx as Arc<dyn TableProvider>)
@@ -203,14 +214,14 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         self.inner_connector.metadata_provider(dataset).await
     }
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         self.inner_connector
@@ -229,11 +240,11 @@ impl DataConnector for ElasticsearchFullTextConnector {
     #[cfg(feature = "elasticsearch")]
     async fn on_accelerator_setup(
         &self,
-        dataset: &Dataset,
-        builder: &mut accelerated::Builder,
+        dataset: &DatasetSpec,
+        accelerator: &mut dyn AcceleratorSetup,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
-            .on_accelerator_setup(dataset, builder)
+            .on_accelerator_setup(dataset, accelerator)
             .await?;
 
         Ok(())
@@ -241,8 +252,8 @@ impl DataConnector for ElasticsearchFullTextConnector {
 
     async fn on_accelerated_table_registration(
         &self,
-        dataset: &Dataset,
-        accelerated_table: &mut AcceleratedTable,
+        dataset: &DatasetSpec,
+        accelerated_table: &mut dyn RegisteredAcceleratedTable,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
@@ -261,25 +272,35 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        dataset: &DatasetSpec,
+        acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
-        self.with_indexed_stream(federated_table, |inner, table| {
-            inner.changes_stream(table, dataset)
-        })
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
+        let stream = self
+            .inner_connector
+            .changes_stream(context, below, dataset, acceleration)
+            .await?;
+        Some(Self::maintaining(stream, indexes))
     }
 
     fn supports_append_stream(&self) -> bool {
         self.inner_connector.supports_append_stream()
     }
 
-    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
-        self.with_indexed_stream(federated_table, |inner, table| inner.append_stream(table))
+    fn append_stream(
+        &self,
+        federated_table: Arc<dyn FederatedTableProvider>,
+    ) -> Option<ChangesStream> {
+        let (indexes, below) = Self::indexed_stream_inputs(federated_table)?;
+        let stream = self.inner_connector.append_stream(below)?;
+        Some(Self::maintaining(stream, indexes))
     }
 
-    fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
+    fn initialization_for_dataset(&self, dataset: &DatasetSpec) -> ComponentInitialization {
         self.inner_connector.initialization_for_dataset(dataset)
     }
 }
@@ -287,7 +308,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
 /// The dataset's configured `on_zero_results` acceleration setting, defaulting to
 /// [`ZeroResultsAction::ReturnEmpty`] when no acceleration is configured. Drives the compound
 /// full-text index's read mode: whether an empty warm-tier result falls back to Elasticsearch.
-fn on_zero_results(dataset: &Dataset) -> ZeroResultsAction {
+fn on_zero_results(dataset: &DatasetSpec) -> ZeroResultsAction {
     dataset
         .acceleration
         .as_ref()

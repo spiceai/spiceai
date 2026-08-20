@@ -17,16 +17,45 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::ResultExt;
 use spice_table::{Index, IndexLayer, SpiceTable};
-use spicepod::semantic::{Column, IndexStore, MetadataType};
+use spicepod::semantic::{Column, IndexStore};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::component::column::full_text_search_config;
-use crate::component::dataset::FullTextSearchDatasetConfig;
+use crate::component::dataset::{
+    DatasetSpec, FullTextSearchDatasetConfig, acceleration::RefreshMode,
+};
+use crate::dataconnector::DataConnector;
 use crate::make_spice_data_sub_directory;
 
 use search::generation::text_search::index::FullTextDatabaseIndex;
+
+/// Whether registering `dataset` on `connector` will attach a CDC change stream or an append
+/// stream to a full-text index built for it — i.e. whether that index must be constructed with
+/// its deferred-commit window permanently disabled (see `FullTextDatabaseIndex::try_new`'s
+/// `stream_attached` parameter), because it will share a single tantivy writer with a change stream
+/// running outside the sink write lifecycle.
+///
+/// Mirrors the refresh-mode resolution `DataFusion::create_accelerated_table` performs before
+/// wiring `changes_stream`/`append_stream`, computed here ahead of index construction instead of
+/// determined afterwards.
+pub(crate) fn dataset_attaches_stream(
+    connector: &Arc<dyn DataConnector>,
+    dataset: &DatasetSpec,
+) -> bool {
+    let refresh_mode = connector.resolve_refresh_mode(
+        dataset
+            .acceleration
+            .as_ref()
+            .and_then(|acceleration| acceleration.refresh_mode),
+    );
+    match refresh_mode {
+        RefreshMode::Changes => connector.supports_changes_stream(),
+        RefreshMode::Append if dataset.time_column.is_none() => connector.supports_append_stream(),
+        _ => false,
+    }
+}
 
 /// Builds (but does not register) a [`FullTextDatabaseIndex`] over `inner_table_provider`.
 ///
@@ -41,6 +70,7 @@ pub(crate) fn build_full_text_database_index(
     columns: &[Column],
     tbl: &TableReference,
     store_fields_override: Option<&[String]>,
+    stream_attached: bool,
 ) -> Result<FullTextDatabaseIndex, Box<dyn std::error::Error + Send + Sync>> {
     let schema = inner_table_provider.schema();
     for c in columns {
@@ -88,11 +118,24 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields = columns
             .iter()
             .filter_map(|c| {
-                if c.as_vector_metadata() == Some(MetadataType::NonFilterable) {
-                    Some(c.name.clone())
-                } else {
-                    None
+                // Both metadata kinds are only about vector-search's own metadata filter;
+                // either one still means the column should be projectable and, per its
+                // tantivy type, filterable through the FTS index too.
+                c.as_vector_metadata()?;
+                let (_, field) = schema.column_with_name(&c.name)?;
+                if !FullTextDatabaseIndex::is_field_type_supported(field.data_type()) {
+                    // e.g. `Date32`/`Date64`/`Timestamp`: a valid `Filterable` metadata type for
+                    // other index backends (Elasticsearch), but not yet representable in the
+                    // local FTS schema. Skip it here rather than fail index construction.
+                    tracing::warn!(
+                        "Column {} on table {} has vector-search metadata but its type ({}) is not supported by the full text search index; it will not be filterable there",
+                        c.name,
+                        tbl,
+                        field.data_type()
+                    );
+                    return None;
                 }
+                Some(c.name.clone())
             })
             .collect::<Vec<_>>();
         derived_store_fields.as_slice()
@@ -104,6 +147,7 @@ pub(crate) fn build_full_text_database_index(
         Some(primary_key),
         directory,
         store_fields,
+        stream_attached,
     )
     .boxed()
 }
@@ -139,9 +183,15 @@ pub(crate) fn add_full_text_search_to_table(
     inner_table_provider: &Arc<dyn TableProvider>,
     columns: &[Column],
     tbl: &TableReference,
+    stream_attached: bool,
 ) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
-    let index =
-        build_full_text_database_index(Arc::clone(inner_table_provider), columns, tbl, None)?;
+    let index = build_full_text_database_index(
+        Arc::clone(inner_table_provider),
+        columns,
+        tbl,
+        None,
+        stream_attached,
+    )?;
     Ok(register_index(
         inner_table_provider,
         Arc::new(index) as Arc<dyn Index + Send + Sync>,
@@ -200,6 +250,7 @@ pub(crate) async fn add_compound_fts_to_table(
     tbl: &datafusion::sql::TableReference,
     fts_params: &runtime_search::store_params::elasticsearch::ElasticsearchFtsConfig,
     on_zero_results: &crate::component::dataset::acceleration::ZeroResultsAction,
+    stream_attached: bool,
 ) -> Result<Arc<SpiceTable>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::component::dataset::acceleration::ZeroResultsAction;
     use search::index::SearchIndex;
@@ -232,6 +283,7 @@ pub(crate) async fn add_compound_fts_to_table(
         columns,
         tbl,
         Some(&[] as &[String]),
+        stream_attached,
     ) {
         Ok(index) => index,
         Err(source) => {
@@ -515,9 +567,14 @@ mod tests {
         ];
         let table_ref = datafusion::sql::TableReference::parse_str("docs");
 
-        let index =
-            build_full_text_database_index(table, &columns, &table_ref, Some(&[] as &[String]))
-                .expect("warm index builds");
+        let index = build_full_text_database_index(
+            table,
+            &columns,
+            &table_ref,
+            Some(&[] as &[String]),
+            false,
+        )
+        .expect("warm index builds");
 
         let plan = index
             .query_table_provider("hello")

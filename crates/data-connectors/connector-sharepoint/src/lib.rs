@@ -26,7 +26,7 @@ limitations under the License.
 //!
 //! - **Object-store tabular / blob**: `from: sharepoint://me/Documents/...`.
 //!   Delegates to [`SharepointListingConnector`] which implements
-//!   [`runtime::dataconnector::listing::ListingTableConnector`]. DataFusion's
+//!   [`data_connector_api::listing::ListingTableConnector`]. DataFusion's
 //!   `ListingTable` provides `SELECT`, `INSERT INTO`, `COPY TO`, `COPY FROM`
 //!   for CSV/JSON/Parquet; binary formats (PDF, PPTX, etc.) go through the
 //!   `ObjectStore` as raw bytes. Writes create new versions by default —
@@ -47,21 +47,23 @@ use crate::sharepoint::object_store::{
 };
 use crate::sharepoint::table::SharepointTableProvider;
 use crate::sharepoint::url::DriveRef;
+use app::App;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
-use datafusion::execution::runtime_env::RuntimeEnv;
-use document_parse::DocumentParser;
-use graph_rs_sdk::GraphClient;
-use runtime::Runtime;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
 };
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::parameters::{ParameterSpec, Parameters};
+use datafusion::datasource::TableProvider;
+use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use document_parse::DocumentParser;
+use graph_rs_sdk::GraphClient;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
 use std::any::Any;
@@ -119,7 +121,10 @@ pub struct Sharepoint {
     client: Arc<GraphClient>,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
+    /// The runtime's own session, whose `RuntimeEnv` is where a store must be
+    /// registered for a scan against the registered `ListingTable` to resolve it.
+    datafusion_session_context: Option<Arc<SessionContext>>,
 }
 
 impl fmt::Debug for Sharepoint {
@@ -140,7 +145,8 @@ impl Sharepoint {
     async fn new(
         params: Parameters,
         tokio_io_runtime: tokio::runtime::Handle,
-        runtime: Option<Runtime>,
+        app: Option<Arc<App>>,
+        datafusion_session_context: Option<Arc<SessionContext>>,
     ) -> Result<Self> {
         let auth = build_auth_from_params(&params)?;
         let client = auth.build_graph_client().await.context(AuthBuildSnafu)?;
@@ -148,7 +154,8 @@ impl Sharepoint {
             client,
             params,
             tokio_io_runtime,
-            runtime,
+            app,
+            datafusion_session_context,
         })
     }
 
@@ -156,7 +163,7 @@ impl Sharepoint {
     /// explicit `file_format=` param first, then falls back to the URL's
     /// trailing extension. `None` means "no document parsing" — raw bytes
     /// are surfaced as text, which is the right default for `.md` / `.txt`.
-    async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
+    async fn get_formatter(&self, dataset: &DatasetSpec) -> Option<Arc<dyn DocumentParser>> {
         let key = dataset
             .params
             .get("file_format")
@@ -174,7 +181,7 @@ impl Sharepoint {
     /// URL schemes are case-insensitive, so we parse and compare on scheme
     /// and authority rather than a raw prefix match — `SharePoint://me/…`
     /// should route the same as `sharepoint://me/…`.
-    fn uses_object_store(dataset: &Dataset) -> bool {
+    fn uses_object_store(dataset: &DatasetSpec) -> bool {
         match Url::parse(&dataset.from) {
             Ok(u) => u.scheme().eq_ignore_ascii_case(CONNECTOR_NAME) && u.has_authority(),
             Err(_) => false,
@@ -198,7 +205,7 @@ impl Sharepoint {
     /// format for non-tabular extensions like `.xlsx`/`.pdf`.
     fn listing_connector(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<SharepointListingConnector> {
         let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
         let mut params = self.params.clone();
@@ -217,10 +224,10 @@ impl Sharepoint {
         // register_object_stores() is only called on the cluster path, not on the
         // normal single-node dataset init path, so this is the only place where the
         // collision is reliably caught in the standard runtime.
-        if let Some(rt) = &self.runtime {
+        if let Some(session_context) = &self.datafusion_session_context {
             let fingerprint = store_fingerprint(&self.params, kind, &config);
             let key_url = registry_key_for(&store_url);
-            let env_id = Arc::as_ptr(&rt.datafusion().ctx.runtime_env()) as usize;
+            let env_id = Arc::as_ptr(&session_context.runtime_env()) as usize;
             let map_key = (env_id, key_url.clone());
             let fps = SHAREPOINT_STORE_FINGERPRINTS
                 .lock()
@@ -256,7 +263,8 @@ impl Sharepoint {
             config,
             params,
             tokio_io_runtime: self.tokio_io_runtime.clone(),
-            runtime: self.runtime.clone(),
+            app: self.app.clone(),
+            datafusion_session_context: self.datafusion_session_context.clone(),
         })
     }
 }
@@ -407,7 +415,7 @@ fn register_sharepoint_store(
     store_url: &Url,
     store: Arc<SharepointObjectStore>,
     fingerprint: u64,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<()> {
     let key_url = registry_key_for(store_url);
     let env_id = Arc::as_ptr(runtime_env) as usize;
@@ -469,7 +477,7 @@ fn register_sharepoint_store_on_fresh(
 /// drive-kind routing, and config.
 fn parse_object_store_components(
     params: &Parameters,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
 ) -> DataConnectorResult<(Url, Option<DriveKind>, SharepointObjectStoreConfig)> {
     let store_url =
         Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -704,14 +712,17 @@ impl DataConnectorFactory for SharepointFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let io_runtime = params.io_runtime.clone();
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
-            let connector = Sharepoint::new(params.parameters, io_runtime, runtime).await?;
+            let app = Some(context.app());
+            let session_context = Some(context.datafusion_session_context());
+            let connector =
+                Sharepoint::new(params.parameters, io_runtime, app, session_context).await?;
             Ok(Arc::new(connector) as Arc<dyn DataConnector>)
         })
     }
@@ -733,12 +744,13 @@ impl DataConnector for Sharepoint {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
             return self
                 .listing_connector(dataset)?
-                .read_provider(dataset)
+                .read_provider(context, dataset)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -759,7 +771,8 @@ impl DataConnector for Sharepoint {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !Self::uses_object_store(dataset) {
             return None;
@@ -768,12 +781,12 @@ impl DataConnector for Sharepoint {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
         };
-        Some(connector.read_provider(dataset).await)
+        Some(connector.read_provider(context, dataset).await)
     }
 
     async fn metadata_provider(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         if !dataset.has_metadata_table {
             return None;
@@ -804,7 +817,7 @@ impl DataConnector for Sharepoint {
 
     async fn register_object_stores(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
         if !Self::uses_object_store(dataset) {
@@ -849,7 +862,8 @@ struct SharepointListingConnector {
     config: SharepointObjectStoreConfig,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
+    datafusion_session_context: Option<Arc<SessionContext>>,
 }
 
 impl fmt::Debug for SharepointListingConnector {
@@ -888,8 +902,8 @@ impl ListingTableConnector for SharepointListingConnector {
         self.tokio_io_runtime.clone()
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn object_versioning_type(&self) -> Option<ObjectVersionType> {
@@ -898,7 +912,7 @@ impl ListingTableConnector for SharepointListingConnector {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url_str = url.unwrap_or(dataset.from.as_str());
@@ -929,7 +943,7 @@ impl ListingTableConnector for SharepointListingConnector {
     /// dataset, and `SpiceObjectStoreRegistry` doesn't.
     fn get_object_store(
         &self,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn datafusion::object_store::ObjectStore>> {
         Ok(self.build_object_store())
     }
@@ -957,8 +971,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Record the fingerprint after registering so that listing_connector()'s
         // collision check can find it on the next dataset — without this the map
         // stays empty on the single-node path and the check never fires.
-        if let Some(rt) = &self.runtime {
-            let ctx = Arc::clone(&rt.datafusion().ctx);
+        if let Some(ctx) = self.datafusion_session_context.clone() {
             let key_url = registry_key_for(&self.store_url);
             let fingerprint = store_fingerprint(&self.params, self.kind, &self.config);
             let env_id = Arc::as_ptr(&ctx.runtime_env()) as usize;
@@ -977,7 +990,7 @@ impl ListingTableConnector for SharepointListingConnector {
         // Fallback for contexts where the runtime isn't wired in (e.g. tests,
         // cluster schema-inference). Build a fresh session with a dedicated
         // RuntimeEnv and register the store on that.
-        let mut config = runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
+        let mut config = runtime_datafusion::session_config::DEFAULT_DATAFUSION_CONFIG
             .read()
             .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
         config
@@ -1046,10 +1059,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_sharepoint as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_sharepoint_connector,
     SHAREPOINT_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

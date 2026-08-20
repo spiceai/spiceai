@@ -20,7 +20,7 @@ use crate::metric::Metrics;
 
 use super::{
     Nameable, WithDependsOn,
-    model::{HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType},
+    model::{HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType, huggingface_model_id},
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -128,16 +128,7 @@ impl Embeddings {
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
         match self.get_prefix() {
-            Some(EmbeddingPrefix::HuggingFace) => {
-                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
-                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                    if let Some(revision) = caps.name("revision") {
-                        format!("{}:{}", model, revision.as_str())
-                    } else {
-                        model
-                    }
-                })
-            }
+            Some(EmbeddingPrefix::HuggingFace) => huggingface_model_id(&self.from),
             Some(EmbeddingPrefix::OpenAi) => {
                 let from = &self.from;
                 from.strip_prefix("openai:").map(ToString::to_string)

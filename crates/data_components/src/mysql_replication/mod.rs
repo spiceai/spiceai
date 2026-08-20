@@ -224,7 +224,8 @@ pub const CHECKPOINT_META_VERSION: u32 = 2;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct CheckpointMeta {
     pub version: u32,
-    /// Serialized dataset Arrow schema (same bytes `MySqlBinlogSys::serialize_schema` produces).
+    /// Serialized dataset Arrow schema (the encoding `arrow_tools::schema::schema_to_json`
+    /// produces).
     pub dataset_schema_json: String,
     /// [`setup::TableLayout::fingerprint`] of the source table at checkpoint time.
     pub source_layout_fingerprint: String,

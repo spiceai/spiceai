@@ -31,18 +31,19 @@ mod pool;
 use async_trait::async_trait;
 use clickhouse_rs::Options;
 use data_components::Read;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::sql::db_connection_pool::Error as DbConnectionPoolError;
 use factory::ClickhouseTableFactory;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use pool::ClickhouseConnectionPool;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, NewDataConnectorResult,
-};
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::{ParamLookup, ParameterSpec, Parameters};
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParamLookup, ParameterSpec, Parameters};
+use runtime_udfs_api::deny_spice_specific_functions;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::any::Any;
@@ -174,10 +175,11 @@ impl DataConnectorFactory for ClickhouseFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match get_config_from_params(params.parameters).await {
                 Ok(config) => {
@@ -261,7 +263,8 @@ impl DataConnector for Clickhouse {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.clickhouse_factory, dataset.path().into())
@@ -482,10 +485,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_clickhouse as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_clickhouse_connector,
     CLICKHOUSE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,
