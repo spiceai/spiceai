@@ -356,36 +356,14 @@ impl CloudClient {
             .map_err(|error| self.err(error))
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub async fn create_project(
         &self,
         name: &str,
-        region: &str,
-        kind: ProjectKind,
         description: Option<&str>,
         visibility: &str,
-        replicas: Option<i32>,
-        cpu: Option<i32>,
-        memory: Option<NumBytes>,
-        storage_size_gb: Option<f64>,
-        executor_replicas: Option<i32>,
-        executor_cpu: Option<i32>,
-        executor_memory: Option<NumBytes>,
+        placement: CreateProjectPlacement,
     ) -> Result<Project> {
-        let request = build_create_project_request(
-            name,
-            region,
-            kind,
-            description,
-            visibility,
-            replicas,
-            cpu,
-            memory,
-            storage_size_gb,
-            executor_replicas,
-            executor_cpu,
-            executor_memory,
-        );
+        let request = build_create_project_request(name, description, visibility, placement);
         self.inner
             .create_project(&request)
             .await
@@ -897,46 +875,92 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
 
 use super::bytes::NumBytes;
 
-#[expect(clippy::too_many_arguments)]
+/// The placement `POST /v1/projects` is asked for, and everything that only
+/// means something once a placement exists.
+///
+/// Spice Cloud resolves the project's kind from whether the request names a
+/// region source at all, and refuses a client-supplied `kind`. Modelling the
+/// two answers as separate variants is what makes the standalone request
+/// unable to carry a region, replica count, resource limit, or executor: those
+/// fields exist only on [`ManagedProjectPlacement`], so there is no path that
+/// sets one and still omits the region source.
+#[derive(Debug)]
+pub enum CreateProjectPlacement {
+    /// A Spice-managed project: a region, and the hosted runtime that region
+    /// provisions.
+    Managed(ManagedProjectPlacement),
+    /// A Cloud Connect project. The request names no region source, so Spice
+    /// Cloud creates the project with no instance attached; the operator's own
+    /// `spiced` becomes its runtime when the instance is attached, and the
+    /// region follows from the stamp that instance's control stream terminates
+    /// on.
+    Standalone,
+}
+
+/// Region and hosted-runtime configuration for a Spice-managed project.
+#[derive(Debug)]
+pub struct ManagedProjectPlacement {
+    /// Data region name, already normalized (e.g. `us-east-1-prod-aws-data`).
+    pub region: String,
+    pub kind: ProjectKind,
+    pub replicas: Option<i32>,
+    pub cpu: Option<i32>,
+    pub memory: Option<NumBytes>,
+    pub storage_size_gb: Option<f64>,
+    pub executor_replicas: Option<i32>,
+    pub executor_cpu: Option<i32>,
+    pub executor_memory: Option<NumBytes>,
+}
+
 fn build_create_project_request(
     name: &str,
-    region: &str,
-    kind: ProjectKind,
     description: Option<&str>,
     visibility: &str,
-    replicas: Option<i32>,
-    cpu: Option<i32>,
-    memory: Option<NumBytes>,
-    storage_size_gb: Option<f64>,
-    executor_replicas: Option<i32>,
-    executor_cpu: Option<i32>,
-    executor_memory: Option<NumBytes>,
+    placement: CreateProjectPlacement,
 ) -> CreateProjectRequest {
-    let resources = build_resources(cpu, memory);
-    let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
+    let base = CreateProjectRequest {
+        name: name.to_string(),
+        description: description.map(String::from),
+        visibility: visibility.to_string(),
+        cname: None,
+        cluster_name: None,
+        tags: None,
+        replicas: None,
+        resources: None,
+        executor: None,
+        storage_size_gb: None,
+    };
 
-    let (tags, replicas) = match kind {
+    // Every field left unset is skipped on the wire, so this is the request
+    // with no region source in it — which is what Spice Cloud reads as a
+    // request for a Cloud Connect project.
+    let CreateProjectPlacement::Managed(managed) = placement else {
+        return base;
+    };
+
+    let (tags, replicas) = match managed.kind {
         ProjectKind::Cluster => {
             let mut tags = BTreeMap::new();
             tags.insert("kind".to_string(), "cluster".to_string());
             (Some(tags), Some(1))
         }
-        ProjectKind::Set => (None, replicas),
+        ProjectKind::Set => (None, managed.replicas),
     };
 
     CreateProjectRequest {
-        name: name.to_string(),
-        description: description.map(String::from),
-        visibility: visibility.to_string(),
         // The Cloud create-app endpoint currently accepts the target deployment region
         // in the legacy `cname` request field; update-app uses the newer `region` field.
-        cname: Some(region.to_string()),
-        cluster_name: None,
+        cname: Some(managed.region),
         tags,
         replicas,
-        resources,
-        executor,
-        storage_size_gb,
+        resources: build_resources(managed.cpu, managed.memory),
+        executor: build_executor(
+            managed.executor_replicas,
+            managed.executor_cpu,
+            managed.executor_memory,
+        ),
+        storage_size_gb: managed.storage_size_gb,
+        ..base
     }
 }
 
@@ -1019,21 +1043,27 @@ mod tests {
         assert!(resources.limits.memory.is_none());
     }
 
+    fn managed_placement(region: &str) -> ManagedProjectPlacement {
+        ManagedProjectPlacement {
+            region: region.to_string(),
+            kind: ProjectKind::Set,
+            replicas: None,
+            cpu: None,
+            memory: None,
+            storage_size_gb: None,
+            executor_replicas: None,
+            executor_cpu: None,
+            executor_memory: None,
+        }
+    }
+
     #[test]
     fn create_project_request_sends_region_as_cname() {
         let request = build_create_project_request(
             "app",
-            "us-east-1-prod-aws-data",
-            ProjectKind::Set,
             None,
             "private",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            CreateProjectPlacement::Managed(managed_placement("us-east-1-prod-aws-data")),
         );
 
         let value = serde_json::to_value(request).expect("create app request should serialize");
@@ -1048,11 +1078,36 @@ mod tests {
         );
     }
 
+    /// Spice Cloud reads "no region source at all" as the request for a Cloud
+    /// Connect project, so the absence of every one of `cname`, `cluster_name`
+    /// and `region` is the wire contract — not an incidental empty field.
+    #[test]
+    fn standalone_create_project_request_names_no_region_source() {
+        let request = build_create_project_request(
+            "app",
+            Some("analytics"),
+            "private",
+            CreateProjectPlacement::Standalone,
+        );
+
+        let value = serde_json::to_value(request).expect("create app request should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "app",
+                "description": "analytics",
+                "visibility": "private"
+            })
+        );
+    }
+
     fn test_app(id: i64, name: &str, org: &str) -> Project {
         Project {
             id,
             name: name.to_string(),
             org: org.to_string(),
+            kind: None,
             description: None,
             visibility: None,
             created_at: None,
