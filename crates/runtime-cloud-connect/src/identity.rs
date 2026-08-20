@@ -738,13 +738,12 @@ pub fn snapshot_regular_file_create_new(
     source: &Path,
     destination: &Path,
 ) -> std::io::Result<bool> {
-    use std::io::Write as _;
-
     #[cfg(unix)]
-    let (mut source_file, mut destination_file) = {
+    {
+        use std::io::Write as _;
         use std::os::unix::fs::MetadataExt as _;
 
-        let Some(source_file) = open_regular_file_optional_unix(source)? else {
+        let Some(mut source_file) = open_regular_file_optional_unix(source)? else {
             return Ok(false);
         };
         let source_metadata = source_file.metadata()?;
@@ -755,23 +754,22 @@ pub fn snapshot_regular_file_create_new(
             ));
         }
 
-        let destination_file = create_regular_file_new_unix(destination)?;
-        (source_file, destination_file)
-    };
+        let mut destination_file = create_regular_file_new_unix(destination)?;
+        std::io::copy(&mut source_file, &mut destination_file)?;
+        destination_file.flush()?;
+        destination_file.sync_all()?;
+        sync_parent_directory(destination)?;
+        Ok(true)
+    }
 
     #[cfg(not(unix))]
     {
-        return Err(std::io::Error::new(
+        let _ = (source, destination);
+        Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "secure state-file snapshots are unsupported on this platform",
-        ));
+        ))
     }
-
-    std::io::copy(&mut source_file, &mut destination_file)?;
-    destination_file.flush()?;
-    destination_file.sync_all()?;
-    sync_parent_directory(destination)?;
-    Ok(true)
 }
 
 /// Read a security-sensitive state file without following symlinks or opening
@@ -797,50 +795,49 @@ pub(crate) fn read_regular_file_optional_bounded(
     path: &Path,
     max_bytes: u64,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-
-    #[cfg(unix)]
-    let Some(file) = open_regular_file_optional_unix(path)? else {
-        return Ok(None);
-    };
-
-    #[cfg(not(unix))]
-    let mut file = {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "secure state-file reads are unsupported on this platform",
-        ));
-    };
-
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the state path must be a bounded regular file",
-        ));
-    }
-
     #[cfg(unix)]
     {
+        use std::io::Read as _;
         use std::os::unix::fs::MetadataExt as _;
+
+        let Some(file) = open_regular_file_optional_unix(path)? else {
+            return Ok(None);
+        };
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the state path must be a bounded regular file",
+            ));
+        }
         if metadata.nlink() != 1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "the state file must not be hard-linked",
             ));
         }
+
+        let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut contents)?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the state file exceeded its size limit",
+            ));
+        }
+        Ok(Some(contents))
     }
 
-    let mut contents = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut contents)?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the state file exceeded its size limit",
-        ));
+    #[cfg(not(unix))]
+    {
+        let _ = (path, max_bytes);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "secure state-file reads are unsupported on this platform",
+        ))
     }
-    Ok(Some(contents))
 }
 
 /// Open a state file relative to verified directory descriptors, refusing a
