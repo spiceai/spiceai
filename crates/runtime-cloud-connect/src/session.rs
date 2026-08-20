@@ -60,7 +60,14 @@ pub struct AcknowledgedSession {
     pub identity_path: PathBuf,
     /// The organization this instance is enrolled in, when one is recorded.
     pub org_name: Option<String>,
-    /// The attached project, when this instance is attached to one.
+    /// The attached project's cloud id, when this instance is attached to one.
+    ///
+    /// This is the attachment itself. [`Self::app_name`] and
+    /// [`Self::monitor_url`] label it, and the control plane can deliver an
+    /// attachment without either, so absent metadata says nothing about whether
+    /// the instance is attached — only this field does.
+    pub app_id: Option<String>,
+    /// The attached project's display name, when the control plane supplied one.
     pub app_name: Option<String>,
     /// The portal page for the attached project. Cloud-constructed; never
     /// derived locally.
@@ -78,6 +85,7 @@ impl AcknowledgedSession {
             identifier: identity.identifier.clone(),
             identity_path: identity_path.to_path_buf(),
             org_name: identity.org_name.clone(),
+            app_id: identity.app_id.clone(),
             app_name: identity.app_name.clone(),
             monitor_url: identity.monitor_url.clone(),
             new_project_url: identity.new_project_url.clone(),
@@ -196,6 +204,7 @@ mod tests {
             identifier: identifier.to_string(),
             identity_path: PathBuf::from("/nonexistent/identity.json"),
             org_name: Some("acme".to_string()),
+            app_id: None,
             app_name: None,
             monitor_url: None,
             new_project_url: None,
@@ -294,6 +303,7 @@ mod tests {
             identifier: "inst_old".to_string(),
             identity_path: path.clone(),
             org_name: Some("acme".to_string()),
+            app_id: None,
             app_name: None,
             monitor_url: None,
             new_project_url: None,

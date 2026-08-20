@@ -486,6 +486,27 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         ))
     }
 
+    /// The configuration sections whose deployed value is not the one this
+    /// process is running with, sorted and deduplicated: what a restart would
+    /// put into effect. Stamped on every heartbeat.
+    ///
+    /// Not a [`Capability`]: the client pushes it with the heartbeat rather than
+    /// answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `None` and `Some` of an empty set are different answers, and the control
+    /// plane reads them as different states: `None` means this instance has no
+    /// restart-state source of truth and claims nothing, an empty `Some` means
+    /// it looked and nothing is pending. The default is `None` for that reason —
+    /// a handle with nothing to read must never send an empty set as a stand-in
+    /// for "unknown".
+    ///
+    /// An implementation answers from the same place its [`Self::status`]
+    /// document does, so the heartbeat and that document cannot disagree about
+    /// what is pending.
+    async fn restart_required(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// The instance's current metrics, as a serialized OTLP
     /// `ExportMetricsServiceRequest`.
     ///

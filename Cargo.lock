@@ -6070,6 +6070,7 @@ name = "data-accelerator-api"
 version = "2.2.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "arrow_tools",
  "async-trait",
  "datafusion",
@@ -6078,11 +6079,14 @@ dependencies = [
  "linkme",
  "paste",
  "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-component",
  "runtime-parameters",
  "runtime-secrets",
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "sysinfo 0.38.4",
  "tokio",
  "tracing",
 ]
@@ -7123,7 +7127,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=318492b8ae79162586ada08f7672563176bb0331#318492b8ae79162586ada08f7672563176bb0331"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=3c40145d671792f3974bc95af5587b699c86c86c#3c40145d671792f3974bc95af5587b699c86c86c"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -17265,6 +17269,7 @@ dependencies = [
  "hex",
  "object_store 0.13.2",
  "opentelemetry",
+ "runtime-checkpoint-api",
  "runtime-datafusion",
  "runtime-object-store",
  "runtime-parameters",
@@ -17334,25 +17339,38 @@ dependencies = [
  "async-trait",
  "serde",
  "snafu",
+ "tracing",
+ "util",
 ]
 
 [[package]]
 name = "runtime-checkpoint-duckdb"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow_tools",
  "async-trait",
+ "chrono",
  "datafusion-table-providers",
+ "duckdb",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "runtime-checkpoint-postgres"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
  "datafusion-table-providers",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
  "tokio-postgres",
 ]
 
@@ -17360,19 +17378,30 @@ dependencies = [
 name = "runtime-checkpoint-sqlite"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow_tools",
  "async-trait",
+ "chrono",
  "datafusion-table-providers",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
  "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "runtime-checkpoint-turso"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
+ "chrono",
  "data_components",
+ "runtime-acceleration",
  "runtime-checkpoint-api",
+ "serde_json",
  "turso",
 ]
 
@@ -19578,6 +19607,7 @@ dependencies = [
  "rstest 0.26.1",
  "runtime-api-types",
  "runtime-cloud-connect",
+ "runtime-secrets",
  "rustyline",
  "secrecy",
  "semver",
@@ -19609,6 +19639,7 @@ name = "spice-cloud"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-accelerator-api",
  "data-connector-api",
  "datafusion",
  "reqwest 0.13.4",
@@ -19834,6 +19865,7 @@ dependencies = [
  "connector-snowflake",
  "connector-spark",
  "connector-spiceai",
+ "data-accelerator-api",
  "data-connector-api",
  "regex",
  "runtime",
@@ -25338,8 +25370,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "datafusion-federation"
-version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=eba20fd9f539b8c1bb993e29373b2a644d3bcea8#eba20fd9f539b8c1bb993e29373b2a644d3bcea8"

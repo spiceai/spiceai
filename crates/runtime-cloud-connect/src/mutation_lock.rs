@@ -127,13 +127,38 @@ impl MutationLock {
         Ok(&self.config_dir)
     }
 
+    /// Duplicate the directory descriptor this lock retained.
+    ///
+    /// The handle names the protected directory by inode and carries no
+    /// pathname, so an operation performed relative to it (`openat`,
+    /// `renameat`, `unlinkat`) applies to the instance the lock was taken for
+    /// even when the config directory's pathname is replaced afterwards — by
+    /// its own owner, and so past the ownership test a re-resolved pathname
+    /// can still satisfy. That holds on every Unix, whereas
+    /// `descriptor_relative_config_dir` can offer it on Linux alone, so a
+    /// privileged state operation should resolve through this rather than
+    /// through a name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the descriptor cannot be duplicated.
+    #[cfg(unix)]
+    pub fn pinned_directory(&self) -> Result<File> {
+        self.directory.try_clone().context(IoSnafu {
+            path: self.config_dir.clone(),
+        })
+    }
+
     /// A path whose directory component resolves through the retained
     /// descriptor rather than by looking up the original pathname again.
     ///
     /// On Linux, `/proc/self/fd` keeps child lookups rooted at the inode this
     /// guard opened even if its canonical name is replaced. Other platforms use
     /// the verified canonical path because `/dev/fd` does not provide Linux's
-    /// directory traversal semantics.
+    /// directory traversal semantics, which leaves the identity check and a
+    /// later open separated in time there: a caller that can work from a
+    /// descriptor instead of a path should take `pinned_directory` (Unix
+    /// only), which closes that interval on every Unix.
     ///
     /// # Errors
     ///
@@ -408,22 +433,12 @@ fn open_unix_lock_file(config_dir: &Path, path: &Path) -> Result<(File, File)> {
         }
     }
 
-    let lock_name = c"connect.lock";
-    let lock_fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            lock_name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if lock_fd < 0 {
-        return Err(Error::Io {
+    let lock = crate::lock_file::create_or_open_lock_at(&directory, c"connect.lock").map_err(
+        |source| Error::Io {
             path: path.to_path_buf(),
-            source: std::io::Error::last_os_error(),
-        });
-    }
-    let lock = unsafe { File::from_raw_fd(lock_fd) };
+            source,
+        },
+    )?;
     Ok((lock, directory))
 }
 
@@ -717,6 +732,57 @@ mod tests {
         .expect_err("an aliased path must reach the same lock, not a second one");
         assert!(matches!(error, Error::LockTimeout { .. }), "{error}");
         drop(held);
+    }
+
+    /// The retained descriptor names the locked directory by inode, so it
+    /// still reaches the protected state after the pathname it was acquired
+    /// through names a different directory the same owner created. This is the
+    /// guarantee `descriptor_relative_config_dir` can only give where
+    /// `/proc/self/fd` supports directory traversal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_retained_descriptor_reaches_the_locked_state_after_a_same_owner_replacement() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config_dir = dir.path().join(".spice");
+        let moved_config_dir = dir.path().join("moved-spice");
+        std::fs::create_dir_all(&config_dir).expect("create locked config dir");
+        std::fs::write(config_dir.join("identity.json"), "locked").expect("write locked identity");
+
+        let held = MutationLock::acquire(&config_dir, "remove")
+            .await
+            .expect("lock the original config directory");
+
+        // Replaced before the descriptor is taken: the lock verified the
+        // directory's identity when it was acquired, so every instant after
+        // that is one a re-resolved pathname would have to cross.
+        std::fs::rename(&config_dir, &moved_config_dir).expect("rename the locked directory");
+        std::fs::create_dir_all(&config_dir).expect("create the replacement directory");
+        std::fs::write(config_dir.join("identity.json"), "replacement")
+            .expect("write the replacement identity");
+
+        let retained = held
+            .pinned_directory()
+            .expect("retain the locked directory");
+        let name = c"identity.json";
+        let fd = unsafe {
+            libc::openat(
+                retained.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut contents = String::new();
+        unsafe { File::from_raw_fd(fd) }
+            .read_to_string(&mut contents)
+            .expect("read state through the retained descriptor");
+
+        assert_eq!(
+            contents, "locked",
+            "the retained descriptor must reach the locked instance, not the replacement"
+        );
     }
 
     #[cfg(target_os = "linux")]

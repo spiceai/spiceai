@@ -25,6 +25,14 @@ pub trait DatasetCheckpointer: Send + Sync {
     async fn get_schema(&self) -> Result<Option<SchemaRef>>;
     async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
     async fn get_refresh_sql(&self) -> Result<Option<String>>;
+
+    /// Discards this dataset's checkpoint, so the next refresh treats the accelerated
+    /// table as fresh.
+    ///
+    /// Called when a schema change forces the table to be recreated: a checkpoint
+    /// describing the old schema would otherwise make the refresh believe the new,
+    /// empty table is already populated.
+    async fn delete(&self) -> Result<()>;
 }
 
 type CheckpointerFuture =
@@ -39,4 +47,24 @@ where
     Fut: Future<Output = Result<Arc<dyn DatasetCheckpointer>>> + Send + 'static,
 {
     Arc::new(move || Box::pin(f()))
+}
+
+/// Encodes a schema for the checkpoint's `schema_json` column.
+///
+/// # Errors
+///
+/// Returns the serde failure when the schema cannot be encoded.
+pub fn serialize_schema(schema: &SchemaRef) -> Result<String> {
+    serde_json::to_string(schema).map_err(|source| Box::new(source) as _)
+}
+
+/// Decodes a schema previously written by [`serialize_schema`].
+///
+/// # Errors
+///
+/// Returns the serde failure when the stored JSON is not a schema.
+pub fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
+    let schema: arrow::datatypes::Schema = serde_json::from_str(schema_json)
+        .map_err(|source| -> Box<dyn std::error::Error + Send + Sync> { Box::new(source) })?;
+    Ok(Arc::new(schema))
 }

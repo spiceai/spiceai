@@ -29,6 +29,33 @@ fn fmt_subscriber() -> tracing_subscriber::FmtSubscriber {
         .finish()
 }
 
+/// Collapses the control characters in `message` so it logs as a single record.
+///
+/// A message that breaks mid-line is one a log collector cannot group or alert
+/// on, and the text a log line embeds is routinely something else's: a
+/// `PostgreSQL` connection failure spreads its cause over two lines, and a
+/// `DataFusion` error appends `Caused by:` on its own. A formatter that
+/// interpolates such a cause emits a multiline event however carefully its own
+/// wording is kept to one line, so normalize at the point of interpolation
+/// rather than trusting the source.
+///
+/// Every control character is replaced rather than dropped, so offsets into the
+/// logged line still match the original message, and a message with nothing to
+/// collapse is borrowed, so the common path does not allocate.
+#[must_use]
+pub fn single_line(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.contains(char::is_control) {
+        std::borrow::Cow::Owned(
+            message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    }
+}
+
 pub fn in_tracing_context<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -46,4 +73,39 @@ where
     F: Future<Output = R>,
 {
     f.with_subscriber(Dispatch::new(fmt_subscriber())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_line;
+
+    /// The shape that motivates this: the `PostgreSQL` connection pool reports a
+    /// failure over two lines, so a warning embedding it would break mid-record.
+    #[test]
+    fn single_line_collapses_an_embedded_multiline_cause() {
+        let collapsed = single_line("PostgreSQL connection failed.\ndb error: FATAL: no database");
+
+        assert_eq!(
+            collapsed,
+            "PostgreSQL connection failed. db error: FATAL: no database"
+        );
+        assert!(!collapsed.contains('\n'));
+    }
+
+    #[test]
+    fn single_line_replaces_every_control_character_in_place() {
+        // Replaced rather than dropped, so offsets into the line still match.
+        let collapsed = single_line("a\r\nb\tc");
+
+        assert_eq!(collapsed, "a  b c");
+        assert_eq!(collapsed.len(), "a\r\nb\tc".len());
+    }
+
+    #[test]
+    fn single_line_borrows_a_message_with_nothing_to_collapse() {
+        assert!(matches!(
+            single_line("already one line"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }

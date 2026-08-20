@@ -49,13 +49,17 @@ use super::{
     get_primary_keys_from_constraints, upsert_dedup,
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::{
-    FilePathError, resolved_refresh_mode, snapshots::download_snapshot_if_needed,
-};
+use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
+use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
+use runtime_checkpoint_api::CheckpointError;
+#[cfg(feature = "sqlite")]
+use runtime_checkpoint_sqlite::SqliteSidecar;
 use search::index::native_vector::NativeVectorIndex;
 use spice_table::{Index, IndexLayer};
 use spicepod::acceleration as spicepod_acceleration;
@@ -92,6 +96,14 @@ pub enum Error {
 
     #[snafu(display("Invalid Cayenne acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display(
+        "Failed to evolve the schema of dataset {dataset} (cayenne): in-place schema evolution is not supported for a partitioned acceleration, \
+        because each partition stores its own schema. \
+        Set 'mode: file_update', or 'on_schema_change: drop_and_recreate' with 'refresh_mode: full', to rebuild the acceleration with the new schema. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PartitionedEvolutionUnsupported { dataset: Arc<str> },
 
     #[snafu(display(
         "Failed to configure dataset {table_name} (cayenne): The acceleration data directory '{data_dir}' contains the Cayenne metastore directory '{metadata_dir}'. \
@@ -1743,11 +1755,20 @@ impl CayenneAccelerator {
             // v1: its hidden `__spice_cache_namespace` column is appended LAST
             // and evolution also appends at the end — the positional
             // disagreement is unfixable via column adds.
+            // A partitioned table is excluded here, where the config is built,
+            // rather than only where the partition wrapper is: this same config
+            // opens the PARENT catalog entry, which is created first. Leaving
+            // evolution on for that open lets the catalog widen the parent's
+            // stored schema while every partition keeps its own — the accelerated
+            // table then advertises a schema its data does not have, which is the
+            // silent narrowing cast of #12999 reached through the open path
+            // instead of `evolve_table_schema`.
             let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
+            let is_partitioned = !acceleration.partition_by.is_empty();
             config.schema_evolution = source
                 .as_any()
                 .downcast_ref::<crate::component::dataset::Dataset>()
-                .filter(|_| !is_caching_mode)
+                .filter(|_| !is_caching_mode && !is_partitioned)
                 .map_or(
                     cayenne::metadata::SchemaEvolutionMode::Disabled,
                     |dataset| match dataset.on_schema_change {
@@ -3090,10 +3111,117 @@ impl DataAccelerator for CayenneAccelerator {
     /// Initializes a `Cayenne` database for the dataset
     /// If the dataset is not file-accelerated, this is a no-op
     /// Creates the data directory if it doesn't exist
-    async fn init(
+    /// Cayenne keeps its sidecar tables in the metastore database beside the dataset's
+    /// Cayenne directory, not in the dataset's own store.
+    ///
+    /// When that metastore is Turso, the pool comes from the **Turso accelerator's**
+    /// path-keyed cache rather than one built here: `cayenne.db` is opened by every
+    /// sidecar of every Cayenne dataset in the pod, and the lock that serializes their
+    /// DDL against each other's `BEGIN CONCURRENT` writes lives on the pool instance —
+    /// a pool of our own would hold a lock no other sidecar observes.
+    async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
         registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        #[cfg(feature = "sqlite")]
+        {
+            use datafusion_table_providers::sqlite::SqliteTableProviderFactory;
+
+            // Resolving the data directory validates the acceleration configuration; the
+            // metastore path below is derived independently of it.
+            self.file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+
+            if open_option == OpenOption::OpenExisting
+                && !std::path::Path::new(&metadata_db_path).exists()
+            {
+                return Err(CheckpointError::Store {
+                    source: format!(
+                        "Cayenne metadata directory does not exist at {metadata_db_path}"
+                    )
+                    .into(),
+                });
+            }
+
+            if let Some(parent) = std::path::Path::new(&metadata_db_path).parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|source| {
+                    CheckpointError::Store {
+                        source: Box::new(source),
+                    }
+                })?;
+            }
+
+            #[cfg(feature = "turso")]
+            {
+                let metastore_type = source
+                    .acceleration()
+                    .and_then(|a| a.params.get("cayenne_metastore"))
+                    .map_or("sqlite", String::as_str);
+                if metastore_type == "turso" {
+                    let turso_engine = registry
+                        .get_accelerator_engine(Engine::Turso)
+                        .await
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "Turso accelerator engine not available".into(),
+                        })?;
+                    let turso_accelerator = turso_engine
+                        .as_any()
+                        .downcast_ref::<crate::dataaccelerator::turso::TursoAccelerator>()
+                        .ok_or_else(|| CheckpointError::Store {
+                            source: "expected the registered Turso accelerator".into(),
+                        })?;
+                    let pool = turso_accelerator
+                        .get_shared_pool_for_path(&metadata_db_path)
+                        .await
+                        .map_err(|source| CheckpointError::Store {
+                            source: Box::new(source),
+                        })?;
+                    return Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
+                        pool,
+                        source.name().to_string(),
+                    )));
+                }
+            }
+
+            let sqlite_factory = SqliteTableProviderFactory::new();
+            let pool = sqlite_factory
+                .get_or_init_instance(
+                    Arc::from(metadata_db_path.as_str()),
+                    datafusion_table_providers::sql::db_connection_pool::Mode::File,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+
+            Ok(Arc::new(SqliteSidecar::new(
+                Arc::new(pool),
+                source.name().to_string(),
+            )))
+        }
+
+        // The Cayenne metastore is a SQLite (or Turso) database, so without the
+        // `sqlite` engine compiled in there is nothing to open it with.
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = (source, registry, open_option);
+            Err(runtime_acceleration::sidecar::unsupported_sidecar(
+                "cayenne", "sidecar",
+            ))
+        }
+    }
+
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
@@ -3255,9 +3383,9 @@ impl DataAccelerator for CayenneAccelerator {
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
                 );
-                super::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
-                    source,
+                    &source.name().to_string(),
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
@@ -3271,9 +3399,43 @@ impl DataAccelerator for CayenneAccelerator {
                     // and `snapshot_before_recreate` skips the snapshot rather than
                     // publish an archive nothing can restore.
                     self.snapshot_engine_for_source(source).await,
+                    resolved_refresh_mode(source, acceleration),
                 )
                 .await;
+            }
 
+            // Metadata before files, and its failures are fatal — the same
+            // ordering `drop_table` uses, and for the same reason. Deleting the
+            // directory first and then continuing past a failed catalog drop
+            // leaves rows describing files that are gone, and for a partitioned
+            // table leaves the per-partition children whose stale schemas this
+            // rebuild exists to discard. Failing first leaves an acceleration
+            // the operator can retry.
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+
+            let table_name = source.name().to_string();
+            let catalog = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            if catalog
+                .drop_table(&table_name)
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?
+            {
+                tracing::info!(
+                    "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
+                );
+            }
+
+            if path_buf.exists() {
                 // Re-check now that the directories exist: `snapshot_before_recreate`
                 // creates both, so an overlap only a symlink reveals is resolvable here
                 // even though the open-time check above had nothing to canonicalize.
@@ -3287,37 +3449,6 @@ impl DataAccelerator for CayenneAccelerator {
                     .await
                     .boxed()
                     .context(AccelerationInitializationFailedSnafu)?;
-            }
-
-            // Also drop the table from metadata catalog to clean up stale metadata
-            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
-
-            let metastore_type = acceleration
-                .params
-                .get("cayenne_metastore")
-                .map_or("sqlite", String::as_str);
-
-            // Get or create catalog and drop the table if it exists
-            if let Ok(catalog) = self
-                .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let table_name = source.name().to_string();
-                match catalog.drop_table(&table_name).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            "Dropped existing Cayenne table metadata for '{table_name}' (file_create mode)"
-                        );
-                    }
-                    Ok(false) => {
-                        // Table didn't exist in metadata, nothing to drop
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to drop Cayenne table metadata for '{table_name}': {e}. Continuing anyway."
-                        );
-                    }
-                }
             }
         }
 
@@ -3368,10 +3499,10 @@ impl DataAccelerator for CayenneAccelerator {
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 snapshot_adapter,
                 AccelerationEngine::Cayenne,
                 snapshot_engine,
+                resolved_refresh_mode(source, acceleration),
             )
             .await)
         } else {
@@ -3439,7 +3570,7 @@ impl DataAccelerator for CayenneAccelerator {
                 .map(str::trim)
                 .filter(|sql| !sql.is_empty())
                 .map(|retention_sql| {
-                    match crate::datafusion::retention_sql::parse_retention_sql(
+                    match runtime_datafusion::retention_sql::parse_retention_sql(
                         source.name(),
                         retention_sql,
                         Arc::clone(&arrow_schema),
@@ -3608,14 +3739,21 @@ impl DataAccelerator for CayenneAccelerator {
             .await?;
             // Partitioned tables are excluded from v1 schema evolution
             // (per-partition catalog tables would evolve lazily as each
-            // partition opens, leaving mixed schemas across partitions);
-            // keep the legacy pin-stored-schema behavior.
-            if !vortex_config.schema_evolution.is_disabled() {
+            // partition opens, leaving mixed schemas across partitions); keep
+            // the legacy pin-stored-schema behavior. The config already arrives
+            // Disabled for a partitioned table — see where `schema_evolution` is
+            // built, which has to exclude it there so the parent open cannot
+            // widen either — so this only tells an operator whose
+            // `on_schema_change` asked for evolution that it will not apply.
+            debug_assert!(
+                vortex_config.schema_evolution.is_disabled(),
+                "a partitioned Cayenne table must never carry an evolution mode"
+            );
+            if requests_schema_evolution(source) {
                 tracing::warn!(
                     dataset = %source.name(),
                     "on_schema_change schema evolution is not supported for partitioned Cayenne tables; schema changes will not be applied in place"
                 );
-                vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
             }
 
             serialize_partition_child_writes(&mut vortex_config, &table_name);
@@ -3790,30 +3928,40 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
         let path_buf = PathBuf::from(&dir_path);
-        if path_buf.exists() {
-            // A schema rebuild reaches this without going through `init`, so the
-            // open-time check is not on this path's stack.
-            Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
 
-            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
-            tracing::info!(
-                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
-            );
+        // A schema rebuild reaches this without going through `init`, so the
+        // open-time check is not on this path's stack. Refuse before touching
+        // the catalog: an overlapping metastore is a configuration the whole
+        // rebuild must reject, not just the delete below — opening the nested
+        // path as a catalog would fail confusingly (or worse, mutate it) first.
+        if path_buf.exists() {
+            Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
         }
 
-        // Also drop the table from metadata catalog
+        // Metadata first, and its failures are fatal. The caller treats a
+        // successful drop as licence to clear the dataset checkpoint and
+        // recreate, so a drop that removed the files and then failed to remove
+        // the catalog rows would hand the next create a manifest of files that
+        // no longer exist and, for a partitioned table, children still pinning
+        // the old schema. Failing before anything is deleted leaves a table the
+        // operator can retry; the reverse order leaves one nothing can repair.
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
                 .params
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str);
-            if let Ok(catalog) = self
+            let catalog = self
                 .get_or_create_catalog(&metadata_dir, metastore_type)
-                .await
-            {
-                let _ = catalog.drop_table(table_name).await;
-            }
+                .await?;
+            catalog.drop_table(table_name).await.boxed()?;
+        }
+
+        if path_buf.exists() {
+            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
+            tracing::info!(
+                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+            );
         }
 
         // Recreate the data directory so the next create_external_table works
@@ -3830,6 +3978,10 @@ impl DataAccelerator for CayenneAccelerator {
     /// Idempotent: re-applying a plan whose evolved schema is already stored
     /// is a no-op, so a crash between this engine update and the checkpoint
     /// update self-heals via restart re-classification.
+    ///
+    /// Refused for a partitioned table: see [`PartitionedEvolutionUnsupported`].
+    ///
+    /// [`PartitionedEvolutionUnsupported`]: Error::PartitionedEvolutionUnsupported
     async fn evolve_table_schema(
         &self,
         table_name: &str,
@@ -3843,6 +3995,29 @@ impl DataAccelerator for CayenneAccelerator {
                 dataset: Arc::from(source.name().to_string()),
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
+
+        // A partitioned table keeps one Vortex table per partition, each with its
+        // own stored schema, and this method can only reach the parent catalog
+        // entry. Evolving the parent alone would report success while every
+        // partition still holds the old schema — so writes narrow-cast into them
+        // (silently losing precision) and the caller advances the dataset
+        // checkpoint past a change that was never applied, which makes every
+        // later restart classify source and checkpoint as identical and leaves
+        // the dataset permanently stuck. Refusing hands the change to the
+        // caller's fallback, which honors `mode: file_update` and
+        // `on_schema_change: drop_and_recreate` by recreating the table with the
+        // new schema.
+        //
+        // NOTE: this check belongs here and not in
+        // `engine_supports_in_place_evolution`, which `engine_supports_recreate`
+        // delegates to — excluding partitioned Cayenne there would also
+        // disqualify it from the recreate that makes this path work.
+        if !acceleration.partition_by.is_empty() {
+            return Err(Box::new(Error::PartitionedEvolutionUnsupported {
+                dataset: Arc::from(source.name().to_string()),
+            }));
+        }
+
         let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
         let metastore_type = acceleration
             .params
@@ -3916,6 +4091,24 @@ impl DataAccelerator for CayenneAccelerator {
 
         Ok(())
     }
+}
+
+/// Whether the dataset's `on_schema_change` asks for in-place schema evolution.
+///
+/// The policy lives on the `Dataset` component, so a non-`Dataset` source (a
+/// view, or DDL) never asks for it.
+fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
+    source
+        .as_any()
+        .downcast_ref::<crate::component::dataset::Dataset>()
+        .is_some_and(|dataset| {
+            matches!(
+                dataset.on_schema_change,
+                crate::component::dataset::OnSchemaChange::AppendNewColumns
+                    | crate::component::dataset::OnSchemaChange::SyncAllColumns
+                    | crate::component::dataset::OnSchemaChange::DropAndRecreate
+            )
+        })
 }
 
 /// Force partition child tables to encode serially (one write shard).
@@ -5180,9 +5373,8 @@ mod tests {
             ..Default::default()
         });
 
-        let registry = Arc::new(AcceleratorEngineRegistry::new());
         let err = CayenneAccelerator::new()
-            .init(&dataset, registry)
+            .init(&dataset)
             .await
             .expect_err("init must refuse a data directory that contains the metastore");
 
@@ -6366,6 +6558,155 @@ mod tests {
         assert_eq!(
             CayenneAccelerator::resolve_metadata_dir(Some(&acceleration)),
             "/persistent/data/metadata"
+        );
+    }
+
+    /// A partitioned Cayenne table keeps one Vortex table per partition, each
+    /// with its own stored schema, and `evolve_table_schema` can only reach the
+    /// parent catalog entry. Reporting success there would advance the dataset
+    /// checkpoint past a change no partition ever applied — every later restart
+    /// then classifies source and checkpoint as identical, so the acceleration
+    /// stays on the old schema forever while writes narrow-cast into it, and the
+    /// caller's `file_update` / `drop_and_recreate` recreate never runs (#12999).
+    #[tokio::test]
+    async fn evolving_a_partitioned_table_in_place_is_refused() {
+        use arrow_tools::schema_evolution::WideningPlan;
+        use spicepod::partitioning::PartitionedBy;
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        // Keep the metastore this test may open inside a temp dir rather than the
+        // process-wide Spice data path.
+        let metadata_dir = tempfile::TempDir::new().expect("tempdir");
+        let build = |partition_by: Vec<PartitionedBy>| {
+            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::FileUpdate,
+                refresh_mode: Some(RefreshMode::Full),
+                partition_by,
+                params: [(
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.path().to_string_lossy().to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+            dataset
+        };
+
+        let plan = WideningPlan {
+            added_columns: vec![Arc::new(Field::new("added", DataType::Utf8, true))],
+            widened_columns: Vec::new(),
+            relaxed_nullability: Vec::new(),
+            evolved_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("added", DataType::Utf8, true),
+            ])),
+        };
+
+        let partitioned = build(vec![PartitionedBy {
+            name: "bucket".to_string(),
+            expression: "bucket".to_string(),
+        }]);
+        let error = CayenneAccelerator::new()
+            .evolve_table_schema("users", &partitioned, &plan)
+            .await
+            .expect_err("in-place evolution of a partitioned table must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not supported for a partitioned acceleration"),
+            "the refusal must name partitioning as the reason, got: {message}"
+        );
+        assert!(
+            message.contains("drop_and_recreate") && message.contains("file_update"),
+            "the refusal must point at the settings that rebuild the table, got: {message}"
+        );
+
+        // The unpartitioned path is untouched: it still reaches the metastore,
+        // which is what the refusal above must not pre-empt. `users` was never
+        // created, so it fails on the missing table rather than on partitioning.
+        let unpartitioned_error = CayenneAccelerator::new()
+            .evolve_table_schema("users", &build(Vec::new()), &plan)
+            .await
+            .expect_err("no such table exists in a fresh metastore");
+        assert!(
+            !unpartitioned_error
+                .to_string()
+                .contains("partitioned acceleration"),
+            "an unpartitioned table must not take the partitioned refusal, got: {unpartitioned_error}"
+        );
+    }
+
+    /// The vortex config built for a partitioned dataset also opens the PARENT
+    /// catalog entry, which is created before the partition wrapper exists. If
+    /// it carried an evolution mode, the catalog would widen the parent's stored
+    /// schema at open while every partition kept its own — the same silent
+    /// narrowing as #12999, reached without ever calling `evolve_table_schema`.
+    #[tokio::test]
+    async fn a_partitioned_dataset_never_carries_a_schema_evolution_mode() {
+        use spicepod::partitioning::PartitionedBy;
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let build = |partition_by: Vec<PartitionedBy>, policy| {
+            let mut dataset = DatasetBuilder::try_new("postgres:users".to_string(), "users")
+                .expect("dataset builder")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&rt))
+                .build()
+                .expect("dataset");
+            dataset.on_schema_change = policy;
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                partition_by,
+                ..Default::default()
+            });
+            dataset
+        };
+        let partitioned_by_bucket = || {
+            vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket".to_string(),
+            }]
+        };
+        let workload = autotune::WorkloadProfile::default();
+        let evolution_mode = async |dataset: &crate::component::dataset::Dataset| {
+            CayenneAccelerator::get_vortex_config_with_footer_cache(
+                "users", dataset, None, &workload,
+            )
+            .await
+            .expect("the vortex config is built")
+            .schema_evolution
+        };
+
+        assert!(
+            evolution_mode(&build(
+                partitioned_by_bucket(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "a partitioned dataset must not carry an evolution mode, whatever its policy asks for"
+        );
+
+        // The same policy on an unpartitioned dataset still evolves: the guard
+        // above must key on partitioning, not disable evolution outright.
+        assert!(
+            !evolution_mode(&build(
+                Vec::new(),
+                crate::component::dataset::OnSchemaChange::SyncAllColumns
+            ))
+            .await
+            .is_disabled(),
+            "an unpartitioned dataset keeps in-place evolution"
         );
     }
 }

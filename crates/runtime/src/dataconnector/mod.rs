@@ -138,6 +138,8 @@ pub async fn create_new_connector(
     Some(result)
 }
 
+// [`DataConnectorFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     for registration in DATA_CONNECTOR_REGISTRATIONS {
         register_connector_factory(registration.name, (registration.constructor)()).await;
@@ -159,11 +161,6 @@ pub async fn registered_connector_names() -> Vec<String> {
 /// consistent with runtime tunables and component-level parameters.
 pub async fn suggest_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_connector_names().await)
-}
-
-pub async fn unregister_all() {
-    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-    registry.clear();
 }
 
 impl From<&Dataset> for ConnectorComponent {
@@ -542,5 +539,29 @@ mod tests {
             drasi.supports_durable_write_back_delivery(),
             "DrasiConnector must forward the source's delivery capability"
         );
+    }
+
+    #[tokio::test]
+    async fn shutting_down_one_runtime_does_not_deregister_connectors_for_another() {
+        // Regression test for the `s3` connector race that flaked
+        // `search::test_megascience_permutations` in CI: shutting one
+        // `Runtime` down must not deregister connectors a sibling `Runtime`
+        // still relies on.
+        let rt_a = crate::Runtime::builder().build().await;
+        let rt_b = crate::Runtime::builder().build().await;
+
+        assert!(
+            get_connector_factory("s3").await.is_some(),
+            "s3 connector should be registered before any shutdown"
+        );
+
+        rt_a.shutdown().await;
+
+        assert!(
+            get_connector_factory("s3").await.is_some(),
+            "shutting down one Runtime must not deregister connectors a sibling Runtime still needs"
+        );
+
+        rt_b.shutdown().await;
     }
 }
