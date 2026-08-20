@@ -4,6 +4,7 @@ exclude = ["crates/data-connectors/connector-nfs"]
 members = [
     "bin/spice/",
     "bin/spiced/",
+    "crates/accelerators/*",
     "crates/ansi_colors",
     "crates/app",
     "crates/arrow_tools",

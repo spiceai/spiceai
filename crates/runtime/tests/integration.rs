@@ -28,6 +28,28 @@ use std::sync::Arc;
 
 #[cfg(feature = "postgres-accel")]
 use crate::utils::TEST_REQUEST_CONTEXT;
+
+// The PostgreSQL accelerator is its own crate and self-registers via
+// `register_data_accelerator!` into a linkme slice. A dev-dependency alone does not put
+// the entry in this test binary — the linker drops the unreferenced static — so force
+// the link the same way `spiced` does. `postgres_accelerator_is_registered` below fails
+// if this line is ever dropped.
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+
+/// The engine reaches the registry only if its crate is linked into this binary, which a
+/// Cargo dependency does not guarantee. Asserted here rather than left to the first
+/// PostgreSQL-accelerated test, which needs a live database and so cannot tell a missing
+/// registration apart from a missing server.
+#[test]
+#[cfg(feature = "postgres-accel")]
+fn postgres_accelerator_is_registered() {
+    let engines = data_accelerator_api::registered_engine_names();
+    assert!(
+        engines.iter().any(|engine| engine == "postgres"),
+        "the postgres accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+}
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;

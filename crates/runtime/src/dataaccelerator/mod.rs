@@ -28,8 +28,6 @@ pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "postgres-accel")]
-pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 #[cfg(feature = "turso")]

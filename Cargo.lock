@@ -19,6 +19,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-postgres"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-postgres",
+ "runtime-datafusion",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "snafu",
+]
+
+[[package]]
 name = "adbc_core"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16985,6 +17005,7 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-postgres",
  "adbc_core",
  "adbc_driver_manager",
  "anyhow",
@@ -17153,7 +17174,6 @@ dependencies = [
  "runtime-auth",
  "runtime-checkpoint-api",
  "runtime-checkpoint-duckdb",
- "runtime-checkpoint-postgres",
  "runtime-checkpoint-sqlite",
  "runtime-checkpoint-turso",
  "runtime-cluster",
@@ -19699,6 +19719,7 @@ dependencies = [
 name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-postgres",
  "ansi_colors",
  "app",
  "arrow",

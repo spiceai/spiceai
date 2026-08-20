@@ -64,7 +64,6 @@ datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 spice-table = { path = "../spice-table" }
-tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -141,7 +140,6 @@ runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
-runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
 runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
@@ -267,6 +265,7 @@ connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
+accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -382,7 +381,10 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres", "dep:tokio-postgres", "dep:runtime-checkpoint-postgres"]
+# Selects the PostgreSQL-accelerator integration tests. The engine itself is a crate
+# (`accelerator-postgres`), linked by `spiced` in a shipped build and by the dev-dependency
+# below for these tests, so this feature no longer pulls anything into the library.
+postgres-accel = ["postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",

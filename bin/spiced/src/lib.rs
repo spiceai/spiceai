@@ -97,6 +97,11 @@ use connector_smb as _;
 use connector_snowflake as _;
 #[cfg(feature = "spark")]
 use connector_spark as _;
+
+// Same force-linkage for accelerator engines, which self-register via
+// `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;

@@ -42,6 +42,7 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
+accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -198,7 +199,7 @@ odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
-postgres-accel = ["runtime/postgres-accel"]
+postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
