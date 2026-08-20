@@ -37,8 +37,8 @@ use super::org;
 const DEV_CLOUD_API_BASE_URL: &str = "https://dev-api.spice.ai";
 const CLOUD_API_BASE_URL: &str = "https://api.spice.ai";
 
-/// The project a command acts on, after `--project`, `--org`, the linked
-/// project, and the active org have been reconciled.
+/// The project a command acts on, after `--project`, `--org`, the enrolled
+/// instance attachment, and the active org have been reconciled.
 ///
 /// `org` is `None` only when nothing in the invocation named one, in which case
 /// the credential's own org is used.
@@ -114,16 +114,10 @@ pub struct UpdateProjectParams<'a> {
 impl CloudClient {
     /// Create a new authenticated cloud client that acts on `org`.
     ///
-    /// A credential stored for that org wins. Otherwise the default credential
-    /// is used **only when it can be shown to belong to that same org** — the
-    /// invariant is "never use one organization's token for another", not
-    /// "never use the default token", and rejecting a user's own credential for
-    /// their own org would break the single-credential path most people have.
-    ///
-    /// A service-account credential has no user identity to check against. Its
-    /// organization is fixed by the OAuth client that issued it and the server
-    /// authorizes every request, so it is allowed through rather than blocked
-    /// on a check that cannot be performed.
+    /// A credential stored for that org wins. Otherwise a default *user*
+    /// credential may be used for any organization whose membership endpoint
+    /// accepts it. Machine credentials have no membership identity and remain
+    /// organization-bound, so they require an explicitly stored per-org token.
     pub async fn connect(org: Option<&str>) -> Result<Self> {
         let Some(org) = org else {
             let token = org::default_token().ok_or_else(not_authenticated)?;
@@ -138,18 +132,13 @@ impl CloudClient {
 
         let default = org::default_token().ok_or_else(|| org_credential_missing(org))?;
 
-        // Probe the token's own identity before granting it the requested org.
-        // `get_auth_context` sends no org context precisely so the answer names
-        // the org the token is *bound to*, rather than echoing back the org
-        // being asked about — the latter would accept any credential.
         let probe = Self::with_token_for_org(default.clone(), None)?;
         match probe.optional_user_auth_context().await? {
-            Some(context) if context.org_name.eq_ignore_ascii_case(org) => {
+            Some(_) => {
+                probe.get_auth_context_for_org(org).await?;
                 Self::with_token_for_org(default, Some(org))
             }
-            Some(context) => Err(default_credential_wrong_org(org, &context.org_name)),
-            // A service-account credential has no user identity to check.
-            None => Self::with_token_for_org(default, Some(org)),
+            None => Err(org_credential_missing(org)),
         }
     }
 
@@ -629,9 +618,16 @@ impl CloudClient {
 // Helper functions
 // ============================================================================
 
-fn get_base_url() -> String {
+pub(crate) fn get_base_url() -> String {
     if let Ok(url) = std::env::var("SPICE_CLOUD_API_URL") {
         return url;
+    }
+
+    // Compatibility for one release. `SPICE_CLOUD_API_URL` is authoritative;
+    // the old portal-origin variable is converted only for the known hosted
+    // origins, while arbitrary self-hosted origins remain unchanged.
+    if let Ok(url) = std::env::var("SPICE_BASE_URL") {
+        return api_base_url_from_legacy_portal(&url);
     }
 
     // Use dev API for dev versions
@@ -643,26 +639,49 @@ fn get_base_url() -> String {
     CLOUD_API_BASE_URL.to_string()
 }
 
+fn api_base_url_from_legacy_portal(base_url: &str) -> String {
+    match base_url.trim_end_matches('/') {
+        "https://spice.ai" => "https://api.spice.ai".to_string(),
+        "https://dev.spice.ai" => "https://dev-api.spice.ai".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Portal origin paired with the authoritative Cloud API origin.
+#[must_use]
+pub(crate) fn portal_base_url() -> String {
+    portal_base_url_from_api(&get_base_url())
+}
+
+fn portal_base_url_from_api(base: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base) else {
+        return base.trim_end_matches('/').to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return base.trim_end_matches('/').to_string();
+    };
+    let portal_host = if let Some(rest) = host.strip_prefix("api.") {
+        Some(rest.to_string())
+    } else if let Some(rest) = host.strip_suffix("-api.spice.ai") {
+        Some(format!("{rest}.spice.ai"))
+    } else if let Some((prefix, rest)) = host.split_once(".api.") {
+        Some(format!("{prefix}.{rest}"))
+    } else {
+        None
+    };
+    if let Some(portal_host) = portal_host
+        && url.set_host(Some(&portal_host)).is_ok()
+    {
+        return url.as_str().trim_end_matches('/').to_string();
+    }
+    base.trim_end_matches('/').to_string()
+}
+
 fn not_authenticated() -> Error {
     Error::cloud_with_hint(
         CloudErrorCode::NotAuthenticated,
         "Not authenticated with Spice Cloud.",
         "Run 'spice cloud login' (or set SPICE_SPICEAI_TOKEN) to authenticate.",
-    )
-}
-
-/// The default credential belongs to a different organization than the one
-/// named, so using it would run the command somewhere the caller did not ask
-/// for while reporting the org they did ask for.
-fn default_credential_wrong_org(requested: &str, actual: &str) -> Error {
-    Error::cloud_with_hint(
-        CloudErrorCode::OrgCredentialMissing,
-        format!(
-            "No Spice Cloud credential is stored for organization '{requested}'; your default credential belongs to '{actual}'."
-        ),
-        format!(
-            "Authenticate for it with 'spice cloud login pat --org {requested}' (or 'spice cloud login api --org {requested}' for automation)."
-        ),
     )
 }
 
@@ -681,7 +700,7 @@ fn org_credential_missing(org: &str) -> Error {
         CloudErrorCode::OrgCredentialMissing,
         format!("No Spice Cloud credential is stored for organization '{org}'.{current}"),
         format!(
-            "Authenticate for it with 'spice cloud login pat --org {org}' (or 'spice cloud login api --org {org}' for automation), or set {}.",
+            "Authenticate for it with 'spice cloud login token --org {org}' (or 'spice cloud login api --org {org}' for automation), or set {}.",
             org::org_token_var(org)
         ),
     )
@@ -1065,6 +1084,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_portal_origins_map_to_their_cloud_api_origins() {
+        for (portal, api) in [
+            ("https://spice.ai", "https://api.spice.ai"),
+            ("https://dev.spice.ai/", "https://dev-api.spice.ai"),
+            (
+                "https://cloud.internal.example/base/",
+                "https://cloud.internal.example/base",
+            ),
+        ] {
+            assert_eq!(api_base_url_from_legacy_portal(portal), api);
+        }
+    }
+
+    #[test]
+    fn portal_origin_is_derived_from_the_authoritative_api_origin() {
+        for (api, portal) in [
+            ("https://api.spice.ai", "https://spice.ai"),
+            ("https://dev-api.spice.ai", "https://dev.spice.ai"),
+            (
+                "https://cloud.internal.example",
+                "https://cloud.internal.example",
+            ),
+            (
+                "https://cloud.internal.example/base/",
+                "https://cloud.internal.example/base",
+            ),
+        ] {
+            assert_eq!(portal_base_url_from_api(api), portal);
+        }
+    }
+
+    #[test]
     fn resolve_project_id_matches_the_requested_org() {
         let apps = vec![
             test_app(1, "dashboard", "analytics"),
@@ -1205,35 +1256,13 @@ mod tests {
     }
 
     #[test]
-    fn a_default_credential_from_another_org_is_refused_by_name() {
-        // The invariant is "never use one org's token for another", not "never
-        // use the default token". When the default credential demonstrably
-        // belongs elsewhere, say so — and name both orgs, because "no
-        // credential" alone sends the user looking for the wrong problem.
-        let err = default_credential_wrong_org("spicehq", "lukekim");
-
-        assert_eq!(err.cloud_code(), Some(CloudErrorCode::OrgCredentialMissing));
-        let rendered = err.to_string();
-        assert!(
-            rendered.contains("'spicehq'") && rendered.contains("'lukekim'"),
-            "the error must name the requested and the actual org: {rendered}"
-        );
-        assert!(
-            rendered.contains("login pat --org spicehq"),
-            "the error must say how to authenticate for the requested org: {rendered}"
-        );
-    }
-
-    #[test]
     fn a_named_org_without_a_credential_fails_closed() {
-        // The credential fallback used to run the command against the default
-        // token's org while reporting the requested one.
         let err = org_credential_missing("spicehq");
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::OrgCredentialMissing));
         let rendered = err.to_string();
         assert!(
-            rendered.contains("'spicehq'") && rendered.contains("login pat --org spicehq"),
+            rendered.contains("'spicehq'") && rendered.contains("login token --org spicehq"),
             "the error must name the org and how to authenticate for it: {rendered}"
         );
     }

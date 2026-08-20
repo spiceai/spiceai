@@ -17,23 +17,22 @@ limitations under the License.
 //! Cloud commands for managing Spice Cloud resources.
 
 pub mod bytes;
-mod client;
-mod config;
+pub(crate) mod client;
 pub mod org;
 
+use crate::commands::login::LoginOutput;
 use crate::context::RuntimeContext;
 use crate::error::{CloudErrorCode, Error, InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
-use std::{fmt, io::IsTerminal};
+use std::{collections::BTreeSet, fmt, io::IsTerminal};
 
-pub(crate) use client::format_org_list;
 pub use client::{
     CloudClient, ProjectTarget, is_device_authorization_denied_error, parse_org_project,
 };
-pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
+use runtime_cloud_connect::{CloudConnectConfig, identity::IdentityStore};
 use spice_cloud_client::{
     endpoints::{data_region_name, normalize_data_region},
     types::{Deployment, IngestionMetrics, PodMetrics, ProjectKind, UpdateChannel},
@@ -48,7 +47,7 @@ apps and deployments, manage secrets, view logs and metrics, and deploy.
 
 Most subcommands require an active Spice Cloud session. Sign in with one of:
   spice cloud login subscription      # Browser-based subscription login
-  spice cloud login pat               # Personal access token
+  spice cloud login token             # Access token (alias: pat)
   spice cloud login api               # OAuth client credentials (automation)
 
 ORGANIZATIONS
@@ -127,7 +126,7 @@ pub enum CloudCommands {
     #[command(subcommand)]
     Secrets(SecretsCommands),
 
-    /// View deployment logs
+    /// View runtime logs
     Logs(LogsArgs),
 
     // `about`/`long_about` live on `DeployArgs`; a doc comment here would
@@ -136,6 +135,9 @@ pub enum CloudCommands {
 
     // `about`/`long_about` live on `StatusArgs`.
     Status(StatusArgs),
+
+    /// Install and manage the persistent service for this enrolled directory
+    Service(crate::commands::connect::service::cli::ServiceArgs),
 
     /// Show dataset load state for a project
     Datasets(DatasetsArgs),
@@ -174,10 +176,9 @@ pub enum CloudCommands {
 impl CloudCommands {
     /// The command's `--output` setting, when it produces structured output.
     ///
-    /// Lives beside the enum so adding a subcommand is a one-file change. This
-    /// previously took two exhaustive matches in `main.rs` that had to agree;
-    /// forgetting the second silently printed the startup banner into
-    /// `--machine` stdout and broke `jq`.
+    /// Lives beside the enum so adding a subcommand requires one exhaustive
+    /// match. Omitting structured output here would print the startup banner
+    /// into `--machine` stdout and break `jq`.
     pub fn output_mut(&mut self) -> Option<&mut OutputFormat> {
         match self {
             Self::Whoami(a) => Some(&mut a.output),
@@ -218,6 +219,7 @@ impl CloudCommands {
             | Self::Logout(_)
             | Self::Link(_)
             | Self::Unlink
+            | Self::Service(_)
             | Self::Org(OrgCommands::Clear) => None,
         }
     }
@@ -228,7 +230,8 @@ impl CloudCommands {
     /// command tree is enumerated; callers already hold the parsed `Cli`
     /// mutably at this point.
     pub fn produces_json(&mut self) -> bool {
-        self.output_mut().is_some_and(|o| *o == OutputFormat::Json)
+        matches!(self, Self::Login(args) if args.output == LoginOutput::Json)
+            || self.output_mut().is_some_and(|o| *o == OutputFormat::Json)
     }
 }
 
@@ -283,7 +286,7 @@ EXAMPLES
   spice cloud status --project spicehq/team-app --instance spicepod-team-app-abc-0-0"#
 )]
 pub struct StatusArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -298,7 +301,7 @@ pub struct StatusArgs {
 
 #[derive(Args, Debug)]
 pub struct DatasetsArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -393,7 +396,7 @@ pub enum InstanceCommands {
 
 #[derive(Args, Debug)]
 pub struct InstanceListArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -404,7 +407,7 @@ pub struct InstanceListArgs {
 
 #[derive(Args, Debug)]
 pub struct InstanceStatusArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -419,7 +422,7 @@ pub struct InstanceStatusArgs {
 
 #[derive(Args, Debug)]
 pub struct InstanceDatasetsArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -441,6 +444,10 @@ pub struct RegionsArgs {
 
 #[derive(Args)]
 pub struct LoginArgs {
+    /// Where to store or print the resulting credentials.
+    #[arg(long, short = 'o', default_value = "env")]
+    pub output: LoginOutput,
+
     #[command(subcommand)]
     pub method: Option<LoginMethod>,
 }
@@ -448,6 +455,7 @@ pub struct LoginArgs {
 impl fmt::Debug for LoginArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoginArgs")
+            .field("output", &self.output)
             .field("method", &self.method)
             .finish()
     }
@@ -458,9 +466,9 @@ pub enum LoginMethod {
     /// Log in with your Spice Cloud subscription in a browser
     Subscription(SubscriptionLoginArgs),
 
-    /// Log in with a Spice Cloud personal access token
-    #[command(name = "pat")]
-    Pat(PatLoginArgs),
+    /// Log in with a Spice Cloud access token
+    #[command(alias = "pat")]
+    Token(TokenLoginArgs),
 
     /// Log in with OAuth client credentials for automation
     Api(ApiLoginArgs),
@@ -470,7 +478,7 @@ impl fmt::Debug for LoginMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Subscription(args) => f.debug_tuple("Subscription").field(args).finish(),
-            Self::Pat(args) => f.debug_tuple("Pat").field(args).finish(),
+            Self::Token(args) => f.debug_tuple("Token").field(args).finish(),
             Self::Api(args) => f.debug_tuple("Api").field(args).finish(),
         }
     }
@@ -485,33 +493,33 @@ pub struct SubscriptionLoginArgs {
 }
 
 #[derive(Args)]
-pub struct PatLoginArgs {
-    /// Personal access token. Omit to enter it securely.
+pub struct TokenLoginArgs {
+    /// Access token. Omit to enter it securely.
     #[arg(
         long,
         env = "SPICE_CLOUD_PAT",
         value_name = "TOKEN",
-        help_heading = "PAT Login Options"
+        help_heading = "Access Token Login Options"
     )]
     pub token: Option<String>,
 }
 
-impl fmt::Debug for PatLoginArgs {
+impl fmt::Debug for TokenLoginArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PatLoginArgs")
+        f.debug_struct("TokenLoginArgs")
             .field("token", &self.token.as_deref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
 
-/// Where a freshly minted credential is filed, and which org it claims to be for.
+/// Where a credential is filed and which organization it must serve.
 ///
-/// Spice Cloud fixes a token's organization when it is minted, so `--org` states
-/// which org the caller believes the credential serves. The CLI verifies that
-/// claim against the server before storing it under that org, so a mismatch
-/// fails at login rather than silently acting on the wrong org later.
+/// User access tokens may serve every organization the user belongs to;
+/// machine credentials remain organization-bound. The server verifies the
+/// requested organization before the credential is stored under that name.
 struct LoginTarget<'a> {
     requested_org: Option<&'a str>,
+    output: LoginOutput,
 }
 
 #[derive(Args)]
@@ -549,13 +557,13 @@ impl fmt::Debug for ApiLoginArgs {
 
 #[derive(Args, Debug)]
 pub struct LinkArgs {
-    /// Project name in org/project format
-    pub project: String,
+    /// Project name in org/project format. Omit to choose interactively.
+    pub project: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct DeploymentsArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -587,7 +595,7 @@ pub struct ImagesArgs {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum LogLevelFilter {
-    /// Every entry the deployment emitted (default).
+    /// Every entry the runtime emitted (default).
     #[default]
     All,
     /// Warnings and errors.
@@ -611,19 +619,22 @@ impl LogLevelFilter {
     }
 }
 
+const MAX_LOG_LINES: u32 = 100_000;
+
 #[derive(Args, Debug)]
 pub struct LogsArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
-    /// Deployment ID (uses latest if not specified)
-    #[arg(long)]
-    pub deployment: Option<i64>,
-
-    /// Maximum number of log entries to show
-    #[arg(long, visible_alias = "tail", default_value = "100")]
-    pub limit: usize,
+    /// Maximum number of log entries to request per runtime instance
+    #[arg(
+        long,
+        visible_alias = "tail",
+        default_value = "100",
+        value_parser = parse_log_limit,
+    )]
+    pub limit: u32,
 
     /// Only show entries at or above this severity
     #[arg(long, value_enum, default_value = "all")]
@@ -647,10 +658,11 @@ pub struct LogsArgs {
     about = "Deploy a project",
     long_about = r#"Deploy an app on Spice Cloud.
 
-Spice Cloud pulls the spicepod from the app's connected git repository — by
-default the app's production branch. A local spicepod is NOT uploaded; use
-`spice cloud update app --spicepod <path>` to change the stored spicepod first,
-or `--branch` / `--commit` to deploy a different revision.
+Spice Cloud deploys the project's stored Spicepod. `spice cloud link` seeds it
+from the local Spicepod only when the project has none; later local edits are
+not synchronized. Use `spice cloud project update --spicepod <path>` to replace
+the stored Spicepod explicitly, or `--branch` / `--commit` to deploy a
+different repository revision.
 
 EXAMPLES
   spice cloud deploy --project spicehq/team-app
@@ -658,7 +670,7 @@ EXAMPLES
   spice cloud deploy --project spicehq/team-app --branch release --replicas 2"#
 )]
 pub struct DeployArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -697,7 +709,7 @@ pub struct DeployArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -708,7 +720,7 @@ pub struct InspectArgs {
 
 #[derive(Args, Debug)]
 pub struct ApiKeysArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -723,7 +735,7 @@ pub struct ApiKeysArgs {
 
 #[derive(Args, Debug)]
 pub struct MetricsArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -758,7 +770,7 @@ pub enum SecretsCommands {
 
 #[derive(Args, Debug)]
 pub struct SecretsListArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -769,7 +781,7 @@ pub struct SecretsListArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsSetArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -786,7 +798,7 @@ pub struct SecretsSetArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsGetArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -800,7 +812,7 @@ pub struct SecretsGetArgs {
 
 #[derive(Args, Debug)]
 pub struct SecretsDeleteArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -889,7 +901,7 @@ pub struct CreateProjectArgs {
 
 #[derive(Args, Debug)]
 pub struct CreateDeploymentArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -942,7 +954,7 @@ pub enum UpdateCommands {
 
 #[derive(Args, Debug)]
 pub struct UpdateProjectArgs {
-    /// Project name in org/project format (uses the linked project if omitted)
+    /// Project name in org/project format (uses the enrolled instance's project if omitted)
     #[arg(long, alias = "app", value_name = "ORG/PROJECT")]
     pub project: Option<String>,
 
@@ -1048,17 +1060,18 @@ pub async fn execute(ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Whoami(whoami_args) => execute_whoami(whoami_args, org).await,
         CloudCommands::Orgs(orgs_args) => execute_orgs(orgs_args, org).await,
         CloudCommands::Org(org_cmd) => execute_org(org_cmd, org).await,
-        CloudCommands::Link(link_args) => execute_link(link_args, org).await,
-        CloudCommands::Unlink => execute_unlink(),
+        CloudCommands::Link(link_args) => execute_link(ctx, link_args, org).await,
+        CloudCommands::Unlink => execute_unlink().await,
         CloudCommands::Projects(apps_args) => execute_projects(apps_args, org).await,
         CloudCommands::Deployments(deploy_args) => execute_deployments(deploy_args, org).await,
         CloudCommands::Regions(regions_args) => execute_regions(regions_args, org).await,
         CloudCommands::Images(images_args) => execute_images(images_args, org).await,
         CloudCommands::Project(project_cmd) => execute_project(project_cmd, org).await,
         CloudCommands::Secrets(secrets_cmd) => execute_secrets(secrets_cmd, org).await,
-        CloudCommands::Logs(logs_args) => execute_logs(logs_args, org).await,
+        CloudCommands::Logs(logs_args) => execute_logs(ctx, logs_args, org).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args, org).await,
         CloudCommands::Status(status_args) => execute_status(ctx, status_args, org).await,
+        CloudCommands::Service(service_args) => execute_service(ctx, service_args).await,
         CloudCommands::Datasets(datasets_args) => execute_datasets(ctx, datasets_args, org).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args, org).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args, org).await,
@@ -1158,9 +1171,9 @@ async fn execute_project(cmd: &ProjectCommands, flag_org: Option<&str>) -> Resul
 
 /// One report answering "is this project healthy?".
 ///
-/// Aggregates what previously took five commands — project metadata, the latest
-/// deployment, every instance with its health, and any dataset that is not
-/// loading. Aggregation is the default and narrowing is the flag, matching
+/// Aggregates project metadata, the latest deployment, every instance with its
+/// health, and any dataset that is not loading. Aggregation is the default and
+/// narrowing is the flag, matching
 /// `kubectl describe --show-events` and `fly status`; an operator diagnosing an
 /// outage should not have to know which of five commands holds the answer.
 async fn execute_status(
@@ -1168,8 +1181,28 @@ async fn execute_status(
     args: &StatusArgs,
     flag_org: Option<&str>,
 ) -> Result<()> {
+    let current = std::env::current_dir().map_err(|source| Error::CloudConnectIo {
+        message: format!("resolve the current instance directory for Cloud status: {source}"),
+    })?;
+    let instance_dir =
+        tokio::fs::canonicalize(&current)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!(
+                    "canonicalize the current instance directory {}: {source}",
+                    current.display()
+                ),
+            })?;
+    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let local = crate::commands::connect::status::ConnectStatus::collect(
+        &instance_dir,
+        &config_dir,
+        &client::get_base_url(),
+    )
+    .await;
+    let local_degradation = local.degradation();
     let (target, org_source) =
-        resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
+        resolve_project_target_with_source(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
 
     let project = client.get_project(&target).await?;
@@ -1227,9 +1260,11 @@ async fn execute_status(
         .iter()
         .filter(|dataset| dataset_needs_attention(dataset.status.as_deref()))
         .collect();
+    let status_degradation = cloud_status_degradation(local_degradation, runtime_error.as_deref());
 
     if args.output == OutputFormat::Json {
-        return write_json(&serde_json::json!({
+        write_json(&serde_json::json!({
+            "schema_version": local.schema_version,
             "project": project,
             "org": target.org,
             "instance": args.instance,
@@ -1237,8 +1272,17 @@ async fn execute_status(
             "instances": instances,
             "datasets_total": datasets.len(),
             "datasets_unhealthy": unhealthy,
-            "runtime_error": runtime_error,
-        }));
+            "runtime_error": &runtime_error,
+            "link": {
+                "connection": local.connection,
+                "service": local.service,
+                "deployment": local.deployment,
+            },
+        }))?;
+        return match status_degradation {
+            Some(message) => Err(Error::ServiceUnavailable { message }),
+            None => Ok(()),
+        };
     }
 
     println!("{}", describe_scope(&target, args.instance.as_deref()));
@@ -1324,7 +1368,20 @@ async fn execute_status(
         }
     }
 
-    Ok(())
+    println!();
+    println!("Local enrolled-instance state:");
+    crate::commands::connect::status::render(&local, OutputFormat::Table)?;
+    match status_degradation {
+        Some(message) => Err(Error::ServiceUnavailable { message }),
+        None => Ok(()),
+    }
+}
+
+fn cloud_status_degradation(
+    local_degradation: Option<String>,
+    runtime_error: Option<&str>,
+) -> Option<String> {
+    local_degradation.or_else(|| runtime_error.map(str::to_string))
 }
 
 async fn execute_datasets(
@@ -1332,7 +1389,7 @@ async fn execute_datasets(
     args: &DatasetsArgs,
     flag_org: Option<&str>,
 ) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
     let runtime_ctx =
         project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await?;
@@ -1378,7 +1435,7 @@ pub enum OrgSource {
     Flag,
     /// The `SPICE_CLOUD_ORG` environment variable.
     Environment,
-    /// `.spice/cloud.json`, written by `spice cloud link`.
+    /// The attachment stored with this directory's enrolled identity.
     LinkedApp,
     /// The persisted active org, set by `spice cloud org use`.
     ActiveOrg,
@@ -1394,7 +1451,7 @@ impl OrgSource {
             Self::ProjectArgument => "project argument",
             Self::Flag => "--org flag",
             Self::Environment => org::ACTIVE_ORG_VAR,
-            Self::LinkedApp => "linked app",
+            Self::LinkedApp => "enrolled instance",
             Self::ActiveOrg => "active org",
             Self::Credential => "credential",
         }
@@ -1440,11 +1497,43 @@ fn resolve_org(flag_org: Option<&str>) -> Result<Option<String>> {
 /// <org>/<app>` and `--org` name different orgs, or a linked directory
 /// disagrees with an explicit `--org`, the command fails and names both. A
 /// wrong-organization deploy is not recoverable by re-reading the scrollback.
-fn resolve_project_target_with_source(
+async fn resolve_project_target_with_source(
     app_flag: Option<&str>,
     flag_org: Option<&str>,
 ) -> Result<(ProjectTarget, OrgSource)> {
-    let (context_org, context_source) = resolve_org_with_source(flag_org)?;
+    let (explicit_org, explicit_source) = if let Some(org) = flag_org {
+        org::validate_org_name(org)?;
+        (Some(org.to_string()), OrgSource::Flag)
+    } else if let Ok(org) = std::env::var(org::ACTIVE_ORG_VAR)
+        && !org.is_empty()
+    {
+        org::validate_org_name(&org)?;
+        (Some(org), OrgSource::Environment)
+    } else {
+        (None, OrgSource::Credential)
+    };
+
+    let config_dir = CloudConnectConfig::resolve_config_dir(None);
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let identity = IdentityStore::load_optional_async(identity_path.clone())
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!(
+                "read the enrolled identity at {} while resolving the Cloud project: {source}",
+                identity_path.display()
+            ),
+        })?;
+    let attached_org = identity
+        .as_ref()
+        .and_then(|identity| identity.org_name.as_deref())
+        .filter(|org| !org.is_empty());
+    let (default_org, default_source) = if let Some(org) = explicit_org.clone() {
+        (Some(org), explicit_source)
+    } else if let Some(org) = attached_org {
+        (Some(org.to_string()), OrgSource::LinkedApp)
+    } else {
+        resolve_org_with_source(None)?
+    };
 
     // An `<org>/<app>` argument names the app completely and outranks everything.
     if let Some(app_flag) = app_flag {
@@ -1459,15 +1548,15 @@ fn resolve_project_target_with_source(
 
         let Some(path_org) = path_org else {
             // A bare app name inherits whatever org is in effect.
-            return Ok((ProjectTarget::new(context_org, app), context_source));
+            return Ok((ProjectTarget::new(default_org, app), default_source));
         };
 
         org::validate_org_name(&path_org)?;
         ensure_orgs_agree(
             &path_org,
             "the app argument",
-            context_org.as_deref(),
-            context_source,
+            explicit_org.as_deref(),
+            explicit_source,
         )?;
         return Ok((
             ProjectTarget::new(Some(path_org), app),
@@ -1475,31 +1564,34 @@ fn resolve_project_target_with_source(
         ));
     }
 
-    // No app named: fall back to the directory's linked app.
-    let Some(link) = load_cloud_link()? else {
+    // No app named: the enrolled identity is the directory's single source of
+    // attachment truth. `.spice/cloud.json` is not a resolution source.
+    let Some(identity) = identity else {
         return Err(Error::cloud_with_hint(
             CloudErrorCode::InvalidRequest,
             "No app specified.",
-            "Pass --project <org>/<project>, or run 'spice cloud link <org>/<project>' to set a default for this directory.",
+            "Pass --project <org>/<project>, or enroll this directory and run 'spice cloud link <org>/<project>'.",
         ));
     };
-
-    let Some(link_org) = (!link.org.is_empty()).then(|| link.org.clone()) else {
-        return Ok((ProjectTarget::new(context_org, link.app), context_source));
+    let Some(project) = identity.app_name.filter(|project| !project.is_empty()) else {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            "No app specified: this directory's enrolled instance is not attached to a project.",
+            "Pass --project <org>/<project> to select one, or run 'spice cloud link' interactively.",
+        ));
     };
-
-    org::validate_org_name(&link_org)?;
-
-    // The link is project-level config, so it loses to a flag or the
-    // environment — but only after saying so, never silently.
-    ensure_orgs_agree(
-        &link_org,
-        "the linked project",
-        context_org.as_deref(),
-        context_source,
-    )?;
+    let linked_org = identity.org_name.filter(|org| !org.is_empty());
+    if let Some(linked_org) = linked_org.as_deref() {
+        org::validate_org_name(linked_org)?;
+        ensure_orgs_agree(
+            linked_org,
+            "the enrolled instance",
+            explicit_org.as_deref(),
+            explicit_source,
+        )?;
+    }
     Ok((
-        ProjectTarget::new(Some(link_org), link.app),
+        ProjectTarget::new(linked_org.or(default_org), project),
         OrgSource::LinkedApp,
     ))
 }
@@ -1540,8 +1632,13 @@ fn ensure_orgs_agree(
 }
 
 /// Resolve which app a command acts on.
-fn resolve_project_target(app_flag: Option<&str>, flag_org: Option<&str>) -> Result<ProjectTarget> {
-    Ok(resolve_project_target_with_source(app_flag, flag_org)?.0)
+async fn resolve_project_target(
+    app_flag: Option<&str>,
+    flag_org: Option<&str>,
+) -> Result<ProjectTarget> {
+    Ok(resolve_project_target_with_source(app_flag, flag_org)
+        .await?
+        .0)
 }
 
 /// Build a client for the org a command acts on.
@@ -1575,13 +1672,16 @@ fn announce_target(action: &str, target: &ProjectTarget, source: OrgSource, outp
 // Command implementations
 // ============================================================================
 
-async fn execute_login(args: &LoginArgs, org: Option<&str>) -> Result<()> {
-    let target = LoginTarget { requested_org: org };
+pub(crate) async fn execute_login(args: &LoginArgs, org: Option<&str>) -> Result<()> {
+    let target = LoginTarget {
+        requested_org: org,
+        output: args.output,
+    };
     match &args.method {
         Some(LoginMethod::Subscription(args)) => {
             execute_login_device_flow(!args.device, &target).await
         }
-        Some(LoginMethod::Pat(args)) => execute_login_pat(args, &target).await,
+        Some(LoginMethod::Token(args)) => execute_login_token(args, &target).await,
         Some(LoginMethod::Api(args)) => execute_login_api(args, &target).await,
         None => execute_login_with_chooser(&target).await,
     }
@@ -1590,14 +1690,9 @@ async fn execute_login(args: &LoginArgs, org: Option<&str>) -> Result<()> {
 async fn execute_login_with_chooser(target: &LoginTarget<'_>) -> Result<()> {
     ensure_login_chooser_tty(std::io::stdin().is_terminal())?;
 
-    let items = [
-        "Subscription Login (browser)",
-        "Subscription Login (device code, no browser)",
-        "Personal Access Token (PAT)",
-        "API Login (OAuth client)",
-    ];
+    let items = ["Login with a web browser", "Paste an access token"];
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("How would you like to log in to Spice Cloud?")
+        .with_prompt("How would you like to authenticate to Spice Cloud?")
         .items(items)
         .default(0)
         .interact()
@@ -1607,18 +1702,7 @@ async fn execute_login_with_chooser(target: &LoginTarget<'_>) -> Result<()> {
 
     match selection {
         0 => execute_login_device_flow(true, target).await,
-        1 => execute_login_device_flow(false, target).await,
-        2 => execute_login_pat(&PatLoginArgs { token: None }, target).await,
-        3 => {
-            execute_login_api(
-                &ApiLoginArgs {
-                    client_id: None,
-                    client_secret: None,
-                },
-                target,
-            )
-            .await
-        }
+        1 => execute_login_token(&TokenLoginArgs { token: None }, target).await,
         _ => InvalidArgumentSnafu {
             message: "Invalid login selection".to_string(),
         }
@@ -1629,7 +1713,7 @@ async fn execute_login_with_chooser(target: &LoginTarget<'_>) -> Result<()> {
 fn ensure_login_chooser_tty(is_terminal: bool) -> Result<()> {
     if !is_terminal {
         return InvalidArgumentSnafu {
-            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
+            message: "Choose a login type explicitly when running non-interactively: 'spice login subscription', 'spice login token', or 'spice login api'",
         }
         .fail();
     }
@@ -1637,13 +1721,19 @@ fn ensure_login_chooser_tty(is_terminal: bool) -> Result<()> {
     Ok(())
 }
 
-async fn execute_login_pat(args: &PatLoginArgs, target: &LoginTarget<'_>) -> Result<()> {
+async fn execute_login_token(args: &TokenLoginArgs, target: &LoginTarget<'_>) -> Result<()> {
+    if target.output != LoginOutput::Json && args.token.is_none() {
+        println!(
+            "Tip: you can generate an access token here {}/account/tokens",
+            client::portal_base_url()
+        );
+    }
     let token = resolve_string_or_prompt(
         args.token.as_deref(),
-        "PAT",
+        "Access token",
         "--token",
         "SPICE_CLOUD_PAT",
-        "Spice Cloud personal access token",
+        "Paste your access token",
         true,
     )?;
 
@@ -1760,17 +1850,6 @@ fn resolve_string_or_prompt_with_terminal(
     Ok(value)
 }
 
-/// Store a credential under the org it actually serves.
-///
-/// With no `--org`, the credential becomes the default one, preserving today's
-/// single-org behavior. With `--org`, the credential is filed under a per-org
-/// variable so it cannot displace the personal-org credential.
-fn store_credential(token: &str, org: Option<&str>) -> Result<()> {
-    use crate::commands::login::merge_auth_config;
-
-    merge_auth_config("SPICEAI", &[(&credential_key(org), token)])
-}
-
 /// The `merge_auth_config` key a credential is filed under.
 ///
 /// `merge_auth_config("SPICEAI", &[(key, _)])` writes `SPICE_SPICEAI_{key}`, so
@@ -1800,11 +1879,63 @@ fn api_key_credential_key(org: Option<&str>) -> String {
     }
 }
 
+/// Build the credential writes for a user login.
+///
+/// User management tokens are membership-wide, so the default token and every
+/// verified organization receive a copy. A data-plane API key belongs to the
+/// organization returned with the authenticated user context; an explicit
+/// login for another member organization must not relabel that key or replace
+/// the default data-plane key.
+fn user_login_values<'a>(
+    token: &'a str,
+    api_key: Option<&'a str>,
+    token_org: Option<&str>,
+    store_org: Option<&str>,
+) -> Vec<(String, &'a str)> {
+    let mut credential_orgs = BTreeSet::new();
+    if let Some(org) = token_org {
+        credential_orgs.insert(org.to_string());
+    }
+    if let Some(org) = store_org {
+        credential_orgs.insert(org.to_string());
+    }
+
+    let mut values = vec![(credential_key(None), token)];
+    values.extend(
+        credential_orgs
+            .iter()
+            .map(|org| (credential_key(Some(org)), token)),
+    );
+
+    if let Some(api_key) = api_key {
+        if store_org.is_none() {
+            values.push((api_key_credential_key(None), api_key));
+        }
+        if let Some(org) = token_org.or(store_org) {
+            values.push((api_key_credential_key(Some(org)), api_key));
+        }
+    }
+
+    values
+}
+
+/// Machine credentials are confined to one organization when one is named.
+/// A named API login must not replace the membership-wide default user token.
+fn machine_login_values<'a>(token: &'a str, store_org: Option<&str>) -> Vec<(String, &'a str)> {
+    vec![(credential_key(store_org), token)]
+}
+
+fn keychain_login_orgs(spiceai: &[(&str, &str)]) -> BTreeSet<String> {
+    spiceai
+        .iter()
+        .filter_map(|(key, _)| org::org_from_credential_key(key))
+        .collect()
+}
+
 /// Check that a freshly minted credential really serves the requested org.
 ///
-/// Spice Cloud binds a token to one org at mint time, so `--org` is a claim to
-/// verify, not a setting to apply. Returns the org the credential should be
-/// filed under, which is `None` when the caller did not name one.
+/// User credentials can act across every organization the user belongs to;
+/// machine credentials remain bound to the organization that issued them.
 async fn verify_login_org(
     client: &CloudClient,
     requested_org: Option<&str>,
@@ -1814,33 +1945,61 @@ async fn verify_login_org(
         return Ok(None);
     };
 
-    if let Some(token_org) = token_org
-        && token_org.eq_ignore_ascii_case(requested)
-    {
-        return Ok(Some(requested.to_string()));
-    }
-
-    // The identity endpoint reports the token's own org. A different org means
-    // this credential cannot act on the requested one, however the CLI files it.
-    if let Some(token_org) = token_org {
-        return Err(Error::cloud_with_hint(
-            CloudErrorCode::WrongOrg,
-            format!("This credential is issued for organization '{token_org}', not '{requested}'."),
-            format!(
-                "Mint a credential for '{requested}' in the Spice Cloud portal (a personal access token or an OAuth client owned by that organization), then re-run with --org {requested}."
-            ),
-        ));
-    }
-
-    // A service-account credential has no user identity, so probe the org
-    // directly; the server rejects a credential that cannot act on it.
+    // The server is authoritative on user membership and machine-token scope.
+    // Do not compare a user's default org with the requested org: doing so
+    // rejects valid member access before the membership endpoint can decide.
+    let _ = token_org;
     client.get_auth_context_for_org(requested).await?;
     Ok(Some(requested.to_string()))
 }
 
-async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>) -> Result<()> {
-    use crate::commands::login::merge_auth_config;
+fn persist_login_values(
+    output: LoginOutput,
+    spiceai: &[(&str, &str)],
+    cloud: &[(&str, &str)],
+    context: Option<&spice_cloud_client::types::AuthContext>,
+) -> Result<()> {
+    use crate::commands::login::save_credentials;
 
+    if output == LoginOutput::Json {
+        let mut result = serde_json::Map::new();
+        for (key, value) in spiceai {
+            result.insert(
+                format!("SPICE_SPICEAI_{key}"),
+                serde_json::Value::String((*value).to_string()),
+            );
+        }
+        for (key, value) in cloud {
+            result.insert(
+                format!("SPICE_CLOUD_{key}"),
+                serde_json::Value::String((*value).to_string()),
+            );
+        }
+        if let Some(context) = context {
+            result.insert("username".to_string(), context.username.clone().into());
+            result.insert("org".to_string(), context.org_name.clone().into());
+            result.insert(
+                "app".to_string(),
+                context.app_name.clone().unwrap_or_default().into(),
+            );
+        }
+        return write_json(&serde_json::Value::Object(result));
+    }
+
+    if output == LoginOutput::Keychain {
+        org::remember_keychain_orgs(&keychain_login_orgs(spiceai))?;
+    }
+
+    if !spiceai.is_empty() {
+        save_credentials(output, "SPICEAI", spiceai)?;
+    }
+    if !cloud.is_empty() {
+        save_credentials(output, "CLOUD", cloud)?;
+    }
+    Ok(())
+}
+
+async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>) -> Result<()> {
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let auth_context_result = authed_client.get_auth_context().await;
 
@@ -1855,30 +2014,28 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
     let store_org =
         verify_login_org(&authed_client, target.requested_org, token_org.as_deref()).await?;
 
-    store_credential(token, store_org.as_deref())?;
+    let api_key = auth_context_result
+        .as_ref()
+        .ok()
+        .and_then(|context| context.app_api_key.as_deref());
+    let values = user_login_values(token, api_key, token_org.as_deref(), store_org.as_deref());
+    let value_refs: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), *value))
+        .collect();
+    persist_login_values(
+        target.output,
+        &value_refs,
+        &[],
+        auth_context_result.as_ref().ok(),
+    )?;
 
-    // File the credential under its own organization too, so naming that org
-    // later resolves without a verification round trip. Skipped when --org
-    // already filed it there, and when the org is unknown.
-    if store_org.is_none()
-        && let Some(token_org) = &token_org
-    {
-        store_credential(token, Some(token_org))?;
+    if target.output == LoginOutput::Json {
+        return Ok(());
     }
 
     match auth_context_result {
         Ok(context) => {
-            if let Some(api_key) = context.app_api_key {
-                // File the data-plane key beside the management token for the
-                // same org. Writing it to the shared default would let a second
-                // org's login replace the first org's key, and leave it behind
-                // when that org logs out.
-                merge_auth_config(
-                    "SPICEAI",
-                    &[(&api_key_credential_key(store_org.as_deref()), &api_key)],
-                )?;
-            }
-
             println!();
             println!(
                 "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
@@ -1907,22 +2064,33 @@ async fn save_api_credentials_and_print_login_result(
     token: &str,
     target: &LoginTarget<'_>,
 ) -> Result<()> {
-    use crate::commands::login::merge_auth_config;
-
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let store_org = verify_login_org(&authed_client, target.requested_org, None).await?;
 
-    store_credential(token, store_org.as_deref())?;
-    merge_auth_config(
-        "CLOUD",
+    let values = machine_login_values(token, store_org.as_deref());
+    let value_refs: Vec<(&str, &str)> = values
+        .iter()
+        .map(|(key, value)| (key.as_str(), *value))
+        .collect();
+    persist_login_values(
+        target.output,
+        &value_refs,
         &[("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret)],
+        None,
     )?;
+    if target.output == LoginOutput::Json {
+        return Ok(());
+    }
 
     println!();
     println!("\x1b[32m✓ Successfully logged in to Spice Cloud with API credentials\x1b[0m");
     println!("  Client ID: {client_id}");
     println!();
-    println!("Credentials saved to env.");
+    match target.output {
+        LoginOutput::Env => println!("Credentials saved to the local `.env` file."),
+        LoginOutput::Keychain => println!("Credentials saved to the platform keychain."),
+        LoginOutput::Json => {}
+    }
 
     print_post_login_org_context(&authed_client, None, store_org.as_deref()).await;
     print_post_login_help();
@@ -1974,85 +2142,19 @@ async fn print_post_login_org_context(
 }
 
 async fn execute_login_device_flow(open_browser: bool, target: &LoginTarget<'_>) -> Result<()> {
-    use rand::RngExt;
+    use crate::commands::login::session::{BrowserLogin, BrowserLoginOutcome};
 
-    // Generate auth code
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::rng();
-    let auth_code: String = (0..8)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
-
-    let client = CloudClient::new_unauthenticated()?;
-    let auth_url = client.get_auth_url(&auth_code);
-
+    let flow = BrowserLogin::at(client::portal_base_url());
+    if target.output != LoginOutput::Json {
+        flow.announce();
+    }
     if open_browser {
-        println!("Opening Spice Cloud authorization page in your default browser...");
-    } else {
-        println!("Complete Spice Cloud device login in a browser.");
+        flow.open_browser();
     }
-    println!(
-        "\nYour auth code:\n\n  {}-{}\n",
-        &auth_code[..4],
-        &auth_code[4..]
-    );
-    if open_browser {
-        println!("If the browser does not open, visit the following URL manually:");
-    } else {
-        println!("Open this URL in a browser:");
-    }
-    println!("\n  {auth_url}\n");
-
-    if open_browser {
-        // Fire-and-forget: open in spawn_blocking so Command::status does not
-        // block a Tokio worker or delay the device-flow poll loop.
-        let auth_url_for_open = auth_url.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = system_open::that(auth_url_for_open);
-        });
-    }
-
-    println!("Waiting for authentication...");
-
-    // Poll for auth status
-    let timeout = std::time::Duration::from_mins(5); // 5 minutes
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            return InvalidArgumentSnafu {
-                message: "Authentication timed out. Please try again.",
-            }
-            .fail();
-        }
-
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        let response = match client.exchange_code(&auth_code).await {
-            Ok(response) => response,
-            Err(error) if is_device_authorization_denied_error(&error) => return Err(error),
-            Err(error) => {
-                tracing::debug!("Failed to poll device login status; retrying: {error}");
-                continue;
-            }
-        };
-
-        if let Some(response) = response {
-            if response.access_denied {
-                return InvalidArgumentSnafu {
-                    message: "Access denied",
-                }
-                .fail();
-            }
-
-            if let Some(token) = response.access_token {
-                return save_token_and_print_login_result(&token, target).await;
-            }
-        }
-    }
+    let BrowserLoginOutcome::Granted { access_token, .. } = flow.authenticate().await? else {
+        return Err(Error::DeviceAuthorizationDenied);
+    };
+    save_token_and_print_login_result(&access_token, target).await
 }
 
 fn print_post_login_help() {
@@ -2073,41 +2175,36 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
 
     match args.scope {
         LogoutScope::All => {
-            for org in org::orgs_with_stored_tokens() {
+            for org in org::orgs_with_stored_tokens()? {
                 if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
                     cleared.push(org);
                 }
             }
             remove_env_keys(&default_credential_keys())?;
+            org::clear_keychain_orgs()?;
             org::clear_active_org()?;
         }
-        LogoutScope::Active => match resolve_org(flag_org)? {
-            // An org with its own credential loses only that credential; the
-            // personal-org session in the same directory survives.
-            Some(org) if org::has_org_token(&org) => {
-                if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
-                    cleared.push(org.clone());
+        LogoutScope::Active => {
+            if let Some(org) = resolve_org(flag_org)? {
+                ensure_active_org_logout_is_isolated(&org, org::default_token().is_some())?;
+                if org::has_org_token(&org) {
+                    if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
+                        cleared.push(org.clone());
+                    }
+                    org::forget_keychain_org(&org)?;
+                } else {
+                    already_logged_out = Some(org.clone());
                 }
                 if resolve_org(None)?.is_some_and(|active| active.eq_ignore_ascii_case(&org)) {
                     org::clear_active_org()?;
                 }
-            }
-            // An org was named but holds no credential of its own. It is
-            // already logged out. Falling through to the default credentials
-            // here would destroy a *different* organization's session — the
-            // default credential belongs to whichever org minted it, and named
-            // orgs deliberately never fall back to it.
-            Some(org) => {
-                already_logged_out = Some(org);
-            }
-            // No org named: clear the default session.
-            None => {
+            } else {
                 if remove_env_keys(&default_credential_keys())? {
                     cleared.push("default".to_string());
                 }
                 org::clear_active_org()?;
             }
-        },
+        }
     }
 
     // Say exactly what was discarded. "Logged out" over a no-op would leave a
@@ -2144,6 +2241,19 @@ fn default_credential_keys() -> Vec<String> {
     ]
 }
 
+fn ensure_active_org_logout_is_isolated(org: &str, default_token_present: bool) -> Result<()> {
+    if default_token_present {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "Cannot log out only of organization '{org}' while a default user credential is stored, because it may authenticate to every organization the user belongs to."
+            ),
+            "Run `spice cloud logout --scope all` to clear the shared credential and every organization-specific credential.",
+        ));
+    }
+    Ok(())
+}
+
 /// Drop `keys` from the env file, and from the platform keychain.
 ///
 /// Returns whether anything was removed. Uses the writer's own parser rather
@@ -2161,37 +2271,25 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
     // The keychain is consulted before the env file when reading a credential,
     // so clearing only the file would leave a working credential behind.
     //
-    // A failure here must not abort: aborting would skip the env file too and
-    // leave *more* credentials live than before. Instead keep going and report
-    // what could not be cleared, so the user knows to remove it by hand rather
-    // than believing a clean logout. `NoEntry` and an unavailable backend both
-    // mean there is nothing stored to clear — headless and containerized hosts
-    // legitimately have no keychain at all.
+    // A failure here must not abort immediately: aborting would skip the env
+    // file too and leave more credentials live than before. Instead keep going
+    // and report what could not be cleared, so the user never receives a false
+    // successful logout.
     let mut keychain_failures = Vec::new();
     for key in keys {
-        match keyring::Entry::new(key, "spice").map(|entry| entry.delete_credential()) {
-            Ok(Ok(())) => removed = true,
-            // Nothing stored to clear: either no entry, or no usable keychain
-            // at all — headless and containerized hosts legitimately have none.
-            Ok(Err(
-                keyring::Error::NoEntry
-                | keyring::Error::NoStorageAccess(_)
-                | keyring::Error::PlatformFailure(_),
-            ))
-            | Err(_) => {}
-            Ok(Err(err)) => keychain_failures.push(format!("{key} ({err})")),
+        match keyring::Entry::new(key, "spice") {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) => removed = true,
+                Err(keyring::Error::NoEntry) => {}
+                Err(err) => keychain_failures.push(format!("{key} ({err})")),
+            },
+            Err(err) => keychain_failures.push(format!("{key} ({err})")),
         }
-    }
-
-    if !keychain_failures.is_empty() {
-        tracing::warn!(
-            "Could not remove {} from the keychain; remove them manually — the credential may still be usable.",
-            keychain_failures.join(", ")
-        );
     }
 
     let path = std::path::Path::new(env_file_path());
     if !path.exists() {
+        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2227,6 +2325,7 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
             path: path.to_path_buf(),
             source: e,
         })?;
+        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2240,7 +2339,22 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         source: e,
     })?;
 
+    ensure_keychain_credentials_removed(&keychain_failures)?;
+
     Ok(removed)
+}
+
+fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::InvalidArgument {
+        message: format!(
+            "Failed to remove {} from the keychain. Local env-file entries were cleared, but these credentials may still be usable. Remove them manually before leaving this machine.",
+            failures.join(", ")
+        ),
+    })
 }
 
 /// Whether an env-file line assigns one of `keys`.
@@ -2271,7 +2385,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
                 return Err(Error::cloud_with_hint(
                     CloudErrorCode::Forbidden,
                     "User identity is not available for this authentication method. The current credential is a valid service-account token and can be used for API calls, but has no user identity.",
-                    "Run 'spice cloud login subscription' or 'spice cloud login pat' to obtain a user token.",
+                    "Run 'spice cloud login subscription' or 'spice cloud login token' to obtain a user token.",
                 ));
             }
             return Err(err);
@@ -2332,7 +2446,7 @@ async fn execute_orgs(args: &OrgsArgs, flag_org: Option<&str>) -> Result<()> {
         .map(|context| context.org_name)
         .filter(|org| !org.is_empty());
 
-    let stored = org::orgs_with_stored_tokens();
+    let stored = org::orgs_with_stored_tokens()?;
     let rows = build_org_rows(
         listed.as_deref(),
         context_org.as_deref(),
@@ -2491,19 +2605,7 @@ async fn execute_org(cmd: &OrgCommands, flag_org: Option<&str>) -> Result<()> {
             }
             if !org::has_org_token(&args.org) {
                 println!(
-                    "  No credential is stored for this organization yet — run 'spice cloud login pat --org {}'.",
-                    args.org
-                );
-            }
-            // A directory linked to another org's app will not follow this
-            // switch; say so now rather than failing confusingly later.
-            if let Ok(Some(link)) = load_cloud_link()
-                && !link.org.is_empty()
-                && !link.org.eq_ignore_ascii_case(&args.org)
-            {
-                println!(
-                    "  Note: this directory is linked to {}, which takes precedence here. Re-link with 'spice cloud link {}/<app>' to follow the switch.",
-                    link.full_name(),
+                    "  No credential is stored for this organization yet — run 'spice cloud login token --org {}'.",
                     args.org
                 );
             }
@@ -2536,39 +2638,129 @@ async fn execute_org(cmd: &OrgCommands, flag_org: Option<&str>) -> Result<()> {
     }
 }
 
-async fn execute_link(args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(Some(&args.project), flag_org)?;
-    let client = connect_for_target(&target).await?;
+async fn execute_service(
+    ctx: &RuntimeContext,
+    args: &crate::commands::connect::service::cli::ServiceArgs,
+) -> Result<()> {
+    let current = std::env::current_dir().map_err(|source| Error::CloudConnectIo {
+        message: format!("resolve the current instance directory: {source}"),
+    })?;
+    let instance_dir =
+        tokio::fs::canonicalize(&current)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!(
+                    "canonicalize the current instance directory {}: {source}",
+                    current.display()
+                ),
+            })?;
+    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    crate::commands::connect::service::cli::execute(
+        ctx,
+        crate::commands::connect::service::cli::ServiceArgs {
+            command: args.command.clone(),
+        },
+        &instance_dir,
+        &config_dir,
+    )
+    .await
+}
 
-    // Verify the app exists
-    let app = client.get_project(&target).await?;
+async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
+    ensure_link_chooser_tty(std::io::stdin().is_terminal())?;
+    let current = std::env::current_dir().map_err(|source| Error::CloudConnectIo {
+        message: format!("resolve the current instance directory: {source}"),
+    })?;
+    let instance_dir =
+        tokio::fs::canonicalize(&current)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!(
+                    "canonicalize the current instance directory {}: {source}",
+                    current.display()
+                ),
+            })?;
+    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let identity = IdentityStore::load_optional_async(identity_path)
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("read the enrolled identity before linking: {source}"),
+        })?;
+    let endpoint = identity
+        .as_ref()
+        .and_then(|identity| identity.control_plane_endpoint.clone())
+        .unwrap_or_else(client::get_base_url);
 
-    // The API does not return `org` on app payloads, so fall back to the org the
-    // command resolved, which is what later commands will use for this link.
-    let org = if app.org.is_empty() {
-        target.org.clone().unwrap_or_default()
+    let target = if let Some(project) = args.project.as_deref() {
+        resolve_project_target(Some(project), flag_org).await?
     } else {
-        app.org
+        let (requested_org, requested_source) = resolve_org_with_source(flag_org)?;
+        let token =
+            user_token_for_cloud_connect(&endpoint, requested_org.as_deref(), "Linking", "link")
+                .await?;
+        let attach_client = crate::commands::connect::project::ProjectClient::new(&endpoint)
+            .map_err(|error| Error::CloudConnectIo {
+                message: error.to_string(),
+            })?;
+        let projects = attach_client
+            .list_attachable(&runtime_cloud_connect::enroll::SessionToken::new(token))
+            .await
+            .map_err(|error| Error::CloudConnectIo {
+                message: error.to_string(),
+            })?;
+        let selected = choose_attachable_project(projects).await?;
+        if let Some(selected_org) = selected.org.as_deref() {
+            ensure_orgs_agree(
+                selected_org,
+                "the selected project",
+                requested_org.as_deref(),
+                requested_source,
+            )?;
+        }
+        selected
     };
+    let org = target.org.as_deref().ok_or_else(|| {
+        Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!("Project '{}' has no organization metadata.", target.project),
+            "Pass an explicit <org>/<project> target.",
+        )
+    })?;
+    let token = user_token_for_cloud_connect(&endpoint, Some(org), "Linking", "link").await?;
+    let management_client = CloudClient::with_token_for_org_at(token, Some(org), &endpoint)?;
+    let project = management_client.get_project(&target).await?;
 
-    // Save the link
-    let link = CloudLink {
-        org,
-        app: app.name,
-        project_id: Some(app.id),
-        region: app.region,
-        linked_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-    save_cloud_link(&link)?;
-    // The link names one org's app, so committing it would retarget a teammate
-    // working in another org. Keep it out of version control by default.
-    if let Err(err) = ignore_cloud_link_dir() {
-        tracing::debug!("Could not add .spice to .gitignore: {err}");
+    let result = crate::commands::connect::transaction::execute(
+        ctx,
+        crate::commands::connect::transaction::ConnectRequest {
+            org: Some(org.to_string()),
+            project: Some(project.name.clone()),
+            token: None,
+            region: None,
+            dir: None,
+            endpoint: Some(endpoint),
+        },
+    )
+    .await?;
+    if result.is_none() {
+        return Ok(());
     }
 
-    println!("\x1b[32m✓ Linked to app {}\x1b[0m", link.full_name());
+    upload_local_spicepod_if_absent(&management_client, &target, &project).await?;
+    if let Err(err) = ignore_cloud_link_dir().await {
+        tracing::warn!(
+            "Linked the enrolled instance to project '{}', but failed to add `.spice` to `.gitignore`, so its mTLS private key could be committed. Add `.spice/` to `.gitignore` before committing. Cause: {err}. See: https://spiceai.org/docs",
+            target
+        );
+    }
+
+    println!("\x1b[32m✓ Linked the enrolled instance to project {target}\x1b[0m");
     println!();
-    println!("You can now use commands without specifying --app:");
+    println!("Start this instance in the current directory with:");
+    println!("  spice run");
+    println!();
+    println!("You can now use commands without specifying --project:");
     println!("  spice cloud deploy");
     println!("  spice cloud logs");
     println!("  spice cloud secrets list");
@@ -2576,17 +2768,200 @@ async fn execute_link(args: &LinkArgs, flag_org: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+async fn user_token_for_cloud_connect(
+    endpoint: &str,
+    requested_org: Option<&str>,
+    action: &str,
+    command: &str,
+) -> Result<String> {
+    let mut candidates = Vec::new();
+    for token in [
+        requested_org.and_then(org::token_for_org),
+        org::default_token(),
+        org::active_org()
+            .ok()
+            .flatten()
+            .and_then(|org| org::token_for_org(&org)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&token) {
+            candidates.push(token);
+        }
+    }
+    if candidates.is_empty() {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::NotAuthenticated,
+            format!("{action} an enrolled instance requires a Spice Cloud user login."),
+            format!("Run `spice login`, then retry `spice cloud {command}`."),
+        ));
+    }
+
+    for token in candidates {
+        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
+        if client.optional_user_auth_context().await?.is_none() {
+            continue;
+        }
+        if let Some(org) = requested_org {
+            client.get_auth_context_for_org(org).await?;
+        }
+        return Ok(token);
+    }
+
+    Err(Error::cloud_with_hint(
+        CloudErrorCode::NotAuthenticated,
+        format!("{action} an enrolled instance requires a Spice Cloud user login."),
+        "Run `spice login` with a user account that can access the target organization.",
+    ))
+}
+
+fn ensure_link_chooser_tty(is_terminal: bool) -> Result<()> {
+    if is_terminal {
+        return Ok(());
+    }
+    Err(Error::cloud_with_hint(
+        CloudErrorCode::InvalidRequest,
+        "`spice cloud link` requires an interactive terminal.",
+        "Run the command from an interactive terminal; use `spiced --token <enrollment-key>` for unattended enrollment.",
+    ))
+}
+
+async fn choose_attachable_project(
+    projects: Vec<crate::commands::connect::project::AttachableProject>,
+) -> Result<ProjectTarget> {
+    if projects.is_empty() {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            "Spice Cloud returned no projects that can be attached.",
+            "Create a project in Spice Cloud, then retry `spice cloud link`.",
+        ));
+    }
+    let items: Vec<String> = projects
+        .iter()
+        .map(|project| {
+            let instances = if project.instances.is_empty() {
+                "no enrolled instances".to_string()
+            } else {
+                project
+                    .instances
+                    .iter()
+                    .map(|instance| match instance.location.as_deref() {
+                        Some(location) => format!("{} ({location})", instance.id),
+                        None => instance.id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("{}/{} — {instances}", project.org, project.name)
+        })
+        .collect();
+    let selection = tokio::task::spawn_blocking(move || {
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Choose a Spice Cloud project")
+            .items(&items)
+            .default(0)
+            .interact()
+    })
+    .await
+    .map_err(|source| Error::CloudConnectIo {
+        message: format!("project chooser task failed: {source}"),
+    })?
+    .map_err(|source| Error::InvalidArgument {
+        message: format!("Failed to read the project selection: {source}"),
+    })?;
+    let project = projects
+        .get(selection)
+        .ok_or_else(|| Error::InvalidArgument {
+            message: "The selected project was not present in the server response.".to_string(),
+        })?;
+    Ok(ProjectTarget::new(
+        Some(project.org.clone()),
+        project.name.clone(),
+    ))
+}
+
+async fn upload_local_spicepod_if_absent(
+    client: &CloudClient,
+    target: &ProjectTarget,
+    project: &spice_cloud_client::types::Project,
+) -> Result<()> {
+    let remote_has_spicepod = project
+        .config
+        .as_ref()
+        .and_then(|config| config.spicepod.as_ref())
+        .is_some_and(|spicepod| !spicepod.is_null());
+    if remote_has_spicepod {
+        println!(
+            "Project {target} already has a Spicepod configuration; the local Spicepod was not uploaded. Reconcile changes explicitly with `spice cloud project update --spicepod <path> {target}`."
+        );
+        return Ok(());
+    }
+    let Some(path) = crate::manifest::existing_spicepod_path(std::path::Path::new(".")) else {
+        return Ok(());
+    };
+    let spicepod = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|source| Error::ConfigIo {
+            operation: "read",
+            path: path.clone(),
+            source,
+        })?;
+    client
+        .update_project(
+            target,
+            client::UpdateProjectParams {
+                spicepod: Some(spicepod.clone()),
+                ..client::UpdateProjectParams::default()
+            },
+        )
+        .await?;
+    println!("Uploaded {} to project {target}.", path.display());
+    let secret_names = secret_references(&spicepod);
+    if !secret_names.is_empty() {
+        println!("Set the referenced project secrets before deploying:");
+        for name in secret_names {
+            println!("  spice cloud secrets set {name} <value> --project {target}");
+        }
+    }
+    Ok(())
+}
+
+fn secret_references(spicepod: &str) -> Vec<String> {
+    runtime_secrets::iter_secret_references(spicepod)
+        .filter(|reference| reference.store == runtime_secrets::SECRETS)
+        .map(|reference| reference.key)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Add `.spice` to the working directory's `.gitignore`, if it is a git
 /// repository and the entry is not already present.
 ///
 /// Best-effort: never fails a `link` that otherwise succeeded.
-fn ignore_cloud_link_dir() -> Result<()> {
-    if !std::path::Path::new(".git").exists() {
+async fn ignore_cloud_link_dir() -> Result<()> {
+    if !tokio::fs::try_exists(".git")
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("inspect the repository before ignoring `.spice`: {source}"),
+        })?
+    {
         return Ok(());
     }
 
     let path = std::path::Path::new(".gitignore");
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = match tokio::fs::read_to_string(path).await {
+        Ok(existing) => existing,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(crate::error::Error::ConfigIo {
+                operation: "read",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
     if existing
         .lines()
         .any(|line| matches!(line.trim(), ".spice" | ".spice/" | "/.spice" | "/.spice/"))
@@ -2600,31 +2975,149 @@ fn ignore_cloud_link_dir() -> Result<()> {
     }
     updated.push_str(".spice\n");
 
-    std::fs::write(path, updated).map_err(|e| crate::error::Error::ConfigIo {
-        operation: "write",
-        path: path.to_path_buf(),
-        source: e,
-    })
+    tokio::fs::write(path, updated)
+        .await
+        .map_err(|e| crate::error::Error::ConfigIo {
+            operation: "write",
+            path: path.to_path_buf(),
+            source: e,
+        })
 }
 
-fn execute_unlink() -> Result<()> {
-    remove_cloud_link()?;
-    println!("\x1b[32m✓ Unlinked from Spice Cloud app\x1b[0m");
+async fn execute_unlink() -> Result<()> {
+    let current = std::env::current_dir().map_err(|source| Error::CloudConnectIo {
+        message: format!("resolve the current instance directory: {source}"),
+    })?;
+    let instance_dir =
+        tokio::fs::canonicalize(&current)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!(
+                    "canonicalize the current instance directory {}: {source}",
+                    current.display()
+                ),
+            })?;
+    let requested_config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let mutation_lock =
+        runtime_cloud_connect::MutationLock::acquire(&requested_config_dir, "unlink")
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!("acquire Cloud Connect state for unlink: {source}"),
+            })?;
+    let display_config_dir = tokio::fs::canonicalize(&requested_config_dir)
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!(
+                "resolve the locked Cloud Connect config directory {}: {source}",
+                requested_config_dir.display()
+            ),
+        })?;
+    mutation_lock
+        .ensure_directory_stable()
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("validate locked Cloud Connect state for unlink: {source}"),
+        })?;
+    let config_dir = mutation_lock
+        .descriptor_relative_config_dir()
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("pin locked Cloud Connect state for unlink: {source}"),
+        })?;
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let pinned_config = crate::commands::connect::service::PinnedConfigDir::for_lock(
+        display_config_dir.clone(),
+        &mutation_lock,
+    )?;
+    let _runtime_lock =
+        runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
+            Error::CloudConnectIo {
+                message: format!(
+                    "{source} Stop the running instance before using `spice cloud unlink`."
+                ),
+            }
+        })?;
+    let service_backend = crate::commands::connect::service::backend();
+    let installed_service = crate::commands::connect::service::resolve_with_state(
+        service_backend,
+        &instance_dir,
+        &pinned_config,
+        &display_config_dir,
+    )?;
+    let identity = IdentityStore::load_optional_async(identity_path.clone())
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("read the enrolled identity before unlinking: {source}"),
+        })?
+        .ok_or_else(|| {
+            Error::cloud_with_hint(
+                CloudErrorCode::InvalidRequest,
+                "This directory has no enrolled Spice Cloud instance to unlink.",
+                "Run `spice cloud status` to inspect the current directory.",
+            )
+        })?;
+    if let Some(manifest) = installed_service.as_ref() {
+        service_backend.authorize_uninstall(manifest)?;
+    }
+
+    let configured_endpoint = client::get_base_url();
+    let endpoint = release_endpoint(
+        identity.control_plane_endpoint.as_deref(),
+        &configured_endpoint,
+    );
+    let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
+    let token =
+        user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
+    match runtime_cloud_connect::release::release(endpoint, &identity, &token, None).await {
+        Ok(_) => {}
+        Err(error) if error.is_not_found() => {}
+        Err(error) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "Spice Cloud did not confirm release of instance '{}', so its local identity was kept for retry: {error}",
+                    identity.identifier
+                ),
+            });
+        }
+    }
+
+    if let Some(manifest) = installed_service.as_ref() {
+        crate::commands::connect::service::uninstall_resolved(
+            service_backend,
+            manifest,
+            &pinned_config,
+        )
+        .map_err(|error| Error::ServiceUnavailable {
+            message: format!(
+                "Spice Cloud released instance '{}', but its local service could not be removed, so the local identity was kept for a safe retry: {error}",
+                identity.identifier
+            ),
+        })?;
+    }
+    crate::commands::connect::transaction::clear_local_state(&config_dir, &identity_path).await?;
+    println!("\x1b[32m✓ Unlinked and released the enrolled Spice Cloud instance\x1b[0m");
     Ok(())
+}
+
+fn release_endpoint<'a>(
+    identity_endpoint: Option<&'a str>,
+    configured_endpoint: &'a str,
+) -> &'a str {
+    identity_endpoint.unwrap_or(configured_endpoint)
 }
 
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
     let active_org = resolve_org(flag_org)?;
     let client = CloudClient::connect(active_org.as_deref()).await?;
     let context = client.optional_user_auth_context().await?;
-    let mut apps = client.list_projects().await?;
+    let mut projects = client.list_projects().await?;
 
-    if apps.is_empty() {
+    if projects.is_empty() {
         match &active_org {
             Some(org) => println!(
-                "No apps found in organization {org}. Create one with: spice cloud project create <name> --org {org}"
+                "No projects found in organization {org}. Create one with: spice cloud project create <name> --org {org}"
             ),
-            None => println!("No apps found. Create one with: spice cloud project create <name>"),
+            None => {
+                println!("No projects found. Create one with: spice cloud project create <name>");
+            }
         }
         return Ok(());
     }
@@ -2639,15 +3132,15 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         .filter(|org| !org.is_empty())
         .or(active_org.as_deref())
         .unwrap_or("");
-    // The Spice Cloud `/v1/apps` endpoint does not populate `org` per app, so
+    // The Spice Cloud `/v1/apps` endpoint does not populate `org` per project, so
     // backfill it from the auth-context org — the same fallback the table
     // rendering applies via `display_project_name`. Without this, `--output json`
     // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
     // format parity and machine-readable scripting (see #11041).
-    backfill_project_orgs(&mut apps, context_org);
+    backfill_project_orgs(&mut projects, context_org);
 
     if args.output == OutputFormat::Json {
-        return write_json(&apps);
+        return write_json(&projects);
     }
 
     let mut table = TableOutput::new(vec![
@@ -2657,16 +3150,20 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         "VISIBILITY",
         "CREATED",
     ]);
-    for app in &apps {
-        let display_name = display_project_name(app, context_org);
+    for project in &projects {
+        let display_name = display_project_name(project, context_org);
         table.add_row(vec![
             display_name,
-            app.description.clone().unwrap_or_default(),
-            app.region.clone().unwrap_or_else(|| "-".to_string()),
-            app.visibility
+            project.description.clone().unwrap_or_default(),
+            project.region.clone().unwrap_or_else(|| "-".to_string()),
+            project
+                .visibility
                 .clone()
                 .unwrap_or_else(|| "private".to_string()),
-            app.created_at.clone().unwrap_or_else(|| "-".to_string()),
+            project
+                .created_at
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
         ]);
     }
     table.print();
@@ -2674,41 +3171,41 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     Ok(())
 }
 
-/// Backfill each app's empty `org` from the auth-context org so machine-readable
+/// Backfill each project's empty `org` from the auth-context org so machine-readable
 /// (`--output json`) output matches the human-readable table, which already
 /// applies this fallback when rendering via [`display_project_name`]. The Spice
-/// Cloud `/v1/apps` endpoint does not populate `org` on each app, so the auth
+/// Cloud `/v1/apps` endpoint does not populate `org` on each project, so the auth
 /// context is the only source of truth for the user's org. A no-op when
-/// `context_org` is empty (nothing to fall back to) or the app already carries
+/// `context_org` is empty (nothing to fall back to) or the project already carries
 /// an org.
-fn backfill_project_orgs(apps: &mut [spice_cloud_client::types::Project], context_org: &str) {
+fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], context_org: &str) {
     if context_org.is_empty() {
         return;
     }
-    for app in apps.iter_mut() {
-        if app.org.is_empty() {
-            app.org = context_org.to_string();
+    for project in projects.iter_mut() {
+        if project.org.is_empty() {
+            project.org = context_org.to_string();
         }
     }
 }
 
-/// Format an app's display name as `org/name`, falling back to the auth
-/// context org when the app payload does not include one.
-fn display_project_name(app: &spice_cloud_client::types::Project, context_org: &str) -> String {
-    let org = if app.org.is_empty() {
+/// Format a project's display name as `org/name`, falling back to the auth
+/// context org when the project payload does not include one.
+fn display_project_name(project: &spice_cloud_client::types::Project, context_org: &str) -> String {
+    let org = if project.org.is_empty() {
         context_org
     } else {
-        app.org.as_str()
+        project.org.as_str()
     };
     if org.is_empty() {
-        app.name.clone()
+        project.name.clone()
     } else {
-        format!("{org}/{}", app.name)
+        format!("{org}/{}", project.name)
     }
 }
 
 async fn execute_deployments(args: &DeploymentsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
 
     let deployments = client
@@ -2816,7 +3313,7 @@ async fn execute_images(args: &ImagesArgs, flag_org: Option<&str>) -> Result<()>
 async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Result<()> {
     match cmd {
         SecretsCommands::List(args) => {
-            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
             let client = connect_for_target(&target).await?;
             let secrets = client.list_secrets(&target).await?;
 
@@ -2840,7 +3337,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
         }
         SecretsCommands::Set(args) => {
             let (target, org_source) =
-                resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
+                resolve_project_target_with_source(args.project.as_deref(), flag_org).await?;
             announce_target("Setting secret on", &target, org_source, args.output);
             let client = connect_for_target(&target).await?;
             client.set_secret(&target, &args.name, &args.value).await?;
@@ -2850,7 +3347,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
             println!("\x1b[32m✓ Secret '{}' set successfully\x1b[0m", args.name);
         }
         SecretsCommands::Get(args) => {
-            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
             let client = connect_for_target(&target).await?;
             let secret = client.get_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
@@ -2859,7 +3356,7 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
             println!("{}", secret.value.unwrap_or_default());
         }
         SecretsCommands::Delete(args) => {
-            let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+            let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
             let client = connect_for_target(&target).await?;
             client.delete_secret(&target, &args.name).await?;
             if args.output == OutputFormat::Json {
@@ -2871,28 +3368,328 @@ async fn execute_secrets(cmd: &SecretsCommands, flag_org: Option<&str>) -> Resul
     Ok(())
 }
 
-async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
-    let client = connect_for_target(&target).await?;
-
-    let deployment_id = if let Some(id) = args.deployment {
-        id
-    } else {
-        let latest = client.get_latest_deployment(&target).await?;
-        latest.id
+async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
+    let tail_lines = args.limit;
+    let since = args
+        .since
+        .as_deref()
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|source| Error::InvalidArgument {
+            message: format!("Invalid --since timestamp: {source}. Expected RFC 3339."),
+        })?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
+    let cloud_result = match connect_for_target(&target).await {
+        Ok(client) => fetch_runtime_logs(ctx, &client, &target, tail_lines).await,
+        Err(error) => Err(error),
     };
 
-    let mut logs = client
-        .get_deployment_logs(&target, deployment_id, args.limit, args.since.as_deref())
-        .await?;
-
-    logs.logs
-        .retain(|entry| args.level.admits(entry.level.as_deref()));
-
-    if args.output == OutputFormat::Json {
-        return write_json(&logs);
+    let mut cloud_error = None;
+    let mut empty_cloud_response = None;
+    match cloud_result {
+        Ok(logs) => {
+            if logs.logs.is_empty() {
+                empty_cloud_response = Some(logs);
+            } else {
+                ensure_cloud_logs_follow_supported(args.follow)?;
+                let logs = filter_cloud_logs_since(logs, args.level, since.as_ref());
+                if args.output == OutputFormat::Json {
+                    return write_json(&logs);
+                }
+                render_cloud_logs(logs);
+                return Ok(());
+            }
+        }
+        Err(error) => cloud_error = Some(error),
     }
 
+    let current = std::env::current_dir().map_err(|source| Error::CloudConnectIo {
+        message: format!("resolve the current instance directory for local logs: {source}"),
+    })?;
+    let instance_dir =
+        tokio::fs::canonicalize(&current)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!(
+                    "canonicalize the current instance directory {} for local logs: {source}",
+                    current.display()
+                ),
+            })?;
+    let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let local_identity = IdentityStore::load_optional_async(identity_path.clone())
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!(
+                "read the enrolled identity at {} before using local logs: {source}",
+                identity_path.display()
+            ),
+        })?;
+    let local_fallback_allowed = local_identity.as_ref().is_some_and(|identity| {
+        local_attachment_matches_target(
+            identity.org_name.as_deref(),
+            identity.app_name.as_deref(),
+            &target,
+        )
+    });
+    let number = args.limit;
+    if local_fallback_allowed && args.follow {
+        if args.output == OutputFormat::Json {
+            return Err(Error::InvalidArgument {
+                message: "`--follow` cannot produce one bounded JSON document. Omit `--follow` or use table output for local service logs.".to_string(),
+            });
+        }
+        if !matches!(args.level, LogLevelFilter::All) || since.is_some() {
+            return Err(Error::InvalidArgument {
+                message: "Local service log streaming cannot apply `--level` or `--since`. Omit `--follow` to use these filters.".to_string(),
+            });
+        }
+
+        let local_instance_dir = instance_dir.clone();
+        let local_config_dir = config_dir.clone();
+        let local = tokio::task::spawn_blocking(move || {
+            crate::commands::connect::service::cli::print_local_logs(
+                &local_instance_dir,
+                &local_config_dir,
+                number,
+                true,
+            )
+        })
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("local service log task failed: {source}"),
+        })??;
+        if local {
+            if let Some(error) = cloud_error {
+                eprintln!(
+                    "warning: Spice Cloud logs for project '{target}' were unavailable, so logs from this directory's local service are shown instead. Cause: {error}"
+                );
+            }
+            return Ok(());
+        }
+    } else if local_fallback_allowed {
+        let local_instance_dir = instance_dir.clone();
+        let local_config_dir = config_dir.clone();
+        let local = tokio::task::spawn_blocking(move || {
+            crate::commands::connect::service::cli::read_local_logs(
+                &local_instance_dir,
+                &local_config_dir,
+                number,
+            )
+        })
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("local service log task failed: {source}"),
+        })??;
+        if let Some(lines) = local {
+            let logs =
+                filter_cloud_logs_since(parse_local_log_lines(lines), args.level, since.as_ref());
+            if args.output == OutputFormat::Json {
+                return write_json(&logs);
+            }
+            if let Some(error) = cloud_error {
+                eprintln!(
+                    "warning: Spice Cloud logs for project '{target}' were unavailable, so logs from this directory's local service are shown instead. Cause: {error}"
+                );
+            }
+            render_cloud_logs(logs);
+            return Ok(());
+        }
+    }
+    if let Some(error) = cloud_error {
+        return Err(error);
+    }
+    if args.output == OutputFormat::Json {
+        return write_json(
+            &empty_cloud_response
+                .unwrap_or(spice_cloud_client::types::LogsResponse { logs: Vec::new() }),
+        );
+    }
+    Ok(())
+}
+
+const STANDALONE_LOG_POD_PLACEHOLDER: &str = "standalone";
+
+fn parse_log_limit(value: &str) -> std::result::Result<u32, String> {
+    let limit = value
+        .parse::<u32>()
+        .map_err(|_| format!("expected an integer from 1 through {MAX_LOG_LINES}"))?;
+    if !(1..=MAX_LOG_LINES).contains(&limit) {
+        return Err(format!(
+            "expected an integer from 1 through {MAX_LOG_LINES}"
+        ));
+    }
+    Ok(limit)
+}
+
+async fn fetch_runtime_logs(
+    ctx: &RuntimeContext,
+    client: &CloudClient,
+    target: &ProjectTarget,
+    tail_lines: u32,
+) -> Result<spice_cloud_client::types::LogsResponse> {
+    let runtime_ctx = project_runtime_context(ctx, client, target, None).await?;
+    let status: serde_json::Value =
+        fetch_instance_json(&runtime_ctx, "/v1/spice_runtime", target).await?;
+    let pods = runtime_log_pods(&status, target)?;
+    let mut logs = Vec::new();
+
+    for pod in pods {
+        let path = runtime_logs_path(&pod, tail_lines);
+        let response = runtime_ctx.get(&path).await.map_err(|source| {
+            Error::cloud_with_hint(
+                CloudErrorCode::NotFound,
+                format!("Could not reach runtime logs for project {target}: {source}"),
+                format!("Check it with 'spice cloud status --project {target}'."),
+            )
+        })?;
+        let response = crate::error::check_response(response, runtime_ctx.http_endpoint()).await?;
+        let text =
+            response
+                .text()
+                .await
+                .map_err(|source| crate::error::Error::InvalidResponse {
+                    message: format!(
+                        "Failed to read runtime logs for project {target} from {path}: {source}"
+                    ),
+                })?;
+        let source = if pod == STANDALONE_LOG_POD_PLACEHOLDER {
+            "standalone"
+        } else {
+            pod.as_str()
+        };
+        logs.extend(parse_runtime_log_text(&text, source));
+    }
+
+    Ok(spice_cloud_client::types::LogsResponse { logs })
+}
+
+fn runtime_log_pods(status: &serde_json::Value, target: &ProjectTarget) -> Result<Vec<String>> {
+    let Some(hosted_status) = status.get("status") else {
+        return Ok(vec![STANDALONE_LOG_POD_PLACEHOLDER.to_string()]);
+    };
+    let hosted: SpicepodStatus =
+        serde_json::from_value(hosted_status.clone()).map_err(|source| {
+            crate::error::Error::InvalidResponse {
+                message: format!("Failed to read runtime instances for project {target}: {source}"),
+            }
+        })?;
+    let mut pods: Vec<String> = hosted
+        .pod_statuses
+        .into_iter()
+        .map(|pod| pod.name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    pods.sort();
+    pods.dedup();
+    if pods.is_empty() {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::NotFound,
+            format!("Project {target} has no running instances whose logs can be read."),
+            format!("Check it with 'spice cloud status --project {target}'."),
+        ));
+    }
+    Ok(pods)
+}
+
+fn runtime_logs_path(pod: &str, tail_lines: u32) -> String {
+    format!(
+        "/v1/spice_runtime/pods/{}/logs?tailLines={tail_lines}",
+        urlencoding::encode(pod)
+    )
+}
+
+fn parse_runtime_log_text(text: &str, source: &str) -> Vec<spice_cloud_client::types::LogEntry> {
+    text.lines()
+        .map(|line| parse_runtime_log_line(line.trim_end_matches('\r'), source))
+        .collect()
+}
+
+fn parse_runtime_log_line(line: &str, source: &str) -> spice_cloud_client::types::LogEntry {
+    let (first, after_first) = split_log_field(line);
+    let (timestamp, remainder) = if chrono::DateTime::parse_from_rfc3339(first).is_ok() {
+        (Some(first.to_string()), after_first)
+    } else {
+        (None, line)
+    };
+    let (candidate_level, after_level) = split_log_field(remainder);
+    let normalized_level = candidate_level.to_ascii_lowercase();
+    let (level, message) = if matches!(
+        normalized_level.as_str(),
+        "trace" | "debug" | "info" | "warn" | "error"
+    ) {
+        (Some(normalized_level), after_level)
+    } else {
+        (None, remainder)
+    };
+
+    spice_cloud_client::types::LogEntry {
+        timestamp,
+        level,
+        message: message.to_string(),
+        source: Some(source.to_string()),
+    }
+}
+
+fn split_log_field(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start();
+    match trimmed.find(char::is_whitespace) {
+        Some(index) => (&trimmed[..index], trimmed[index..].trim_start()),
+        None => (trimmed, ""),
+    }
+}
+
+fn filter_cloud_logs_since(
+    mut logs: spice_cloud_client::types::LogsResponse,
+    level: LogLevelFilter,
+    since: Option<&chrono::DateTime<chrono::FixedOffset>>,
+) -> spice_cloud_client::types::LogsResponse {
+    logs.logs.retain(|entry| {
+        level.admits(entry.level.as_deref())
+            && since.is_none_or(|since| {
+                entry.timestamp.as_deref().is_none_or(|timestamp| {
+                    match chrono::DateTime::parse_from_rfc3339(timestamp) {
+                        Ok(timestamp) => timestamp >= *since,
+                        Err(_) => true,
+                    }
+                })
+            })
+    });
+    logs
+}
+
+fn parse_local_log_lines(lines: Vec<String>) -> spice_cloud_client::types::LogsResponse {
+    spice_cloud_client::types::LogsResponse {
+        logs: lines
+            .into_iter()
+            .map(|line| parse_runtime_log_line(&line, "local"))
+            .collect(),
+    }
+}
+
+fn local_attachment_matches_target(
+    local_org: Option<&str>,
+    local_project: Option<&str>,
+    target: &ProjectTarget,
+) -> bool {
+    let (Some(local_org), Some(local_project), Some(target_org)) =
+        (local_org, local_project, target.org.as_deref())
+    else {
+        return false;
+    };
+    local_org.eq_ignore_ascii_case(target_org) && local_project == target.project
+}
+
+fn ensure_cloud_logs_follow_supported(follow: bool) -> Result<()> {
+    if follow {
+        return Err(Error::InvalidArgument {
+            message: "`--follow` is not supported when logs are served by Spice Cloud. Omit `--follow` and rerun the command to fetch newer entries.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse) {
     for entry in logs.logs {
         let level_color = match entry.level.as_deref() {
             Some("error") => "\x1b[31m",
@@ -2909,15 +3706,6 @@ async fn execute_logs(args: &LogsArgs, flag_org: Option<&str>) -> Result<()> {
             entry.message
         );
     }
-
-    if args.follow {
-        println!();
-        println!(
-            "Note: --follow is not yet supported by the Spice Cloud logs API; re-run the command to fetch newer entries."
-        );
-    }
-
-    Ok(())
 }
 
 async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
@@ -3009,7 +3797,7 @@ async fn execute_create_deployment(
     args: &CreateDeploymentArgs,
     flag_org: Option<&str>,
 ) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
     let deployment = client
         .create_deployment(
@@ -3068,7 +3856,7 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
 }
 
 async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(Some(&args.project), flag_org)?;
+    let target = resolve_project_target(Some(&args.project), flag_org).await?;
     let client = connect_for_target(&target).await?;
     let app = client.get_project(&target).await?;
 
@@ -3094,7 +3882,7 @@ async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> R
 }
 
 async fn execute_project_update(args: &UpdateProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
     let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
         Some(read_spicepod_file(path).await?)
@@ -3134,7 +3922,8 @@ async fn execute_project_update(args: &UpdateProjectArgs, flag_org: Option<&str>
 async fn execute_project_delete(args: &DeleteProjectArgs, flag_org: Option<&str>) -> Result<()> {
     use std::io::Write;
 
-    let (target, org_source) = resolve_project_target_with_source(Some(&args.project), flag_org)?;
+    let (target, org_source) =
+        resolve_project_target_with_source(Some(&args.project), flag_org).await?;
 
     if !args.yes {
         // Confirm against the fully-qualified name and say where the org
@@ -3194,7 +3983,7 @@ fn deployment_outcome(status: &str) -> Option<bool> {
 
 async fn execute_deploy(args: &DeployArgs, flag_org: Option<&str>) -> Result<()> {
     let (target, org_source) =
-        resolve_project_target_with_source(args.project.as_deref(), flag_org)?;
+        resolve_project_target_with_source(args.project.as_deref(), flag_org).await?;
     announce_target("Deploying to", &target, org_source, args.output);
     let client = connect_for_target(&target).await?;
 
@@ -3298,10 +4087,7 @@ async fn wait_for_deployment(
                     "Deployment {} for app {target} finished with status '{}'{detail}",
                     deployment.id, deployment.status
                 ),
-                format!(
-                    "Inspect it with 'spice cloud logs --project {target} --deployment {} --level error'.",
-                    deployment.id
-                ),
+                format!("Inspect it with 'spice cloud logs --project {target} --level error'."),
             ));
         }
 
@@ -3352,7 +4138,7 @@ async fn wait_for_deployment(
 }
 
 async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
 
     if let Some(key_num) = args.regenerate {
@@ -3390,7 +4176,7 @@ async fn execute_api_keys(args: &ApiKeysArgs, flag_org: Option<&str>) -> Result<
 }
 
 async fn execute_metrics(args: &MetricsArgs, flag_org: Option<&str>) -> Result<()> {
-    let target = resolve_project_target(args.project.as_deref(), flag_org)?;
+    let target = resolve_project_target(args.project.as_deref(), flag_org).await?;
     let client = connect_for_target(&target).await?;
     let app = client.get_project(&target).await?;
 
@@ -3901,6 +4687,23 @@ mod tests {
     }
 
     #[test]
+    fn link_requires_a_terminal_even_with_an_explicit_target() {
+        let error = ensure_link_chooser_tty(false).expect_err("link is interactive-only");
+        assert!(error.to_string().contains("interactive terminal"));
+        ensure_link_chooser_tty(true).expect("an interactive terminal is accepted");
+    }
+
+    #[test]
+    fn spicepod_secret_references_are_sorted_and_deduplicated() {
+        assert_eq!(
+            secret_references(
+                "password: ${ secrets: ZETA }\nuser: ${secrets : ALPHA}\nagain: ${secrets:ZETA}\nenv: ${ env:IGNORED }\nempty: ${secrets:}\nbroken: ${secrets:OPEN"
+            ),
+            vec!["ALPHA".to_string(), "ZETA".to_string()]
+        );
+    }
+
+    #[test]
     fn is_cloud_unauthorized_error_matches_a_rejected_credential() {
         let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired");
 
@@ -4075,7 +4878,7 @@ mod tests {
         );
     }
 
-    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::Project {
+    fn test_project(org: &str, name: &str) -> spice_cloud_client::types::Project {
         spice_cloud_client::types::Project {
             id: 1,
             name: name.to_string(),
@@ -4090,51 +4893,56 @@ mod tests {
     }
 
     #[test]
-    fn display_project_name_uses_app_org_when_present() {
-        let app = test_app("analytics", "dashboard");
+    fn display_project_name_uses_project_org_when_present() {
+        let project = test_project("analytics", "dashboard");
         assert_eq!(
-            display_project_name(&app, "fallback"),
+            display_project_name(&project, "fallback"),
             "analytics/dashboard"
         );
     }
 
     #[test]
-    fn display_project_name_falls_back_to_context_org_when_app_org_is_empty() {
-        let app = test_app("", "dashboard");
+    fn display_project_name_falls_back_to_context_org_when_project_org_is_empty() {
+        let project = test_project("", "dashboard");
         assert_eq!(
-            display_project_name(&app, "analytics"),
+            display_project_name(&project, "analytics"),
             "analytics/dashboard"
         );
     }
 
     #[test]
     fn display_project_name_omits_leading_slash_when_org_unavailable() {
-        let app = test_app("", "dashboard");
-        assert_eq!(display_project_name(&app, ""), "dashboard");
+        let project = test_project("", "dashboard");
+        assert_eq!(display_project_name(&project, ""), "dashboard");
     }
 
     #[test]
     fn backfill_project_orgs_fills_empty_org_from_context() {
-        let mut apps = vec![test_app("", "ltd-mint"), test_app("", "zippy-cayenne")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        assert_eq!(apps[0].org, "Jeadie");
-        assert_eq!(apps[1].org, "Jeadie");
+        let mut projects = vec![
+            test_project("", "ltd-mint"),
+            test_project("", "zippy-cayenne"),
+        ];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        assert_eq!(projects[0].org, "Jeadie");
+        assert_eq!(projects[1].org, "Jeadie");
     }
 
     #[test]
     fn backfill_project_orgs_preserves_existing_org() {
-        let mut apps = vec![test_app("analytics", "dashboard"), test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        // An app that already carries an org keeps it; only empty orgs are filled.
-        assert_eq!(apps[0].org, "analytics");
-        assert_eq!(apps[1].org, "Jeadie");
+        let mut projects = vec![
+            test_project("analytics", "dashboard"),
+            test_project("", "ltd-mint"),
+        ];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        assert_eq!(projects[0].org, "analytics");
+        assert_eq!(projects[1].org, "Jeadie");
     }
 
     #[test]
     fn backfill_project_orgs_noop_when_context_empty() {
-        let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "");
-        assert_eq!(apps[0].org, "");
+        let mut projects = vec![test_project("", "ltd-mint")];
+        backfill_project_orgs(&mut projects, "");
+        assert_eq!(projects[0].org, "");
     }
 
     // ========================================================================
@@ -4167,7 +4975,7 @@ mod tests {
     fn the_environment_is_explicit_enough_to_conflict() {
         let err = ensure_orgs_agree(
             "spicehq",
-            "the linked app",
+            "the enrolled instance",
             Some("lukekim"),
             OrgSource::Environment,
         )
@@ -4194,7 +5002,7 @@ mod tests {
             Some("lukekim"),
             OrgSource::LinkedApp,
         )
-        .expect("an explicit org may override a linked app");
+        .expect("an explicit org may override an enrolled instance");
     }
 
     #[test]
@@ -4214,7 +5022,7 @@ mod tests {
     fn org_source_labels_name_something_the_user_can_act_on() {
         assert_eq!(OrgSource::Flag.label(), "--org flag");
         assert_eq!(OrgSource::Environment.label(), "SPICE_CLOUD_ORG");
-        assert_eq!(OrgSource::LinkedApp.label(), "linked app");
+        assert_eq!(OrgSource::LinkedApp.label(), "enrolled instance");
         assert_eq!(OrgSource::ActiveOrg.label(), "active org");
     }
 
@@ -4312,6 +5120,73 @@ mod tests {
     #[test]
     fn an_org_credential_never_overwrites_the_default_one() {
         assert_ne!(credential_key(Some("spicehq")), credential_key(None));
+    }
+
+    #[test]
+    fn a_named_machine_login_does_not_replace_the_default_user_token() {
+        let values = machine_login_values("machine-token", Some("acme"));
+        let keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
+
+        assert_eq!(keys, vec![credential_key(Some("acme"))]);
+        assert!(!keys.contains(&credential_key(None)));
+    }
+
+    #[test]
+    fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
+        let values = user_login_values(
+            "user-token",
+            Some("personal-api-key"),
+            Some("personal"),
+            Some("acme"),
+        );
+        let value_refs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|(key, value)| (key.as_str(), *value))
+            .collect();
+
+        assert_eq!(
+            keychain_login_orgs(&value_refs),
+            BTreeSet::from(["acme".to_string(), "personal".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
+        let values = user_login_values("user-token", None, Some("personal"), Some("acme"));
+
+        assert!(
+            values.iter().all(|(key, _)| !key.contains("API_KEY")),
+            "an absent API key must produce no API-key write: {values:?}"
+        );
+    }
+
+    #[test]
+    fn a_cross_org_user_login_does_not_relabel_or_replace_the_data_plane_key() {
+        let values = user_login_values(
+            "user-token",
+            Some("personal-api-key"),
+            Some("personal"),
+            Some("acme"),
+        );
+        let keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
+
+        assert!(keys.contains(&credential_key(None)));
+        assert!(keys.contains(&credential_key(Some("personal"))));
+        assert!(keys.contains(&credential_key(Some("acme"))));
+        assert!(keys.contains(&api_key_credential_key(Some("personal"))));
+        assert!(!keys.contains(&api_key_credential_key(None)));
+        assert!(!keys.contains(&api_key_credential_key(Some("acme"))));
+    }
+
+    #[test]
+    fn unlink_uses_the_configured_cloud_api_when_identity_has_no_endpoint() {
+        let configured = "https://staging.api.spice.ai";
+
+        assert_eq!(release_endpoint(None, configured), configured);
+        assert_eq!(
+            release_endpoint(Some("https://identity.example"), configured),
+            "https://identity.example"
+        );
     }
 
     #[test]
@@ -4472,6 +5347,19 @@ mod tests {
         assert!(!dataset_needs_attention(None));
     }
 
+    #[test]
+    fn runtime_health_failures_make_cloud_status_degraded() {
+        assert_eq!(
+            cloud_status_degradation(None, Some("runtime unavailable")),
+            Some("runtime unavailable".to_string())
+        );
+        assert_eq!(
+            cloud_status_degradation(Some("local state unreadable".to_string()), None),
+            Some("local state unreadable".to_string())
+        );
+        assert_eq!(cloud_status_degradation(None, None), None);
+    }
+
     // ========================================================================
     // Deploy and logs
     // ========================================================================
@@ -4523,6 +5411,153 @@ mod tests {
         // An unlabelled line is often the panic or stack trace being hunted;
         // dropping it would hide the failure the filter was meant to surface.
         assert!(LogLevelFilter::Error.admits(None));
+    }
+
+    #[test]
+    fn a_nonempty_cloud_log_response_never_falls_back_after_filtering() {
+        let logs = spice_cloud_client::types::LogsResponse {
+            logs: vec![spice_cloud_client::types::LogEntry {
+                timestamp: None,
+                level: Some("info".to_string()),
+                message: "healthy".to_string(),
+                source: None,
+            }],
+        };
+
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::Error, None);
+        assert!(filtered.logs.is_empty());
+    }
+
+    #[test]
+    fn runtime_log_route_maps_limit_and_escapes_the_pod_segment() {
+        assert_eq!(
+            runtime_logs_path("pod/name", 250),
+            "/v1/spice_runtime/pods/pod%2Fname/logs?tailLines=250"
+        );
+        parse_log_limit("0").expect_err("zero limit must be rejected");
+        parse_log_limit("100001").expect_err("unbounded history must be rejected");
+        assert_eq!(parse_log_limit("42").expect("valid limit"), 42);
+    }
+
+    #[test]
+    fn runtime_log_pods_use_a_placeholder_only_for_standalone_status() {
+        let target = ProjectTarget::new(Some("acme".to_string()), "analytics");
+        let standalone = serde_json::json!({
+            "phase": "Ready",
+            "reason": "runtime is ready"
+        });
+        assert_eq!(
+            runtime_log_pods(&standalone, &target).expect("standalone status"),
+            vec![STANDALONE_LOG_POD_PLACEHOLDER.to_string()]
+        );
+
+        let hosted = serde_json::json!({
+            "status": {
+                "podStatuses": [
+                    {"name": "analytics-b", "phase": "Running"},
+                    {"name": "analytics-a", "phase": "Running"},
+                    {"name": "analytics-a", "phase": "Running"}
+                ]
+            }
+        });
+        assert_eq!(
+            runtime_log_pods(&hosted, &target).expect("hosted status"),
+            vec!["analytics-a".to_string(), "analytics-b".to_string()]
+        );
+
+        let hosted_without_pods = serde_json::json!({"status": {"podStatuses": []}});
+        runtime_log_pods(&hosted_without_pods, &target)
+            .expect_err("hosted status without pods must be rejected");
+    }
+
+    #[test]
+    fn raw_runtime_logs_are_parsed_and_filtered_since_client_side() {
+        let raw = concat!(
+            "2026-08-20T00:00:00Z  INFO runtime: old\n",
+            "2026-08-20T00:00:02+00:00 ERROR runtime: new\n",
+            "panic continuation without a timestamp\n"
+        );
+        let logs = spice_cloud_client::types::LogsResponse {
+            logs: parse_runtime_log_text(raw, "analytics-a"),
+        };
+        assert_eq!(logs.logs.len(), 3);
+        assert_eq!(logs.logs[0].level.as_deref(), Some("info"));
+        assert_eq!(logs.logs[0].message, "runtime: old");
+        assert_eq!(logs.logs[0].source.as_deref(), Some("analytics-a"));
+
+        let since =
+            chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:01Z").expect("valid timestamp");
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::All, Some(&since));
+        let messages: Vec<&str> = filtered
+            .logs
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec!["runtime: new", "panic continuation without a timestamp"]
+        );
+    }
+
+    #[test]
+    fn local_fallback_logs_apply_the_same_level_and_since_filters() {
+        let logs = parse_local_log_lines(vec![
+            "2026-08-20T00:00:00Z INFO runtime: old".to_string(),
+            "2026-08-20T00:00:02Z ERROR runtime: failed".to_string(),
+        ]);
+        let since =
+            chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:01Z").expect("valid timestamp");
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::Error, Some(&since));
+
+        assert_eq!(filtered.logs.len(), 1);
+        assert_eq!(filtered.logs[0].message, "runtime: failed");
+        assert_eq!(filtered.logs[0].level.as_deref(), Some("error"));
+        assert_eq!(filtered.logs[0].source.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn local_logs_fall_back_only_for_the_enrolled_project() {
+        let target = ProjectTarget::new(Some("acme".to_string()), "analytics");
+        assert!(local_attachment_matches_target(
+            Some("ACME"),
+            Some("analytics"),
+            &target
+        ));
+        assert!(!local_attachment_matches_target(
+            Some("acme"),
+            Some("other"),
+            &target
+        ));
+        assert!(!local_attachment_matches_target(
+            None,
+            Some("analytics"),
+            &target
+        ));
+    }
+
+    #[test]
+    fn cloud_logs_reject_follow_instead_of_returning_a_one_shot_response() {
+        let error = ensure_cloud_logs_follow_supported(true)
+            .expect_err("a successful Cloud response cannot honor follow");
+        assert!(error.to_string().contains("--follow"));
+        ensure_cloud_logs_follow_supported(false).expect("a one-shot request is supported");
+    }
+
+    #[test]
+    fn logout_does_not_claim_success_after_a_keychain_removal_failure() {
+        let error = ensure_keychain_credentials_removed(&["SPICE_SPICEAI_TOKEN_ACME".to_string()])
+            .expect_err("a usable keychain credential must fail logout");
+
+        assert!(error.to_string().contains("may still be usable"));
+    }
+
+    #[test]
+    fn active_org_logout_refuses_a_membership_wide_default_credential() {
+        let error = ensure_active_org_logout_is_isolated("acme", true)
+            .expect_err("a shared default credential prevents isolated logout");
+        assert!(error.to_string().contains("--scope all"));
+        ensure_active_org_logout_is_isolated("acme", false)
+            .expect("an org-specific credential can be removed in isolation");
     }
 
     #[test]
@@ -4596,9 +5631,9 @@ mod tests {
         // `--output json` serialized `"org": ""`. After the backfill the
         // serialized JSON must carry the context org, matching the table's
         // `<org>/<name>` display.
-        let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        let value = serde_json::to_value(&apps[0]).expect("app should serialize to JSON");
+        let mut projects = vec![test_project("", "ltd-mint")];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        let value = serde_json::to_value(&projects[0]).expect("project should serialize to JSON");
         assert_eq!(
             value.get("org").and_then(serde_json::Value::as_str),
             Some("Jeadie"),

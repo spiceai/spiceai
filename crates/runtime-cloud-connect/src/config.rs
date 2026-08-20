@@ -308,17 +308,17 @@ impl CloudConnectConfig {
         Ok(endpoint)
     }
 
-    /// The `spice connect` operation journals, relative to the config directory:
+    /// The `spice cloud link` operation journals, relative to the config directory:
     /// the enrollment journal and the project-assignment journal.
     ///
     /// The single source of truth for these names. A release deletes the
-    /// journals and `spice connect` writes them, so `commands::connect::state`
+    /// journals and `spice cloud link` writes them, so `commands::connect::state`
     /// aliases these constants rather than declaring its own: a name defined
     /// independently on each side would let a rename leave the removal reading a
     /// path nothing writes.
     ///
     /// They cannot outlive the identity: a journal left in the enrolled phase
-    /// with no identity beside it makes the next `spice connect` quarantine it
+    /// with no identity beside it makes the next `spice cloud link` quarantine it
     /// rather than resume, and a project journal in the same state fails as a
     /// pending-project mismatch.
     pub const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
@@ -403,12 +403,11 @@ impl CloudConnectConfig {
     }
 
     /// Resolve the Cloud Connect config directory for an explicit instance
-    /// directory (`spice connect --dir <path>`).
+    /// directory.
     ///
     /// Precedence:
-    /// 1. `$SPICE_CONFIG_DIR` env var (explicit override, wins even over
-    ///    `--dir` so a single knob controls every consumer of the config
-    ///    dir)
+    /// 1. `$SPICE_CONFIG_DIR` env var (explicit override, so a single knob
+    ///    controls every consumer of the config directory)
     /// 2. `<instance_dir>/.spice` when an instance directory is given
     /// 3. `./.spice` (the current working directory)
     ///
@@ -452,8 +451,8 @@ impl CloudConnectConfig {
     }
 
     /// [`Self::from_env`] with the config directory pinned by the caller
-    /// instead of resolved from the environment — used by `spice connect
-    /// --dir <path>`, where the instance directory is an explicit argument.
+    /// instead of resolved from the environment, for callers that already
+    /// resolved an explicit instance directory.
     #[must_use]
     pub fn from_env_at(runtime_version: impl Into<String>, config_dir: PathBuf) -> Self {
         let identity_path = config_dir.join(IDENTITY_FILE);
@@ -586,7 +585,7 @@ mod tests {
         assert_eq!(
             dir,
             PathBuf::from("/tmp/spice-env-dir"),
-            "SPICE_CONFIG_DIR must win over --dir"
+            "SPICE_CONFIG_DIR must win over an explicit instance directory"
         );
         unsafe {
             std::env::remove_var("SPICE_CONFIG_DIR");
@@ -618,7 +617,7 @@ mod tests {
             .join(".spice");
         assert_eq!(
             dir, expected,
-            "a relative --dir must be resolved against the cwd at enroll time"
+            "a relative instance directory must be resolved against the cwd at enroll time"
         );
     }
 
