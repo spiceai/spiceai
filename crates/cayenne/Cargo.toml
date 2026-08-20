@@ -438,6 +438,10 @@ name = "compaction_write_amplification"
 
 [[bench]]
 harness = false
+name = "compaction_pass_scaling"
+
+[[bench]]
+harness = false
 name = "p1_audit_coverage"
 
 [[bench]]
