@@ -41,9 +41,10 @@ const THREAD_ID: HeaderName = HeaderName::from_static("thread-id");
 const X_CLIENT_REQUEST_ID: HeaderName = HeaderName::from_static("x-client-request-id");
 const X_CODEX_BETA_FEATURES: HeaderName = HeaderName::from_static("x-codex-beta-features");
 const X_CODEX_TURN_METADATA: HeaderName = HeaderName::from_static("x-codex-turn-metadata");
+const X_CODEX_TURN_STATE: HeaderName = HeaderName::from_static("x-codex-turn-state");
 const X_CODEX_WINDOW_ID: HeaderName = HeaderName::from_static("x-codex-window-id");
 
-static FORWARDED_HEADERS: LazyLock<[HeaderName; 12]> = LazyLock::new(|| {
+static FORWARDED_HEADERS: LazyLock<[HeaderName; 13]> = LazyLock::new(|| {
     [
         ACCEPT,
         AUTHORIZATION,
@@ -56,9 +57,16 @@ static FORWARDED_HEADERS: LazyLock<[HeaderName; 12]> = LazyLock::new(|| {
         X_CLIENT_REQUEST_ID,
         X_CODEX_BETA_FEATURES,
         X_CODEX_TURN_METADATA,
+        X_CODEX_TURN_STATE,
         X_CODEX_WINDOW_ID,
     ]
 });
+
+/// Backend response headers that a Codex-compatible caller must see and replay
+/// on its next request in the same turn (`openai/codex`,
+/// `codex-rs/core/tests/suite/turn_state.rs`).
+static REPLAYED_RESPONSE_HEADERS: LazyLock<[HeaderName; 1]> =
+    LazyLock::new(|| [X_CODEX_TURN_STATE]);
 
 /// The Codex request headers that may be forwarded to the Codex backend.
 ///
@@ -96,6 +104,64 @@ impl CodexRequestHeaders {
 impl Extension for CodexRequestHeaders {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+/// The Codex backend response headers that must be relayed back to the caller
+/// so it can replay them on the next request in the same turn.
+///
+/// Stashed on the [`RequestContext`] by [`Codex::responses_request`] /
+/// [`Codex::responses_stream`] once the backend response arrives, and read
+/// back by the `/v1/responses` HTTP handler once it builds the outgoing
+/// response.
+#[derive(Clone)]
+pub struct CodexResponseHeaders {
+    headers: HeaderMap,
+}
+
+impl CodexResponseHeaders {
+    /// Returns `None` if the backend response carried none of the headers a
+    /// Codex-compatible caller needs replayed.
+    fn from_headers(source: &HeaderMap) -> Option<Self> {
+        let mut headers = HeaderMap::with_capacity(REPLAYED_RESPONSE_HEADERS.len());
+        for name in REPLAYED_RESPONSE_HEADERS.iter() {
+            for value in source.get_all(name).iter() {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+        (!headers.is_empty()).then_some(Self { headers })
+    }
+
+    #[must_use]
+    pub fn headers(&self) -> HeaderMap {
+        self.headers.clone()
+    }
+}
+
+#[async_trait]
+impl Extension for CodexResponseHeaders {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Stashes the Codex backend's turn-continuation headers on the current
+/// [`RequestContext`] so the HTTP handler can copy them onto its response.
+async fn stash_response_headers(source: &HeaderMap) {
+    if let Some(response_headers) = CodexResponseHeaders::from_headers(source) {
+        let context = RequestContext::current(AsyncMarker::new().await);
+        context.insert_extension(response_headers);
+    }
+}
+
+/// Copies any stashed [`CodexResponseHeaders`] from the current
+/// [`RequestContext`] onto an outgoing HTTP response, so a Codex-compatible
+/// caller sees `x-codex-turn-state` and can replay it on the next request in
+/// the same turn.
+pub async fn apply_response_headers(headers: &mut HeaderMap) {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    if let Some(response_headers) = context.extension::<CodexResponseHeaders>() {
+        headers.extend(response_headers.headers());
     }
 }
 
@@ -175,12 +241,13 @@ impl Responses for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let stream = client
+        let (stream, headers) = client
             .responses()
-            .create_stream(req)
+            .create_stream_with_headers(req)
             .await
             .map_err(normalize_codex_error)?;
         drop(permit);
+        stash_response_headers(&headers).await;
         Ok(Box::pin(stream))
     }
 
@@ -195,12 +262,13 @@ impl Responses for Codex {
             .acquire()
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
-        let response = client
+        let (response, headers) = client
             .responses()
-            .create(req)
+            .create_with_headers(req)
             .await
             .map_err(normalize_codex_error)?;
         drop(permit);
+        stash_response_headers(&headers).await;
         Ok(response)
     }
 }
@@ -287,6 +355,24 @@ mod tests {
         assert!(!forwarded.contains_key("host"));
         assert!(!forwarded.contains_key("content-length"));
         assert!(!forwarded.contains_key("x-unrelated"));
+    }
+
+    #[test]
+    fn extracts_only_the_replayed_response_headers() {
+        let mut source = HeaderMap::new();
+        source.insert(X_CODEX_TURN_STATE, HeaderValue::from_static("turn-abc"));
+        source.insert("x-unrelated", HeaderValue::from_static("not-replayed"));
+
+        let replayed = CodexResponseHeaders::from_headers(&source)
+            .expect("a turn-state header should produce a replay set")
+            .headers();
+        assert_eq!(
+            replayed.get(X_CODEX_TURN_STATE),
+            Some(&HeaderValue::from_static("turn-abc"))
+        );
+        assert!(!replayed.contains_key("x-unrelated"));
+
+        assert!(CodexResponseHeaders::from_headers(&HeaderMap::new()).is_none());
     }
 
     #[test]

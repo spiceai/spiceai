@@ -216,7 +216,10 @@ pub(crate) async fn post(
                     }
                     tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                    Json(response).into_response()
+                    let mut http_response = Json(response).into_response();
+                    llms::openai::codex::apply_response_headers(http_response.headers_mut())
+                        .await;
+                    http_response
                 }
                 Err(e) => {
                     tracing::error!(target: "task_history", parent: &span_clone, "{e}");
@@ -321,9 +324,11 @@ async fn create_response_sse_response(
         )
     };
 
-    Sse::new(Box::pin(sse_stream))
+    let mut http_response = Sse::new(Box::pin(sse_stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(KEEP_ALIVE_INTERVAL)))
-        .into_response()
+        .into_response();
+    llms::openai::codex::apply_response_headers(http_response.headers_mut()).await;
+    http_response
 }
 
 #[cfg(test)]
