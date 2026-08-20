@@ -3729,8 +3729,8 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
         .await?;
 
     // Which kind of project this is, is Spice Cloud's answer and not the
-    // request's, so it is read off the create response and reported. Held here
-    // because the optional spicepod/channel update below replaces `app`.
+    // request's, so it is read off the create response. Held here because the
+    // optional spicepod/channel update below replaces `app`.
     let created_kind = app.kind.clone();
 
     // The create response may omit `org`, so fall back to the org this
@@ -3744,7 +3744,7 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
         app.name.clone(),
     );
 
-    let app = if spicepod_content.is_some() || args.channel.is_some() {
+    let mut app = if spicepod_content.is_some() || args.channel.is_some() {
         match client
             .update_project(
                 &created,
@@ -3777,10 +3777,18 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
         app
     };
 
+    // The kind is resolved once, at create, so an update response that omits it
+    // is not a project whose kind changed: the create's answer fills the gap
+    // rather than being overruled by its absence. Both output paths read the
+    // same field afterwards, so neither can report a kind the other does not.
+    if app.kind.is_none() {
+        app.kind = created_kind;
+    }
+
     if args.output == OutputFormat::Json {
         return write_json(&app);
     }
-    match created_kind.as_deref() {
+    match app.kind.as_deref() {
         Some(kind) => println!("\x1b[32m✓ Created {kind} app {created}\x1b[0m"),
         None => println!("\x1b[32m✓ Created app {created}\x1b[0m"),
     }
