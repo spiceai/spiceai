@@ -26,10 +26,16 @@ limitations under the License.
 //!    compare-and-clear in step 4, not from claiming these markers here.
 //! 2. **Read** those keys' *current* committed values from the accelerator
 //!    (a fenced point scan), AFTER the list.
-//! 3. **Deliver** to the source idempotently: delete those keys, then
-//!    insert the rows that are still present (delete-all-then-insert-present is
-//!    the same regardless of how many times it runs, so a re-delivery after a
-//!    crash converges).
+//! 3. **Deliver** to the source idempotently, splitting the claimed keys by
+//!    whether the step-2 read still returned them:
+//!    - **present** keys → one atomic upsert (`InsertOp::Replace`, an
+//!      `INSERT … ON CONFLICT (pk) DO UPDATE`). No delete leg, so a present key
+//!      never produces a spurious source delete for the CDC stream to echo back
+//!      and erase the committed write (#11915).
+//!    - **absent** keys (claimed but not returned) → a delete, correct now that
+//!      it only fires for keys that are genuinely gone from the accelerator.
+//!    Both statements are idempotent (upsert and delete-by-key converge on
+//!    re-run), so a re-delivery after a crash reaches the same state.
 //! 4. **Compare-and-clear** the markers whose stored sequence is still at or
 //!    below the sequence listed in step 1 — a newer commit that bumped a marker
 //!    during delivery leaves it in place, so the stale delivery never clears a
@@ -39,11 +45,22 @@ limitations under the License.
 //! grows until the next successful pass. Marking happens only in the
 //! commit-publish transaction (never in the CDC apply path), so an echo of our
 //! own write cannot spawn a fresh delivery.
+//!
+//! # Known limitation — mixed writers
+//!
+//! The present-key upsert is an unconditional `ON CONFLICT (pk) DO UPDATE`: it
+//! overwrites the source row with the accelerator's value regardless of what
+//! the source currently holds. A second writer that mutates the same source row
+//! directly (not through this accelerator) can therefore be clobbered — this
+//! worker does no compare-and-set against the source. Durable write-back is
+//! safe only when the accelerator is the sole writer of the rows it delivers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef};
+use arrow::record_batch::RecordBatch;
 use cayenne::CayenneTableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::dml::InsertOp;
@@ -67,7 +84,8 @@ pub(crate) struct WriteBackWorker {
     /// live table's catalog, listing fence, and keyset, so the marker CRUD and
     /// the point scan observe committed state.
     provider: Arc<CayenneTableProvider>,
-    /// The federated source (upsert emulation = delete-by-PK + insert).
+    /// The federated source. Present keys are delivered as a native atomic
+    /// upsert (`InsertOp::Replace`); absent keys as a delete.
     federated: Arc<FederatedTable>,
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
@@ -171,30 +189,62 @@ impl WriteBackWorker {
         let accelerator = Arc::clone(&self.provider);
         let current = ctx
             .read_table(accelerator)?
-            .filter(filter.clone())?
+            .filter(filter)?
             .collect()
             .await?;
         let session_state = ctx.state();
 
-        // Idempotent upsert emulation: delete the claimed keys from the source,
-        // then insert the rows still present in the accelerator. Absent keys stay
-        // deleted; present keys are re-inserted with their current value.
-        let federated_provider = self.federated.table_provider().await;
-        let delete_plan = federated_provider
-            .delete_from(&session_state, vec![filter])
-            .await?;
-        let _ = datafusion::physical_plan::collect(delete_plan, session_state.task_ctx()).await?;
+        // Split the claimed keys by whether the post-claim read still returned
+        // them. Present and absent key sets are disjoint, so the upsert and the
+        // delete below touch disjoint source rows.
+        let pk_col = self.pk_columns[0].as_str();
+        let absent = absent_claimed_keys(pk_col, &pk_values, &current)?;
 
+        let federated_provider = self.federated.table_provider().await;
+
+        // Present keys → one atomic upsert (`INSERT … ON CONFLICT (pk) DO
+        // UPDATE`). No delete leg, so a present key never emits a spurious
+        // source delete that the CDC stream could echo back and erase the
+        // committed write (#11915).
         if current.iter().any(|batch| batch.num_rows() > 0) {
-            execute_insert(
+            if let Err(e) = execute_insert(
                 Arc::clone(&federated_provider),
                 self.provider.table_schema(),
                 current,
-                InsertOp::Append,
+                InsertOp::Replace,
                 &session_state,
                 None,
             )
-            .await?;
+            .await
+            {
+                // A `NotImplemented` here means the source rejected `Replace`
+                // even though `supports_durable_write_back_delivery()` gated the
+                // dataset as safe at registration — the capability check and
+                // runtime have diverged. Surface it loudly; do NOT fall back to
+                // delete+insert (that reintroduces the spurious-delete window
+                // this design removes). Other errors flow to the caller's
+                // backoff unchanged.
+                if matches!(e, DataFusionError::NotImplemented(_)) {
+                    tracing::error!(
+                        dataset = %self.dataset_name,
+                        error = %e,
+                        "durable write-back: source rejected InsertOp::Replace though the dataset was gated as supported at registration; delivery cannot proceed safely and will not fall back to delete+insert"
+                    );
+                }
+                return Err(e);
+            }
+        }
+
+        // Absent keys → delete. Genuinely gone from the accelerator (the read
+        // did not return them), so this delete is correct rather than a blanket
+        // first step.
+        if !absent.is_empty() {
+            let absent_filter = col(pk_col).in_list(absent.into_iter().map(lit).collect(), false);
+            let delete_plan = federated_provider
+                .delete_from(&session_state, vec![absent_filter])
+                .await?;
+            let _ =
+                datafusion::physical_plan::collect(delete_plan, session_state.task_ctx()).await?;
         }
 
         // Ack: clear only markers still at/below the claimed sequence.
@@ -213,6 +263,40 @@ fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
         list.push(lit(ScalarValue::try_from_array(values.as_ref(), index)?));
     }
     Ok(col(pk_col).in_list(list, false))
+}
+
+/// The claimed primary keys that the post-claim accelerator read did NOT return
+/// — the keys that are genuinely gone and must be deleted from the source.
+///
+/// `claimed_pks` are all the keys listed this pass; `current` holds the rows the
+/// read returned for the keys still present. Absent = claimed − present, so the
+/// caller can upsert `current` and delete only the absent keys, never issuing a
+/// delete for a key that still exists (the spurious delete #11915 depended on).
+fn absent_claimed_keys(
+    pk_col: &str,
+    claimed_pks: &ArrayRef,
+    current: &[RecordBatch],
+) -> DataFusionResult<Vec<ScalarValue>> {
+    let mut present: HashSet<ScalarValue> = HashSet::new();
+    for batch in current {
+        let Some(column) = batch.column_by_name(pk_col) else {
+            return Err(DataFusionError::Execution(format!(
+                "durable write-back: primary-key column '{pk_col}' missing from the accelerator read"
+            )));
+        };
+        for row in 0..column.len() {
+            present.insert(ScalarValue::try_from_array(column.as_ref(), row)?);
+        }
+    }
+
+    let mut absent: Vec<ScalarValue> = Vec::new();
+    for row in 0..claimed_pks.len() {
+        let key = ScalarValue::try_from_array(claimed_pks.as_ref(), row)?;
+        if !present.contains(&key) {
+            absent.push(key);
+        }
+    }
+    Ok(absent)
 }
 
 #[expect(

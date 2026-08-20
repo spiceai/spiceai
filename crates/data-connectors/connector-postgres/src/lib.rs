@@ -37,6 +37,8 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
+use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime::component::dataset::Dataset;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -972,10 +974,51 @@ async fn federated_postgres_table_provider(
     )))
 }
 
+/// The `on_conflict` upsert target to bind to the write-back writer, or `None`
+/// for the ordinary append-only writer.
+///
+/// A durable-write-back dataset reconciles each committed row to the source via
+/// `InsertOp::Replace`, which needs an `ON CONFLICT (pk) DO UPDATE` target to
+/// deliver as one atomic upsert instead of a delete-then-insert. The target is
+/// the dataset's own `primary_key` — the same key the CDC changes stream
+/// already requires (`refresh_mode: changes` refuses to run without it), so it
+/// names a real, database-enforced unique constraint on the source table. This
+/// is deliberately NOT derived from the accelerator-side `on_conflict` config,
+/// which resolves accelerator write conflicts, not source delivery.
+///
+/// Every other dataset returns `None` and keeps the append-only writer, so no
+/// existing write path changes behaviour.
+fn durable_write_back_on_conflict(dataset: &Dataset) -> Option<OnConflict> {
+    let acceleration = dataset.acceleration.as_ref()?;
+    if !acceleration.resolves_to_durable_write_back() {
+        return None;
+    }
+    let columns: Vec<String> = acceleration
+        .primary_key
+        .as_ref()?
+        .iter()
+        .map(str::to_string)
+        .collect();
+    if columns.is_empty() {
+        return None;
+    }
+    Some(OnConflict::Upsert(ColumnReference::new(columns)))
+}
+
 #[async_trait]
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn supports_durable_write_back_delivery(&self) -> bool {
+        // Durable write-back reconciles each committed row to the source with a
+        // single `INSERT ... ON CONFLICT (pk) DO UPDATE` (see
+        // `read_write_provider` and `durable_write_back_on_conflict`). That
+        // upsert is atomic, so a present key never produces the spurious delete
+        // that a delete-then-insert emulation would — the delete leg that the
+        // CDC changes stream could echo back and erase the committed write.
+        true
     }
 
     async fn read_write_provider(
@@ -984,7 +1027,10 @@ impl DataConnector for Postgres {
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
             .factory
-            .read_write_table_provider(dataset.path().into())
+            .read_write_table_provider_with_on_conflict(
+                dataset.path().into(),
+                durable_write_back_on_conflict(dataset),
+            )
             .await
         {
             Ok(provider) => Some(Ok(enrich_with_postgres_metadata(
