@@ -202,23 +202,34 @@ pub async fn execute(
                     "validate locked Cloud Connect state for service {action}: {source}"
                 ),
             })?;
-        let state_config_dir =
+        let identity_config_dir =
             lock.descriptor_relative_config_dir()
                 .map_err(|source| Error::CloudConnectIo {
                     message: format!(
                         "pin locked Cloud Connect state for service {action}: {source}"
                     ),
                 })?;
-        Some((service_config_dir, state_config_dir))
+        Some((service_config_dir, identity_config_dir))
     } else {
         None
     };
-    let (service_config_dir, state_config_dir) = locked_dirs.as_ref().map_or(
+    let (service_config_dir, identity_config_dir) = locked_dirs.as_ref().map_or(
         (config_dir, config_dir),
-        |(service_config_dir, state_config_dir)| {
-            (service_config_dir.as_path(), state_config_dir.as_path())
+        |(service_config_dir, identity_config_dir)| {
+            (service_config_dir.as_path(), identity_config_dir.as_path())
         },
     );
+    // Manifest state resolves through the descriptor the lock retains, not
+    // through a name (see `PinnedConfigDir`).
+    //
+    // `identity_config_dir` above is still a pathname on a platform without
+    // Linux's descriptor-rooted traversal, so identity validation and the
+    // manifest can resolve to different directories in one install. Closing
+    // that needs descriptor-relative reads through the whole state layer: #13291.
+    let state_config_dir = match mutation_lock.as_ref() {
+        Some(lock) => super::PinnedConfigDir::for_lock(service_config_dir, lock)?,
+        None => super::PinnedConfigDir::unlocked(config_dir),
+    };
     match command {
         ServiceCommand::Install => {
             install(
@@ -226,12 +237,13 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
+                identity_config_dir,
                 state_config_dir,
             )
             .await
         }
         ServiceCommand::Uninstall => {
-            uninstall(backend, instance_dir, service_config_dir, state_config_dir)
+            uninstall(backend, instance_dir, service_config_dir, &state_config_dir)
         }
         ServiceCommand::Status(args) => {
             let status = ConnectStatus::collect(instance_dir, service_config_dir, endpoint).await;
@@ -243,7 +255,7 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
-                state_config_dir,
+                &state_config_dir,
                 action,
             )?;
             with_recovery_detail(backend, &manifest, backend.start(&manifest))
@@ -252,7 +264,7 @@ pub async fn execute(
             backend,
             instance_dir,
             service_config_dir,
-            state_config_dir,
+            &state_config_dir,
             action,
         )? {
             Some(manifest) => with_recovery_detail(backend, &manifest, backend.stop(&manifest)),
@@ -263,7 +275,7 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
-                state_config_dir,
+                &state_config_dir,
                 action,
             )?;
             with_recovery_detail(backend, &manifest, backend.restart(&manifest))
@@ -273,7 +285,7 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
-                state_config_dir,
+                &state_config_dir,
                 action,
             )? {
                 Some(manifest) => {
@@ -322,9 +334,10 @@ async fn install(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    identity_config_dir: &Path,
+    state_config_dir: super::PinnedConfigDir,
 ) -> Result<()> {
-    let identity = validate_service_identity(state_config_dir).await?;
+    let identity = validate_service_identity(identity_config_dir).await?;
 
     // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
     // the runtime the operator installed is normally under their own home.
@@ -357,13 +370,12 @@ async fn install(
     // install waits for the runtime to settle.
     let install_instance_dir = instance_dir.to_path_buf();
     let install_service_config_dir = service_config_dir.to_path_buf();
-    let install_state_config_dir = state_config_dir.to_path_buf();
     let manifest = tokio::task::spawn_blocking(move || {
         super::install_with_state(
             super::backend(),
             &install_instance_dir,
             &install_service_config_dir,
-            &install_state_config_dir,
+            &state_config_dir,
             &spiced_path,
             &runtime_version,
             &health_url,
@@ -439,7 +451,7 @@ fn uninstall(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
 ) -> Result<()> {
     let Some(manifest) =
         super::uninstall_with_state(backend, instance_dir, state_config_dir, service_config_dir)?
@@ -471,7 +483,7 @@ fn require_installed(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
     action: &str,
 ) -> Result<ServiceManifest> {
     super::resolve_with_state(backend, instance_dir, state_config_dir, service_config_dir)?
@@ -496,7 +508,7 @@ fn resolve_or_report(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
     action: &str,
 ) -> Result<Option<ServiceManifest>> {
     let resolved =

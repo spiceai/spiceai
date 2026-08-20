@@ -22,8 +22,7 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
 use crate::component::dataset::{Dataset, DatasetSpec, acceleration::RefreshMode};
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -35,6 +34,8 @@ use datafusion::{
     },
 };
 use futures::Future;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -69,9 +70,14 @@ pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<S
         return None;
     }
     let registry = dataset.runtime.accelerator_engine_registry();
-    let checkpoint = DatasetCheckpoint::try_new(dataset, registry, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+    let checkpoint = dataset_checkpointer(
+        dataset,
+        registry,
+        OpenOption::OpenExisting,
+        SnapshotBehavior::Disabled,
+    )
+    .await
+    .ok()?;
     checkpoint.get_schema().await.ok().flatten()
 }
 

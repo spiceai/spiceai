@@ -39,7 +39,7 @@ use crate::component::{
 };
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
 use crate::federated::FederatedTable;
-use crate::search::full_text::table::add_compound_fts_to_table;
+use crate::search::full_text::table::{add_compound_fts_to_table, dataset_attaches_stream};
 use data_connector_api::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use data_connector_api::federated::FederatedTableProvider;
 use runtime_metrics::component::MetricsProvider;
@@ -167,6 +167,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
             &dataset.name,
             &self.fts_params,
             &on_zero_results(dataset),
+            dataset_attaches_stream(&self.inner_connector, dataset),
         )
         .await
         .map(|idx| idx as Arc<dyn TableProvider>)
@@ -195,6 +196,7 @@ impl DataConnector for ElasticsearchFullTextConnector {
                     &dataset.name,
                     &self.fts_params,
                     &on_zero_results(dataset),
+                    dataset_attaches_stream(&self.inner_connector, dataset),
                 )
                 .await
                 .map(|idx| idx as Arc<dyn TableProvider>)
