@@ -86,7 +86,7 @@ use sha2::{Digest as _, Sha256};
 use crate::error::{Error, Result};
 
 pub(crate) use backend::{InstallRequest, LogRequest, ServiceBackend, for_host as backend};
-pub(crate) use manifest::{ServiceManifest, ServiceOwner};
+pub(crate) use manifest::{PinnedConfigDir, ServiceManifest, ServiceOwner};
 pub(crate) use model::{ServiceScope, ServiceState, ServiceStatus};
 
 /// Longest directory-name fragment carried into a service name, so a deeply-named
@@ -464,7 +464,12 @@ pub(crate) fn resolve(
     instance_dir: &Path,
     config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    resolve_with_state(backend, instance_dir, config_dir, config_dir)
+    resolve_with_state(
+        backend,
+        instance_dir,
+        &PinnedConfigDir::unlocked(config_dir),
+        config_dir,
+    )
 }
 
 /// Resolve a manifest through the retained state directory while comparing
@@ -472,14 +477,10 @@ pub(crate) fn resolve(
 pub(crate) fn resolve_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     service_config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    let loaded = if state_config_dir == service_config_dir {
-        ServiceManifest::load(state_config_dir, instance_dir, backend)?
-    } else {
-        ServiceManifest::load_from_pinned_directory(state_config_dir, instance_dir, backend)?
-    };
+    let loaded = ServiceManifest::load(state_config_dir, instance_dir, backend)?;
     if let Some(manifest) = loaded {
         validate_manifest_definition(backend, instance_dir, service_config_dir, &manifest)?;
         return Ok(Some(manifest));
@@ -683,7 +684,7 @@ pub(crate) fn install(
         backend,
         instance_dir,
         config_dir,
-        config_dir,
+        &PinnedConfigDir::unlocked(config_dir),
         spiced_path,
         runtime_version,
         health_url,
@@ -694,7 +695,7 @@ pub(crate) fn install_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     spiced_path: &Path,
     runtime_version: &str,
     health_url: &str,
@@ -1013,13 +1014,18 @@ pub(crate) fn uninstall(
     instance_dir: &Path,
     config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    uninstall_with_state(backend, instance_dir, config_dir, config_dir)
+    uninstall_with_state(
+        backend,
+        instance_dir,
+        &PinnedConfigDir::unlocked(config_dir),
+        config_dir,
+    )
 }
 
 pub(crate) fn uninstall_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     service_config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
     let Some(manifest) =
@@ -1038,7 +1044,7 @@ pub(crate) fn uninstall_with_state(
 pub(crate) fn uninstall_resolved(
     backend: &dyn ServiceBackend,
     manifest: &ServiceManifest,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
 ) -> Result<()> {
     backend.uninstall(manifest)?;
     manifest.remove(state_config_dir)
@@ -1711,9 +1717,13 @@ mod tests {
         assert_eq!(manifest.directory, instance_dir);
         assert_eq!(manifest.runtime_version, "v2.2.0");
         assert_eq!(
-            ServiceManifest::load(&config_dir, &instance_dir, &fake)
-                .expect("load")
-                .as_ref(),
+            ServiceManifest::load(
+                &PinnedConfigDir::unlocked(&config_dir),
+                &instance_dir,
+                &fake
+            )
+            .expect("load")
+            .as_ref(),
             Some(&manifest)
         );
 
@@ -2089,7 +2099,7 @@ mod tests {
     /// supervisor.
     fn write_manifest_for(backend: &FakeBackend, instance_dir: &Path, config_dir: &Path) {
         manifest_for(backend, instance_dir)
-            .write(config_dir)
+            .write(&PinnedConfigDir::unlocked(config_dir))
             .expect("write manifest");
     }
 
@@ -2111,11 +2121,12 @@ mod tests {
         );
     }
 
-    /// Only Linux pins the locked directory by descriptor
-    /// (`/proc/self/fd/<n>`); elsewhere `descriptor_relative_config_dir`
-    /// falls back to the pathname, so the redirection this rules out is not
-    /// ruled out there. The guarantee is scoped the same way the mechanism is.
-    #[cfg(target_os = "linux")]
+    /// A privileged uninstall applies to the instance its lock was taken for.
+    /// The locked directory is named by the descriptor the lock retains, so
+    /// this holds on every Unix — including where `/proc/self/fd` cannot be
+    /// traversed and a pathname would be re-resolved after the lock's identity
+    /// check.
+    #[cfg(unix)]
     #[tokio::test]
     async fn locked_uninstall_cannot_be_redirected_by_config_path_replacement() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -2130,9 +2141,12 @@ mod tests {
         )
         .await
         .expect("acquire mutation lock");
-        let state_config_dir = mutation_lock
-            .descriptor_relative_config_dir()
-            .expect("pin state directory");
+        let state_config_dir = PinnedConfigDir::locked(
+            config_dir.clone(),
+            mutation_lock
+                .pinned_directory()
+                .expect("retain the locked directory"),
+        );
         let moved_config_dir = instance_dir.join("locked-spice");
         std::fs::rename(&config_dir, &moved_config_dir).expect("rename locked directory");
         std::fs::create_dir_all(&config_dir).expect("create replacement directory");
