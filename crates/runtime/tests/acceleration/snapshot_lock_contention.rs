@@ -701,9 +701,9 @@ impl EngineType {
 
 /// Run contention test for a specific engine type
 async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<()> {
+    use data_accelerator_api::DataAccelerator;
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion_expr::CreateExternalTable;
-    use runtime::dataaccelerator::DataAccelerator;
     use std::collections::HashMap;
 
     let temp_root = unique_temp_dir(&format!("lock_contention_{engine_type}"));
