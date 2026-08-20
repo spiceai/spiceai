@@ -22,5 +22,6 @@ select
        sc.revenue <= 0.1 * sb.ave and
        s_store_sk = sc.ss_store_sk and
        i_item_sk = sc.ss_item_sk
- order by s_store_name, i_item_desc
- LIMIT 100;
+ order by s_store_name, i_item_desc,
+          revenue desc --added to make results deterministic
+ LIMIT 10;
