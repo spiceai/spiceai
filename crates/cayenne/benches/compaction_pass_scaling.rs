@@ -449,6 +449,20 @@ async fn accumulate(
         let written = write_snapshot(&fixture, (shape.batch)(base, rows)).await;
         assert_eq!(written as usize, rows, "{} snapshot {s} row count", shape.name);
     }
+    // Quiesce post-write bookkeeping BEFORE timing. Each insert queues stats
+    // persistence and a listing refresh, which bump the snapshot generation; the
+    // compaction commit is fenced on that generation, so maintenance landing
+    // mid-pass aborts the merge and the pass returns `Ok(false)`. The longer
+    // accumulation takes the likelier that is, which is why declines tracked
+    // setup duration rather than size — 6 of 10 iterations at `stock`/500k.
+    //
+    // Safe to drain here only because `begin_compaction_shutdown` is active:
+    // the drain would otherwise schedule and run the very compaction under test.
+    fixture
+        .provider
+        .flush_pending_maintenance()
+        .await
+        .expect("quiesce post-write maintenance");
     fixture
 }
 
