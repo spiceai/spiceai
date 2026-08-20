@@ -1019,6 +1019,13 @@ impl DataConnector for Postgres {
         // upsert is atomic, so a present key never produces the spurious delete
         // that a delete-then-insert emulation would — the delete leg that the
         // CDC changes stream could echo back and erase the committed write.
+        //
+        // This advertises Postgres delivery in general; it cannot see the
+        // dataset's primary key. The single-column-primary-key requirement of
+        // the delivery worker is enforced separately at registration (see the
+        // composite-primary-key gate in `init::dataset`), so a composite-key
+        // dataset is rejected with an actionable error rather than admitted here
+        // and then silently never delivered.
         true
     }
 
