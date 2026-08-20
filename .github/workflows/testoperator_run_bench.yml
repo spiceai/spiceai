@@ -105,7 +105,7 @@ on:
         description: 'Bypass the SQL results cache so the timings measure query execution?'
         required: false
         type: boolean
-        default: true
+        default: false
 
 jobs:
   run-bench:
