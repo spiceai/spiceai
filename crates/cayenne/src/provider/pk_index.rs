@@ -1186,6 +1186,15 @@ impl CachedPkIndex {
             Self::Bloom(bloom) => bloom.size_bytes(),
         }
     }
+
+    /// Representation name for the `kind` dimension of
+    /// `cayenne_pk_index_discard_total`.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact",
+            Self::Bloom(_) => "bloom",
+        }
+    }
 }
 
 /// One committed key batch held while a PK existence index was checked out of
@@ -1329,6 +1338,8 @@ impl PendingPkKeys {
         let restored = RestoredPkKeys {
             batches: std::mem::take(&mut self.batches),
             discard_index: self.overflowed || self.invalidated,
+            overflowed: self.overflowed,
+            invalidated: self.invalidated,
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1376,6 +1387,14 @@ impl PendingPkKeys {
 pub(crate) struct RestoredPkKeys {
     batches: Vec<PendingPkKeyBatch>,
     discard_index: bool,
+    /// Which of the two independent conditions forced the discard, for the
+    /// `cayenne_pk_index_discard_total` reason dimension. The two have different
+    /// remedies — a log that outgrew its cap is a sizing/representation problem,
+    /// an invalidation is a compaction/snapshot-rewrite problem — and only one
+    /// counter can tell them apart, so the flags are carried separately rather
+    /// than collapsed into `discard_index`.
+    overflowed: bool,
+    invalidated: bool,
 }
 
 impl RestoredPkKeys {
@@ -1385,6 +1404,17 @@ impl RestoredPkKeys {
     /// answer "absent" for a live key, which reads as a new primary key.
     pub(crate) fn index_must_be_discarded(&self) -> bool {
         self.discard_index
+    }
+
+    /// Why the index must be dropped, as the `reason` dimension of
+    /// `cayenne_pk_index_discard_total`. `None` when it may be cached.
+    pub(crate) fn discard_reason(&self) -> Option<&'static str> {
+        match (self.overflowed, self.invalidated) {
+            (true, true) => Some("overflowed_and_invalidated"),
+            (true, false) => Some("overflowed"),
+            (false, true) => Some("invalidated"),
+            (false, false) => None,
+        }
     }
 
     /// Replay every held batch, oldest first, so a key committed twice ends on its
@@ -1562,6 +1592,16 @@ pub(crate) enum ShardedPkIndex {
 }
 
 impl ShardedPkIndex {
+    /// Representation name for the `kind` dimension of
+    /// `cayenne_pk_index_discard_total`. A sharded index is wholly one or the
+    /// other — degrading converts every shard — so one name covers it.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Exact(_) => "exact",
+            Self::Bloom(_) => "bloom",
+        }
+    }
+
     /// Partition an exact keyset into `n` per-shard keysets by `shard_of_pk` on
     /// each key's `OwnedRow` bytes (§3.5). Bloom-path indices are built sharded at
     /// load time instead — a combined bloom can't be partitioned (its keys are

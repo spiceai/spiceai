@@ -8203,6 +8203,20 @@ impl CayenneTableProvider {
         true
     }
 
+    /// Count a dropped PK existence index against
+    /// `cayenne_pk_index_discard_total`. `reason` comes from the restore and is
+    /// `None` only when the index may be cached, which the callers have already
+    /// ruled out — the fallback name records that impossible case rather than
+    /// silently attributing it to one of the real reasons.
+    fn track_pk_index_discard(&self, path: &'static str, kind: &'static str, reason: Option<&'static str>) {
+        telemetry::cayenne::track_pk_index_discard(&[
+            telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            telemetry::KeyValue::new("path", path),
+            telemetry::KeyValue::new("kind", kind),
+            telemetry::KeyValue::new("reason", reason.unwrap_or("unknown")),
+        ]);
+    }
+
     /// Build a bloom existence filter over `keyset`'s keys.
     ///
     /// Sized for the conversion-time key count with 4× growth headroom
@@ -8233,6 +8247,7 @@ impl CayenneTableProvider {
         let restored = self.pk_keyset_pending.lock().end_checkout();
         if restored.index_must_be_discarded() {
             drop(guard);
+            self.track_pk_index_discard("single", index.kind(), restored.discard_reason());
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 key_count = index.len(),
@@ -8772,6 +8787,7 @@ impl CayenneTableProvider {
         let restored = self.sharded_pk_keyset_pending.lock().end_checkout();
         if restored.index_must_be_discarded() {
             drop(guard);
+            self.track_pk_index_discard("sharded", index.kind(), restored.discard_reason());
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
                 "Dropping the per-shard primary-key index instead of caching it: it no longer \

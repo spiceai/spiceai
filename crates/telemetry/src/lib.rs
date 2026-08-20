@@ -1308,6 +1308,49 @@ pub mod cayenne {
         .add(1, dimensions);
     }
 
+    static PK_INDEX_DISCARD: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts a checked-out PK existence index that had to be dropped instead of
+    /// returned to its cache, forcing the next upsert validation to rebuild it from
+    /// a full-table scan. `dimensions` should carry `table`, `path`, `reason`, and
+    /// `kind`.
+    ///
+    /// That rebuild is O(live rows) and runs ON the CDC apply thread, so on a large
+    /// table it is the longest stall the write path can take — measured at ~5
+    /// minutes for a 337M-row table, during which the source reader backs up and
+    /// replication lag steps by the length of the stall. Both branches previously
+    /// returned after only a `debug!`, so a run could pay several full rebuilds with
+    /// nothing to attribute them to.
+    ///
+    /// The two reasons are independent and have different remedies, which is why
+    /// they are dimensions rather than one counter:
+    /// - `"overflowed"` — the pending-key log, which holds every key committed by
+    ///   another writer while the index was out, hit its byte cap and stopped
+    ///   recording, so the index can no longer be made whole. A sizing or
+    ///   representation problem on the log.
+    /// - `"invalidated"` — the cache was cleared mid-checkout by a delete,
+    ///   compaction, snapshot rewrite, or recovery, so the index describes a state
+    ///   the table has since left. A maintenance-scheduling problem.
+    /// - `"overflowed_and_invalidated"` — both, which the flags cannot rank.
+    ///
+    /// `path` is `"single"` (the table-wide keyset, which also carries per-key OCC
+    /// stamps) or `"sharded"` (the per-shard index used when
+    /// `cdc_mem_tier_shards > 1`). `kind` is the representation being dropped,
+    /// `"exact"` or `"bloom"`: a bloomed index holds membership only, so what it
+    /// costs to lose one and what it would take to keep it both differ.
+    pub fn track_pk_index_discard(dimensions: &[KeyValue]) {
+        PK_INDEX_DISCARD
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_pk_index_discard_total")
+                    .with_description(
+                        "Times a checked-out PK existence index was dropped instead of cached, forcing the next upsert validation into a full-table keyset rebuild, by reason and representation.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
     static SCAN_FILES_LISTED: OnceLock<Counter<u64>> = OnceLock::new();
     static SCAN_FILES_PRUNED: OnceLock<Counter<u64>> = OnceLock::new();
 
