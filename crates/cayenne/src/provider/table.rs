@@ -7566,15 +7566,28 @@ impl CayenneTableProvider {
     /// explicitly when a table needs more encode parallelism (and the process-wide
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
-    /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the CPU budget's core count
-    /// (see [`Self::create_session_context`]) — so a configured value above
-    /// the core count is capped, not honored. That ceiling is intentional:
-    /// parallel encode is CPU-bound, so extra shards would only add files (read
-    /// amplification) without speeding the write.
+    /// `session_target_partitions` is a HARD cap, and a configured
+    /// `cayenne_write_concurrency` above it is clamped rather than honored.
+    /// Parallel encode is CPU-bound, so extra shards would only add files (read
+    /// amplification) without speeding the write — but the load-bearing reason
+    /// is that callers use this cap to *require* a single writer. The
+    /// protected-snapshot merge asks for `(1, None)` to keep position-delete
+    /// tables serial (`subset_merge_write_shape`), and the sorted rewrites pin
+    /// 1 the same way.
+    ///
+    /// `VortexFormat::build_shard_spec` cannot enforce that for us: it clamps
+    /// against the write *session's* `target_partitions` (the CPU budget's core
+    /// count — see [`Self::create_session_context`]), not against the value the
+    /// caller passed here, so a count that escapes this function reaches the
+    /// sink as a real shard fan-out while the encode-permit request stays
+    /// clamped to the caller's value.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
-        let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
-        self.context.write_concurrency().unwrap_or(default).max(1)
+        let cap = session_target_partitions.max(1);
+        let default = DEFAULT_WRITE_CONCURRENCY.min(cap);
+        self.context
+            .write_concurrency()
+            .unwrap_or(default)
+            .clamp(1, cap)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -38473,9 +38486,10 @@ mod tests {
             "test",
         );
 
-        // The explicit `write_concurrency` override wins over the session's
-        // target-partition count. `estimated_bytes = None` ⇒ full fan-out, so
-        // the override (2) is honored unclamped by size.
+        // The explicit `write_concurrency` override wins over the default the
+        // session's target-partition count would have produced, up to that
+        // count as a ceiling (2 <= 4 here, so it is honored in full).
+        // `estimated_bytes = None` ⇒ full fan-out, so it is unclamped by size.
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(provider.snapshot_shard_count(4, tsb, None), 2);
         assert_eq!(
@@ -38486,6 +38500,67 @@ mod tests {
                 .write_concurrency,
             2
         );
+    }
+
+    /// A caller that pins `target_partitions = 1` gets ONE writer even when
+    /// `cayenne_write_concurrency` is configured higher.
+    ///
+    /// `subset_merge_write_shape` returns `(1, None)` to keep a position-delete
+    /// table's merge serial — its tombstones are file-path scoped and the
+    /// position bake-in assumes a single output sequence. That cap is the only
+    /// thing enforcing it: `VortexFormat::build_shard_spec` clamps against the
+    /// write *session's* `target_partitions`, not the caller's, so a shard count
+    /// that escapes `snapshot_write_concurrency` reaches the sink as a real
+    /// fan-out while the encode-permit request stays clamped to the caller's
+    /// value.
+    ///
+    /// The fixture declares no sort columns on purpose: `snapshot_shard_count`
+    /// returns 1 outright for a sorted table, which would mask the cap.
+    #[tokio::test]
+    async fn test_pinned_single_partition_survives_write_concurrency_override() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (mut provider, _temp_dir) = create_sorted_cayenne_table(
+            "pinned_single_partition",
+            Arc::clone(&schema),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        provider.context = CayenneContext::new(
+            &VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
+            ctx.runtime_env(),
+            "test",
+        );
+
+        let tsb = provider.context.target_file_size_bytes();
+        // Both size-estimate shapes a pinned caller can pass: `None` (the serial
+        // position-delete shape) and a large estimate, which would otherwise
+        // earn the full fan-out.
+        let huge = Some(tsb as u64 * 64);
+        for estimated in [None, huge] {
+            assert_eq!(
+                provider.snapshot_shard_count(1, tsb, estimated),
+                1,
+                "target_partitions=1 must cap the configured write concurrency \
+                 (estimated_bytes={estimated:?})"
+            );
+            assert!(
+                provider
+                    .write_shard_format(1, tsb, estimated)
+                    .write_shard()
+                    .is_none(),
+                "a pinned single partition must produce the unsharded base \
+                 format (estimated_bytes={estimated:?})"
+            );
+        }
+
+        // The override is still honored where it fits under the caller's cap.
+        assert_eq!(provider.snapshot_shard_count(8, tsb, None), 8);
     }
 
     #[tokio::test]
