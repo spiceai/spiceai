@@ -46,14 +46,22 @@ runs:
         # compiles uncached, reporting nothing worse than a `::warning::`. Owning the
         # credentials here is what makes that ordering impossible to get wrong at a call
         # site.
-        if [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
+        # Export only where the cache actually signs. macOS prefers `spiceio_endpoint` and
+        # writes `no_credentials = true` for it, so keys are unnecessary there -- and
+        # `$GITHUB_ENV` is job-wide, so exporting them anyway would leave MinIO credentials
+        # in every later step's environment, where they can displace that step's own AWS
+        # identity. Linux and Windows always write `no_credentials = false`, and macOS falls
+        # back to the signing minio path whenever the spiceio endpoint resolves empty, so
+        # both of those still need them.
+        if [[ "${RUNNER_OS}" == "macOS" && -n "${SPICEIO_ENDPOINT}" ]]; then
+          echo "Compiler cache signs no requests on this path; leaving credentials out of the job environment."
+        elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
           echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}" >> $GITHUB_ENV
-        elif [[ "${RUNNER_OS}" != "macOS" || -z "${SPICEIO_ENDPOINT}" ]]; then
-          # macOS via spiceio is the one configuration written with `no_credentials = true`,
-          # so it alone needs none. Warn rather than fail: a cache that cannot answer is
-          # meant to degrade, and failing here would fail builds for an infrastructure
-          # outage -- in the merge queue that dequeues the whole batch (see #12770).
+        else
+          # Warn rather than fail: a cache that cannot answer is meant to degrade, and
+          # failing here would fail builds for an infrastructure outage -- in the merge queue
+          # that dequeues the whole batch (see #12770).
           echo "::warning::No compiler-cache credentials supplied (minio_access_key/minio_secret_key). This cache configuration signs its requests, so the pre-flight will disable the cache and this job will compile uncached."
         fi
 
