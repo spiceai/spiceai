@@ -62,6 +62,46 @@ use iceberg::{Catalog, Error as IcebergError};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
+/// The columns an equality delete keys on, as `(field IDs, column indices)` in
+/// schema order.
+///
+/// Iceberg equality deletes match rows *by value*, so a column whose equality is
+/// not well defined cannot take part. Floating point is excluded (`NaN` is not
+/// equal to itself and `-0.0 == 0.0`), nested types are excluded, and so is any
+/// column without a Parquet field ID — the reader resolves delete columns by ID,
+/// never by name.
+///
+/// The delete therefore keys on a *subset* of the row. Two rows agreeing on
+/// every returned column are indistinguishable to the delete file, so a `DELETE`
+/// whose predicate separates them only by an excluded column removes both. An
+/// empty result means no column is eligible at all; the caller must refuse the
+/// statement rather than write a delete file that matches the whole table.
+fn equality_delete_columns(schema: &ArrowSchema) -> (Vec<i32>, Vec<usize>) {
+    let mut equality_ids: Vec<i32> = Vec::new();
+    let mut projection_indices: Vec<usize> = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.data_type().is_nested()
+            || matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            )
+        {
+            continue;
+        }
+        if let Some(field_id) = field
+            .metadata()
+            .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            equality_ids.push(field_id);
+            projection_indices.push(idx);
+        }
+    }
+
+    (equality_ids, projection_indices)
+}
+
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -443,28 +483,19 @@ impl IcebergDeletionProvider {
         let iceberg_schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(iceberg_schema).map_err(to_df_error)?);
 
-        // Compute (column_index, field_id) pairs for eligible equality columns
-        let mut equality_ids: Vec<i32> = Vec::new();
-        let mut projection_indices: Vec<usize> = Vec::new();
-        for (idx, field) in arrow_schema.fields().iter().enumerate() {
-            if field.data_type().is_nested()
-                || matches!(
-                    field.data_type(),
-                    arrow::datatypes::DataType::Float16
-                        | arrow::datatypes::DataType::Float32
-                        | arrow::datatypes::DataType::Float64
-                )
-            {
-                continue;
-            }
-            if let Some(field_id) = field
-                .metadata()
-                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
-                .and_then(|v| v.parse::<i32>().ok())
-            {
-                equality_ids.push(field_id);
-                projection_indices.push(idx);
-            }
+        let (equality_ids, projection_indices) = equality_delete_columns(&arrow_schema);
+
+        // An equality delete file with no key columns imposes no condition, so
+        // it would match every row: a `DELETE ... WHERE` would empty the table.
+        // Refuse the statement rather than destroy data.
+        if equality_ids.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to delete from Iceberg table {}: no column can identify the rows to delete. \
+                Equality deletes cannot key on floating-point or nested columns, and every other column must carry a Parquet field ID. \
+                Add an integer, string, boolean, date, timestamp, or decimal column to the table. \
+                See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                self.table_ident
+            )));
         }
 
         tracing::debug!(
@@ -538,5 +569,139 @@ impl IcebergDeletionProvider {
             coalesced,
             equality_ids,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::equality_delete_columns;
+    use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn field(name: &str, data_type: DataType, field_id: Option<&str>) -> Field {
+        let field = Field::new(name, data_type, true);
+        match field_id {
+            Some(id) => field.with_metadata(HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])),
+            None => field,
+        }
+    }
+
+    #[test]
+    fn primitive_columns_with_field_ids_are_eligible() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("name", DataType::Utf8, Some("2")),
+            field("active", DataType::Boolean, Some("3")),
+            field("day", DataType::Date32, Some("4")),
+            field(
+                "seen",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                Some("5"),
+            ),
+            field("amount", DataType::Decimal128(10, 2), Some("6")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Floating point has no usable equality (`NaN != NaN`, `-0.0 == 0.0`), so
+    /// the Iceberg spec forbids keying a delete on it.
+    #[test]
+    fn floating_point_columns_are_excluded() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("f16", DataType::Float16, Some("2")),
+            field("f32", DataType::Float32, Some("3")),
+            field("f64", DataType::Float64, Some("4")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn nested_columns_are_excluded() {
+        let inner = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("tags", DataType::List(Arc::clone(&inner)), Some("2")),
+            field(
+                "meta",
+                DataType::Struct(Fields::from(vec![Field::new("k", DataType::Utf8, true)])),
+                Some("3"),
+            ),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    /// The Iceberg reader resolves delete columns by field ID, never by name, so
+    /// a column without one cannot take part.
+    #[test]
+    fn columns_without_a_usable_field_id_are_excluded() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("no_id", DataType::Utf8, None),
+            field("bad_id", DataType::Utf8, Some("not-a-number")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    /// The returned IDs and indices are positionally paired: index `n` of the
+    /// scan projection carries the column whose field ID is `ids[n]`. A drift
+    /// between them would write each row's values under the wrong key.
+    #[test]
+    fn ids_and_projection_indices_stay_paired_across_skipped_columns() {
+        let schema = ArrowSchema::new(vec![
+            field("skip_me", DataType::Float64, Some("10")),
+            field("id", DataType::Int64, Some("11")),
+            field("also_skip", DataType::Utf8, None),
+            field("name", DataType::Utf8, Some("13")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![11, 13]);
+        assert_eq!(indices, vec![1, 3]);
+        for (id, idx) in ids.iter().zip(indices.iter()) {
+            let meta = schema.field(*idx).metadata();
+            let declared = meta
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .expect("eligible columns carry a field ID");
+            assert_eq!(declared, &id.to_string());
+        }
+    }
+
+    /// The case the caller must refuse: nothing is eligible, so a delete file
+    /// built from this schema would carry no key columns and match every row.
+    #[test]
+    fn a_table_with_no_eligible_column_yields_an_empty_key() {
+        let schema = ArrowSchema::new(vec![
+            field("x", DataType::Float64, Some("1")),
+            field("y", DataType::Float32, Some("2")),
+            field("z", DataType::Utf8, None),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert!(ids.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn an_empty_schema_yields_an_empty_key() {
+        let (ids, indices) = equality_delete_columns(&ArrowSchema::empty());
+        assert!(ids.is_empty());
+        assert!(indices.is_empty());
     }
 }
