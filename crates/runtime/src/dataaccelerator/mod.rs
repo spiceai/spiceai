@@ -43,10 +43,12 @@ pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
 pub use snapshot_validation::validate_cayenne_snapshot_consistency;
 
 // The accelerator contract lives in `data-accelerator-api`; re-exported so
-// `crate::dataaccelerator::…` paths resolve. (The `register_data_accelerator!` macro
-// is invoked path-qualified as `data_accelerator_api::register_data_accelerator!` by
-// the engine modules.)
-pub use data_accelerator_api::*;
+// `crate::dataaccelerator::…` paths resolve inside this crate. Deliberately
+// `pub(crate)`: a caller outside `runtime` names the contract crate directly, so
+// that reaching the contract does not mean depending on the orchestrator. (The
+// `register_data_accelerator!` macro is invoked path-qualified as
+// `data_accelerator_api::register_data_accelerator!` by the engine modules.)
+pub(crate) use data_accelerator_api::*;
 
 /// The refresh mode a source actually runs with, applying the connector's fill-in
 /// for an unset `refresh_mode`.
