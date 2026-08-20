@@ -19,11 +19,22 @@ limitations under the License.
 //! into a runtime [`llms::rerank::Rerank`] instance. Mirrors
 //! [`crate::model::embed::try_to_embedding`] but targets the reranker trait.
 
+pub mod params;
+
 #[cfg(feature = "models")]
 use llms::rerank::TeiRerank;
 use llms::rerank::{CohereReranker, HttpReranker, JinaReranker, Rerank, VoyageReranker};
+#[cfg(feature = "models")]
+use params::file::FileRerankerParams;
+#[cfg(feature = "models")]
+use params::huggingface::HuggingFaceRerankerParams;
+use params::{
+    cohere::CohereRerankerParams, http::HttpRerankerParams, jina::JinaRerankerParams,
+    voyage::VoyageRerankerParams,
+};
+use runtime_parameters_typed::{ParamsError, TypedParams};
 use runtime_secrets::{Secrets, get_params_with_secrets};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use snafu::{OptionExt, ResultExt, Snafu};
 use spicepod::component::rerankers::{Reranker, RerankerPrefix};
 use std::{collections::HashMap, sync::Arc};
@@ -71,6 +82,30 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Wraps a typed-params deserialization failure with the reranker name, same
+/// pattern `try_to_embedding` uses for embedding providers.
+fn params_err(name: &str, e: ParamsError) -> Error {
+    match e {
+        ParamsError::MissingRequired { user_key, .. } => Error::MissingParam {
+            name: name.to_string(),
+            param_key: user_key,
+        },
+        ParamsError::InvalidValue { user_key, reason } => Error::InvalidParam {
+            name: name.to_string(),
+            param_key: user_key,
+            reason,
+        },
+        ParamsError::UnknownParameter {
+            user_key,
+            supported,
+        } => Error::InvalidParam {
+            name: name.to_string(),
+            param_key: user_key,
+            reason: format!("unknown parameter. Supported: {supported}"),
+        },
+    }
+}
+
 /// Construct a `Rerank` instance from a Spicepod `Reranker` component.
 ///
 /// Secret-bearing params (`api_key`, `endpoint`) are resolved through the
@@ -93,7 +128,7 @@ pub async fn try_to_rerank_model(
             )
         })
         .collect();
-    let params = get_params_with_secrets(secrets, &string_params).await;
+    let params = get_params_with_secrets(Arc::clone(&secrets), &string_params).await;
 
     let prefix = component.get_prefix().context(UnknownSourceSnafu {
         from: component.from.clone(),
@@ -101,55 +136,50 @@ pub async fn try_to_rerank_model(
     let model_id = component.get_model_id().context(UnknownSourceSnafu {
         from: component.from.clone(),
     })?;
+    let component_name = format!("reranker {}", component.name);
 
     let reranker: Arc<dyn Rerank> = match prefix {
         RerankerPrefix::Cohere => {
-            let api_key = extract_secret(&params, "api_key")
-                .or_else(|| extract_secret(&params, "cohere_api_key"))
-                .context(MissingParamSnafu {
-                    name: component.name.clone(),
-                    param_key: "api_key".to_string(),
-                })?;
-            let mut c = CohereReranker::try_new(component.name.clone(), api_key)
-                .context(BuildFailedSnafu {
-                    name: component.name.clone(),
-                })?
-                .with_model_id(model_id);
-            if let Some(endpoint) = extract_secret(&params, "endpoint") {
+            let typed = CohereRerankerParams::try_from_params(&component_name, params, &secrets)
+                .await
+                .map_err(|e| params_err(&component.name, e))?;
+            let mut c =
+                CohereReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
+                    .context(BuildFailedSnafu {
+                        name: component.name.clone(),
+                    })?
+                    .with_model_id(model_id);
+            if let Some(endpoint) = typed.endpoint {
                 c = c.with_endpoint(endpoint);
             }
             Arc::new(c)
         }
         RerankerPrefix::Voyage => {
-            let api_key = extract_secret(&params, "api_key")
-                .or_else(|| extract_secret(&params, "voyage_api_key"))
-                .context(MissingParamSnafu {
-                    name: component.name.clone(),
-                    param_key: "api_key".to_string(),
-                })?;
-            let mut v = VoyageReranker::try_new(component.name.clone(), api_key)
-                .context(BuildFailedSnafu {
-                    name: component.name.clone(),
-                })?
-                .with_model_id(model_id);
-            if let Some(endpoint) = extract_secret(&params, "endpoint") {
+            let typed = VoyageRerankerParams::try_from_params(&component_name, params, &secrets)
+                .await
+                .map_err(|e| params_err(&component.name, e))?;
+            let mut v =
+                VoyageReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
+                    .context(BuildFailedSnafu {
+                        name: component.name.clone(),
+                    })?
+                    .with_model_id(model_id);
+            if let Some(endpoint) = typed.endpoint {
                 v = v.with_endpoint(endpoint);
             }
             Arc::new(v)
         }
         RerankerPrefix::Jina => {
-            let api_key = extract_secret(&params, "api_key")
-                .or_else(|| extract_secret(&params, "jina_api_key"))
-                .context(MissingParamSnafu {
-                    name: component.name.clone(),
-                    param_key: "api_key".to_string(),
-                })?;
-            let mut j = JinaReranker::try_new(component.name.clone(), api_key)
-                .context(BuildFailedSnafu {
-                    name: component.name.clone(),
-                })?
-                .with_model_id(model_id);
-            if let Some(endpoint) = extract_secret(&params, "endpoint") {
+            let typed = JinaRerankerParams::try_from_params(&component_name, params, &secrets)
+                .await
+                .map_err(|e| params_err(&component.name, e))?;
+            let mut j =
+                JinaReranker::try_new(component.name.clone(), typed.api_key.expose_secret())
+                    .context(BuildFailedSnafu {
+                        name: component.name.clone(),
+                    })?
+                    .with_model_id(model_id);
+            if let Some(endpoint) = typed.endpoint {
                 j = j.with_endpoint(endpoint);
             }
             Arc::new(j)
@@ -158,16 +188,19 @@ pub async fn try_to_rerank_model(
             // For HTTP BYO the `from` *is* the endpoint URL. Model id +
             // auth header are both optional (some self-hosted services pin
             // the model and auth upstream).
+            let typed = HttpRerankerParams::try_from_params(&component_name, params, &secrets)
+                .await
+                .map_err(|e| params_err(&component.name, e))?;
             let endpoint = model_id;
             let mut h = HttpReranker::try_new(component.name.clone(), endpoint).context(
                 BuildFailedSnafu {
                     name: component.name.clone(),
                 },
             )?;
-            if let Some(api_key) = extract_secret(&params, "api_key") {
-                h = h.with_api_key(Some(api_key));
+            if let Some(api_key) = typed.api_key {
+                h = h.with_api_key(Some(api_key.expose_secret().to_string()));
             }
-            if let Some(id) = extract_secret(&params, "model") {
+            if let Some(id) = typed.model {
                 h = h.with_model_id(Some(id));
             }
             Arc::new(h)
@@ -178,15 +211,18 @@ pub async fn try_to_rerank_model(
             // `org/model:revision`; recover the two halves before the repo id
             // reaches the Hub (same convention as embeddings/models).
             let (repo_id, revision) = spicepod::component::model::split_hf_model_id(&model_id);
-            let hf_token = extract_secret(&params, "hf_token");
-            let max_seq_length = parse_max_seq_length(&component.name, &params)?;
-            let truncation = parse_truncation(&component.name, &params)?;
+            let typed =
+                HuggingFaceRerankerParams::try_from_params(&component_name, params, &secrets)
+                    .await
+                    .map_err(|e| params_err(&component.name, e))?;
+            let hf_token = typed.hf_token.as_ref().map(ExposeSecret::expose_secret);
+            let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_hf(
                 component.name.clone(),
                 repo_id,
                 revision,
-                hf_token.as_deref(),
-                max_seq_length,
+                hf_token,
+                typed.max_seq_length,
                 truncation,
             )
             .await
@@ -197,12 +233,14 @@ pub async fn try_to_rerank_model(
         }
         #[cfg(feature = "models")]
         RerankerPrefix::File => {
-            let max_seq_length = parse_max_seq_length(&component.name, &params)?;
-            let truncation = parse_truncation(&component.name, &params)?;
+            let typed = FileRerankerParams::try_from_params(&component_name, params, &secrets)
+                .await
+                .map_err(|e| params_err(&component.name, e))?;
+            let truncation = typed.truncate.unwrap_or_default().direction();
             let r = TeiRerank::from_dir(
                 component.name.clone(),
                 std::path::Path::new(&model_id),
-                max_seq_length,
+                typed.max_seq_length,
                 truncation,
             )
             .await
@@ -221,49 +259,4 @@ pub async fn try_to_rerank_model(
     };
 
     Ok(reranker)
-}
-
-/// Parse the optional `max_seq_length` param (inputs longer than the model's
-/// max are otherwise handled per `truncate`).
-#[cfg(feature = "models")]
-fn parse_max_seq_length(
-    name: &str,
-    params: &HashMap<String, SecretString>,
-) -> Result<Option<usize>> {
-    extract_secret(params, "max_seq_length")
-        .map(|s| {
-            s.parse::<usize>().map_err(|e| Error::InvalidParam {
-                name: name.to_string(),
-                param_key: "max_seq_length".to_string(),
-                reason: format!("expected a non-negative integer, got '{s}': {e}"),
-            })
-        })
-        .transpose()
-}
-
-/// Parse the optional `truncate` param controlling how over-long `(query,
-/// document)` pairs are handled: `none` (reject — default), `end` (keep the
-/// start), or `start` (keep the end).
-#[cfg(feature = "models")]
-fn parse_truncation(
-    name: &str,
-    params: &HashMap<String, SecretString>,
-) -> Result<Option<tokenizers::TruncationDirection>> {
-    match extract_secret(params, "truncate") {
-        None => Ok(None),
-        Some(v) => match v.to_ascii_lowercase().as_str() {
-            "none" => Ok(None),
-            "end" => Ok(Some(tokenizers::TruncationDirection::Right)),
-            "start" => Ok(Some(tokenizers::TruncationDirection::Left)),
-            other => Err(Error::InvalidParam {
-                name: name.to_string(),
-                param_key: "truncate".to_string(),
-                reason: format!("must be one of: none, end, start. Found '{other}'"),
-            }),
-        },
-    }
-}
-
-fn extract_secret(params: &HashMap<String, SecretString>, key: &str) -> Option<String> {
-    params.get(key).map(|v| v.expose_secret().to_string())
 }

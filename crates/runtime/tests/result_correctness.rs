@@ -239,8 +239,8 @@ mod sqlite_accel {
         compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
     };
     use arrow::array::RecordBatch;
+    use data_accelerator_api::DataAccelerator;
     use datafusion::datasource::TableProvider;
-    use runtime::dataaccelerator::DataAccelerator;
     use runtime::dataaccelerator::sqlite::SqliteAccelerator;
     use rusqlite::Connection;
     use std::sync::Arc;
@@ -485,9 +485,9 @@ mod duckdb_accel {
         compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
     };
     use arrow::array::RecordBatch;
+    use data_accelerator_api::DataAccelerator;
     use datafusion::datasource::TableProvider;
     use duckdb::Connection;
-    use runtime::dataaccelerator::DataAccelerator;
     use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
     use std::sync::Arc;
 

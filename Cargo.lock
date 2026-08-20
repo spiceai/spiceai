@@ -19625,6 +19625,7 @@ name = "spice-cloud"
 version = "2.2.0-unstable"
 dependencies = [
  "async-trait",
+ "data-accelerator-api",
  "data-connector-api",
  "datafusion",
  "reqwest 0.13.4",
@@ -19850,6 +19851,7 @@ dependencies = [
  "connector-snowflake",
  "connector-spark",
  "connector-spiceai",
+ "data-accelerator-api",
  "data-connector-api",
  "regex",
  "runtime",
