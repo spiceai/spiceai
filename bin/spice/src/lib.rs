@@ -31,6 +31,7 @@ pub mod github;
 pub mod manifest;
 pub mod output;
 pub mod registry;
+pub mod runtime_launcher;
 pub(crate) mod sse;
 
 #[cfg(test)]

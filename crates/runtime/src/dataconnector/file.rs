@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::component::dataset::DatasetSpec;
 use crate::dataconnector::ConnectorComponent;
+use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use async_trait::async_trait;
 use data_connector_api::accelerated::RegisteredAcceleratedTable;
@@ -72,10 +73,11 @@ impl DataConnectorFactory for FileFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(File {
                 params: params.parameters,
@@ -234,7 +236,7 @@ impl ListingTableConnector for File {
     }
 }
 
-register_data_connector!("file", FileFactory);
+data_connector_api::register_data_connector!("file", FileFactory);
 
 fn get_path(dataset: &DatasetSpec) -> PathBuf {
     PathBuf::from(dataset.path())

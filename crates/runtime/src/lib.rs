@@ -380,7 +380,9 @@ pub enum Error {
         reason: String,
     },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    #[snafu(display(
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadCatalogConnector {
         catalog: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -1787,6 +1789,38 @@ impl Runtime {
         self.initial_load.in_flight.load(Ordering::SeqCst)
     }
 
+    /// Reports every `${ store:key }` reference the app cannot resolve, as one
+    /// consolidated block, before any component is loaded.
+    ///
+    /// Runs at the start of the load rather than when the runtime is built,
+    /// because the two are not the same moment for the stores the runtime owns
+    /// rather than the spicepod: Cloud Connect registers its delivered-secrets
+    /// store on the built runtime and fills it from the local cache, and a
+    /// preflight that ran before that reported every delivered secret as
+    /// missing while the components that referenced them went on to load
+    /// perfectly well.
+    ///
+    /// Diagnostics only: it never changes whether or how components load, and
+    /// it never logs secret values.
+    async fn secrets_preflight(&self) {
+        // A cluster executor resolves every reference over the scheduler RPC
+        // store, one round trip each, and the scheduler has already checked
+        // them — so checking here re-reports the scheduler's own findings at
+        // the cost of a round trip per reference.
+        if matches!(self.distributed, Some(DistributedNode::Executor { .. })) {
+            return;
+        }
+
+        let Some(app) = self.app.read().await.clone() else {
+            return;
+        };
+        // A snapshot rather than the read guard: a lookup can be a network
+        // round trip, and holding the guard across it stalls a writer (and
+        // risks the write-preferring deadlock `Secrets::snapshot` documents).
+        let secrets = secrets::Secrets::snapshot(&self.secrets).await;
+        secrets_preflight::run(&app, &secrets).await;
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
@@ -1802,6 +1836,8 @@ impl Runtime {
             );
             return;
         }
+
+        self.secrets_preflight().await;
 
         Arc::clone(&self).set_components_initializing().await;
 
@@ -1953,7 +1989,7 @@ impl Runtime {
         }
     }
 
-    // Closes and deallocates all resources (including the static registries)
+    // Closes and deallocates all resources, including this runtime's accelerator engines.
     pub async fn shutdown(&self) {
         if self.status.is_shutdown() {
             return;
@@ -2038,12 +2074,12 @@ impl Runtime {
             }
         }
 
-        dataconnector::unregister_all().await;
-        catalogconnector::unregister_all().await;
+        // `dataconnector`, `catalogconnector`, and `document_parse` hold only
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
-
-        document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics endpoints.
@@ -2137,16 +2173,9 @@ impl Runtime {
     }
 }
 
-// Moved to `data-accelerator-api` (so the accelerator builder can name the data
-// directory without an upward dependency); re-exported here for path compatibility.
+// The accelerator data directory is named by `data-accelerator-api`, so an engine
+// below `runtime` can resolve it; re-exported here for path compatibility.
 pub use data_accelerator_api::spice_data_base_path;
-
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
-#[expect(clippy::result_large_err)]
-pub(crate) fn make_spice_data_directory() -> Result<()> {
-    make_spice_data_sub_directory(&[])?;
-    Ok(())
-}
 
 #[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {

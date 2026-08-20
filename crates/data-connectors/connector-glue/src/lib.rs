@@ -21,7 +21,7 @@ limitations under the License.
 
 pub use runtime::dataconnector::glue::{GlueDataConnector, GlueDataConnectorFactory, InputFormat};
 
-use runtime::dataconnector::DataConnectorFactory;
+use data_connector_api::DataConnectorFactory;
 use std::sync::Arc;
 
 /// The name used to identify this connector in configuration.
@@ -33,10 +33,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     GlueDataConnectorFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_glue as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_glue_connector,
     GLUE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

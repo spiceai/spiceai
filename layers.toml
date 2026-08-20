@@ -7,11 +7,8 @@
 # depend only on crates in its own tier or a lower one.
 #
 # This encodes the layering that ALREADY holds on the current tree so it cannot
-# regress. It is NOT the target architecture — notably, connectors currently sit
-# in `extension` (ABOVE `runtime`) because the `DataConnector` trait/registry
-# live in the `runtime` crate. The target is to invert that so connectors live
-# in a `data` tier BELOW `runtime`. See docs/dev/crate_layering.md for the plan
-# and for how to tighten these rules as crates move.
+# regress. See docs/dev/crate_layering.md for the remaining plan and for how to
+# tighten these rules as crates move.
 
 # Tiers, lowest first. A dependency edge must go to this tier or lower.
 #
@@ -29,7 +26,23 @@
 #                        upward); the reverse is enforced by `forbid` below.
 # Extensions may therefore depend on BOTH utility tiers; `runtime-*` may depend
 # only on shared-utility. See docs/dev/crate_layering.md.
-order = ["foundation", "shared-utility", "runtime", "extension-utility", "extension", "binary"]
+#
+# `connector` sits between shared-utility and `runtime`: a connector implements
+# the `DataConnector` contract, which lives in `data-connector-api` below
+# `runtime`, so a connector never names the orchestrator. Being below `runtime`
+# is what lets the whole set compile in parallel with it instead of behind it.
+# The linear order alone would still permit `runtime` to depend on a connector,
+# which would put them back on its prerequisite path — `forbid` below rejects
+# that.
+order = [
+    "foundation",
+    "shared-utility",
+    "connector",
+    "runtime",
+    "extension-utility",
+    "extension",
+    "binary",
+]
 
 # Crates not matched by a rule or override land here. shared-utility is the
 # conservative default: it sits below `runtime`, so runtime may build on it. A
@@ -43,7 +56,10 @@ default_tier = "shared-utility"
 # runtime->extension-utility is already caught as upward; this forbids the
 # REVERSE, keeping connector-only building blocks from pulling in the
 # orchestrator (they may still use the low runtime-*-api interface crates).
-forbid = [["extension-utility", "runtime"]]
+# `runtime -> connector` is the edge the inversion removed: the orchestrator must
+# not build on a connector, or every connector rejoins its prerequisite closure and
+# the parallelism is lost. Only the binaries (and the schema tool) link connectors.
+forbid = [["extension-utility", "runtime"], ["runtime", "connector"]]
 
 # Dependency-ownership rules, checked IN ADDITION to the tier rule. The tier check
 # only catches UPWARD edges; a driver/format crate sits at/below `foundation`, so a
@@ -107,9 +123,11 @@ tier = "binary"
 path_prefix = "tools/"
 tier = "binary"
 
+# Connectors sit BELOW `runtime` — see the `connector` tier note above. The three
+# that still depend on the orchestrator carry an `[override]` back to `extension`.
 [[rules]]
 path_prefix = "crates/data-connectors/"
-tier = "extension"
+tier = "connector"
 
 [[rules]]
 path_prefix = "crates/vendor/"
@@ -125,6 +143,18 @@ runtime = "runtime"
 # interface crates a connector needs (data-connector-api) name a component's
 # configuration without pulling in the orchestrator.
 runtime-component = "shared-utility"
+# The data-connector contract: the `DataConnector` trait and its factory, the
+# link-time registration, the `ConnectorParams`/`ConnectorContext` a connector is
+# handed, the listing-table connector, and the parameter validators. Below
+# `runtime` so a connector names the contract without the orchestrator, and
+# `shared-utility` rather than `extension-utility` because `runtime`'s own
+# in-body connectors (file/s3/https, iceberg, glue) build on it too.
+data-connector-api = "shared-utility"
+# The vocabulary both the contract and the crates a connector builds on need:
+# which component a connector is for, and the errors it reports. Below
+# `data-connector-api` because `data-http-rate-control` reports a
+# `DataConnectorError` and sits below the contract, not above it.
+data-connector-types = "shared-utility"
 # Connector HTTP rate control carved out of the `runtime` crate body: the
 # per-dataset parameters, the process-wide per-origin registry, and its metrics.
 # `shared-utility`, NOT `extension-utility`, even though it is a connector-facing
@@ -144,9 +174,19 @@ runtime-table = "runtime"
 # Extensions that sit above the runtime crate (depend on `runtime`).
 spice-cloud = "extension"
 tpc-extension = "extension"
+# The three connectors that still depend on `runtime`, and why:
+#   - connector-glue and connector-spiceai are registration shims over connector
+#     bodies that still live inside `runtime` (`runtime::dataconnector::{glue,
+#     spiceai}`), kept there because their catalog connectors are not yet carved
+#     out. They flip when those bodies are evacuated.
+#   - connector-databricks reaches `runtime::catalogconnector::databricks` and
+#     `runtime::token_providers::databricks`; it flips with the catalog seam.
+connector-databricks = "extension"
+connector-glue = "extension"
+connector-spiceai = "extension"
 # TEMPORARY (see docs/dev/crate_layering.md). This crate lives under
-# crates/data-connectors/ (which the path rule would place in `extension`), but
-# it is a leaf helper — its entire workspace-internal dep closure is empty (only
+# crates/data-connectors/ (which the path rule places in `connector`), but it is
+# a leaf helper — its entire workspace-internal dep closure is empty (only
 # external deps: datafusion-common, datafusion-table-providers, snafu,
 # tokio-postgres). It holds the PostgreSQL catalog/CDC-support queries
 # (list_schemas/list_tables/primary_key_columns/check_cdc_prerequisites), which
@@ -158,7 +198,7 @@ tpc-extension = "extension"
 # `runtime::catalogconnector::postgres_accelerated` — into a single
 # `connector-postgres` crate that owns the CDC mechanisms; once runtime no longer
 # depends (even transitively via re-export) on these queries, drop this override
-# so the crate returns to the default `extension` tier.
+# so the crate joins the other connectors.
 connector-postgres-common = "shared-utility"
 
 # --- foundation: near-dependency-free utilities + config/platform primitives.
@@ -194,6 +234,19 @@ runtime-async = "foundation"
 # Interface crate: the accelerator (runtime side) satisfies CheckpointStore; a
 # connector only calls it, so it lives low (foundation) below both.
 runtime-checkpoint-api = "foundation"
+# The model-provider contracts, one per capability. Split because their dependency
+# sets are nearly disjoint (see docs/dev/crate_layering.md, "How finely to split a
+# family"): a reranker vendor is a small HTTP client and has no business waiting on
+# `cache`/`chunking`/`hf-hub`, which only the embedding contract needs.
+#
+# `chat-api` and `rerank-api` are foundation: their whole closure is external crates
+# plus `spicepod`. Keeping them there is the constraint — a contract that grows a
+# shared-utility dependency has stopped being a thin interface, and the guard says so.
+# `embed-api` is assigned explicitly rather than left to `default_tier`, so that
+# changing the default can never silently relocate it away from `cache`/`hf-hub`.
+chat-api = "foundation"
+embed-api = "shared-utility"
+rerank-api = "foundation"
 runtime-cloud-connect = "foundation"
 runtime-datafusion-index = "foundation"
 spice-table = "foundation"

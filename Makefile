@@ -137,8 +137,15 @@ endif
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
 # recompile instead of reading the build nextest just did.
+#
+# `runtime-cloud-connect`'s integration tests are selected for the same reason
+# cayenne's are: they stand their whole control plane up in-process — a TLS
+# enroll mock and a tonic gateway on ephemeral ports — so unlike the suites in
+# `integration*.yml` they need no credentials and no external service. They are
+# also the only coverage of the enrollment, reconnect, command-dispatch and
+# heartbeat wire paths; `--lib` cannot reach a running client at all.
 NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

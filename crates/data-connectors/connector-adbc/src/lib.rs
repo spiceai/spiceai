@@ -20,29 +20,28 @@ use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
+use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
+use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
 use futures::TryStreamExt;
 use runtime_component::dataset::DatasetSpec;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
-#[cfg(test)]
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
@@ -385,6 +384,18 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
+        // Identity used to decide whether two ADBC-backed tables can be joined
+        // in one federated pushdown: DataFusion's federation optimizer only
+        // merges sub-plans whose `compute_context()` strings match, and
+        // `SqlTable::compute_context()` derives that string from this pool's
+        // `join_push_down()`.
+        let join_context = build_join_context(
+            &uri_str,
+            username,
+            connection_namespace.catalog.as_deref(),
+            connection_namespace.schema.as_deref(),
+        );
+
         is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "adbc".to_string(),
@@ -470,7 +481,8 @@ impl AdbcFactory {
 
             let mut pool_builder = AdbcConnectionPoolBuilder::new(db)
                 .with_max_size(pool_size)
-                .with_min_idle(pool_min_idle);
+                .with_min_idle(pool_min_idle)
+                .with_join_push_down(JoinPushDown::AllowedFor(join_context));
 
             if let Some(conn_opts) = conn_options {
                 pool_builder = pool_builder.with_conn_options(conn_opts);
@@ -750,10 +762,11 @@ impl DataConnectorFactory for AdbcFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         let cache_key = compute_adbc_cache_key(&params);
 
         let entry = {
@@ -1071,7 +1084,6 @@ fn build_conn_options(
 ///   enabling federated join pushdown
 /// - Different usernames, catalogs, or schemas produce different hashes,
 ///   preventing incorrect cross-credential pushdown
-#[cfg(test)]
 fn build_join_context(
     uri: &str,
     username: Option<&str>,
@@ -1165,6 +1177,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
@@ -1201,6 +1214,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
@@ -1606,7 +1620,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1639,7 +1652,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(&dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1768,7 +1780,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1811,6 +1822,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")
@@ -1948,10 +1960,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_adbc as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_adbc_connector,
     ADBC_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

@@ -36,11 +36,11 @@ use std::time::Duration;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
+use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
-    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, SchemaEvolutionPolicy,
-    config, start_replication_stream,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -78,6 +78,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         initial_snapshot: true,
         snapshot_on_resume: false,
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: true,
@@ -199,6 +200,20 @@ fn input_with_watermark<S: AppliedLsnStore + 'static>(
 ) -> ReplicationStreamInput {
     let mut input = input_for(port, table);
     input.applied_lsn_store = Arc::clone(store) as Arc<dyn AppliedLsnStore>;
+    input
+}
+
+/// [`input_with_watermark`] carrying what the runtime observed the accelerator to
+/// hold, which is what tells a first load apart from one that may be carrying
+/// rows the source has since deleted.
+fn input_with_contents<S: AppliedLsnStore + 'static>(
+    port: u16,
+    table: &str,
+    store: &Arc<S>,
+    acceleration: AccelerationContents,
+) -> ReplicationStreamInput {
+    let mut input = input_with_watermark(port, table, store);
+    input.params.acceleration = acceleration;
     input
 }
 
@@ -1239,6 +1254,402 @@ async fn a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed()
 
     drop(restarted);
     wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// Take the slot away from a *running* stream, the way an operator does.
+///
+/// The pump reconnects on its own, so the drop has to win a race against it: a
+/// slot an active walsender holds cannot be dropped (SQLSTATE 55006), and the
+/// walsender comes back after each eviction. Evict, try to drop, repeat until the
+/// drop lands — polling the actual condition rather than sleeping in the hope the
+/// pump is between attempts.
+async fn drop_slot_underneath_a_running_stream(
+    source: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut last_error = None;
+    while std::time::Instant::now() < deadline {
+        source
+            .execute(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                 WHERE slot_name = $1 AND active_pid IS NOT NULL",
+                &[&slot],
+            )
+            .await?;
+        match source
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // Already gone, which is the state this is trying to reach.
+            Err(error) if error.code() == Some(&SqlState::UNDEFINED_OBJECT) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(anyhow::anyhow!(
+        "could not take slot {slot} away from the running stream. Last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
+}
+
+/// A replication slot lost while Spice is *running* must be recovered without a
+/// restart.
+///
+/// Recovery for a slot that is missing or invalidated at *startup* already
+/// existed, but it was only reachable through setup. Mid-stream,
+/// `START_REPLICATION` fails permanently, that error was classified fatal, and the
+/// stream stopped — the runtime stays healthy, so nothing necessarily restarts it,
+/// and the dataset was down until an operator noticed.
+///
+/// The source deletes a row while the slot is gone, so the recovery is exercised
+/// against the case that makes it a correctness fix and not only an availability
+/// one: that deletion has no change event left to replay, and an acceleration that
+/// merely resumed would keep the deleted row in every later query.
+///
+/// What this suite asserts is that the *request* to rebuild reaches the consumer,
+/// once, on a stream that was never restarted — there is no accelerator here to
+/// converge. The rebuild's own correctness (a streaming `InsertOp::Overwrite`
+/// rather than an upsert over survivors) is the same path a startup rebuild takes
+/// and is covered where that path is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_lost_while_running_is_recovered_without_a_restart() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slot_lost_live", &[(1, "alice"), (2, "bob")]).await?;
+
+    // A durable acceleration observed to be empty, so the first load is an ordinary
+    // snapshot bootstrap and any later rebuild is unambiguously this recovery.
+    let store = InMemoryAppliedLsnStore::shared();
+    let mut stream = start_replication_stream(input_with_contents(
+        port,
+        "slot_lost_live",
+        &store,
+        AccelerationContents::Empty,
+    ));
+
+    let bootstrap = next_envelope(&mut stream, "the initial snapshot").await?;
+    anyhow::ensure!(
+        !bootstrap.history_unavailable(),
+        "the first load must be a snapshot bootstrap, so a rebuild later in this test can only \
+         be the slot recovery"
+    );
+    assert_eq!(ids_of(&bootstrap), vec![1, 2], "the snapshot's rows");
+    bootstrap.commit().await?;
+
+    // Stream one live change, so a position is recorded and the acceleration has a
+    // watermark for the lost slot to become unreachable from.
+    source
+        .execute("INSERT INTO public.slot_lost_live VALUES (3, 'carol')", &[])
+        .await?;
+    expect_single_change(&mut stream, "the pre-loss insert", "c", 3).await?;
+    // The recorded position is what the replacement slot will be unable to reach,
+    // so the loss has to happen after one exists. Written by a background task
+    // after the commit above proved durable, so poll for it rather than assuming
+    // the commit was enough.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while store.recorded_lsn().is_none() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "no position was ever recorded, so there is no watermark for the replacement slot to \
+             be unable to reach and this test would pass for the wrong reason"
+        );
+        let envelope = next_envelope(&mut stream, "an envelope carrying a position").await?;
+        envelope.commit().await?;
+    }
+
+    // --- Lose the slot, and delete a row while it is gone. ---
+    drop_slot_underneath_a_running_stream(&source, SLOT).await?;
+    source
+        .execute("DELETE FROM public.slot_lost_live WHERE id = 1", &[])
+        .await?;
+
+    // The same stream — never restarted — must be asked to rebuild.
+    let mut rebuild_requests = 0;
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the stream never recovered from losing its replication slot. Losing the slot must not \
+             end the dataset: the slot can be replaced and the acceleration rebuilt from the \
+             source, without a restart"
+        );
+        let envelope = next_envelope(&mut stream, "the rebuild request").await?;
+        if envelope.history_unavailable() {
+            rebuild_requests += 1;
+            anyhow::ensure!(
+                num_rows(&envelope) == 0,
+                "the rebuild request is a signal, not data: the consumer replaces the \
+                 acceleration's contents itself, so carrying rows here would append to what it is \
+                 about to replace. Carried {} row(s)",
+                num_rows(&envelope)
+            );
+        }
+        envelope.commit().await?;
+        // Committing the request is what releases the member's hold, so the loop
+        // must not exit before that lands.
+        if rebuild_requests > 0 {
+            break;
+        }
+    }
+
+    // A replacement slot exists, and exactly one: recovery must not leave the dead
+    // slot behind, nor accumulate a slot per attempt.
+    assert_eq!(
+        slot_count(&source).await?,
+        1,
+        "recovery must leave exactly one slot behind"
+    );
+
+    // Streaming continues on the replacement, which is the half that used to need a
+    // restart — and getting there is also what proves the rebuild was requested
+    // *once*. Every envelope in between is inspected rather than skipped:
+    // `next_change_envelope` would commit and discard a second zero-row rebuild
+    // request along with the idle heartbeats, leaving a rebuild loop invisible here.
+    source
+        .execute("INSERT INTO public.slot_lost_live VALUES (4, 'dave')", &[])
+        .await?;
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    let resumed = loop {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the insert made after the recovery never arrived, so streaming did not resume on the \
+             replacement slot"
+        );
+        let envelope = next_envelope(&mut stream, "an insert after the recovery").await?;
+        if envelope.history_unavailable() {
+            rebuild_requests += 1;
+        }
+        anyhow::ensure!(
+            rebuild_requests == 1,
+            "the acceleration must be asked to rebuild once per lost slot, not once per reconnect \
+             attempt — a rebuild loop re-reads the whole source table on a cycle. Saw \
+             {rebuild_requests} requests"
+        );
+        if num_rows(&envelope) > 0 {
+            break envelope;
+        }
+        envelope.commit().await?;
+    };
+    assert_eq!(ops_of(&resumed), vec!["c".to_string()]);
+    assert_eq!(ids_of(&resumed), vec![4]);
+    resumed.commit().await?;
+
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// A durable acceleration holding no rows must load through the ordinary snapshot
+/// bootstrap, not a rebuild.
+///
+/// Nothing has been recorded for it, and a missing watermark is normally treated
+/// as evidence of a gap, because it cannot be told apart from one whose write
+/// failed. Emptiness settles that: an acceleration with no rows has nothing that
+/// could be stale and no deletion it could be missing, so there is nothing for a
+/// rebuild to repair. Every durable CDC acceleration starts here exactly once, so
+/// getting this wrong routes every first load through a full re-read of the
+/// source (#13118).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_bootstraps_rather_than_rebuilding() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "fresh_empty", &[(1, "alice"), (2, "bob")]).await?;
+
+    // A durable acceleration (the store records positions) that has recorded
+    // nothing, observed to hold no rows — the state every first load is in.
+    let store = InMemoryAppliedLsnStore::shared();
+    let input = input_with_contents(port, "fresh_empty", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut stream = start_replication_stream(input);
+
+    let envelope = next_envelope(&mut stream, "first envelope of a fresh acceleration").await?;
+    anyhow::ensure!(
+        !envelope.history_unavailable(),
+        "an acceleration observed to hold no rows was asked to rebuild from the source. There is \
+         nothing in it that could be stale, so the rebuild repairs nothing and only re-reads the \
+         whole table on what is the first load of every durable CDC acceleration (#13118)"
+    );
+    anyhow::ensure!(
+        num_rows(&envelope) == 2,
+        "the snapshot bootstrap must deliver the source rows; first envelope carried {} row(s)",
+        num_rows(&envelope)
+    );
+    assert_eq!(
+        ids_of(&envelope),
+        vec![1, 2],
+        "the bootstrap must carry the rows present at the source"
+    );
+    envelope.commit().await?;
+
+    // `history_unavailable` being clear only says no rebuild was requested. The
+    // snapshot bootstrap counts the rows it delivers and the rebuild path runs no
+    // snapshot at all, so this is what tells "bootstrapped" apart from "loaded by
+    // some other means".
+    anyhow::ensure!(
+        metrics.bootstrap_rows_total() > 0,
+        "no rows were delivered by the snapshot bootstrap, so the acceleration was not loaded \
+         through it"
+    );
+
+    drop(stream);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// An empty acceleration must still be **loaded** when no snapshot is going to
+/// run, which means rebuilding it.
+///
+/// Emptiness says only that there is nothing stale to repair. It does not load
+/// the table. When the slot already exists and its publication already carries
+/// this table, none of `need_snapshot`'s conditions hold, so no snapshot runs —
+/// and if the rebuild is skipped too, the member resumes from the slot's
+/// position and every row committed before it is missing from the acceleration
+/// permanently. That is silent, unrecoverable data loss: no change event for
+/// those rows will ever be replayed.
+///
+/// Reached by starting a stream (creating the slot and publication), dropping
+/// it, and rejoining against a *fresh* acceleration — the shape of a deleted or
+/// relocated accelerator directory under a slot that outlived it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_acceleration_is_still_loaded_when_no_snapshot_runs() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "slot_outlived", &[(1, "alice"), (2, "bob")]).await?;
+
+    // First start: creates the slot and puts the table in the publication, and
+    // commits so the slot holds a real position.
+    let first_store = InMemoryAppliedLsnStore::shared();
+    let mut first = start_replication_stream(input_with_contents(
+        port,
+        "slot_outlived",
+        &first_store,
+        AccelerationContents::Empty,
+    ));
+    next_envelope(&mut first, "first-start bootstrap")
+        .await?
+        .commit()
+        .await?;
+    drop(first);
+    wait_for_walsender_count(&source, 0).await?;
+
+    // Rows committed while nothing is streaming. A resume from the slot position
+    // would carry these, but never the two rows that predate the slot.
+    source
+        .execute(
+            "INSERT INTO public.slot_outlived (id, name) VALUES ($1, 'carol')",
+            &[&3_i32],
+        )
+        .await?;
+
+    // Rejoin with a brand-new acceleration: empty, nothing recorded, against the
+    // surviving slot and publication. No snapshot can run in this state.
+    let store = InMemoryAppliedLsnStore::shared();
+    let input = input_with_contents(port, "slot_outlived", &store, AccelerationContents::Empty);
+    let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+    let mut rejoined = start_replication_stream(input);
+
+    let envelope =
+        next_envelope(&mut rejoined, "first envelope after the slot outlived it").await?;
+    let loaded = envelope.history_unavailable() || metrics.bootstrap_rows_total() > 0;
+    anyhow::ensure!(
+        loaded,
+        "an empty acceleration was neither rebuilt nor snapshotted when it rejoined a slot that \
+         outlived it, so it resumed from the slot position and the rows committed before that \
+         position are gone for good. Emptiness means there is nothing stale to repair — it does \
+         not mean something else will load the table"
+    );
+    envelope.commit().await?;
+
+    drop(rejoined);
+    wait_for_walsender_count(&source, 0).await?;
+    drop_replication_slot_when_inactive(&source, SLOT).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// The other side of [`an_empty_acceleration_bootstraps_rather_than_rebuilding`]:
+/// an acceleration that holds rows it cannot place must still be rebuilt.
+///
+/// This is the case the rebuild exists for. Rows are present, no position says
+/// what they are current as of, and a row deleted at the source while the
+/// acceleration was away produces no change row — appending a snapshot over the
+/// top would upsert every surviving row and leave the deleted one behind
+/// forever. Only re-reading the table removes it.
+///
+/// A probe that could not answer must land here too: not knowing whether rows are
+/// present is not the same as knowing there are none, and only the latter is
+/// proof.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unplaceable_acceleration_still_rebuilds() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "unplaceable", &[(1, "alice")]).await?;
+
+    for (contents, described) in [
+        (AccelerationContents::NonEmpty, "observed to hold rows"),
+        (AccelerationContents::Unknown, "could not be read"),
+    ] {
+        let store = InMemoryAppliedLsnStore::shared();
+        let input = input_with_contents(port, "unplaceable", &store, contents);
+        let metrics = ReplicationMetrics::new(Arc::clone(&input.metrics));
+        let mut stream = start_replication_stream(input);
+        let envelope =
+            next_envelope(&mut stream, "first envelope of an unplaceable acceleration").await?;
+        anyhow::ensure!(
+            envelope.history_unavailable(),
+            "an acceleration whose contents {described}, with no recorded position, was resumed \
+             rather than rebuilt. A row deleted at the source while it was away produces no \
+             change row, so nothing but a re-read of the table would ever remove it (#12922)"
+        );
+        envelope.commit().await?;
+        anyhow::ensure!(
+            metrics.bootstrap_rows_total() == 0,
+            "the rebuild replaces the acceleration's contents, so no snapshot may also be \
+             appended over them"
+        );
+
+        drop(stream);
+        wait_for_walsender_count(&source, 0).await?;
+    }
+
     drop_replication_slot_when_inactive(&source, SLOT).await?;
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))

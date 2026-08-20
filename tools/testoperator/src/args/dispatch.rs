@@ -258,7 +258,9 @@ pub struct AppendArgs {
 pub struct SearchArgs {
     pub spicepod_path: PathBuf,
     pub runner_type: RunnerType,
-    pub benchmark_dataset: SearchDatasetArg,
+    /// Built-in MTEB benchmark dataset. Omitted for a custom run against `spicepod_path` as-is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_dataset: Option<SearchDatasetArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
 }
@@ -774,7 +776,7 @@ tests:
         ));
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::QuoraRetrieval
+            Some(SearchDatasetArg::QuoraRetrieval)
         ));
         assert_eq!(test_file.tests.search[0].ready_wait, Some(1800));
 
@@ -799,7 +801,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::MiraclEnRetrieval
+            Some(SearchDatasetArg::MiraclEnRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -821,7 +823,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::FiqaRetrieval
+            Some(SearchDatasetArg::FiqaRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -843,7 +845,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::TrecCovidRetrieval
+            Some(SearchDatasetArg::TrecCovidRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -865,7 +867,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::ArguanaRetrieval
+            Some(SearchDatasetArg::ArguanaRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -887,7 +889,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::ScidocsRetrieval
+            Some(SearchDatasetArg::ScidocsRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -909,7 +911,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::ScifactRetrieval
+            Some(SearchDatasetArg::ScifactRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -931,7 +933,7 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::NfcorpusRetrieval
+            Some(SearchDatasetArg::NfcorpusRetrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
@@ -953,10 +955,32 @@ tests:
 
         assert!(matches!(
             test_file.tests.search[0].benchmark_dataset,
-            SearchDatasetArg::Touche2020Retrieval
+            Some(SearchDatasetArg::Touche2020Retrieval)
         ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["benchmark_dataset"], "touche2020_retrieval");
+    }
+
+    #[test]
+    fn test_custom_search_section_omits_benchmark_dataset() {
+        // A custom run leaves `benchmark_dataset` unset. It must deserialize to `None` and, so the
+        // dispatch workflow input stays absent (letting the workflow default to a custom run), it
+        // must not serialize the field back out.
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/custom/my-spicepod.yaml
+    runner_type: spiceai-dev-runners
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(test_file.tests.search[0].benchmark_dataset.is_none());
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert!(serialized.get("benchmark_dataset").is_none());
     }
 }

@@ -16,14 +16,58 @@ limitations under the License.
 
 //! Configuration for the Cloud Connect client.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use snafu::Snafu;
+
+/// Canonicalize a Cloud-provided portal URL before it can be displayed.
+/// Only HTTPS is accepted, and embedded credentials or control characters are
+/// never retained.
+#[must_use]
+pub fn safe_portal_url(candidate: &str) -> Option<String> {
+    if candidate.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(candidate).ok()?;
+    if parsed.cannot_be_a_base() || parsed.host_str().is_none() {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    Some(parsed.to_string())
+}
 
 /// Default enroll endpoint for the Spice Cloud control plane (state
 /// plane): the base URL the out-of-band HTTPS `/v1/cloud-connect/enroll`
 /// and `/v1/cloud-connect/renew` requests are made against. The gateway
 /// (stream) address is returned by the enroll response, not configured.
 pub const DEFAULT_ENDPOINT: &str = "https://api.spice.ai";
+
+#[derive(Debug, Snafu)]
+pub enum EnrollmentEndpointOverrideError {
+    #[snafu(display(
+        "Failed to read the Cloud Connect endpoint override at {}: {source}",
+        path.display()
+    ))]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display(
+        "The Cloud Connect endpoint override at {} is invalid: {source}",
+        path.display()
+    ))]
+    Invalid {
+        path: PathBuf,
+        source: InvalidControlPlaneEndpoint,
+    },
+}
 
 /// Default lead time before the identity cert's `not_after` at which the
 /// client renews. The cloud issues 24h leaves, so a 12h lead yields the
@@ -59,37 +103,65 @@ pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(25);
 /// spicepod is written when an `ApplySpicepod` command arrives.
 pub const CLOUD_MANAGED_SPICEPOD_FILE: &str = "spicepod-cloud-managed.yml";
 
-/// File name (relative to `$SPICE_CONFIG_DIR`) where a freshly-scheduled
-/// adoption code is staged by `spice connect <code>` before `spiced`
-/// starts and consumes it on first Hello.
-pub const PENDING_ADOPT_CODE_FILE: &str = "pending-adopt-code";
-
+/// Write-ahead marker and inert staging files used to commit a cloud-managed
+/// Spicepod and its delivered-secret cache as one recoverable generation.
+pub const DEPLOYMENT_TRANSACTION_FILE: &str = ".cloud-deployment-transaction";
+pub const DEPLOYMENT_TRANSACTION_INCOMING_FILE: &str = ".cloud-deployment-transaction.incoming";
+pub const PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE: &str = ".spicepod-cloud-managed.previous.yml";
+pub const PREVIOUS_SECRET_CACHE_FILE: &str = ".secrets-cache.previous.json";
+pub const INCOMING_SECRET_CACHE_FILE: &str = ".secrets-cache.incoming.json";
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the runtime identity
-/// is persisted after adoption.
+/// is persisted after enrollment.
 pub const IDENTITY_FILE: &str = "identity.json";
 
-/// Env var carrying a first-contact adoption code, for hosts where the
-/// `spice` CLI is not available (containers, cloud-init).
-pub const ADOPT_CODE_ENV: &str = "SPICE_CONNECT_ADOPT_CODE";
+/// A control-plane URL that would expose an enrollment authority or cannot be
+/// used as an HTTP base URL.
+#[derive(Debug, Snafu)]
+#[snafu(display("invalid control-plane endpoint: {reason}"))]
+pub struct InvalidControlPlaneEndpoint {
+    reason: String,
+}
 
-/// Env var carrying the org-scoped app name to attach the instance to at
-/// enroll (mirrors `spice connect --app-name`), for hosts with no CLI.
-pub const ADOPT_APP_NAME_ENV: &str = "SPICE_CONNECT_ADOPT_APP_NAME";
+/// Parse and normalize the control-plane endpoint before any enrollment
+/// authority is attached to a request. Control-plane endpoints require HTTPS.
+///
+/// # Errors
+///
+/// Returns [`InvalidControlPlaneEndpoint`] when `endpoint` is not an absolute
+/// HTTP(S) base URL or contains credentials, a query, or a fragment.
+pub fn normalize_control_plane_endpoint(
+    endpoint: &str,
+) -> Result<String, InvalidControlPlaneEndpoint> {
+    let invalid = |reason: String| InvalidControlPlaneEndpoint { reason };
+    let mut parsed = reqwest::Url::parse(endpoint)
+        .map_err(|source| invalid(format!("it is not a valid absolute URL: {source}")))?;
+    if parsed.cannot_be_a_base() || parsed.host_str().is_none() {
+        return Err(invalid(
+            "it must be an absolute HTTP base URL with a host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("embedded credentials are not allowed".to_string()));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid(
+            "query strings and fragments are not allowed".to_string(),
+        ));
+    }
 
-/// Env var mirroring `spice connect --create`: when truthy (`true`/`1`)
-/// and the app named by [`ADOPT_APP_NAME_ENV`] does not exist, the cloud
-/// creates it at enroll and attaches the instance.
-pub const ADOPT_CREATE_APP_ENV: &str = "SPICE_CONNECT_ADOPT_CREATE";
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            return Err(invalid("plaintext HTTP is not allowed".to_string()));
+        }
+        scheme => return Err(invalid(format!("unsupported URL scheme {scheme:?}"))),
+    }
 
-/// Env var mirroring `spice connect --region`: where *this instance* runs
-/// (`us-west-2`, `on-prem-syd`, …). A customer-declared label recorded on
-/// the registry row, not a probed fact.
-pub const ADOPT_REGION_ENV: &str = "SPICE_CONNECT_ADOPT_REGION";
-
-/// Read the adoption code from [`ADOPT_CODE_ENV`]. An empty value is
-/// treated as unset.
-fn adoption_code_from_env() -> Option<String> {
-    std::env::var(ADOPT_CODE_ENV).ok().filter(|c| !c.is_empty())
+    // The request builder appends fixed API paths, so retain an optional base
+    // path but canonicalize redundant trailing slashes.
+    let normalized_path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(&normalized_path);
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
 }
 
 /// Runtime config for the Cloud Connect client.
@@ -125,43 +197,18 @@ pub struct CloudConnectConfig {
     pub identity_path: PathBuf,
 
     /// Directory where cloud-managed spicepod overlays should be written
-    /// when an `ApplySpicepod` command arrives.
+    /// when an `ApplySpicepod` command arrives, and where the enrollment
+    /// draft lives while an enrollment is in flight.
     pub config_dir: PathBuf,
 
-    /// First-contact adoption code, if any. May be `None` even when
-    /// `CloudConnect` is enabled — that means the identity file is present
-    /// and the client should reconnect with the stored identity.
-    pub adoption_code: Option<String>,
-
-    /// Path to the pending adoption-code file, if applicable. The driver
-    /// intentionally retains this file across reconnects until adoption
-    /// fully succeeds — it is deleted only once `handle_adopt` has
-    /// persisted the issued identity to disk. Keeping it until then lets a
-    /// dropped or retried connection re-send the code, while the post-adopt
-    /// delete stops a restart from accidentally re-sending a consumed
-    /// single-use code.
-    pub pending_adopt_code_path: Option<PathBuf>,
-
-    /// Org-scoped app name to attach the instance to at enroll
-    /// (`spice connect --app-name` / [`ADOPT_APP_NAME_ENV`]). Sent in the
-    /// enroll request; the cloud validates it before consuming the code.
-    /// `None` enrolls unattached (or under the code's own app scope).
-    pub adopt_app_name: Option<String>,
-
-    /// When `true` and `adopt_app_name` names no existing app, the cloud
-    /// creates the app at enroll and attaches the instance
-    /// (`spice connect --create` / [`ADOPT_CREATE_APP_ENV`]).
-    pub adopt_create_app: bool,
-
-    /// Where this instance runs (`spice connect --region` /
-    /// [`ADOPT_REGION_ENV`]) — a customer-declared label, not a probed fact,
-    /// so it rides the enroll request as a sibling of the host facts rather
-    /// than as one of them. The cloud records it on the registry row and
-    /// resolves the instance's gateway stamp from it.
+    /// Where this instance runs (`--region`) — a customer-declared label,
+    /// not a probed fact, so it rides the enroll request as a sibling of
+    /// the host facts rather than as one of them. The cloud records it on
+    /// the registry row and resolves the instance's gateway stamp from it.
     ///
-    /// `None` means "leave the stored value alone": a re-enrol (the recovery
-    /// path once the renewal grace window has passed) must not erase a region
-    /// set in the portal.
+    /// `None` means "leave the stored value alone": a re-enroll after the
+    /// control plane rejects the old credential must not erase a region set in
+    /// the portal.
     pub instance_region: Option<String>,
 
     /// Runtime semver-like string (`v2.0.0-build.deadbeef`). Sent in
@@ -194,6 +241,146 @@ pub struct CloudConnectConfig {
 }
 
 impl CloudConnectConfig {
+    /// Replace `config_dir` with its descriptor-validated spelling while
+    /// preserving an explicitly configured identity path. The ordinary
+    /// derived identity follows the pinned directory; a caller-provided path
+    /// remains authoritative and is validated by `IdentityStore` when opened.
+    pub(crate) fn pin_config_dir(&mut self, pinned_config_dir: PathBuf) {
+        let derived_identity = self.config_dir.join(IDENTITY_FILE);
+        let identity_was_derived = self.identity_path == derived_identity;
+        self.config_dir = pinned_config_dir;
+        if identity_was_derived {
+            self.identity_path = self.config_dir.join(IDENTITY_FILE);
+        }
+    }
+
+    /// Resolve the control-stream endpoint for a persisted identity.
+    ///
+    /// A configured override is already a complete URL. Otherwise the enroll
+    /// response supplies `host:port`, and transport mode supplies the scheme.
+    #[must_use]
+    pub fn stream_endpoint(&self, identity: &crate::identity::Identity) -> Option<String> {
+        if let Some(ref endpoint) = self.gateway_endpoint {
+            return Some(endpoint.clone());
+        }
+        if identity.gateway_addr.trim().is_empty() {
+            return None;
+        }
+        let scheme = if self.insecure { "http" } else { "https" };
+        Some(format!("{scheme}://{}", identity.gateway_addr))
+    }
+
+    /// Resolve and validate the persisted control-stream endpoint shape.
+    ///
+    /// Durable activation deliberately ignores the process-local gateway
+    /// override. The override may redirect the running client's reconnect
+    /// attempts, but a typo or a service environment difference must not make
+    /// consumers disagree about whether the persisted identity is usable.
+    pub(crate) fn validated_persisted_gateway_endpoint(
+        &self,
+        identity: &crate::identity::Identity,
+    ) -> Result<String, &'static str> {
+        if identity.gateway_addr.trim().is_empty() {
+            return Err("the gateway address is empty");
+        }
+        let expected_scheme = if self.insecure { "http" } else { "https" };
+        let endpoint = format!("{expected_scheme}://{}", identity.gateway_addr);
+        let uri = endpoint
+            .parse::<http::Uri>()
+            .map_err(|_| "the gateway endpoint is invalid")?;
+        if uri.scheme_str() != Some(expected_scheme) {
+            return Err("the gateway endpoint uses the wrong transport scheme");
+        }
+        if uri.host().is_none() {
+            return Err("the gateway endpoint has no host");
+        }
+        match uri.port_u16() {
+            None => return Err("the gateway endpoint has no explicit port"),
+            Some(0) => return Err("the gateway endpoint port must be greater than zero"),
+            Some(_) => {}
+        }
+        if uri
+            .path_and_query()
+            .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+        {
+            return Err("the gateway endpoint must not contain a path or query");
+        }
+        Ok(endpoint)
+    }
+
+    /// The `spice connect` operation journals, relative to the config directory:
+    /// the enrollment journal and the project-assignment journal.
+    ///
+    /// The single source of truth for these names. A release deletes the
+    /// journals and `spice connect` writes them, so `commands::connect::state`
+    /// aliases these constants rather than declaring its own: a name defined
+    /// independently on each side would let a rename leave the removal reading a
+    /// path nothing writes.
+    ///
+    /// They cannot outlive the identity: a journal left in the enrolled phase
+    /// with no identity beside it makes the next `spice connect` quarantine it
+    /// rather than resume, and a project journal in the same state fails as a
+    /// pending-project mismatch.
+    pub const CONNECT_OPERATION_FILE: &str = "connect-operation.json";
+    /// See [`Self::CONNECT_OPERATION_FILE`].
+    pub const PROJECT_OPERATION_FILE: &str = "connect-project-operation.json";
+
+    /// The instance-local control-plane endpoint override, relative to the
+    /// config directory.
+    ///
+    /// The single source of truth for this name, aliased by the writer in
+    /// `commands::connect`. Resolution reads it and a release deletes it: `spice
+    /// connect` persists it for an explicit `--endpoint` and for a binding taken
+    /// from the durable identity or a pending draft, so it can carry cloud-issued
+    /// state that must not outlive the enrollment.
+    pub const ENDPOINT_OVERRIDE_FILE: &str = "cloud-endpoint";
+
+    /// Read the optional instance-local enrollment endpoint override without
+    /// following symlinks or opening special files in blocking mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path exists but is unreadable or is not a
+    /// regular file.
+    pub fn read_enroll_endpoint_override(config_dir: &Path) -> std::io::Result<Option<String>> {
+        let path = config_dir.join(Self::ENDPOINT_OVERRIDE_FILE);
+        crate::identity::read_regular_file_optional(&path).map(|contents| {
+            contents
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    }
+
+    /// Read and normalize the legacy instance-local control-plane endpoint.
+    ///
+    /// Enrollment and state-management front ends share this helper so a
+    /// fresh or pre-binding instance cannot choose different control planes in
+    /// `spice` and `spiced`. Durable identity/draft bindings still take
+    /// precedence at each caller; this file is only the fallback before such a
+    /// binding exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists but is unsafe/unreadable, or when
+    /// its non-empty value is not a safe control-plane base URL.
+    pub fn read_normalized_enroll_endpoint_override(
+        config_dir: &Path,
+    ) -> std::result::Result<Option<String>, EnrollmentEndpointOverrideError> {
+        let path = config_dir.join(Self::ENDPOINT_OVERRIDE_FILE);
+        let Some(endpoint) = Self::read_enroll_endpoint_override(config_dir).map_err(|source| {
+            EnrollmentEndpointOverrideError::Read {
+                path: path.clone(),
+                source,
+            }
+        })?
+        else {
+            return Ok(None);
+        };
+        normalize_control_plane_endpoint(&endpoint)
+            .map(Some)
+            .map_err(|source| EnrollmentEndpointOverrideError::Invalid { path, source })
+    }
+
     /// Resolve the Cloud Connect config directory to its canonical location.
     ///
     /// Precedence:
@@ -202,11 +389,11 @@ impl CloudConnectConfig {
     ///    directory (the `spiced` instance's working directory)
     ///
     /// This deliberately does **not** fall back to the global `~/.spice`.
-    /// Adoption state (the pending code, `identity.json`, and the
+    /// Enrollment state (`identity.json`, the enrollment draft, and the
     /// `cloud-endpoint` override) is per-`spiced`-instance: several `spiced`
-    /// processes can run on one machine and each must adopt into Spice Cloud
+    /// processes can run on one machine and each must enroll into Spice Cloud
     /// independently. A shared `~/.spice` would make one machine present as a
-    /// single runtime and let one instance's adoption clobber another's, so
+    /// single runtime and let one instance's enrollment clobber another's, so
     /// the state is scoped to the working directory instead. The `spiced`
     /// binary itself still installs to the shared `~/.spice/bin` — only this
     /// per-instance state is local.
@@ -251,24 +438,14 @@ impl CloudConnectConfig {
         Self::default_config_dir().join(IDENTITY_FILE)
     }
 
-    /// Resolve the canonical pending-adopt-code path.
-    #[must_use]
-    pub fn default_pending_adopt_code_path() -> PathBuf {
-        Self::default_config_dir().join(PENDING_ADOPT_CODE_FILE)
-    }
-
-    /// Returns a config bootstrap that picks up adoption state from disk
-    /// and the environment.
+    /// Returns a config bootstrap from the environment.
     ///
-    /// Precedence for the adoption credential:
-    /// 1. [`ADOPT_CODE_ENV`] env var.
-    /// 2. `$SPICE_CONFIG_DIR/pending-adopt-code` file.
-    /// 3. None (rely on identity at `$SPICE_CONFIG_DIR/identity.json`).
-    ///
-    /// The enroll endpoint defaults to [`DEFAULT_ENDPOINT`]; override via
-    /// the `SPICE_CLOUD_ENDPOINT` env var. The gateway (stream) endpoint
-    /// normally comes from the enroll response; the
-    /// `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.
+    /// Enrollment is driven explicitly (a `--token` bootstrap, or a
+    /// caller-provided authenticated-session authority); this config only
+    /// locates state on disk and the endpoints. The enroll endpoint defaults to
+    /// [`DEFAULT_ENDPOINT`]; override via the `SPICE_CLOUD_ENDPOINT` env
+    /// var. The gateway (stream) endpoint normally comes from the enroll
+    /// response; the `SPICE_CLOUD_GATEWAY_ENDPOINT` env var overrides it.
     #[must_use]
     pub fn from_env(runtime_version: impl Into<String>) -> Self {
         Self::from_env_at(runtime_version, Self::default_config_dir())
@@ -280,7 +457,6 @@ impl CloudConnectConfig {
     #[must_use]
     pub fn from_env_at(runtime_version: impl Into<String>, config_dir: PathBuf) -> Self {
         let identity_path = config_dir.join(IDENTITY_FILE);
-        let pending_path = config_dir.join(PENDING_ADOPT_CODE_FILE);
 
         let enroll_endpoint = std::env::var("SPICE_CLOUD_ENDPOINT")
             .ok()
@@ -290,68 +466,6 @@ impl CloudConnectConfig {
             .ok()
             .filter(|v| !v.is_empty());
 
-        let (adoption_code, pending_adopt_code_path) = if let Some(code) = adoption_code_from_env()
-        {
-            // Env var wins; we do not delete the pending file in this
-            // branch because it's an out-of-band re-adopt signal.
-            (Some(code), None)
-        } else if pending_path.exists() {
-            match std::fs::read_to_string(&pending_path) {
-                Ok(s) => {
-                    let trimmed = s.trim().to_string();
-                    if trimmed.is_empty() {
-                        (None, None)
-                    } else {
-                        (Some(trimmed), Some(pending_path))
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        "Cloud Connect: failed to read pending adopt code at {}: {err}",
-                        pending_path.display()
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        let adopt_app_name = std::env::var(ADOPT_APP_NAME_ENV)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let mut adopt_create_app = std::env::var(ADOPT_CREATE_APP_ENV)
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1"));
-        // "Create the app" needs an app to name. The `--create` flag is
-        // guarded by clap (`requires = "app_name"`); the env pair has no
-        // such guard, so enforce it here rather than sending a request the
-        // cloud would reject.
-        if adopt_create_app && adopt_app_name.is_none() {
-            tracing::warn!(
-                "{ADOPT_CREATE_APP_ENV} is set but {ADOPT_APP_NAME_ENV} is empty; ignoring it. Set {ADOPT_APP_NAME_ENV} to the app to attach this instance to, or attach it in the Spice Cloud portal after enrolling. See: https://spiceai.org/docs"
-            );
-            adopt_create_app = false;
-        }
-
-        // A malformed region is dropped rather than sent: the cloud rejects it
-        // before consuming the adoption code, so enrolling anyway would only
-        // turn a typo in the environment into a failed enrollment.
-        let instance_region = std::env::var(ADOPT_REGION_ENV)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .and_then(|region| {
-                if crate::is_valid_instance_region(&region) {
-                    Some(region)
-                } else {
-                    tracing::warn!(
-                        "{ADOPT_REGION_ENV} value {region:?} is not a valid region label; ignoring it. Expected 2-64 lowercase letters, digits, or hyphens (for example 'us-west-2' or 'on-prem-syd'). Set the region on the instance in the Spice Cloud portal instead. See: https://spiceai.org/docs"
-                    );
-                    None
-                }
-            });
-
         Self {
             enroll_endpoint,
             gateway_endpoint,
@@ -359,11 +473,7 @@ impl CloudConnectConfig {
             insecure: false,
             identity_path,
             config_dir,
-            adoption_code,
-            pending_adopt_code_path,
-            adopt_app_name,
-            adopt_create_app,
-            instance_region,
+            instance_region: None,
             runtime_version: runtime_version.into(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
@@ -380,6 +490,26 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn portal_urls_are_safe_before_display() {
+        assert_eq!(
+            safe_portal_url("https://spice.ai/projects/new?instance=inst_1").as_deref(),
+            Some("https://spice.ai/projects/new?instance=inst_1")
+        );
+        for unsafe_url in [
+            "http://localhost:8080/projects/new",
+            "http://spice.ai/projects/new",
+            "https://user:secret@spice.ai/projects/new",
+            "https://spice.ai/projects/new\nforged",
+            "mailto:security@spice.ai",
+        ] {
+            assert!(
+                safe_portal_url(unsafe_url).is_none(),
+                "{unsafe_url:?} must not be displayed"
+            );
+        }
+    }
 
     /// The instance must be the layer that gives up first, because it is the
     /// only one holding the query slot. If the control plane answers the caller
@@ -428,9 +558,9 @@ mod tests {
             std::env::remove_var("SPICE_CONFIG_DIR");
         }
         let dir = CloudConnectConfig::default_config_dir();
-        // Adoption state must be scoped to the instance's working directory
+        // Enrollment state must be scoped to the instance's working directory
         // (`./.spice`), never the machine-global `~/.spice`, so that multiple
-        // spiced instances on one host adopt independently.
+        // spiced instances on one host enroll independently.
         assert_eq!(dir.file_name(), Some(std::ffi::OsStr::new(".spice")));
         let expected = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -440,7 +570,7 @@ mod tests {
             assert_ne!(
                 dir,
                 home.join(".spice"),
-                "adoption config dir must not resolve to the global ~/.spice"
+                "enrollment config dir must not resolve to the global ~/.spice"
             );
         }
     }
@@ -493,65 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn adoption_code_env_treats_empty_as_unset() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        // SAFETY: tests gate env-var mutations behind a mutex.
-        unsafe {
-            std::env::set_var(ADOPT_CODE_ENV, "SPICE-ADOPT-7K2PX-9XYZ2");
-        }
-        assert_eq!(
-            adoption_code_from_env().as_deref(),
-            Some("SPICE-ADOPT-7K2PX-9XYZ2")
-        );
-
-        // An exported-but-empty var is how a shell passes "no code"; it must
-        // not be presented to the cloud as a credential.
-        unsafe {
-            std::env::set_var(ADOPT_CODE_ENV, "");
-        }
-        assert_eq!(adoption_code_from_env(), None);
-
-        unsafe {
-            std::env::remove_var(ADOPT_CODE_ENV);
-        }
-        assert_eq!(adoption_code_from_env(), None);
-    }
-
-    #[test]
-    fn from_env_ignores_create_app_without_an_app_name() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        // SAFETY: tests gate env-var mutations behind a mutex.
-        unsafe {
-            std::env::remove_var(ADOPT_APP_NAME_ENV);
-            std::env::set_var(ADOPT_CREATE_APP_ENV, "true");
-        }
-        let config = CloudConnectConfig::from_env("v0.0.0-test");
-        assert!(
-            !config.adopt_create_app,
-            "creating an app needs an app to name"
-        );
-
-        // With a name it takes effect.
-        unsafe {
-            std::env::set_var(ADOPT_APP_NAME_ENV, "edge-fleet");
-        }
-        let config = CloudConnectConfig::from_env("v0.0.0-test");
-        assert_eq!(config.adopt_app_name.as_deref(), Some("edge-fleet"));
-        assert!(config.adopt_create_app);
-
-        unsafe {
-            std::env::remove_var(ADOPT_APP_NAME_ENV);
-            std::env::remove_var(ADOPT_CREATE_APP_ENV);
-        }
-    }
-
-    #[test]
     fn from_env_uses_default_endpoint_when_unset() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         unsafe {
             std::env::remove_var("SPICE_CLOUD_ENDPOINT");
             std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
-            std::env::remove_var(ADOPT_CODE_ENV);
         }
         let config = CloudConnectConfig::from_env("v0.0.0-test");
         assert_eq!(config.enroll_endpoint, DEFAULT_ENDPOINT);
@@ -559,5 +635,119 @@ mod tests {
             config.gateway_endpoint.is_none(),
             "gateway endpoint comes from the enroll response unless overridden"
         );
+        assert!(
+            config.instance_region.is_none(),
+            "the region is an explicit argument, never read from the environment"
+        );
+    }
+
+    #[test]
+    fn persisted_gateway_rejects_port_zero() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        unsafe {
+            std::env::remove_var("SPICE_CLOUD_ENDPOINT");
+            std::env::remove_var("SPICE_CLOUD_GATEWAY_ENDPOINT");
+        }
+        let config = CloudConnectConfig::from_env("v0.0.0-test");
+        let identity = crate::identity::Identity {
+            identifier: "inst_test".to_string(),
+            control_plane_endpoint: None,
+            new_project_url: None,
+            identity_cert_pem: String::new(),
+            private_key_pem: String::new(),
+            public_key_pem: String::new(),
+            ca_bundle_pem: String::new(),
+            gateway_addr: "gateway.example.test:0".to_string(),
+            not_after_unix: None,
+            app_id: None,
+            org_name: None,
+            app_name: None,
+            monitor_url: None,
+            enc_private_key_pem: String::new(),
+            enc_public_key_pem: String::new(),
+            enc_previous_private_key_pem: String::new(),
+            cache_key_b64: String::new(),
+        };
+
+        assert_eq!(
+            config.validated_persisted_gateway_endpoint(&identity),
+            Err("the gateway endpoint port must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn enrollment_endpoint_override_is_trimmed_and_optional() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+                .expect("missing override is ordinary absence")
+                .is_none()
+        );
+        std::fs::write(
+            dir.path().join("cloud-endpoint"),
+            "  https://cloud.example.test  \n",
+        )
+        .expect("write override");
+        assert_eq!(
+            CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+                .expect("read override")
+                .as_deref(),
+            Some("https://cloud.example.test")
+        );
+        assert_eq!(
+            CloudConnectConfig::read_normalized_enroll_endpoint_override(dir.path())
+                .expect("normalize override")
+                .as_deref(),
+            Some("https://cloud.example.test")
+        );
+
+        std::fs::write(dir.path().join("cloud-endpoint"), "not an endpoint\n")
+            .expect("write invalid override");
+        CloudConnectConfig::read_normalized_enroll_endpoint_override(dir.path())
+            .expect_err("an invalid configured endpoint must fail closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enrollment_endpoint_override_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        std::fs::write(&target, "https://redirected.example.test").expect("write symlink target");
+        symlink(&target, dir.path().join("cloud-endpoint")).expect("create symlink");
+
+        CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+            .expect_err("a state-file symlink must be rejected");
+    }
+    /// The one rule for a Cloud-provided link: absolute, `https`, and carrying
+    /// no credentials. A create-project link keeps its query — that is how it
+    /// names the instance.
+    #[test]
+    fn a_portal_link_is_accepted_only_when_it_is_safe_to_open() {
+        for accepted in [
+            "https://spice.ai/acme/new?instance=inst_1",
+            "https://dev.spice.ai/acme/new",
+        ] {
+            assert_eq!(
+                safe_portal_url(accepted).as_deref(),
+                Some(accepted),
+                "{accepted} should be usable as-is"
+            );
+        }
+        for rejected in [
+            "javascript:alert(1)",
+            "http://attacker.example/acme/new",
+            "https://user:secret@spice.ai/acme/new",
+            "/acme/new",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(
+                safe_portal_url(rejected),
+                None,
+                "{rejected} must be refused"
+            );
+        }
     }
 }

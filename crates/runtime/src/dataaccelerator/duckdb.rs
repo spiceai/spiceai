@@ -14,20 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::resolved_refresh_mode;
+use data_accelerator_api::make_spice_data_directory;
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
 use crate::{
     App,
     component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
-    dataaccelerator::{
-        FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::FilePathError,
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
     },
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -65,7 +67,10 @@ use datafusion_table_providers::{
 use duckdb::AccessMode;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_duckdb::DuckDbSidecar;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -698,10 +703,44 @@ impl DataAccelerator for DuckDBAccelerator {
         self.has_existing_file(source)
     }
 
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        // Resolved unconditionally, and that is load-bearing: `duckdb_file_path`
+        // fails for an acceleration that is not file-backed, which is what stops a
+        // `mode: memory` acceleration from acquiring a checkpoint. A memory
+        // acceleration holds nothing across a restart, so a checkpoint for it would
+        // let a reload restore superseded rows instead of re-reading the source.
+        let duckdb_file =
+            self.duckdb_file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&duckdb_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("DuckDB file does not exist at {duckdb_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(DuckDbSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -749,6 +788,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
                         None,
+                        resolved_refresh_mode(source, acceleration),
                     )
                     .await;
 
@@ -765,10 +805,10 @@ impl DataAccelerator for DuckDBAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::DuckDB,
                 None,
+                resolved_refresh_mode(source, acceleration),
             )
             .await;
 
@@ -2010,7 +2050,10 @@ mod tests {
 
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
+    use crate::dataaccelerator::{
+        AcceleratorEngineRegistry, DataAccelerator, duckdb::DuckDBAccelerator,
+    };
+    use runtime_acceleration::sidecar::OpenOption;
 
     fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2662,7 +2705,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 
@@ -2673,6 +2716,43 @@ mod tests {
 
         // cleanup
         std::fs::remove_file(&path).expect("file should be removed");
+    }
+
+    /// A `mode: memory` acceleration must NOT resolve a checkpointing sidecar: it holds
+    /// nothing across a restart, so a checkpoint would let a reload restore superseded
+    /// rows rather than re-read the source (regression test for the reload path in
+    /// `acceleration::file_create_duckdb::test_file_create_reload_keeps_unchanged_datasets`).
+    #[tokio::test]
+    async fn duckdb_memory_mode_resolves_no_sidecar() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let mut dataset =
+            DatasetBuilder::try_new("duckdb_memory_sidecar".to_string(), "duckdb_memory_sidecar")
+                .expect("to create builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::new(rt))
+                .build()
+                .expect("to build dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::DuckDB,
+            mode: Mode::Memory,
+            ..Default::default()
+        });
+
+        // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so assert on `is_err` rather
+        // than `expect_err`.
+        let resolved = DuckDBAccelerator::new()
+            .sidecar(
+                &dataset,
+                Arc::new(AcceleratorEngineRegistry::new()),
+                OpenOption::OpenExisting,
+            )
+            .await
+            .is_err();
+        assert!(
+            resolved,
+            "a memory-mode acceleration must not resolve a checkpointing sidecar"
+        );
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.

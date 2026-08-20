@@ -41,6 +41,7 @@ limitations under the License.
 //! is the deferred path: a placeholder is registered up-front and the
 //! real provider is materialized on first reference.
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -264,7 +265,8 @@ impl DatasetInitialization {
                     });
                 }
 
-                let federated_provider = match connector.read_provider(&dataset).await {
+                let context = RuntimeConnectorContext::for_dataset(&dataset);
+                let federated_provider = match connector.read_provider(&context, &dataset).await {
                     Ok(provider) => provider,
                     Err(e) => {
                         return Err(report_deferred_failure(
@@ -425,6 +427,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             if self.fail_read {

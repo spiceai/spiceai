@@ -23,9 +23,9 @@ license-file.workspace = true
 description = "SMB data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["smb"] }
 runtime-component = { path = "../../runtime-component" }
 runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
@@ -34,6 +34,9 @@ url.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

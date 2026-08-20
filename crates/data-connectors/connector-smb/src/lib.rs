@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::dataconnector::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{self, LISTING_TABLE_PARAMETERS, ListingTableConnector};
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
     NewDataConnectorResult,
 };
@@ -82,10 +83,11 @@ impl DataConnectorFactory for SMBFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let smb = SMB {
                 params: params.parameters,
@@ -123,7 +125,7 @@ impl ListingTableConnector for SMB {
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
         let mut smb_url = Url::parse(url).boxed().map_err(|source| {
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+            data_connector_api::DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
                 message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/smb"),
                 connector_component: ConnectorComponent::from(dataset),
@@ -149,10 +151,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     SMBFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_smb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_smb_connector,
     SMB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

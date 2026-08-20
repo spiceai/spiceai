@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
@@ -107,7 +108,7 @@ async fn get_local_table_provider(
     let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateSourceTableProviderSnafu)?;
