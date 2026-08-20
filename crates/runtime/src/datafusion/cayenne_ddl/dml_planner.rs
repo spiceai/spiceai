@@ -41,15 +41,36 @@ use super::physical_plans::{
 };
 use crate::cluster::ExecutorRegistry;
 
-/// Walk the input plan to find the topmost `Filter` and return predicate
+/// The row condition of a distributed `DELETE`/`UPDATE`, as predicate
 /// expressions.
 ///
-/// Used by distributed DELETE/UPDATE planning. Empty means no `WHERE` clause.
-pub fn extract_filters(plan: &LogicalPlan) -> DFResult<Vec<Expr>> {
+/// An empty result means the statement had no `WHERE` clause and so affects
+/// every row — which is why no shape may fall through to "empty" by accident.
+/// A restriction this walk does not read is not a narrower delete, it is the
+/// whole table: `runtime_datafusion::dml_guard` documents how the same
+/// conflation destroys data on the non-distributed path. So the shapes whose
+/// condition this walk provably carries are named, and anything else is
+/// refused rather than silently widened.
+///
+/// # Errors
+///
+/// [`DataFusionError::Plan`] when the input plan restricts rows in a way these
+/// predicates cannot express.
+pub fn extract_filters(plan: &LogicalPlan, table_name: &str) -> DFResult<Vec<Expr>> {
     match plan {
         LogicalPlan::Filter(filter) => Ok(vec![filter.predicate.clone()]),
-        LogicalPlan::Projection(proj) => extract_filters(&proj.input),
-        _ => Ok(Vec::new()),
+        LogicalPlan::Projection(proj) => extract_filters(&proj.input, table_name),
+        LogicalPlan::SubqueryAlias(alias) => extract_filters(&alias.input, table_name),
+        // The one shape that legitimately affects every row: a statement with
+        // no `WHERE`. A filter already pushed into the scan is still a
+        // condition and has to be carried, not dropped.
+        LogicalPlan::TableScan(scan) => Ok(scan.filters.clone()),
+        _ => Err(DataFusionError::Plan(format!(
+            "Failed to plan a distributed statement for table '{table_name}': the rows it affects are restricted in a way that cannot be carried to the table as a row condition, \
+            so every row would be affected instead of the rows the condition selected. \
+            Rewrite the statement so the rows are selected by a condition on the table's own columns. \
+            See: https://spiceai.org/docs/reference/sql"
+        ))),
     }
 }
 

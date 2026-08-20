@@ -21,10 +21,11 @@
 # `scripts/check_crate_layers.py` all sat until #12111.
 #
 # The paths that must be gated are DERIVED, not listed: from what the `lint-rust`
-# recipe reads (`CLIPPY_CONF_DIR`, each `python3 scripts/…` guard) and from the
-# tracked files whose name marks them as lint/test config. So this catches "a
-# config file the gate reads is in none of the lists" — the actual bug — and not
-# merely "the lists disagree about a path someone already thought of".
+# recipe reads (`CLIPPY_CONF_DIR`, each `python3 scripts/…` guard), from the
+# tracked files whose name marks them as lint/test config, and from every tracked
+# `.rs` file. So this catches "a config file the gate reads is in none of the
+# lists" and "a Rust source tree is in none of the lists" — the actual bugs — and
+# not merely "the lists disagree about a path someone already thought of".
 #
 # Usage:
 #   scripts/check_rust_gate_paths.py    # validate (exit 1 on drift, 2 if unreadable)
@@ -56,9 +57,9 @@ GATE_CONFIG_BASENAMES = (
     "layers.toml",
 )
 
-# Rust inputs that are not config files, so there is nothing to derive them from.
+# Rust inputs that are neither config files nor `.rs` sources, so there is
+# nothing to derive them from.
 RUST_SOURCE_PATHS = (
-    "crates/runtime/src/lib.rs",
     "Cargo.toml",
     "Cargo.lock",
     "crates/cayenne/Cargo.toml",
@@ -127,7 +128,22 @@ def lint_recipe() -> str:
     return "\n".join(lines)
 
 
-def derived_gate_paths() -> tuple[list[str], list[str]]:
+def tracked_files() -> tuple[list[str], list[str]]:
+    """Every tracked path in the repo, plus notes if git could not be read."""
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=REPO,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        return [], [f"could not list tracked files ({error})"]
+    return [p for p in listing.split("\0") if p], []
+
+
+def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
@@ -147,46 +163,121 @@ def derived_gate_paths() -> tuple[list[str], list[str]]:
         paths.add(f"{conf_dir.rstrip('/')}/clippy.toml")
     paths.update(re.findall(r"python3 (scripts/[\w./-]+\.py)", recipe))
 
-    try:
-        tracked = subprocess.run(
-            ["git", "ls-files", "-z"],
-            cwd=REPO,
-            capture_output=True,
-            check=True,
-            text=True,
-        ).stdout.split("\0")
-    except (OSError, subprocess.CalledProcessError) as error:
-        notes.append(
-            f"could not list tracked files ({error}) — derived only from the lint-rust recipe"
-        )
-        tracked = []
-    paths.update(p for p in tracked if p and Path(p).name in GATE_CONFIG_BASENAMES)
+    paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
 
     return sorted(paths), notes
+
+
+def rust_source_trees(tracked: list[str]) -> dict[str, list[str]]:
+    """Tracked `.rs` files, grouped by their top-level directory.
+
+    The config-file derivation above reads what the gate *configures*, so it is
+    blind to a Rust source tree the lists never mention: `vendor/` held 17
+    tracked `.rs` files compiled through a `[patch.crates-io]` entry, in no
+    `code_changes` glob, and this guard passed (#13120). Grouping keeps one
+    error per tree rather than one per file.
+
+    A `.rs` file at the repo root has no directory to group under and is keyed
+    `"."` — no glob covers one today, so that is the shape an error would take.
+    """
+    trees: dict[str, list[str]] = {}
+    for path in tracked:
+        if path.endswith(".rs"):
+            head, separator, _ = path.partition("/")
+            trees.setdefault(head if separator else ".", []).append(path)
+    return trees
 
 
 def glob_matches(glob: str, path: str) -> bool:
     """Match one dorny/paths-filter (picomatch) glob against a path.
 
-    Equivalent to `glob.translate(glob, recursive=True, include_hidden=False)`,
+    Equivalent to `glob.translate(glob, recursive=True, include_hidden=True)`,
     hand-rolled only because that landed in Python 3.13 and this repo's guards
-    run on 3.11. `include_hidden=False` is the rule that matters: a wildcard
-    never matches a path segment starting with `.`, because picomatch descends
-    into dot-prefixed directories only with `dot: true`, which this filter does
-    not set. So a dot path (`.ci/clippy.toml`) must be covered by a glob that
-    spells the dot segment out (`.ci/**`) — which matches either way — rather
-    than relying on `**` to reach it.
+    run on 3.11. `include_hidden=True` is the rule that matters, and it is read
+    off the action rather than assumed: `dorny/paths-filter` builds every
+    matcher with `MatchOptions = {dot: true}` (`src/filter.ts`, at the SHA
+    pinned in `check-code-changes/action.yml`), so a wildcard *does* reach a
+    segment starting with `.` and `**` alone covers `.ci/clippy.toml`. Modelling
+    it the other way makes this guard stricter than the filter it stands in for,
+    which reports a covered path as ungated.
     """
     if glob.startswith("**/"):
         # picomatch lets a leading `**/` match nothing, so `**/x` matches `x`.
         return glob_matches(glob[3:], path) or glob_matches(f"*/{glob}", path)
     pattern = (
         re.escape(glob)
-        .replace(r"\*\*/", "(?:[^./][^/]*/)*")
-        .replace(r"\*\*", "[^./][^/]*(?:/[^./][^/]*)*")
-        .replace(r"\*", "[^./][^/]*")
+        .replace(r"\*\*/", "(?:[^/]+/)*")
+        .replace(r"\*\*", "[^/]+(?:/[^/]+)*")
+        .replace(r"\*", "[^/]+")
     )
     return re.fullmatch(pattern, path) is not None
+
+
+def coverage_gaps(
+    paths: list[str], globs: list[str], patterns: dict[str, str]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Which of `paths` each list would skip: per pattern, then for the globs.
+
+    The one place that decides "is this path gated". Both callers below report
+    the answer differently — per path for a config file, per tree for a source
+    directory — and the two reports drifting apart is how a list quietly stops
+    being checked, so the decision itself has exactly one definition.
+    """
+    return (
+        {
+            name: [p for p in paths if not re.search(pattern, p)]
+            for name, pattern in patterns.items()
+        },
+        [p for p in paths if not any(glob_matches(g, p) for g in globs)],
+    )
+
+
+def gate_config_errors(
+    gated: list[str], globs: list[str], patterns: dict[str, str]
+) -> list[str]:
+    """One error per config path the Rust gate reads that a list would skip."""
+    pattern_misses, glob_misses = coverage_gaps(gated, globs, patterns)
+    errors = [
+        f"{path} changes what the Rust gate does, but the pattern in {name} "
+        "does not match it — the branch would skip every Rust check."
+        for name, missed in pattern_misses.items()
+        for path in missed
+    ]
+    errors.extend(
+        f"{path} changes what the Rust gate does, but no check-code-changes glob "
+        "matches it — the merge queue would report `Rust Lint` and `Build and "
+        "Test` green without running a step."
+        for path in glob_misses
+    )
+    return errors
+
+
+def rust_source_errors(
+    trees: dict[str, list[str]], globs: list[str], patterns: dict[str, str]
+) -> list[str]:
+    """One error per source tree that any of the three lists would skip.
+
+    Reported per tree, naming the file count and one example: the fix is always
+    a glob or pattern for the tree, so a per-file list would be noise.
+    """
+    errors: list[str] = []
+    for tree, sources in sorted(trees.items()):
+        label = "the repo root" if tree == "." else f"{tree}/"
+        pattern_misses, glob_misses = coverage_gaps(sources, globs, patterns)
+        for name, missed in pattern_misses.items():
+            if missed:
+                errors.append(
+                    f"{label} holds {len(missed)} tracked Rust source file(s) the pattern in "
+                    f"{name} does not match (e.g. {missed[0]}) — a branch changing only those "
+                    "would skip every Rust check."
+                )
+        if glob_misses:
+            errors.append(
+                f"{label} holds {len(glob_misses)} tracked Rust source file(s) matched by no "
+                f"check-code-changes glob (e.g. {glob_misses[0]}) — the merge queue would report "
+                "`Rust Lint` and `Build and Test` green without compiling them."
+            )
+    return errors
 
 
 def read_patterns() -> dict[str, str] | None:
@@ -240,23 +331,23 @@ def main() -> int:
             "Attestation check) and must classify paths identically."
         )
 
-    gated, notes = derived_gate_paths()
+    # A guard that passes when it could not look is the defect this file exists
+    # to catch, so an unreadable tree is exit 2 (unreadable) rather than a
+    # warning and a green "0 source tree(s)" line.
+    tracked, listing_notes = tracked_files()
+    if listing_notes:
+        for note in listing_notes:
+            print(f"error: {note} — nothing could be checked.", file=sys.stderr)
+        return 2
+
+    gated, notes = derived_gate_paths(tracked)
     for note in notes:
         print(f"warning: {note}", file=sys.stderr)
 
-    for path in gated:
-        for name, pattern in patterns.items():
-            if not re.search(pattern, path):
-                errors.append(
-                    f"{path} changes what the Rust gate does, but the pattern in {name} "
-                    "does not match it — the branch would skip every Rust check."
-                )
-        if not any(glob_matches(glob, path) for glob in globs):
-            errors.append(
-                f"{path} changes what the Rust gate does, but no check-code-changes glob "
-                "matches it — the merge queue would report `Rust Lint` and `Build and "
-                "Test` green without running a step."
-            )
+    trees = rust_source_trees(tracked)
+    errors.extend(rust_source_errors(trees, globs, patterns))
+
+    errors.extend(gate_config_errors(gated, globs, patterns))
 
     for path in MUST_SKIP_RUST_CHECKS:
         for name, pattern in patterns.items():
@@ -279,8 +370,9 @@ def main() -> int:
         return 1
 
     print(
-        f"Rust-gate paths OK: patterns agree, {len(gated)} gated path(s) matched by all "
-        f"three lists, {len(MUST_SKIP_RUST_CHECKS)} fast-track path(s) still skipped."
+        f"Rust-gate paths OK: patterns agree, {len(gated)} gated path(s) and "
+        f"{len(trees)} Rust source tree(s) matched by all three lists, "
+        f"{len(MUST_SKIP_RUST_CHECKS)} fast-track path(s) still skipped."
     )
     return 0
 

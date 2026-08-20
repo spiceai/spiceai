@@ -100,7 +100,7 @@ pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
         // when a FunctionSupport is set; without this the deny-list never runs.
         // Mirrors the connector wiring (`DuckDB::with_spice_deny_list`). See #10703.
         .with_function_support(
-            crate::datafusion::udf::deny_spice_functions_for_duckdb_table_providers(),
+            runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers(),
         )
         .with_settings_registry(
             DuckDBSettingsRegistry::new()
@@ -978,7 +978,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 .map(str::trim)
                 .filter(|sql| !sql.is_empty())
             {
-                match crate::datafusion::retention_sql::parse_retention_sql(
+                match runtime_datafusion::retention_sql::parse_retention_sql(
                     src.name(),
                     retention_sql,
                     Arc::clone(&schema),
@@ -3060,7 +3060,7 @@ mod tests {
 
     #[test]
     fn on_refresh_order_by_clause_always_quotes_identifiers() {
-        use crate::datafusion::sort_columns::{SortColumn, SortDirection};
+        use runtime_datafusion::sort_columns::{SortColumn, SortDirection};
 
         let clause = super::on_refresh_order_by_clause(&[
             // Lowercase reserved word: `quote_identifier` would leave it bare
@@ -3087,7 +3087,7 @@ mod tests {
 
     #[test]
     fn on_refresh_sort_sql_executes_in_duckdb_for_reserved_word_columns() {
-        use crate::datafusion::sort_columns::SortColumn;
+        use runtime_datafusion::sort_columns::SortColumn;
 
         let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
         conn.execute_batch(

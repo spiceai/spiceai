@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Narrow client for the atomic Cloud Connect project operation.
+//! Narrow client for listing attachable projects and atomically attaching one.
 
 use futures::StreamExt as _;
 use reqwest::{StatusCode, redirect::Policy};
@@ -23,39 +23,41 @@ use runtime_cloud_connect::enroll::SessionToken;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
-const PROJECT_PATH: &str = "/v1/cloud-connect/project";
+const ATTACH_PATH: &str = "/v1/cloud-connect/attach";
+const ATTACHABLE_PROJECTS_PATH: &str = "/v1/cloud-connect/attachable-projects";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_ATTACHABLE_PROJECT_PAGES: usize = 100;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Snafu)]
-pub(super) enum Error {
+pub(crate) enum Error {
     #[snafu(display(
-        "Failed to create and attach the Spice Cloud project: the request could not be sent: {source}"
+        "Failed to attach the Spice Cloud project: the request could not be sent: {source}"
     ))]
     Transport { source: reqwest::Error },
 
     #[snafu(display(
-        "Failed to create and attach the Spice Cloud project: the response could not be read: {source}"
+        "Failed to attach the Spice Cloud project: the response could not be read: {source}"
     ))]
     ResponseBody { source: reqwest::Error },
 
     #[snafu(display(
-        "Failed to create and attach the Spice Cloud project: the response exceeded the 64 KiB limit"
+        "Failed to attach the Spice Cloud project: the response exceeded the 64 KiB limit"
     ))]
     ResponseTooLarge,
 
     #[snafu(display(
-        "Failed to create and attach the Spice Cloud project: the server returned an invalid response ({reason})"
+        "Failed to attach the Spice Cloud project: the server returned an invalid response ({reason})"
     ))]
     InvalidResponse { reason: &'static str },
 
     #[snafu(display(
-        "Failed to create and attach the Spice Cloud project: the enrolled identity could not sign the request: {reason}"
+        "Failed to attach the Spice Cloud project: the enrolled identity could not sign the request: {reason}"
     ))]
     IdentityProof { reason: String },
 
     #[snafu(display(
-        "Spice Cloud did not create the project ({status}, code={code}, retryable={retryable})"
+        "Spice Cloud did not attach the project ({status}, code={code}, retryable={retryable})"
     ))]
     Denied {
         status: u16,
@@ -65,18 +67,6 @@ pub(super) enum Error {
 }
 
 impl Error {
-    #[must_use]
-    pub(super) fn is_name_conflict(&self) -> bool {
-        matches!(
-            self,
-            Self::Denied {
-                status: 409,
-                code: ProjectErrorCode::ProjectNameConflict,
-                retryable: false,
-            }
-        )
-    }
-
     #[must_use]
     pub(super) fn is_already_attached(&self) -> bool {
         matches!(
@@ -108,12 +98,13 @@ impl Error {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProjectErrorCode {
-    InvalidProjectName,
+pub(crate) enum ProjectErrorCode {
+    InvalidProject,
     Unauthenticated,
     Forbidden,
     InstanceNotFound,
-    ProjectNameConflict,
+    ProjectAlreadyAttached,
+    ProjectNotStandalone,
     InstanceNotEnrolled,
     InstanceAlreadyAttached,
     RateLimited,
@@ -124,11 +115,14 @@ pub(super) enum ProjectErrorCode {
 impl ProjectErrorCode {
     fn parse(value: Option<&str>) -> Self {
         match value {
-            Some("invalid_project_name") => Self::InvalidProjectName,
+            Some("invalid_project" | "invalid_project_id") => Self::InvalidProject,
             Some("unauthenticated") => Self::Unauthenticated,
             Some("forbidden") => Self::Forbidden,
             Some("instance_not_found") => Self::InstanceNotFound,
-            Some("project_name_conflict") => Self::ProjectNameConflict,
+            Some("project_already_attached") => Self::ProjectAlreadyAttached,
+            Some("project_not_standalone" | "project_kind_not_standalone") => {
+                Self::ProjectNotStandalone
+            }
             Some("instance_not_enrolled") => Self::InstanceNotEnrolled,
             Some("instance_already_attached") => Self::InstanceAlreadyAttached,
             Some("rate_limited") => Self::RateLimited,
@@ -141,11 +135,12 @@ impl ProjectErrorCode {
 impl std::fmt::Display for ProjectErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::InvalidProjectName => "invalid_project_name",
+            Self::InvalidProject => "invalid_project",
             Self::Unauthenticated => "unauthenticated",
             Self::Forbidden => "forbidden",
             Self::InstanceNotFound => "instance_not_found",
-            Self::ProjectNameConflict => "project_name_conflict",
+            Self::ProjectAlreadyAttached => "project_already_attached",
+            Self::ProjectNotStandalone => "project_not_standalone",
             Self::InstanceNotEnrolled => "instance_not_enrolled",
             Self::InstanceAlreadyAttached => "instance_already_attached",
             Self::RateLimited => "rate_limited",
@@ -164,9 +159,10 @@ pub(super) struct ProjectAttachment {
     pub monitor_url: String,
 }
 
-pub(super) struct ProjectClient {
+pub(crate) struct ProjectClient {
     http: reqwest::Client,
-    url: String,
+    attach_url: String,
+    attachable_projects_url: String,
 }
 
 impl std::fmt::Debug for ProjectClient {
@@ -176,7 +172,7 @@ impl std::fmt::Debug for ProjectClient {
 }
 
 impl ProjectClient {
-    pub(super) fn new(endpoint: &str) -> std::result::Result<Self, Error> {
+    pub(crate) fn new(endpoint: &str) -> std::result::Result<Self, Error> {
         Self::build(endpoint, true)
     }
 
@@ -203,11 +199,15 @@ impl ProjectClient {
             .map_err(|source| Error::Transport { source })?;
         Ok(Self {
             http,
-            url: format!("{}{PROJECT_PATH}", endpoint.trim_end_matches('/')),
+            attach_url: format!("{}{ATTACH_PATH}", endpoint.trim_end_matches('/')),
+            attachable_projects_url: format!(
+                "{}{ATTACHABLE_PROJECTS_PATH}",
+                endpoint.trim_end_matches('/')
+            ),
         })
     }
 
-    pub(super) async fn create(
+    pub(super) async fn attach(
         &self,
         token: &SessionToken,
         organization: &str,
@@ -215,7 +215,7 @@ impl ProjectClient {
     ) -> std::result::Result<ProjectAttachment, Error> {
         let response = self
             .http
-            .post(&self.url)
+            .post(&self.attach_url)
             .bearer_auth(token.expose_secret())
             .header("X-Org-Name", organization)
             .json(mutation)
@@ -230,6 +230,11 @@ impl ProjectClient {
         }
         let body = bounded_body(response).await?;
 
+        if status == StatusCode::NOT_FOUND && serde_json::from_slice::<ErrorWire>(&body).is_err() {
+            return Err(Error::InvalidResponse {
+                reason: "the Cloud endpoint does not provide /v1/cloud-connect/attach; update the endpoint before linking",
+            });
+        }
         if !matches!(status, StatusCode::OK | StatusCode::CREATED) {
             return Err(parse_denial(status, &body)?);
         }
@@ -239,8 +244,12 @@ impl ProjectClient {
                 reason: "response was not the documented JSON object",
             }
         })?;
-        let monitor_url =
-            validate_response(&result, organization, &mutation.instance_id, &mutation.name)?;
+        let monitor_url = validate_response(
+            &result,
+            organization,
+            &mutation.instance_id,
+            mutation.project_id,
+        )?;
 
         Ok(ProjectAttachment {
             instance_id: result.instance_id,
@@ -250,6 +259,102 @@ impl ProjectClient {
             monitor_url,
         })
     }
+
+    pub(crate) async fn list_attachable(
+        &self,
+        token: &SessionToken,
+    ) -> std::result::Result<Vec<AttachableProject>, Error> {
+        let mut projects = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        for _ in 0..MAX_ATTACHABLE_PROJECT_PAGES {
+            let mut url = reqwest::Url::parse(&self.attachable_projects_url).map_err(|_| {
+                Error::InvalidResponse {
+                    reason: "the attachable-projects endpoint was not an absolute URL",
+                }
+            })?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", "100");
+                if let Some(cursor) = cursor.as_deref() {
+                    query.append_pair("cursor", cursor);
+                }
+            }
+            let response = self
+                .http
+                .get(url)
+                .bearer_auth(token.expose_secret())
+                .send()
+                .await
+                .map_err(|source| Error::Transport { source })?;
+            let status = response.status();
+            if status.is_redirection() {
+                return Err(Error::InvalidResponse {
+                    reason: "redirect responses are not allowed",
+                });
+            }
+            let body = bounded_body(response).await?;
+            if status == StatusCode::NOT_FOUND
+                && serde_json::from_slice::<ErrorWire>(&body).is_err()
+            {
+                return Err(Error::InvalidResponse {
+                    reason: "the Cloud endpoint does not provide /v1/cloud-connect/attachable-projects; update the endpoint before linking",
+                });
+            }
+            if !status.is_success() {
+                return Err(parse_denial(status, &body)?);
+            }
+            let page = serde_json::from_slice::<AttachableProjectsPage>(&body).map_err(|_| {
+                Error::InvalidResponse {
+                    reason: "attachable-projects response was not the documented JSON object",
+                }
+            })?;
+            validate_attachable_projects(&page.projects)?;
+            projects.extend(page.projects);
+            let Some(next_cursor) = page.next_cursor.filter(|cursor| !cursor.is_empty()) else {
+                return Ok(projects);
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(Error::InvalidResponse {
+                    reason: "attachable-projects response repeated a pagination cursor",
+                });
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(Error::InvalidResponse {
+            reason: "attachable-projects response exceeded the pagination limit",
+        })
+    }
+}
+
+fn validate_attachable_projects(projects: &[AttachableProject]) -> std::result::Result<(), Error> {
+    for project in projects {
+        if project.id <= 0 || project.name.is_empty() || project.org.is_empty() {
+            return Err(Error::InvalidResponse {
+                reason: "attachable-projects response contained incomplete project metadata",
+            });
+        }
+        let project_text_is_unsafe = project
+            .name
+            .chars()
+            .chain(project.org.chars())
+            .chain(project.region.as_deref().unwrap_or_default().chars())
+            .any(char::is_control);
+        let instance_text_is_unsafe = project.instances.iter().any(|instance| {
+            instance
+                .id
+                .chars()
+                .chain(instance.location.as_deref().unwrap_or_default().chars())
+                .chain(instance.enrolled_at.as_deref().unwrap_or_default().chars())
+                .any(char::is_control)
+        });
+        if project_text_is_unsafe || instance_text_is_unsafe {
+            return Err(Error::InvalidResponse {
+                reason: "attachable-projects response contained control characters",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_denial(status: StatusCode, body: &[u8]) -> std::result::Result<Error, Error> {
@@ -261,7 +366,7 @@ fn parse_denial(status: StatusCode, body: &[u8]) -> std::result::Result<Error, E
         (status, code),
         (
             StatusCode::BAD_REQUEST,
-            ProjectErrorCode::InvalidProjectName
+            ProjectErrorCode::InvalidProject | ProjectErrorCode::ProjectNotStandalone
         ) | (StatusCode::UNAUTHORIZED, ProjectErrorCode::Unauthenticated)
             | (StatusCode::FORBIDDEN, ProjectErrorCode::Forbidden)
             | (
@@ -270,7 +375,8 @@ fn parse_denial(status: StatusCode, body: &[u8]) -> std::result::Result<Error, E
             )
             | (
                 StatusCode::CONFLICT,
-                ProjectErrorCode::ProjectNameConflict | ProjectErrorCode::InstanceAlreadyAttached
+                ProjectErrorCode::ProjectAlreadyAttached
+                    | ProjectErrorCode::InstanceAlreadyAttached
             )
             | (StatusCode::TOO_MANY_REQUESTS, ProjectErrorCode::RateLimited)
             | (
@@ -316,7 +422,7 @@ fn validate_response(
     response: &ProjectResponse,
     expected_org: &str,
     expected_instance: &str,
-    expected_name: &str,
+    expected_project_id: i64,
 ) -> std::result::Result<String, Error> {
     if response.instance_id != expected_instance {
         return Err(Error::InvalidResponse {
@@ -332,9 +438,9 @@ fn validate_response(
             reason: "organization did not match the request",
         });
     }
-    if response.project.name != expected_name {
+    if response.project.id != expected_project_id {
         return Err(Error::InvalidResponse {
-            reason: "project name did not match the request",
+            reason: "project id did not match the request",
         });
     }
     if response.project.id <= 0 {
@@ -366,7 +472,9 @@ fn validate_response(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ProjectMutation {
     pub(super) instance_id: String,
-    pub(super) name: String,
+    pub(super) project_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) location: Option<String>,
     pub(super) cert_pem: String,
     pub(super) pop_sig: String,
 }
@@ -375,11 +483,12 @@ impl ProjectMutation {
     pub(super) fn signed(
         identity: &Identity,
         organization: &str,
-        name: &str,
+        project_id: i64,
+        location: Option<&str>,
     ) -> std::result::Result<Self, Error> {
         let proof_payload = format!(
-            "spice-cloud-connect/project/v1\n{organization}\n{}\n{name}",
-            identity.identifier
+            "spice-cloud-connect/attach/v1\n{organization}\n{}\n{project_id}",
+            identity.identifier,
         );
         let pop_sig = runtime_cloud_connect::sign_identity_proof(
             &identity.private_key_pem,
@@ -388,11 +497,39 @@ impl ProjectMutation {
         .map_err(|reason| Error::IdentityProof { reason })?;
         Ok(Self {
             instance_id: identity.identifier.clone(),
-            name: name.to_string(),
+            project_id,
+            location: location.map(ToString::to_string),
             cert_pem: identity.identity_cert_pem.clone(),
             pop_sig,
         })
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct AttachableProject {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) org: String,
+    #[serde(default)]
+    pub(crate) region: Option<String>,
+    #[serde(default)]
+    pub(crate) instances: Vec<AttachableInstance>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct AttachableInstance {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) location: Option<String>,
+    #[serde(default)]
+    pub(crate) enrolled_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttachableProjectsPage {
+    projects: Vec<AttachableProject>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -420,7 +557,7 @@ struct ErrorWire {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TOKEN: &str = "login-secret-that-must-not-leak";
@@ -453,7 +590,7 @@ mod tests {
     }
 
     fn test_mutation(identity: &Identity) -> ProjectMutation {
-        ProjectMutation::signed(identity, "acme", "retail-analytics")
+        ProjectMutation::signed(identity, "acme", 314, Some("us-east-1"))
             .expect("sign project mutation")
     }
 
@@ -467,10 +604,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_create_sends_the_exact_atomic_project_contract() {
+    async fn attach_sends_the_exact_atomic_project_contract() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(PROJECT_PATH))
+            .and(path(ATTACH_PATH))
             .and(header("Authorization", format!("Bearer {TOKEN}")))
             .and(header("X-Org-Name", "acme"))
             .respond_with(ResponseTemplate::new(201).set_body_json(success_body()))
@@ -482,9 +619,9 @@ mod tests {
         let mutation = test_mutation(&identity);
         let result = ProjectClient::new_allowing_http_for_test(&server.uri())
             .expect("client")
-            .create(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
             .await
-            .expect("project created");
+            .expect("project attached");
         assert_eq!(result.project_id, 314);
         assert_eq!(result.project_name, "retail-analytics");
         let requests = server
@@ -494,7 +631,9 @@ mod tests {
         let request: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("parse project request body");
         assert_eq!(request["instance_id"], "inst_8fa21c");
-        assert_eq!(request["name"], "retail-analytics");
+        assert_eq!(request["project_id"], 314);
+        assert_eq!(request["location"], "us-east-1");
+        assert!(request.get("name").is_none());
         assert_eq!(request["cert_pem"], identity.identity_cert_pem);
         assert!(
             request["pop_sig"]
@@ -505,10 +644,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_replay_accepts_the_same_project_with_status_200() {
+    async fn exact_replay_accepts_the_same_attachment_with_status_200() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(PROJECT_PATH))
+            .and(path(ATTACH_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(success_body()))
             .expect(2)
             .mount(&server)
@@ -520,18 +659,18 @@ mod tests {
 
         for _ in 0..2 {
             client
-                .create(&token, "acme", &mutation)
+                .attach(&token, "acme", &mutation)
                 .await
                 .expect("exact replay succeeds");
         }
     }
 
     #[tokio::test]
-    async fn project_conflicts_are_typed_and_server_detail_is_redacted() {
+    async fn attachment_conflicts_are_typed_and_server_detail_is_redacted() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "code": "project_name_conflict",
+                "code": "project_already_attached",
                 "error": format!("{TOKEN} acme retail-analytics https://private.example"),
                 "retryable": false
             })))
@@ -541,11 +680,18 @@ mod tests {
         let mutation = test_mutation(&identity);
         let err = ProjectClient::new_allowing_http_for_test(&server.uri())
             .expect("client")
-            .create(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
             .await
             .expect_err("conflict");
 
-        assert!(err.is_name_conflict());
+        assert!(matches!(
+            err,
+            Error::Denied {
+                code: ProjectErrorCode::ProjectAlreadyAttached,
+                retryable: false,
+                ..
+            }
+        ));
         let rendered = format!("{err:?} {err}");
         for secret in [TOKEN, "acme", "retail-analytics", "private.example"] {
             assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
@@ -565,7 +711,7 @@ mod tests {
         let mutation = test_mutation(&identity);
         let err = ProjectClient::new_allowing_http_for_test(&server.uri())
             .expect("client")
-            .create(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
             .await
             .expect_err("mismatch must fail closed");
         assert!(matches!(err, Error::InvalidResponse { .. }));
@@ -585,7 +731,7 @@ mod tests {
         let mutation = test_mutation(&identity);
         let err = ProjectClient::new_allowing_http_for_test(&server.uri())
             .expect("client")
-            .create(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
             .await
             .expect_err("plaintext remote monitor URL must fail closed");
         assert!(matches!(err, Error::InvalidResponse { .. }));
@@ -602,7 +748,7 @@ mod tests {
             .mount(&target)
             .await;
         Mock::given(method("POST"))
-            .and(path(PROJECT_PATH))
+            .and(path(ATTACH_PATH))
             .respond_with(
                 ResponseTemplate::new(307)
                     .insert_header("Location", format!("{}/stolen", target.uri())),
@@ -615,18 +761,134 @@ mod tests {
         let mutation = test_mutation(&identity);
         let err = ProjectClient::new_allowing_http_for_test(&source.uri())
             .expect("client")
-            .create(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
             .await
             .expect_err("redirect must fail closed");
         assert!(matches!(err, Error::InvalidResponse { .. }), "{err}");
         target.verify().await;
     }
 
+    #[tokio::test]
+    async fn attachable_projects_are_paginated_without_client_side_filtering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ATTACHABLE_PROJECTS_PATH))
+            .and(query_param("limit", "100"))
+            .and(query_param_is_missing("cursor"))
+            .and(header("Authorization", format!("Bearer {TOKEN}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "id": 11,
+                    "name": "attached-project",
+                    "org": "acme",
+                    "region": "us-east-1",
+                    "instances": [{
+                        "id": "inst_other",
+                        "location": "iad",
+                        "enrolled_at": "2026-08-20T00:00:00Z"
+                    }]
+                }],
+                "next_cursor": "page-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(ATTACHABLE_PROJECTS_PATH))
+            .and(query_param("limit", "100"))
+            .and(query_param("cursor", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [{
+                    "id": 12,
+                    "name": "standalone-project",
+                    "org": "globex",
+                    "instances": []
+                }],
+                "next_cursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let projects = ProjectClient::new_allowing_http_for_test(&server.uri())
+            .expect("client")
+            .list_attachable(&SessionToken::new(TOKEN.to_string()))
+            .await
+            .expect("list every server-returned project");
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "attached-project");
+        assert_eq!(projects[0].instances[0].id, "inst_other");
+        assert_eq!(projects[1].org, "globex");
+    }
+
+    #[tokio::test]
+    async fn repeated_pagination_cursor_is_rejected_without_looping() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ATTACHABLE_PROJECTS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "projects": [],
+                "next_cursor": "same-page"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let error = ProjectClient::new_allowing_http_for_test(&server.uri())
+            .expect("client")
+            .list_attachable(&SessionToken::new(TOKEN.to_string()))
+            .await
+            .expect_err("a repeated cursor must not loop forever");
+
+        assert!(matches!(error, Error::InvalidResponse { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn missing_attachable_projects_route_is_actionable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ATTACHABLE_PROJECTS_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = ProjectClient::new_allowing_http_for_test(&server.uri())
+            .expect("client")
+            .list_attachable(&SessionToken::new(TOKEN.to_string()))
+            .await
+            .expect_err("an old endpoint must not masquerade as an empty project list");
+
+        assert!(err.to_string().contains("update the endpoint"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn missing_attach_route_is_actionable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(ATTACH_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let identity = test_identity();
+        let mutation = test_mutation(&identity);
+
+        let err = ProjectClient::new_allowing_http_for_test(&server.uri())
+            .expect("client")
+            .attach(&SessionToken::new(TOKEN.to_string()), "acme", &mutation)
+            .await
+            .expect_err("an old endpoint must not look like a malformed documented denial");
+
+        let message = err.to_string();
+        assert!(message.contains(ATTACH_PATH), "{message}");
+        assert!(message.contains("update the endpoint"), "{message}");
+    }
+
     #[test]
     fn only_authoritative_denials_are_safe_to_report_as_unattached() {
         let denied = Error::Denied {
             status: 409,
-            code: ProjectErrorCode::ProjectNameConflict,
+            code: ProjectErrorCode::ProjectAlreadyAttached,
             retryable: false,
         };
         assert!(!denied.is_attachment_ambiguous());

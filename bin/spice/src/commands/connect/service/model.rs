@@ -16,11 +16,10 @@ limitations under the License.
 
 //! The normalized service vocabulary.
 //!
-//! One state vocabulary is shared by every backend and by both status
-//! commands, so `spice connect status` and `spice connect service status`
-//! cannot drift: the backends translate their supervisor's words into these
-//! types once, and everything above them — human rendering, JSON, exit
-//! codes — reads only these types.
+//! One state vocabulary is shared by every backend and `spice cloud status`:
+//! the backends translate their supervisor's words into these types once, and
+//! everything above them — human rendering, JSON, exit codes — reads only
+//! these types.
 //!
 //! The per-supervisor translation tables live with the back ends that own
 //! those words (`normalize_systemd_state`, `normalize_launchd_state`), so a
@@ -187,8 +186,9 @@ impl fmt::Display for ServiceStarts {
 ///
 /// Modelled rather than flattened to a string because the two supervisors
 /// answer differently in kind: systemd owns the journal and is queried by
-/// unit, while launchd writes to files the definition names. `spice connect
-/// service logs` needs to know which of those it is looking at.
+/// unit, while launchd writes to files the definition names. The local
+/// fallback for `spice cloud logs` needs to know which of those it is looking
+/// at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum LogSource {
@@ -219,11 +219,9 @@ impl LogSource {
 
 /// The service half of [`super::super::status::ConnectStatus`].
 ///
-/// `spice connect service status` renders this exact value, and
-/// `spice connect status` embeds this exact value, so the two commands cannot
-/// publish different field names, orders, or enum spellings. Field order here
-/// *is* the JSON field order — keep additions at the end so a golden fixture
-/// diff stays readable.
+/// `spice cloud status` embeds this exact value. Field order here *is* the JSON
+/// field order — keep additions at the end so a golden fixture diff stays
+/// readable.
 ///
 /// This is a public automation surface, versioned by
 /// [`super::super::status::STATUS_SCHEMA_VERSION`]: adding a field is
