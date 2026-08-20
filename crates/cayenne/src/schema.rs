@@ -326,10 +326,10 @@ mod tests {
     use arrow_tools::type_rewrite::apply_rules;
     use datafusion_table_providers::UnsupportedTypeAction;
 
-    use super::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
+    use super::{CAYENNE_CREATION_REWRITE_RULES, transform_schema_for_vortex};
 
     #[test]
-    fn published_rewrite_rules_match_vortex_for_all_supported_type_families() {
+    fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
         let list_item = Arc::new(Field::new(
             "item",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -427,11 +427,11 @@ mod tests {
 
         let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect("supported types should transform for Vortex");
-        let published_rules = apply_rules(&schema, CAYENNE_TYPE_REWRITE_RULES);
+        let creation_rules = apply_rules(&schema, CAYENNE_CREATION_REWRITE_RULES);
 
         assert_eq!(
-            published_rules, transformed,
-            "runtime callers must normalize every supported Cayenne type exactly as table creation does"
+            creation_rules, transformed,
+            "creation rewrite rules must normalize every supported Cayenne type exactly as table creation does"
         );
     }
 
