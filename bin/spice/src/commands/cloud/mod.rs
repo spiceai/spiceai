@@ -2807,7 +2807,7 @@ async fn choose_attachable_project(
         return Err(Error::cloud_with_hint(
             CloudErrorCode::ProjectNotFound,
             "Spice Cloud returned no projects that can be attached.",
-            "Create a standalone project in Spice Cloud, then retry `spice cloud link`.",
+            "Create a project in Spice Cloud, then retry `spice cloud link`.",
         ));
     }
     let items: Vec<String> = projects
