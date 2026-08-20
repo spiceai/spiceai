@@ -325,6 +325,62 @@ fn resolve_maintenance_fan_out(override_value: Option<&str>, budget: usize) -> M
     resolved
 }
 
+/// Encode shards a MAINTENANCE write is pinned to, when pinned at all.
+///
+/// `snapshot_shard_count` sizes the encode fan-out from the write's bytes and
+/// caps it at `cayenne_write_concurrency` (unset default 4, and an adaptive
+/// actuator that can raise it). Microbenchmarks on the real CH-benCHmark table
+/// shapes say that fan-out is a pessimization for a compaction output at every
+/// size measured: on a 1.63 GiB `stock` pass — six target files' worth, where a
+/// size-derived policy would ask for six shards — one shard takes 162 ms against
+/// 389 ms at four and 1.9 s at sixteen. Sixteen is inside the core count on the
+/// measuring host, so oversubscription does not explain it.
+///
+/// This exists to test that in CI against the metrics that matter (freshness,
+/// convergence, QPH) rather than to assert it: unset leaves the sized behaviour
+/// exactly as it is, so one binary serves both arms of the comparison. It pins
+/// only `Maintenance` writes — `Delta` writes are the latency-bound CDC encode,
+/// and serializing those would trade ingest for compaction, which is the wrong
+/// direction.
+static MAINTENANCE_ENCODE_SHARDS: LazyLock<Option<usize>> = LazyLock::new(|| {
+    resolve_maintenance_encode_shards(
+        std::env::var("SPICE_CAYENNE_MAINTENANCE_ENCODE_SHARDS")
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Pure resolution behind [`MAINTENANCE_ENCODE_SHARDS`], separated so the
+/// parsing is testable without mutating the process environment (which is
+/// `unsafe` in edition 2024 and racy across parallel tests).
+///
+/// Anything unusable leaves the sized behaviour in place rather than pinning to a
+/// guess: an experiment knob must not be able to change the shipped policy by
+/// being mistyped.
+fn resolve_maintenance_encode_shards(override_value: Option<&str>) -> Option<usize> {
+    let raw = override_value?;
+    match raw.trim().parse::<usize>() {
+        Ok(shards) if shards > 0 => {
+            tracing::info!(
+                "Cayenne is pinning every compaction and bake encode to {shards} shard(s), from `SPICE_CAYENNE_MAINTENANCE_ENCODE_SHARDS`; CDC delta encodes keep their sized fan-out."
+            );
+            Some(shards)
+        }
+        _ => {
+            tracing::warn!(
+                "Ignoring `SPICE_CAYENNE_MAINTENANCE_ENCODE_SHARDS={raw}`: expected a whole number above zero, so maintenance encodes keep their size-derived fan-out."
+            );
+            None
+        }
+    }
+}
+
+/// Shards a maintenance write should use, or `None` to size it from its bytes.
+#[must_use]
+pub(crate) fn maintenance_encode_shards() -> Option<usize> {
+    *MAINTENANCE_ENCODE_SHARDS
+}
+
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.
 /// Existing pass guards remain counted and can be drained via
 /// [`drain_compaction_tasks`].
@@ -1489,6 +1545,24 @@ mod tests {
             Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         assert!(BackgroundCompactor::spawn(weak, Duration::ZERO, semaphore).is_none());
+    }
+
+    #[test]
+    fn maintenance_encode_pin_is_opt_in() {
+        assert_eq!(resolve_maintenance_encode_shards(None), None);
+        assert_eq!(resolve_maintenance_encode_shards(Some("1")), Some(1));
+        assert_eq!(resolve_maintenance_encode_shards(Some(" 4 ")), Some(4));
+    }
+
+    #[test]
+    fn an_unusable_maintenance_pin_leaves_the_sized_policy_alone() {
+        for raw in ["0", "-1", "", "auto", "serial"] {
+            assert_eq!(
+                resolve_maintenance_encode_shards(Some(raw)),
+                None,
+                "pin {raw:?} must not change the shipped policy"
+            );
+        }
     }
 
     #[test]

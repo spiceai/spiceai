@@ -5879,7 +5879,7 @@ impl CayenneTableProvider {
                 staging_snapshot_id,
                 target_partitions,
                 None,
-                super::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
         Ok(row_count)
@@ -6981,7 +6981,7 @@ impl CayenneTableProvider {
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
         let shard_count =
-            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
+            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes, write_class);
         // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
         // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
         // Acquire permits for that clamped count so a `cayenne_write_concurrency`
@@ -7044,9 +7044,19 @@ impl CayenneTableProvider {
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
-                self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
+                self.write_shard_config(
+                    target_partitions,
+                    target_size_bytes,
+                    estimated_bytes,
+                    write_class,
+                ),
             ),
-            None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+            None => self.write_shard_format(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                write_class,
+            ),
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -7330,7 +7340,7 @@ impl CayenneTableProvider {
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        crate::provider::delta_encoding::WriteClass::Delta,
                     )
                     .await
             }));
@@ -7435,7 +7445,18 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
     ) -> usize {
+        // An experiment pin, honoured only for maintenance writes — see
+        // `compaction::maintenance_encode_shards`. Checked before the sort-column
+        // and volume branches so the arm under test is unambiguous in the
+        // write-shape counter.
+        if matches!(write_class, super::delta_encoding::WriteClass::Maintenance) {
+            if let Some(shards) = super::compaction::maintenance_encode_shards() {
+                self.record_write_shape("maintenance_pinned", shards);
+                return shards;
+            }
+        }
         // A sorted write must go through ONE writer, or the global order is
         // scattered across shard files and each file's zone maps span the whole
         // range — forfeiting exactly the pruning the sort was for.
@@ -7508,12 +7529,14 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
         match self.write_shard_config(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            write_class,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
@@ -7535,11 +7558,13 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            write_class,
         );
         if shard_count <= 1 {
             return None;
@@ -17360,7 +17385,12 @@ impl CayenneTableProvider {
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
-        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let shard = self.write_shard_config(
+            1,
+            target_size_bytes,
+            None,
+            super::delta_encoding::WriteClass::Maintenance,
+        );
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -25233,7 +25263,7 @@ impl CayenneTableProvider {
                     &self.get_current_snapshot_id(),
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
-                    super::delta_encoding::WriteClass::Delta,
+                    crate::provider::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
             // Clear under the publish locks (inner to the held fence), uniform
@@ -25278,7 +25308,7 @@ impl CayenneTableProvider {
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        crate::provider::delta_encoding::WriteClass::Delta,
                     )
                     .await?;
                 (files, stats)
@@ -26208,7 +26238,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
 
@@ -26391,7 +26421,7 @@ impl CayenneTableProvider {
                         &self.get_current_snapshot_id(),
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        crate::provider::delta_encoding::WriteClass::Delta,
                     )
                     .await?;
                 stats
@@ -38545,8 +38575,8 @@ mod tests {
         // requested writer count for parallel encode (no key clustering).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
+        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -38577,20 +38607,20 @@ mod tests {
         // count is capped at `snapshot_write_concurrency` = DEFAULT_WRITE_CONCURRENCY
         // (4) clamped to session_target_partitions (8) ⇒ 4.
         // A small exact delta (< one unit) stays a single file.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib)), 1);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib), crate::provider::delta_encoding::WriteClass::Delta), 1);
         // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16
         // unit-shards, capped to the write-concurrency ceiling (4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib)), 4);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib), crate::provider::delta_encoding::WriteClass::Delta), 4);
         // Mid-size flush: 48 MiB / 16 MiB = 3 shards (under the cap ⇒ unit-driven).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib)), 3);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib), crate::provider::delta_encoding::WriteClass::Delta), 3);
         // A tiny configured target (≤ 16 MiB) keeps the old whole-file unit.
         let small_tsb = 8 * 1024 * 1024usize;
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib), crate::provider::delta_encoding::WriteClass::Delta),
             1
         );
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), crate::provider::delta_encoding::WriteClass::Delta),
             2
         );
     }
@@ -38615,8 +38645,8 @@ mod tests {
         // output file is PK-clustered (tight per-file zone maps).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
+        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
@@ -38647,7 +38677,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38676,7 +38706,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38712,10 +38742,10 @@ mod tests {
         // target-partition count. `estimated_bytes = None` ⇒ full fan-out, so
         // the override (2) is honored unclamped by size.
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 2);
+        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 2);
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None)
+                .write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta)
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
@@ -38740,10 +38770,10 @@ mod tests {
         // regardless of the size estimate, so pass a large `estimated_bytes`.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
-        assert_eq!(provider.snapshot_shard_count(4, tsb, huge), 1);
+        assert_eq!(provider.snapshot_shard_count(4, tsb, huge, crate::provider::delta_encoding::WriteClass::Delta), 1);
         assert!(
             provider
-                .write_shard_format(4, tsb, huge)
+                .write_shard_format(4, tsb, huge, crate::provider::delta_encoding::WriteClass::Delta)
                 .write_shard()
                 .is_none(),
             "sorted writes fall back to the unsharded base format"
@@ -38770,13 +38800,13 @@ mod tests {
         // A few KiB — far below one 256 MiB target file.
         let small = Some(4 * 1024);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, small),
+            provider.snapshot_shard_count(4, tsb, small, crate::provider::delta_encoding::WriteClass::Delta),
             1,
             "a sub-target-file write must stay a single shard"
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small)
+                .write_shard_format(4, tsb, small, crate::provider::delta_encoding::WriteClass::Delta)
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -38802,11 +38832,11 @@ mod tests {
         // clamp to 4.
         let large = Some(tsb as u64 * 100);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, large),
+            provider.snapshot_shard_count(4, tsb, large, crate::provider::delta_encoding::WriteClass::Delta),
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large);
+        let format = provider.write_shard_format(4, tsb, large, crate::provider::delta_encoding::WriteClass::Delta);
         assert_eq!(
             format
                 .write_shard()
@@ -38839,19 +38869,19 @@ mod tests {
         let unit = (target / 16).clamp((16 * 1024 * 1024u64).min(target), target);
 
         // < 1 unit ⇒ 1 shard (need to *fill* a unit to earn a second).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1)), 1);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1), crate::provider::delta_encoding::WriteClass::Delta), 1);
         // Exactly 1 unit ⇒ 1 shard.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit)), 1);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit), crate::provider::delta_encoding::WriteClass::Delta), 1);
         // 3 units' worth ⇒ 3 shards (below the concurrency cap of 4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3)), 3);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3), crate::provider::delta_encoding::WriteClass::Delta), 3);
         // 3.9 units' worth still floors to 3 shards.
         assert_eq!(
-            provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10)),
+            provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10), crate::provider::delta_encoding::WriteClass::Delta),
             3
         );
         // 12 units' worth, but with no per-table override the default
         // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 4);
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12), crate::provider::delta_encoding::WriteClass::Delta), 4);
     }
 
     #[tokio::test]
@@ -38873,10 +38903,10 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(6, tsb, None), 4);
+        assert_eq!(provider.snapshot_shard_count(6, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None)
+                .write_shard_format(6, tsb, None, crate::provider::delta_encoding::WriteClass::Delta)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
