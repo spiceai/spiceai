@@ -62,8 +62,11 @@ fn collect_mapping_fields(
 
         // Recurse into nested objects, mirroring `collect_fields`; a `nested` object is treated
         // as an opaque JSON string by `mapping_to_schema` and is not filterable here either.
+        // `enabled: false` means Elasticsearch never parses or indexes this subtree at all, even
+        // though its children still appear under `properties` — skip it entirely rather than
+        // registering fields a filter can never actually match.
         if let Some(sub_props) = &mapping.properties {
-            if mapping.field_type.as_deref() != Some("nested") {
+            if mapping.enabled != Some(false) && mapping.field_type.as_deref() != Some("nested") {
                 collect_mapping_fields(sub_props, &full_name, fields);
             }
             continue;
@@ -365,6 +368,34 @@ mod tests {
             classify_filter(&filter_schema, &col("unsorted").eq(lit(5_i64))),
             TableProviderFilterPushDown::Inexact
         );
+    }
+
+    #[test]
+    fn disabled_object_subtree_is_excluded_from_filter_schema() {
+        // `enabled: false` means Elasticsearch never parses or indexes this subtree at all, even
+        // though its children still appear under `properties` and remain retrievable via
+        // `_source` — a filter against them must not be classified as pushable.
+        let mut sub_props = HashMap::new();
+        sub_props.insert(
+            "internal_id".to_string(),
+            FieldMapping {
+                field_type: Some("keyword".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut properties = HashMap::new();
+        properties.insert(
+            "metadata".to_string(),
+            FieldMapping {
+                properties: Some(sub_props),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let filter_schema = mapping_to_filter_schema(&properties);
+        assert!(filter_schema.is_empty());
+        assert!(filter_schema.get("metadata.internal_id").is_none());
     }
 
     #[test]

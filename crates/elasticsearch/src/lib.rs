@@ -124,6 +124,11 @@ pub struct FieldMapping {
     /// pushdown against this field unsafe — see `EsFieldType::supports_range`.
     #[serde(default)]
     pub normalizer: Option<String>,
+    /// Elasticsearch `enabled` on an `object`-typed field. Defaults to `true`; `Some(false)`
+    /// means Elasticsearch never parses or indexes this subtree at all — its children still
+    /// appear under `properties` but are not searchable, even though they remain in `_source`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// A search request body sent to `POST /<index>/_search`.
