@@ -60,6 +60,14 @@ limitations under the License.
 //! never silently time a no-op.
 
 #![allow(clippy::expect_used)]
+// Deterministic data generation converts freely between row indices and column
+// types; the widths are fixed and small, so the cast lints add noise here.
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    dead_code
+)]
 
 use std::path::Path;
 use std::sync::Arc;
