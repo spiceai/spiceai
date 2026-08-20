@@ -31,6 +31,7 @@ use datafusion::{
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableType, dml::InsertOp},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, metrics::MetricsSet,
         stream::RecordBatchStreamAdapter,
@@ -234,7 +235,20 @@ impl UpsertDedupExec {
         constraints: Constraints,
         upsert_options: UpsertOptions,
     ) -> Self {
-        let properties = Arc::clone(input.properties());
+        // Deduplication runs the batch through a DataFusion frame (`distinct`,
+        // then a window function for last-write-wins), so any ordering the input
+        // guaranteed no longer holds on the output. Carrying the input's
+        // equivalence properties across would let an optimizer treat this node
+        // as still sorted and drop a sort the plan actually needs. Partitioning,
+        // emission and boundedness are unchanged, so only the ordering is
+        // dropped.
+        let input_properties = input.properties();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(input.schema()),
+            input_properties.partitioning.clone(),
+            input_properties.emission_type,
+            input_properties.boundedness,
+        ));
         Self {
             input,
             constraints,
@@ -831,6 +845,44 @@ mod tests {
             .expect("rebuild with one child");
 
         assert_eq!(rows_of(rebuilt).await, vec![(1, "second".to_string())]);
+    }
+
+    /// The node reorders its input, so it must not advertise the input's
+    /// ordering. Carrying it across would let an optimizer conclude the output
+    /// is already sorted and drop a sort the plan needs — the sort would vanish
+    /// and the rows would come back in whatever order the deduplication frame
+    /// produced.
+    #[test]
+    fn the_dedup_node_does_not_inherit_its_input_ordering() {
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::expressions::col as physical_col;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let input = source(&[vec![batch(&[(2, "b"), (1, "a")])]]);
+        let input_schema = input.schema();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+            physical_col("id", &input_schema).expect("id column"),
+        )])
+        .expect("non-empty ordering");
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
+        assert!(
+            sorted.properties().output_ordering().is_some(),
+            "the input really is ordered, otherwise this test proves nothing"
+        );
+
+        let dedup = UpsertDedupExec::new(Arc::clone(&sorted), pk_constraints(), last_write_wins());
+        assert!(
+            dedup.properties().output_ordering().is_none(),
+            "dedup must not claim the ordering it just destroyed"
+        );
+        // Compared by count, not by `==`: `Partitioning`'s `PartialEq` answers
+        // `false` for `UnknownPartitioning` even against itself, since "unknown"
+        // asserts nothing that could be proven equal.
+        assert_eq!(
+            dedup.properties().partitioning.partition_count(),
+            sorted.properties().partitioning.partition_count(),
+            "partitioning is unchanged and must be carried across"
+        );
     }
 
     #[test]

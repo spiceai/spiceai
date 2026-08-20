@@ -128,41 +128,40 @@ fn decode_base64_decimal(s: &str) -> Result<i128> {
 pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Result<i128> {
     let s = n.to_string();
 
-    if s.bytes().any(|b| b == b'e' || b == b'E') {
-        let f: f64 = s.parse().map_err(|_| Error::Invalid {
-            reason: format!("cannot parse '{s}' as decimal"),
-        })?;
-        let scale_factor = 10_i128
-            .checked_pow(u32::from(target_scale.cast_unsigned()))
-            .context(OverflowSnafu)?;
-        #[expect(clippy::cast_precision_loss)]
-        let scaled = (f * scale_factor as f64).round();
-        // `as i128` *saturates* on an out-of-range float, so an unchecked cast
-        // would silently store `i128::MAX` for a value the column cannot hold.
-        // The representable range is `[-2^127, 2^127)`; both bounds are exact
-        // in f64, so the comparison admits exactly the castable values.
-        let limit = 2.0_f64.powi(127);
-        ensure!(
-            scaled.is_finite() && scaled >= -limit && scaled < limit,
-            OverflowSnafu
-        );
-        #[expect(clippy::cast_possible_truncation)]
-        return Ok(scaled as i128);
-    }
+    // Split an optional exponent off the mantissa. Everything below is exact
+    // integer work: routing scientific notation through `f64` made the stored
+    // decimal depend on how the source spelled the number — `1e23` landed on
+    // the nearest binary float (`99999999999999991611392`) while `100000...0`
+    // parsed exactly, and `1.239e0` rounded to `124` where `1.239` truncates
+    // to `123`.
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(pos) => {
+            let (mantissa, rest) = s.split_at(pos);
+            let exponent: i32 = rest[1..].parse().map_err(|_| Error::Invalid {
+                reason: format!("cannot parse exponent of '{s}'"),
+            })?;
+            (mantissa, exponent)
+        }
+        None => (s.as_str(), 0),
+    };
 
-    let negative = s.starts_with('-');
-    let digits = if negative { &s[1..] } else { &s };
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa.strip_prefix(['-', '+']).unwrap_or(mantissa);
 
     let (int_str, frac_str) = match digits.find('.') {
         Some(pos) => (&digits[..pos], &digits[pos + 1..]),
         None => (digits, ""),
     };
 
-    let int_val: i128 = int_str.parse().map_err(|_| Error::Invalid {
-        reason: format!("cannot parse integer part '{int_str}'"),
-    })?;
+    let int_val: i128 = if int_str.is_empty() {
+        0
+    } else {
+        int_str.parse().map_err(|_| Error::Invalid {
+            reason: format!("cannot parse integer part '{int_str}'"),
+        })?
+    };
 
-    let frac_scale = i8::try_from(frac_str.len()).map_err(|_| Error::Invalid {
+    let frac_scale = i32::try_from(frac_str.len()).map_err(|_| Error::Invalid {
         reason: "fractional part too long".to_string(),
     })?;
 
@@ -174,13 +173,20 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
         })?
     };
 
-    let scaled_int = rescale_i128(int_val, 0, target_scale)?;
-    let scaled_frac = rescale_i128(frac_val, frac_scale, target_scale)?;
-    // Each half fits on its own, but their sum need not: at `target_scale` 38,
-    // `1.<38 nines>` scales to just under `2 * 10^38`, past `i128::MAX`. An
-    // unchecked add would wrap in release builds and store a sign-flipped value.
-    let result = scaled_int.checked_add(scaled_frac).context(OverflowSnafu)?;
+    // Fold the fraction into one unscaled integer at `frac_scale`, then let the
+    // exponent shift that scale: `m * 10^exp` at scale `f` is the same value as
+    // `m` at scale `f - exp`.
+    let pow = u32::try_from(frac_scale).map_err(|_| OverflowSnafu.build())?;
+    let unscaled = int_val
+        .checked_mul(10_i128.checked_pow(pow).context(OverflowSnafu)?)
+        .context(OverflowSnafu)?
+        .checked_add(frac_val)
+        .context(OverflowSnafu)?;
 
+    let effective_scale = frac_scale.checked_sub(exponent).context(OverflowSnafu)?;
+    let src_scale = i8::try_from(effective_scale).map_err(|_| OverflowSnafu.build())?;
+
+    let result = rescale_i128(unscaled, src_scale, target_scale)?;
     Ok(if negative { -result } else { result })
 }
 
@@ -385,6 +391,58 @@ mod tests {
         assert_eq!(
             parse_number_to_decimal(&number("-1.5e3"), 2).expect("in range"),
             -150_000
+        );
+    }
+
+    /// The stored decimal must not depend on how the source spelled the number.
+    /// Routing scientific notation through `f64` made `1e23` land on the nearest
+    /// binary float — `99999999999999991611392` — while the plain form parsed
+    /// exactly, and rounded `1.239e0` to `124` where `1.239` truncates to `123`.
+    #[test]
+    fn lexical_form_does_not_change_the_stored_decimal() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1e23"), 0).expect("1e23 at scale 0"),
+            100_000_000_000_000_000_000_000_i128,
+            "must be exact, not the nearest f64"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e23"), 0).expect("scientific"),
+            parse_number_to_decimal(&number("100000000000000000000000"), 0).expect("plain"),
+            "the two spellings of one value must agree"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.239e0"), 2).expect("scientific"),
+            parse_number_to_decimal(&number("1.239"), 2).expect("plain"),
+            "an exponent of zero must not change truncation"
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.239e0"), 2).expect("ok"),
+            123,
+            "truncates toward zero, never rounds"
+        );
+    }
+
+    #[test]
+    fn exponents_shift_the_scale_in_both_directions() {
+        assert_eq!(
+            parse_number_to_decimal(&number("1.5e3"), 2).expect("ok"),
+            150_000
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("-1.5e3"), 2).expect("ok"),
+            -150_000
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e-2"), 4).expect("ok"),
+            100
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1.25e-1"), 4).expect("ok"),
+            1_250
+        );
+        assert_eq!(
+            parse_number_to_decimal(&number("1e-2"), 4).expect("scientific"),
+            parse_number_to_decimal(&number("0.01"), 4).expect("plain")
         );
     }
 
