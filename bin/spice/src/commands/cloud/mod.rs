@@ -1868,6 +1868,52 @@ fn api_key_credential_key(org: Option<&str>) -> String {
     }
 }
 
+/// Build the credential writes for a user login.
+///
+/// User management tokens are membership-wide, so the default token and every
+/// verified organization receive a copy. A data-plane API key belongs to the
+/// organization returned with the authenticated user context; an explicit
+/// login for another member organization must not relabel that key or replace
+/// the default data-plane key.
+fn user_login_values<'a>(
+    token: &'a str,
+    api_key: Option<&'a str>,
+    token_org: Option<&str>,
+    store_org: Option<&str>,
+) -> Vec<(String, &'a str)> {
+    let mut credential_orgs = BTreeSet::new();
+    if let Some(org) = token_org {
+        credential_orgs.insert(org.to_string());
+    }
+    if let Some(org) = store_org {
+        credential_orgs.insert(org.to_string());
+    }
+
+    let mut values = vec![(credential_key(None), token)];
+    values.extend(
+        credential_orgs
+            .iter()
+            .map(|org| (credential_key(Some(org)), token)),
+    );
+
+    if let Some(api_key) = api_key {
+        if store_org.is_none() {
+            values.push((api_key_credential_key(None), api_key));
+        }
+        if let Some(org) = token_org.or(store_org) {
+            values.push((api_key_credential_key(Some(org)), api_key));
+        }
+    }
+
+    values
+}
+
+/// Machine credentials are confined to one organization when one is named.
+/// A named API login must not replace the membership-wide default user token.
+fn machine_login_values<'a>(token: &'a str, store_org: Option<&str>) -> Vec<(String, &'a str)> {
+    vec![(credential_key(store_org), token)]
+}
+
 /// Check that a freshly minted credential really serves the requested org.
 ///
 /// User credentials can act across every organization the user belongs to;
@@ -1950,26 +1996,7 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
         .as_ref()
         .ok()
         .and_then(|context| context.app_api_key.as_deref());
-    let mut credential_orgs = BTreeSet::new();
-    if let Some(org) = token_org.as_deref() {
-        credential_orgs.insert(org.to_string());
-    }
-    if let Some(org) = store_org.as_deref() {
-        credential_orgs.insert(org.to_string());
-    }
-    let mut values = vec![(credential_key(None), token)];
-    values.extend(
-        credential_orgs
-            .iter()
-            .map(|org| (credential_key(Some(org)), token)),
-    );
-    let api_key = api_key.unwrap_or_default();
-    values.push((api_key_credential_key(None), api_key));
-    values.extend(
-        credential_orgs
-            .iter()
-            .map(|org| (api_key_credential_key(Some(org)), api_key)),
-    );
+    let values = user_login_values(token, api_key, token_org.as_deref(), store_org.as_deref());
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2018,10 +2045,7 @@ async fn save_api_credentials_and_print_login_result(
     let authed_client = CloudClient::with_token_for_org(token, target.requested_org)?;
     let store_org = verify_login_org(&authed_client, target.requested_org, None).await?;
 
-    let mut values = vec![(credential_key(None), token)];
-    if let Some(org) = store_org.as_deref() {
-        values.push((credential_key(Some(org)), token));
-    }
+    let values = machine_login_values(token, store_org.as_deref());
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2995,10 +3019,11 @@ async fn execute_unlink() -> Result<()> {
             )
         })?;
 
-    let endpoint = identity
-        .control_plane_endpoint
-        .as_deref()
-        .unwrap_or(runtime_cloud_connect::config::DEFAULT_ENDPOINT);
+    let configured_endpoint = client::get_base_url();
+    let endpoint = release_endpoint(
+        identity.control_plane_endpoint.as_deref(),
+        &configured_endpoint,
+    );
     let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
     let token =
         user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
@@ -3031,6 +3056,13 @@ async fn execute_unlink() -> Result<()> {
     crate::commands::connect::transaction::clear_local_state(&config_dir, &identity_path).await?;
     println!("\x1b[32m✓ Unlinked and released the enrolled Spice Cloud instance\x1b[0m");
     Ok(())
+}
+
+fn release_endpoint<'a>(
+    identity_endpoint: Option<&'a str>,
+    configured_endpoint: &'a str,
+) -> &'a str {
+    identity_endpoint.unwrap_or(configured_endpoint)
 }
 
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
@@ -4846,6 +4878,54 @@ mod tests {
     #[test]
     fn an_org_credential_never_overwrites_the_default_one() {
         assert_ne!(credential_key(Some("spicehq")), credential_key(None));
+    }
+
+    #[test]
+    fn a_named_machine_login_does_not_replace_the_default_user_token() {
+        let values = machine_login_values("machine-token", Some("acme"));
+        let keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
+
+        assert_eq!(keys, vec![credential_key(Some("acme"))]);
+        assert!(!keys.contains(&credential_key(None)));
+    }
+
+    #[test]
+    fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
+        let values = user_login_values("user-token", None, Some("personal"), Some("acme"));
+
+        assert!(
+            values.iter().all(|(key, _)| !key.contains("API_KEY")),
+            "an absent API key must produce no API-key write: {values:?}"
+        );
+    }
+
+    #[test]
+    fn a_cross_org_user_login_does_not_relabel_or_replace_the_data_plane_key() {
+        let values = user_login_values(
+            "user-token",
+            Some("personal-api-key"),
+            Some("personal"),
+            Some("acme"),
+        );
+        let keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
+
+        assert!(keys.contains(&credential_key(None)));
+        assert!(keys.contains(&credential_key(Some("personal"))));
+        assert!(keys.contains(&credential_key(Some("acme"))));
+        assert!(keys.contains(&api_key_credential_key(Some("personal"))));
+        assert!(!keys.contains(&api_key_credential_key(None)));
+        assert!(!keys.contains(&api_key_credential_key(Some("acme"))));
+    }
+
+    #[test]
+    fn unlink_uses_the_configured_cloud_api_when_identity_has_no_endpoint() {
+        let configured = "https://staging.api.spice.ai";
+
+        assert_eq!(release_endpoint(None, configured), configured);
+        assert_eq!(
+            release_endpoint(Some("https://identity.example"), configured),
+            "https://identity.example"
+        );
     }
 
     #[test]

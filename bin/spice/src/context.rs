@@ -343,9 +343,8 @@ impl RuntimeContext {
     ///
     /// The first matching entry wins, exactly as before -- .env.local outranks .env,
     /// and within a file the earlier line wins. A blank value is authoritative but is
-    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
-    /// that has no key, so a blank resolves to `None` rather than falling through to
-    /// an older key in a lower-precedence file.
+    /// never a credential, so it resolves to `None` rather than falling through to an
+    /// older key in a lower-precedence file.
     fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
