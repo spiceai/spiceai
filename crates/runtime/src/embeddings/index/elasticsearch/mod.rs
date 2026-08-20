@@ -19,6 +19,7 @@ limitations under the License.
 //! Constructs [`ElasticsearchIndex`] instances from dataset configuration
 //! and wires them into the [`IndexedTableProvider`] pipeline.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -96,14 +97,31 @@ pub async fn try_from_table(
         .clone()
         .unwrap_or_else(|| format!("{column}_embedding"));
 
+    // Resolve spicepod `vectors: filterable | non-filterable` hints into
+    // [`search::metadata::MetadataColumns`]. These shape the ES mapping
+    // (`index: true` / `index: false`) so filterable fields participate in
+    // query filters, and non-filterable fields are stored only in `_source`.
+    // Computed before `text_fields` below so a string column explicitly marked
+    // non-filterable can be excluded from the full-text mapping entirely, rather
+    // than being inserted as indexed `text` first and then left that way (see
+    // `add_metadata_column_mappings`, which skips a name already in `properties`).
+    let metadata_columns =
+        es_metadata_columns(&dataset_columns, &inner_schema, &[&column, &vector_field]);
+    let non_filterable_names: HashSet<&str> = metadata_columns
+        .iter()
+        .filter(|c| matches!(c, MetadataColumn::NonFilterable(_)))
+        .map(MetadataColumn::name)
+        .collect();
+
     // Determine text fields for full-text search from the dataset columns.
     // Match both Utf8 and LargeUtf8 since accelerated tables may use LargeUtf8.
     let text_fields: Vec<String> = dataset_columns
         .iter()
         .filter(|c| {
-            inner_schema
-                .field_with_name(&c.name)
-                .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+            !non_filterable_names.contains(c.name.as_str())
+                && inner_schema
+                    .field_with_name(&c.name)
+                    .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
         })
         .map(|c| c.name.clone())
         .collect();
@@ -154,13 +172,6 @@ pub async fn try_from_table(
     } else {
         DEFAULT_BATCH_WRITE_ROWS
     };
-
-    // Resolve spicepod `vectors: filterable | non-filterable` hints into
-    // [`search::metadata::MetadataColumns`]. These shape the ES mapping
-    // (`index: true` / `index: false`) so filterable fields participate in
-    // query filters, and non-filterable fields are stored only in `_source`.
-    let metadata_columns =
-        es_metadata_columns(&dataset_columns, &inner_schema, &[&column, &vector_field]);
 
     // Normalize the source schema to match what the Elasticsearch HTTP client actually produces.
     // Accelerated tables (e.g. DuckDB) may store columns with types that differ from what ES
@@ -281,18 +292,33 @@ pub(crate) async fn fetch_filter_schema(
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     // ES keys the response by resolved concrete index name (which can differ from `es_index`,
-    // e.g. an alias), so take the single mapping by value rather than indexing by `es_index`.
-    let properties = mapping_response
-        .into_values()
+    // e.g. an alias), so take the mapping by value rather than indexing by `es_index`. If
+    // `es_index` is an alias over more than one concrete index, their mappings can diverge
+    // (different fields, types, or `index`/`doc_values`/`normalizer` settings); deriving filter
+    // capabilities from an arbitrary one of them could enable pushdown against a field that
+    // another backing index doesn't support, silently dropping matching rows. Require exactly one
+    // concrete index rather than guess.
+    let mut mappings = mapping_response.into_values();
+    let index_mapping = mappings
         .next()
         .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
             Box::from(format!(
                 "Failed to prepare Elasticsearch index '{es_index}': the mapping response contained no index entry."
             ))
-        })?
-        .mappings
-        .properties;
-    Ok(data_components::elasticsearch::schema::mapping_to_filter_schema(&properties))
+        })?;
+    if mappings.next().is_some() {
+        return Err(Box::from(format!(
+            "Failed to prepare Elasticsearch index '{es_index}': it resolves to more than one \
+            concrete index (it may be an alias spanning multiple indices), and their mappings \
+            may not agree on which columns are filterable. Point 'index' at a single concrete \
+            index."
+        )));
+    }
+    Ok(
+        data_components::elasticsearch::schema::mapping_to_filter_schema(
+            &index_mapping.mappings.properties,
+        ),
+    )
 }
 
 /// Default number of rows per Elasticsearch `_bulk` request.

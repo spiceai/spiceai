@@ -64,12 +64,15 @@ pub enum EsFieldType {
     ///
     /// `has_normalizer` is `true` when the mapping configures a `normalizer` on this field.
     /// Elasticsearch compares normalized indexed terms while SQL compares the raw `_source`
-    /// value; a normalizer is not order-preserving (e.g. a lowercase normalizer makes indexed
+    /// value. A normalizer is not order-preserving (e.g. a lowercase normalizer makes indexed
     /// `"z"` sort before `"a"` even though the raw values compare the other way), so a `range`
-    /// clause is not provably a superset — see [`Self::supports_range`]. Equality/`IN`/prefix are
-    /// unaffected: a deterministic normalizer applied identically to the indexed value and the
-    /// query term preserves membership and prefix relationships even though it does not preserve
-    /// ordering.
+    /// clause is not provably a superset — see [`Self::supports_range`]. Equality/`IN` are also
+    /// affected: a `term` match against the normalized indexed value is a superset of the raw SQL
+    /// comparison (e.g. source `"ABC"` indexes to `"abc"` and matches a `term` query for `"abc"`,
+    /// even though SQL `col = 'abc'` must not), so `DataFusion` must re-check — see
+    /// [`Self::is_exact_for_value_match`]. Prefix is unaffected: applied identically to the
+    /// indexed value and the query term, a normalizer preserves prefix relationships even though
+    /// it does not preserve ordering or exact membership.
     Keyword {
         ignore_above: Option<usize>,
         has_normalizer: bool,
@@ -109,10 +112,16 @@ impl EsFieldType {
 
     /// Whether an equality/`IN`/`range` predicate on this field type is exact (`true`) or a
     /// superset that `DataFusion` must re-check (`false`).
+    ///
+    /// A `Keyword` with `has_normalizer` is not exact even for equality: Elasticsearch matches on
+    /// the *normalized* indexed term, so e.g. a lowercase normalizer makes source value `"ABC"`
+    /// match a `term` query for `"abc"`, while SQL `col = 'abc'` must not — the `term` match is a
+    /// superset `DataFusion` has to re-check against the raw `_source` value.
     #[must_use]
     pub fn is_exact_for_value_match(&self) -> bool {
         match self {
-            EsFieldType::Boolean | EsFieldType::Integer | EsFieldType::Keyword { .. } => true,
+            EsFieldType::Boolean | EsFieldType::Integer => true,
+            EsFieldType::Keyword { has_normalizer, .. } => !has_normalizer,
             EsFieldType::Float
             | EsFieldType::QuantizedFloat
             | EsFieldType::TextWithKeyword { .. } => false,

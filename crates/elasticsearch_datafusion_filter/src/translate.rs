@@ -759,10 +759,13 @@ mod tests {
     /// Normalization is not order-preserving (e.g. a lowercase normalizer indexes `"Z"` before
     /// `"a"` even though the raw `_source` values compare the other way around), so a range/
     /// `BETWEEN` clause against a normalized `keyword`-family field is not provably a superset of
-    /// the SQL predicate and must not be pushed — but equality and `IN`, which only need the
-    /// normalizer to be deterministic (not order-preserving), are unaffected.
+    /// the SQL predicate and must not be pushed. Equality/`IN` still push (Elasticsearch's `term`
+    /// query is a safe superset — it can only match extra rows, never miss one), but are `Inexact`
+    /// rather than `Exact`: a `term` match against the normalized indexed value can include a
+    /// source row that does not equal the raw SQL literal (e.g. a lowercase normalizer makes
+    /// `"ABC"` match a `term` query for `"abc"`), so `DataFusion` must re-check.
     #[test]
-    fn normalizer_disables_range_but_not_equality_or_in() {
+    fn normalizer_disables_range_and_exact_equality_but_not_in_or_eq_pushdown() {
         let schema = normalizer_schema();
 
         for column in ["code", "name"] {
@@ -786,18 +789,19 @@ mod tests {
             );
         }
 
-        // Equality still pushes as `Exact` for the bare keyword field (a normalizer applied
-        // identically to the indexed value and the query term preserves membership).
+        // Equality/IN still push against the bare keyword field, but as `Inexact`: a `term` match
+        // against the normalized indexed value can include a source row that doesn't equal the
+        // raw SQL literal.
         assert_eq!(
             classify_filter(&schema, &col("code").eq(lit("abc"))),
-            TableProviderFilterPushDown::Exact
+            TableProviderFilterPushDown::Inexact
         );
         assert_eq!(
             classify_filter(
                 &schema,
                 &col("code").in_list(vec![lit("a"), lit("b")], false)
             ),
-            TableProviderFilterPushDown::Exact
+            TableProviderFilterPushDown::Inexact
         );
 
         // Equality/IN against the text-with-keyword field stay `Inexact`, same as without a
