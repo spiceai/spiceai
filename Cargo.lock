@@ -19565,6 +19565,7 @@ dependencies = [
  "rstest 0.26.1",
  "runtime-api-types",
  "runtime-cloud-connect",
+ "runtime-secrets",
  "rustyline",
  "secrecy",
  "semver",
