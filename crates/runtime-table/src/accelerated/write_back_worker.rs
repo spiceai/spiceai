@@ -27,11 +27,11 @@ limitations under the License.
 //! 2. **Read** those keys' *current* committed values from the accelerator
 //!    (a fenced point scan), AFTER the list.
 //! 3. **Deliver** to the source idempotently. Partition keys by delete-only
-//!    vs upsert, processes separately. If the source cannot do a native upsert (it answers `Replace` with
-//!    `NotImplemented`), delivery falls back to the older delete-then-insert
-//!    emulation over all claimed keys — a temporary path that reopens the
-//!    #11915 window, kept only until every durable-write-back source supports
-//!    native upsert.
+//!    vs upsert, processes separately. If the source cannot do a native upsert
+//!    (it answers `Replace` with `NotImplemented`), delivery falls back to the
+//!    older delete-then-insert emulation over all claimed keys - a temporary path
+//!    that reopens the #11915 window, kept only until every durable-write-back
+//!    source supports native upsert.
 //! 4. **Compare-and-clear** the markers whose stored sequence is still at or
 //!    below the sequence listed in step 1 — a newer commit that bumped a marker
 //!    during delivery leaves it in place, so the stale delivery never clears a
