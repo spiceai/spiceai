@@ -1302,10 +1302,15 @@ pub mod cayenne {
     /// `"skipped_earlier_pass_committed"` (an earlier pass in the same trigger
     /// committed, so this one had nothing to do), `"skipped_shutdown"`, and — under
     /// the synthetic kind `"trigger"`, which precedes path selection —
-    /// `"skipped_coalesced"` for a trigger request dropped because a pass was
-    /// already in flight. A table whose pass outlasts the compaction tick sits in
-    /// that last state permanently, which without this counter is
-    /// indistinguishable from a trigger that never fires.
+    /// `"not_yet_triggered"` (neither the file-count nor the protected-set
+    /// trigger fired), `"scheduled"` (a pass was started), and
+    /// `"skipped_coalesced"` (dropped because a pass was already in flight).
+    /// Those three sum to the maintenance drains that happened, which is what
+    /// makes the trigger's cadence measurable; a run reporting no declines is
+    /// otherwise indistinguishable from one where the trigger was never
+    /// evaluated. Expect `subset/skipped_below_trigger` to read ~0: the
+    /// scheduling gate and pass 3 read the same threshold, so an under-floor set
+    /// stops at the gate rather than reaching the pass.
     pub fn track_compaction_outcome(dimensions: &[KeyValue]) {
         compaction_outcome().add(1, dimensions);
     }

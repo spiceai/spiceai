@@ -14654,6 +14654,13 @@ impl CayenneTableProvider {
         if self.new_files_since_last_compaction.load(Ordering::Relaxed) < cfg.trigger_files
             && maintenance_trigger.is_none()
         {
+            // The overwhelmingly common outcome, and the denominator the other two
+            // are read against: without it, "compaction never declined" cannot be
+            // told apart from "the trigger was never evaluated". It is also why
+            // `subset/skipped_below_trigger` reads ~0 — this gate and pass 3 read
+            // the same `compaction_trigger_protected_snapshots`, so a set that is
+            // under the floor stops here rather than reaching the pass.
+            self.record_compaction_outcome("trigger", "not_yet_triggered");
             return;
         }
 
@@ -14662,11 +14669,14 @@ impl CayenneTableProvider {
             .swap(true, Ordering::AcqRel)
         {
             // Not an error: the in-flight pass will re-evaluate on the next drain.
-            // Counted because a table whose pass outlasts the tick sits here
-            // permanently, which is indistinguishable from "never triggered".
             self.record_compaction_outcome("trigger", "skipped_coalesced");
             return;
         }
+
+        // A pass is actually being started. Counted so the three outcomes of a
+        // maintenance drain sum to the drains that happened, which is what makes
+        // the trigger's cadence measurable rather than inferred from pass counts.
+        self.record_compaction_outcome("trigger", "scheduled");
 
         let table = self.clone_for_write();
         // Run the compaction pass (size-tiered protected-snapshot merge and/or
