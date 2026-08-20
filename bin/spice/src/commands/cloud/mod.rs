@@ -842,13 +842,14 @@ pub struct CreateProjectArgs {
     /// Project name
     pub name: String,
 
-    /// Deployment region (e.g. us-east-1-prod-aws-data)
+    /// Deployment region for a Spice-managed project (e.g. us-east-1-prod-aws-data)
     #[arg(long, value_parser = parse_create_project_region)]
-    pub region: String,
+    pub region: Option<String>,
 
-    /// Project kind (set or cluster)
-    #[arg(long, value_parser = clap::value_parser!(ProjectKind), default_value = "set")]
-    pub kind: ProjectKind,
+    /// Project kind (set or cluster) for a Spice-managed project. Omit to create a
+    /// Cloud Connect project that your own runtime serves
+    #[arg(long, value_parser = clap::value_parser!(ProjectKind))]
+    pub kind: Option<ProjectKind>,
 
     /// Project description
     #[arg(long)]
@@ -3709,7 +3710,7 @@ fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse) {
 }
 
 async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    let create_region = validate_create_project_args(args)?;
+    let placement = resolve_create_project_placement(args)?;
 
     let client = connect(flag_org).await?;
     let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -3721,19 +3722,16 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
     let app = client
         .create_project(
             &args.name,
-            &create_region,
-            args.kind,
             args.description.as_deref(),
             &args.visibility,
-            args.replicas,
-            args.cpu,
-            args.memory,
-            args.storage_size_gb,
-            args.executor_replicas,
-            args.executor_cpu,
-            args.executor_memory,
+            placement,
         )
         .await?;
+
+    // Which kind of project this is, is Spice Cloud's answer and not the
+    // request's, so it is read off the create response and reported. Held here
+    // because the optional spicepod/channel update below replaces `app`.
+    let created_kind = app.kind.clone();
 
     // The create response may omit `org`, so fall back to the org this
     // command acted on — the same org the new app was created in.
@@ -3782,7 +3780,10 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
     if args.output == OutputFormat::Json {
         return write_json(&app);
     }
-    println!("\x1b[32m✓ Created app {created}\x1b[0m");
+    match created_kind.as_deref() {
+        Some(kind) => println!("\x1b[32m✓ Created {kind} app {created}\x1b[0m"),
+        None => println!("\x1b[32m✓ Created app {created}\x1b[0m"),
+    }
     if let Ok(api_keys) = client.get_api_keys(&created).await
         && let Some(api_key) = api_keys.api_key
     {
@@ -3821,10 +3822,88 @@ async fn execute_create_deployment(
     Ok(())
 }
 
-fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
-    let region = normalize_create_project_region(&args.region)?;
+/// Flags that configure a hosted runtime, and so have no meaning on a project
+/// Spice Cloud does not run.
+///
+/// This is the set Spice Cloud itself calls hosted runtime configuration and
+/// refuses on a Cloud Connect project — sizing and version selection alike.
+/// `--channel` reaches the control plane through the update that follows the
+/// create rather than through the create itself, so refusing it here is what
+/// keeps that update from being sent at all: were it allowed through, the create
+/// would succeed and the update would fail, and the CLI would roll the create
+/// back by deleting the project it had just made.
+fn hosted_runtime_flags(args: &CreateProjectArgs) -> Vec<&'static str> {
+    [
+        ("--replicas", args.replicas.is_some()),
+        ("--cpu", args.cpu.is_some()),
+        ("--memory", args.memory.is_some()),
+        ("--storage-size-gb", args.storage_size_gb.is_some()),
+        ("--executor-replicas", args.executor_replicas.is_some()),
+        ("--executor-cpu", args.executor_cpu.is_some()),
+        ("--executor-memory", args.executor_memory.is_some()),
+        ("--channel", args.channel.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, given)| given.then_some(flag))
+    .collect()
+}
 
-    if args.kind == ProjectKind::Cluster {
+/// Decide which project `spice cloud project create` was asked for.
+///
+/// `--kind` is the discriminator, because naming a kind is naming a hosted
+/// topology: a Cloud Connect project has no hosted runtime, so there is no
+/// third kind value that could stand for one. Naming a kind therefore requires
+/// a region and admits the runtime configuration that region provisions;
+/// omitting it asks for a Cloud Connect project and admits neither.
+///
+/// Placement flags are refused rather than dropped. A region silently ignored
+/// looks like a working region selection until someone checks where the
+/// project actually runs, and a Cloud Connect project's region is not the
+/// caller's to state in the first place — it follows from the stamp the
+/// attached instance's control stream terminates on.
+fn resolve_create_project_placement(
+    args: &CreateProjectArgs,
+) -> Result<client::CreateProjectPlacement> {
+    let Some(kind) = args.kind else {
+        if let Some(region) = args.region.as_deref() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "--region {region} does not apply to project '{name}': without --kind this creates a Cloud Connect project, whose region is not chosen here — it follows from the stamp the attached instance's control stream terminates on. Pass --kind set (or --kind cluster) alongside --region to create a Spice-managed project in that region instead. See: https://spiceai.org/docs/spice-cloud",
+                    name = args.name,
+                ),
+            });
+        }
+
+        let unsupported = hosted_runtime_flags(args);
+        if !unsupported.is_empty() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "{flags} {do_not} apply to project '{name}': without --kind this creates a Cloud Connect project, which Spice Cloud does not run — your own runtime serves it, and you choose its size and version. Drop {them}, or pass --kind set to create a Spice-managed project that has a hosted runtime to configure. See: https://spiceai.org/docs/spice-cloud",
+                    flags = unsupported.join(", "),
+                    do_not = if unsupported.len() == 1 {
+                        "does not"
+                    } else {
+                        "do not"
+                    },
+                    them = if unsupported.len() == 1 { "it" } else { "them" },
+                    name = args.name,
+                ),
+            });
+        }
+
+        return Ok(client::CreateProjectPlacement::Standalone);
+    };
+
+    let Some(region) = args.region.as_deref() else {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "--kind {kind} creates a Spice-managed project, which needs a region: pass --region <region>, and run 'spice cloud regions' to list them. Omit --kind to create a Cloud Connect project that your own runtime serves, which has no region to choose. See: https://spiceai.org/docs/spice-cloud"
+            ),
+        });
+    };
+    let region = normalize_create_project_region(region)?;
+
+    if kind == ProjectKind::Cluster {
         if args.replicas != Some(1) {
             return Err(crate::error::Error::InvalidArgument {
                 message: "Cluster apps require --replicas 1".to_string(),
@@ -3852,7 +3931,19 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
         }
     }
 
-    Ok(region)
+    Ok(client::CreateProjectPlacement::Managed(
+        client::ManagedProjectPlacement {
+            region,
+            kind,
+            replicas: args.replicas,
+            cpu: args.cpu,
+            memory: args.memory,
+            storage_size_gb: args.storage_size_gb,
+            executor_replicas: args.executor_replicas,
+            executor_cpu: args.executor_cpu,
+            executor_memory: args.executor_memory,
+        },
+    ))
 }
 
 async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
@@ -4802,8 +4893,8 @@ mod tests {
     fn create_project_args(kind: ProjectKind, replicas: Option<i32>) -> CreateProjectArgs {
         CreateProjectArgs {
             name: "app".to_string(),
-            region: "us-east-1-prod-aws-data".to_string(),
-            kind,
+            region: Some("us-east-1-prod-aws-data".to_string()),
+            kind: Some(kind),
             description: None,
             visibility: "private".to_string(),
             replicas,
@@ -4827,10 +4918,20 @@ mod tests {
         args
     }
 
+    /// A `spice cloud project create <name>` with no placement flags at all —
+    /// the invocation that asks Spice Cloud for a Cloud Connect project.
+    fn standalone_project_args() -> CreateProjectArgs {
+        let mut args = create_project_args(ProjectKind::Set, None);
+        args.kind = None;
+        args.region = None;
+        args
+    }
+
     #[test]
     fn create_cluster_requires_explicit_single_replica() {
-        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, None))
-            .expect_err("cluster without replicas should fail");
+        let err =
+            resolve_create_project_placement(&create_project_args(ProjectKind::Cluster, None))
+                .expect_err("cluster without replicas should fail");
 
         assert_eq!(
             err.to_string(),
@@ -4840,8 +4941,9 @@ mod tests {
 
     #[test]
     fn create_cluster_requires_executor_configuration() {
-        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, Some(1)))
-            .expect_err("cluster without executor configuration should fail");
+        let err =
+            resolve_create_project_placement(&create_project_args(ProjectKind::Cluster, Some(1)))
+                .expect_err("cluster without executor configuration should fail");
 
         assert_eq!(
             err.to_string(),
@@ -4851,18 +4953,112 @@ mod tests {
 
     #[test]
     fn create_cluster_accepts_one_replica() {
-        validate_create_project_args(&cluster_app_args(Some(1)))
+        let placement = resolve_create_project_placement(&cluster_app_args(Some(1)))
             .expect("cluster with one scheduler replica should pass");
+
+        let client::CreateProjectPlacement::Managed(managed) = placement else {
+            panic!("a named kind creates a Spice-managed project");
+        };
+        assert_eq!(managed.region, "us-east-1-prod-aws-data");
+        assert_eq!(managed.kind, ProjectKind::Cluster);
     }
 
     #[test]
     fn create_project_rejects_invalid_region_syntax() {
         let mut args = create_project_args(ProjectKind::Set, None);
-        args.region = "bad_region".to_string();
+        args.region = Some("bad_region".to_string());
 
-        let err = validate_create_project_args(&args).expect_err("invalid region should fail");
+        let err = resolve_create_project_placement(&args).expect_err("invalid region should fail");
 
         assert!(err.to_string().contains("Invalid region 'bad_region'"));
+    }
+
+    #[test]
+    fn create_project_without_kind_asks_for_a_cloud_connect_project() {
+        let placement = resolve_create_project_placement(&standalone_project_args())
+            .expect("no kind and no placement flags should be accepted");
+
+        assert!(matches!(
+            placement,
+            client::CreateProjectPlacement::Standalone
+        ));
+    }
+
+    #[test]
+    fn create_project_rejects_region_without_kind() {
+        let mut args = standalone_project_args();
+        args.region = Some("us-east-1-prod-aws-data".to_string());
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("a region without a kind should fail rather than be dropped");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --region us-east-1-prod-aws-data does not apply to project 'app': without --kind this creates a Cloud Connect project, whose region is not chosen here — it follows from the stamp the attached instance's control stream terminates on. Pass --kind set (or --kind cluster) alongside --region to create a Spice-managed project in that region instead. See: https://spiceai.org/docs/spice-cloud"
+        );
+    }
+
+    #[test]
+    fn create_project_rejects_hosted_runtime_flags_without_kind() {
+        let mut args = standalone_project_args();
+        args.replicas = Some(3);
+        args.executor_cpu = Some(8);
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("hosted runtime configuration without a kind should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --replicas, --executor-cpu do not apply to project 'app': without --kind this creates a Cloud Connect project, which Spice Cloud does not run — your own runtime serves it, and you choose its size and version. Drop them, or pass --kind set to create a Spice-managed project that has a hosted runtime to configure. See: https://spiceai.org/docs/spice-cloud"
+        );
+    }
+
+    /// `--channel` is applied by an update that runs after the create, so
+    /// letting it through would create the project and then delete it again when
+    /// Spice Cloud refused the update. It has to be refused before the create.
+    #[test]
+    fn create_project_rejects_channel_without_kind() {
+        let mut args = standalone_project_args();
+        args.channel = Some(UpdateChannel::Nightly);
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("an update channel without a kind should fail");
+
+        assert!(
+            err.to_string()
+                .starts_with("Invalid argument: --channel does not apply to project 'app':"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn create_project_rejects_a_single_hosted_runtime_flag_in_the_singular() {
+        let mut args = standalone_project_args();
+        args.memory = Some(bytes::NumBytes::from_bytes(1024));
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("hosted runtime configuration without a kind should fail");
+
+        assert!(
+            err.to_string()
+                .starts_with("Invalid argument: --memory does not apply to project 'app':"),
+            "unexpected message: {err}"
+        );
+        assert!(err.to_string().contains("Drop it, or pass --kind set"));
+    }
+
+    #[test]
+    fn create_project_requires_a_region_with_kind() {
+        let mut args = create_project_args(ProjectKind::Set, None);
+        args.region = None;
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("a named kind without a region should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --kind set creates a Spice-managed project, which needs a region: pass --region <region>, and run 'spice cloud regions' to list them. Omit --kind to create a Cloud Connect project that your own runtime serves, which has no region to choose. See: https://spiceai.org/docs/spice-cloud"
+        );
     }
 
     #[test]
@@ -4883,6 +5079,7 @@ mod tests {
             id: 1,
             name: name.to_string(),
             org: org.to_string(),
+            kind: None,
             description: None,
             visibility: None,
             created_at: None,
