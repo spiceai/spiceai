@@ -661,7 +661,9 @@ mod tests {
     use super::{
         equality_delete_columns, unkeyable_predicate_columns, unkeyable_predicate_message,
     };
-    use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+    use arrow::datatypes::{
+        DataType, Field, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef, TimeUnit,
+    };
     use datafusion::prelude::{col, lit};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -911,6 +913,276 @@ mod tests {
         assert!(
             message.contains("no column of this table can be matched on"),
             "{message}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end coverage against a real catalog.
+    //
+    // These commit Iceberg tables through a REST catalog and a local-filesystem
+    // warehouse, so they assert on *rows that survived a delete* rather than on
+    // the plan that would have run. That distinction is the point: every earlier
+    // attempt at this code planned exactly as intended and still removed the
+    // wrong rows, and no unit test could see it.
+    //
+    // Skipped unless ICEBERG_REST_CATALOG_URI names a running catalog, matching
+    // how `hadoop_catalog_test.rs` gates on its own endpoint. Bring one up with:
+    //
+    //   docker run -d -p 8181:8181 -v /tmp/wh:/tmp/wh \
+    //     -e CATALOG_WAREHOUSE=file:///tmp/wh \
+    //     -e CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
+    //     apache/iceberg-rest-fixture:latest
+    //
+    // The warehouse is bind-mounted at the *same* path inside the container so
+    // the absolute locations the catalog records resolve for this process too.
+    // ---------------------------------------------------------------------
+
+    use datafusion::datasource::TableProvider;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::prelude::SessionContext;
+    use iceberg::io::LocalFsStorageFactory;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    use iceberg_catalog_rest::{
+        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    };
+    use iceberg_datafusion::IcebergTableProvider;
+
+    use super::IcebergDeletionProvider;
+
+    const CATALOG_URI_ENV: &str = "ICEBERG_REST_CATALOG_URI";
+    const WAREHOUSE_ENV: &str = "ICEBERG_REST_WAREHOUSE";
+
+    /// The catalog endpoint and warehouse root, or `None` when the environment
+    /// does not offer one and the test should not run.
+    fn catalog_env() -> Option<(String, String)> {
+        let uri = std::env::var(CATALOG_URI_ENV).ok()?;
+        let warehouse = std::env::var(WAREHOUSE_ENV)
+            .unwrap_or_else(|_| "file:///tmp/iceberg-e2e-warehouse".to_string());
+        (!uri.trim().is_empty()).then_some((uri, warehouse))
+    }
+
+    /// A fresh table per test. The name carries the caller so concurrently
+    /// running tests never share a table, and a stale one from an earlier run is
+    /// dropped rather than reused.
+    async fn fresh_table(name: &str) -> (Arc<dyn Catalog>, NamespaceIdent, String) {
+        let (uri, warehouse) = catalog_env().expect("checked by the caller");
+
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "rest",
+                HashMap::from([
+                    (REST_CATALOG_PROP_URI.to_string(), uri),
+                    (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse),
+                ]),
+            )
+            .await
+            .expect("load REST catalog");
+
+        let namespace = NamespaceIdent::new("delete_e2e".to_string());
+        // Ignore the already-exists error; the namespace outlives a single test.
+        let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
+
+        let table_ident = iceberg::TableIdent::new(namespace.clone(), name.to_string());
+        let _ = catalog.drop_table(&table_ident).await;
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "price", Type::Primitive(PrimitiveType::Double)).into(),
+            ])
+            .build()
+            .expect("iceberg schema");
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(name.to_string())
+                    .schema(schema)
+                    // Equality deletes need v2; v1 is refused before we get here.
+                    .properties(HashMap::from([(
+                        "format-version".to_string(),
+                        "2".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .expect("create table");
+
+        (Arc::new(catalog), namespace, name.to_string())
+    }
+
+    /// Two rows share `(id, label)` and differ only in `price` — the pair an
+    /// equality delete keyed on `(id, label)` cannot tell apart.
+    fn seed_batch() -> arrow::array::RecordBatch {
+        let schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("label", DataType::Utf8, true),
+            ArrowField::new("price", DataType::Float64, true),
+        ]));
+        arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1_i64, 1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.5, 2.5, 9.0])),
+            ],
+        )
+        .expect("seed batch")
+    }
+
+    async fn table_provider(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> Arc<dyn TableProvider> {
+        Arc::new(
+            IcebergTableProvider::try_new(Arc::clone(catalog), namespace.clone(), name.to_string())
+                .await
+                .expect("iceberg table provider"),
+        )
+    }
+
+    /// Every `(id, price)` currently in the table, sorted so the assertion does
+    /// not depend on scan order.
+    async fn rows_now(
+        ctx: &SessionContext,
+        provider: &Arc<dyn TableProvider>,
+    ) -> Vec<(i64, String)> {
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in batches {
+            let schema = batch.schema();
+            let ids = batch
+                .column(schema.index_of("id").expect("id"))
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("id is Int64");
+            let prices = batch
+                .column(schema.index_of("price").expect("price"))
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("price is Float64");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), format!("{:.1}", prices.value(row))));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    async fn seed(ctx: &SessionContext, provider: &Arc<dyn TableProvider>) {
+        let batch = seed_batch();
+        let source = MemorySourceConfig::try_new(&[vec![batch.clone()]], batch.schema(), None)
+            .expect("memory source");
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                Arc::new(DataSourceExec::new(Arc::new(source))),
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("insert runs");
+    }
+
+    fn deletable(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        name: &str,
+        inner: &Arc<dyn TableProvider>,
+    ) -> Arc<dyn TableProvider> {
+        let layer = IcebergDeletionProvider::new(
+            Arc::clone(catalog),
+            namespace.clone(),
+            name.to_string(),
+            Arc::clone(inner),
+        );
+        spice_table::SpiceTable::over(Arc::new(layer), Arc::clone(inner))
+    }
+
+    fn all_three_rows() -> Vec<(i64, String)> {
+        vec![
+            (1, "1.5".to_string()),
+            (1, "2.5".to_string()),
+            (2, "9.0".to_string()),
+        ]
+    }
+
+    /// A condition the key *can* express removes exactly the rows it selected.
+    #[tokio::test]
+    async fn a_delete_on_a_keyable_column_removes_exactly_those_rows() {
+        let Some(_) = catalog_env() else {
+            eprintln!("skipping: {CATALOG_URI_ENV} is not set");
+            return;
+        };
+        let (catalog, namespace, name) = fresh_table("keyable").await;
+        let ctx = SessionContext::new();
+        let inner = table_provider(&catalog, &namespace, &name).await;
+        seed(&ctx, &inner).await;
+        assert_eq!(rows_now(&ctx, &inner).await, all_three_rows());
+
+        let plan = deletable(&catalog, &namespace, &name, &inner)
+            .delete_from(&ctx.state(), vec![col("id").eq(lit(1_i64))])
+            .await
+            .expect("delete plans");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete runs");
+
+        let after = table_provider(&catalog, &namespace, &name).await;
+        assert_eq!(
+            rows_now(&ctx, &after).await,
+            vec![(2, "9.0".to_string())],
+            "both id = 1 rows go, and only those"
+        );
+    }
+
+    /// The reason this guard exists. `price` cannot be part of the key, so
+    /// `WHERE price = 1.5` has no faithful equality delete — the closest one also
+    /// removes the `price = 2.5` row. It must be refused, and the table must be
+    /// untouched afterwards. This is the assertion no unit test could make.
+    #[tokio::test]
+    async fn a_delete_on_an_unkeyable_column_is_refused_and_loses_no_rows() {
+        let Some(_) = catalog_env() else {
+            eprintln!("skipping: {CATALOG_URI_ENV} is not set");
+            return;
+        };
+        let (catalog, namespace, name) = fresh_table("unkeyable").await;
+        let ctx = SessionContext::new();
+        let inner = table_provider(&catalog, &namespace, &name).await;
+        seed(&ctx, &inner).await;
+
+        let error = deletable(&catalog, &namespace, &name, &inner)
+            .delete_from(&ctx.state(), vec![col("price").eq(lit(1.5_f64))])
+            .await
+            .expect_err("a condition on an unkeyable column must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains("'price'"), "{message}");
+        assert!(
+            message.contains("rows the condition did not select would be deleted too"),
+            "{message}"
+        );
+
+        let after = table_provider(&catalog, &namespace, &name).await;
+        assert_eq!(
+            rows_now(&ctx, &after).await,
+            all_three_rows(),
+            "a refused delete must leave every row in place"
         );
     }
 
