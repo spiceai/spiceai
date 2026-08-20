@@ -6922,8 +6922,13 @@ impl CayenneTableProvider {
     /// * `stream` - The stream of record batches to write
     /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
-    /// * `target_partitions` - Upper bound on intra-write shard writers (the
-    ///   host's logical-core count); also the ceiling the Vortex sink clamps to.
+    /// * `target_partitions` - Hard ceiling on intra-write shard writers, and the
+    ///   caller's statement of intent: usually the host's logical-core count, but
+    ///   `1` where the write must stay serial (the sorted rewrites, and the
+    ///   protected-snapshot merge for position-delete tables), or
+    ///   `ceil(bytes / target_file_size)` where it bounds file roll-over instead.
+    ///   Enforced by `snapshot_write_concurrency` — see there for why the Vortex
+    ///   sink cannot enforce it.
     /// * `estimated_bytes` - Caller's estimate of the total bytes this write will
     ///   produce, used to size the intra-write shard count (small writes stay a
     ///   single file). `None` ⇒ unknown size ⇒ shard across the full write
@@ -6979,20 +6984,12 @@ impl CayenneTableProvider {
         // is installed (unit tests, embedders). See `write_budget`.
         let shard_count =
             self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
-        // `snapshot_shard_count` already caps the fan-out at `target_partitions`
-        // (`snapshot_write_concurrency` treats it as a hard ceiling), so the
-        // count we permit for is the count the sink will encode with — no
-        // second clamp, and one place to change the rule. Permitting for the
-        // real fan-out is what keeps a `cayenne_write_concurrency` above the
-        // core count from over-subscribing the global budget and throttling
-        // other tables. (`acquire_encode_permits` additionally caps to the
-        // budget total, e.g. when it is sized below the core count for reserved
-        // query threads.)
-        debug_assert!(
-            shard_count <= target_partitions.max(1),
-            "snapshot_shard_count must not exceed the caller's target_partitions"
-        );
-        let encode_shards = shard_count;
+        // `snapshot_write_concurrency` already clamps the fan-out to
+        // `target_partitions`, so there is no second clamp here — one place owns
+        // the rule. Permitting for that count is what keeps a
+        // `cayenne_write_concurrency` above the caller's cap from
+        // over-subscribing the global budget and throttling other tables.
+        // (`acquire_encode_permits` caps to the budget total besides.)
         // Class-aware: `Delta` (CDC staged appends, mem-tier checkpoints) may
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
@@ -7009,7 +7006,7 @@ impl CayenneTableProvider {
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
         let _encode_permits = super::write_budget::acquire_encode_permits(
-            encode_shards,
+            shard_count,
             write_class,
             self.context.is_coupled_writer(),
         )
@@ -7198,16 +7195,13 @@ impl CayenneTableProvider {
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
         // when it receives rows). Drives only the compaction-trigger heuristic.
-        // This is `encode_shards` — the size-aware request ALREADY CLAMPED to
-        // `target_partitions` (the Vortex sink clamps to it via `build_shard_spec`),
-        // so it matches the files actually produced. Using the raw
-        // `snapshot_shard_count` would over-count whenever `target_partitions` caps
-        // the fan-out below the size-based request — e.g. the concurrent per-shard
-        // checkpoint encode pins `target_partitions = 1` (one file per shard), where
-        // the raw request would report the full write concurrency and over-trigger
-        // compaction by the fan-out ratio. For every caller whose `target_partitions`
-        // already meets the size-based count, this is unchanged.
-        let writer_ops = if total_rows > 0 { encode_shards } else { 0 };
+        // `shard_count` is already clamped to `target_partitions` by
+        // `snapshot_write_concurrency`, so it matches the files actually produced.
+        // That clamp is why this can be counted at all: the per-shard checkpoint
+        // encode pins `target_partitions = 1` (one file per shard), and an
+        // unclamped request would report the full write concurrency and
+        // over-trigger compaction by the fan-out ratio.
+        let writer_ops = if total_rows > 0 { shard_count } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -7589,10 +7583,9 @@ impl CayenneTableProvider {
     /// clamped to the caller's value.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let cap = session_target_partitions.max(1);
-        let default = DEFAULT_WRITE_CONCURRENCY.min(cap);
         self.context
             .write_concurrency()
-            .unwrap_or(default)
+            .unwrap_or(DEFAULT_WRITE_CONCURRENCY)
             .clamp(1, cap)
     }
 
@@ -38513,12 +38506,8 @@ mod tests {
     ///
     /// `subset_merge_write_shape` returns `(1, None)` to keep a position-delete
     /// table's merge serial — its tombstones are file-path scoped and the
-    /// position bake-in assumes a single output sequence. That cap is the only
-    /// thing enforcing it: `VortexFormat::build_shard_spec` clamps against the
-    /// write *session's* `target_partitions`, not the caller's, so a shard count
-    /// that escapes `snapshot_write_concurrency` reaches the sink as a real
-    /// fan-out while the encode-permit request stays clamped to the caller's
-    /// value.
+    /// position bake-in assumes a single output sequence. See
+    /// [`Self::snapshot_write_concurrency`] for why the sink cannot enforce that.
     ///
     /// The fixture declares no sort columns on purpose: `snapshot_shard_count`
     /// returns 1 outright for a sorted table, which would mask the cap.
@@ -38526,22 +38515,17 @@ mod tests {
     async fn test_pinned_single_partition_survives_write_concurrency_override() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
-        let (mut provider, _temp_dir) = create_sorted_cayenne_table(
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
             "pinned_single_partition",
             Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
             vec![],
             ctx.runtime_env(),
         )
         .await;
-
-        provider.context = CayenneContext::new(
-            &VortexConfig {
-                write_concurrency: Some(8),
-                ..VortexConfig::default()
-            },
-            ctx.runtime_env(),
-            "test",
-        );
 
         let tsb = provider.context.target_file_size_bytes();
         // Both size-estimate shapes a pinned caller can pass: `None` (the serial
