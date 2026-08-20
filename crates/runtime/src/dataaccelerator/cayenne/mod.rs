@@ -55,6 +55,7 @@ use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::OnSchemaChange;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_checkpoint_api::CheckpointError;
@@ -1766,21 +1767,18 @@ impl CayenneAccelerator {
             let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
             let is_partitioned = !acceleration.partition_by.is_empty();
             config.schema_evolution = source
-                .as_any()
-                .downcast_ref::<crate::component::dataset::Dataset>()
+                .on_schema_change()
                 .filter(|_| !is_caching_mode && !is_partitioned)
                 .map_or(
                     cayenne::metadata::SchemaEvolutionMode::Disabled,
-                    |dataset| match dataset.on_schema_change {
-                        crate::component::dataset::OnSchemaChange::AppendNewColumns => {
+                    |on_schema_change| match on_schema_change {
+                        OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns
-                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
+                        OnSchemaChange::SyncAllColumns | OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
-                        crate::component::dataset::OnSchemaChange::Block
-                        | crate::component::dataset::OnSchemaChange::Fail => {
+                        OnSchemaChange::Block | OnSchemaChange::Fail => {
                             cayenne::metadata::SchemaEvolutionMode::Disabled
                         }
                     },
@@ -2567,14 +2565,10 @@ impl CayenneAccelerator {
         let is_cdc_replica = source
             .acceleration()
             .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
-        let default_scan_freshness = match source
-            .as_any()
-            .downcast_ref::<crate::component::dataset::Dataset>()
-        {
-            Some(dataset) if is_cdc_replica && !dataset.access().allows_write() => {
-                read_only_scan_freshness()
-            }
-            _ => std::time::Duration::ZERO,
+        let default_scan_freshness = if is_cdc_replica && !source.allows_write() {
+            read_only_scan_freshness()
+        } else {
+            std::time::Duration::ZERO
         };
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
@@ -4093,22 +4087,18 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
-/// Whether the dataset's `on_schema_change` asks for in-place schema evolution.
+/// Whether the source's `on_schema_change` asks for in-place schema evolution.
 ///
-/// The policy lives on the `Dataset` component, so a non-`Dataset` source (a
-/// view, or DDL) never asks for it.
+/// A source that states no policy (a view, or DDL) never asks for it.
 fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
-    source
-        .as_any()
-        .downcast_ref::<crate::component::dataset::Dataset>()
-        .is_some_and(|dataset| {
-            matches!(
-                dataset.on_schema_change,
-                crate::component::dataset::OnSchemaChange::AppendNewColumns
-                    | crate::component::dataset::OnSchemaChange::SyncAllColumns
-                    | crate::component::dataset::OnSchemaChange::DropAndRecreate
-            )
-        })
+    source.on_schema_change().is_some_and(|on_schema_change| {
+        matches!(
+            on_schema_change,
+            OnSchemaChange::AppendNewColumns
+                | OnSchemaChange::SyncAllColumns
+                | OnSchemaChange::DropAndRecreate
+        )
+    })
 }
 
 /// Force partition child tables to encode serially (one write shard).

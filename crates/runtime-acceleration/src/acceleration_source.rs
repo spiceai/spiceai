@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::acceleration::Acceleration;
+use crate::schema_change::OnSchemaChange;
 use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -58,6 +59,31 @@ pub trait AccelerationSource: Send + Sync {
     /// Deliberately has NO default implementation: every impl states its own answer,
     /// so a new source cannot silently inherit a wrong `None` and misclassify itself.
     fn connector_name(&self) -> Option<&str>;
+
+    /// The `on_schema_change` policy this source declares, or `None` for a source that
+    /// has no such policy — a view, or a table created by DDL.
+    ///
+    /// An engine that can widen its stored schema in place asks here instead of
+    /// downcasting to the source's concrete type: `None` is the answer that keeps schema
+    /// evolution off, which is what a source with no policy to state must resolve to.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default would let a new source silently inherit
+    /// somebody else's schema-change policy.
+    fn on_schema_change(&self) -> Option<OnSchemaChange>;
+
+    /// Whether rows can reach this source through anything other than its refresh path
+    /// — `access: read_write` on a dataset, or DML against a DDL-created table.
+    ///
+    /// Load-bearing for scan freshness: only a source that provably takes no writes of
+    /// its own can serve a scan from a slightly older view of its accelerator, because
+    /// for anything else a pre-mutation view is a stale (wrong) result. A source that
+    /// cannot prove it is write-free answers `true`.
+    ///
+    /// Deliberately has NO default implementation: the safe answer here is the
+    /// permissive one, and a default would hand a new source the *restrictive* answer
+    /// and with it a silently stale read.
+    fn allows_write(&self) -> bool;
 
     /// Returns the time column name if configured, None otherwise.
     /// Views always return None as they don't support time-based append mode.
