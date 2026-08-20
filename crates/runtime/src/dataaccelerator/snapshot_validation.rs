@@ -201,6 +201,15 @@ mod tests {
             None
         }
 
+        fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+            // Snapshot-consistency validation never consults the schema-change policy.
+            None
+        }
+
+        fn allows_write(&self) -> bool {
+            true
+        }
+
         fn time_column(&self) -> Option<&str> {
             None
         }

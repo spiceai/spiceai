@@ -56,8 +56,9 @@ pub(crate) use data_accelerator_api::*;
 /// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
 /// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
 /// `None` for a genuine `debezium:`/`cdc:` stream or a `sink:` dataset. Mapping the
-/// source's connector name through [`crate::builder::unset_refresh_mode_for_connector`]
-/// — the same table the runtime builder classifies the pod with — recovers it.
+/// source's connector name through
+/// [`runtime_acceleration::acceleration::unset_refresh_mode_for_connector`] — the same
+/// table the runtime builder classifies the pod with — recovers it.
 ///
 /// A source with no connector (a view, an Iceberg DDL table) has no default to apply
 /// and falls back to `full`, which is what those paths resolve an unset mode to.
@@ -68,7 +69,7 @@ pub(crate) fn resolved_refresh_mode(
     acceleration.refresh_mode.unwrap_or_else(|| {
         source.connector_name().map_or(
             crate::component::dataset::acceleration::RefreshMode::Full,
-            crate::builder::unset_refresh_mode_for_connector,
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector,
         )
     })
 }
