@@ -185,6 +185,146 @@ pub fn compaction_budget_permits() -> usize {
     cpu_budget::cpu_budget().cayenne_compaction_permits()
 }
 
+/// How Cayenne sizes the partition fan-out of its own maintenance passes
+/// (compaction and the seq-prefix bake).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaintenanceFanOut {
+    /// One partition per output file the pass is estimated to produce, so the
+    /// read fan-out matches the number of writers that will consume it. A merge
+    /// small enough to land in one file therefore plans one partition rather
+    /// than fanning out and immediately coalescing back.
+    PerOutputFile,
+    /// The same count for every pass, whatever its size.
+    Fixed(usize),
+}
+
+/// Ceiling on any maintenance fan-out, and the value used when a pass has no
+/// size estimate to derive one from.
+///
+/// `SessionConfig::default()` would resolve `target_partitions` to
+/// `available_parallelism()`. The intent at these call sites is the logical CPU
+/// count — it is the parallel-encode shard ceiling, and encoding is CPU-bound,
+/// so more shards than cores buys no throughput and only inflates file count.
+/// But `available_parallelism()` reports the *node's* cores whenever a pod sets
+/// `requests.cpu` without `limits.cpu`, so it overstates that ceiling on exactly
+/// the deployments where it matters. The CPU budget expresses the same intent
+/// and gets the entitlement right. The operator's
+/// `runtime.query.target_partitions` stays a read-path knob and is still not
+/// inherited: raising it would not speed an encode.
+static MAINTENANCE_FAN_OUT_BUDGET: LazyLock<usize> =
+    LazyLock::new(|| cpu_budget::cpu_budget().target_partitions().max(1));
+
+/// Resolved fan-out policy, read once per process.
+///
+/// `SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS` selects it so a benchmark sweep
+/// can vary the fan-out per run without a rebuild: a whole number pins every
+/// pass to that width, and `auto` derives it per pass from the output size. The
+/// variable's name lags this scope, which started at compaction alone; renaming
+/// it while a sweep is queued would make a run silently fall back to the budget
+/// and read as a duplicate control, so the two change together afterwards.
+static MAINTENANCE_FAN_OUT: LazyLock<MaintenanceFanOut> = LazyLock::new(|| {
+    resolve_maintenance_fan_out(
+        std::env::var("SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS")
+            .ok()
+            .as_deref(),
+        *MAINTENANCE_FAN_OUT_BUDGET,
+    )
+});
+
+/// Output files a write of `estimated_bytes` is expected to produce, before any
+/// concurrency cap.
+///
+/// The unit is `target_size / 16` floored at 16 MiB and capped at `target_size`,
+/// so the count answers "how many encode-efficient shards would this write
+/// fill?" rather than "how many full target files?". `estimated_bytes` is
+/// compression-blind in-memory Arrow bytes, which biases the count upward.
+///
+/// Single source of truth for that count: the encoder shard count
+/// (`snapshot_shard_count`) and the [`MaintenanceFanOut::PerOutputFile`] read
+/// fan-out both derive from it, so the two cannot drift apart — the whole point
+/// of the policy is that they agree.
+#[must_use]
+pub(crate) fn estimated_output_files(estimated_bytes: u64, target_size_bytes: usize) -> u64 {
+    /// Smallest span of bytes worth handing a separate encoder.
+    const MIN_ENCODE_SHARD_BYTES: u64 = 16 * 1024 * 1024;
+    // `target_size_bytes` comes from a configured MiB value and is never 0, but
+    // guard anyway so a misconfiguration cannot divide by zero.
+    let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
+    let unit = (target / 16).clamp(MIN_ENCODE_SHARD_BYTES.min(target), target);
+    (estimated_bytes / unit).max(1)
+}
+
+/// Partitions a maintenance pass with no size estimate plans across.
+#[must_use]
+pub(crate) fn internal_target_partitions() -> usize {
+    match *MAINTENANCE_FAN_OUT {
+        MaintenanceFanOut::Fixed(partitions) => partitions,
+        MaintenanceFanOut::PerOutputFile => *MAINTENANCE_FAN_OUT_BUDGET,
+    }
+}
+
+/// Partitions a maintenance pass plans across given the bytes it will merge.
+///
+/// `estimated_bytes` of 0 means "no estimate" (the caller could not price its
+/// inputs) and falls back to [`internal_target_partitions`] rather than
+/// deriving 1 from an absence — a pass must never be serialized because its
+/// size was unknown.
+#[must_use]
+pub(crate) fn internal_target_partitions_for_output(
+    estimated_bytes: u64,
+    target_size_bytes: usize,
+) -> usize {
+    match *MAINTENANCE_FAN_OUT {
+        MaintenanceFanOut::Fixed(partitions) => partitions,
+        MaintenanceFanOut::PerOutputFile if estimated_bytes == 0 => internal_target_partitions(),
+        MaintenanceFanOut::PerOutputFile => {
+            let files = estimated_output_files(estimated_bytes, target_size_bytes);
+            let ceiling = *MAINTENANCE_FAN_OUT_BUDGET;
+            usize::try_from(files).unwrap_or(ceiling).clamp(1, ceiling)
+        }
+    }
+}
+
+/// Pure resolution behind [`MAINTENANCE_FAN_OUT`], separated so the override
+/// parsing is testable without mutating the process environment (which is
+/// `unsafe` in edition 2024 and racy across parallel tests).
+///
+/// A value that is absent, unparseable, or zero falls back to the budget: an
+/// experiment knob must never be able to stop this work from running. The
+/// resolved policy is always logged, so a run whose override never reached the
+/// process is visible in its own log rather than silently reading as a control.
+fn resolve_maintenance_fan_out(override_value: Option<&str>, budget: usize) -> MaintenanceFanOut {
+    let budget = budget.max(1);
+    let (resolved, source) = match override_value.map(str::trim) {
+        None => (MaintenanceFanOut::Fixed(budget), "its CPU budget"),
+        Some(raw) if raw.eq_ignore_ascii_case("auto") => (
+            MaintenanceFanOut::PerOutputFile,
+            "`SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS=auto`",
+        ),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(partitions) if partitions > 0 => (
+                MaintenanceFanOut::Fixed(partitions),
+                "`SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS`",
+            ),
+            _ => {
+                tracing::warn!(
+                    "Ignoring `SPICE_CAYENNE_COMPACTION_TARGET_PARTITIONS={raw}`: expected `auto` or a whole number above zero."
+                );
+                (MaintenanceFanOut::Fixed(budget), "its CPU budget")
+            }
+        },
+    };
+    match resolved {
+        MaintenanceFanOut::Fixed(partitions) => tracing::info!(
+            "Cayenne is planning its compaction and bake passes across {partitions} partitions, from {source}."
+        ),
+        MaintenanceFanOut::PerOutputFile => tracing::info!(
+            "Cayenne is sizing each compaction and bake pass to the output files it is estimated to produce (ceiling {budget}), from {source}."
+        ),
+    }
+    resolved
+}
+
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.
 /// Existing pass guards remain counted and can be drained via
 /// [`drain_compaction_tasks`].
@@ -1349,5 +1489,75 @@ mod tests {
             Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         assert!(BackgroundCompactor::spawn(weak, Duration::ZERO, semaphore).is_none());
+    }
+
+    #[test]
+    fn fan_out_defaults_to_the_cpu_budget() {
+        assert_eq!(
+            resolve_maintenance_fan_out(None, 64),
+            MaintenanceFanOut::Fixed(64)
+        );
+    }
+
+    #[test]
+    fn fan_out_honors_a_pinned_sweep_override() {
+        // 256 is above the budget on purpose: a sweep has to be able to probe
+        // oversubscription, not only undersubscription.
+        for (raw, want) in [("1", 1), ("8", 8), (" 4 ", 4), ("256", 256)] {
+            assert_eq!(
+                resolve_maintenance_fan_out(Some(raw), 64),
+                MaintenanceFanOut::Fixed(want)
+            );
+        }
+    }
+
+    #[test]
+    fn auto_selects_per_output_file_sizing() {
+        for raw in ["auto", "AUTO", " Auto "] {
+            assert_eq!(
+                resolve_maintenance_fan_out(Some(raw), 64),
+                MaintenanceFanOut::PerOutputFile
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_override_falls_back_rather_than_stalling_the_pass() {
+        for raw in ["0", "-1", "", "4.5", "some"] {
+            assert_eq!(
+                resolve_maintenance_fan_out(Some(raw), 64),
+                MaintenanceFanOut::Fixed(64),
+                "override {raw:?} should fall back to the budget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degenerate_budget_still_plans_one_partition() {
+        // A zero would propagate into the encoder shard cap as "no writers".
+        assert_eq!(
+            resolve_maintenance_fan_out(None, 0),
+            MaintenanceFanOut::Fixed(1)
+        );
+        assert_eq!(
+            resolve_maintenance_fan_out(Some("0"), 0),
+            MaintenanceFanOut::Fixed(1)
+        );
+    }
+
+    #[test]
+    fn output_file_estimate_tracks_the_encode_shard_unit() {
+        // A 512 MiB target gives unit = max(512/16, 16) MiB = 32 MiB.
+        const TARGET: usize = 512 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(estimated_output_files(0, TARGET), 1, "an empty write still writes one file");
+        assert_eq!(estimated_output_files(20 * MIB, TARGET), 1, "under one unit");
+        assert_eq!(estimated_output_files(32 * MIB, TARGET), 1);
+        assert_eq!(estimated_output_files(64 * MIB, TARGET), 2);
+        assert_eq!(estimated_output_files(320 * MIB, TARGET), 10);
+        // A target below the 16 MiB floor clamps the unit to the target itself.
+        assert_eq!(estimated_output_files(4 * MIB, 1024 * 1024), 4);
+        // A zeroed target must not divide by zero.
+        assert_eq!(estimated_output_files(4 * MIB, 0), 4 * MIB);
     }
 }

@@ -6922,8 +6922,11 @@ impl CayenneTableProvider {
     /// * `stream` - The stream of record batches to write
     /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
-    /// * `target_partitions` - Upper bound on intra-write shard writers (the
-    ///   host's logical-core count); also the ceiling the Vortex sink clamps to.
+    /// * `target_partitions` - Upper bound on intra-write shard writers; also the
+    ///   ceiling the Vortex sink clamps to. Sourced from the caller's session
+    ///   config, so a maintenance write carries the compaction fan-out
+    ///   ([`super::compaction::compaction_target_partitions`]) and a CDC delta
+    ///   write carries the query fan-out.
     /// * `estimated_bytes` - Caller's estimate of the total bytes this write will
     ///   produce, used to size the intra-write shard count (small writes stay a
     ///   single file). `None` ⇒ unknown size ⇒ shard across the full write
@@ -7459,19 +7462,13 @@ impl CayenneTableProvider {
             return write_concurrency;
         };
         {
-            // Encode-shard unit (see the doc comment): `target_size / 16`
-            // floored at 16 MiB and capped at `target_size`, so the count
-            // is "how many encode-efficient shards would this write fill?"
-            // rather than "how many full target files?". The estimate is
-            // (compression-blind) in-memory Arrow bytes — see the doc
-            // comment on the deliberate Arrow-vs-Vortex unit asymmetry
-            // that biases this toward more shards. `target_size_bytes` is
-            // derived from a configured MiB value and is never 0, but
-            // guard against it so a misconfiguration can't divide-by-zero.
-            const MIN_ENCODE_SHARD_BYTES: u64 = 16 * 1024 * 1024;
-            let target = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
-            let unit = (target / 16).clamp(MIN_ENCODE_SHARD_BYTES.min(target), target);
-            let files = (bytes / unit).max(1);
+            // The shard count and the read-side fan-out must agree for a
+            // size-derived policy to mean anything, so both come from
+            // `estimated_output_files` rather than from separate copies of the
+            // arithmetic. The estimate is (compression-blind) in-memory Arrow
+            // bytes — see the doc comment on the deliberate Arrow-vs-Vortex unit
+            // asymmetry that biases this toward more shards.
+            let files = super::compaction::estimated_output_files(bytes, target_size_bytes);
             let upper = u64::try_from(write_concurrency).unwrap_or(u64::MAX);
             let shards = usize::try_from(files.min(upper)).unwrap_or(write_concurrency);
             // Distinguishes "volume did not justify the fan-out" from "the CPU
@@ -18558,7 +18555,7 @@ impl CayenneTableProvider {
         // partial deletion filter exactly as the read path does, then stream
         // the merged rows into a fresh snapshot dir.
         let phase2_start = std::time::Instant::now();
-        let ctx = self.create_compaction_session_context();
+        let ctx = self.create_compaction_session_context_for_output(total_input_bytes);
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
@@ -19280,7 +19277,7 @@ impl CayenneTableProvider {
         // --- Phase 2: rewrite outside the lock (identical to the size-tier
         // path): union over selected inputs, each with its own partial deletion
         // filter, streamed into one fresh snapshot whose dead rows are removed. ---
-        let ctx = self.create_compaction_session_context();
+        let ctx = self.create_compaction_session_context_for_output(selected_input_bytes);
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
@@ -19709,7 +19706,8 @@ impl CayenneTableProvider {
             })?;
 
         Ok(SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            SessionConfig::default()
+                .with_target_partitions(super::compaction::internal_target_partitions()),
             runtime_env,
         ))
     }
@@ -20255,6 +20253,10 @@ impl CayenneTableProvider {
     /// bounded pool carved from `runtime.query.memory_limit`, so a large
     /// snapshot rewrite cannot starve concurrent queries. Falls back to the
     /// shared query environment when no dedicated compaction env is set.
+    ///
+    /// Fan-out comes from [`super::compaction::compaction_target_partitions`]
+    /// rather than `SessionConfig`'s default, which would read the host's cores
+    /// instead of the CPU the runtime is entitled to.
     fn create_compaction_session_context(&self) -> SessionContext {
         self.create_compaction_session_context_with_config(SessionConfig::default())
     }
@@ -20263,13 +20265,30 @@ impl CayenneTableProvider {
     /// the carry-forward promotion attaches its
     /// [`super::cold_partition::ColdScanFiles`] extension here so its private
     /// session's cold branch reads only the dirty files being rewritten.
+    /// [`Self::create_compaction_session_context`] sized from the bytes this pass
+    /// will merge, so `PerOutputFile` plans one partition per output file the
+    /// write is estimated to produce. `estimated_bytes` of 0 means the caller
+    /// could not price its inputs and keeps the unsized fan-out.
+    fn create_compaction_session_context_for_output(&self, estimated_bytes: u64) -> SessionContext {
+        let partitions = super::compaction::internal_target_partitions_for_output(
+            estimated_bytes,
+            self.context.target_file_size_bytes(),
+        );
+        self.create_compaction_session_context_with_config(
+            SessionConfig::default().with_target_partitions(partitions),
+        )
+    }
+
     fn create_compaction_session_context_with_config(
         &self,
         config: SessionConfig,
     ) -> SessionContext {
         let runtime_env = super::compaction::compaction_runtime_env()
             .unwrap_or_else(|| Arc::clone(self.context.runtime_env()));
-        SessionContext::new_with_config_rt(config, runtime_env)
+        SessionContext::new_with_config_rt(
+            config.with_target_partitions(super::compaction::internal_target_partitions()),
+            runtime_env,
+        )
     }
 
     /// Wrap a plan with a `FilterExec` that enforces the retention filter.
