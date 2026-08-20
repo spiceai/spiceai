@@ -102,77 +102,71 @@ fn equality_delete_columns(schema: &ArrowSchema) -> (Vec<i32>, Vec<usize>) {
     (equality_ids, projection_indices)
 }
 
-/// The two projections an equality delete needs, which are *not* the same list.
+/// The columns a predicate references that the equality key cannot carry, sorted
+/// and deduplicated.
 ///
-/// `equality_ids` is the delete file's key — the columns whose values identify
-/// the rows to remove. `scan_indices` is what the scan must actually read: every
-/// key column, plus every column the predicate mentions.
+/// An equality delete says "remove rows whose key columns equal these values".
+/// That is only the same statement as the original `WHERE` when the predicate is
+/// a function of the key columns alone: a row sharing the key values of a matched
+/// row then necessarily satisfies the predicate too, so nothing unmatched is
+/// removed. The moment the predicate reads a column outside the key — a float, a
+/// nested field, anything [`equality_delete_columns`] excludes — the delete file
+/// can no longer distinguish a matched row from an unmatched one beside it, and
+/// deletes both.
 ///
-/// Conflating them breaks the statement in one direction or the other. Reading
-/// only the key columns leaves a predicate on an excluded column — a float, say —
-/// with nothing to resolve against, so `DELETE ... WHERE price = 1.5` cannot be
-/// planned. Keying on everything the scan read is what makes the delete match
-/// more rows than the predicate did.
-#[derive(Debug, PartialEq, Eq)]
-struct EqualityDeletePlan {
-    /// Field IDs the delete file keys on, in schema order.
-    equality_ids: Vec<i32>,
-    /// Column indices the scan projects, ascending.
-    scan_indices: Vec<usize>,
+/// Sorted so the refusal names the same column every time; `column_refs` returns
+/// an unordered set.
+fn unkeyable_predicate_columns(
+    schema: &ArrowSchema,
+    key_indices: &[usize],
+    filters: &[datafusion::logical_expr::Expr],
+) -> Vec<String> {
+    let keyable: std::collections::HashSet<&str> = key_indices
+        .iter()
+        .map(|idx| schema.field(*idx).name().as_str())
+        .collect();
+
+    let mut unkeyable: Vec<String> = filters
+        .iter()
+        .flat_map(|filter| {
+            filter
+                .column_refs()
+                .into_iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|name| !keyable.contains(name.as_str()))
+        .collect();
+    unkeyable.sort_unstable();
+    unkeyable.dedup();
+    unkeyable
 }
 
-/// Choose the delete key and the scan projection for a `DELETE`.
-///
-/// The key is the table's declared identifier fields when it has them and all of
-/// them can take part in an equality delete: those fields *are* the row identity,
-/// so keying on them removes exactly the rows the predicate matched. Without a
-/// usable identity there is no better answer than every eligible column, which
-/// narrows the match as far as the schema allows — see [`equality_delete_columns`]
-/// for why that is still a subset of the row, and what that costs.
-///
-/// The scan is widened to cover the predicate's columns regardless, so the filter
-/// always has something to bind to.
-fn plan_equality_delete(
-    schema: &ArrowSchema,
-    identifier_field_ids: &std::collections::HashSet<i32>,
-    filters: &[datafusion::logical_expr::Expr],
-) -> EqualityDeletePlan {
-    let (eligible_ids, eligible_indices) = equality_delete_columns(schema);
-
-    // A partial identity is not an identity: keying on the usable part of it
-    // would match rows the predicate never selected.
-    let identity_is_usable = !identifier_field_ids.is_empty()
-        && identifier_field_ids
+/// The refusal a caller gets when the condition cannot be expressed as an
+/// equality key. Built here rather than inline so its wording is pinned by a
+/// test: it has to keep naming the table, the offending column, and what the
+/// user can do instead.
+fn unkeyable_predicate_message(table: &str, unkeyable: &[String], keyable: &[String]) -> String {
+    let quoted = |names: &[String]| {
+        names
             .iter()
-            .all(|id| eligible_ids.contains(id));
-
-    let (equality_ids, key_indices): (Vec<i32>, Vec<usize>) = if identity_is_usable {
-        eligible_ids
-            .iter()
-            .zip(eligible_indices.iter())
-            .filter(|(id, _)| identifier_field_ids.contains(*id))
-            .map(|(id, idx)| (*id, *idx))
-            .unzip()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let usable = if keyable.is_empty() {
+        "no column of this table can be matched on".to_string()
     } else {
-        (eligible_ids, eligible_indices)
+        format!("this table can only be matched on {}", quoted(keyable))
     };
 
-    let mut scan_indices = key_indices;
-    for filter in filters {
-        for column in filter.column_refs() {
-            if let Ok(idx) = schema.index_of(column.name.as_str())
-                && !scan_indices.contains(&idx)
-            {
-                scan_indices.push(idx);
-            }
-        }
-    }
-    scan_indices.sort_unstable();
-
-    EqualityDeletePlan {
-        equality_ids,
-        scan_indices,
-    }
+    format!(
+        "Failed to delete from Iceberg table '{table}': the condition reads {}, which an equality delete cannot match on, so rows the condition did not select would be deleted too. \
+        Rewrite the condition to use only columns the delete can match, or delete the rows through a source that supports row-level deletes; {usable}. \
+        Floating-point and nested columns can never be matched on, and neither can a column without a Parquet field ID. \
+        See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        quoted(unkeyable)
+    )
 }
 
 fn to_df_error(e: IcebergError) -> DataFusionError {
@@ -189,12 +183,8 @@ pub(crate) struct IcebergDeleteExec {
     /// The child plan that produces the rows to delete (a scan with filters applied).
     /// The scan is projected to only include columns eligible for equality deletes.
     input: Arc<dyn ExecutionPlan>,
-    /// Pre-computed equality delete field IDs — the delete file's key.
+    /// Pre-computed equality delete field IDs (primitive, non-float columns).
     equality_ids: Vec<i32>,
-    /// Field IDs the input scan actually carries. A superset of `equality_ids`:
-    /// the scan also reads whatever the predicate references, so the writer's
-    /// projector must map from these columns, not from the key alone.
-    scan_field_ids: Vec<i32>,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -204,7 +194,6 @@ impl IcebergDeleteExec {
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         equality_ids: Vec<i32>,
-        scan_field_ids: Vec<i32>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Arc::new(PlanProperties::new(
@@ -219,7 +208,6 @@ impl IcebergDeleteExec {
             catalog,
             input,
             equality_ids,
-            scan_field_ids,
             plan_properties,
         }
     }
@@ -295,7 +283,6 @@ impl ExecutionPlan for IcebergDeleteExec {
             Arc::clone(&self.catalog),
             Arc::clone(&children[0]),
             self.equality_ids.clone(),
-            self.scan_field_ids.clone(),
         )))
     }
 
@@ -315,7 +302,6 @@ impl ExecutionPlan for IcebergDeleteExec {
         let input_plan = Arc::clone(&self.input);
         let count_schema = Self::make_count_schema();
         let equality_ids = self.equality_ids.clone();
-        let scan_field_ids = self.scan_field_ids.clone();
 
         let stream = futures::stream::once(async move {
             // Collect all input partitions into a single stream
@@ -352,19 +338,18 @@ impl ExecutionPlan for IcebergDeleteExec {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-            // Describe the batches the scan actually produces, which is the key
-            // columns plus whatever the predicate referenced. The projector maps
-            // this schema down to `equality_ids`; handing it the key alone would
-            // index past the end of a wider batch. Columns it cannot key on
-            // (floats, nested) are skipped by the projector rather than rejected,
-            // so carrying them here is safe.
-            let scan_id_set: std::collections::HashSet<i32> =
-                scan_field_ids.iter().copied().collect();
+            // Build a sub-schema containing only the equality-eligible
+            // fields. The input scan is already projected to these columns,
+            // so the `EqualityDeleteWriterConfig` projector must map from
+            // this sub-schema (not the full table schema) to avoid index
+            // out-of-bounds when re-projecting the already-projected batches.
+            let equality_id_set: std::collections::HashSet<i32> =
+                equality_ids.iter().copied().collect();
             let equality_fields: Vec<_> = iceberg_schema
                 .as_struct()
                 .fields()
                 .iter()
-                .filter(|f| scan_id_set.contains(&f.id))
+                .filter(|f| equality_id_set.contains(&f.id))
                 .cloned()
                 .collect();
             let equality_schema = Arc::new(
@@ -565,25 +550,7 @@ impl IcebergDeletionProvider {
         let iceberg_schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(iceberg_schema).map_err(to_df_error)?);
 
-        let identifier_field_ids: std::collections::HashSet<i32> =
-            iceberg_schema.identifier_field_ids().collect();
-        let EqualityDeletePlan {
-            equality_ids,
-            scan_indices,
-        } = plan_equality_delete(&arrow_schema, &identifier_field_ids, filters);
-
-        // The Parquet field IDs of the columns the scan will carry, in the same
-        // order, so the delete writer can describe its own input.
-        let scan_field_ids: Vec<i32> = scan_indices
-            .iter()
-            .filter_map(|idx| {
-                arrow_schema
-                    .field(*idx)
-                    .metadata()
-                    .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
-                    .and_then(|v| v.parse::<i32>().ok())
-            })
-            .collect();
+        let (equality_ids, projection_indices) = equality_delete_columns(&arrow_schema);
 
         // An equality delete file with no key columns imposes no condition, so
         // it would match every row: a `DELETE ... WHERE` would empty the table.
@@ -595,6 +562,23 @@ impl IcebergDeletionProvider {
                 Add an integer, string, boolean, date, timestamp, or decimal column to the table. \
                 See: https://spiceai.org/docs/components/data-connectors/iceberg",
                 self.table_ident
+            )));
+        }
+
+        // An equality delete can only reproduce a condition built from the columns
+        // it keys on. Anything else would delete more than the condition selected,
+        // so refuse rather than approximate — losing rows silently is worse than
+        // refusing the statement.
+        let unkeyable = unkeyable_predicate_columns(&arrow_schema, &projection_indices, filters);
+        if !unkeyable.is_empty() {
+            let keyable: Vec<String> = projection_indices
+                .iter()
+                .map(|idx| arrow_schema.field(*idx).name().clone())
+                .collect();
+            return Err(DataFusionError::Plan(unkeyable_predicate_message(
+                &self.table_ident.to_string(),
+                &unkeyable,
+                &keyable,
             )));
         }
 
@@ -610,7 +594,7 @@ impl IcebergDeletionProvider {
         // float/nested columns that cause field-id resolution errors.
         let scan_plan = self
             .inner
-            .scan(state, Some(&scan_indices), filters, None)
+            .scan(state, Some(&projection_indices), filters, None)
             .await?;
 
         // The Iceberg provider may not push down filters, so add a FilterExec
@@ -668,14 +652,15 @@ impl IcebergDeletionProvider {
             Arc::clone(&self.catalog),
             coalesced,
             equality_ids,
-            scan_field_ids,
         )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EqualityDeletePlan, equality_delete_columns, plan_equality_delete};
+    use super::{
+        equality_delete_columns, unkeyable_predicate_columns, unkeyable_predicate_message,
+    };
     use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
     use datafusion::prelude::{col, lit};
     use std::collections::HashMap;
@@ -800,12 +785,8 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    fn ids(values: &[i32]) -> std::collections::HashSet<i32> {
-        values.iter().copied().collect()
-    }
-
-    /// A schema whose only distinguishing column is a float: `id` and `label`
-    /// repeat, `price` does not.
+    /// `(id, label)` repeat across rows; `price` is what tells them apart — and
+    /// `price` is a float, so the delete can never key on it.
     fn float_keyed_schema() -> ArrowSchema {
         ArrowSchema::new(vec![
             field("id", DataType::Int64, Some("1")),
@@ -814,135 +795,123 @@ mod tests {
         ])
     }
 
-    /// A predicate on a float column has to reach the scan even though the
-    /// delete cannot key on it. Projecting only the key columns left
-    /// `DELETE ... WHERE price = 1.5` with no `price` to bind to, so the
-    /// statement could not be planned at all.
-    #[test]
-    fn a_predicate_column_reaches_the_scan_even_when_it_cannot_be_keyed_on() {
-        let schema = float_keyed_schema();
-        let plan = plan_equality_delete(&schema, &ids(&[]), &[col("price").eq(lit(1.5))]);
-
-        assert_eq!(plan.scan_indices, vec![0, 1, 2], "price must be scanned");
-        assert_eq!(
-            plan.equality_ids,
-            vec![1, 2],
-            "but it must not become part of the delete key"
-        );
+    fn key_indices(schema: &ArrowSchema) -> Vec<usize> {
+        equality_delete_columns(schema).1
     }
 
-    /// The scan is a superset of the key, never a replacement for it: widening
-    /// for the predicate must not drop a key column.
+    /// The case that must be refused. Two rows can share `(id, label)` and differ
+    /// only in `price`, so a delete keyed on `(id, label)` removes both — while
+    /// `WHERE price = 1.5` selected one. Approximating here loses a row silently
+    /// and unrecoverably, so the statement is refused instead.
     #[test]
-    fn the_scan_always_covers_every_key_column() {
+    fn a_predicate_on_an_unkeyable_column_is_refused() {
         let schema = float_keyed_schema();
+        let unkeyable = unkeyable_predicate_columns(
+            &schema,
+            &key_indices(&schema),
+            &[col("price").eq(lit(1.5))],
+        );
+
+        assert_eq!(unkeyable, vec!["price".to_string()]);
+    }
+
+    /// A predicate built only from key columns is exact: any row sharing those
+    /// values satisfies the same predicate, so nothing unmatched is removed.
+    #[test]
+    fn a_predicate_on_key_columns_only_is_allowed() {
+        let schema = float_keyed_schema();
+        let indices = key_indices(&schema);
+
         for filters in [
-            vec![],
-            vec![col("price").gt(lit(0.0))],
             vec![col("id").eq(lit(1_i64))],
-            vec![col("id").eq(lit(1_i64)), col("price").lt(lit(9.0))],
+            vec![col("label").eq(lit("x"))],
+            vec![col("id").eq(lit(1_i64)), col("label").eq(lit("x"))],
+            vec![col("id").gt(lit(1_i64)).and(col("label").is_not_null())],
         ] {
-            let plan = plan_equality_delete(&schema, &ids(&[]), &filters);
-            let (key_ids, key_indices) = equality_delete_columns(&schema);
-            assert_eq!(plan.equality_ids, key_ids);
-            for idx in key_indices {
-                assert!(
-                    plan.scan_indices.contains(&idx),
-                    "key column {idx} missing from the scan for {filters:?}"
-                );
-            }
+            assert!(
+                unkeyable_predicate_columns(&schema, &indices, &filters).is_empty(),
+                "should be allowed: {filters:?}"
+            );
         }
     }
 
-    /// Identifier fields are the row identity, so the delete keys on those and
-    /// removes exactly the rows the predicate matched. Keying on every eligible
-    /// column instead looks stricter but is not: two rows agreeing on all of
-    /// them are one row to the delete file.
+    /// `DELETE FROM t` with no condition removes every row, which an equality
+    /// delete reproduces exactly. Refusing it would be wrong.
     #[test]
-    fn a_declared_identity_becomes_the_key_while_the_scan_stays_wide() {
+    fn a_delete_with_no_condition_is_allowed() {
         let schema = float_keyed_schema();
-        let plan = plan_equality_delete(&schema, &ids(&[1]), &[col("price").eq(lit(1.5))]);
-
-        assert_eq!(plan.equality_ids, vec![1], "keyed on the declared identity");
-        assert_eq!(
-            plan.scan_indices,
-            vec![0, 2],
-            "identity column plus the predicate's column"
-        );
+        assert!(unkeyable_predicate_columns(&schema, &key_indices(&schema), &[]).is_empty());
     }
 
+    /// A mixed condition is still refused, and every offending column is named
+    /// so the user does not have to rediscover them one error at a time.
     #[test]
-    fn a_composite_identity_keeps_every_part_in_schema_order() {
+    fn every_unkeyable_column_is_reported_at_once_and_in_a_stable_order() {
         let schema = ArrowSchema::new(vec![
-            field("tenant", DataType::Int32, Some("7")),
-            field("payload", DataType::Utf8, Some("8")),
-            field("id", DataType::Int64, Some("9")),
+            field("id", DataType::Int64, Some("1")),
+            field("price", DataType::Float64, Some("2")),
+            field("ratio", DataType::Float32, Some("3")),
         ]);
-        let plan = plan_equality_delete(&schema, &ids(&[9, 7]), &[]);
+        let filters = vec![
+            col("ratio").gt(lit(0.5_f32)),
+            col("id").eq(lit(1_i64)),
+            col("price").eq(lit(1.5)),
+        ];
 
-        assert_eq!(plan.equality_ids, vec![7, 9]);
-        assert_eq!(plan.scan_indices, vec![0, 2]);
+        // Sorted, so the message does not vary run to run: `column_refs` is a set.
+        assert_eq!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &filters),
+            vec!["price".to_string(), "ratio".to_string()]
+        );
     }
 
-    /// No declared identity leaves no better key than every eligible column.
+    /// A column named twice is reported once.
     #[test]
-    fn without_an_identity_the_key_is_every_eligible_column() {
+    fn a_repeated_unkeyable_column_is_reported_once() {
         let schema = float_keyed_schema();
-        let plan = plan_equality_delete(&schema, &ids(&[]), &[]);
+        let filters = vec![col("price").gt(lit(1.0)), col("price").lt(lit(9.0))];
 
         assert_eq!(
-            plan,
-            EqualityDeletePlan {
-                equality_ids: vec![1, 2],
-                scan_indices: vec![0, 1],
-            }
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &filters),
+            vec!["price".to_string()]
         );
     }
 
-    /// A partial identity is not an identity. If one identifier field cannot be
-    /// keyed on, keying on the rest would match rows the predicate never chose.
+    /// The refusal has to stay actionable: name the table, the column that caused
+    /// it, what can be used instead, and where to read more. A reword must not
+    /// quietly drop any of those.
     #[test]
-    fn an_identity_with_an_unusable_field_falls_back_to_every_eligible_column() {
-        let schema = float_keyed_schema();
-
-        // Field 3 is the float, so the identity can never be honoured.
-        let plan = plan_equality_delete(&schema, &ids(&[1, 3]), &[]);
-        assert_eq!(plan.equality_ids, vec![1, 2]);
-
-        // Same for an identity naming a field the schema does not carry.
-        let plan = plan_equality_delete(&schema, &ids(&[99]), &[]);
-        assert_eq!(plan.equality_ids, vec![1, 2]);
-    }
-
-    /// A predicate naming a column that is not in the schema must not silently
-    /// widen the scan with a bogus index; planning fails later on its own terms.
-    #[test]
-    fn an_unknown_predicate_column_does_not_widen_the_scan() {
-        let schema = float_keyed_schema();
-        let plan = plan_equality_delete(&schema, &ids(&[]), &[col("nope").eq(lit(1_i64))]);
-
-        assert_eq!(plan.scan_indices, vec![0, 1]);
-    }
-
-    /// The scan projection is handed to `TableProvider::scan`, which requires
-    /// ascending indices, and duplicates would double-project a column.
-    #[test]
-    fn the_scan_projection_is_sorted_and_free_of_duplicates() {
-        let schema = float_keyed_schema();
-        let plan = plan_equality_delete(
-            &schema,
-            &ids(&[]),
-            &[
-                col("price").eq(lit(1.5)),
-                col("label").eq(lit("x")),
-                col("price").gt(lit(0.0)),
-            ],
+    fn the_refusal_names_the_table_the_column_and_the_way_out() {
+        let message = unkeyable_predicate_message(
+            "sales.orders",
+            &["price".to_string()],
+            &["id".to_string(), "label".to_string()],
         );
 
-        assert_eq!(plan.scan_indices, vec![0, 1, 2]);
-        let mut deduped = plan.scan_indices.clone();
-        deduped.dedup();
-        assert_eq!(deduped, plan.scan_indices);
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(message.contains("'price'"), "{message}");
+        assert!(message.contains("'id', 'label'"), "{message}");
+        assert!(
+            message.contains("rows the condition did not select would be deleted too"),
+            "must say what goes wrong, not just that it refused: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-connectors/iceberg"),
+            "{message}"
+        );
+        assert!(!message.contains('\n'), "must stay on one line: {message}");
+    }
+
+    /// When nothing is keyable the message must not claim an empty list of usable
+    /// columns — that reads as "use these" followed by nothing.
+    #[test]
+    fn the_refusal_says_so_plainly_when_no_column_is_usable() {
+        let message = unkeyable_predicate_message("sales.orders", &["price".to_string()], &[]);
+
+        assert!(
+            message.contains("no column of this table can be matched on"),
+            "{message}"
+        );
     }
 
     #[test]
