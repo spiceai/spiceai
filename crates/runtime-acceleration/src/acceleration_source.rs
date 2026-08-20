@@ -54,7 +54,7 @@ pub trait AccelerationSource: Send + Sync {
     /// `acceleration().refresh_mode` is still `None` for a genuine `debezium:`/`cdc:`
     /// stream. A consumer that must know the mode the source will actually run with
     /// maps this name through the connector-default table instead of reading the
-    /// field raw (see `runtime::builder::unset_refresh_mode_for_connector`).
+    /// field raw (see [`crate::acceleration::unset_refresh_mode_for_connector`]).
     ///
     /// Deliberately has NO default implementation: every impl states its own answer,
     /// so a new source cannot silently inherit a wrong `None` and misclassify itself.

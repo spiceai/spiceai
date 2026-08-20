@@ -778,7 +778,8 @@ impl RefreshWriteProfile {
     ///   default: `debezium` and `cdc` resolve it to `changes`, `sink` to
     ///   `disabled`, everything else to `full`. Assuming `full` here would classify
     ///   an unannotated CDC dataset as a whole-table replace and under-provision its
-    ///   memory. See `crate::builder::connector_unset_refresh_mode`.
+    ///   memory. See
+    ///   [`runtime_acceleration::acceleration::unset_refresh_mode_for_connector`].
     /// * `refresh_check_interval` is still an unparsed string. An unparseable one is
     ///   treated as absent — the same conservative direction the component builder
     ///   takes when it later rejects the value, and the same `fundu` parser it uses.
