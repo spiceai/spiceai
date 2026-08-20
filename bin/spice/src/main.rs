@@ -344,10 +344,17 @@ fn main() {
 
     // Run the CLI
     let machine = cli.machine;
+    let cloud_service_command = matches!(
+        &cli.command,
+        Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Service(_),
+            ..
+        })
+    );
     if let Err(e) = run_cli(cli) {
         if machine {
             write_machine_error(&e);
-        } else if matches!(e, spice::error::Error::ServiceNotInstalled { .. }) {
+        } else if cloud_service_command {
             eprintln!("{e}");
         } else {
             tracing::error!("{e}");
