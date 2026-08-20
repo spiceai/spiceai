@@ -28472,11 +28472,21 @@ impl CayenneTableProvider {
 pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
-            // Only Utf8 (the i32-offset string type) is the q21 overflow case and
-            // the only type Vortex reliably re-decodes as a view. Binary is NOT
-            // mapped (Vortex's BinaryView path yields LargeBinary -> verify_schema
-            // divergence); LargeUtf8/LargeBinary already use i64 offsets.
-            DataType::Utf8 => Some(DataType::Utf8View),
+            // Both string types map: `Utf8` is the i32 2 GiB overflow case, and
+            // `LargeUtf8` is what most sources actually deliver, so excluding it
+            // made this flag a no-op on the shape it most needs to cover — a
+            // 100M-row `ClickBench` load arrives entirely as `LargeUtf8`.
+            //
+            // Mapping `LargeUtf8` narrows: a view's offset into its buffer is
+            // `i32`, so a single value above ~2 GiB (a `LONGTEXT`/JSON blob) no
+            // longer fits where `LargeUtf8`'s i64 offsets would have held it. That
+            // is why this is reached only through `force_view_read_schema`, which
+            // is opt-in — an operator asking to force view types is accepting the
+            // per-value ceiling that comes with them.
+            //
+            // Binary is still NOT mapped: Vortex's `BinaryView` path yields
+            // `LargeBinary`, which diverges from `verify_schema`.
+            DataType::Utf8 | DataType::LargeUtf8 => Some(DataType::Utf8View),
             _ => None,
         }
     }
@@ -31148,7 +31158,7 @@ mod tests {
     }
 
     #[test]
-    fn viewify_read_schema_maps_only_utf8_to_utf8view() {
+    fn viewify_read_schema_maps_both_string_types_to_utf8view() {
         use std::collections::HashMap;
         let md = HashMap::from([("k".to_string(), "v".to_string())]);
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
@@ -31164,10 +31174,12 @@ mod tests {
         ));
         let view = viewify_read_schema(&schema);
         assert_eq!(view.field(0).data_type(), &DataType::Int64);
+        // BOTH string types viewify. Excluding `LargeUtf8` left the flag inert on
+        // the shape most sources deliver, which is the whole point of setting it.
         assert_eq!(view.field(1).data_type(), &DataType::Utf8View);
-        // Only Utf8 is viewified. LargeUtf8/LargeBinary (i64 offsets) and Binary
-        // (Vortex BinaryView decode diverges to LargeBinary) are left unchanged.
-        assert_eq!(view.field(2).data_type(), &DataType::LargeUtf8);
+        assert_eq!(view.field(2).data_type(), &DataType::Utf8View);
+        // Binary is still left alone: Vortex's BinaryView decode diverges to
+        // LargeBinary, which `verify_schema` then rejects.
         assert_eq!(view.field(3).data_type(), &DataType::Binary);
         assert_eq!(view.field(4).data_type(), &DataType::LargeBinary);
         assert_eq!(view.field(5).data_type(), &DataType::Float64);
@@ -31177,13 +31189,12 @@ mod tests {
         assert!(!view.field(2).is_nullable());
         assert_eq!(view.metadata(), &md);
 
-        // No Utf8 columns (Binary / Large* / scalar) -> same Arc returned (zero
-        // allocation): Binary is not viewified (Vortex BinaryView diverges) and a
-        // MySQL JSON/BLOB column (LargeUtf8/LargeBinary) is not narrowing-cast.
+        // No string columns at all (Binary / scalar) -> same Arc returned, zero
+        // allocation. Binary stays put for the BinaryView divergence above.
         let no_view = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ls", DataType::LargeUtf8, false),
             Field::new("b", DataType::Binary, false),
+            Field::new("lb", DataType::LargeBinary, false),
         ]));
         assert!(Arc::ptr_eq(&no_view, &viewify_read_schema(&no_view)));
     }
