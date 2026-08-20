@@ -59,6 +59,7 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+const CAYENNE_SEGMENT_CACHE_MB_PARAM: &str = "cayenne_segment_cache_mb";
 const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
 const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
@@ -108,6 +109,7 @@ const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_SEGMENT_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
     CAYENNE_FILTER_PROPAGATION_PARAM,
@@ -397,6 +399,10 @@ impl RuntimeBuilder {
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_segment_cache_mb =
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SEGMENT_CACHE_MB_PARAM);
+        log_applied_cayenne_param(CAYENNE_SEGMENT_CACHE_MB_PARAM, cayenne_segment_cache_mb);
+        install_segment_cache(cayenne_segment_cache_mb);
         let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
@@ -581,30 +587,22 @@ impl RuntimeBuilder {
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let loaded_secrets = Self::load_secrets(self.app.as_ref()).await;
 
-        // Diagnostics-only: resolve every `${ store:key }` reference in the
-        // app up front so secret problems surface as one consolidated report
-        // instead of scattered per-component errors. Skipped on cluster
-        // executors, where secrets resolve via scheduler RPC and the
-        // scheduler has already validated them. Never changes component
-        // loading; never logs secret values.
-        //
-        // Runs on the owned `Secrets` before it is wrapped in the shared
-        // `RwLock` below, so no lock guard is held across the lookups' awaits.
-        // Wrapped in `in_tracing_context_async` for the same reason as
-        // `load_secrets`: this runs before `spiced::init_tracing` installs the
-        // global subscriber, so without a temporary subscriber the summary
-        // would be dropped on the floor.
+        // The secret preflight runs at the start of `Runtime::load_components`,
+        // not here: stores the runtime owns rather than the spicepod — the
+        // Cloud Connect delivered-secrets store, restored from its local cache
+        // — are registered on the built runtime, between this point and the
+        // load that resolves the references.
+        let secrets = Arc::new(RwLock::new(loaded_secrets));
+
+        // Read here because `self.resolved_cluster_config` is moved into the
+        // DataFusion builder below, and the executor's cluster status is
+        // registered once the runtime is constructed.
         let is_cluster_executor = matches!(
             self.resolved_cluster_config
                 .as_ref()
                 .and_then(ResolvedClusterConfig::effective_role),
             Some(ClusterRole::Executor)
         );
-        if !is_cluster_executor && let Some(app) = self.app.as_ref() {
-            in_tracing_context_async(crate::secrets_preflight::run(app, &loaded_secrets)).await;
-        }
-
-        let secrets = Arc::new(RwLock::new(loaded_secrets));
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
@@ -1031,6 +1029,84 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
 /// operators see at startup which override actually took effect. Only logs
 /// when `value` is `Some` (the parser already emits a warning for malformed
 /// values). See spiceai/spiceai#10970.
+/// Total byte budget for the process-wide Vortex segment cache.
+///
+/// One cache serves every Cayenne table, so this is a whole-process budget:
+/// adding a table divides this pool instead of reserving another cache of its own
+/// (spiceai/spiceai#12937). Unset derives ~1/64 of the process's memory
+/// entitlement, clamped to [256 MiB, 2 GiB] — a single-table deployment gets
+/// somewhat more than the old per-table share, while a fleet of tables can no
+/// longer multiply it. `0` disables segment caching.
+///
+/// The floor matches the old per-table floor on purpose, and is not a regression
+/// against it: the old default floored at 256 MiB *per table*, so below 16 GiB —
+/// where `RAM/64` is still under the floor — this whole-process budget is at most
+/// what a single table used to take, and strictly less for any pod with two or
+/// more. A deployment that set an explicit per-table value smaller than the floor
+/// is the one case this does not cover, and no floor would: the fix there is to
+/// set `runtime.params.cayenne_segment_cache_mb`.
+///
+/// Note `get_total_memory()` prefers the cgroup limit but falls back to host RAM,
+/// so a pod with `requests.memory` and no `limits.memory` still derives from the
+/// node's memory; that entitlement gap is tracked separately.
+fn segment_cache_budget_bytes(configured_mb: Option<usize>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const FLOOR_BYTES: u64 = 256 * MIB;
+    const CEIL_BYTES: u64 = 2048 * MIB;
+    const HOST_FRACTION: u64 = 64;
+
+    match configured_mb {
+        Some(mb) => u64::try_from(mb).unwrap_or(u64::MAX).saturating_mul(MIB),
+        // Derive in whole MiB: `get_total_memory()` is not page-aligned on every
+        // host, so dividing the byte count would give a budget whose value
+        // depends on the machine.
+        None => (crate::resource_monitor::get_total_memory() / HOST_FRACTION / MIB)
+            .clamp(FLOOR_BYTES / MIB, CEIL_BYTES / MIB)
+            .saturating_mul(MIB),
+    }
+}
+
+/// Install the process-wide Vortex segment cache, before any Cayenne table is
+/// registered so every format shares one budget.
+///
+/// Always installs a decision, even for a pod with no Cayenne table today.
+/// Datasets can be added after startup through `apply_app`/`apply_dataset_diff`,
+/// and a format that finds no decision falls back to a cache of its own — which
+/// would rebuild the per-table allocation this replaced, and would ignore a
+/// configured `0`. What *is* gated on a Cayenne table is the memory reservation
+/// (see `estimate_cayenne_reservation_bytes`): an empty Moka cache allocates
+/// nothing until something inserts into it, so installing costs nothing, while
+/// reserving against the query pool for a cache no table can read would shrink
+/// every other query's budget for nothing.
+fn install_segment_cache(configured_mb: Option<usize>) {
+    // `runtime.params.cayenne_segment_cache_mb` is the only input. Per-table values
+    // sized a per-table cache; there is no conversion from them to a shared budget
+    // that is not invented, and a single dataset's setting must not decide the
+    // budget every other table reads from. They are reported as ignored where they
+    // are read, against the dataset that set them.
+    let bytes = segment_cache_budget_bytes(configured_mb);
+
+    if bytes == 0 {
+        // Install the decision, not just the absence of one: a format must not
+        // substitute a private cache for one the operator switched off.
+        vortex_datafusion::install_process_segment_cache(0);
+        return;
+    }
+    if vortex_datafusion::install_process_segment_cache(bytes) {
+        tracing::info!(
+            "Vortex segment cache installed: {} MB shared across all Cayenne tables",
+            bytes / (1024 * 1024)
+        );
+    } else {
+        // A second runtime in one process (tests, embedded hosts) keeps the cache
+        // the first one installed; the budget is process-wide by construction.
+        tracing::debug!(
+            "Vortex segment cache already installed; keeping the existing budget and ignoring {} MB",
+            bytes / (1024 * 1024)
+        );
+    }
+}
+
 fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
     if let Some(value) = value {
         tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
@@ -1385,6 +1461,23 @@ fn plan_cayenne_memory_budgets(
     }
 }
 
+/// Whether the pod reads from a `from: cayenne` catalog.
+///
+/// Such a catalog reads an existing Cayenne store, so it declares no acceleration
+/// at all — [`cayenne_accelerations`] converts a catalog's `CatalogAcceleration`
+/// and drops the catalogs that have none, which is every catalog of this shape.
+/// It is the one way a pod hosts Cayenne tables that no acceleration block names.
+#[cfg(not(windows))]
+fn reads_from_cayenne_catalog(app: &Arc<app::App>) -> bool {
+    app.catalogs.iter().any(|catalog| {
+        catalog
+            .from
+            .split(':')
+            .next()
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cayenne"))
+    })
+}
+
 /// Every enabled Cayenne acceleration in `app`, paired with its RESOLVED write
 /// profile — the connector default is already applied for an unset `refresh_mode`
 /// (see [`connector_unset_refresh_mode`]), so a consumer cannot read the fallback
@@ -1466,14 +1559,13 @@ fn cayenne_accelerations(
 /// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
 /// sync).
 ///
-/// Two tiers of consumer, because they attach to different tables:
+/// Two tiers of consumer, because they scale differently:
 ///
-/// * The **Vortex segment cache** is a SCAN-path cache. `CayenneContext` builds one
-///   `SharedSegmentCache` the moment a table is registered, whatever its refresh
-///   mode, and it fills to its cap under query load. It is counted for EVERY enabled
-///   Cayenne acceleration. One per acceleration is exact: a partitioned dataset's
-///   children all share the parent's context, and therefore its one cache
-///   (`CayennePartitionCreator::new`).
+/// * The **Vortex segment cache** is a SCAN-path cache, and there is exactly one for
+///   the process however many tables read through it. It is counted ONCE, outside the
+///   per-acceleration fold, at whatever capacity was installed — so adding a table
+///   divides that pool rather than reserving another cache. Its presence in this
+///   estimate is gated on the pod having something to read through it at all.
 /// * The **PK keyset, CDC coalesce buffer, and inline memtable** are write-path
 ///   state that only a small-write (CDC-profile) table populates, so they are
 ///   counted only for those.
@@ -1489,10 +1581,10 @@ fn cayenne_accelerations(
 /// mmap are intentionally excluded: the tier is already capped at host/5 and the
 /// mmap is page-cache-backed.
 ///
-/// Datasets, views AND catalogs: a view registers a Cayenne table with its own
-/// segment cache exactly as a dataset does. `ViewBuilder::try_from` rejects every
-/// view refresh mode except `full`, so a view never contributes the write-path tier,
-/// but it is classified through the same predicate rather than assumed.
+/// Datasets, views AND catalogs: a view registers a Cayenne table exactly as a
+/// dataset does. `ViewBuilder::try_from` rejects every view refresh mode except
+/// `full`, so a view never contributes the write-path tier, but it is classified
+/// through the same predicate rather than assumed.
 ///
 /// A catalog contributes ONE table's worth, which is a floor rather than an
 /// estimate: it accelerates every table it discovers, and that count is unknowable
@@ -1508,7 +1600,6 @@ fn estimate_cayenne_reservation_bytes(
     const GIB: u64 = 1024 * MIB;
     // Auto-derived per-table cap fractions (mirror of the accelerator's autotune).
     const KEYSET_CACHE_HOST_FRACTION: u64 = 32; // ~1/32 host, clamped [256 MiB, 8 GiB]
-    const SEGMENT_CACHE_HOST_FRACTION: u64 = 128; // ~1/128 host, clamped [256 MiB, 1 GiB]
     const DEFAULT_COALESCE_BYTES: u64 = 128 * MIB;
     const DEFAULT_INLINE_BYTES: u64 = 8 * MIB;
 
@@ -1530,21 +1621,14 @@ fn estimate_cayenne_reservation_bytes(
         parse_u64(runtime_params, &["cdc_max_coalesced_bytes"]).unwrap_or(DEFAULT_COALESCE_BYTES);
 
     let mut total: u64 = 0;
+    let mut has_cayenne_acceleration = false;
     for (accel, profile) in cayenne_accelerations(app) {
+        has_cayenne_acceleration = true;
         let params = accel
             .params
             .as_ref()
             .map(spicepod::param::Params::as_string_map)
             .unwrap_or_default();
-        // Scan-path cache: allocated per registered Cayenne acceleration regardless
-        // of refresh mode.
-        let segment = parse_u64(&params, &["cayenne_segment_cache_mb", "segment_cache_mb"])
-            .map_or_else(
-                || (total_memory / SEGMENT_CACHE_HOST_FRACTION).clamp(256 * MIB, GIB),
-                |mb| mb.saturating_mul(MIB),
-            );
-        total = total.saturating_add(segment);
-
         // Inline-admission state: the bounded Arrow buffer a write is admitted
         // through, plus the Arrow IPC entry it serializes into. Byte-valued
         // params, so no MB conversion; the accelerator's key lists (with the
@@ -1601,6 +1685,22 @@ fn estimate_cayenne_reservation_bytes(
             .saturating_add(keyset)
             .saturating_add(coalesce)
             .saturating_add(inline);
+    }
+
+    // Scan-path cache: one process-wide cache shared by every table, so it is
+    // counted once rather than per acceleration — and only when something exists
+    // to use it, since reserving against the query pool for a cache no table can
+    // read would shrink every other query's budget for nothing. Reading the
+    // installed capacity rather than recomputing the budget also reports zero
+    // when caching is switched off.
+    //
+    // Catalogs count as much as datasets here: a `from: cayenne` catalog builds
+    // its tables through `CayenneTableProviderBuilder` and `CayenneContext`, which
+    // read from the same shared cache. A catalog-only pod would otherwise keep the
+    // full query pool while the cache filled beside it.
+    if has_cayenne_acceleration || reads_from_cayenne_catalog(app) {
+        total = total
+            .saturating_add(vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0));
     }
     total
 }
@@ -1991,6 +2091,116 @@ fn parse_cayenne_optimizer_rules(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn dataset_with_cayenne(
+        name: &str,
+        segment_cache_mb: Option<&str>,
+    ) -> spicepod::component::dataset::Dataset {
+        let mut dataset = spicepod::component::dataset::Dataset::new("postgres:public.t", name);
+        let mut acceleration = spicepod::acceleration::Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            ..Default::default()
+        };
+        if let Some(mb) = segment_cache_mb {
+            acceleration.params = Some(spicepod::param::Params::from_string_map(
+                [("cayenne_segment_cache_mb".to_string(), mb.to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        dataset.acceleration = Some(acceleration);
+        dataset
+    }
+
+    /// A pod with no Cayenne acceleration must reserve nothing. The reservation is
+    /// subtracted from the query memory limit, so counting a cache that is never
+    /// installed would shrink every query's budget for memory nothing allocates.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_cayenne_acceleration_reserves_nothing() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(spicepod::component::dataset::Dataset::new(
+                    "postgres:public.t",
+                    "plain",
+                ))
+                .build(),
+        );
+        assert_eq!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()),
+            0,
+            "a pod with no Cayenne table reserves nothing, segment cache included"
+        );
+    }
+
+    /// The counterpart to the no-Cayenne case: a pod that does have a Cayenne
+    /// table reserves its write-path state, so the gate above is what decides,
+    /// not an empty estimator.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_acceleration_reserves_its_write_path_state() {
+        let app = Arc::new(
+            app::AppBuilder::new("test")
+                .with_dataset(dataset_with_cayenne("accelerated", None))
+                .build(),
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
+            "a Cayenne table reserves against the query pool"
+        );
+    }
+
+    /// A catalog-only pod hosts Cayenne tables with no dataset acceleration block,
+    /// so the reservation has to see it or the shared cache grows beside a query
+    /// pool that never accounted for it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cayenne_catalog_reserves_even_without_a_dataset_acceleration() {
+        let catalog =
+            spicepod::component::catalog::Catalog::new("cayenne".to_string(), "cat".to_string());
+        let app = Arc::new(app::AppBuilder::new("test").with_catalog(catalog).build());
+        assert!(
+            reads_from_cayenne_catalog(&app),
+            "a `from: cayenne` catalog must be recognized"
+        );
+        assert!(
+            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0
+                || vortex_datafusion::process_segment_cache_capacity_bytes().is_none(),
+            "a catalog-only pod reserves the shared cache when one is installed"
+        );
+    }
+
+    #[test]
+    fn segment_cache_budget_honours_an_explicit_value() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(segment_cache_budget_bytes(Some(512)), 512 * MIB);
+        // Below the derived floor on purpose: an explicit value is the operator's
+        // call, not a hint to clamp.
+        assert_eq!(segment_cache_budget_bytes(Some(16)), 16 * MIB);
+        assert_eq!(
+            segment_cache_budget_bytes(Some(0)),
+            0,
+            "zero disables segment caching"
+        );
+    }
+
+    #[test]
+    fn segment_cache_budget_default_stays_within_its_bounds() {
+        const MIB: u64 = 1024 * 1024;
+        // Derived from the host, so assert the contract rather than a figure: one
+        // shared budget between 256 MiB and 2 GiB, whatever the machine.
+        let derived = segment_cache_budget_bytes(None);
+        assert!(
+            (256 * MIB..=2048 * MIB).contains(&derived),
+            "derived budget {derived} out of bounds"
+        );
+        assert!(
+            derived.is_multiple_of(MIB),
+            "the budget is a whole number of MiB"
+        );
+    }
 
     #[test]
     fn test_parse_memory_limit() {

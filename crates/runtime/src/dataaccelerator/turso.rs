@@ -41,6 +41,13 @@ limitations under the License.
 //! connector** (for source datasets), where remote access patterns are the primary use case
 //! and local acceleration is not the goal.
 
+use super::resolved_refresh_mode;
+use data_accelerator_api::make_spice_data_directory;
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
@@ -56,18 +63,18 @@ use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{
-        AcceleratorEngineRegistry, FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::FilePathError,
     datafusion::udf::deny_spice_specific_functions,
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_turso::TursoSidecar;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -579,10 +586,36 @@ impl DataAccelerator for TursoAccelerator {
     ///
     /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
     /// parameters are provided in the acceleration configuration.
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let turso_file = self
+            .turso_file_path(source)
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&turso_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("Turso file does not exist at {turso_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         // Reject remote database configurations (not supported as accelerators)
         // Note: This is an accelerator-specific limitation. Remote databases will be
@@ -639,6 +672,7 @@ impl DataAccelerator for TursoAccelerator {
                         AccelerationEngine::Turso,
                         Arc::new(arrow_schema::Schema::empty()),
                         None,
+                        resolved_refresh_mode(source, acceleration),
                     )
                     .await;
 
@@ -670,10 +704,10 @@ impl DataAccelerator for TursoAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                 AccelerationEngine::Turso,
                 None,
+                resolved_refresh_mode(source, acceleration),
             )
             .await;
 
@@ -1051,7 +1085,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 
@@ -1091,9 +1125,7 @@ mod tests {
         });
 
         let accelerator = TursoAccelerator::new();
-        let result = accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
-            .await;
+        let result = accelerator.init(&dataset).await;
         assert!(result.is_err());
         let error = result.expect_err("Expected error for remote Turso database");
         assert!(
@@ -1123,9 +1155,7 @@ mod tests {
             ..Default::default()
         });
 
-        let result2 = accelerator
-            .init(&dataset2, dataset2.runtime.accelerator_engine_registry())
-            .await;
+        let result2 = accelerator.init(&dataset2).await;
         assert!(result2.is_err());
         let error2 = result2.expect_err("Expected error for remote Turso database with auth token");
         assert!(
@@ -1497,7 +1527,7 @@ mod tests {
 
         // Initialize the accelerator
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 

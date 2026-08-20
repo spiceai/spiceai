@@ -45,6 +45,10 @@ use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
 
+use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::synthetic_object_meta;
+
 /// How [`VortexSink`] fans a single input stream into N concurrent file writers.
 ///
 /// `Single` reproduces the historical one-writer-per-statement behavior. The
@@ -308,6 +312,9 @@ impl DataSink for VortexSink {
         // parallelizes Vortex encode across shards (the framework demuxer does
         // not).
         if !self.config.table_partition_cols.is_empty() {
+            // No write-time footer caching on this path: partitioned tables are
+            // listed with real store mtimes, so an epoch-stamped entry (see
+            // `synthetic_object_meta`) could never validate.
             return FileSink::write_all(self, data, context).await;
         }
 
@@ -343,6 +350,10 @@ impl DataSink for VortexSink {
         .await?;
 
         let mut row_count = 0_u64;
+        let file_metadata_cache = context
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
         for (path, summary) in summaries {
             row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
                 exec_datafusion_err!(
@@ -351,6 +362,17 @@ impl DataSink for VortexSink {
                     summary.row_count()
                 )
             })?;
+            // Cache the just-written footer so the first post-write scan skips
+            // the cold footer read. Only readers that list from recorded
+            // metadata can hit this entry (see `synthetic_object_meta`);
+            // listings carrying real store mtimes miss and read the footer as
+            // before.
+            cache_footer(
+                &file_metadata_cache,
+                synthetic_object_meta(path.clone(), summary.size()),
+                Arc::new(CachedVortexMetadata::from_footer(summary.footer().clone())),
+                "write",
+            );
             tracing::debug!(path = %path, "Successfully written file");
         }
 
@@ -943,6 +965,58 @@ mod tests {
             &batches
         );
 
+        Ok(())
+    }
+
+    /// Write-time footer-cache population: `write_all` caches each written
+    /// file's footer, so the first post-write scan (e.g. right after an
+    /// acceleration refresh) skips the cold footer read.
+    #[tokio::test]
+    async fn test_write_all_populates_file_metadata_cache() -> anyhow::Result<()> {
+        use crate::persistent::cache::CachedVortexMetadata;
+
+        let ctx = TestSessionContext::default();
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                    (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/';",
+            )
+            .await?;
+
+        let cache = ctx
+            .session
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
+
+        ctx.session
+            .sql("INSERT INTO my_tbl VALUES ('hello', 1), ('world', 2);")
+            .await?
+            .collect()
+            .await?;
+
+        let entries = cache.list_entries();
+        assert!(
+            !entries.is_empty(),
+            "write_all must cache the written files' footers"
+        );
+        for path in entries.keys() {
+            let entry = cache.get(path).expect("entry for listed path");
+            // The cached footer is complete: usable without reading the file back.
+            let footer = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedVortexMetadata>()
+                .expect("cached entry holds Vortex footer metadata")
+                .footer();
+            assert_eq!(footer.row_count(), 2);
+            // The validation meta carries the epoch mtime `synthetic_object_meta`
+            // stamps, so recorded-metadata listings can match it.
+            assert!(entry.meta.size > 0);
+            assert_eq!(entry.meta.last_modified.timestamp(), 0);
+        }
         Ok(())
     }
 

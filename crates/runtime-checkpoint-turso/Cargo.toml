@@ -23,8 +23,12 @@ license-file.workspace = true
 description = "Per-dataset blob checkpoint store backed by a Turso accelerator (implements runtime-checkpoint-api::BlobCheckpointStore)."
 
 [dependencies]
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+arrow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
 data_components = { path = "../data_components", features = ["turso"] }
 turso.workspace = true
 

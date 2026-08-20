@@ -31,6 +31,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use snafu::Snafu;
 
+use crate::identity::AppAttachment;
 use crate::sealed_secrets::DeliveredSecrets;
 
 /// Why a command did not succeed.
@@ -259,9 +260,10 @@ pub struct SpicepodDeployment<'a> {
     /// The spicepod to apply, verbatim.
     pub spicepod_yaml: &'a str,
     /// App secrets that rode the same dispatch, already opened (see
-    /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because
-    /// applying is a restart: secrets that landed afterwards would arrive after
-    /// the components that referenced them had already tried to load.
+    /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because a
+    /// component resolves its secrets as it loads: values that landed
+    /// afterwards would arrive after the components referencing them had
+    /// already tried.
     ///
     /// `None` means the deployment carried none, which is distinct from an
     /// empty map — an app whose secrets were all removed.
@@ -273,53 +275,6 @@ pub struct SpicepodDeployment<'a> {
     ///
     /// `None` when the control plane named no app.
     pub app_id: Option<&'a str>,
-}
-
-/// What the client must do once the result of an apply has been sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PostApply {
-    /// Nothing. The instance is already serving this deployment, so there is
-    /// nothing left to make live.
-    #[default]
-    Nothing,
-    /// The spicepod is persisted but not live: exit the process
-    /// ([`RuntimeHandle::exit_to_apply`]) so the supervisor relaunches it on
-    /// the new configuration.
-    ExitToApply,
-}
-
-/// What an [`ApplySpicepod`](crate::proto::ApplySpicepod) produced: the document
-/// the control plane reads, and what has to happen next for it to take effect.
-///
-/// `Debug` carries only what already goes to the control plane — the result
-/// document and the follow-up action — so there is nothing here a log line
-/// could leak. A delivered secret never reaches this type.
-#[derive(Debug)]
-pub struct ApplyOutcome {
-    /// JSON summary of what was applied, returned as the command payload.
-    pub document: serde_json::Value,
-    pub post_apply: PostApply,
-}
-
-impl ApplyOutcome {
-    /// The deployment is already live; the result is the whole answer.
-    #[must_use]
-    pub fn settled(document: serde_json::Value) -> Self {
-        Self {
-            document,
-            post_apply: PostApply::Nothing,
-        }
-    }
-
-    /// The deployment is persisted and takes effect on the restart the client
-    /// triggers once this result is on the wire.
-    #[must_use]
-    pub fn exit_to_apply(document: serde_json::Value) -> Self {
-        Self {
-            document,
-            post_apply: PostApply::ExitToApply,
-        }
-    }
 }
 
 /// Runtime readiness: the reply to `GetStatus`, and the source of the phase
@@ -385,14 +340,23 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// The message returned when `capability` is dispatched anyway.
     ///
     /// The default merely names the command. Override it wherever the
-    /// instance can say something the operator can act on — "there is no
-    /// supervisor to restart this process" beats "not implemented".
+    /// instance can say something the operator can act on — "upgrade it the way
+    /// you installed it" beats "not implemented".
     fn unsupported_reason(&self, capability: Capability) -> String {
         format!(
             "{} is not supported by this instance",
             capability.wire_name()
         )
     }
+
+    /// Clear Cloud-delivered values still held by the runtime after a
+    /// cloud-dispatched `Remove` has durably cleared their persisted cache.
+    ///
+    /// Already-loaded components may retain values they resolved into their
+    /// own in-memory configuration; a standalone runtime deliberately keeps
+    /// serving after removal, so stopping or restarting those components
+    /// remains the local operator's decision.
+    async fn clear_cloud_delivered_secrets(&self);
 
     /// Number of active datasets currently loaded.
     async fn active_datasets(&self) -> u32 {
@@ -415,22 +379,19 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     }
 
     /// Persist a cloud-managed spicepod as the configuration this instance
-    /// starts on.
+    /// starts on, and put as much of it into effect as the handle can.
     ///
-    /// The spicepod is validated and persisted, and how it becomes live is the
-    /// handle's to decide: one that reconciled the change into the running
-    /// process returns [`PostApply::Nothing`] and reports the deployment as
-    /// live, one that cannot returns [`PostApply::ExitToApply`] and is restarted
-    /// onto the file it persisted. Redelivering a deployment the instance is
-    /// already serving must return [`PostApply::Nothing`] — restarting for it
-    /// would make a redelivery a restart loop.
+    /// An apply never ends or interrupts the process: it answers with the
+    /// document the control plane reads, and an implementation that cannot put
+    /// part of the deployment into effect says so in that document rather than
+    /// restarting to get there. Redelivering a deployment the instance is
+    /// already serving is a no-op that answers the same way.
     ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
     /// filesystem write does not block the runtime worker thread. It cannot
-    /// restart the process, so it reports `applied: false` and
-    /// [`PostApply::Nothing`]: the file is on disk and the next start — whenever
-    /// that is — picks it up.
+    /// apply anything to a running process, so it reports `applied: false`: the
+    /// file is on disk and the next start — whenever that is — picks it up.
     ///
     /// The default **refuses** a deployment that carries secrets rather than
     /// writing the spicepod and dropping them: an adapter that cannot apply
@@ -442,7 +403,7 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
-    ) -> Result<ApplyOutcome, CommandError> {
+    ) -> Result<serde_json::Value, CommandError> {
         if deployment
             .delivered_secrets
             .is_some_and(|secrets| !secrets.is_empty())
@@ -466,29 +427,11 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
-        Ok(ApplyOutcome::settled(serde_json::json!({
+        Ok(serde_json::json!({
             "path": path.display().to_string(),
             "applied": false,
             "note": "spicepod written to disk; restart spiced (or implement RuntimeHandle::apply_spicepod) to take effect",
-        })))
-    }
-
-    /// Exit the process so the supervisor relaunches it on the spicepod
-    /// [`RuntimeHandle::apply_spicepod`] just persisted.
-    ///
-    /// Called only after the command result has been flushed, and only for
-    /// [`PostApply::ExitToApply`]. It is not expected to return; an
-    /// implementation that returns has failed to exit, and the client says so
-    /// rather than leaving the control plane to infer it from a deployment that
-    /// never goes live.
-    ///
-    /// The default reports that this adapter cannot restart itself — which is
-    /// why the default `apply_spicepod` never asks for it.
-    async fn exit_to_apply(&self) {
-        tracing::error!(
-            "Spice Cloud Connect: this runtime adapter cannot restart itself, so the persisted \
-             spicepod stays pending until the process is restarted"
-        );
+        }))
     }
 
     /// Restart the runtime with the requested `mode`.
@@ -543,6 +486,27 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         ))
     }
 
+    /// The configuration sections whose deployed value is not the one this
+    /// process is running with, sorted and deduplicated: what a restart would
+    /// put into effect. Stamped on every heartbeat.
+    ///
+    /// Not a [`Capability`]: the client pushes it with the heartbeat rather than
+    /// answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `None` and `Some` of an empty set are different answers, and the control
+    /// plane reads them as different states: `None` means this instance has no
+    /// restart-state source of truth and claims nothing, an empty `Some` means
+    /// it looked and nothing is pending. The default is `None` for that reason —
+    /// a handle with nothing to read must never send an empty set as a stand-in
+    /// for "unknown".
+    ///
+    /// An implementation answers from the same place its [`Self::status`]
+    /// document does, so the heartbeat and that document cannot disagree about
+    /// what is pending.
+    async fn restart_required(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// The instance's current metrics, as a serialized OTLP
     /// `ExportMetricsServiceRequest`.
     ///
@@ -558,11 +522,18 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Apply the control plane's current app attachment state.
+    /// Apply the control plane's current app attachment state: the attached
+    /// app plus the portal metadata that describes it, as one tuple.
     ///
-    /// `None` means detached. A present value is always non-empty; the client
-    /// rejects an empty present value before invoking the handle.
-    async fn attach_app(&self, _app_id: Option<&str>) -> Result<serde_json::Value, CommandError> {
+    /// `None` means detached. A present attachment always carries a non-empty
+    /// `app_id`, and its optional members are non-empty when present; the
+    /// client rejects empty present values before invoking the handle. An
+    /// implementation persists the tuple as a unit — see
+    /// [`crate::IdentityStore::set_attachment`] for the detach semantics.
+    async fn attach_app(
+        &self,
+        _attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
         Err(CommandError::unsupported(
             "AttachApp is not implemented in this build",
         ))
@@ -625,6 +596,9 @@ impl RuntimeHandle for NoopRuntimeHandle {
     fn supports(&self, _capability: Capability) -> bool {
         false
     }
+
+    // This stand-in has no delivered-secret store to clear.
+    async fn clear_cloud_delivered_secrets(&self) {}
 }
 
 #[cfg(test)]
@@ -663,7 +637,13 @@ mod tests {
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(
-            h.attach_app(Some("4002")).await,
+            h.attach_app(Some(&AppAttachment {
+                app_id: "4002".to_string(),
+                org_name: None,
+                app_name: None,
+                monitor_url: None,
+            }))
+            .await,
             Err(CommandError::Unsupported { .. })
         ));
         assert!(matches!(
@@ -685,6 +665,9 @@ mod tests {
             fn supports(&self, capability: Capability) -> bool {
                 capability == Capability::ExecuteQuery
             }
+
+            // This query-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
         }
 
         assert_eq!(
@@ -711,10 +694,10 @@ mod tests {
         assert_eq!(effective_max_rows(u32::MAX), MAX_QUERY_ROWS);
     }
 
-    /// The default apply persists the spicepod but cannot make it live, so it
-    /// must not ask the client to exit — nothing would bring the process back.
+    /// The default apply persists the spicepod but cannot put it into effect,
+    /// and says so rather than reporting a deployment that is not serving.
     #[tokio::test]
-    async fn default_apply_persists_without_asking_for_a_restart() {
+    async fn default_apply_persists_without_claiming_to_be_live() {
         let dir = std::env::temp_dir().join(format!(
             "spice-handlers-default-apply-{}",
             std::process::id()
@@ -731,8 +714,7 @@ mod tests {
             .await
             .expect("the default apply writes the spicepod");
 
-        assert_eq!(outcome.post_apply, PostApply::Nothing);
-        assert_eq!(outcome.document["applied"], false);
+        assert_eq!(outcome["applied"], false);
         let written = std::fs::read_to_string(dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE))
             .expect("spicepod written");
         assert!(written.contains("name: default-apply"));

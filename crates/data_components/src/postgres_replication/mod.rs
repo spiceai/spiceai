@@ -29,6 +29,7 @@ pub mod config;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
+pub mod retention;
 pub mod schema_evolution;
 pub mod shared;
 pub mod slot;
@@ -43,6 +44,7 @@ use crate::cdc::{ChangesStream, StreamError};
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
+pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
@@ -204,12 +206,16 @@ pub struct AppliedLsn {
 ///
 /// * `watermark` — the LSN the acceleration's contents are complete as of, or
 ///   `None` when none has been recorded.
-/// * `slot_restart_lsn` — the earliest LSN the slot can still stream from, or
-///   `None` when the slot does not exist.
+/// * `slot_earliest_streamable_lsn` — the earliest LSN the slot can still stream
+///   from, or `None` when the slot does not exist. This is the later of its
+///   `restart_lsn` and its `confirmed_flush_lsn`, not `restart_lsn` alone:
+///   Postgres forwards a start position below `confirmed_flush_lsn` up to it, so
+///   an acknowledged change cannot be re-streamed even while its WAL is retained.
 /// * `absence_implies_gap` — whether a *missing* watermark is evidence of one.
 ///   True when the acceleration survives restarts (so it can hold rows this
-///   process did not load) and a position could have been recorded (so absence
-///   is informative rather than permanent).
+///   process did not load), a position could have been recorded (so absence is
+///   informative rather than permanent), and the acceleration is not known to be
+///   empty (see below).
 ///
 /// A watermark the slot cannot reach is a gap nothing can fill: the changes in
 /// between are gone from the source's log, so a row deleted there would never be
@@ -222,10 +228,43 @@ pub struct AppliedLsn {
 /// acceleration with no recorded position is rebuilt rather than assumed fresh:
 /// on a genuinely first load the rebuild reads the same rows the bootstrap would
 /// have, and on an upgraded one it repairs divergence that is already there.
+///
+/// What settles that question is the acceleration's *contents*, not its record.
+/// An acceleration observed to hold no rows has nothing that could be stale and
+/// no deletion it could be missing, so absence of a watermark tells against
+/// nothing and the load can proceed through the ordinary snapshot bootstrap.
+/// Only a positive observation of emptiness counts
+/// ([`crate::cdc::AccelerationContents::is_provably_empty`]); a probe that could
+/// not answer leaves the rebuild in place.
+///
+/// Emptiness alone is not enough, and callers must not pass it through on its
+/// own: it licenses skipping the rebuild only when a snapshot is actually going
+/// to run. If nothing else loads the table, the rebuild is the only thing that
+/// would, and skipping it resumes from the slot's position with every earlier
+/// row missing for good.
+///
+/// # Why an unreachable watermark rebuilds even with snapshots disabled
+///
+/// `pg_replication_initial_snapshot: disabled` says "do not read the source table
+/// to populate this acceleration", so answering slot loss with a full re-read
+/// looks like it contradicts the setting. It does not, and the alternative is
+/// worse. `disabled` is a preference about *initial load* — how the acceleration
+/// comes into existence — not a licence to keep serving one that is known to have
+/// diverged. Once the slot cannot stream from the recorded position, a row deleted
+/// at the source in that window has no change event left to carry the deletion, so
+/// every later query answers from rows the source no longer has.
+///
+/// The apparent alternative — make it terminal, and let an operator decide — does
+/// not exist today: a fatal changes-stream error marks the dataset's status
+/// `Error` but does not stop its accelerated table from serving, so "terminal"
+/// means serving those same wrong rows indefinitely with a status field to say so.
+/// Between a re-read the operator did not ask for and an answer that is wrong, the
+/// re-read wins. Revisit only if a post-load fatal can make the table refuse a
+/// scan (#13218); until then this arm is deliberate, not inherited.
 #[must_use]
 pub fn needs_rebuild(
     position: &RecordedPosition,
-    slot_restart_lsn: Option<u64>,
+    slot_earliest_streamable_lsn: Option<u64>,
     absence_implies_gap: bool,
 ) -> bool {
     match position {
@@ -238,10 +277,10 @@ pub fn needs_rebuild(
         // leave the old source's rows in place while never loading the new
         // source's.
         RecordedPosition::ForeignSource => true,
-        // A gap when there is no slot at all, or when the slot's earliest
-        // retained position is already past the watermark.
+        // A gap when there is no slot at all, or when the slot can no longer
+        // stream from as far back as the watermark.
         RecordedPosition::At(watermark) => {
-            slot_restart_lsn.is_none_or(|earliest| earliest > watermark.lsn)
+            slot_earliest_streamable_lsn.is_none_or(|earliest| earliest > watermark.lsn)
         }
     }
 }
@@ -518,5 +557,47 @@ mod tests {
         // being mistaken for "never loaded".
         assert!(needs_rebuild_persist(at(0), Some(1)));
         assert!(needs_rebuild_persist(at(0), None));
+    }
+
+    /// `needs_rebuild` takes no `snapshotting` argument, so this is structural
+    /// rather than conditional — but it is the answer to a real question (whether
+    /// `pg_replication_initial_snapshot: disabled` should make slot loss terminal
+    /// instead), and structure is exactly what a later change could quietly undo.
+    #[test]
+    fn an_unreachable_watermark_rebuilds_even_where_snapshots_are_disabled() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+        // `disabled` reaches this decision as a durable acceleration whose
+        // watermark the slot can no longer stream from — the same inputs as any
+        // other acceleration, because whether an *initial* snapshot may run says
+        // nothing about whether these rows are still current.
+        assert!(
+            needs_rebuild(&at(100), Some(101), true),
+            "a diverged acceleration is re-read rather than served"
+        );
+        // And the setting does not make a resumable gap into a rebuild either:
+        // where the slot still reaches the watermark, `disabled` resumes like
+        // everything else and never re-reads the source.
+        assert!(!needs_rebuild(&at(100), Some(100), true));
+    }
+
+    /// The caller passes the later of `restart_lsn` and `confirmed_flush_lsn`,
+    /// because Postgres forwards a start position below `confirmed_flush_lsn` up to
+    /// it. Retained WAL that the slot has already acknowledged is therefore *not*
+    /// streamable, and treating it as such is a silent skip (#11289).
+    #[test]
+    fn an_acknowledged_change_is_a_gap_even_while_its_wal_is_retained() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+        // A slot retaining from 40 but acknowledged to 200 cannot supply a
+        // watermark of 100, even though 100 sits inside the retained range.
+        let restart_lsn: u64 = 40;
+        let confirmed_flush_lsn: u64 = 200;
+        assert!(
+            needs_rebuild(&at(100), Some(restart_lsn.max(confirmed_flush_lsn)), true),
+            "a watermark behind the acknowledged position is unreachable"
+        );
+        assert!(
+            !needs_rebuild(&at(100), Some(restart_lsn), true),
+            "control: comparing against retention alone calls the same gap resumable"
+        );
     }
 }

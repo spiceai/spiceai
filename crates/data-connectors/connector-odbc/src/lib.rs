@@ -28,16 +28,17 @@ use crate::odbcconn::ODBCDbConnectionPool;
 use crate::odbcpool::ODBCPool;
 use async_trait::async_trait;
 use data_components::Read;
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    NewDataConnectorResult,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
-    NewDataConnectorResult,
-};
+use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
@@ -233,10 +234,11 @@ impl DataConnectorFactory for ODBCFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;
             parameter_is_integer(&params.parameters, "max_text_size")?;
@@ -312,13 +314,14 @@ where
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
                 .map_err(|source| {
-                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                    data_connector_api::DataConnectorError::UnableToGetReadProvider {
                         dataconnector: "odbc".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source,
@@ -373,10 +376,10 @@ mod test {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_odbc as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_odbc_connector,
     ODBC_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

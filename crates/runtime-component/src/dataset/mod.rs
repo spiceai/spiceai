@@ -376,6 +376,9 @@ pub struct DatasetSpec {
     pub metrics: Metrics,
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<spicepod::fts::FtsStore>,
+    /// Forwards this dataset's CDC stream to a Drasi source. Requires
+    /// `acceleration.refresh_mode: changes`.
+    pub drasi: Option<spicepod::drasi::Drasi>,
     pub check_availability: CheckAvailability,
     /// How often the availability monitor probes this (non-accelerated)
     /// dataset's source, parsed from the Spicepod duration string at
@@ -408,6 +411,7 @@ impl std::fmt::Debug for DatasetSpec {
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
+            .field("drasi", &self.drasi)
             .field("check_availability", &self.check_availability)
             .field(
                 "check_availability_interval",
@@ -442,10 +446,48 @@ impl PartialEq for DatasetSpec {
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
             && self.check_availability_interval == other.check_availability_interval
+            // Compared so a reload that only edits `drasi:` still recreates the
+            // dataset: the forwarder is built when the connector is, so an
+            // unequal-but-untracked block would leave the old one running.
+            && self.drasi == other.drasi
     }
 }
 
 impl DatasetSpec {
+    /// A spec for the dataset `name` read from `from`, with every other field at
+    /// its default. Callers that need more set the fields they care about;
+    /// `DatasetBuilder` in the runtime builds the fully-configured spec from a
+    /// Spicepod definition.
+    #[must_use]
+    pub fn new(from: impl Into<String>, name: TableReference) -> Self {
+        Self {
+            from: from.into(),
+            name,
+            access: AccessMode::default(),
+            params: HashMap::default(),
+            metadata: HashMap::default(),
+            columns: Vec::default(),
+            schema: None,
+            has_metadata_table: false,
+            replication: None,
+            time_column: None,
+            time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
+            acceleration: None,
+            embeddings: Vec::default(),
+            unsupported_type_action: None,
+            on_schema_change: OnSchemaChange::default(),
+            ready_state: ReadyState::default(),
+            metrics: Metrics::default(),
+            vectors: None,
+            full_text_search: None,
+            drasi: None,
+            check_availability: CheckAvailability::default(),
+            check_availability_interval: None,
+        }
+    }
+
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
     pub fn source(&self) -> &str {

@@ -53,7 +53,8 @@ use super::on_conflict::{
     PkDeletionSnapshot, PkKeysetInvalidatingDeletionSink, PreparedInsertStream,
     PreparedOnConflictDeletionPublish, PreparedOnConflictDurablePayload,
     PreparedProtectedSnapshotUpdate, PreparedShardedInsertStream, ProtectedSnapshotScan,
-    RowKeyDeletionDelta, ShardedApplyResult, pk_deletion_snapshot_for_strategy,
+    RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyResult,
+    pk_deletion_snapshot_for_strategy,
 };
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
@@ -1522,6 +1523,16 @@ pub struct CayenneTableProvider {
     /// concurrent maintenance tasks cannot merge from the same cached base and
     /// overwrite each other's row-count or column-stat deltas.
     table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set when a durable `num_rows_exact` taint (or an authoritative `Set`) failed
+    /// to persist, so the metastore's exactness bit is known to over-claim.
+    ///
+    /// The local demotion in the statistics cache is not enough on its own: the
+    /// statistics merge re-derives the prior exactness from the persisted record,
+    /// which still reads exact, so the next provably-exact `Delta` would republish
+    /// the stale count as `Exact` and undo the demotion. While this is set, no merge
+    /// may report an exact count and every later `DELETE` retries the durable write.
+    /// Cleared by the write that finally lands.
+    row_count_taint_pending: Arc<AtomicBool>,
     /// Optional retention filters that should be applied immediately after writes.
     retention_filters: Vec<Expr>,
     /// Optional builder to construct time-based retention filter.
@@ -2928,6 +2939,26 @@ impl ProtectedMergeSelection {
     }
 }
 
+/// Whether a write may fan its encode across shards at all.
+///
+/// The partition count a caller passes alongside this is a *hint*: ordinary
+/// writes inherit it from whichever session is executing them, so it can be
+/// small for reasons that have nothing to do with this write, and a configured
+/// `cayenne_write_concurrency` is meant to survive that. A write whose output
+/// shape is load-bearing therefore states it here instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeFanOut {
+    /// Size the fan-out from the configured write concurrency and the byte
+    /// estimate. The overwhelming majority of writes.
+    Sized,
+    /// One encoder, whatever the configuration says. Required where the output
+    /// must be a single sequence of files: a position-delete table's merge
+    /// (its tombstones are file-path scoped and the rewrite's position bake-in
+    /// assumes one output sequence), and a Z-order-clustered cold promotion
+    /// (sharding scatters the clustering the promotion exists to create).
+    Serial,
+}
+
 /// Write shape — encoder fan-out cap and size estimate — for the
 /// subset-merge output (see `compact_protected_snapshots_subset`).
 ///
@@ -3883,6 +3914,8 @@ impl CayenneTableProvider {
 
         let mut deleted = 0u64;
         let mut skipped_errors = 0u64;
+        let mut retired_cache_paths = HashSet::new();
+        let mut retired_listing_dirs = HashSet::new();
         for full_url in to_delete {
             // Map the absolute URL back to the store-relative path for deletion.
             let Some(rel) = full_url.strip_prefix(object_store_url_str.as_str()) else {
@@ -3894,6 +3927,10 @@ impl CayenneTableProvider {
                 // another sweep or manual cleanup), not a retryable failure.
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                     deleted += 1;
+                    retired_cache_paths.insert(path);
+                    if let Some((dir, _)) = full_url.rsplit_once('/') {
+                        retired_listing_dirs.insert(format!("{dir}/"));
+                    }
                     self.cold_gc_orphaned_first_seen.lock().remove(&full_url);
                 }
                 Err(error) => {
@@ -3908,6 +3945,27 @@ impl CayenneTableProvider {
                 }
             }
         }
+        // Key-delete scans build one `ListingTable` per live cold directory.
+        // A directory can contain both live manifest files and an orphan from
+        // an earlier generation, so deleting only that orphan leaves the
+        // directory in service. Evict its infinite-TTL listing after the
+        // physical delete; otherwise the next delete can try to open the now
+        // absent file even though the manifest no longer references it.
+        //
+        // Before the segment cache below, deliberately: this eviction is
+        // synchronous while segment invalidation enumerates a cache holding every
+        // table's segments on the blocking pool. Leaving the stale listing in
+        // place across that await is long enough for a concurrent key-delete scan
+        // to pick it up and fail opening an object this sweep already removed.
+        for dir in retired_listing_dirs {
+            Self::invalidate_list_files_cache(self.context.runtime_env(), &dir);
+        }
+        // Cold scans use the same shared Vortex format as warm scans. Evict
+        // exactly the successfully absent objects after the physical sweep so
+        // superseded generations cannot occupy the bounded segment cache, which
+        // is process-wide: what they hold is taken from every other table too.
+        self.invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -4014,6 +4072,7 @@ impl CayenneTableProvider {
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
             let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
+            let file_format = Arc::clone(self.context.file_format());
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4028,48 +4087,104 @@ impl CayenneTableProvider {
                 // long-running query's Vortex files are not deleted mid-read; a
                 // later compaction's cleanup retries any dir deferred here.
                 protected_snapshot_ids.extend(snapshot_scan_refs.lock().keys().cloned());
-                // Ref-count source: the manifest, read AFTER the grace so it
-                // reflects the same live set the protected read above does. A
-                // live/protected snapshot can reference a data file that lives
-                // in an old snapshot's dir (an in-place compaction reference);
-                // those files must survive even though their dir is "old". The
-                // in-flight scan snapshots added above are part of the live set,
-                // so their referenced files are protected too.
-                let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        // Reading the manifest is the safety gate; on failure do
-                        // NOT delete (a referenced file could be orphaned).
-                        tracing::warn!(
-                            "Old-snapshot cleanup skipped for table {table_id}: failed to read \
-                             snapshot manifest ({error})"
-                        );
-                        return;
-                    }
-                };
-                let manifest_populated = !all_rows.is_empty();
-                let mut live_snapshot_ids = protected_snapshot_ids.clone();
-                live_snapshot_ids.insert(current_snapshot.clone());
-                let live_referenced =
-                    Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = Self::cleanup_old_snapshots_blocking(
-                        &table_path,
-                        &table_id,
-                        &current_snapshot,
-                        &protected_snapshot_ids,
-                        manifest_populated,
-                        &live_referenced,
-                    ) {
-                        tracing::warn!(
-                            "Failed to cleanup old snapshots for table {}: {e}",
-                            table_id
-                        );
-                    }
-                })
-                .await;
+                if let Err(error) = Self::cleanup_old_snapshots_local(
+                    table_path,
+                    table_id.clone(),
+                    current_snapshot,
+                    protected_snapshot_ids,
+                    catalog,
+                    file_format,
+                )
+                .await
+                {
+                    tracing::warn!("Failed to cleanup old snapshots for table {table_id}: {error}");
+                }
             });
         }
+    }
+
+    async fn cleanup_old_snapshots_local(
+        table_path: String,
+        table_id: String,
+        current_snapshot: String,
+        protected_snapshot_ids: HashSet<String>,
+        catalog: Arc<dyn MetadataCatalog>,
+        file_format: Arc<VortexFormat>,
+    ) -> Result<()> {
+        let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+            Ok(rows) => rows,
+            Err(source) => {
+                tracing::warn!(
+                    table_id,
+                    %source,
+                    "Old-snapshot cleanup skipped: failed to read the snapshot manifest safety gate"
+                );
+                return Err(Error::Catalog { source });
+            }
+        };
+        let manifest_populated = !all_rows.is_empty();
+        let mut live_snapshot_ids = protected_snapshot_ids.clone();
+        live_snapshot_ids.insert(current_snapshot.clone());
+        let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+        let task_table = table_id.clone();
+        let retired_cache_paths = Arc::new(ParkingMutex::new(HashSet::new()));
+        let retired_cache_paths_for_cleanup = Arc::clone(&retired_cache_paths);
+        let cleanup_result = tokio::task::spawn_blocking(move || {
+            Self::cleanup_old_snapshots_blocking(
+                &table_path,
+                &table_id,
+                &current_snapshot,
+                &protected_snapshot_ids,
+                manifest_populated,
+                &live_referenced,
+                |paths| {
+                    retired_cache_paths_for_cleanup.lock().extend(paths);
+                },
+            )
+        })
+        .await;
+        // The blocking cleanup has finished unlinking every reported path, so
+        // no valid scan can insert another segment after this exact-key sweep.
+        let paths = std::mem::take(&mut *retired_cache_paths.lock());
+        file_format.invalidate_segment_cache_paths(paths).await;
+        cleanup_result
+            .map_err(|source| Error::TaskPanicked {
+                table: task_table,
+                source,
+            })?
+            .map_err(|source| Error::Catalog { source })
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_old_snapshots_now_for_test(
+        &self,
+        current_snapshot: &str,
+    ) -> Result<()> {
+        let mut protected_snapshot_ids: HashSet<String> =
+            self.protected_snapshots.load().keys().cloned().collect();
+        protected_snapshot_ids.extend(self.in_flight_scan_snapshot_ids());
+        self.cleanup_old_snapshots_with_protected_now_for_test(
+            current_snapshot,
+            protected_snapshot_ids,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn cleanup_old_snapshots_with_protected_now_for_test(
+        &self,
+        current_snapshot: &str,
+        protected_snapshot_ids: HashSet<String>,
+    ) -> Result<()> {
+        Self::cleanup_old_snapshots_local(
+            self.table_metadata.path.clone(),
+            self.table_metadata.table_id.clone(),
+            current_snapshot.to_string(),
+            protected_snapshot_ids,
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.file_format()),
+        )
+        .await
     }
 
     /// Grace before physically deleting a retired snapshot dir, measured from
@@ -4199,6 +4314,7 @@ impl CayenneTableProvider {
         snapshot_dir: &std::path::Path,
         retiring_snapshot_id: &str,
         live_referenced: &HashSet<String>,
+        invalidate: impl FnOnce(HashSet<ObjectStorePath>),
     ) -> std::io::Result<bool> {
         let entries = match std::fs::read_dir(snapshot_dir) {
             Ok(entries) => entries,
@@ -4207,6 +4323,7 @@ impl CayenneTableProvider {
         };
 
         let mut kept_any = false;
+        let mut retired_files = Vec::new();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -4235,12 +4352,36 @@ impl CayenneTableProvider {
                 kept_any = true;
                 continue;
             }
+            let cache_path = match Self::local_segment_cache_path(&path) {
+                Ok(cache_path) => Some(cache_path),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "Failed to reconstruct a retired Vortex segment-cache path; physical cleanup will continue"
+                    );
+                    None
+                }
+            };
+            retired_files.push((path, cache_path));
+        }
+
+        let mut retired_cache_paths = HashSet::new();
+        for (path, cache_path) in retired_files {
             match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Ok(()) => {
+                    retired_cache_paths.extend(cache_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    retired_cache_paths.extend(cache_path);
+                }
+                Err(e) => {
+                    invalidate(retired_cache_paths);
+                    return Err(e);
+                }
             }
         }
+        invalidate(retired_cache_paths);
 
         if kept_any {
             return Ok(false);
@@ -4257,6 +4398,52 @@ impl CayenneTableProvider {
             Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    fn segment_cache_paths_in_dir(
+        snapshot_dir: &std::path::Path,
+    ) -> std::io::Result<HashSet<ObjectStorePath>> {
+        let entries = match std::fs::read_dir(snapshot_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HashSet::new());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut paths = HashSet::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(Self::is_compactable_data_file)
+            {
+                let path = entry.path();
+                match Self::local_segment_cache_path(&path) {
+                    Ok(cache_path) => {
+                        paths.insert(cache_path);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "Failed to reconstruct a retired Vortex segment-cache path; physical cleanup will continue"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    fn local_segment_cache_path(path: &std::path::Path) -> std::io::Result<ObjectStorePath> {
+        // Use the same parser and prefix derivation as the scan-time
+        // ListingTable, rather than maintaining a parallel approximation of
+        // LocalFileSystem key normalization here.
+        ListingTableUrl::parse(path.to_string_lossy().as_ref())
+            .map(|url| url.prefix().clone())
+            .map_err(std::io::Error::other)
     }
 
     /// Physically delete retired snapshot dirs whose grace has fully elapsed,
@@ -4323,6 +4510,7 @@ impl CayenneTableProvider {
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
+        let file_format = Arc::clone(self.context.file_format());
         let ledger = Arc::clone(&self.retired_snapshot_dirs);
         let last_listed = Arc::clone(&self.snapshot_last_listed);
         let catalog = Arc::clone(&self.catalog);
@@ -4356,24 +4544,47 @@ impl CayenneTableProvider {
                 let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
                 let id_for_task = id.clone();
                 let referenced = live_referenced.clone();
+                let retired_cache_paths = Arc::new(ParkingMutex::new(HashSet::new()));
+                let retired_cache_paths_for_task = Arc::clone(&retired_cache_paths);
                 let removed = tokio::task::spawn_blocking(move || {
                     if manifest_populated {
                         Self::delete_retired_snapshot_dir_refcounted(
                             &dir,
                             &id_for_task,
                             &referenced,
+                            |paths| {
+                                retired_cache_paths_for_task.lock().extend(paths);
+                            },
                         )
                     } else {
                         // Legacy path: no manifest, so no file is referenced
                         // across snapshots — the whole dir is dead.
+                        let paths = Self::segment_cache_paths_in_dir(&dir)?;
                         match std::fs::remove_dir_all(&dir) {
-                            Ok(()) => Ok(true),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
-                            Err(e) => Err(e),
+                            Ok(()) => {
+                                retired_cache_paths_for_task.lock().extend(paths);
+                                Ok(true)
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                retired_cache_paths_for_task.lock().extend(paths);
+                                Ok(true)
+                            }
+                            Err(e) => {
+                                let remaining = Self::segment_cache_paths_in_dir(&dir)
+                                    .unwrap_or_else(|_| paths.clone());
+                                retired_cache_paths_for_task
+                                    .lock()
+                                    .extend(paths.difference(&remaining).cloned());
+                                Err(e)
+                            }
                         }
                     }
                 })
                 .await;
+                // Physical cleanup is complete before exact-key invalidation;
+                // the same scan-ref gate above excludes a later cache reinsert.
+                let paths = std::mem::take(&mut *retired_cache_paths.lock());
+                file_format.invalidate_segment_cache_paths(paths).await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -4542,6 +4753,59 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
+    pub(crate) async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+        self.context
+            .file_format()
+            .invalidate_segment_cache_paths(paths)
+            .await;
+    }
+
+    /// Delete listed objects and evict segments only for paths confirmed
+    /// absent. Every delete is allowed to finish even when a sibling fails, so
+    /// a partial object-store cleanup cannot lose track of an already-deleted
+    /// cache key.
+    async fn delete_objects_and_invalidate(
+        &self,
+        objects: Vec<ObjectMeta>,
+        operation: &'static str,
+    ) -> Result<()> {
+        let store = Arc::clone(&self.require_object_store()?.store);
+        let table_name = self.table_metadata.table_name.clone();
+        let deletes = stream::iter(objects).map(|meta| {
+            let store = Arc::clone(&store);
+            let table_name = table_name.clone();
+            async move {
+                let location = meta.location;
+                match store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(location),
+                    Err(source) => Err(Error::ObjectStore {
+                        operation,
+                        table: table_name,
+                        source,
+                    }),
+                }
+            }
+        });
+        let mut deletes = deletes.buffer_unordered(OBJECT_STORE_MOVE_CONCURRENCY);
+        let mut retired_cache_paths = HashSet::new();
+        let mut first_error = None;
+        while let Some(result) = deletes.next().await {
+            match result {
+                Ok(path) => {
+                    retired_cache_paths.insert(path);
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        self.invalidate_segment_cache_paths(retired_cache_paths)
+            .await;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn delete_prefix_with_object_store(&self, prefix: &ObjectStorePath) -> Result<()> {
         let config = self.require_object_store()?;
         let objects: Vec<_> = config
@@ -4555,26 +4819,8 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
-        let store = Arc::clone(&config.store);
-        let table_name = self.table_metadata.table_name.clone();
-        stream::iter(objects.into_iter().map(Ok::<_, Error>))
-            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
-                let store = Arc::clone(&store);
-                let table_name = table_name.clone();
-                async move {
-                    store
-                        .delete(&meta.location)
-                        .await
-                        .map_err(|e| Error::ObjectStore {
-                            operation: "delete object from snapshot cleanup",
-                            table: table_name,
-                            source: e,
-                        })
-                }
-            })
-            .await?;
-
-        Ok(())
+        self.delete_objects_and_invalidate(objects, "delete object from snapshot cleanup")
+            .await
     }
 
     async fn cleanup_old_snapshots_s3(
@@ -4680,54 +4926,21 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
-        let store = Arc::clone(&config.store);
-        let table_name = self.table_metadata.table_name.clone();
-        stream::iter(objects.into_iter().map(Ok::<_, Error>))
-            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
-                let store = Arc::clone(&store);
-                let table_name = table_name.clone();
-                // The object's bare file name is the last path segment; combined
-                // with the retiring snapshot id it forms the same relative key
-                // the manifest ref-count is built from.
-                let file_name = meta
-                    .location
-                    .parts()
-                    .next_back()
-                    .map(|p| p.as_ref().to_string());
-                // Only compactable data files participate in ref-counting; a
-                // non-data sidecar (e.g. a staging WAL artifact) is never a
-                // manifest target, so leave it untouched — mirrors the local
-                // delete_retired_snapshot_dir_refcounted conservative
-                // (never-orphan) behavior instead of deleting unknown objects.
-                let is_data_file = file_name
-                    .as_deref()
-                    .is_some_and(Self::is_compactable_data_file);
-                let referenced = is_data_file
-                    && file_name.as_ref().is_some_and(|name| {
-                        live_referenced.contains(&Self::manifest_file_relative_path(
+        let objects: Vec<_> = objects
+            .into_iter()
+            .filter(|meta| {
+                meta.location.filename().is_some_and(|name| {
+                    Self::is_compactable_data_file(name)
+                        && !live_referenced.contains(&Self::manifest_file_relative_path(
                             retiring_snapshot_id,
                             name,
                         ))
-                    });
-                async move {
-                    if !is_data_file || referenced {
-                        // Non-data sidecar (kept, never orphaned) or referenced in
-                        // place by a live/protected snapshot — keep.
-                        return Ok(());
-                    }
-                    store
-                        .delete(&meta.location)
-                        .await
-                        .map_err(|e| Error::ObjectStore {
-                            operation: "delete object from snapshot cleanup",
-                            table: table_name,
-                            source: e,
-                        })
-                }
+                })
             })
-            .await?;
+            .collect();
 
-        Ok(())
+        self.delete_objects_and_invalidate(objects, "delete object from snapshot cleanup")
+            .await
     }
 
     /// Create a new `ListingTable` for a snapshot directory.
@@ -5060,6 +5273,44 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Move write-time footer-cache entries along with staged files.
+    ///
+    /// The Vortex sink caches each written file's footer under the path it
+    /// wrote — for staged writes, the staging directory — while scans look up
+    /// the post-move location, so without this the entries are unreachable and
+    /// the first post-publish scan pays the cold footer read anyway. Each
+    /// `(source, dst_meta)` pair removes the staging-keyed entry and, when the
+    /// post-move listing meta is known (`Some`), re-inserts the same footer
+    /// under the moved location with exactly the meta the delta-applied
+    /// listing will present (`is_valid_for` compares size and mtime exactly).
+    /// Best-effort in every direction: a missing source entry, or a `None`
+    /// meta, degrades to the cold footer read the scan always paid.
+    pub(super) fn rekey_moved_footer_cache_entries(
+        &self,
+        moves: Vec<(object_store::path::Path, Option<ObjectMeta>)>,
+    ) {
+        use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
+
+        let cache = self
+            .context
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
+        for (source, dst_meta) in moves {
+            let Some(entry) = cache.remove(&source) else {
+                continue;
+            };
+            let Some(dst_meta) = dst_meta else {
+                continue;
+            };
+            let dst = dst_meta.location.clone();
+            cache.put(
+                &dst,
+                CachedFileMetadataEntry::new(dst_meta, entry.file_metadata),
+            );
+        }
+    }
+
     fn record_current_snapshot_files_added(&self, file_count: usize) {
         if file_count == 0 {
             return;
@@ -5146,36 +5397,64 @@ impl CayenneTableProvider {
             Self::sync_snapshot_dir(&target_dir).await?;
             self.record_current_snapshot_files_added(moved_count);
 
-            // Record the moved files' ObjectMeta in the side-channel so the
-            // caller's `publish_current_snapshot_files_changed_under_held_fence`
-            // can delta-apply them onto the list-files cache instead of evicting
-            // the whole directory listing. Best-effort: if stat fails for any
-            // file we skip the side-channel entirely (leaving `None`), so the
-            // publish falls back to a full eviction + re-LIST — never wrong, just
-            // not incremental.
+            // Stat the moved files for the list-files-cache delta-apply below.
+            // Best-effort: if stat fails for any file this stays `None`, so the
+            // publish falls back to a full eviction + re-LIST — never wrong,
+            // just not incremental.
             //
             // ONLY when the move target is the live current snapshot. A
             // compaction/overwrite move targets a not-yet-current snapshot and is
             // followed by `refresh_listing_table_under_held_fence` (which evicts),
             // NOT this delta path — recording its files would let a later
             // current-snapshot publish apply the WRONG snapshot's additions.
-            if self.get_current_snapshot_id() == current_snapshot {
+            let delta_metas = if self.get_current_snapshot_id() == current_snapshot {
                 let snapshot_dir_url = Self::snapshot_dir_url(
                     &self.table_metadata.path,
                     &self.table_metadata.table_id,
                     current_snapshot,
                 );
-                if let Some(metas) = self
-                    .stat_moved_files_as_object_metas(
-                        &snapshot_dir_url,
-                        &target_dir,
-                        &moved_file_names,
-                    )
-                    .await
-                {
-                    *self.last_moved_snapshot_files.lock() =
-                        Some((current_snapshot.to_string(), metas));
-                }
+                self.stat_moved_files_as_object_metas(
+                    &snapshot_dir_url,
+                    &target_dir,
+                    &moved_file_names,
+                )
+                .await
+            } else {
+                None
+            };
+
+            // Move the write-time footer-cache entries along with the files
+            // (see `rekey_moved_footer_cache_entries`). `delta_metas` is
+            // index-aligned with `moved_file_names` when present.
+            let staging_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                staging_snapshot_id,
+            ))
+            .ok()
+            .map(|url| url.prefix().clone());
+            if let Some(staging_prefix) = staging_prefix {
+                let moves = moved_file_names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| {
+                        let name = name.to_str()?;
+                        Some((
+                            staging_prefix.clone().join(name),
+                            delta_metas.as_ref().and_then(|metas| metas.get(i).cloned()),
+                        ))
+                    })
+                    .collect();
+                self.rekey_moved_footer_cache_entries(moves);
+            }
+
+            // Record the moved files' ObjectMeta in the side-channel so the
+            // caller's `publish_current_snapshot_files_changed_under_held_fence`
+            // can delta-apply them onto the list-files cache instead of evicting
+            // the whole directory listing.
+            if let Some(metas) = delta_metas {
+                *self.last_moved_snapshot_files.lock() =
+                    Some((current_snapshot.to_string(), metas));
             }
         }
 
@@ -5361,6 +5640,17 @@ impl CayenneTableProvider {
 
         self.record_current_snapshot_files_added(file_moves.len());
 
+        // Move the write-time footer-cache entries along with the objects (see
+        // `rekey_moved_footer_cache_entries`). `moved_metas` is index-aligned
+        // with `file_moves` when the cache prefix parsed; otherwise this
+        // degrades to removing the now-stale staging-keyed entries.
+        let footer_cache_moves = file_moves
+            .iter()
+            .enumerate()
+            .map(|(i, (source, _))| (source.clone(), moved_metas.get(i).cloned()))
+            .collect();
+        self.rekey_moved_footer_cache_entries(footer_cache_moves);
+
         // Record the moved files for the list-files-cache delta-apply (see
         // `last_moved_snapshot_files`). Only when (a) the move target is the live
         // current snapshot — a compaction/overwrite move to a not-yet-current
@@ -5542,11 +5832,57 @@ impl CayenneTableProvider {
             }
             return Ok(());
         }
-        match tokio::fs::remove_dir_all(self.snapshot_dir_path_for(snapshot_id)).await {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(Error::IoError { source }),
+
+        let snapshot_dir = self.snapshot_dir_path_for(snapshot_id);
+        let cache_path_dir = snapshot_dir.clone();
+        let cache_paths = match tokio::task::spawn_blocking(move || {
+            Self::segment_cache_paths_in_dir(&cache_path_dir)
+        })
+        .await
+        {
+            Ok(Ok(paths)) => paths,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    path = %snapshot_dir.display(),
+                    %error,
+                    "Failed to enumerate Vortex segment-cache paths; physical snapshot cleanup will continue"
+                );
+                HashSet::new()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    path = %snapshot_dir.display(),
+                    %error,
+                    "Vortex segment-cache path enumeration task failed; physical snapshot cleanup will continue"
+                );
+                HashSet::new()
+            }
+        };
+        let deletion_error = match tokio::fs::remove_dir_all(&snapshot_dir).await {
+            Ok(()) => None,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => Some(source),
+        };
+        let absent_paths = if deletion_error.is_some() {
+            let remaining_dir = snapshot_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                Self::segment_cache_paths_in_dir(&remaining_dir)
+            })
+            .await
+            {
+                Ok(Ok(remaining)) => cache_paths.difference(&remaining).cloned().collect(),
+                Ok(Err(_)) | Err(_) => HashSet::new(),
+            }
+        } else {
+            cache_paths
+        };
+        self.invalidate_segment_cache_paths(absent_paths).await;
+        if let Some(source) = deletion_error {
+            return Err(Error::IoError { source });
         }
+        Ok(())
     }
 
     pub(crate) async fn write_stream_to_staging_snapshot(
@@ -5563,7 +5899,7 @@ impl CayenneTableProvider {
                 staging_snapshot_id,
                 target_partitions,
                 None,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
         Ok(row_count)
@@ -5669,6 +6005,7 @@ impl CayenneTableProvider {
         protected_snapshot_ids: &HashSet<String>,
         manifest_populated: bool,
         live_referenced: &HashSet<String>,
+        mut invalidate: impl FnMut(HashSet<ObjectStorePath>),
     ) -> CatalogResult<()> {
         let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
@@ -5768,6 +6105,7 @@ impl CayenneTableProvider {
                     &path,
                     &snapshot_id,
                     live_referenced,
+                    &mut invalidate,
                 )
                 .map_err(|source| CatalogError::IoError { source })?;
                 if fully_removed {
@@ -5779,9 +6117,24 @@ impl CayenneTableProvider {
                     );
                 }
             } else {
-                std::fs::remove_dir_all(&path)
+                let paths = Self::segment_cache_paths_in_dir(&path)
                     .map_err(|source| CatalogError::IoError { source })?;
-                deleted_count += 1;
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {
+                        invalidate(paths);
+                        deleted_count += 1;
+                    }
+                    Err(source) => {
+                        // `remove_dir_all` may have removed a prefix of the
+                        // tree before failing. Invalidate only paths confirmed
+                        // absent by a fresh listing; keep every surviving
+                        // path cached.
+                        let remaining = Self::segment_cache_paths_in_dir(&path)
+                            .unwrap_or_else(|_| paths.clone());
+                        invalidate(paths.difference(&remaining).cloned().collect());
+                        return Err(CatalogError::IoError { source });
+                    }
+                }
             }
         }
 
@@ -6077,6 +6430,7 @@ impl CayenneTableProvider {
                 count_exact: table_statistics_count_exact,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+            row_count_taint_pending: Arc::new(AtomicBool::new(false)),
             retention_filters,
             time_retention_filter_builder,
             context,
@@ -6588,8 +6942,13 @@ impl CayenneTableProvider {
     /// * `stream` - The stream of record batches to write
     /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
-    /// * `target_partitions` - Upper bound on intra-write shard writers (the
-    ///   host's logical-core count); also the ceiling the Vortex sink clamps to.
+    /// * `target_partitions` - Hard ceiling on intra-write shard writers, and the
+    ///   caller's statement of intent: usually the host's logical-core count, but
+    ///   `1` where the write must stay serial (the sorted rewrites, and the
+    ///   protected-snapshot merge for position-delete tables), or
+    ///   `ceil(bytes / target_file_size)` where it bounds file roll-over instead.
+    ///   Enforced by `snapshot_write_concurrency` — see there for why the Vortex
+    ///   sink cannot enforce it.
     /// * `estimated_bytes` - Caller's estimate of the total bytes this write will
     ///   produce, used to size the intra-write shard count (small writes stay a
     ///   single file). `None` ⇒ unknown size ⇒ shard across the full write
@@ -6610,10 +6969,15 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         target_partitions: usize,
         estimated_bytes: Option<u64>,
-        write_class: super::delta_encoding::WriteClass,
+        policy: super::delta_encoding::WritePolicy,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
+
+        let super::delta_encoding::WritePolicy {
+            class: write_class,
+            fan_out,
+        } = policy;
 
         // Materialize the snapshot directory before the write, unconditionally.
         // The Vortex sink creates it lazily when it writes its first file, so a
@@ -6643,16 +7007,18 @@ impl CayenneTableProvider {
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
-        let shard_count =
-            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
-        // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
-        // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
-        // Acquire permits for that clamped count so a `cayenne_write_concurrency`
-        // configured above `target_partitions` can't over-subscribe the global
-        // budget and throttle other tables. (`acquire_encode_permits` also caps to
-        // the budget total, but clamping here keeps the request honest even if the
-        // budget is ever sized below the core count, e.g. reserved query threads.)
-        let encode_shards = shard_count.min(target_partitions.max(1));
+        let shard_count = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            fan_out,
+        );
+        // `snapshot_write_concurrency` already clamps the fan-out to
+        // `target_partitions`, so there is no second clamp here — one place owns
+        // the rule. Permitting for that count is what keeps a
+        // `cayenne_write_concurrency` above the caller's cap from
+        // over-subscribing the global budget and throttling other tables.
+        // (`acquire_encode_permits` caps to the budget total besides.)
         // Class-aware: `Delta` (CDC staged appends, mem-tier checkpoints) may
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
@@ -6669,7 +7035,7 @@ impl CayenneTableProvider {
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
         let _encode_permits = super::write_budget::acquire_encode_permits(
-            encode_shards,
+            shard_count,
             write_class,
             self.context.is_coupled_writer(),
         )
@@ -6707,9 +7073,19 @@ impl CayenneTableProvider {
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
-                self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
+                self.write_shard_config(
+                    target_partitions,
+                    target_size_bytes,
+                    estimated_bytes,
+                    fan_out,
+                ),
             ),
-            None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+            None => self.write_shard_format(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                fan_out,
+            ),
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -6858,16 +7234,13 @@ impl CayenneTableProvider {
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
         // when it receives rows). Drives only the compaction-trigger heuristic.
-        // This is `encode_shards` — the size-aware request ALREADY CLAMPED to
-        // `target_partitions` (the Vortex sink clamps to it via `build_shard_spec`),
-        // so it matches the files actually produced. Using the raw
-        // `snapshot_shard_count` would over-count whenever `target_partitions` caps
-        // the fan-out below the size-based request — e.g. the concurrent per-shard
-        // checkpoint encode pins `target_partitions = 1` (one file per shard), where
-        // the raw request would report the full write concurrency and over-trigger
-        // compaction by the fan-out ratio. For every caller whose `target_partitions`
-        // already meets the size-based count, this is unchanged.
-        let writer_ops = if total_rows > 0 { encode_shards } else { 0 };
+        // `shard_count` is already clamped to `target_partitions` by
+        // `snapshot_write_concurrency`, so it matches the files actually produced.
+        // That clamp is why this can be counted at all: the per-shard checkpoint
+        // encode pins `target_partitions = 1` (one file per shard), and an
+        // unclamped request would report the full write concurrency and
+        // over-trigger compaction by the fan-out ratio.
+        let writer_ops = if total_rows > 0 { shard_count } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -6993,7 +7366,7 @@ impl CayenneTableProvider {
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await
             }));
@@ -7083,7 +7456,13 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> usize {
+        // The caller requires a single sequence of output files. Checked before
+        // the configured concurrency, which must not be able to override it.
+        if matches!(fan_out, EncodeFanOut::Serial) {
+            return 1;
+        }
         // A sorted write must go through ONE writer, or the global order is
         // scattered across shard files and each file's zone maps span the whole
         // range — forfeiting exactly the pruning the sort was for.
@@ -7144,12 +7523,14 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
         match self.write_shard_config(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            fan_out,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
@@ -7171,11 +7552,13 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            fan_out,
         );
         if shard_count <= 1 {
             return None;
@@ -7232,12 +7615,13 @@ impl CayenneTableProvider {
     /// explicitly when a table needs more encode parallelism (and the process-wide
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
-    /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the CPU budget's core count
-    /// (see [`Self::create_session_context`]) — so a configured value above
-    /// the core count is capped, not honored. That ceiling is intentional:
-    /// parallel encode is CPU-bound, so extra shards would only add files (read
-    /// amplification) without speeding the write.
+    /// This is the *requested* count, sized against the caller's partition hint
+    /// only when nothing is configured. A write that must not fan out at all
+    /// says so with [`EncodeFanOut::Serial`] rather than by passing a small
+    /// `session_target_partitions` — the hint cannot carry that meaning, because
+    /// an ordinary write inherits it from whatever session is executing
+    /// (`runtime.query.target_partitions`, or a cluster's executor-slot count),
+    /// and a configured `cayenne_write_concurrency` must survive that.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
         self.context.write_concurrency().unwrap_or(default).max(1)
@@ -7270,6 +7654,7 @@ impl CayenneTableProvider {
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
+            row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
@@ -8873,19 +9258,37 @@ impl CayenneTableProvider {
             if let Some(bloom) = f.pk_bloom.as_deref().and_then(PkBloom::from_bytes) {
                 blooms.push(bloom);
             } else {
-                // A live cold file without a usable bloom (legacy row, over
-                // the per-file cap, or corrupt) means the union would omit
-                // that file's keys. Missing a cold key would let an upsert
+                // A live cold file without a usable bloom means the union would
+                // omit that file's keys. Missing a cold key would let an upsert
                 // false-negative and double-count, so fall back to the exact
                 // cold scan for the whole table. Nothing to publish and nothing
                 // to pair: the exact fold reads the manifest under the rebuild's
                 // own fence.
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    file = f.file_url.as_str(),
-                    "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
-                );
+                //
+                // The two ways to get here are not equally normal, so they do
+                // not share a level. Having no bloom at all is routine — a row
+                // written before per-file blooms existed, or a file over the
+                // per-file cap. Having bloom bytes this build declines to read
+                // is not: the frame is corrupt, or its format version or probe
+                // function is not this binary's, and the table pays the exact
+                // cold scan on every rebuild until those files are re-promoted.
+                // That is the conservative outcome, but it is a standing cost
+                // nobody would find at DEBUG.
+                if f.pk_bloom.is_some() {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        file = f.file_url.as_str(),
+                        "Cold-tier file's PK bloom is unreadable by this build (corrupt, or a different bloom format or probe function); keyset rebuild falls back to the exact cold scan until the file is re-promoted"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        file = f.file_url.as_str(),
+                        "Cold-tier file has no PK bloom; keyset rebuild falls back to the exact cold scan"
+                    );
+                }
                 self.store_cold_pk_existence(None);
                 return Ok(ColdKeysetPlan {
                     source: ColdKeysetSource::Scan,
@@ -13578,15 +13981,12 @@ impl CayenneTableProvider {
                         );
                     }
                 }
-            } else {
-                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-                if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await {
-                    tracing::warn!(
-                        "Failed to clean up failed sort-rewrite snapshot dir {} for table {}: {e}",
-                        snapshot_dir.display(),
-                        self.table_metadata.table_name
-                    );
-                }
+            } else if let Err(e) = self.clear_snapshot_dir(&new_snapshot_id).await {
+                tracing::warn!(
+                    "Failed to clean up failed sort-rewrite snapshot {} for table {}: {e}",
+                    new_snapshot_id,
+                    self.table_metadata.table_name
+                );
             }
         };
 
@@ -13606,7 +14006,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 1,
                 None,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await?;
 
@@ -14048,7 +14448,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
 
@@ -16422,7 +16822,7 @@ impl CayenneTableProvider {
                 // file is the whole point), so the shard count is forced to 1
                 // regardless; no size estimate needed.
                 None,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
 
@@ -16917,6 +17317,10 @@ impl CayenneTableProvider {
     /// read-optimized Vortex files, returning one [`ColdTierFile`] per written
     /// file with accurate per-file footer statistics (for listing-time pruning).
     ///
+    /// A file whose footer row count cannot be read is still returned — dropping
+    /// it would lose rows — carrying the placeholder `row_count` of 0 that
+    /// [`Self::promote_warm_to_cold_inner`] treats as an unknown count.
+    ///
     /// Single ordered run (`target_partitions = 1`) so the Z-order survives across
     /// cold files — each file is a contiguous slice of the sorted order, giving
     /// tight, non-overlapping zone maps. Bloom-eligible tables split the stream
@@ -16928,6 +17332,7 @@ impl CayenneTableProvider {
         cold_config: Option<&crate::metadata::ObjectStoreConfig>,
         stream: SendableRecordBatchStream,
         max_sequence: i64,
+        fan_out: EncodeFanOut,
     ) -> Result<(Vec<crate::metadata::ColdTierFile>, u64)> {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
@@ -16950,7 +17355,7 @@ impl CayenneTableProvider {
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
-        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out);
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -17063,12 +17468,24 @@ impl CayenneTableProvider {
             let stats = format
                 .infer_stats(session_state.as_ref(), &store, self.table_schema(), &meta)
                 .await?;
-            let row_count = stats
+            let inferred_row_count = stats
                 .num_rows
                 .get_value()
                 .copied()
-                .and_then(|v| i64::try_from(v).ok())
-                .unwrap_or(0);
+                .and_then(|v| i64::try_from(v).ok());
+            if inferred_row_count.is_none() {
+                // The manifest still records this file (dropping it would lose
+                // rows), but its row count falls back to the placeholder 0 below,
+                // which the promotion reads as "unknown" and refuses to build an
+                // exact live count from.
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    file = %meta.location,
+                    "Datalake file row count could not be read from its footer; the maintained row count stays inexact until the next full rewrite"
+                );
+            }
+            let row_count = inferred_row_count.unwrap_or(0);
             total_rows += u64::try_from(row_count.max(0)).unwrap_or(0);
             let statistics_blob =
                 crate::stats::statistics_to_persisted_blob(&stats, &self.table_metadata.schema)
@@ -17551,6 +17968,7 @@ impl CayenneTableProvider {
 
         // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
+        let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
         let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
@@ -17561,6 +17979,14 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
+                // `zorder_sort_stream` returned the stream untouched when no
+                // clustering key resolved; otherwise sharding would scatter the
+                // clustering this promotion exists to create.
+                if clustering_is_empty {
+                    EncodeFanOut::Sized
+                } else {
+                    EncodeFanOut::Serial
+                },
             )
             .await?;
         tracing::debug!(
@@ -17623,6 +18049,21 @@ impl CayenneTableProvider {
             "Committing the datalake manifest + snapshot flip under fence"
         );
         let cold_files = Arc::new(cold_files);
+        // Captured BEFORE the commit: `commit_overwrite_to_cold` deletes this
+        // table's `cayenne_table_statistics` row, so the re-baseline below has to
+        // carry the min/max + NDV aggregate over from here rather than re-reading a
+        // row that no longer exists. See `write_rebaselined_row_count`.
+        let stats_baseline = self.load_persisted_table_statistics().await;
+        // Demote the served exactness BEFORE publishing. The commit below clears the
+        // deletion index, so `has_pending_deletions()` — the mask that has been
+        // keeping a delete-staled count off the `Exact` path — goes false the moment
+        // the fence releases, while the re-baseline that corrects the count only
+        // lands afterwards. `optimizer_table_statistics()` does not take
+        // `listing_fence`, so without this a distributed `COUNT(*)` can fold the
+        // stale value in that window. The `Set` restores exactness once it holds an
+        // authoritative count; if it never lands, staying inexact is the right
+        // resting state anyway.
+        self.table_statistics.write().count_exact = false;
         {
             let _fence = self.listing_fence.write().await;
             self.catalog
@@ -17642,6 +18083,54 @@ impl CayenneTableProvider {
             // metastore read, and no capture can observe one half without the other.
             self.store_cold_manifest(&new_snapshot_id, &cold_files);
         }
+
+        // Re-baseline the maintained live row count from the manifest this commit
+        // just registered. Promotion is a full-rewrite fold: it applies every
+        // tombstone physically and clears the deletion index, which drops
+        // `has_pending_deletions()` — the only thing masking a count a standalone
+        // delete left stale. Compaction and overwrite `Set` their count for the
+        // same reason; without this, promotion instead restores `Exact` over the
+        // stale value, and an exact statistic may be substituted into a result
+        // (a distributed `COUNT(*)` then over-counts by the deleted rows).
+        //
+        // The committed manifest IS the whole live set: warm and the prior cold
+        // manifest were overwrite-cleared, and the mem/inline tiers were
+        // checkpointed into the rewrite above. Its sum may only be claimed exact
+        // when every entry's count is known, judged over the WHOLE manifest — a
+        // carried-forward clean file's count comes from the prior manifest, where
+        // an earlier promotion may have left the placeholder 0 for a footer it
+        // could not read, so checking only the files this promotion wrote would
+        // mark the sum `Exact` while omitting every row in that carried file. Any
+        // non-positive count therefore reads as unknown; a genuinely empty file
+        // costs the metadata `COUNT(*)` fast path until the next full rewrite,
+        // which is the safe direction to be wrong in.
+        // `checked_add`, not `saturating_add`: a clamp to `i64::MAX` would publish an
+        // undercount as exact. An overflowing total reads as unknown like any other
+        // unreadable count. (Unreachable for a real table — it needs more live rows
+        // than `i64::MAX` — but the exactness claim should not rest on that.)
+        let mut live_rows: Option<i64> = Some(0);
+        let mut counts_known = true;
+        for file in cold_files.iter() {
+            live_rows = live_rows.and_then(|sum| sum.checked_add(file.row_count.max(0)));
+            counts_known &= file.row_count > 0;
+        }
+        let counts_known = counts_known && live_rows.is_some();
+        let live_rows = live_rows.unwrap_or(0);
+        if !counts_known {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                manifest_files = cold_files.len(),
+                "Datalake manifest carries an unknown row count; leaving the maintained count inexact"
+            );
+        }
+        if counts_known {
+            self.set_persisted_row_count(stats_baseline, live_rows)
+                .await;
+        } else {
+            self.taint_persisted_row_count_exactness().await;
+        }
+
         if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
             tracing::warn!(
                 target: "cayenne::compaction",
@@ -18149,7 +18638,15 @@ impl CayenneTableProvider {
                 estimated_bytes,
                 // Compaction re-encodes for the long term: always the full
                 // (Maintenance) encoding cascade, never the cheap delta tier.
-                super::delta_encoding::WriteClass::Maintenance,
+                // A position-delete table's tombstones are file-path scoped and
+                // the position bake-in assumes one output sequence, so this
+                // merge must not fan out however the table is configured. The
+                // partition hint alone cannot say that.
+                if keeps_positions_serial {
+                    super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
+                } else {
+                    super::delta_encoding::WritePolicy::MAINTENANCE
+                },
             )
             .await;
 
@@ -18766,7 +19263,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
@@ -18978,17 +19475,12 @@ impl CayenneTableProvider {
                     );
                 }
             }
-        } else {
-            let snapshot_dir = self.snapshot_dir_path_for(new_snapshot_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&snapshot_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    "Failed to clean up failed compaction snapshot dir {} for table {}: {e}",
-                    snapshot_dir.display(),
-                    self.table_metadata.table_name
-                );
-            }
+        } else if let Err(e) = self.clear_snapshot_dir(new_snapshot_id).await {
+            tracing::warn!(
+                "Failed to clean up failed compaction snapshot {} for table {}: {e}",
+                new_snapshot_id,
+                self.table_metadata.table_name
+            );
         }
     }
 
@@ -20856,6 +21348,207 @@ impl CayenneTableProvider {
             .await;
     }
 
+    /// Read the persisted statistics record, preferring the in-memory raw blob so
+    /// the common case costs no catalog round-trip. `None` means the table has no
+    /// statistics row (nothing serves a count) or the read failed.
+    async fn load_persisted_table_statistics(&self) -> Option<TableStatistics> {
+        if let Some(raw) = self.table_statistics.read().raw.clone() {
+            return Some(raw);
+        }
+        match self
+            .catalog
+            .get_table_statistics(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(stats) => stats,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load table stats for {} while amending the maintained row count: {e}",
+                    self.table_metadata.table_name
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply `num_rows_update` to the persisted statistics **without** a write
+    /// accumulator to merge — for the callers that change how many rows are live
+    /// without producing one.
+    ///
+    /// The row-count arms are [`Self::persist_table_stats_locked`]'s, shared via
+    /// [`Self::apply_row_count_update`]; the min/max + NDV blob is carried forward
+    /// verbatim. That is sound for both kinds of caller: a delete can only narrow
+    /// the live aggregate, so the existing one stays a valid superset, and a
+    /// datalake promotion writes through the cold Vortex sink, which accumulates no
+    /// column stats to merge.
+    ///
+    /// The record is read **inside** the persistence lock. Reading it outside would
+    /// be a lost update: a maintenance persist can commit a row-count delta and
+    /// refresh the cached record between the read and the lock, and writing the
+    /// older record back would drop that delta along with the column statistics it
+    /// merged.
+    ///
+    /// `fallback_baseline` is used only when no record can be read under the lock.
+    /// Datalake promotion needs it because `commit_overwrite_to_cold` routes through
+    /// `commit_overwrite_in_txn`, which deletes the table's
+    /// `cayenne_table_statistics` row — so it captures the record before committing
+    /// and hands it here. A record that *does* exist under the lock is preferred
+    /// over it, being at least as new.
+    ///
+    /// Best-effort like [`Self::persist_table_stats`], with one asymmetry: a failure
+    /// arms [`Self::row_count_taint_pending`], because continuing to serve or
+    /// re-derive an exact count is the wrong-answer direction.
+    async fn write_rebaselined_row_count(
+        &self,
+        fallback_baseline: Option<TableStatistics>,
+        num_rows_update: RowCountUpdate,
+    ) {
+        let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+
+        let Some(baseline) = self
+            .load_persisted_table_statistics()
+            .await
+            .or(fallback_baseline)
+        else {
+            // Either no statistics record exists or the read failed —
+            // `load_persisted_table_statistics` cannot tell the two apart. Both
+            // demote: the derived cache can still be serving an exact count loaded
+            // at open, and the caller has just invalidated it.
+            self.arm_row_count_taint_retry();
+            return;
+        };
+
+        let (num_rows, num_rows_exact) = Self::apply_row_count_update(
+            num_rows_update,
+            baseline.num_rows,
+            baseline.num_rows_exact,
+        );
+        let stats = TableStatistics {
+            num_rows,
+            num_rows_exact,
+            ..baseline
+        };
+        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
+            tracing::warn!(
+                "Failed to persist the amended maintained row count for {}: {e}",
+                self.table_metadata.table_name
+            );
+            self.arm_row_count_taint_retry();
+            return;
+        }
+
+        // The durable bit now matches what is served, so nothing is owed.
+        self.row_count_taint_pending.store(false, Ordering::Release);
+        // `num_rows` feeds the derived `Statistics`, so both cached views are
+        // rebuilt rather than only flipping `count_exact`.
+        self.store_cached_table_statistics(stats);
+    }
+
+    /// Record that the durable exactness bit over-claims and could not be corrected:
+    /// stop serving the count `Exact`, stop any merge re-deriving exactness from the
+    /// persisted record, and leave the write owed so a later `DELETE` retries it.
+    ///
+    /// `raw` is dropped alongside so the next merge re-reads the catalog rather than
+    /// building on a record this process already distrusts.
+    fn arm_row_count_taint_retry(&self) {
+        self.row_count_taint_pending.store(true, Ordering::Release);
+        let mut cache = self.table_statistics.write();
+        cache.count_exact = false;
+        cache.raw = None;
+    }
+
+    /// Re-baseline the maintained live row count to an authoritative live count,
+    /// re-establishing exactness — the datalake-promotion counterpart to
+    /// compaction's and overwrite's `Set`. `baseline` must have been captured
+    /// before the promotion's commit; see [`Self::write_rebaselined_row_count`].
+    ///
+    /// Carrying the previous column aggregate forward alongside an exact count is
+    /// deliberate and safe: the metadata-only `MIN`/`MAX`/`SUM` fold
+    /// ([`crate::stats_aggregate`]) consumes the *scan's* statistics, which come
+    /// from the live files' footers, and the table-level aggregate only refills
+    /// columns the scan leaves `Absent` (`restore_absent_column_statistics`). So the
+    /// carried blob — a documented superset whose min/max only ever widened — cannot
+    /// displace a live footer value and be folded into an answer.
+    pub(crate) async fn set_persisted_row_count(
+        &self,
+        baseline: Option<TableStatistics>,
+        live_rows: i64,
+    ) {
+        self.write_rebaselined_row_count(baseline, RowCountUpdate::Set(live_rows))
+            .await;
+    }
+
+    /// Mark the maintained live row count as no longer a provably-exact live count,
+    /// durably, so no later fold of a tombstone can serve a stale count `Exact` and
+    /// the taint survives a restart.
+    pub(crate) async fn taint_persisted_row_count_exactness(&self) {
+        // Cheap pre-lock reject: this runs on every user `DELETE` statement, so once
+        // the taint cannot change anything, skip the async mutex, the catalog read,
+        // and the derived-statistics rebuild. Both terms are needed. The evidence
+        // must be the cached *record* rather than `count_exact`, because a failed
+        // persist demotes `count_exact` locally while the durable bit stays exact;
+        // and `row_count_taint_pending` must clear the reject outright, since a
+        // dropped `raw` after such a failure would otherwise let an absent record
+        // read as "nothing owed". Racing with a concurrent persist costs at most a
+        // redundant write below, never a missed taint — the write path re-reads the
+        // record under the persistence lock.
+        if !self.row_count_taint_pending.load(Ordering::Acquire)
+            && self
+                .table_statistics
+                .read()
+                .raw
+                .as_ref()
+                .is_some_and(|raw| !raw.num_rows_exact)
+        {
+            return;
+        }
+        self.write_rebaselined_row_count(
+            None,
+            RowCountUpdate::Delta {
+                delta: 0,
+                exact: false,
+            },
+        )
+        .await;
+    }
+
+    /// Resolve a [`RowCountUpdate`] against the previous count and its exactness.
+    ///
+    /// Shared by [`Self::persist_table_stats_locked`] and
+    /// [`Self::write_rebaselined_row_count`] so the two cannot drift: a `Set` is
+    /// authoritative and re-establishes exactness, an `exact` `Delta` preserves the
+    /// prior exactness, a best-effort `Delta` taints it, and `Unchanged` preserves
+    /// both. The count never goes negative.
+    fn apply_row_count_update(
+        update: RowCountUpdate,
+        prev_num_rows: i64,
+        prev_num_rows_exact: bool,
+    ) -> (i64, bool) {
+        match update {
+            RowCountUpdate::Delta { delta, exact } => (
+                prev_num_rows.saturating_add(delta).max(0),
+                exact && prev_num_rows_exact,
+            ),
+            RowCountUpdate::Set(n) => (n.max(0), true),
+            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
+        }
+    }
+
+    /// Publish freshly-persisted statistics into the in-memory cache: both derived
+    /// views, the exactness bit `cached_table_statistics_for_optimizer` gates on,
+    /// and the raw blob the next persist reads instead of the catalog.
+    fn store_cached_table_statistics(&self, stats: TableStatistics) {
+        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
+        let df_stats_inexact = df_stats
+            .as_ref()
+            .map(|s| Self::statistics_to_inexact(s.clone()));
+        let mut cache = self.table_statistics.write();
+        cache.optimizer = df_stats;
+        cache.optimizer_inexact = df_stats_inexact;
+        cache.count_exact = stats.num_rows_exact;
+        cache.raw = Some(stats);
+    }
+
     /// Persist merged/replaced stats.
     ///
     /// `replace_aggregate` true ignores any existing aggregate (overwrite); false
@@ -20912,7 +21605,12 @@ impl CayenneTableProvider {
         let prev_num_rows = existing_stats.as_ref().map_or(0, |e| e.num_rows);
         // Whether the prior count was provably exact. Absent existing stats (first
         // write / overwrite-replace) start exact; a `Set` overrides regardless.
-        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact);
+        // A pending taint retry means the persisted `num_rows_exact` over-claims, so
+        // the prior exactness it would otherwise supply cannot be trusted — without
+        // this, the next provably-exact `Delta` republishes the stale count `Exact`
+        // and undoes the demotion the failed taint was supposed to make.
+        let prev_num_rows_exact = existing_stats.as_ref().is_none_or(|e| e.num_rows_exact)
+            && !self.row_count_taint_pending.load(Ordering::Acquire);
         let statistics_blob = match &existing_stats {
             Some(existing) => accumulator
                 .merged_file_statistics_blob(&existing.statistics_blob)
@@ -20942,14 +21640,8 @@ impl CayenneTableProvider {
         // taints it; `Unchanged` preserves. A tainted (`false`) count is served
         // `Inexact` so the COUNT(*) fold declines rather than answering from a
         // possibly-over-counted maintained value.
-        let (num_rows, num_rows_exact) = match num_rows_update {
-            RowCountUpdate::Delta { delta, exact } => (
-                prev_num_rows.saturating_add(delta).max(0),
-                exact && prev_num_rows_exact,
-            ),
-            RowCountUpdate::Set(n) => (n.max(0), true),
-            RowCountUpdate::Unchanged => (prev_num_rows, prev_num_rows_exact),
-        };
+        let (num_rows, num_rows_exact) =
+            Self::apply_row_count_update(num_rows_update, prev_num_rows, prev_num_rows_exact);
 
         let stats = TableStatistics {
             table_id: self.table_metadata.table_id.clone(),
@@ -20967,16 +21659,14 @@ impl CayenneTableProvider {
             return false;
         }
 
-        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
-        let df_stats_inexact = df_stats
-            .as_ref()
-            .map(|s| Self::statistics_to_inexact(s.clone()));
-        let mut cache = self.table_statistics.write();
-        cache.optimizer = df_stats;
-        cache.optimizer_inexact = df_stats_inexact;
-        cache.count_exact = stats.num_rows_exact;
-        // Keep the raw blob for the next persist to avoid a catalog read.
-        cache.raw = Some(stats);
+        // An authoritative exact count settles anything a failed taint left owed:
+        // a full-rewrite `Set` measured the live rows directly, so the durable bit
+        // it just wrote is correct regardless of what the previous one claimed.
+        if stats.num_rows_exact {
+            self.row_count_taint_pending.store(false, Ordering::Release);
+        }
+        // Keeping the raw blob also avoids a catalog read on the next persist.
+        self.store_cached_table_statistics(stats);
         true
     }
 
@@ -24380,7 +25070,7 @@ impl CayenneTableProvider {
                     &self.get_current_snapshot_id(),
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
-                    super::delta_encoding::WriteClass::Delta,
+                    super::delta_encoding::WritePolicy::DELTA,
                 )
                 .await?;
             // Clear under the publish locks (inner to the held fence), uniform
@@ -24425,7 +25115,7 @@ impl CayenneTableProvider {
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await?;
                 (files, stats)
@@ -25355,7 +26045,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
 
@@ -25538,7 +26228,7 @@ impl CayenneTableProvider {
                         &self.get_current_snapshot_id(),
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await?;
                 stats
@@ -26961,13 +27651,10 @@ impl CayenneTableProvider {
             if object_store_url.is_none() {
                 object_store_url = Some(listing_url.clone());
             }
-            let object_meta = ObjectMeta {
-                location: listing_url.prefix().clone(),
-                last_modified: chrono::DateTime::UNIX_EPOCH,
-                size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                e_tag: None,
-                version: None,
-            };
+            let object_meta = vortex_datafusion::synthetic_object_meta(
+                listing_url.prefix().clone(),
+                u64::try_from(file.file_size_bytes).unwrap_or(0),
+            );
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
@@ -27106,16 +27793,14 @@ impl CayenneTableProvider {
             // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
             .map(|file| {
-                let object_meta = ObjectMeta {
-                    location: prefix.clone().join(file.file_path.as_str()),
-                    // `last_modified` is unused by the Vortex scan (it reads
-                    // footer stats by location/size); a fixed epoch keeps the
-                    // value deterministic without an extra stat round-trip.
-                    last_modified: chrono::DateTime::UNIX_EPOCH,
-                    size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                    e_tag: None,
-                    version: None,
-                };
+                // `synthetic_object_meta` stamps the epoch mtime the Vortex
+                // write path also stamps on its footer-cache entries, so
+                // `is_valid_for` matches and post-write scans reuse the
+                // just-written footers instead of re-reading them cold.
+                let object_meta = vortex_datafusion::synthetic_object_meta(
+                    prefix.clone().join(file.file_path.as_str()),
+                    u64::try_from(file.file_size_bytes).unwrap_or(0),
+                );
                 // Same conversion `pruned_partition_list` uses for the
                 // unpartitioned case (`object_meta.into()`).
                 PartitionedFile::from(object_meta)
@@ -28842,12 +29527,12 @@ impl TableProvider for CayenneTableProvider {
         let file_sink = self
             .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
             .await?;
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            InlineAwareDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(InlineAwareDeletionSink {
                 table: self.clone_for_write(),
                 file_sink,
                 filters,
-            },
+            }),
         ))))
     }
 
@@ -29028,13 +29713,23 @@ impl CayenneTableProvider {
             Arc::clone(&self.write_lock),
             Arc::clone(&self.listing_fence),
         ));
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
+    }
+
+    /// Wrap a user-`DELETE` sink so a delete that removed rows taints the
+    /// maintained row count's exactness — see
+    /// [`RowCountExactnessTaintingDeletionSink`].
+    fn taint_row_count_exactness(&self, inner: Arc<dyn DeletionSink>) -> Arc<dyn DeletionSink> {
+        Arc::new(RowCountExactnessTaintingDeletionSink {
+            table: self.clone_for_write(),
+            inner,
+        })
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
@@ -29050,12 +29745,12 @@ impl CayenneTableProvider {
             )
             .await?,
         );
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            PkKeysetInvalidatingDeletionSink {
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(PkKeysetInvalidatingDeletionSink {
                 table: self.clone_for_write(),
                 inner: sink,
                 filters: filters.to_vec(),
-            },
+            }),
         ))))
     }
 
@@ -30189,6 +30884,305 @@ mod tests {
             CayenneTableProvider::plan_cold_gc_deletions(&[], &empty, &mut first_seen, t0, grace);
         assert!(del.is_empty());
         assert!(first_seen.is_empty(), "gone-from-store entry pruned");
+    }
+
+    #[tokio::test]
+    async fn cold_gc_invalidates_segments_for_deleted_objects() {
+        use crate::metadata::ObjectStoreConfig;
+        use object_store::memory::InMemory;
+
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            runtime_env_with_list_files_cache(),
+        );
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let cold_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let cold_store_url =
+            url::Url::parse("s3://cold-segment-cache").expect("cold object-store URL should parse");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_cold_object_store(ObjectStoreConfig {
+                url: cold_store_url,
+                store: Arc::clone(&cold_store),
+            })
+            .create(CreateTableOptions {
+                table_name: "cold_gc_segment_cache".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    cold_tier_location: Some("s3://cold-segment-cache/root".to_string()),
+                    cold_tier_gc_interval_ms: 0,
+                    cold_tier_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("cold-tier table created");
+
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+            )
+            .expect("input batch"),
+        )
+        .await;
+        let warm_snapshot_dir = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+        let warm_file = std::fs::read_dir(&warm_snapshot_dir)
+            .expect("list warm snapshot")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(CayenneTableProvider::is_compactable_data_file)
+            })
+            .expect("warm Vortex file");
+        let cold_path = ObjectStorePath::from(format!(
+            "root/{}/data/orphan.vortex",
+            provider.table_metadata.datalake_dir_segment()
+        ));
+        cold_store
+            .put(
+                &cold_path,
+                tokio::fs::read(&warm_file)
+                    .await
+                    .expect("read warm Vortex file")
+                    .into(),
+            )
+            .await
+            .expect("copy Vortex file to cold store");
+
+        CayenneTableProvider::register_object_store_if_needed(
+            &ctx.runtime_env(),
+            provider
+                .cold_object_store_config
+                .as_ref()
+                .expect("cold store config retained"),
+        );
+        let cold_dir_url = format!(
+            "s3://cold-segment-cache/root/{}/data/",
+            provider.table_metadata.datalake_dir_segment()
+        );
+        let cold_listing = CayenneTableProvider::create_listing_table(
+            &cold_dir_url,
+            Arc::clone(&schema),
+            provider.context().file_format(),
+            &provider.pk_deletion_strategy,
+        )
+        .expect("cold listing table");
+        let cold_plan = cold_listing
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("cold scan plan");
+        let cold_rows: usize = collect(cold_plan, ctx.task_ctx())
+            .await
+            .expect("scan cold object")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(cold_rows, 2_000, "the copied cold object must be scanned");
+        let listing_key = TableScopedPath {
+            table: None,
+            path: ListingTableUrl::parse(&cold_dir_url)
+                .expect("cold directory URL should parse")
+                .prefix()
+                .clone(),
+        };
+        let listing_cache = ctx
+            .runtime_env()
+            .cache_manager
+            .get_list_files_cache()
+            .expect("list-files cache enabled");
+        assert!(
+            listing_cache.get(&listing_key).is_some(),
+            "the cold scan must populate the directory listing cache"
+        );
+        let entries_before_gc = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache enabled");
+        assert!(
+            entries_before_gc > 0,
+            "the cold scan must populate the cache"
+        );
+
+        provider.run_cold_tier_gc_tick().await;
+        assert!(
+            cold_store.head(&cold_path).await.is_ok(),
+            "the first GC observation only marks the orphan"
+        );
+        provider.run_cold_tier_gc_tick().await;
+        assert!(
+            matches!(
+                cold_store.head(&cold_path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the second GC pass must physically delete the aged orphan"
+        );
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(0),
+            "cold GC must evict every segment cached for the deleted object"
+        );
+        assert!(
+            listing_cache.get(&listing_key).is_none(),
+            "cold GC must evict the directory listing that named the deleted object"
+        );
+        let post_gc_plan = cold_listing
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("post-GC cold scan plan");
+        let post_gc_rows: usize = collect(post_gc_plan, ctx.task_ctx())
+            .await
+            .expect("post-GC cold scan must not reopen the deleted object")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(post_gc_rows, 0, "the deleted orphan must not be relisted");
+    }
+
+    #[tokio::test]
+    async fn file_retention_invalidates_segments_for_deleted_files() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow_schema::TimeUnit;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}/cayenne.db",
+                metadata_dir
+                    .to_str()
+                    .expect("metadata path should be UTF-8")
+            ))
+            .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let retention_builder =
+            crate::TimeRetentionFilterBuilder::try_new("event_time", u64::MAX, &schema)
+                .expect("retention builder");
+        let provider = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .with_time_retention_filter_builder(retention_builder)
+            .create(CreateTableOptions {
+                table_name: "file_retention_segment_cache".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: data_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("retention table created");
+
+        for values in [vec![1_i64, 1], vec![3_i64, 3]] {
+            insert_batch(
+                &provider,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(TimestampNanosecondArray::from(values))],
+                )
+                .expect("timestamp batch"),
+            )
+            .await;
+        }
+        assert_eq!(
+            read_all(&ctx, &provider, "file_retention_segment_cache")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            4,
+            "both source files must be visible and scanned before retention"
+        );
+        let entries_before_delete = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache enabled");
+        assert!(
+            entries_before_delete > 1,
+            "both files must populate the cache"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![datafusion_expr::col("event_time").lt(datafusion_expr::lit(
+                    ScalarValue::TimestampNanosecond(Some(2), None),
+                ))],
+            )
+            .await
+            .expect("file-retention delete plan");
+        let delete_output = collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("file-retention delete executed");
+        let deleted_rows = delete_output[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .expect("delete count is UInt64")
+            .value(0);
+        assert_eq!(deleted_rows, 2, "only the fully expired file is deleted");
+        let entries_after_delete = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_after_delete > 0 && entries_after_delete < entries_before_delete,
+            "file retention must evict retired segments while preserving the live file's cache"
+        );
+        assert_eq!(
+            read_all(&ctx, &provider, "file_retention_segment_cache")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2,
+            "the live file remains queryable after retention"
+        );
     }
 
     /// The orphaned-DV sweep floor must never trust an empty manifest as genesis
@@ -33243,7 +34237,7 @@ mod tests {
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
             Some(CachedPkIndex::Bloom(bloom)) => {
-                let bloom_bytes = bloom.bits.len() * 8;
+                let bloom_bytes = bloom.size_bytes();
                 assert!(
                     bloom_bytes <= budget_bytes / 4,
                     "conversion bloom must be right-sized, got {bloom_bytes} bytes for a {budget_bytes}-byte budget"
@@ -37384,8 +38378,11 @@ mod tests {
         // requested writer count for parallel encode (no key clustering).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            4
+        );
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -37416,20 +38413,29 @@ mod tests {
         // count is capped at `snapshot_write_concurrency` = DEFAULT_WRITE_CONCURRENCY
         // (4) clamped to session_target_partitions (8) ⇒ 4.
         // A small exact delta (< one unit) stays a single file.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(2 * mib), EncodeFanOut::Sized),
+            1
+        );
         // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16
         // unit-shards, capped to the write-concurrency ceiling (4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib)), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(256 * mib), EncodeFanOut::Sized),
+            4
+        );
         // Mid-size flush: 48 MiB / 16 MiB = 3 shards (under the cap ⇒ unit-driven).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib)), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(48 * mib), EncodeFanOut::Sized),
+            3
+        );
         // A tiny configured target (≤ 16 MiB) keeps the old whole-file unit.
         let small_tsb = 8 * 1024 * 1024usize;
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib), EncodeFanOut::Sized),
             1
         );
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), EncodeFanOut::Sized),
             2
         );
     }
@@ -37454,8 +38460,11 @@ mod tests {
         // output file is PK-clustered (tight per-file zone maps).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            4
+        );
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
@@ -37486,7 +38495,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -37515,7 +38524,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -37547,18 +38556,112 @@ mod tests {
             "test",
         );
 
-        // The explicit `write_concurrency` override wins over the session's
-        // target-partition count. `estimated_bytes = None` ⇒ full fan-out, so
-        // the override (2) is honored unclamped by size.
+        // The explicit `write_concurrency` override wins over the default the
+        // session's target-partition count would have produced, up to that
+        // count as a ceiling (2 <= 4 here, so it is honored in full).
+        // `estimated_bytes = None` ⇒ full fan-out, so it is unclamped by size.
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 2);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            2
+        );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None)
+                .write_shard_format(4, tsb, None, EncodeFanOut::Sized)
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
             2
+        );
+    }
+
+    /// `EncodeFanOut::Serial` forces one encoder however high
+    /// `cayenne_write_concurrency` is set.
+    ///
+    /// The protected-snapshot merge needs this for position-delete tables: their
+    /// tombstones are file-path scoped and the position bake-in assumes one
+    /// output sequence. It cannot be expressed as a small partition hint, because
+    /// an ordinary write inherits that hint from whatever session executes it.
+    ///
+    /// The fixture declares no sort columns on purpose: `snapshot_shard_count`
+    /// returns 1 outright for a sorted table, which would mask the intent.
+    #[tokio::test]
+    async fn test_serial_fan_out_overrides_configured_write_concurrency() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "serial_fan_out",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        // Both size-estimate shapes the merge can pass: `None` (its serial
+        // position-delete shape) and a large estimate, which would otherwise earn
+        // the full fan-out.
+        let huge = Some(tsb as u64 * 64);
+        for estimated in [None, huge] {
+            assert_eq!(
+                provider.snapshot_shard_count(8, tsb, estimated, EncodeFanOut::Serial),
+                1,
+                "Serial must override the configured write concurrency \
+                 (estimated_bytes={estimated:?})"
+            );
+            assert!(
+                provider
+                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial)
+                    .write_shard()
+                    .is_none(),
+                "a Serial write must produce the unsharded base format \
+                 (estimated_bytes={estimated:?})"
+            );
+        }
+    }
+
+    /// A LOW partition hint must not serialize an ordinary write.
+    ///
+    /// The hint is inherited from whichever session is executing — a low
+    /// `runtime.query.target_partitions`, or a cluster's executor-slot count — so
+    /// treating it as a hard ceiling would silently disable a configured
+    /// `cayenne_write_concurrency` on the CDC, DML, staged and overwrite paths.
+    /// `write_to_snapshot` builds its own `SessionConfig::default()` session for
+    /// the sink, so the sink would still have encoded at the configured width;
+    /// only the accelerator's request would have collapsed.
+    #[tokio::test]
+    async fn test_low_partition_hint_does_not_serialize_a_sized_write() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "low_partition_hint",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
+            8,
+            "a configured write concurrency must survive a low partition hint"
+        );
+        assert_eq!(
+            provider
+                .write_shard_format(1, tsb, None, EncodeFanOut::Sized)
+                .write_shard()
+                .expect("a sized write keeps its shard config")
+                .write_concurrency,
+            8
         );
     }
 
@@ -37579,10 +38682,13 @@ mod tests {
         // regardless of the size estimate, so pass a large `estimated_bytes`.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
-        assert_eq!(provider.snapshot_shard_count(4, tsb, huge), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            1
+        );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
                 .write_shard()
                 .is_none(),
             "sorted writes fall back to the unsharded base format"
@@ -37609,13 +38715,13 @@ mod tests {
         // A few KiB — far below one 256 MiB target file.
         let small = Some(4 * 1024);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, small),
+            provider.snapshot_shard_count(4, tsb, small, EncodeFanOut::Sized),
             1,
             "a sub-target-file write must stay a single shard"
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small)
+                .write_shard_format(4, tsb, small, EncodeFanOut::Sized)
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -37641,11 +38747,11 @@ mod tests {
         // clamp to 4.
         let large = Some(tsb as u64 * 100);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, large),
+            provider.snapshot_shard_count(4, tsb, large, EncodeFanOut::Sized),
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large);
+        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized);
         assert_eq!(
             format
                 .write_shard()
@@ -37678,19 +38784,36 @@ mod tests {
         let unit = (target / 16).clamp((16 * 1024 * 1024u64).min(target), target);
 
         // < 1 unit ⇒ 1 shard (need to *fill* a unit to earn a second).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit - 1), EncodeFanOut::Sized),
+            1
+        );
         // Exactly 1 unit ⇒ 1 shard.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit), EncodeFanOut::Sized),
+            1
+        );
         // 3 units' worth ⇒ 3 shards (below the concurrency cap of 4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3)), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit * 3), EncodeFanOut::Sized),
+            3
+        );
         // 3.9 units' worth still floors to 3 shards.
         assert_eq!(
-            provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10)),
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit * 3 + unit * 9 / 10),
+                EncodeFanOut::Sized
+            ),
             3
         );
         // 12 units' worth, but with no per-table override the default
         // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit * 12), EncodeFanOut::Sized),
+            4
+        );
     }
 
     #[tokio::test]
@@ -37712,10 +38835,13 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(6, tsb, None), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(6, tsb, None, EncodeFanOut::Sized),
+            4
+        );
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None)
+                .write_shard_format(6, tsb, None, EncodeFanOut::Sized)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
@@ -40453,6 +41579,8 @@ mod tests {
     /// dir as NOT fully removed while a referenced file survives.
     #[test]
     fn delete_retired_snapshot_dir_refcounted_keeps_referenced_files() {
+        use std::cell::RefCell;
+
         let tmp = TempDir::new().expect("temp dir");
         let table_root = tmp.path().join("table-id");
         let retired_dir = table_root.join("retired-snap");
@@ -40470,11 +41598,19 @@ mod tests {
         let referenced: HashSet<String> = ["retired-snap/kept.vortex".to_string()]
             .into_iter()
             .collect();
+        let orphan_cache_path =
+            CayenneTableProvider::local_segment_cache_path(&retired_dir.join("orphan.vortex"))
+                .expect("orphan path should convert before deletion");
+        let referenced_cache_path =
+            CayenneTableProvider::local_segment_cache_path(&retired_dir.join("kept.vortex"))
+                .expect("referenced path should convert before deletion");
 
+        let invalidated = RefCell::new(HashSet::new());
         let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
             "retired-snap",
             &referenced,
+            |paths| *invalidated.borrow_mut() = paths,
         )
         .expect("refcounted delete");
 
@@ -40493,6 +41629,15 @@ mod tests {
         assert!(
             retired_dir.join("notes.txt").exists(),
             "a non-data sidecar is conservatively kept (never a manifest target)"
+        );
+        assert_eq!(invalidated.borrow().len(), 1);
+        assert!(
+            invalidated.borrow().contains(&orphan_cache_path),
+            "the orphan's exact cache path must be invalidated"
+        );
+        assert!(
+            !invalidated.borrow().contains(&referenced_cache_path),
+            "a path referenced in place by a live snapshot must remain cached"
         );
     }
 
@@ -40515,6 +41660,7 @@ mod tests {
             &retired_dir,
             "dead-snap",
             &referenced,
+            |_| {},
         )
         .expect("refcounted delete");
 
@@ -40535,9 +41681,226 @@ mod tests {
             &missing,
             "never-existed",
             &HashSet::new(),
+            |_| {},
         )
         .expect("missing dir is not an error");
         assert!(fully_removed, "a NotFound dir counts as fully removed");
+    }
+
+    #[test]
+    fn local_segment_cache_path_matches_relative_listing_path() {
+        let tmp = TempDir::new_in(".").expect("relative temp dir");
+        let nested = tmp.path().join("space % # ü");
+        std::fs::create_dir_all(&nested).expect("create special-character directory");
+        let file = nested.join("data # %.vortex");
+        std::fs::write(&file, b"data").expect("write listed file");
+
+        let listing = ListingTableUrl::parse(file.to_string_lossy())
+            .expect("relative file path should parse as a listing URL");
+        assert_eq!(
+            CayenneTableProvider::local_segment_cache_path(&file)
+                .expect("relative cache path should convert"),
+            listing.prefix().clone(),
+            "cache retirement must reconstruct the exact LocalFileSystem key"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_store_refcounted_cleanup_invalidates_only_retired_cached_path() {
+        use crate::metadata::ObjectStoreConfig;
+        use crate::provider::delta_encoding::WritePolicy;
+        use object_store::memory::InMemory;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!(
+            "sqlite://{}/cayenne.db",
+            metadata_dir
+                .to_str()
+                .expect("metadata path should be UTF-8")
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let store_url = url::Url::parse("s3://segment-cache-retirement")
+            .expect("object-store URL should be valid");
+        let provider = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog),
+            SessionContext::new().runtime_env(),
+        )
+        .with_object_store(ObjectStoreConfig {
+            url: store_url,
+            store: Arc::clone(&store),
+        })
+        .create(CreateTableOptions {
+            table_name: "object_store_segment_cache_retirement".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "s3://segment-cache-retirement/cayenne".to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+        })
+        .await
+        .expect("object-store table created");
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        provider
+            .write_to_snapshot(
+                single_batch_stream(
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+                    )
+                    .expect("input batch"),
+                ),
+                provider.target_file_size_bytes(),
+                &snapshot_id,
+                1,
+                None,
+                WritePolicy::DELTA,
+            )
+            .await
+            .expect("write source Vortex object");
+
+        let prefix = provider
+            .snapshot_object_store_prefix(&snapshot_id)
+            .expect("snapshot prefix should resolve")
+            .expect("S3 table should have an object-store prefix");
+        let source_objects: Vec<_> = store
+            .list(Some(&prefix))
+            .try_collect()
+            .await
+            .expect("list written objects");
+        let source_data_paths: Vec<_> = source_objects
+            .iter()
+            .filter(|meta| {
+                meta.location.parts().next_back().is_some_and(|name| {
+                    CayenneTableProvider::is_compactable_data_file(name.as_ref())
+                })
+            })
+            .map(|meta| meta.location.clone())
+            .collect();
+        assert_eq!(
+            source_data_paths.len(),
+            1,
+            "the single-shard write should create one Vortex object: {source_data_paths:?}"
+        );
+        let source_path = source_data_paths[0].clone();
+        let retired_path =
+            ObjectStorePath::from(format!("{}/retired-copy.vortex", prefix.as_ref()));
+        store
+            .copy(&source_path, &retired_path)
+            .await
+            .expect("copy source object to the retiring path");
+
+        provider
+            .refresh_listing_table()
+            .await
+            .expect("refresh listing after copied object");
+        let ctx = SessionContext::new();
+        CayenneTableProvider::register_object_store_if_needed(
+            &ctx.runtime_env(),
+            provider
+                .object_store_config
+                .as_ref()
+                .expect("object-store config should be retained"),
+        );
+        let snapshot_url = CayenneTableProvider::snapshot_dir_url(
+            provider.table_path(),
+            provider.table_id(),
+            &snapshot_id,
+        );
+        let listing_table = CayenneTableProvider::create_listing_table(
+            &snapshot_url,
+            Arc::clone(&schema),
+            provider.context().file_format(),
+            &provider.pk_deletion_strategy,
+        )
+        .expect("create direct snapshot listing");
+        let listed_files = listing_table
+            .list_files_for_scan(&ctx.state(), &[], None)
+            .await
+            .expect("list direct snapshot files");
+        let listed_paths: HashSet<_> = listed_files
+            .file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| file.path().clone())
+            .collect();
+        assert_eq!(
+            listed_paths,
+            HashSet::from([source_path.clone(), retired_path.clone()]),
+            "the direct snapshot listing must include both object paths"
+        );
+        let scan = listing_table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("plan direct snapshot scan");
+        let rows: usize = collect(scan, ctx.task_ctx())
+            .await
+            .expect("scan both snapshot objects")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 4_000, "the scan must read both identical objects");
+        let entries_before = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the segment cache should be enabled");
+        assert!(entries_before > 1, "both object paths must be cached");
+
+        let source_file_name = source_path
+            .parts()
+            .next_back()
+            .expect("source path should have a file name");
+        let live_referenced = HashSet::from([CayenneTableProvider::manifest_file_relative_path(
+            &snapshot_id,
+            source_file_name.as_ref(),
+        )]);
+        provider
+            .delete_prefix_refcounted(&prefix, &snapshot_id, &live_referenced)
+            .await
+            .expect("ref-counted object-store cleanup");
+
+        let remaining_data_paths: HashSet<_> = store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list objects after cleanup")
+            .into_iter()
+            .filter(|meta| {
+                meta.location.parts().next_back().is_some_and(|name| {
+                    CayenneTableProvider::is_compactable_data_file(name.as_ref())
+                })
+            })
+            .map(|meta| meta.location)
+            .collect();
+        assert_eq!(
+            remaining_data_paths,
+            HashSet::from([source_path]),
+            "cleanup must preserve the referenced object and delete only the retired object"
+        );
+        let entries_after = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the segment cache should remain enabled");
+        assert_eq!(
+            entries_after.saturating_mul(2),
+            entries_before,
+            "identical objects cache equal segment counts, so cleanup must evict only the retired path"
+        );
     }
 
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
@@ -40714,6 +42077,122 @@ mod tests {
         assert!(
             plan_after.properties().output_ordering().is_none(),
             "after an append delta-adds an unsorted file, output_ordering must NOT be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_compaction_invalidates_retired_segments_after_cleanup() {
+        use arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "compaction_segment_cache_retirement",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(0..2_000))],
+            )
+            .expect("input batch"),
+        )
+        .await;
+        assert_eq!(
+            read_all(&ctx, &provider, "compaction_segment_cache_retirement")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2_000
+        );
+        let old_cache_entries = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("the file-backed test enables the segment cache");
+        assert!(
+            old_cache_entries > 0,
+            "the source scan must populate the cache"
+        );
+        let old_snapshot = provider.get_current_snapshot_id();
+
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("compaction rewrite"),
+            "the compaction must publish a replacement snapshot"
+        );
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain post-compaction maintenance");
+        assert_eq!(
+            read_all(&ctx, &provider, "compaction_segment_cache_retirement")
+                .await
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2_000
+        );
+        let entries_before_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_before_cleanup > old_cache_entries,
+            "the replacement scan must cache live segments alongside retired inputs"
+        );
+
+        let current_snapshot = provider.get_current_snapshot_id();
+        provider.protected_snapshots.store(Arc::new(HashMap::new()));
+        provider
+            .snapshot_scan_refs
+            .lock()
+            .insert(old_snapshot.clone(), 1);
+        provider
+            .cleanup_old_snapshots_now_for_test(&current_snapshot)
+            .await
+            .expect("in-flight cleanup pass");
+        assert_eq!(
+            provider
+                .context()
+                .file_format()
+                .segment_cache_entry_count()
+                .await,
+            Some(entries_before_cleanup),
+            "in-flight compaction inputs must remain cached"
+        );
+        assert_eq!(
+            provider.snapshot_scan_refs.lock().remove(&old_snapshot),
+            Some(1),
+            "the test must release the old snapshot's in-flight guard"
+        );
+        provider
+            .cleanup_old_snapshots_now_for_test(&current_snapshot)
+            .await
+            .expect("cleanup committed compaction inputs after the scan guard is released");
+        let entries_after_cleanup = provider
+            .context()
+            .file_format()
+            .segment_cache_entry_count()
+            .await
+            .expect("segment cache remains enabled");
+        assert!(
+            entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
+            "cleanup must remove retired compaction inputs while preserving the output cache"
         );
     }
 
@@ -45602,7 +47081,7 @@ mod tests {
             deserialize_pk_bloom_sidecar(&bytes).expect("sidecar roundtrips");
 
         assert_eq!(snapshot_id, "snap-abc-123");
-        assert_eq!(restored.bit_mask, bloom.bit_mask);
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
         assert_eq!(restored.inserted_keys, bloom.inserted_keys);
         for key in &keys {
             assert!(
@@ -46253,7 +47732,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_skips_snapshots_newer_than_current() {
+    fn cleanup_invalidates_only_committed_retired_snapshot_paths() {
+        use std::cell::RefCell;
+
         let tmp = TempDir::new().expect("create temp dir");
         let table_path = tmp.path().to_str().expect("valid UTF-8 path");
         let table_id = uuid::Uuid::now_v7().to_string();
@@ -46262,21 +47743,40 @@ mod tests {
         let table_dir = tmp.path().join(&table_id);
         std::fs::create_dir_all(&table_dir).expect("create table dir");
 
-        // Create 3 snapshot directories:
+        // Create 4 snapshot directories:
         // - old_snapshot (older than current) → should be deleted
+        // - protected_snapshot (older than current) → should be kept
         // - current_snapshot → should be kept
         // - newer_snapshot (newer than current, simulating in-flight write) → should be kept
         let old_snapshot = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let protected_snapshot = uuid::Uuid::now_v7().to_string();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let current_snapshot = uuid::Uuid::now_v7().to_string();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let newer_snapshot = uuid::Uuid::now_v7().to_string();
 
         std::fs::create_dir(table_dir.join(&old_snapshot)).expect("create old snapshot dir");
+        std::fs::create_dir(table_dir.join(&protected_snapshot))
+            .expect("create protected snapshot dir");
         std::fs::create_dir(table_dir.join(&current_snapshot)).expect("create current dir");
         std::fs::create_dir(table_dir.join(&newer_snapshot)).expect("create newer dir");
+        for snapshot in [
+            &old_snapshot,
+            &protected_snapshot,
+            &current_snapshot,
+            &newer_snapshot,
+        ] {
+            std::fs::write(table_dir.join(snapshot).join("data.vortex"), b"data")
+                .expect("write snapshot data file");
+        }
 
-        let protected: HashSet<String> = HashSet::new();
+        let protected = HashSet::from([protected_snapshot.clone()]);
+        let old_cache_path = CayenneTableProvider::local_segment_cache_path(
+            &table_dir.join(&old_snapshot).join("data.vortex"),
+        )
+        .expect("old data path should convert before cleanup");
+        let invalidated = RefCell::new(HashSet::new());
 
         // Legacy / unpopulated-manifest mode: whole-dir delete (the historical
         // behavior). Ref-counted file-by-file deletion is covered separately.
@@ -46287,6 +47787,7 @@ mod tests {
             &protected,
             false,
             &HashSet::new(),
+            |paths| invalidated.borrow_mut().extend(paths),
         )
         .expect("cleanup should succeed");
 
@@ -46300,10 +47801,19 @@ mod tests {
             table_dir.join(&current_snapshot).exists(),
             "current snapshot must be preserved"
         );
+        assert!(
+            table_dir.join(&protected_snapshot).exists(),
+            "protected snapshot must be preserved"
+        );
         // newer_snapshot should be kept (in-flight write protection)
         assert!(
             table_dir.join(&newer_snapshot).exists(),
             "snapshot newer than current must be preserved (in-flight write)"
+        );
+        assert_eq!(
+            *invalidated.borrow(),
+            HashSet::from([old_cache_path]),
+            "only the exact committed retired path is invalidated"
         );
     }
 

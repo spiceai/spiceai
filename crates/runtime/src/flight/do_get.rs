@@ -52,7 +52,17 @@ pub(crate) async fn handle(
         }
     };
 
-    match Command::try_from(msg).map_err(to_tonic_err)? {
+    // The arms below record per-command; a ticket that is not a `Command` reaches
+    // none of them, so it is recorded here.
+    let command = match Command::try_from(msg) {
+        Ok(command) => command,
+        Err(e) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            return Err(to_tonic_err(e));
+        }
+    };
+
+    match command {
         Command::CommandStatementQuery(command) => {
             Box::pin(flightsql::statement_query::do_get(command)).await
         }

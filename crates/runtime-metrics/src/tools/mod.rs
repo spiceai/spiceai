@@ -40,3 +40,8 @@ pub static LOAD_ERROR: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("Number of errors loading the LLM tool.")
         .build()
 });
+
+/// See [`crate::publish_component_counters_at_zero`].
+pub fn publish_counters_at_zero() {
+    LOAD_ERROR.add(0, &[]);
+}

@@ -24,6 +24,7 @@ limitations under the License.
 //! `runtime_table::refresh_source` for why, and for how this adapter
 //! retires once `DataConnector` itself moves down.
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,8 +34,10 @@ use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint};
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataconnector::DataConnector;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 
 /// A [`DataConnector`] bound to the dataset it resolves, as a [`RefreshSource`].
 #[derive(Debug)]
@@ -66,7 +69,10 @@ impl RefreshSource for ConnectorRefreshSource {
 
     async fn read_provider(&self) -> Result<Arc<dyn TableProvider>, RefreshSourceError> {
         self.connector
-            .read_provider(&self.dataset)
+            .read_provider(
+                &RuntimeConnectorContext::for_dataset(&self.dataset),
+                &self.dataset,
+            )
             .await
             .map_err(|source| Box::new(source) as RefreshSourceError)
     }
@@ -77,10 +83,13 @@ impl RefreshSource for ConnectorRefreshSource {
         }
 
         let registry = self.dataset.runtime.accelerator_engine_registry();
-        let checkpoint =
-            DatasetCheckpoint::try_new(self.dataset.as_ref(), registry, OpenOption::OpenExisting)
-                .await
-                .ok()?;
-        Some(checkpoint.to_arc())
+        dataset_checkpointer(
+            self.dataset.as_ref(),
+            registry,
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .ok()
     }
 }
