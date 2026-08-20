@@ -26,16 +26,12 @@ limitations under the License.
 //!    compare-and-clear in step 4, not from claiming these markers here.
 //! 2. **Read** those keys' *current* committed values from the accelerator
 //!    (a fenced point scan), AFTER the list.
-//! 3. **Deliver** to the source idempotently, splitting the claimed keys by
-//!    whether the step-2 read still returned them:
-//!    - **present** keys → one atomic upsert (`InsertOp::Replace`, an
-//!      `INSERT … ON CONFLICT (pk) DO UPDATE`). No delete leg, so a present key
-//!      never produces a spurious source delete for the CDC stream to echo back
-//!      and erase the committed write (#11915).
-//!    - **absent** keys (claimed but not returned) → a delete, correct now that
-//!      it only fires for keys that are genuinely gone from the accelerator.
-//!    Both statements are idempotent (upsert and delete-by-key converge on
-//!    re-run), so a re-delivery after a crash reaches the same state.
+//! 3. **Deliver** to the source idempotently. Partition keys by delete-only
+//!    vs upsert, processes separately. If the source cannot do a native upsert (it answers `Replace` with
+//!    `NotImplemented`), delivery falls back to the older delete-then-insert
+//!    emulation over all claimed keys — a temporary path that reopens the
+//!    #11915 window, kept only until every durable-write-back source supports
+//!    native upsert.
 //! 4. **Compare-and-clear** the markers whose stored sequence is still at or
 //!    below the sequence listed in step 1 — a newer commit that bumped a marker
 //!    during delivery leaves it in place, so the stale delivery never clears a
@@ -84,8 +80,6 @@ pub(crate) struct WriteBackWorker {
     /// live table's catalog, listing fence, and keyset, so the marker CRUD and
     /// the point scan observe committed state.
     provider: Arc<CayenneTableProvider>,
-    /// The federated source. Present keys are delivered as a native atomic
-    /// upsert (`InsertOp::Replace`); absent keys as a delete.
     federated: Arc<FederatedTable>,
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
@@ -189,7 +183,7 @@ impl WriteBackWorker {
         let accelerator = Arc::clone(&self.provider);
         let current = ctx
             .read_table(accelerator)?
-            .filter(filter)?
+            .filter(filter.clone())?
             .collect()
             .await?;
         let session_state = ctx.state();
@@ -199,46 +193,59 @@ impl WriteBackWorker {
         // delete below touch disjoint source rows.
         let pk_col = self.pk_columns[0].as_str();
         let absent = absent_claimed_keys(pk_col, &pk_values, &current)?;
+        let has_present = current.iter().any(|batch| batch.num_rows() > 0);
 
         let federated_provider = self.federated.table_provider().await;
 
-        // Present keys → one atomic upsert (`INSERT … ON CONFLICT (pk) DO
-        // UPDATE`). No delete leg, so a present key never emits a spurious
-        // source delete that the CDC stream could echo back and erase the
-        // committed write (#11915).
-        if current.iter().any(|batch| batch.num_rows() > 0) {
-            if let Err(e) = execute_insert(
+        // Attempt a Upsert. If federated source does not support it `DataFusionError::NotImplemented`
+        // Fallback to delete and append.
+        let mut fallback_delivered = false;
+        if has_present {
+            match execute_insert(
                 Arc::clone(&federated_provider),
                 self.provider.table_schema(),
-                current,
+                current.clone(),
                 InsertOp::Replace,
                 &session_state,
                 None,
             )
             .await
             {
-                // A `NotImplemented` here means the source rejected `Replace`
-                // even though `supports_durable_write_back_delivery()` gated the
-                // dataset as safe at registration — the capability check and
-                // runtime have diverged. Surface it loudly; do NOT fall back to
-                // delete+insert (that reintroduces the spurious-delete window
-                // this design removes). Other errors flow to the caller's
-                // backoff unchanged.
-                if matches!(e, DataFusionError::NotImplemented(_)) {
-                    tracing::error!(
+                Ok(()) => {}
+                Err(e) if matches!(e, DataFusionError::NotImplemented(_)) => {
+                    tracing::warn!(
                         dataset = %self.dataset_name,
                         error = %e,
-                        "durable write-back: source rejected InsertOp::Replace though the dataset was gated as supported at registration; delivery cannot proceed safely and will not fall back to delete+insert"
+                        "durable write-back: source does not support InsertOp::Replace; falling back to delete-then-insert delivery"
                     );
+                    let _ = datafusion::physical_plan::collect(
+                        federated_provider
+                            .delete_from(&session_state, vec![filter])
+                            .await?,
+                        session_state.task_ctx(),
+                    )
+                    .await?;
+                    execute_insert(
+                        Arc::clone(&federated_provider),
+                        self.provider.table_schema(),
+                        current,
+                        InsertOp::Append,
+                        &session_state,
+                        None,
+                    )
+                    .await?;
+                    // The blanket delete above already removed the absent keys, so
+                    // skip the absent-only delete below.
+                    fallback_delivered = true;
                 }
-                return Err(e);
+                Err(e) => return Err(e),
             }
         }
 
-        // Absent keys → delete. Genuinely gone from the accelerator (the read
-        // did not return them), so this delete is correct rather than a blanket
-        // first step.
-        if !absent.is_empty() {
+        // Absent keys → delete. Genuinely gone from the accelerator (the read did
+        // not return them), so this delete is correct rather than a blanket first
+        // step. Skipped when the fallback above already deleted every claimed key.
+        if !fallback_delivered && !absent.is_empty() {
             let absent_filter = col(pk_col).in_list(absent.into_iter().map(lit).collect(), false);
             let delete_plan = federated_provider
                 .delete_from(&session_state, vec![absent_filter])
