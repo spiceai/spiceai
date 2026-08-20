@@ -321,7 +321,7 @@ impl Identity {
     /// Validating at the writer stops an unusable link becoming durable, but it
     /// says nothing about links already on disk: these fields predate the rule,
     /// so an identity written by an older runtime can hold one, and every
-    /// consumer — the startup report, `spice connect status`, a browser an
+    /// consumer — the startup report, `spice cloud status`, a browser an
     /// operator opens — reads the stored value rather than a freshly delivered
     /// one. Applying the rule on the way in is what makes "nothing unusable
     /// reaches a log or a browser" true of existing state and not just of new
@@ -511,7 +511,7 @@ impl Identity {
                     "this identity holds no encryption key; it enrolled before encrypted secret \
                      delivery existed. If this identity has a certificate expiry, its scheduled \
                      renewal will re-key it when due. To recover immediately, or if it has no \
-                     renewal deadline, stop spiced, run `spice connect remove --yes` from this \
+                     renewal deadline, stop spiced, run `spice cloud unlink` from this \
                      instance directory, mint a new enrollment key in the Spice Cloud portal, \
                      and restart with `spiced --token <enrollment-key>`. The existing identity \
                      always wins, so supplying --token before removing it cannot re-enroll."
@@ -664,7 +664,7 @@ pub struct IdentityStore;
 /// authenticate.
 ///
 /// The config directory's persistent enrollment transaction additionally
-/// serializes these read-modify-writes against `spice connect remove` in a
+/// serializes these read-modify-writes against `spice cloud unlink` in a
 /// separate process. The process-wide lock remains necessary for writers that
 /// already own that transaction and for the runtime's in-process updates.
 ///
@@ -1440,7 +1440,7 @@ impl IdentityStore {
     /// Remove the identity while the caller retains ownership of the config
     /// directory's enrollment transaction.
     ///
-    /// This is the non-recursive removal path for `spice connect remove`, which
+    /// This is the non-recursive removal path for `spice cloud unlink`, which
     /// owns one transaction across the identity, draft, endpoint, cached
     /// secrets, and installed service. The transaction must protect the same
     /// config directory as `path`.
@@ -1687,7 +1687,7 @@ pub(crate) fn parent_directory(path: &Path) -> &Path {
 ///
 /// Two writers, two shapes, and they do not overlap: the runtime writes the
 /// cache, the draft and the identity through [`atomic_write_owner_only`], while
-/// `spice connect` writes the operation journals and the endpoint override
+/// `spice cloud link` writes the operation journals and the endpoint override
 /// through its own. Accepting both everywhere would delete a
 /// `.identity.json.7.candidate` nothing here can create, and let a
 /// `.cloud-endpoint.<uuid>.tmp` — equally impossible — fail every release.
@@ -1697,7 +1697,7 @@ pub(crate) fn parent_directory(path: &Path) -> &Path {
 pub enum ArtifactKinds {
     /// `.tmp` from [`atomic_write_owner_only`].
     Runtime,
-    /// `.candidate` from `spice connect`'s writer.
+    /// `.candidate` from the `spice cloud link` writer.
     Connect,
 }
 
@@ -1903,11 +1903,11 @@ pub(crate) struct RemainingArtifacts {
 /// reported success. A caller that cannot tolerate that must fail rather than
 /// acknowledge.
 ///
-/// So are `.candidate` files, the artifact `spice connect` leaves for the state
+/// So are `.candidate` files, the artifact `spice cloud link` leaves for the state
 /// it writes — the operation journals and the endpoint override. Those get no
 /// per-file lock, so the temp rule cannot judge them; what authorizes removing
 /// them is that a release holds `connect.lock` for its whole run, which is the
-/// same lock their writer holds for its whole transaction. No `spice connect`
+/// same lock their writer holds for its whole transaction. No `spice cloud link`
 /// can be mid-write, so any candidate present has been abandoned.
 ///
 /// Returns what is still present afterwards, split by whether it can still
@@ -3688,7 +3688,7 @@ mod tests {
         assert!(guidance.contains("scheduled renewal"), "{err}");
         assert!(guidance.contains("no renewal deadline"), "{err}");
         assert!(guidance.contains("stop spiced"), "{err}");
-        assert!(guidance.contains("spice connect remove --yes"), "{err}");
+        assert!(guidance.contains("spice cloud unlink"), "{err}");
         assert!(guidance.contains("existing identity always wins"), "{err}");
     }
 

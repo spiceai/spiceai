@@ -17,10 +17,9 @@ limitations under the License.
 //! The one line that says this instance is connected, and where to look at it.
 //!
 //! It is emitted by the runtime rather than by whatever started it, because
-//! every way of starting one has to say the same thing: `spice connect`
-//! attaching a foreground runtime, a plain `spice run` or `spiced` in an
-//! enrolled directory, and a service the supervisor started all reach the same
-//! state and print the same block.
+//! every way of starting one has to say the same thing: a plain `spice run` or
+//! `spiced` in an enrolled directory and a service the supervisor started all
+//! reach the same state and print the same block.
 //!
 //! Two facts have to be true before it is honest, and they arrive in either
 //! order: the runtime has finished its initial load and bound its HTTP listener
@@ -150,12 +149,10 @@ pub(crate) fn spawn(
 /// Whether the process that started this runtime has already told the operator
 /// that this instance is connected.
 ///
-/// `spice connect` completes a connect transaction and prints that block before
-/// it hands the terminal to the runtime, so repeating it here would put the same
-/// two lines on the same terminal twice. It is a private handshake from that
-/// launcher — never a documented setting, and absent from every start the CLI
-/// does not parent, which is why a direct `spiced` or `spice run` still reports
-/// for itself.
+/// A launcher can print the block before handing the terminal to the runtime,
+/// so repeating it here would put the same two lines on the same terminal
+/// twice. It is a private handshake from that launcher — never a documented
+/// setting, and absent from direct `spiced` and `spice run` starts.
 fn already_reported() -> bool {
     std::env::var_os("SPICE_CONNECTION_REPORTED").is_some_and(|value| !value.is_empty())
 }

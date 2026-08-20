@@ -16,10 +16,10 @@ limitations under the License.
 
 //! Organization context for `spice cloud`.
 //!
-//! Spice Cloud management tokens are scoped to one organization when they are
-//! minted, so a user who belongs to both a personal org and a company org needs
-//! a credential per org plus a record of which one commands act on. This module
-//! owns both halves:
+//! Spice Cloud user access tokens follow the user's memberships, while machine
+//! credentials remain bound to one organization. The CLI keeps an explicit
+//! organization selection and optional per-org credential copies so both token
+//! kinds can be selected without guessing. This module owns both halves:
 //!
 //! - the **active org**, a machine-wide setting in `~/.spice/cloud-context.json`
 //!   so a new shell keeps operating on the org the last `org use` selected;
@@ -54,8 +54,8 @@ const MAX_ORG_NAME_LEN: usize = 64;
 /// Machine-wide `spice cloud` state that is not a secret.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudContext {
-    /// Organization subsequent commands act on. `None` means "the org the
-    /// credential was minted for", which for most users is their personal org.
+    /// Organization subsequent commands act on. `None` means the credential's
+    /// default organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_org: Option<String>,
 
@@ -315,12 +315,10 @@ pub fn default_token() -> Option<String> {
 
 /// The credential bound to `org`.
 ///
-/// Deliberately does **not** fall back to the default credential. Spice Cloud
-/// binds a token to one organization at mint time, so using the personal-org
-/// token for a request that names another org runs the command against the
-/// wrong organization while the CLI reports the requested one — the failure
-/// mode behind every wrong-target incident this design is meant to prevent.
-/// Callers surface [`CloudErrorCode::OrgCredentialMissing`] instead.
+/// Deliberately does **not** decide whether the default credential may fall
+/// back. Callers first prefer this explicit copy, then may probe the default
+/// credential: a user token is valid for every member organization, while a
+/// machine token has no user membership and must stay organization-bound.
 #[must_use]
 pub fn token_for_org(org: &str) -> Option<String> {
     read_credential(&org_token_var(org))

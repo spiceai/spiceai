@@ -100,7 +100,7 @@ const LOGINCTL: &str = "loginctl";
 /// The human-readable command builders deliberately keep using the bare tool
 /// names, while [`ProcessHost`] resolves them here before `Command::new`. This
 /// prevents a caller-controlled `PATH` from selecting an attacker-supplied
-/// binary during a documented `sudo spice connect service ...` invocation.
+/// binary during a documented `sudo spice cloud service ...` invocation.
 const TRUSTED_SUPERVISOR_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// How long an install or upgrade has to prove the service healthy before it is
@@ -433,7 +433,7 @@ fn install_paths(name: &str, instance_dir: &Path, scope: ServiceScope) -> Result
         message: format!(
             "locate the {what} a {scope} service needs: this account has no such directory. Set \
              XDG_CONFIG_HOME and XDG_DATA_HOME, or install a system service with \
-             `sudo spice connect service install`."
+             `sudo spice cloud service install`."
         ),
     };
     let unit = unit_dir(scope).ok_or_else(|| missing("systemd unit directory"))?;
@@ -516,7 +516,7 @@ fn install_at(
             Err(Error::CloudConnectIo {
                 message: format!(
                     "install the Spice Cloud Connect service {name} (systemd): {why}. {restored} \
-                     Read what the runtime said with `spice connect service logs -n 200 --dir {dir}`.",
+                     Read what the runtime said with `cd {dir} && spice cloud logs -n 200`.",
                     dir = request.instance_dir.display(),
                 ),
             })
@@ -787,7 +787,7 @@ impl Rollback {
                     message: format!(
                         "Failed to install the Spice Cloud Connect service: {} is not a regular \
                          file, so the runtime it stands for cannot be preserved across the \
-                         upgrade. Remove it and re-run `spice connect service install`.",
+                         upgrade. Remove it and re-run `spice cloud service install`.",
                         paths.runtime.display()
                     ),
                 });
@@ -1063,7 +1063,7 @@ fn remove_staged_runtime(manifest: &ServiceManifest) -> Result<()> {
             message: format!(
                 "remove the runtime staged for the Spice Cloud Connect service {name} at {}: {e}. \
                  The service definition is already gone, so nothing runs it — remove the \
-                 directory and re-run `spice connect service uninstall`.",
+                 directory and re-run `spice cloud service uninstall`.",
                 owned.display(),
                 name = manifest.name,
             ),
@@ -1129,7 +1129,7 @@ fn await_state(
         message: format!(
             "{action} the Spice Cloud Connect service {name} (systemd): systemd reports it as \
              {observed} rather than {wanted}. Inspect it with `{status}` and \
-             `spice connect service logs -n 200 --dir {dir}`.",
+             `cd {dir} && spice cloud logs -n 200`.",
             name = manifest.name,
             status = systemctl_command(manifest.scope, &["status", &manifest.name]),
             dir = manifest.directory.display(),
@@ -1138,7 +1138,11 @@ fn await_state(
 }
 
 /// Print the service's output from the journal, bounded and without a pager.
-fn logs(host: &dyn SystemdHost, manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
+fn logs(
+    host: &dyn SystemdHost,
+    manifest: &ServiceManifest,
+    request: LogRequest,
+) -> Result<Option<Vec<String>>> {
     let args = journal_args(&manifest.name, manifest.scope, request);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -1150,7 +1154,7 @@ fn logs(host: &dyn SystemdHost, manifest: &ServiceManifest, request: LogRequest)
             // Ended by a signal, or by the SIGINT that also reached this
             // process: the viewer stopped, the service did not change.
             Ok(None | Some(130)) => Err(Error::Interrupted),
-            Ok(Some(0)) => Ok(()),
+            Ok(Some(0)) => Ok(None),
             Ok(Some(code)) => Err(journal_failure(
                 manifest,
                 &format!("`journalctl` exited with status {code}"),
@@ -1166,23 +1170,27 @@ fn logs(host: &dyn SystemdHost, manifest: &ServiceManifest, request: LogRequest)
         return Err(journal_failure(manifest, &output.describe_failure()));
     }
 
+    if request.capture {
+        return Ok(Some(output.stdout.lines().map(str::to_owned).collect()));
+    }
+
     if output.stdout.trim().is_empty() {
         println!("No logs yet for {}.", manifest.name);
         if manifest.scope == ServiceScope::System && !super::is_root() {
             println!(
                 "If this account cannot read the system journal, retry with \
-                 `sudo spice connect service logs --dir {}`.",
+                 `cd {} && sudo spice cloud logs`.",
                 manifest.directory.display()
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     print!("{}", output.stdout);
     if !output.stdout.ends_with('\n') {
         println!();
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The exact `journalctl` invocation for one service.
@@ -1217,7 +1225,7 @@ fn journal_failure(manifest: &ServiceManifest, reason: &str) -> Error {
     let retry = match manifest.scope {
         ServiceScope::System if !super::is_root() => format!(
             " If this account cannot read the system journal, retry with \
-             `sudo spice connect service logs --dir {}`.",
+             `cd {} && sudo spice cloud logs`.",
             manifest.directory.display()
         ),
         _ => String::new(),
@@ -1243,7 +1251,7 @@ fn ensure_authorized(manifest: &ServiceManifest, action: &str) -> Result<()> {
             message: format!(
                 "Failed to {action} the Spice Cloud Connect service {name} (systemd): a system \
                  service is managed with root privileges, and Spice never elevates on its own. \
-                 Retry with `sudo spice connect service {action} --dir {dir}`. Nothing was \
+                 Retry with `cd {dir} && sudo spice cloud service {action}`. Nothing was \
                  changed. See: https://spiceai.org/docs",
                 name = manifest.name,
                 dir = manifest.directory.display(),
@@ -1254,7 +1262,7 @@ fn ensure_authorized(manifest: &ServiceManifest, action: &str) -> Result<()> {
                 "Failed to {action} the Spice Cloud Connect service {name} (systemd): a user \
                  service is managed by the account that owns it ({owner}), and running this \
                  through sudo would target root's user manager instead of that account's. Run \
-                 `spice connect service {action} --dir {dir}` as {owner}. Nothing was changed. \
+                 `cd {dir} && spice cloud service {action}` as {owner}. Nothing was changed. \
                  See: https://spiceai.org/docs",
                 name = manifest.name,
                 owner = manifest.owner.describe(),
@@ -1794,7 +1802,7 @@ fn systemctl_action(
             .any(|word| err.to_string().to_ascii_lowercase().contains(word));
         let retry = if denied && manifest.scope == ServiceScope::System {
             format!(
-                " Retry with `sudo spice connect service {action} --dir {}`.",
+                " Retry with `cd {} && sudo spice cloud service {action}`.",
                 manifest.directory.display()
             )
         } else {
@@ -1854,10 +1862,6 @@ impl ServiceBackend for SystemdBackend {
         install(&ProcessHost, request)
     }
 
-    fn authorize_uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
-        ensure_authorized(manifest, "uninstall")
-    }
-
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
         uninstall(&ProcessHost, manifest)
     }
@@ -1878,7 +1882,7 @@ impl ServiceBackend for SystemdBackend {
         observe(&ProcessHost, manifest)
     }
 
-    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
+    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<Option<Vec<String>>> {
         logs(&ProcessHost, manifest, request)
     }
 
@@ -2641,7 +2645,7 @@ mod tests {
             let error = result.expect_err("a non-root system-service mutation must be refused");
             assert!(
                 error.to_string().contains(&format!(
-                    "sudo spice connect service {action} --dir /opt/edge-1"
+                    "cd /opt/edge-1 && sudo spice cloud service {action}"
                 )),
                 "{action}: {error}"
             );
@@ -2655,7 +2659,7 @@ mod tests {
 
     #[test]
     fn a_user_service_is_never_driven_through_another_accounts_manager() {
-        // What `sudo spice connect service restart` on a user service would
+        // What `sudo spice cloud service restart` on a user service would
         // otherwise do: talk to root's user manager, which holds no such unit.
         let mut manifest = manifest(ServiceScope::User);
         manifest.owner.uid = nix::unistd::Uid::effective().as_raw() + 1;
@@ -2667,7 +2671,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("spice connect service restart --dir /opt/edge-1"),
+                .contains("cd /opt/edge-1 && spice cloud service restart"),
             "{error}"
         );
         assert!(!error.to_string().contains("sudo spice"), "{error}");
@@ -2683,6 +2687,7 @@ mod tests {
             LogRequest {
                 number: 100,
                 follow: false,
+                capture: false,
             },
         );
         assert_eq!(
@@ -2697,6 +2702,7 @@ mod tests {
             LogRequest {
                 number: 0,
                 follow: true,
+                capture: false,
             },
         );
         assert_eq!(user.first().map(String::as_str), Some("--user"));
@@ -2715,6 +2721,7 @@ mod tests {
             LogRequest {
                 number: 100,
                 follow: true,
+                capture: false,
             },
         )
         .expect_err("an interrupted viewer exits as interrupted");
@@ -2741,9 +2748,34 @@ mod tests {
             LogRequest {
                 number: 100,
                 follow: false,
+                capture: false,
             },
         )
         .expect("an empty history is not a failure");
+    }
+
+    #[test]
+    fn journal_history_can_be_captured_for_json_fallback() {
+        let manifest = manifest(ServiceScope::User);
+        let command = format!(
+            "journalctl --user -u {} --no-pager -q -o cat -n 2",
+            manifest.name
+        );
+        let host = ScriptedHost::new().says(&command, "first\nsecond\n");
+        let captured = logs(
+            &host,
+            &manifest,
+            LogRequest {
+                number: 2,
+                follow: false,
+                capture: true,
+            },
+        )
+        .expect("capture journal history");
+        assert_eq!(
+            captured,
+            Some(vec!["first".to_string(), "second".to_string()])
+        );
     }
 
     #[test]
@@ -2762,6 +2794,7 @@ mod tests {
             LogRequest {
                 number: 100,
                 follow: false,
+                capture: false,
             },
         )
         .expect_err("a journal failure is reported");
@@ -3326,10 +3359,7 @@ mod tests {
         let failure = preflight(ServiceScope::User);
         if let Err(failure) = failure {
             let message = Error::from(failure).to_string();
-            assert!(
-                message.contains("spice connect service install"),
-                "{message}"
-            );
+            assert!(message.contains("spice cloud service install"), "{message}");
         }
     }
 

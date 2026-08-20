@@ -890,43 +890,32 @@ fn test_cloud_inspect() {
 }
 
 // ============================================================================
-// Link / Unlink (local config, no API needed)
+// Removed local link file
 // ============================================================================
 
 #[test]
-fn test_cloud_link_and_unlink() {
-    let _ = require_cmd!();
-    let name = test_app_name();
-    let org_app = create_test_app(&name);
-
+fn test_cloud_json_is_not_a_project_resolution_source() {
     let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
-
-    // Link
-    let mut cmd = spice_cloud_cmd().expect("credentials required");
-    cmd.current_dir(temp_dir.path())
-        .args(["cloud", "link", &org_app])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Linked to app"));
-
-    // Verify .spice/cloud.json was created
     let config_path = temp_dir.path().join(".spice").join("cloud.json");
-    assert!(config_path.exists(), ".spice/cloud.json should be created");
+    std::fs::create_dir_all(config_path.parent().expect("config parent"))
+        .expect("create config directory");
+    std::fs::write(
+        &config_path,
+        r#"{"org":"legacy-org","app":"legacy-project"}"#,
+    )
+    .expect("write obsolete cloud.json");
 
-    // Unlink
-    let mut cmd = spice_cloud_cmd().expect("credentials required");
+    let mut cmd = cargo_bin_cmd!("spice");
     cmd.current_dir(temp_dir.path())
-        .args(["cloud", "unlink"])
+        .args(["cloud", "status"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Unlinked"));
+        .failure()
+        .stderr(predicate::str::contains("No app specified"));
 
     assert!(
-        !config_path.exists(),
-        ".spice/cloud.json should be removed after unlink"
+        config_path.exists(),
+        "the CLI must ignore rather than mutate an obsolete cloud.json"
     );
-
-    cleanup_app(&org_app);
 }
 
 // ============================================================================

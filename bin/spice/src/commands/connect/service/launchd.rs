@@ -60,7 +60,7 @@ limitations under the License.
 //! is how a long-running daemon fills a disk. So the definition names neither,
 //! and the runtime is started with `--service-log-dir` instead: it writes its
 //! own bounded, rotating files under one fixed policy
-//! (`runtime_cloud_connect::service_log`) that `spice connect service logs`
+//! (`runtime_cloud_connect::service_log`) that `spice cloud logs`
 //! reads back against the same constants.
 
 use std::io::Write as _;
@@ -79,7 +79,7 @@ use super::{InstalledService, PreflightFailure, ServiceAccount};
 use crate::error::{Error, Result};
 
 /// Absolute path to `launchctl`, so a caller-controlled `PATH` cannot select an
-/// attacker-supplied binary during a documented `sudo spice connect service …`
+/// attacker-supplied binary during a documented `sudo spice cloud service …`
 /// invocation.
 pub(super) const LAUNCHCTL: &str = "/bin/launchctl";
 
@@ -469,7 +469,7 @@ fn install_paths(label: &str, instance_dir: &Path, scope: ServiceScope) -> Resul
         message: format!(
             "locate the {what} a {scope} service needs: this account has no such directory. Log \
              in as the account that will run the instance, or install a system service with \
-             `sudo spice connect service install`."
+             `sudo spice cloud service install`."
         ),
     };
     let definitions =
@@ -518,7 +518,7 @@ fn render_plist(
 	<string>{label}</string>
 	<!-- launchd bounds nothing it writes to StandardOutPath, so neither is
 	     named here: the runtime writes its own bounded, rotating files under
-	     the directory below, and `spice connect service logs` reads them. -->
+	     the directory below, and `spice cloud logs` reads them. -->
 	<key>ProgramArguments</key>
 	<array>
 		<string>{runtime}</string>
@@ -775,7 +775,7 @@ fn install_at(
             Err(Error::CloudConnectIo {
                 message: format!(
                     "install the Spice Cloud Connect service {label} (launchd): {why}. {restored} \
-                     Read what the runtime said with `spice connect service logs -n 200 --dir {dir}`.",
+                     Read what the runtime said with `cd {dir} && spice cloud logs -n 200`.",
                     dir = request.instance_dir.display(),
                 ),
             })
@@ -1067,7 +1067,7 @@ impl Rollback {
                     message: format!(
                         "Failed to install the Spice Cloud Connect service: {} is not a regular \
                          file, so the runtime it stands for cannot be preserved across the \
-                         upgrade. Remove it and re-run `spice connect service install`.",
+                         upgrade. Remove it and re-run `spice cloud service install`.",
                         paths.runtime.display()
                     ),
                 });
@@ -1104,7 +1104,7 @@ impl Rollback {
     /// by hand, because an operator told recovery worked will not go looking.
     ///
     /// A service that was loaded comes back loaded, and `RunAtLoad` starts it.
-    /// One that was booted out — which is the state `spice connect service
+    /// One that was booted out — which is the state `spice cloud service
     /// stop` leaves — stays booted out.
     fn restore(&self, host: &dyn LaunchdHost, label: &str, scope: ServiceScope) -> String {
         let mut failed: Vec<String> = Vec::new();
@@ -1259,7 +1259,7 @@ fn ensure_log_dir(dir: &Path, scope: ServiceScope, account: Option<ServiceAccoun
             message: format!(
                 "Failed to install the Spice Cloud Connect service: {dir} is a symlink. The \
                  service's log files are managed by Spice, so this must be a real directory. \
-                 Replace it and re-run `sudo spice connect service install`.",
+                 Replace it and re-run `sudo spice cloud service install`.",
                 dir = dir.display()
             ),
         });
@@ -1281,7 +1281,7 @@ fn ensure_log_dir(dir: &Path, scope: ServiceScope, account: Option<ServiceAccoun
                 "Failed to install the Spice Cloud Connect service: the service log directory \
                  {dir} is owned by uid {found} with mode {mode:04o}, but the service runs as uid \
                  {uid}. Fix it (`sudo chown {uid} {dir}` and `sudo chmod go-w {dir}`) and re-run \
-                 `sudo spice connect service install`.",
+                 `sudo spice cloud service install`.",
                 dir = dir.display(),
                 found = meta.uid(),
             ),
@@ -1377,7 +1377,7 @@ fn write_plist(path: &Path, plist: &[u8], scope: ServiceScope) -> Result<()> {
                      uid {uid} gid {gid} with mode {mode:04o}. launchd silently refuses to load a \
                      daemon that is not owned by root:wheel and writable only by root. Fix it with \
                      `sudo chown root:wheel {plist_path}` and `sudo chmod 644 {plist_path}`, then \
-                     re-run `sudo spice connect service install`.",
+                     re-run `sudo spice cloud service install`.",
                     plist_path = path.display(),
                     uid = meta.uid(),
                     gid = meta.gid(),
@@ -1447,7 +1447,7 @@ fn verify_staged_runtime_executes(
              was installed and any service already on this host keeps the runtime it has.\
              {quarantine} Check the binary with `codesign --verify {source}` and \
              `spctl --assess --type execute {source}`, then re-run \
-             `spice connect service install`. See: https://spiceai.org/docs",
+             `spice cloud service install`. See: https://spiceai.org/docs",
             source = source.display(),
         ),
     })
@@ -1633,7 +1633,7 @@ fn remove_staged_runtime(manifest: &ServiceManifest) -> Result<()> {
             message: format!(
                 "remove the runtime staged for the Spice Cloud Connect service {name} at {}: {e}. \
                  The service definition is already gone, so nothing runs it — remove the \
-                 directory and re-run `spice connect service uninstall`.",
+                 directory and re-run `spice cloud service uninstall`.",
                 owned.display(),
                 name = manifest.name,
             ),
@@ -1737,7 +1737,7 @@ fn await_state(
         message: format!(
             "{action} the Spice Cloud Connect service {name} (launchd): launchd reports it as \
              {observed} rather than {wanted}. Inspect it with `{print}` and \
-             `spice connect service logs -n 200 --dir {dir}`.",
+             `cd {dir} && spice cloud logs -n 200`.",
             name = manifest.name,
             print = launchctl_command(
                 manifest.scope,
@@ -1820,7 +1820,7 @@ fn observe_persistence(
         ServiceScope::User => (
             ServiceStarts::LoginOnly,
             Some(format!(
-                "spice connect service uninstall --dir {dir} && sudo spice connect service install --dir {dir}",
+                "cd {dir} && spice cloud service uninstall && sudo spice cloud service install",
                 dir = manifest.directory.display()
             )),
         ),
@@ -1828,7 +1828,7 @@ fn observe_persistence(
 }
 
 /// Print the service's output from its own bounded files.
-fn logs(manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
+fn logs(manifest: &ServiceManifest, request: LogRequest) -> Result<Option<Vec<String>>> {
     let directory = log_dir_for_manifest(manifest)?;
     let reader = ServiceLogReader::new(&directory);
     let read_error = |what: &str, e: &std::io::Error| Error::CloudConnectIo {
@@ -1846,12 +1846,16 @@ fn logs(manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
         .read_history(lines)
         .map_err(|e| read_error("open the service log directory", &e))?;
 
+    if request.capture {
+        return Ok(Some(history));
+    }
+
     let mut out = std::io::stdout().lock();
     for line in &history {
         if writeln!(out, "{line}").is_err() {
             // The reader on the other end of the pipe went away, which is what
             // `| head` looks like. Nothing is wrong with the service.
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -1861,7 +1865,7 @@ fn logs(manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
             // failure — the same answer the journal-backed back end gives.
             let _ = writeln!(out, "No logs yet for {}.", manifest.name);
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // Follows until the command is interrupted, which is what `--follow` asks
@@ -1878,7 +1882,8 @@ fn logs(manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
             },
             || streaming.get(),
         )
-        .map_err(|e| read_error("follow the service log in", &e))
+        .map_err(|e| read_error("follow the service log in", &e))?;
+    Ok(None)
 }
 
 /// The directory an installed service writes its log files into.
@@ -1895,7 +1900,7 @@ fn log_dir_for_manifest(manifest: &ServiceManifest) -> Result<PathBuf> {
         message: format!(
             "locate the log files of the Spice Cloud Connect service {name} (launchd): its \
              manifest names no log source and its label carries no instance name. Re-run \
-             `spice connect service install` to rewrite both.",
+             `spice cloud service install` to rewrite both.",
             name = manifest.name,
         ),
     })
@@ -1913,7 +1918,7 @@ fn ensure_authorized(manifest: &ServiceManifest, action: &str) -> Result<()> {
             message: format!(
                 "Failed to {action} the Spice Cloud Connect service {name} (launchd): a system \
                  service is managed with root privileges, and Spice never elevates on its own. \
-                 Retry with `sudo spice connect service {action} --dir {dir}`. Nothing was \
+                 Retry with `cd {dir} && sudo spice cloud service {action}`. Nothing was \
                  changed. See: https://spiceai.org/docs",
                 name = manifest.name,
                 dir = manifest.directory.display(),
@@ -1924,7 +1929,7 @@ fn ensure_authorized(manifest: &ServiceManifest, action: &str) -> Result<()> {
                 "Failed to {action} the Spice Cloud Connect service {name} (launchd): a user \
                  agent is managed by the account that owns it ({owner}), and running this through \
                  sudo would target root's launchd domain instead of that account's. Run \
-                 `spice connect service {action} --dir {dir}` as {owner}. Nothing was changed. \
+                 `cd {dir} && spice cloud service {action}` as {owner}. Nothing was changed. \
                  See: https://spiceai.org/docs",
                 name = manifest.name,
                 owner = manifest.owner.describe(),
@@ -2113,7 +2118,7 @@ fn launchd_action(manifest: &ServiceManifest, action: &str, result: Result<()>) 
             .any(|word| reason.to_ascii_lowercase().contains(word));
         let retry = if denied && manifest.scope == ServiceScope::System && !super::is_root() {
             format!(
-                " Retry with `sudo spice connect service {action} --dir {}`.",
+                " Retry with `cd {} && sudo spice cloud service {action}`.",
                 manifest.directory.display()
             )
         } else {
@@ -2193,10 +2198,6 @@ impl ServiceBackend for LaunchdBackend {
         install(&ProcessHost, request)
     }
 
-    fn authorize_uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
-        ensure_authorized(manifest, "uninstall")
-    }
-
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
         uninstall(&ProcessHost, manifest)
     }
@@ -2217,7 +2218,7 @@ impl ServiceBackend for LaunchdBackend {
         observe(&ProcessHost, manifest)
     }
 
-    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<()> {
+    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<Option<Vec<String>>> {
         logs(manifest, request)
     }
 
@@ -2841,7 +2842,7 @@ mod tests {
         assert_eq!(starts, ServiceStarts::LoginOnly);
         let action = action.expect("an agent has a remediation");
         assert!(
-            action.contains("sudo spice connect service install"),
+            action.contains("sudo spice cloud service install"),
             "{action}"
         );
         assert!(!action.contains("linger"), "{action}");
@@ -3175,7 +3176,7 @@ mod tests {
         let failed = restart(&host, &manifest).expect_err("a job that never comes back must fail");
         let message = failed.to_string();
         assert!(message.contains("failed rather than running"), "{message}");
-        assert!(message.contains("spice connect service logs"), "{message}");
+        assert!(message.contains("spice cloud logs"), "{message}");
     }
 
     #[test]
@@ -3186,7 +3187,7 @@ mod tests {
         let refused = ensure_authorized(&system, "restart").expect_err("root is required");
         let message = refused.to_string();
         assert!(
-            message.contains("sudo spice connect service restart"),
+            message.contains("sudo spice cloud service restart"),
             "{message}"
         );
         assert!(message.contains("Nothing was changed"), "{message}");
@@ -3560,15 +3561,19 @@ mod tests {
         let (history, _) = reader.read_history(2).expect("read history");
         assert_eq!(history, vec!["second", "third"]);
 
-        // Printing history is not an error when there is none.
-        logs(
+        let captured = logs(
             &manifest,
             LogRequest {
-                number: 100,
+                number: 2,
                 follow: false,
+                capture: true,
             },
         )
-        .expect("print the history");
+        .expect("capture the history");
+        assert_eq!(
+            captured,
+            Some(vec!["second".to_string(), "third".to_string()])
+        );
     }
 
     #[test]
@@ -3586,6 +3591,7 @@ mod tests {
             LogRequest {
                 number: 100,
                 follow: false,
+                capture: false,
             },
         )
         .expect("a service with no output yet is a fact, not a failure");

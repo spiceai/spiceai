@@ -45,7 +45,7 @@ dotenv.workspace = true
 # Cross-platform directories
 dirs = "6"
 
-# Deterministic per-instance-directory service names (`spice connect service`)
+# Deterministic per-instance-directory service names (`spice cloud service`)
 sha2.workspace = true
 
 # Semver comparison
