@@ -27,16 +27,19 @@
 # Extensions may therefore depend on BOTH utility tiers; `runtime-*` may depend
 # only on shared-utility. See docs/dev/crate_layering.md.
 #
-# `connector` sits between shared-utility and `runtime`: a connector implements
-# the `DataConnector` contract, which lives in `data-connector-api` below
-# `runtime`, so a connector never names the orchestrator. Being below `runtime`
-# is what lets the whole set compile in parallel with it instead of behind it.
-# The linear order alone would still permit `runtime` to depend on a connector,
-# which would put them back on its prerequisite path — `forbid` below rejects
-# that.
+# `accelerator` and `connector` sit between shared-utility and `runtime`: each
+# implements a contract that lives below `runtime` (`data-accelerator-api`,
+# `data-connector-api`) and self-registers through a `linkme` slice, so neither
+# ever names the orchestrator and only the binaries link them. Being below
+# `runtime` is what lets the whole set compile in parallel with it instead of
+# behind it. The linear order alone would still permit `runtime` to depend on
+# one, which would put them back on its prerequisite path — `forbid` below
+# rejects that. They are siblings, not a stack: the order lists `accelerator`
+# first only because the list must be linear.
 order = [
     "foundation",
     "shared-utility",
+    "accelerator",
     "connector",
     "runtime",
     "extension-utility",
@@ -56,10 +59,18 @@ default_tier = "shared-utility"
 # runtime->extension-utility is already caught as upward; this forbids the
 # REVERSE, keeping connector-only building blocks from pulling in the
 # orchestrator (they may still use the low runtime-*-api interface crates).
-# `runtime -> connector` is the edge the inversion removed: the orchestrator must
-# not build on a connector, or every connector rejoins its prerequisite closure and
-# the parallelism is lost. Only the binaries (and the schema tool) link connectors.
-forbid = [["extension-utility", "runtime"], ["runtime", "connector"]]
+# `runtime -> connector` and `runtime -> accelerator` are the edges the inversion
+# removed: the orchestrator must not build on an extension, or every one of them
+# rejoins its prerequisite closure and the parallelism is lost. Only the binaries
+# (and the schema tool) link them. `connector -> accelerator` is forbidden for the
+# same reason in the sibling direction: the two sets are independent, and the linear
+# order can only reject the accelerator -> connector half.
+forbid = [
+    ["extension-utility", "runtime"],
+    ["runtime", "connector"],
+    ["runtime", "accelerator"],
+    ["connector", "accelerator"],
+]
 
 # Dependency-ownership rules, checked IN ADDITION to the tier rule. The tier check
 # only catches UPWARD edges; a driver/format crate sits at/below `foundation`, so a
@@ -128,6 +139,13 @@ tier = "binary"
 [[rules]]
 path_prefix = "crates/data-connectors/"
 tier = "connector"
+
+# Accelerator engines sit BELOW `runtime` — see the tier note above. Each
+# implements `DataAccelerator` from `data-accelerator-api` and registers itself
+# through `register_data_accelerator!`.
+[[rules]]
+path_prefix = "crates/accelerators/"
+tier = "accelerator"
 
 [[rules]]
 path_prefix = "crates/vendor/"
