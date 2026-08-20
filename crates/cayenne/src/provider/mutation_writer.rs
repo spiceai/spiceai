@@ -1211,7 +1211,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // (partition/retention tables) — those keep the prior full
                 // fan-out sizing and the full default delta encoding.
                 estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -1451,7 +1451,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {
@@ -1552,7 +1552,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {
