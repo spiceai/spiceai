@@ -104,6 +104,8 @@ use connector_spark as _;
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;

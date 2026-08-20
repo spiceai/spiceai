@@ -43,6 +43,8 @@ use tracing_subscriber::EnvFilter;
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
 
 /// An engine reaches the registry only if its crate is linked into this binary, which a
 /// Cargo dependency does not guarantee — the linker drops the unreferenced slice static.
@@ -61,6 +63,11 @@ fn accelerator_crates_register_their_engines() {
     assert!(
         engines.iter().any(|engine| engine == "sqlite"),
         "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "turso")]
+    assert!(
+        engines.iter().any(|engine| engine == "turso"),
+        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
     let _ = &engines;
 }

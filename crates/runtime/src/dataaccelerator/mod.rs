@@ -28,8 +28,6 @@ pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "turso")]
-pub mod turso;
 
 pub(crate) mod imds;
 pub(crate) mod snapshot_validation;
@@ -705,7 +703,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "turso")]
                 Engine::Turso => {
-                    use crate::dataaccelerator::turso::TursoAccelerator;
+                    use accelerator_turso::TursoAccelerator;
                     match TursoAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -1966,7 +1964,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "turso")]
                     Engine::Turso => {
-                        use crate::dataaccelerator::turso::TursoAccelerator;
+                        use accelerator_turso::TursoAccelerator;
                         TursoAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await

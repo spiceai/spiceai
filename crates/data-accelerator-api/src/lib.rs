@@ -495,6 +495,32 @@ pub trait DataAccelerator: Send + Sync {
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
 
+    /// A sidecar over a database this engine owns at `path`, for state that belongs to
+    /// the runtime rather than to a dataset — the Cayenne metastore's `cayenne.db`.
+    ///
+    /// Distinct from [`Self::sidecar`], which derives the path from a source. The
+    /// caller has a path and no source to derive one from, and asks the owning engine
+    /// rather than opening the file itself: the lock that serializes sidecar DDL
+    /// against a concurrent write lives on the engine's pool instance, so a second
+    /// pool over the same file would hold a lock nothing else observes.
+    ///
+    /// Asking through this method is what keeps one engine from naming another's
+    /// concrete type. Defaults to unsupported, which is the true answer for an engine
+    /// that keeps no path-keyed databases of its own.
+    async fn sidecar_for_path(
+        &self,
+        path: &str,
+        _table_name: &str,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        Err(CheckpointError::Store {
+            source: format!(
+                "the {} accelerator does not host databases of its own, so it cannot open '{path}'",
+                self.name()
+            )
+            .into(),
+        })
+    }
+
     /// Drops an existing table from the acceleration engine.
     ///
     /// Used by `file_update` mode to remove a table whose schema is incompatible with

@@ -140,7 +140,6 @@ runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
-runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
@@ -202,7 +201,6 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
@@ -267,6 +265,8 @@ connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
+accelerator-turso = { path = "../accelerators/accelerator-turso" }
+turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -417,9 +417,7 @@ sqlite = [
     "runtime-acceleration/sqlite",
 ]
 turso = [
-    "dep:turso",
     "dep:tokio-rusqlite",
-    "dep:runtime-checkpoint-turso",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "data_components/turso",

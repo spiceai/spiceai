@@ -67,6 +67,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "accelerator-turso"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-turso",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "rusqlite",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "turso",
+]
+
+[[package]]
 name = "adbc_core"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17035,6 +17064,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "accelerator-postgres",
  "accelerator-sqlite",
+ "accelerator-turso",
  "adbc_core",
  "adbc_driver_manager",
  "anyhow",
@@ -17204,7 +17234,6 @@ dependencies = [
  "runtime-checkpoint-api",
  "runtime-checkpoint-duckdb",
  "runtime-checkpoint-sqlite",
- "runtime-checkpoint-turso",
  "runtime-cluster",
  "runtime-component",
  "runtime-datafusion",
@@ -19750,6 +19779,7 @@ version = "2.2.0-unstable"
 dependencies = [
  "accelerator-postgres",
  "accelerator-sqlite",
+ "accelerator-turso",
  "ansi_colors",
  "app",
  "arrow",
