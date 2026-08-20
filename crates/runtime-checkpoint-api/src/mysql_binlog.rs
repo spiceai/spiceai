@@ -47,6 +47,24 @@ pub struct MySqlBinlogCheckpoint {
     pub updated_at: Option<SystemTime>,
 }
 
+/// Converts the replication layer's `u64` offset into the `BIGINT` a sidecar stores.
+///
+/// Positions beyond `i64::MAX` cannot occur (binlog files cap at 1 GiB), but clamp
+/// defensively rather than wrap.
+#[must_use]
+pub fn position_to_i64(pos: u64) -> i64 {
+    i64::try_from(pos).unwrap_or(i64::MAX)
+}
+
+/// Converts a stored `BIGINT` position back to the replication layer's `u64`.
+///
+/// A negative value cannot be a real position, so it reads as 0 — a re-bootstrap —
+/// rather than wrapping to an enormous offset that would skip the whole binlog.
+#[must_use]
+pub fn position_from_i64(pos: i64) -> u64 {
+    u64::try_from(pos).unwrap_or(0)
+}
+
 /// The `MySQL` binlog checkpoint store, satisfied by the accelerator and called by the
 /// `MySQL` data connector. Object-safe, so it is used as `Arc<dyn MySqlBinlogStore>`.
 #[async_trait::async_trait]

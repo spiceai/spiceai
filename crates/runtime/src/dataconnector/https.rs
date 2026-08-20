@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::dataset::DatasetSpec;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::ConnectorContext;
 use crate::dataconnector::client_identity::{
     ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
     TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_IDENTITY_PARAM_NAMES, TLS_CLIENT_KEY,
@@ -1592,6 +1593,7 @@ impl DataConnector for Https {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
@@ -1603,7 +1605,7 @@ impl DataConnector for Https {
             // which properly handles file parsing with correct schemas
             let listing_connector =
                 HttpListingConnector::new(self.params.clone(), Handle::current());
-            return listing_connector.read_provider(dataset).await;
+            return listing_connector.read_provider(context, dataset).await;
         }
 
         // Validate acceleration mode for HTTP connector (JSON API endpoints only)
@@ -1776,18 +1778,16 @@ impl DataConnectorFactory for HttpsFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let runtime_rate_control_params = params.app().map(|app| app.runtime.params.clone());
-            let app_name: Arc<str> = params
-                .app()
-                .map_or_else(|| Arc::from(""), |app| Arc::from(app.name.as_str()));
-            let rate_control_registry = params
-                .http_rate_control_registry()
-                .unwrap_or_else(http_rate_control::global_registry);
+            let app = context.app();
+            let runtime_rate_control_params = Some(app.runtime.params.clone());
+            let app_name: Arc<str> = Arc::from(app.name.as_str());
+            let rate_control_registry = context.http_rate_control_registry();
             let (metrics, emit_rate_control_metrics, rate_control_metric_source) =
                 if let ConnectorComponent::Dataset(dataset) = &params.component {
                     let structured_format = {
@@ -1948,13 +1948,13 @@ impl ListingTableConnector for HttpListingConnector {
     }
 }
 
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_http_connector,
     REGISTER_HTTP_CONNECTOR,
     "http",
     HttpsFactory
 );
-register_data_connector!(
+data_connector_api::register_data_connector!(
     register_https_connector,
     REGISTER_HTTPS_CONNECTOR,
     "https",
@@ -1967,6 +1967,7 @@ mod tests {
     use crate::component::dataset::Dataset;
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::parameters::RuntimeConnectorContext;
     use crate::parameters::Parameters;
     use crate::secrets::Secrets;
     use app::AppBuilder;
@@ -2142,7 +2143,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("full refresh without refresh_sql should be rejected");
 
@@ -2163,7 +2164,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Append, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("append mode should continue to provider validation");
 
@@ -2424,7 +2425,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         )
         .await;
 
-        let Err(error) = connector.read_provider(&dataset).await else {
+        let Err(error) = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
+            .await
+        else {
             panic!("structured HTTP file datasets should reject HTTP rate-control defaults");
         };
 
@@ -2504,7 +2508,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Caching, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("caching mode should continue to provider validation");
 
@@ -2517,7 +2521,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("not a url", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured formats should bypass JSON refresh_sql validation");
 
@@ -2535,7 +2539,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
 
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("structured HTTP file datasets should reject mTLS client identity params");
 
@@ -2583,7 +2587,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
             .await;
 
             let error = connector
-                .read_provider(&dataset)
+                .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
                 .await
                 .expect_err("structured HTTP file datasets should reject OAuth2 params");
 
@@ -2635,7 +2639,7 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         // without a refresh token — proof the auth config was validated rather
         // than dropped.
         let error = connector
-            .read_provider(&dataset)
+            .read_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
             .await
             .expect_err("OAuth2 config without a refresh token should fail validation");
         assert!(

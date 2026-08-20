@@ -17,6 +17,13 @@ spec:
   {{- end }}
   {{- if .Values.stateful.enabled }}
   serviceName: {{ template "spiceai.fullname" .  }}
+  {{- with .Values.updateStrategy }}
+  updateStrategy: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- else }}
+  {{- with .Values.strategy }}
+  strategy: {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
   selector:
     matchLabels:

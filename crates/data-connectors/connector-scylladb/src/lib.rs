@@ -35,12 +35,13 @@ use crate::scylladb::ScyllaDbTableFactory;
 use crate::scylladb::pool::ScyllaDbConnectionPool;
 use async_trait::async_trait;
 use data_components::Read;
-use datafusion::datasource::TableProvider;
-use ns_lookup::verify_ns_lookup_and_tcp_connect;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use scylla::client::session::Session;
@@ -210,10 +211,11 @@ impl DataConnectorFactory for ScyllaDbFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             match create_scylladb_connector(params.parameters).await {
                 Ok((session, keyspace, compute_context)) => {
@@ -312,6 +314,7 @@ impl DataConnector for ScyllaDb {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
@@ -667,10 +670,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_scylladb as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_scylladb_connector,
     SCYLLADB_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

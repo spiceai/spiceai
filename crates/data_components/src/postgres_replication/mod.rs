@@ -29,6 +29,7 @@ pub mod config;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
+pub mod retention;
 pub mod schema_evolution;
 pub mod shared;
 pub mod slot;
@@ -43,6 +44,7 @@ use crate::cdc::{ChangesStream, StreamError};
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
+pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
@@ -240,6 +242,25 @@ pub struct AppliedLsn {
 /// to run. If nothing else loads the table, the rebuild is the only thing that
 /// would, and skipping it resumes from the slot's position with every earlier
 /// row missing for good.
+///
+/// # Why an unreachable watermark rebuilds even with snapshots disabled
+///
+/// `pg_replication_initial_snapshot: disabled` says "do not read the source table
+/// to populate this acceleration", so answering slot loss with a full re-read
+/// looks like it contradicts the setting. It does not, and the alternative is
+/// worse. `disabled` is a preference about *initial load* — how the acceleration
+/// comes into existence — not a licence to keep serving one that is known to have
+/// diverged. Once the slot cannot stream from the recorded position, a row deleted
+/// at the source in that window has no change event left to carry the deletion, so
+/// every later query answers from rows the source no longer has.
+///
+/// The apparent alternative — make it terminal, and let an operator decide — does
+/// not exist today: a fatal changes-stream error marks the dataset's status
+/// `Error` but does not stop its accelerated table from serving, so "terminal"
+/// means serving those same wrong rows indefinitely with a status field to say so.
+/// Between a re-read the operator did not ask for and an answer that is wrong, the
+/// re-read wins. Revisit only if a post-load fatal can make the table refuse a
+/// scan (#13218); until then this arm is deliberate, not inherited.
 #[must_use]
 pub fn needs_rebuild(
     position: &RecordedPosition,
@@ -536,6 +557,27 @@ mod tests {
         // being mistaken for "never loaded".
         assert!(needs_rebuild_persist(at(0), Some(1)));
         assert!(needs_rebuild_persist(at(0), None));
+    }
+
+    /// `needs_rebuild` takes no `snapshotting` argument, so this is structural
+    /// rather than conditional — but it is the answer to a real question (whether
+    /// `pg_replication_initial_snapshot: disabled` should make slot loss terminal
+    /// instead), and structure is exactly what a later change could quietly undo.
+    #[test]
+    fn an_unreachable_watermark_rebuilds_even_where_snapshots_are_disabled() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+        // `disabled` reaches this decision as a durable acceleration whose
+        // watermark the slot can no longer stream from — the same inputs as any
+        // other acceleration, because whether an *initial* snapshot may run says
+        // nothing about whether these rows are still current.
+        assert!(
+            needs_rebuild(&at(100), Some(101), true),
+            "a diverged acceleration is re-read rather than served"
+        );
+        // And the setting does not make a resumable gap into a rebuild either:
+        // where the slot still reaches the watermark, `disabled` resumes like
+        // everything else and never re-reads the source.
+        assert!(!needs_rebuild(&at(100), Some(100), true));
     }
 
     /// The caller passes the later of `restart_lsn` and `confirmed_flush_lsn`,

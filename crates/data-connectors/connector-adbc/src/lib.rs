@@ -20,6 +20,7 @@ use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
+use data_connector_api::ConnectorContext;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
@@ -40,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
@@ -761,10 +762,11 @@ impl DataConnectorFactory for AdbcFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         let cache_key = compute_adbc_cache_key(&params);
 
         let entry = {
@@ -1175,6 +1177,7 @@ impl DataConnector for Adbc {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
@@ -1211,6 +1214,7 @@ impl DataConnector for Adbc {
 
     async fn read_write_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
@@ -1616,7 +1620,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1649,7 +1652,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(&dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1778,7 +1780,6 @@ mod tests {
                 parameters,
                 unsupported_type_action: None,
                 component: ConnectorComponent::from(dataset),
-                context: None,
                 io_runtime: tokio::runtime::Handle::current(),
             }
         };
@@ -1821,6 +1822,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unreachable!("test connector is not used to read data")
@@ -1958,10 +1960,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_adbc as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_adbc_connector,
     ADBC_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

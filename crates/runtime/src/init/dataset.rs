@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::{
     collections::HashMap,
     future::Future,
@@ -24,8 +25,6 @@ use std::{
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
@@ -913,7 +912,10 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+        {
             Ok(provider) => {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
@@ -1259,12 +1261,15 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
-            UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .build()
-        })?;
+        let read_table = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+            .map_err(|_| {
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .build()
+            })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -1417,14 +1422,19 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector =
-            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
-                dc.context(UnableToInitializeDataConnectorSnafu {})?
-            } else {
-                // Only reachable if the connector is deregistered between the check above and
-                // this lookup; report the same error rather than a second, blunter one.
-                return Err(unknown_data_connector(source).await);
-            };
+        let mut data_connector = if let Some(dc) = dataconnector::create_new_connector(
+            source,
+            params,
+            &RuntimeConnectorContext::for_dataset(&ds),
+        )
+        .await
+        {
+            dc.context(UnableToInitializeDataConnectorSnafu {})?
+        } else {
+            // Only reachable if the connector is deregistered between the check above and
+            // this lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_data_connector(source).await);
+        };
 
         // Innermost of the stream decorators, so the properties Drasi receives
         // are the source table's own columns. Wrapping outside the embedding
@@ -1452,7 +1462,6 @@ impl Runtime {
                 data_connector,
                 Arc::clone(&self.embeds),
                 self.secrets(),
-                Arc::downgrade(&self.datafusion()),
             ));
         }
 
@@ -1904,12 +1913,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -2149,30 +2157,22 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at().await {
-                if is_shutdown_cancellation(&e) {
-                    tracing::debug!(
-                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                        dataset.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Failed to update _fetched_at for cached dataset {}: {e}",
-                        dataset.name
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "Updated _fetched_at for all records in cached dataset {}",
-                    dataset.name
-                );
-            }
+    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
+        Ok(()) => {
+            tracing::info!(
+                "Updated _fetched_at for all records in cached dataset {}",
+                dataset.name
+            );
+        }
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(
+                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                dataset.name
+            );
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to initialize caching engine for {}: {e}",
+                "Failed to update _fetched_at for cached dataset {}: {e}",
                 dataset.name
             );
         }
@@ -2209,10 +2209,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             let creates = Arc::clone(&self.creates);
             Box::pin(async move {
                 creates.fetch_add(1, Ordering::SeqCst);
@@ -2250,6 +2251,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
@@ -2375,10 +2377,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
         }
 
@@ -2402,6 +2405,7 @@ mod tests {
 
         async fn read_provider(
             &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
             _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -2432,10 +2436,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(std::future::pending())
         }
 

@@ -36,7 +36,6 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -72,6 +71,7 @@ use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
+use super::cache::cache_footer;
 use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
@@ -707,8 +707,9 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema =
-                            session.arrow().to_arrow_schema(cached_vortex.footer().dtype())?;
+                        let inferred_schema = session
+                            .arrow()
+                            .to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -728,17 +729,7 @@ impl FileFormat for VortexFormat {
 
                     // Cache the metadata
                     let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
-                    // Footer-cache right-sizing telemetry: the accounted footer
-                    // size (what fills the FileMetadataCache budget) per file.
-                    tracing::debug!(
-                        target: "vortex::footer_cache",
-                        path = %object.location,
-                        footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached_metadata.as_ref()),
-                        src = "infer_schema",
-                        "footer cached",
-                    );
-                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
-                    cache.put(&object.location, entry);
+                    cache_footer(&cache, object.clone(), cached_metadata, "infer_schema");
 
                     let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -825,16 +816,7 @@ impl FileFormat for VortexFormat {
 
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                // Footer-cache right-sizing telemetry (see infer_schema above).
-                tracing::debug!(
-                    target: "vortex::footer_cache",
-                    path = %object.location,
-                    footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached.as_ref()),
-                    src = "infer_stats",
-                    "footer cached",
-                );
-                let entry = CachedFileMetadataEntry::new(object.clone(), cached);
-                file_metadata_cache.put(&object.location, entry);
+                cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
 
                 (
                     vxf.dtype().clone(),
