@@ -266,7 +266,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "de2e04b0b5ce8b603f695a535fbbca7d09bddbf8" } # branch: postgres-durable-write-back-upsert (spiceai-54 + Replace-requires-upsert)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "3c40145d671792f3974bc95af5587b699c86c86c" } # spiceai-54
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
