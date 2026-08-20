@@ -169,6 +169,39 @@ fn unkeyable_predicate_message(table: &str, unkeyable: &[String], keyable: &[Str
     )
 }
 
+/// Whether a condition contains a volatile expression.
+///
+/// The exactness argument for an equality delete is that the condition is a
+/// *deterministic function of the key columns*: two rows sharing a key tuple
+/// feed the condition identical inputs, so it answers the same for both and
+/// neither is deleted without the other. A volatile expression is not a
+/// function of its inputs at all — `random() < 0.5` can select one of two rows
+/// that share a key and reject the other, and the delete file, which only
+/// records the key, then removes both.
+///
+/// Only [`Volatility::Volatile`] breaks this. `Stable` is documented to hold
+/// its value for the duration of a query, so `now()` answers the same for every
+/// row of one delete and the argument still holds.
+fn has_volatile_expression(filters: &[datafusion::logical_expr::Expr]) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, Volatility};
+
+    filters.iter().any(|filter| {
+        let mut volatile = false;
+        // `apply` only errors if the closure does, and this one cannot.
+        let _ = filter.apply(|expr| {
+            if let Expr::ScalarFunction(function) = expr
+                && function.func.signature().volatility == Volatility::Volatile
+            {
+                volatile = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        volatile
+    })
+}
+
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -569,6 +602,17 @@ impl IcebergDeletionProvider {
         // it keys on. Anything else would delete more than the condition selected,
         // so refuse rather than approximate — losing rows silently is worse than
         // refusing the statement.
+        // A volatile condition is not a function of the row at all, so no key can
+        // reproduce it — see `has_volatile_expression`.
+        if has_volatile_expression(filters) {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to delete from Iceberg table '{}': the condition is not deterministic, so it can select one of two rows that a delete cannot tell apart and rows it did not select would be deleted too. \
+                Rewrite the condition without volatile functions such as `random()`, or select the rows to delete first and delete them by a stable column. \
+                See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                self.table_ident
+            )));
+        }
+
         let unkeyable = unkeyable_predicate_columns(&arrow_schema, &projection_indices, filters);
         if !unkeyable.is_empty() {
             let keyable: Vec<String> = projection_indices
@@ -659,7 +703,8 @@ impl IcebergDeletionProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        equality_delete_columns, unkeyable_predicate_columns, unkeyable_predicate_message,
+        equality_delete_columns, has_volatile_expression, unkeyable_predicate_columns,
+        unkeyable_predicate_message,
     };
     use arrow::datatypes::{
         DataType, Field, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef, TimeUnit,
@@ -839,6 +884,46 @@ mod tests {
 
     /// `DELETE FROM t` with no condition removes every row, which an equality
     /// delete reproduces exactly. Refusing it would be wrong.
+    /// `random() < 0.5` names no column, so the column check alone waves it
+    /// through — and it can pick one of two rows sharing a key while rejecting
+    /// the other, which is the very over-delete this guard exists to stop.
+    #[test]
+    fn a_volatile_condition_is_detected() {
+        let volatile = datafusion::prelude::random().lt(lit(0.5));
+        assert!(has_volatile_expression(&[volatile.clone()]));
+
+        // Also when it hides beside a perfectly keyable comparison.
+        assert!(has_volatile_expression(&[col("id")
+            .eq(lit(1_i64))
+            .and(volatile)]));
+    }
+
+    /// The column check cannot catch it: a volatile call references no column,
+    /// so it has to be rejected on its own terms.
+    #[test]
+    fn a_volatile_condition_names_no_unkeyable_column() {
+        let schema = float_keyed_schema();
+        let volatile = datafusion::prelude::random().lt(lit(0.5));
+
+        assert!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &[volatile]).is_empty(),
+            "nothing for the column check to find — which is why the volatility check exists"
+        );
+    }
+
+    /// Ordinary conditions must not be swept up by the volatility check.
+    #[test]
+    fn a_deterministic_condition_is_not_volatile() {
+        for filters in [
+            vec![col("id").eq(lit(1_i64))],
+            vec![col("label").eq(lit("x"))],
+            vec![col("id").gt(lit(1_i64)).and(col("label").is_not_null())],
+            vec![],
+        ] {
+            assert!(!has_volatile_expression(&filters), "{filters:?}");
+        }
+    }
+
     #[test]
     fn a_delete_with_no_condition_is_allowed() {
         let schema = float_keyed_schema();
