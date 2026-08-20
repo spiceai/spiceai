@@ -10,17 +10,17 @@ description: "Schema columns for snowflake[catalog]"
 | snowflake     | TPCH_SF1     | CUSTOMER     | C_ADDRESS             | 2                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | CUSTOMER     | C_NATIONKEY           | 3                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | CUSTOMER     | C_PHONE               | 4                | Utf8                                                                                      | YES         |
-| snowflake     | TPCH_SF1     | CUSTOMER     | C_ACCTBAL             | 5                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | CUSTOMER     | C_ACCTBAL             | 5                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | CUSTOMER     | C_MKTSEGMENT          | 6                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | CUSTOMER     | C_COMMENT             | 7                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_ORDERKEY            | 0                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_PARTKEY             | 1                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_SUPPKEY             | 2                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_LINENUMBER          | 3                | Decimal128(38, 0)                                                                         | YES         |
-| snowflake     | TPCH_SF1     | LINEITEM     | L_QUANTITY            | 4                | Decimal128(38, 0)                                                                         | YES         |
-| snowflake     | TPCH_SF1     | LINEITEM     | L_EXTENDEDPRICE       | 5                | Decimal128(38, 0)                                                                         | YES         |
-| snowflake     | TPCH_SF1     | LINEITEM     | L_DISCOUNT            | 6                | Decimal128(38, 0)                                                                         | YES         |
-| snowflake     | TPCH_SF1     | LINEITEM     | L_TAX                 | 7                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | LINEITEM     | L_QUANTITY            | 4                | Decimal128(15, 2)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | LINEITEM     | L_EXTENDEDPRICE       | 5                | Decimal128(15, 2)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | LINEITEM     | L_DISCOUNT            | 6                | Decimal128(15, 2)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | LINEITEM     | L_TAX                 | 7                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_RETURNFLAG          | 8                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_LINESTATUS          | 9                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | LINEITEM     | L_SHIPDATE            | 10               | Date32                                                                                    | YES         |
@@ -36,7 +36,7 @@ description: "Schema columns for snowflake[catalog]"
 | snowflake     | TPCH_SF1     | ORDERS       | O_ORDERKEY            | 0                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | ORDERS       | O_CUSTKEY             | 1                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | ORDERS       | O_ORDERSTATUS         | 2                | Utf8                                                                                      | YES         |
-| snowflake     | TPCH_SF1     | ORDERS       | O_TOTALPRICE          | 3                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | ORDERS       | O_TOTALPRICE          | 3                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | ORDERS       | O_ORDERDATE           | 4                | Date32                                                                                    | YES         |
 | snowflake     | TPCH_SF1     | ORDERS       | O_ORDERPRIORITY       | 5                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | ORDERS       | O_CLERK               | 6                | Utf8                                                                                      | YES         |
@@ -49,12 +49,12 @@ description: "Schema columns for snowflake[catalog]"
 | snowflake     | TPCH_SF1     | PART         | P_TYPE                | 4                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | PART         | P_SIZE                | 5                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | PART         | P_CONTAINER           | 6                | Utf8                                                                                      | YES         |
-| snowflake     | TPCH_SF1     | PART         | P_RETAILPRICE         | 7                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | PART         | P_RETAILPRICE         | 7                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | PART         | P_COMMENT             | 8                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | PARTSUPP     | PS_PARTKEY            | 0                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | PARTSUPP     | PS_SUPPKEY            | 1                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | PARTSUPP     | PS_AVAILQTY           | 2                | Decimal128(38, 0)                                                                         | YES         |
-| snowflake     | TPCH_SF1     | PARTSUPP     | PS_SUPPLYCOST         | 3                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | PARTSUPP     | PS_SUPPLYCOST         | 3                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | PARTSUPP     | PS_COMMENT            | 4                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | REGION       | R_REGIONKEY           | 0                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | REGION       | R_NAME                | 1                | Utf8                                                                                      | YES         |
@@ -64,7 +64,7 @@ description: "Schema columns for snowflake[catalog]"
 | snowflake     | TPCH_SF1     | SUPPLIER     | S_ADDRESS             | 2                | Utf8                                                                                      | YES         |
 | snowflake     | TPCH_SF1     | SUPPLIER     | S_NATIONKEY           | 3                | Decimal128(38, 0)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | SUPPLIER     | S_PHONE               | 4                | Utf8                                                                                      | YES         |
-| snowflake     | TPCH_SF1     | SUPPLIER     | S_ACCTBAL             | 5                | Decimal128(38, 0)                                                                         | YES         |
+| snowflake     | TPCH_SF1     | SUPPLIER     | S_ACCTBAL             | 5                | Decimal128(15, 2)                                                                         | YES         |
 | snowflake     | TPCH_SF1     | SUPPLIER     | S_COMMENT             | 6                | Utf8                                                                                      | YES         |
 | spice         | runtime      | task_history | trace_id              | 0                | Utf8                                                                                      | NO          |
 | spice         | runtime      | task_history | span_id               | 1                | Utf8                                                                                      | NO          |
