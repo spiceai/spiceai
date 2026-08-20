@@ -643,7 +643,6 @@ fn api_base_url_from_legacy_portal(base_url: &str) -> String {
     match base_url.trim_end_matches('/') {
         "https://spice.ai" => "https://api.spice.ai".to_string(),
         "https://dev.spice.ai" => "https://dev-api.spice.ai".to_string(),
-        "https://staging.spice.ai" => "https://staging.api.spice.ai".to_string(),
         other => other.to_string(),
     }
 }
@@ -1089,7 +1088,6 @@ mod tests {
         for (portal, api) in [
             ("https://spice.ai", "https://api.spice.ai"),
             ("https://dev.spice.ai/", "https://dev-api.spice.ai"),
-            ("https://staging.spice.ai", "https://staging.api.spice.ai"),
             (
                 "https://cloud.internal.example/base/",
                 "https://cloud.internal.example/base",
@@ -1104,7 +1102,6 @@ mod tests {
         for (api, portal) in [
             ("https://api.spice.ai", "https://spice.ai"),
             ("https://dev-api.spice.ai", "https://dev.spice.ai"),
-            ("https://staging.api.spice.ai", "https://staging.spice.ai"),
             (
                 "https://cloud.internal.example",
                 "https://cloud.internal.example",

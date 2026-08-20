@@ -1910,6 +1910,13 @@ fn machine_login_values<'a>(token: &'a str, store_org: Option<&str>) -> Vec<(Str
     vec![(credential_key(store_org), token)]
 }
 
+fn keychain_login_orgs(spiceai: &[(&str, &str)]) -> BTreeSet<String> {
+    spiceai
+        .iter()
+        .filter_map(|(key, _)| org::org_from_credential_key(key))
+        .collect()
+}
+
 /// Check that a freshly minted credential really serves the requested org.
 ///
 /// User credentials can act across every organization the user belongs to;
@@ -1962,6 +1969,10 @@ fn persist_login_values(
             );
         }
         return write_json(&serde_json::Value::Object(result));
+    }
+
+    if output == LoginOutput::Keychain {
+        org::remember_keychain_orgs(&keychain_login_orgs(spiceai))?;
     }
 
     if !spiceai.is_empty() {
@@ -2149,12 +2160,13 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
 
     match args.scope {
         LogoutScope::All => {
-            for org in org::orgs_with_stored_tokens() {
+            for org in org::orgs_with_stored_tokens()? {
                 if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
                     cleared.push(org);
                 }
             }
             remove_env_keys(&default_credential_keys())?;
+            org::clear_keychain_orgs()?;
             org::clear_active_org()?;
         }
         LogoutScope::Active => match resolve_org(flag_org)? {
@@ -2164,6 +2176,7 @@ fn execute_logout(args: &LogoutArgs, flag_org: Option<&str>) -> Result<()> {
                 if remove_env_keys(&[org::org_token_var(&org), org::org_api_key_var(&org)])? {
                     cleared.push(org.clone());
                 }
+                org::forget_keychain_org(&org)?;
                 if resolve_org(None)?.is_some_and(|active| active.eq_ignore_ascii_case(&org)) {
                     org::clear_active_org()?;
                 }
@@ -2259,15 +2272,9 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         }
     }
 
-    if !keychain_failures.is_empty() {
-        tracing::warn!(
-            "Could not remove {} from the keychain; remove them manually — the credential may still be usable.",
-            keychain_failures.join(", ")
-        );
-    }
-
     let path = std::path::Path::new(env_file_path());
     if !path.exists() {
+        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2303,6 +2310,7 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
             path: path.to_path_buf(),
             source: e,
         })?;
+        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2316,7 +2324,22 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         source: e,
     })?;
 
+    ensure_keychain_credentials_removed(&keychain_failures)?;
+
     Ok(removed)
+}
+
+fn ensure_keychain_credentials_removed(failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::InvalidArgument {
+        message: format!(
+            "Failed to remove {} from the keychain. Local env-file entries were cleared, but these credentials may still be usable. Remove them manually before leaving this machine.",
+            failures.join(", ")
+        ),
+    })
 }
 
 /// Whether an env-file line assigns one of `keys`.
@@ -2408,7 +2431,7 @@ async fn execute_orgs(args: &OrgsArgs, flag_org: Option<&str>) -> Result<()> {
         .map(|context| context.org_name)
         .filter(|org| !org.is_empty());
 
-    let stored = org::orgs_with_stored_tokens();
+    let stored = org::orgs_with_stored_tokens()?;
     let rows = build_org_rows(
         listed.as_deref(),
         context_org.as_deref(),
@@ -2878,22 +2901,12 @@ async fn upload_local_spicepod_if_absent(
 }
 
 fn secret_references(spicepod: &str) -> Vec<String> {
-    const PREFIX: &str = "${secrets:";
-
-    let mut names = std::collections::BTreeSet::new();
-    let mut remaining = spicepod;
-    while let Some(start) = remaining.find(PREFIX) {
-        let after = &remaining[start + PREFIX.len()..];
-        let Some(end) = after.find('}') else {
-            break;
-        };
-        let name = &after[..end];
-        if !name.is_empty() {
-            names.insert(name.to_string());
-        }
-        remaining = &after[end + 1..];
-    }
-    names.into_iter().collect()
+    runtime_secrets::iter_secret_references(spicepod)
+        .filter(|reference| reference.store == runtime_secrets::SECRETS)
+        .map(|reference| reference.key)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Add `.spice` to the working directory's `.gitignore`, if it is a git
@@ -3340,11 +3353,12 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
             if logs.logs.is_empty() {
                 empty_cloud_response = Some(logs);
             } else {
+                ensure_cloud_logs_follow_supported(args.follow)?;
                 let logs = filter_cloud_logs_since(logs, args.level, since.as_ref());
                 if args.output == OutputFormat::Json {
                     return write_json(&logs);
                 }
-                render_cloud_logs(logs, args.follow);
+                render_cloud_logs(logs);
                 return Ok(());
             }
         }
@@ -3365,7 +3379,41 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
             })?;
     let config_dir = CloudConnectConfig::resolve_config_dir(Some(&instance_dir));
     let number = u32::try_from(args.limit).unwrap_or(u32::MAX);
-    if args.output == OutputFormat::Json {
+    if args.follow {
+        if args.output == OutputFormat::Json {
+            return Err(Error::InvalidArgument {
+                message: "`--follow` cannot produce one bounded JSON document. Omit `--follow` or use table output for local service logs.".to_string(),
+            });
+        }
+        if !matches!(args.level, LogLevelFilter::All) || since.is_some() {
+            return Err(Error::InvalidArgument {
+                message: "Local service log streaming cannot apply `--level` or `--since`. Omit `--follow` to use these filters.".to_string(),
+            });
+        }
+
+        let local_instance_dir = instance_dir.clone();
+        let local_config_dir = config_dir.clone();
+        let local = tokio::task::spawn_blocking(move || {
+            crate::commands::connect::service::cli::print_local_logs(
+                &local_instance_dir,
+                &local_config_dir,
+                number,
+                true,
+            )
+        })
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("local service log task failed: {source}"),
+        })??;
+        if local {
+            if let Some(error) = cloud_error {
+                eprintln!(
+                    "warning: Spice Cloud logs for project '{target}' were unavailable, so logs from this directory's local service are shown instead. Cause: {error}"
+                );
+            }
+            return Ok(());
+        }
+    } else {
         let local_instance_dir = instance_dir.clone();
         let local_config_dir = config_dir.clone();
         let local = tokio::task::spawn_blocking(move || {
@@ -3380,51 +3428,28 @@ async fn execute_logs(ctx: &RuntimeContext, args: &LogsArgs, flag_org: Option<&s
             message: format!("local service log task failed: {source}"),
         })??;
         if let Some(lines) = local {
-            let logs = lines
-                .into_iter()
-                .map(|message| spice_cloud_client::types::LogEntry {
-                    timestamp: None,
-                    level: None,
-                    message,
-                    source: Some("local".to_string()),
-                })
-                .collect();
-            return write_json(&spice_cloud_client::types::LogsResponse { logs });
+            let logs =
+                filter_cloud_logs_since(parse_local_log_lines(lines), args.level, since.as_ref());
+            if args.output == OutputFormat::Json {
+                return write_json(&logs);
+            }
+            if let Some(error) = cloud_error {
+                eprintln!(
+                    "warning: Spice Cloud logs for project '{target}' were unavailable, so logs from this directory's local service are shown instead. Cause: {error}"
+                );
+            }
+            render_cloud_logs(logs);
+            return Ok(());
         }
-        if let Some(error) = cloud_error {
-            return Err(error);
-        }
+    }
+    if let Some(error) = cloud_error {
+        return Err(error);
+    }
+    if args.output == OutputFormat::Json {
         return write_json(
             &empty_cloud_response
                 .unwrap_or(spice_cloud_client::types::LogsResponse { logs: Vec::new() }),
         );
-    }
-
-    let follow = args.follow;
-    let local_instance_dir = instance_dir.clone();
-    let local_config_dir = config_dir.clone();
-    let local = tokio::task::spawn_blocking(move || {
-        crate::commands::connect::service::cli::print_local_logs(
-            &local_instance_dir,
-            &local_config_dir,
-            number,
-            follow,
-        )
-    })
-    .await
-    .map_err(|source| Error::CloudConnectIo {
-        message: format!("local service log task failed: {source}"),
-    })??;
-    if local {
-        if let Some(error) = cloud_error {
-            eprintln!(
-                "warning: Spice Cloud logs for project '{target}' were unavailable, so logs from this directory's local service are shown instead. Cause: {error}"
-            );
-        }
-        return Ok(());
-    }
-    if let Some(error) = cloud_error {
-        return Err(error);
     }
     Ok(())
 }
@@ -3577,7 +3602,25 @@ fn filter_cloud_logs_since(
     logs
 }
 
-fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse, follow: bool) {
+fn parse_local_log_lines(lines: Vec<String>) -> spice_cloud_client::types::LogsResponse {
+    spice_cloud_client::types::LogsResponse {
+        logs: lines
+            .into_iter()
+            .map(|line| parse_runtime_log_line(&line, "local"))
+            .collect(),
+    }
+}
+
+fn ensure_cloud_logs_follow_supported(follow: bool) -> Result<()> {
+    if follow {
+        return Err(Error::InvalidArgument {
+            message: "`--follow` is not supported when logs are served by Spice Cloud. Omit `--follow` and rerun the command to fetch newer entries.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse) {
     for entry in logs.logs {
         let level_color = match entry.level.as_deref() {
             Some("error") => "\x1b[31m",
@@ -3592,12 +3635,6 @@ fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse, follow: bool
             level_color,
             entry.level.unwrap_or_default(),
             entry.message
-        );
-    }
-    if follow {
-        println!();
-        println!(
-            "Note: --follow is not supported by the Spice Cloud logs API; re-run the command to fetch newer entries."
         );
     }
 }
@@ -4591,7 +4628,7 @@ mod tests {
     fn spicepod_secret_references_are_sorted_and_deduplicated() {
         assert_eq!(
             secret_references(
-                "password: ${secrets:ZETA}\nuser: ${secrets:ALPHA}\nagain: ${secrets:ZETA}\nempty: ${secrets:}\nbroken: ${secrets:OPEN"
+                "password: ${ secrets: ZETA }\nuser: ${secrets : ALPHA}\nagain: ${secrets:ZETA}\nenv: ${ env:IGNORED }\nempty: ${secrets:}\nbroken: ${secrets:OPEN"
             ),
             vec!["ALPHA".to_string(), "ZETA".to_string()]
         );
@@ -5021,6 +5058,25 @@ mod tests {
     }
 
     #[test]
+    fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
+        let values = user_login_values(
+            "user-token",
+            Some("personal-api-key"),
+            Some("personal"),
+            Some("acme"),
+        );
+        let value_refs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|(key, value)| (key.as_str(), *value))
+            .collect();
+
+        assert_eq!(
+            keychain_login_orgs(&value_refs),
+            BTreeSet::from(["acme".to_string(), "personal".to_string()])
+        );
+    }
+
+    #[test]
     fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
         let values = user_login_values("user-token", None, Some("personal"), Some("acme"));
 
@@ -5353,6 +5409,38 @@ mod tests {
             messages,
             vec!["runtime: new", "panic continuation without a timestamp"]
         );
+    }
+
+    #[test]
+    fn local_fallback_logs_apply_the_same_level_and_since_filters() {
+        let logs = parse_local_log_lines(vec![
+            "2026-08-20T00:00:00Z INFO runtime: old".to_string(),
+            "2026-08-20T00:00:02Z ERROR runtime: failed".to_string(),
+        ]);
+        let since =
+            chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:01Z").expect("valid timestamp");
+        let filtered = filter_cloud_logs_since(logs, LogLevelFilter::Error, Some(&since));
+
+        assert_eq!(filtered.logs.len(), 1);
+        assert_eq!(filtered.logs[0].message, "runtime: failed");
+        assert_eq!(filtered.logs[0].level.as_deref(), Some("error"));
+        assert_eq!(filtered.logs[0].source.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn cloud_logs_reject_follow_instead_of_returning_a_one_shot_response() {
+        let error = ensure_cloud_logs_follow_supported(true)
+            .expect_err("a successful Cloud response cannot honor follow");
+        assert!(error.to_string().contains("--follow"));
+        ensure_cloud_logs_follow_supported(false).expect("a one-shot request is supported");
+    }
+
+    #[test]
+    fn logout_does_not_claim_success_after_a_keychain_removal_failure() {
+        let error = ensure_keychain_credentials_removed(&["SPICE_SPICEAI_TOKEN_ACME".to_string()])
+            .expect_err("a usable keychain credential must fail logout");
+
+        assert!(error.to_string().contains("may still be usable"));
     }
 
     #[test]

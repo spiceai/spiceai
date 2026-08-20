@@ -104,6 +104,7 @@ runtime-cloud-connect = { workspace = true }
 spice-cloud-client.workspace = true
 repl = { path = "../../crates/repl" }
 runtime-api-types = { path = "../../crates/runtime-api-types" }
+runtime-secrets = { path = "../../crates/runtime-secrets", default-features = false }
 spicepod = { path = "../../crates/spicepod", default-features = false }
 spiceai = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
