@@ -43,6 +43,7 @@ connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional 
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
+accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -211,7 +212,7 @@ client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
-sqlite = ["runtime/sqlite"]
+sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
 vortex = ["runtime/vortex"]

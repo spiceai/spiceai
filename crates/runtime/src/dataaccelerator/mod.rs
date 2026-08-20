@@ -28,8 +28,6 @@ pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
@@ -693,7 +691,7 @@ mod accelerator_compat_tests {
             let table = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
-                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                    use accelerator_sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -1960,7 +1958,7 @@ mod accelerator_compat_tests {
                 let bool_table: Arc<dyn TableProvider> = match engine {
                     #[cfg(feature = "sqlite")]
                     Engine::Sqlite => {
-                        use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                        use accelerator_sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await

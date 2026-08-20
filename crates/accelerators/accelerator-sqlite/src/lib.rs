@@ -14,24 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
 };
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 
 use std::sync::Arc;
 
-use crate::{
-    component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::FilePathError,
-    datafusion::udf::deny_spice_functions_for_table_providers,
-    parameters::ParameterSpec,
-    spice_data_base_path,
-};
 use arrow::datatypes::DataType;
 use async_trait::async_trait;
+use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
@@ -45,13 +39,17 @@ use datafusion_table_providers::{
     },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
+use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration::Mode;
 use runtime_acceleration::snapshot::AccelerationEngine;
+use runtime_parameters::ParameterSpec;
 use runtime_table_partition::expression::PartitionedBy;
+use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{
+use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
@@ -151,6 +149,10 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when the source is not file-accelerated —
+    /// a memory-mode acceleration has no file to name.
     pub fn sqlite_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
@@ -172,6 +174,10 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBusyTimeoutValue`] when `sqlite_busy_timeout` is set to
+    /// something that is not a duration.
     pub fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
         if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
@@ -223,6 +229,11 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    /// # Errors
+    ///
+    /// Returns the errors of the configuration it resolves first — the file path, the
+    /// acceleration block, the busy timeout — or a pool error when the database cannot be
+    /// opened.
     pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
@@ -501,7 +512,7 @@ impl DataAccelerator for SqliteAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
+            data_accelerator_api::InvalidConfigurationSnafu {
                 msg: "Sqlite data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
@@ -602,7 +613,7 @@ impl DataAccelerator for SqliteAccelerator {
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         drop(previous_provider);
 
@@ -777,11 +788,11 @@ data_accelerator_api::register_data_accelerator!(Engine::Sqlite, SqliteAccelerat
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::dataaccelerator::DataAccelerator;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
     };
+    use data_accelerator_api::DataAccelerator;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -791,10 +802,10 @@ mod tests {
     };
     use datafusion_table_providers::util::test::MockExec;
 
-    use crate::component::dataset::acceleration::Acceleration;
-    use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+    use crate::SqliteAccelerator;
+    use runtime_acceleration::Engine;
+    use runtime_acceleration::acceleration::{Acceleration, Mode};
+    use runtime_acceleration::testing::TestAccelerationSource;
 
     #[tokio::test]
     #[expect(clippy::unreadable_literal)]
@@ -1044,24 +1055,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_file_initialization() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset = DatasetBuilder::try_new(
-            "sqlite_file_accelerator_init".to_string(),
-            "sqlite_file_accelerator_init",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Sqlite,
-            mode: Mode::File,
-            ..Default::default()
-        });
+        // A configuration-only source: this engine asks its source for `name`,
+        // `acceleration`, `is_file_accelerated` and `app`, none of which need a runtime.
+        let dataset = TestAccelerationSource::new("sqlite_file_accelerator_init")
+            .with_acceleration(Acceleration {
+                engine: Engine::Sqlite,
+                mode: Mode::File,
+                ..Default::default()
+            });
 
         let accelerator = SqliteAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));

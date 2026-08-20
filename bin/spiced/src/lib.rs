@@ -102,6 +102,8 @@ use connector_spark as _;
 // `register_data_accelerator!` into a linkme slice of their own.
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;

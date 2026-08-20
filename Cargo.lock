@@ -39,6 +39,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "accelerator-sqlite"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-sqlite",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "rusqlite",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adbc_core"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17006,6 +17034,7 @@ name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
  "accelerator-postgres",
+ "accelerator-sqlite",
  "adbc_core",
  "adbc_driver_manager",
  "anyhow",
@@ -19720,6 +19749,7 @@ name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
  "accelerator-postgres",
+ "accelerator-sqlite",
  "ansi_colors",
  "app",
  "arrow",

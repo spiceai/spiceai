@@ -241,7 +241,7 @@ mod sqlite_accel {
     use arrow::array::RecordBatch;
     use data_accelerator_api::DataAccelerator;
     use datafusion::datasource::TableProvider;
-    use runtime::dataaccelerator::sqlite::SqliteAccelerator;
+    use accelerator_sqlite::SqliteAccelerator;
     use rusqlite::Connection;
     use std::sync::Arc;
 

@@ -266,6 +266,7 @@ connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
+accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
