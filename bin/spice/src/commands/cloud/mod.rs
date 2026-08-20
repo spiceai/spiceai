@@ -3078,14 +3078,16 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     let active_org = resolve_org(flag_org)?;
     let client = CloudClient::connect(active_org.as_deref()).await?;
     let context = client.optional_user_auth_context().await?;
-    let mut apps = client.list_projects().await?;
+    let mut projects = client.list_projects().await?;
 
-    if apps.is_empty() {
+    if projects.is_empty() {
         match &active_org {
             Some(org) => println!(
-                "No apps found in organization {org}. Create one with: spice cloud project create <name> --org {org}"
+                "No projects found in organization {org}. Create one with: spice cloud project create <name> --org {org}"
             ),
-            None => println!("No apps found. Create one with: spice cloud project create <name>"),
+            None => {
+                println!("No projects found. Create one with: spice cloud project create <name>");
+            }
         }
         return Ok(());
     }
@@ -3100,15 +3102,15 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         .filter(|org| !org.is_empty())
         .or(active_org.as_deref())
         .unwrap_or("");
-    // The Spice Cloud `/v1/apps` endpoint does not populate `org` per app, so
+    // The Spice Cloud `/v1/apps` endpoint does not populate `org` per project, so
     // backfill it from the auth-context org — the same fallback the table
     // rendering applies via `display_project_name`. Without this, `--output json`
     // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
     // format parity and machine-readable scripting (see #11041).
-    backfill_project_orgs(&mut apps, context_org);
+    backfill_project_orgs(&mut projects, context_org);
 
     if args.output == OutputFormat::Json {
-        return write_json(&apps);
+        return write_json(&projects);
     }
 
     let mut table = TableOutput::new(vec![
@@ -3118,16 +3120,20 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         "VISIBILITY",
         "CREATED",
     ]);
-    for app in &apps {
-        let display_name = display_project_name(app, context_org);
+    for project in &projects {
+        let display_name = display_project_name(project, context_org);
         table.add_row(vec![
             display_name,
-            app.description.clone().unwrap_or_default(),
-            app.region.clone().unwrap_or_else(|| "-".to_string()),
-            app.visibility
+            project.description.clone().unwrap_or_default(),
+            project.region.clone().unwrap_or_else(|| "-".to_string()),
+            project
+                .visibility
                 .clone()
                 .unwrap_or_else(|| "private".to_string()),
-            app.created_at.clone().unwrap_or_else(|| "-".to_string()),
+            project
+                .created_at
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
         ]);
     }
     table.print();
@@ -3135,36 +3141,36 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     Ok(())
 }
 
-/// Backfill each app's empty `org` from the auth-context org so machine-readable
+/// Backfill each project's empty `org` from the auth-context org so machine-readable
 /// (`--output json`) output matches the human-readable table, which already
 /// applies this fallback when rendering via [`display_project_name`]. The Spice
-/// Cloud `/v1/apps` endpoint does not populate `org` on each app, so the auth
+/// Cloud `/v1/apps` endpoint does not populate `org` on each project, so the auth
 /// context is the only source of truth for the user's org. A no-op when
-/// `context_org` is empty (nothing to fall back to) or the app already carries
+/// `context_org` is empty (nothing to fall back to) or the project already carries
 /// an org.
-fn backfill_project_orgs(apps: &mut [spice_cloud_client::types::Project], context_org: &str) {
+fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], context_org: &str) {
     if context_org.is_empty() {
         return;
     }
-    for app in apps.iter_mut() {
-        if app.org.is_empty() {
-            app.org = context_org.to_string();
+    for project in projects.iter_mut() {
+        if project.org.is_empty() {
+            project.org = context_org.to_string();
         }
     }
 }
 
-/// Format an app's display name as `org/name`, falling back to the auth
-/// context org when the app payload does not include one.
-fn display_project_name(app: &spice_cloud_client::types::Project, context_org: &str) -> String {
-    let org = if app.org.is_empty() {
+/// Format a project's display name as `org/name`, falling back to the auth
+/// context org when the project payload does not include one.
+fn display_project_name(project: &spice_cloud_client::types::Project, context_org: &str) -> String {
+    let org = if project.org.is_empty() {
         context_org
     } else {
-        app.org.as_str()
+        project.org.as_str()
     };
     if org.is_empty() {
-        app.name.clone()
+        project.name.clone()
     } else {
-        format!("{org}/{}", app.name)
+        format!("{org}/{}", project.name)
     }
 }
 
@@ -4809,7 +4815,7 @@ mod tests {
         );
     }
 
-    fn test_app(org: &str, name: &str) -> spice_cloud_client::types::Project {
+    fn test_project(org: &str, name: &str) -> spice_cloud_client::types::Project {
         spice_cloud_client::types::Project {
             id: 1,
             name: name.to_string(),
@@ -4824,51 +4830,56 @@ mod tests {
     }
 
     #[test]
-    fn display_project_name_uses_app_org_when_present() {
-        let app = test_app("analytics", "dashboard");
+    fn display_project_name_uses_project_org_when_present() {
+        let project = test_project("analytics", "dashboard");
         assert_eq!(
-            display_project_name(&app, "fallback"),
+            display_project_name(&project, "fallback"),
             "analytics/dashboard"
         );
     }
 
     #[test]
-    fn display_project_name_falls_back_to_context_org_when_app_org_is_empty() {
-        let app = test_app("", "dashboard");
+    fn display_project_name_falls_back_to_context_org_when_project_org_is_empty() {
+        let project = test_project("", "dashboard");
         assert_eq!(
-            display_project_name(&app, "analytics"),
+            display_project_name(&project, "analytics"),
             "analytics/dashboard"
         );
     }
 
     #[test]
     fn display_project_name_omits_leading_slash_when_org_unavailable() {
-        let app = test_app("", "dashboard");
-        assert_eq!(display_project_name(&app, ""), "dashboard");
+        let project = test_project("", "dashboard");
+        assert_eq!(display_project_name(&project, ""), "dashboard");
     }
 
     #[test]
     fn backfill_project_orgs_fills_empty_org_from_context() {
-        let mut apps = vec![test_app("", "ltd-mint"), test_app("", "zippy-cayenne")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        assert_eq!(apps[0].org, "Jeadie");
-        assert_eq!(apps[1].org, "Jeadie");
+        let mut projects = vec![
+            test_project("", "ltd-mint"),
+            test_project("", "zippy-cayenne"),
+        ];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        assert_eq!(projects[0].org, "Jeadie");
+        assert_eq!(projects[1].org, "Jeadie");
     }
 
     #[test]
     fn backfill_project_orgs_preserves_existing_org() {
-        let mut apps = vec![test_app("analytics", "dashboard"), test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        // An app that already carries an org keeps it; only empty orgs are filled.
-        assert_eq!(apps[0].org, "analytics");
-        assert_eq!(apps[1].org, "Jeadie");
+        let mut projects = vec![
+            test_project("analytics", "dashboard"),
+            test_project("", "ltd-mint"),
+        ];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        assert_eq!(projects[0].org, "analytics");
+        assert_eq!(projects[1].org, "Jeadie");
     }
 
     #[test]
     fn backfill_project_orgs_noop_when_context_empty() {
-        let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "");
-        assert_eq!(apps[0].org, "");
+        let mut projects = vec![test_project("", "ltd-mint")];
+        backfill_project_orgs(&mut projects, "");
+        assert_eq!(projects[0].org, "");
     }
 
     // ========================================================================
@@ -5514,9 +5525,9 @@ mod tests {
         // `--output json` serialized `"org": ""`. After the backfill the
         // serialized JSON must carry the context org, matching the table's
         // `<org>/<name>` display.
-        let mut apps = vec![test_app("", "ltd-mint")];
-        backfill_project_orgs(&mut apps, "Jeadie");
-        let value = serde_json::to_value(&apps[0]).expect("app should serialize to JSON");
+        let mut projects = vec![test_project("", "ltd-mint")];
+        backfill_project_orgs(&mut projects, "Jeadie");
+        let value = serde_json::to_value(&projects[0]).expect("project should serialize to JSON");
         assert_eq!(
             value.get("org").and_then(serde_json::Value::as_str),
             Some("Jeadie"),
