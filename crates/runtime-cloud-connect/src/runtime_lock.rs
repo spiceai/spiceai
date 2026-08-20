@@ -51,7 +51,7 @@ pub enum Error {
         "Failed to start the Spice runtime for {}: another runtime is already running in this \
          directory{owner}. One instance directory serves one runtime: a second would share the \
          enrolled identity, the deployed spicepod, and the ports this one is about to bind. Run \
-         `spice connect status` to see what this directory is running, stop that runtime, or \
+         `spice cloud status` to see what this directory is running, stop that runtime, or \
          start this one from another instance directory — `SPICE_CONFIG_DIR` moves the \
          per-instance state on its own. See: https://spiceai.org/docs",
         instance.display(),

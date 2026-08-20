@@ -91,6 +91,9 @@ pub(crate) struct LogRequest {
     pub(crate) number: u32,
     /// Keep printing new output until interrupted.
     pub(crate) follow: bool,
+    /// Return the bounded history to the caller instead of writing it to
+    /// stdout. Capture requests never follow.
+    pub(crate) capture: bool,
 }
 
 /// The operations a supervisor back end provides.
@@ -151,8 +154,11 @@ pub(crate) trait ServiceBackend {
     fn install(&self, request: &InstallRequest<'_>) -> Result<InstalledService>;
 
     /// Validate that this invocation may uninstall `manifest` without changing
-    /// supervisor or filesystem state. Destructive workflows call this before
-    /// an irreversible Cloud mutation.
+    /// supervisor or filesystem state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this process lacks the required local authority.
     fn authorize_uninstall(&self, manifest: &ServiceManifest) -> Result<()>;
 
     /// Stop and remove exactly the service the manifest describes.
@@ -196,12 +202,14 @@ pub(crate) trait ServiceBackend {
     /// render something either way.
     fn observe(&self, manifest: &ServiceManifest) -> ServiceObservation;
 
-    /// Print the service's output as `request` asks.
+    /// Read the service's output as `request` asks. A capture request returns
+    /// the bounded history; a terminal request writes it directly and returns
+    /// `None`.
     ///
     /// # Errors
     ///
     /// Returns an error when the log source cannot be read.
-    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<()>;
+    fn logs(&self, manifest: &ServiceManifest, request: LogRequest) -> Result<Option<Vec<String>>>;
 
     /// The native supervisor commands an operator falls back to when a Spice
     /// command cannot complete. Recovery detail, never the primary interface.
@@ -313,7 +321,11 @@ mod unsupported {
             ))
         }
 
-        fn logs(&self, _manifest: &ServiceManifest, _request: LogRequest) -> Result<()> {
+        fn logs(
+            &self,
+            _manifest: &ServiceManifest,
+            _request: LogRequest,
+        ) -> Result<Option<Vec<String>>> {
             Err(PreflightFailure::UnsupportedPlatform.into())
         }
 
@@ -565,8 +577,13 @@ pub(crate) mod fake {
             self.observation.clone()
         }
 
-        fn logs(&self, _manifest: &ServiceManifest, _request: LogRequest) -> Result<()> {
-            self.record("logs")
+        fn logs(
+            &self,
+            _manifest: &ServiceManifest,
+            request: LogRequest,
+        ) -> Result<Option<Vec<String>>> {
+            self.record("logs")?;
+            Ok(request.capture.then(Vec::new))
         }
 
         fn recovery_hints(&self, manifest: &ServiceManifest) -> Vec<String> {

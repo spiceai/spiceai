@@ -14,14 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The one status model both status commands render.
-//!
-//! `spice connect status` renders all of [`ConnectStatus`].
-//! `spice connect service status` renders the *same* [`ServiceStatus`] value
-//! filtered out of it. Neither command queries, normalizes, labels, or caches
-//! service state of its own, so the two cannot answer differently — the
-//! failure that two independent status implementations produce as soon as one
-//! of them learns a new state.
+//! The local instance status model rendered by `spice cloud status`.
 //!
 //! One snapshot is collected per invocation and then rendered, rather than
 //! probed per printed line, so the report describes a single moment.
@@ -147,23 +140,13 @@ pub(crate) struct DeploymentStatus {
     pub(crate) secret_names: Vec<String>,
 }
 
-/// Everything `spice connect status` reports about one instance directory.
+/// Everything `spice cloud status` reports about one instance directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ConnectStatus {
     pub(crate) schema_version: u32,
     pub(crate) connection: ConnectionStatus,
     pub(crate) service: ServiceStatus,
     pub(crate) deployment: DeploymentStatus,
-}
-
-/// The document `spice connect service status --output json` writes.
-///
-/// It carries the byte-identical `service` object from [`ConnectStatus`], so
-/// automation never has to reconcile a full and a filtered schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ServiceStatusDocument<'a> {
-    pub(crate) schema_version: u32,
-    pub(crate) service: &'a ServiceStatus,
 }
 
 impl ConnectStatus {
@@ -248,7 +231,7 @@ impl ConnectStatus {
                 connection.diagnostic = Some(format!(
                     "The Spice Cloud Connect identity at {} could not be read: {err}. \
                      Re-enroll this directory with `spiced --token <enrollment-key>`, or \
-                     release it with `spice connect remove`. See: https://spiceai.org/docs",
+                     release it with `spice cloud unlink`. See: https://spiceai.org/docs",
                     connection.identity_path.display()
                 ));
                 None
@@ -319,13 +302,6 @@ impl ConnectStatus {
     }
 
     /// The service half on its own, for the filtered command.
-    pub(crate) fn service_document(&self) -> ServiceStatusDocument<'_> {
-        ServiceStatusDocument {
-            schema_version: self.schema_version,
-            service: &self.service,
-        }
-    }
-
     /// The one-line diagnosis for a degraded snapshot, naming whichever part of
     /// it is degraded, or `None` when there is nothing wrong.
     ///
@@ -503,25 +479,6 @@ pub(crate) fn render(status: &ConnectStatus, format: OutputFormat) -> Result<()>
     }
 }
 
-/// Write the service half in `format`, from the same snapshot.
-///
-/// # Errors
-///
-/// Returns an error when the report cannot be serialized.
-pub(crate) fn render_service(status: &ConnectStatus, format: OutputFormat) -> Result<()> {
-    match format {
-        OutputFormat::Json => write_json(&status.service_document()),
-        OutputFormat::Table => {
-            println!(
-                "Spice Cloud Connect service: {}",
-                describe_service_state(&status.service)
-            );
-            render_service_lines(&status.service);
-            Ok(())
-        }
-    }
-}
-
 fn render_connection(connection: &ConnectionStatus) {
     match connection.state {
         ConnectionState::Enrolled => {
@@ -693,7 +650,7 @@ fn render_next_steps(status: &ConnectStatus) {
     }
     if !status.service.installed {
         println!(
-            "No service is installed for this directory. Run `spice connect service install` to \
+            "No service is installed for this directory. Run `spice cloud service install` to \
              keep this instance running across reboots."
         );
     }
@@ -730,31 +687,6 @@ mod tests {
             status.degradation(),
             None,
             "a directory with no service is not degraded"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_full_and_filtered_json_share_one_service_object() {
-        // The acceptance criterion: automation must never have to reconcile two
-        // service schemas.
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let instance_dir = dir.path().join("edge-1");
-        let config_dir = instance_dir.join(".spice");
-        let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
-
-        let full: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&status).expect("serialize full"))
-                .expect("parse full");
-        let filtered: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(&status.service_document()).expect("serialize filtered"),
-        )
-        .expect("parse filtered");
-
-        assert_eq!(full["schema_version"], filtered["schema_version"]);
-        assert_eq!(
-            serde_json::to_string(&full["service"]).expect("re-serialize full service"),
-            serde_json::to_string(&filtered["service"]).expect("re-serialize filtered service"),
-            "the service object must be byte-identical in both documents"
         );
     }
 
@@ -841,20 +773,6 @@ mod tests {
         assert!(!diagnostic.contains("credential-that-must-not-be-printed"));
         assert!(!diagnostic.contains("private-key-that-must-not-be-printed"));
         assert!(status.degradation().is_some());
-    }
-
-    #[test]
-    fn the_filtered_service_status_is_not_degraded_by_hidden_connection_state() {
-        let mut status = golden_status();
-        status.connection.state = ConnectionState::Unusable;
-        status.connection.diagnostic = Some("identity needs repair".to_string());
-
-        assert!(status.degradation().is_some());
-        assert_eq!(
-            status.service_degradation(),
-            None,
-            "the service-only document reports a healthy running service"
-        );
     }
 
     #[tokio::test]
@@ -961,23 +879,6 @@ mod tests {
         // automation surface changed and the version has to change with it.
         let json = serde_json::to_string_pretty(&golden_status()).expect("serialize");
         insta::assert_snapshot!("connect_status_schema", json);
-    }
-
-    #[test]
-    fn the_filtered_service_json_document_matches_its_golden_schema() {
-        let status = golden_status();
-        let json = serde_json::to_string_pretty(&status.service_document()).expect("serialize");
-        insta::assert_snapshot!("connect_service_status_schema", json);
-    }
-
-    #[test]
-    fn every_service_field_of_the_full_document_appears_in_the_filtered_one() {
-        // The two fixtures are reviewed separately, so this is what keeps them
-        // from drifting into two schemas between reviews.
-        let status = golden_status();
-        let full = serde_json::to_value(&status).expect("serialize full");
-        let filtered = serde_json::to_value(status.service_document()).expect("serialize filtered");
-        assert_eq!(full["service"], filtered["service"]);
     }
 
     #[tokio::test]

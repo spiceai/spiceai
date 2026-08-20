@@ -7126,7 +7126,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=318492b8ae79162586ada08f7672563176bb0331#318492b8ae79162586ada08f7672563176bb0331"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=3c40145d671792f3974bc95af5587b699c86c86c#3c40145d671792f3974bc95af5587b699c86c86c"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -19594,6 +19594,7 @@ dependencies = [
  "rstest 0.26.1",
  "runtime-api-types",
  "runtime-cloud-connect",
+ "runtime-secrets",
  "rustyline",
  "secrecy",
  "semver",
