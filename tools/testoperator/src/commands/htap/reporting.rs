@@ -614,6 +614,20 @@ fn cumulative_by_label(
     name: &str,
     label: &str,
 ) -> std::collections::BTreeMap<(String, String), f64> {
+    cumulative_by_labels(metrics, name, &[label])
+}
+
+/// [`cumulative_by_label`] keyed on several labels at once, joined with `/`.
+///
+/// `cayenne_compaction_outcome_total` carries both `kind` and `outcome`, and the
+/// bake shares the counter with compaction — so keying on `outcome` alone would
+/// sum a bake's `skipped_lock_busy` with a compaction's and report one number for
+/// two different problems.
+fn cumulative_by_labels(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    name: &str,
+    labels: &[&str],
+) -> std::collections::BTreeMap<(String, String), f64> {
     use std::collections::BTreeMap;
 
     // Fingerprint the full label set first: a cumulative series' run value is its
@@ -626,11 +640,17 @@ fn cumulative_by_label(
             .get("table")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        let value = sample
-            .labels
-            .get(label)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
+        let value = labels
+            .iter()
+            .map(|label| {
+                sample
+                    .labels
+                    .get(*label)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("/");
         let mut fingerprint: Vec<String> = sample
             .labels
             .iter()
@@ -666,7 +686,8 @@ fn cumulative_by_label(
 /// Silent when neither series was scraped, so a non-Cayenne run prints nothing.
 pub(super) fn emit_cayenne_path_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
     let misses = cumulative_by_label(metrics, "cayenne_pk_index_checkpoint_miss_total", "reason");
-    let outcomes = cumulative_by_label(metrics, "cayenne_compaction_outcome_total", "outcome");
+    let outcomes =
+        cumulative_by_labels(metrics, "cayenne_compaction_outcome_total", &["kind", "outcome"]);
 
     if !misses.is_empty() {
         println!("\nCayenne PK-Index Checkpoint Misses (full keyset rebuild fallbacks)");
@@ -686,9 +707,9 @@ pub(super) fn emit_cayenne_path_metrics(metrics: &crate::spiced_metrics::SpicedM
 
     if !outcomes.is_empty() {
         println!("\nCayenne Compaction Outcomes");
-        println!("  {:<20} {:<28} {:>10}", "table", "outcome", "count");
+        println!("  {:<20} {:<40} {:>10}", "table", "kind/outcome", "count");
         for ((table, outcome), count) in &outcomes {
-            println!("  {table:<20} {outcome:<28} {count:>10.0}");
+            println!("  {table:<20} {outcome:<40} {count:>10.0}");
             crate::metrics::CAYENNE_COMPACTION_OUTCOMES.record(
                 to_u64(*count),
                 &[
@@ -1534,6 +1555,37 @@ mod tests {
             got.get(&("t".to_string(), "over_budget".to_string())),
             Some(&1.0)
         );
+    }
+
+    /// The bake shares `cayenne_compaction_outcome_total` with compaction, so an
+    /// outcome name they both use must not be summed into one number.
+    #[test]
+    fn cumulative_by_labels_keeps_bake_and_compaction_declines_apart() {
+        let m = metrics(vec![
+            sample(
+                "outcome",
+                &[("table", "t"), ("kind", "bake"), ("outcome", "skipped_lock_busy")],
+                3.0,
+                1,
+            ),
+            sample(
+                "outcome",
+                &[("table", "t"), ("kind", "subset"), ("outcome", "skipped_lock_busy")],
+                7.0,
+                1,
+            ),
+        ]);
+        let got = cumulative_by_labels(&m, "outcome", &["kind", "outcome"]);
+        assert_eq!(
+            got.get(&("t".to_string(), "bake/skipped_lock_busy".to_string())),
+            Some(&3.0)
+        );
+        assert_eq!(
+            got.get(&("t".to_string(), "subset/skipped_lock_busy".to_string())),
+            Some(&7.0)
+        );
+        // Keying on `outcome` alone would have reported a single 10.0.
+        assert_eq!(got.len(), 2);
     }
 
     /// An unscraped counter yields nothing, so a non-Cayenne run prints no section.

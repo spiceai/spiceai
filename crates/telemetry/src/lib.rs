@@ -1294,6 +1294,18 @@ pub mod cayenne {
     /// `outcome` is one of `"committed"`, `"committed_prune_skipped"`,
     /// `"skipped_lock_busy"`, `"skipped_no_candidates"`, `"skipped_cas_lost"`,
     /// `"skipped_snapshot_replaced"`, `"declined_over_budget"`, or `"failed"`.
+    ///
+    /// Compaction adds the reasons a pass never started, which have no bake
+    /// equivalent: `"skipped_below_trigger"` (the protected set is under
+    /// `compaction_trigger_protected_snapshots`, the count-only gate),
+    /// `"skipped_staging_appends"` (a staged append is mid-finalization),
+    /// `"skipped_earlier_pass_committed"` (an earlier pass in the same trigger
+    /// committed, so this one had nothing to do), `"skipped_shutdown"`, and — under
+    /// the synthetic kind `"trigger"`, which precedes path selection —
+    /// `"skipped_coalesced"` for a trigger request dropped because a pass was
+    /// already in flight. A table whose pass outlasts the compaction tick sits in
+    /// that last state permanently, which without this counter is
+    /// indistinguishable from a trigger that never fires.
     pub fn track_compaction_outcome(dimensions: &[KeyValue]) {
         compaction_outcome().add(1, dimensions);
     }

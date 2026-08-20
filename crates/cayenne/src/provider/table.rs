@@ -14166,6 +14166,7 @@ impl CayenneTableProvider {
         // A staged append is mid-finalization; files would be neither cleanly in
         //  nor out of our scan.
         if self.has_inflight_staging_appends() {
+            self.record_compaction_outcome("subset_current", "skipped_staging_appends");
             return Ok(false);
         }
 
@@ -14638,6 +14639,10 @@ impl CayenneTableProvider {
             .post_write_compaction_scheduled
             .swap(true, Ordering::AcqRel)
         {
+            // Not an error: the in-flight pass will re-evaluate on the next drain.
+            // Counted because a table whose pass outlasts the tick sits here
+            // permanently, which is indistinguishable from "never triggered".
+            self.record_compaction_outcome("trigger", "skipped_coalesced");
             return;
         }
 
@@ -18324,6 +18329,7 @@ impl CayenneTableProvider {
                         "Skipping protected-snapshot subset compaction: writer active on position-delete table",
                     );
                 }
+                self.record_compaction_outcome("subset", "skipped_lock_busy");
                 return Ok(false);
             }
         } else {
@@ -18486,6 +18492,7 @@ impl CayenneTableProvider {
                 "Skipping fast protected-snapshot compaction: the qualifying tier's two oldest \
                  runs exceed the pass memory budget"
             );
+            self.record_compaction_outcome("subset", "declined_over_budget");
             return Ok(false);
         }
 
@@ -18500,6 +18507,7 @@ impl CayenneTableProvider {
                 max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
                 "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
             );
+            self.record_compaction_outcome("subset", "skipped_no_candidates");
             return Ok(false);
         }
 
@@ -19037,6 +19045,26 @@ impl CayenneTableProvider {
     /// a committed merge or a failed attempt, so every decline below is otherwise
     /// invisible — a trigger firing constantly and always declining looks identical
     /// to one that never fires.
+    /// Counts how a COMPACTION pass ended, mirroring [`Self::record_bake_outcome`].
+    ///
+    /// The duration histogram only sees passes that committed or failed trying, so a
+    /// trigger that fires every tick and declines every time is indistinguishable
+    /// there from one that never fires at all. Compaction had no outcome counter —
+    /// only the bake did — so every decline reason below was `trace!`-only and
+    /// therefore invisible in a real run. That is the same blind spot that let a
+    /// position-delete table accumulate 6,294 files in 11 minutes with zero merges
+    /// before the wall-clock WARN escalation was added.
+    ///
+    /// `kind` matches [`telemetry::cayenne::track_compaction_duration`]
+    /// (`subset` | `subset_current` | `full` | `datalake`).
+    fn record_compaction_outcome(&self, kind: &'static str, outcome: &'static str) {
+        telemetry::cayenne::track_compaction_outcome(&[
+            telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            telemetry::KeyValue::new("kind", kind),
+            telemetry::KeyValue::new("outcome", outcome),
+        ]);
+    }
+
     fn record_bake_outcome(&self, outcome: &'static str) {
         telemetry::cayenne::track_compaction_outcome(&[
             telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
@@ -30191,6 +30219,7 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
+            self.record_compaction_outcome("subset", "skipped_shutdown");
             return Ok(false);
         };
         // One trigger runs up to three passes, in this order:
@@ -30298,7 +30327,9 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
             // Because that re-encode also folds in any protected snapshots and
             // clears them (`clear_all_deletion_caches`), a committed pass leaves
             // nothing for the protected subset path this tick, so return early on
-            // success and let the next tick re-evaluate.
+            // success and let the next tick re-evaluate. Counted so a run can tell
+            // "the subset merge never needed to run" apart from "it was declined".
+            self.record_compaction_outcome("subset", "skipped_earlier_pass_committed");
             return Ok(true);
         }
 
@@ -30328,6 +30359,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 min_inputs,
                 "Skipping fast protected-snapshot compaction: protected set below trigger floor",
             );
+            self.record_compaction_outcome("subset", "skipped_below_trigger");
             return Ok(baked);
         }
 
