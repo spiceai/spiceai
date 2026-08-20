@@ -6979,14 +6979,20 @@ impl CayenneTableProvider {
         // is installed (unit tests, embedders). See `write_budget`.
         let shard_count =
             self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
-        // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
-        // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
-        // Acquire permits for that clamped count so a `cayenne_write_concurrency`
-        // configured above `target_partitions` can't over-subscribe the global
-        // budget and throttle other tables. (`acquire_encode_permits` also caps to
-        // the budget total, but clamping here keeps the request honest even if the
-        // budget is ever sized below the core count, e.g. reserved query threads.)
-        let encode_shards = shard_count.min(target_partitions.max(1));
+        // `snapshot_shard_count` already caps the fan-out at `target_partitions`
+        // (`snapshot_write_concurrency` treats it as a hard ceiling), so the
+        // count we permit for is the count the sink will encode with — no
+        // second clamp, and one place to change the rule. Permitting for the
+        // real fan-out is what keeps a `cayenne_write_concurrency` above the
+        // core count from over-subscribing the global budget and throttling
+        // other tables. (`acquire_encode_permits` additionally caps to the
+        // budget total, e.g. when it is sized below the core count for reserved
+        // query threads.)
+        debug_assert!(
+            shard_count <= target_partitions.max(1),
+            "snapshot_shard_count must not exceed the caller's target_partitions"
+        );
+        let encode_shards = shard_count;
         // Class-aware: `Delta` (CDC staged appends, mem-tier checkpoints) may
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
