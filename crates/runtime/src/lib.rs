@@ -354,15 +354,12 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[cfg(feature = "postgres-accel")]
+    // The list comes from the accelerator registration slice, so it names the engines
+    // this build actually linked. A hand-written list is wrong for every build that
+    // omits an engine, which is every build that omits an engine crate.
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
-    ))]
-    AcceleratorEngineNotAvailable { name: String },
-
-    #[cfg(not(feature = "postgres-accel"))]
-    #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
+        "The accelerator engine {name} is not available. Valid engines are {available}.",
+        available = data_accelerator_api::registered_engine_list()
     ))]
     AcceleratorEngineNotAvailable { name: String },
 

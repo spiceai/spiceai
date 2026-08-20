@@ -110,6 +110,41 @@ impl AcceleratorRegistration {
 #[distributed_slice]
 pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
 
+/// The accelerator engines this build actually linked, as the names a user writes in
+/// `acceleration.engine`, sorted and de-duplicated.
+///
+/// Reads the registration slice rather than a hand-maintained list, so a build that
+/// omits an engine crate cannot advertise it. `Engine::Arrow` and
+/// `Engine::PartitionedArrow` both spell "arrow", which is why this de-duplicates.
+#[must_use]
+pub fn registered_engine_names() -> Vec<String> {
+    let mut names: Vec<String> = DATA_ACCELERATOR_REGISTRATIONS
+        .iter()
+        .map(|registration| registration.engine.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// [`registered_engine_names`] as a user-facing list — `"arrow, duckdb, and sqlite"`.
+///
+/// Separate from the message that embeds it so the wording can be asserted directly;
+/// the link order of the registration slice is not stable, hence the sort above.
+#[must_use]
+pub fn registered_engine_list() -> String {
+    format_engine_list(&registered_engine_names())
+}
+
+fn format_engine_list(names: &[String]) -> String {
+    match names {
+        [] => "none — this build links no accelerator engine".to_string(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 /// Registers a data accelerator for a given engine.
 ///
 /// This macro creates a constructor function for the specified accelerator type and
@@ -891,7 +926,7 @@ pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) 
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none,
+        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none, format_engine_list,
         get_primary_keys_from_constraints, upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -1103,5 +1138,32 @@ mod tests {
             ..Acceleration::default()
         };
         assert!(!cayenne_pk_conflict_detection_none(&acceleration));
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The wording a user reads when they name an engine this build does not have.
+    #[test]
+    fn engine_list_reads_as_prose() {
+        assert_eq!(format_engine_list(&names(&["arrow"])), "arrow");
+        assert_eq!(
+            format_engine_list(&names(&["arrow", "duckdb"])),
+            "arrow and duckdb"
+        );
+        assert_eq!(
+            format_engine_list(&names(&["arrow", "cayenne", "duckdb"])),
+            "arrow, cayenne, and duckdb"
+        );
+    }
+
+    /// A build with no engine linked must not claim an empty set is valid.
+    #[test]
+    fn engine_list_says_so_when_empty() {
+        assert_eq!(
+            format_engine_list(&[]),
+            "none — this build links no accelerator engine"
+        );
     }
 }
