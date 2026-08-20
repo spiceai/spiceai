@@ -102,6 +102,79 @@ fn equality_delete_columns(schema: &ArrowSchema) -> (Vec<i32>, Vec<usize>) {
     (equality_ids, projection_indices)
 }
 
+/// The two projections an equality delete needs, which are *not* the same list.
+///
+/// `equality_ids` is the delete file's key — the columns whose values identify
+/// the rows to remove. `scan_indices` is what the scan must actually read: every
+/// key column, plus every column the predicate mentions.
+///
+/// Conflating them breaks the statement in one direction or the other. Reading
+/// only the key columns leaves a predicate on an excluded column — a float, say —
+/// with nothing to resolve against, so `DELETE ... WHERE price = 1.5` cannot be
+/// planned. Keying on everything the scan read is what makes the delete match
+/// more rows than the predicate did.
+#[derive(Debug, PartialEq, Eq)]
+struct EqualityDeletePlan {
+    /// Field IDs the delete file keys on, in schema order.
+    equality_ids: Vec<i32>,
+    /// Column indices the scan projects, ascending.
+    scan_indices: Vec<usize>,
+}
+
+/// Choose the delete key and the scan projection for a `DELETE`.
+///
+/// The key is the table's declared identifier fields when it has them and all of
+/// them can take part in an equality delete: those fields *are* the row identity,
+/// so keying on them removes exactly the rows the predicate matched. Without a
+/// usable identity there is no better answer than every eligible column, which
+/// narrows the match as far as the schema allows — see [`equality_delete_columns`]
+/// for why that is still a subset of the row, and what that costs.
+///
+/// The scan is widened to cover the predicate's columns regardless, so the filter
+/// always has something to bind to.
+fn plan_equality_delete(
+    schema: &ArrowSchema,
+    identifier_field_ids: &std::collections::HashSet<i32>,
+    filters: &[datafusion::logical_expr::Expr],
+) -> EqualityDeletePlan {
+    let (eligible_ids, eligible_indices) = equality_delete_columns(schema);
+
+    // A partial identity is not an identity: keying on the usable part of it
+    // would match rows the predicate never selected.
+    let identity_is_usable = !identifier_field_ids.is_empty()
+        && identifier_field_ids
+            .iter()
+            .all(|id| eligible_ids.contains(id));
+
+    let (equality_ids, key_indices): (Vec<i32>, Vec<usize>) = if identity_is_usable {
+        eligible_ids
+            .iter()
+            .zip(eligible_indices.iter())
+            .filter(|(id, _)| identifier_field_ids.contains(*id))
+            .map(|(id, idx)| (*id, *idx))
+            .unzip()
+    } else {
+        (eligible_ids, eligible_indices)
+    };
+
+    let mut scan_indices = key_indices;
+    for filter in filters {
+        for column in filter.column_refs() {
+            if let Ok(idx) = schema.index_of(column.name.as_str())
+                && !scan_indices.contains(&idx)
+            {
+                scan_indices.push(idx);
+            }
+        }
+    }
+    scan_indices.sort_unstable();
+
+    EqualityDeletePlan {
+        equality_ids,
+        scan_indices,
+    }
+}
+
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -116,8 +189,12 @@ pub(crate) struct IcebergDeleteExec {
     /// The child plan that produces the rows to delete (a scan with filters applied).
     /// The scan is projected to only include columns eligible for equality deletes.
     input: Arc<dyn ExecutionPlan>,
-    /// Pre-computed equality delete field IDs (primitive, non-float columns).
+    /// Pre-computed equality delete field IDs — the delete file's key.
     equality_ids: Vec<i32>,
+    /// Field IDs the input scan actually carries. A superset of `equality_ids`:
+    /// the scan also reads whatever the predicate references, so the writer's
+    /// projector must map from these columns, not from the key alone.
+    scan_field_ids: Vec<i32>,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -127,6 +204,7 @@ impl IcebergDeleteExec {
         catalog: Arc<dyn Catalog>,
         input: Arc<dyn ExecutionPlan>,
         equality_ids: Vec<i32>,
+        scan_field_ids: Vec<i32>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
         let plan_properties = Arc::new(PlanProperties::new(
@@ -141,6 +219,7 @@ impl IcebergDeleteExec {
             catalog,
             input,
             equality_ids,
+            scan_field_ids,
             plan_properties,
         }
     }
@@ -216,6 +295,7 @@ impl ExecutionPlan for IcebergDeleteExec {
             Arc::clone(&self.catalog),
             Arc::clone(&children[0]),
             self.equality_ids.clone(),
+            self.scan_field_ids.clone(),
         )))
     }
 
@@ -235,6 +315,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         let input_plan = Arc::clone(&self.input);
         let count_schema = Self::make_count_schema();
         let equality_ids = self.equality_ids.clone();
+        let scan_field_ids = self.scan_field_ids.clone();
 
         let stream = futures::stream::once(async move {
             // Collect all input partitions into a single stream
@@ -271,18 +352,19 @@ impl ExecutionPlan for IcebergDeleteExec {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-            // Build a sub-schema containing only the equality-eligible
-            // fields. The input scan is already projected to these columns,
-            // so the `EqualityDeleteWriterConfig` projector must map from
-            // this sub-schema (not the full table schema) to avoid index
-            // out-of-bounds when re-projecting the already-projected batches.
-            let equality_id_set: std::collections::HashSet<i32> =
-                equality_ids.iter().copied().collect();
+            // Describe the batches the scan actually produces, which is the key
+            // columns plus whatever the predicate referenced. The projector maps
+            // this schema down to `equality_ids`; handing it the key alone would
+            // index past the end of a wider batch. Columns it cannot key on
+            // (floats, nested) are skipped by the projector rather than rejected,
+            // so carrying them here is safe.
+            let scan_id_set: std::collections::HashSet<i32> =
+                scan_field_ids.iter().copied().collect();
             let equality_fields: Vec<_> = iceberg_schema
                 .as_struct()
                 .fields()
                 .iter()
-                .filter(|f| equality_id_set.contains(&f.id))
+                .filter(|f| scan_id_set.contains(&f.id))
                 .cloned()
                 .collect();
             let equality_schema = Arc::new(
@@ -483,7 +565,25 @@ impl IcebergDeletionProvider {
         let iceberg_schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(iceberg_schema).map_err(to_df_error)?);
 
-        let (equality_ids, projection_indices) = equality_delete_columns(&arrow_schema);
+        let identifier_field_ids: std::collections::HashSet<i32> =
+            iceberg_schema.identifier_field_ids().collect();
+        let EqualityDeletePlan {
+            equality_ids,
+            scan_indices,
+        } = plan_equality_delete(&arrow_schema, &identifier_field_ids, filters);
+
+        // The Parquet field IDs of the columns the scan will carry, in the same
+        // order, so the delete writer can describe its own input.
+        let scan_field_ids: Vec<i32> = scan_indices
+            .iter()
+            .filter_map(|idx| {
+                arrow_schema
+                    .field(*idx)
+                    .metadata()
+                    .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|v| v.parse::<i32>().ok())
+            })
+            .collect();
 
         // An equality delete file with no key columns imposes no condition, so
         // it would match every row: a `DELETE ... WHERE` would empty the table.
@@ -510,7 +610,7 @@ impl IcebergDeletionProvider {
         // float/nested columns that cause field-id resolution errors.
         let scan_plan = self
             .inner
-            .scan(state, Some(&projection_indices), filters, None)
+            .scan(state, Some(&scan_indices), filters, None)
             .await?;
 
         // The Iceberg provider may not push down filters, so add a FilterExec
@@ -568,14 +668,16 @@ impl IcebergDeletionProvider {
             Arc::clone(&self.catalog),
             coalesced,
             equality_ids,
+            scan_field_ids,
         )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::equality_delete_columns;
+    use super::{EqualityDeletePlan, equality_delete_columns, plan_equality_delete};
     use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+    use datafusion::prelude::{col, lit};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -696,6 +798,151 @@ mod tests {
         let (ids, indices) = equality_delete_columns(&schema);
         assert!(ids.is_empty());
         assert!(indices.is_empty());
+    }
+
+    fn ids(values: &[i32]) -> std::collections::HashSet<i32> {
+        values.iter().copied().collect()
+    }
+
+    /// A schema whose only distinguishing column is a float: `id` and `label`
+    /// repeat, `price` does not.
+    fn float_keyed_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("label", DataType::Utf8, Some("2")),
+            field("price", DataType::Float64, Some("3")),
+        ])
+    }
+
+    /// A predicate on a float column has to reach the scan even though the
+    /// delete cannot key on it. Projecting only the key columns left
+    /// `DELETE ... WHERE price = 1.5` with no `price` to bind to, so the
+    /// statement could not be planned at all.
+    #[test]
+    fn a_predicate_column_reaches_the_scan_even_when_it_cannot_be_keyed_on() {
+        let schema = float_keyed_schema();
+        let plan = plan_equality_delete(&schema, &ids(&[]), &[col("price").eq(lit(1.5))]);
+
+        assert_eq!(plan.scan_indices, vec![0, 1, 2], "price must be scanned");
+        assert_eq!(
+            plan.equality_ids,
+            vec![1, 2],
+            "but it must not become part of the delete key"
+        );
+    }
+
+    /// The scan is a superset of the key, never a replacement for it: widening
+    /// for the predicate must not drop a key column.
+    #[test]
+    fn the_scan_always_covers_every_key_column() {
+        let schema = float_keyed_schema();
+        for filters in [
+            vec![],
+            vec![col("price").gt(lit(0.0))],
+            vec![col("id").eq(lit(1_i64))],
+            vec![col("id").eq(lit(1_i64)), col("price").lt(lit(9.0))],
+        ] {
+            let plan = plan_equality_delete(&schema, &ids(&[]), &filters);
+            let (key_ids, key_indices) = equality_delete_columns(&schema);
+            assert_eq!(plan.equality_ids, key_ids);
+            for idx in key_indices {
+                assert!(
+                    plan.scan_indices.contains(&idx),
+                    "key column {idx} missing from the scan for {filters:?}"
+                );
+            }
+        }
+    }
+
+    /// Identifier fields are the row identity, so the delete keys on those and
+    /// removes exactly the rows the predicate matched. Keying on every eligible
+    /// column instead looks stricter but is not: two rows agreeing on all of
+    /// them are one row to the delete file.
+    #[test]
+    fn a_declared_identity_becomes_the_key_while_the_scan_stays_wide() {
+        let schema = float_keyed_schema();
+        let plan = plan_equality_delete(&schema, &ids(&[1]), &[col("price").eq(lit(1.5))]);
+
+        assert_eq!(plan.equality_ids, vec![1], "keyed on the declared identity");
+        assert_eq!(
+            plan.scan_indices,
+            vec![0, 2],
+            "identity column plus the predicate's column"
+        );
+    }
+
+    #[test]
+    fn a_composite_identity_keeps_every_part_in_schema_order() {
+        let schema = ArrowSchema::new(vec![
+            field("tenant", DataType::Int32, Some("7")),
+            field("payload", DataType::Utf8, Some("8")),
+            field("id", DataType::Int64, Some("9")),
+        ]);
+        let plan = plan_equality_delete(&schema, &ids(&[9, 7]), &[]);
+
+        assert_eq!(plan.equality_ids, vec![7, 9]);
+        assert_eq!(plan.scan_indices, vec![0, 2]);
+    }
+
+    /// No declared identity leaves no better key than every eligible column.
+    #[test]
+    fn without_an_identity_the_key_is_every_eligible_column() {
+        let schema = float_keyed_schema();
+        let plan = plan_equality_delete(&schema, &ids(&[]), &[]);
+
+        assert_eq!(
+            plan,
+            EqualityDeletePlan {
+                equality_ids: vec![1, 2],
+                scan_indices: vec![0, 1],
+            }
+        );
+    }
+
+    /// A partial identity is not an identity. If one identifier field cannot be
+    /// keyed on, keying on the rest would match rows the predicate never chose.
+    #[test]
+    fn an_identity_with_an_unusable_field_falls_back_to_every_eligible_column() {
+        let schema = float_keyed_schema();
+
+        // Field 3 is the float, so the identity can never be honoured.
+        let plan = plan_equality_delete(&schema, &ids(&[1, 3]), &[]);
+        assert_eq!(plan.equality_ids, vec![1, 2]);
+
+        // Same for an identity naming a field the schema does not carry.
+        let plan = plan_equality_delete(&schema, &ids(&[99]), &[]);
+        assert_eq!(plan.equality_ids, vec![1, 2]);
+    }
+
+    /// A predicate naming a column that is not in the schema must not silently
+    /// widen the scan with a bogus index; planning fails later on its own terms.
+    #[test]
+    fn an_unknown_predicate_column_does_not_widen_the_scan() {
+        let schema = float_keyed_schema();
+        let plan = plan_equality_delete(&schema, &ids(&[]), &[col("nope").eq(lit(1_i64))]);
+
+        assert_eq!(plan.scan_indices, vec![0, 1]);
+    }
+
+    /// The scan projection is handed to `TableProvider::scan`, which requires
+    /// ascending indices, and duplicates would double-project a column.
+    #[test]
+    fn the_scan_projection_is_sorted_and_free_of_duplicates() {
+        let schema = float_keyed_schema();
+        let plan = plan_equality_delete(
+            &schema,
+            &ids(&[]),
+            &[
+                col("price").eq(lit(1.5)),
+                col("label").eq(lit("x")),
+                col("price").gt(lit(0.0)),
+            ],
+        );
+
+        assert_eq!(plan.scan_indices, vec![0, 1, 2]);
+        let mut deduped = plan.scan_indices.clone();
+        deduped.dedup();
+        assert_eq!(deduped, plan.scan_indices);
     }
 
     #[test]
