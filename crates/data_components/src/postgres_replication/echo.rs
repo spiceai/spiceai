@@ -44,7 +44,7 @@ limitations under the License.
 //! (a sibling of the applied-LSN watermark), so a restart resumes with the same
 //! suppression set.
 //!
-//! # Lifecycle (see `cdc-echo-drop-xid-design.md`)
+//! # Lifecycle
 //!
 //! - [`register`](XidRegistry::register) — persist the entry **before** the delivery
 //!   `COMMIT` is issued. The instant `COMMIT` succeeds the echo can arrive, so a
