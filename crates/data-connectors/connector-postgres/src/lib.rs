@@ -73,6 +73,24 @@ pub struct Postgres {
     params: Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
+    /// Per-dataset outstanding-write-back-transaction registries, cached so the
+    /// delivery path (`write_back_deliverer`) and the CDC pump (`changes_stream`)
+    /// share the **same** `Arc` for a dataset — the deliverer registers each xid,
+    /// the pump drops its echo. Loaded (and startup-garbage-collected) once, on
+    /// whichever path first asks. Keyed by dataset name.
+    ///
+    /// Each value is its own single-flight cell: the outer mutex is held only
+    /// long enough to get-or-insert a dataset's cell, never across the load/GC
+    /// I/O that initializes it, so one dataset's slow or unavailable connection
+    /// cannot serialize every other dataset's setup behind this connector.
+    write_back_registries: Arc<
+        tokio::sync::Mutex<
+            HashMap<
+                String,
+                Arc<tokio::sync::OnceCell<Arc<data_components::postgres_replication::XidRegistry>>>,
+            >,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -301,6 +319,7 @@ impl DataConnectorFactory for PostgresFactory {
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
+                        write_back_registries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                     }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
@@ -1008,6 +1027,68 @@ fn durable_write_back_on_conflict(dataset: &DatasetSpec) -> Option<OnConflict> {
     Some(OnConflict::Upsert(ColumnReference::new(columns)))
 }
 
+impl Postgres {
+    /// The dataset's outstanding-write-back-transaction registry: `None` when the
+    /// dataset does not deliver durable write-back, `Some(Err(_))` when it does but
+    /// the registry could not be set up, `Some(Ok(_))` otherwise.
+    ///
+    /// Loaded once and cached, so the delivery path and the CDC pump share the
+    /// **same** `Arc`: the deliverer registers each write-back xid into it and the
+    /// pump reads it to drop the matching echo. Startup garbage collection runs on
+    /// the first load, before the registry is handed to either path.
+    async fn write_back_xid_registry(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<
+        Result<
+            Arc<data_components::postgres_replication::XidRegistry>,
+            Box<dyn std::error::Error + Send + Sync>,
+        >,
+    > {
+        // Only a durable-write-back dataset registers xids; every other dataset
+        // gets no registry (and so no echo filtering).
+        durable_write_back_on_conflict(dataset)?;
+
+        // Get (or create) this dataset's single-flight cell and release the map
+        // lock immediately — the load-and-GC I/O below must not run while holding
+        // it, or one dataset's slow or unavailable connection would serialize
+        // every other dataset's initialization behind this connector.
+        let key = dataset.name.to_string();
+        let cell = {
+            let mut cache = self.write_back_registries.lock().await;
+            Arc::clone(
+                cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+
+        let result = cell
+            .get_or_try_init(|| async {
+                let registry =
+                    replication::load_write_back_xid_registry(&self.params, dataset, context)
+                        .await?;
+                // Reconcile stale entries against the source before the registry
+                // is shared. A failure here must not activate an unvalidated
+                // registry for either the delivery path or the pump — it aborts
+                // initialization (nothing is cached, so a later call retries)
+                // rather than continuing best-effort.
+                replication::run_write_back_registry_gc(
+                    &self.pool,
+                    &self.params,
+                    dataset,
+                    context,
+                    &registry,
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(registry)
+            })
+            .await;
+        Some(result.map(Arc::clone))
+    }
+}
+
 /// Build the connector-owned durable write-back deliverer for a dataset already
 /// confirmed to need one (`on_conflict` resolved). Every step here opens a
 /// connection or reads source state, so a failure is surfaced rather than
@@ -1021,9 +1102,7 @@ fn durable_write_back_on_conflict(dataset: &DatasetSpec) -> Option<OnConflict> {
 /// version or schema cannot be read, or the change-echo suppression registry
 /// cannot be loaded.
 async fn build_write_back_deliverer(
-    pool: &Arc<PostgresConnectionPool>,
-    factory: &PostgresTableFactory,
-    params: &Parameters,
+    postgres: &Postgres,
     context: &dyn ConnectorContext,
     dataset: &DatasetSpec,
     on_conflict: OnConflict,
@@ -1040,10 +1119,11 @@ async fn build_write_back_deliverer(
     // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
     // PG10–12 equivalent. Read the server version at setup so delivery does
     // not re-decide per pass.
-    let mut conn = pool
+    let conn = postgres
+        .pool
         .connect_direct()
         .await
-        .map_err(|e| setup_error(Box::new(e)))?;
+        .map_err(|e| setup_error(e))?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
@@ -1055,21 +1135,29 @@ async fn build_write_back_deliverer(
     // The source table schema, for the upsert leg's conflict target and for
     // casting each accelerator batch onto it. Same schema the read provider
     // reports.
-    let schema = factory
+    let schema = postgres
+        .factory
         .table_provider(dataset.path().into())
         .await
         .map_err(setup_error)?
         .schema();
 
-    // The single construction site for the registry: a follow-up hands this
-    // same `Arc` to the replication member registration for the pump filter.
-    let registry =
-        replication::load_write_back_xid_registry(pool, params, dataset, context, xid_fn)
-            .await
-            .map_err(setup_error)?;
+    // The same `Arc` the CDC pump reads for its echo filter (cached, loaded once
+    // per dataset): the deliverer registers each xid, the pump drops its echo.
+    // `on_conflict` being resolved already guarantees this dataset needs one, so
+    // `None` here would be an internal inconsistency, not a legitimate outcome.
+    let registry = postgres
+        .write_back_xid_registry(context, dataset)
+        .await
+        .ok_or_else(|| {
+            setup_error(Box::from(
+                "durable write-back xid registry unexpectedly unavailable for a dataset that requires one",
+            ))
+        })?
+        .map_err(setup_error)?;
 
     let deliverer = Arc::new(write_back::PostgresWriteBackDeliverer::new(
-        Arc::clone(pool),
+        Arc::clone(&postgres.pool),
         dataset.path().into(),
         schema,
         on_conflict,
@@ -1111,17 +1199,7 @@ impl DataConnector for Postgres {
         // other dataset keeps the worker's `TableProvider` path (returns `None`
         // here). Checked first so a non-durable dataset never opens a connection.
         let on_conflict = durable_write_back_on_conflict(dataset)?;
-        Some(
-            build_write_back_deliverer(
-                &self.pool,
-                &self.factory,
-                &self.params,
-                context,
-                dataset,
-                on_conflict,
-            )
-            .await,
-        )
+        Some(build_write_back_deliverer(self, context, dataset, on_conflict).await)
     }
 
     async fn read_write_provider(
@@ -1234,6 +1312,27 @@ impl DataConnector for Postgres {
         dataset: &DatasetSpec,
         acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
+        // Hand the pump the same registry the delivery path registers into (only
+        // for a durable-write-back dataset), so it can drop the echo of each
+        // write-back transaction. `None` for every other dataset — nothing needs
+        // filtering. A durable-write-back dataset whose registry failed to set up
+        // must NOT fall back to an unfiltered stream — that would replay its own
+        // write-back echoes into the accelerator, the exact corruption this
+        // feature exists to prevent. No stream at all is the safe degradation:
+        // logged here, and retried whenever setup for this dataset runs again.
+        let write_back_registry = match self.write_back_xid_registry(context, dataset).await {
+            None => None,
+            Some(Ok(registry)) => Some(registry),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    error = %e,
+                    "durable write-back for dataset '{}' could not set up its change-echo suppression registry; no CDC stream is started for it this pass rather than risk replaying its own write-back echoes",
+                    dataset.name
+                );
+                return None;
+            }
+        };
         Some(
             replication::build_changes_stream(
                 &self.params,
@@ -1242,6 +1341,7 @@ impl DataConnector for Postgres {
                 federated_table,
                 Arc::clone(&self.replication_metrics),
                 acceleration,
+                write_back_registry,
             )
             .await,
         )

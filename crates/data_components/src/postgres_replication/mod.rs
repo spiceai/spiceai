@@ -403,6 +403,15 @@ pub struct ReplicationStreamInput {
     /// Startup compares the loaded watermark against what the slot can still
     /// supply to decide between resuming and rebuilding.
     pub applied_lsn_store: Arc<dyn AppliedLsnStore>,
+    /// The dataset's outstanding-write-back-transaction registry, or `None` when
+    /// the dataset does not deliver durable write-back.
+    ///
+    /// `Some` only for a durable-write-back dataset, and it is the **same**
+    /// [`XidRegistry`] `Arc` the connector's delivery path registers into — the
+    /// pump drops the echo of each registered transaction (the arbitrated table's
+    /// changes) before they become Arrow. See `echo.rs` and
+    /// `cdc-echo-drop-xid-design.md`.
+    pub write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 /// Starts the bootstrap+WAL replication stream.

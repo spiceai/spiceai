@@ -358,15 +358,6 @@ impl XidRegistry {
         }
     }
 
-    /// The full `xid8`s of every currently outstanding entry, for the connector
-    /// to resolve each one's [`XactStatus`] against before calling
-    /// [`gc`](Self::gc). The registry stays connection-free (see the module
-    /// docs), so it cannot resolve these itself.
-    #[must_use]
-    pub async fn outstanding_xids(&self) -> Vec<u64> {
-        self.state.lock().await.entries.keys().copied().collect()
-    }
-
     /// Hot-path membership test for the pump, once per source transaction.
     ///
     /// Reads only the low-32-bit mirror, never the async state lock or the store, so
@@ -374,6 +365,16 @@ impl XidRegistry {
     #[must_use]
     pub fn contains(&self, stream_xid: u32) -> bool {
         self.mirror.read().contains(&stream_xid)
+    }
+
+    /// The full `xid8` of every outstanding entry, for the connector to resolve
+    /// per-entry `pg_xact_status` before calling [`gc`](Self::gc). The registry
+    /// stays connection-free, so it hands out the ids and takes back the resolved
+    /// statuses rather than querying the server itself. Returns an empty vector
+    /// when nothing is outstanding, letting the caller skip the server round trip.
+    #[must_use]
+    pub async fn outstanding_xid8s(&self) -> Vec<u64> {
+        self.state.lock().await.entries.keys().copied().collect()
     }
 
     /// Record the echo's observed commit LSN when the pump sees its `Commit`.
@@ -397,20 +398,35 @@ impl XidRegistry {
         }
     }
 
-    /// Drop every entry whose observed commit LSN the durable applied position has
-    /// now reached. This is the only steady-state removal path.
+    /// Drop every entry the durable applied position has now provably consumed.
+    /// This is the only steady-state removal path, so it applies both rules
+    /// [`gc`](Self::gc) uses to recognize a consumed echo:
     ///
-    /// Entries without an `observed_commit_lsn` are left untouched — their echo has
-    /// not yet been seen, so the durable floor passing an LSN says nothing about
-    /// them. Best-effort persistence: a persistence failure leaves the entry on disk
-    /// to be re-pruned (its echo is already consumed, so no echo re-arrives).
+    /// 1. An **observed** commit LSN at or below the floor — the pump saw the
+    ///    echo's `Commit` and the applied position has since passed it.
+    /// 2. A `commit_lsn_upper_bound` at or below the floor, even with no
+    ///    observed commit — a delivery whose echo affects zero rows (for
+    ///    example an absent-key `DELETE` that matches nothing at the source)
+    ///    never appears in the change stream, so `observed_commit_lsn` never
+    ///    gets set; without this rule such an entry survives every steady-state
+    ///    prune and waits on the once-per-process startup [`gc`](Self::gc),
+    ///    risking a 32-bit xid-wraparound collision on a long-lived process.
+    ///
+    /// An entry with neither field set is left untouched — nothing here says
+    /// whether its echo is still pending. Best-effort persistence: a
+    /// persistence failure leaves the entry on disk to be re-pruned (it is
+    /// already consumed, so no echo re-arrives).
     pub async fn prune_acked(&self, durably_applied_lsn: u64) {
         let mut guard = self.state.lock().await;
         let before = guard.entries.len();
         guard.entries.retain(|_, entry| {
-            entry
+            let observed_consumed = entry
                 .observed_commit_lsn
-                .is_none_or(|commit_lsn| commit_lsn > durably_applied_lsn)
+                .is_some_and(|commit_lsn| commit_lsn <= durably_applied_lsn);
+            let upper_bound_consumed = entry
+                .commit_lsn_upper_bound
+                .is_some_and(|upper_bound| upper_bound <= durably_applied_lsn);
+            !(observed_consumed || upper_bound_consumed)
         });
         if guard.entries.len() != before {
             self.rebuild_mirror(&guard.entries);
@@ -607,24 +623,24 @@ mod tests {
     /// listing before calling `gc` — it must name every registered xid and none
     /// that were never registered or already pruned.
     #[tokio::test]
-    async fn outstanding_xids_lists_every_registered_entry() {
+    async fn outstanding_xid8s_lists_every_registered_entry() {
         let store = FakeBlobStore::arc();
         let registry = empty_registry(Arc::clone(&store)).await;
         assert!(
-            registry.outstanding_xids().await.is_empty(),
+            registry.outstanding_xid8s().await.is_empty(),
             "a fresh registry has no outstanding entries"
         );
 
         registry.register(10).await.expect("register 10");
         registry.register(20).await.expect("register 20");
-        let mut outstanding = registry.outstanding_xids().await;
+        let mut outstanding = registry.outstanding_xid8s().await;
         outstanding.sort_unstable();
         assert_eq!(outstanding, vec![10, 20]);
 
         registry.mark_commit_observed(low32(10), 100).await;
         registry.prune_acked(100).await;
         assert_eq!(
-            registry.outstanding_xids().await,
+            registry.outstanding_xid8s().await,
             vec![20],
             "a pruned entry is no longer outstanding"
         );

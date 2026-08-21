@@ -146,7 +146,7 @@ use bytes::Bytes;
 
 use super::{
     AppliedLsn, AppliedLsnStore, Error, ReplicationMetricsCollector, ReplicationStreamInput,
-    Result, SchemaEvolutionPolicy, bootstrap, changes::PgChangeRows, client,
+    Result, SchemaEvolutionPolicy, XidRegistry, bootstrap, changes::PgChangeRows, client,
     config::ReplicationParams, pgoutput, resilience, retention,
     schema_evolution::RelationSchemaTracker, slot,
 };
@@ -496,6 +496,14 @@ struct MemberHandle {
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     /// Wakes the applied-position writer when this member publishes a position.
     watermark_notify: Arc<Notify>,
+    /// The dataset's outstanding-write-back-transaction registry — `Some` only for
+    /// a durable-write-back dataset, the same `Arc` the connector's delivery path
+    /// registers into. When a committed transaction's `xid` is a member of this
+    /// registry, [`deliver_commit`] drops that member's changes (the echo of its
+    /// own write-back) and acks the commit with a zero-row envelope instead of
+    /// applying it. `None` members are never filtered. See
+    /// `cdc-echo-drop-xid-design.md`.
+    write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 /// `LIVE`: the member is attached and routing to it is allowed. Cleared on
@@ -1786,6 +1794,7 @@ impl SharedSource {
                 dataset: member.dataset_name.clone(),
                 store: Arc::clone(&member.applied_lsn_store),
                 slot,
+                write_back_registry: member.write_back_registry.clone(),
             });
             self.watermark_notify.notify_one();
         }
@@ -2070,6 +2079,7 @@ async fn attach_member(
         metrics,
         policy,
         applied_lsn_store,
+        write_back_registry,
     } = input;
     let member_key: MemberKey = (schema_name.clone(), table_name.clone());
 
@@ -2321,6 +2331,7 @@ async fn attach_member(
             ready_lag: params.ready_lag,
             applied_lsn_store: Arc::clone(&applied_lsn_store),
             watermark_notify: Arc::clone(&source.watermark_notify),
+            write_back_registry,
         }),
     );
     // Membership liveness is now observable (`dataset_postgres_replication_member_attached`):
@@ -2742,6 +2753,9 @@ struct OrphanedPosition {
     dataset: String,
     store: Arc<dyn AppliedLsnStore>,
     slot: Arc<AckSlot>,
+    /// The detached member's write-back registry, so a position written for it
+    /// still prunes any echo entry the durable floor has now passed.
+    write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 /// The **only** writer of applied positions for a source.
@@ -2830,7 +2844,13 @@ async fn write_published_positions(source: &Arc<SharedSource>) {
     let orphans = std::mem::take(&mut *lock(&source.orphaned_positions));
     let mut unwritten = Vec::new();
     for orphan in orphans {
-        write_one(&orphan.dataset, &orphan.store, &orphan.slot).await;
+        write_one(
+            &orphan.dataset,
+            &orphan.store,
+            &orphan.slot,
+            orphan.write_back_registry.as_ref(),
+        )
+        .await;
         if orphan.slot.pending() > orphan.slot.recorded() {
             unwritten.push(orphan);
         }
@@ -2842,17 +2862,39 @@ async fn write_published_positions(source: &Arc<SharedSource>) {
         let Some(slot) = source.ack.slot(&member_key) else {
             continue;
         };
-        write_one(&member.dataset_name, &member.applied_lsn_store, &slot).await;
+        write_one(
+            &member.dataset_name,
+            &member.applied_lsn_store,
+            &slot,
+            member.write_back_registry.as_ref(),
+        )
+        .await;
     }
 }
 
-async fn write_one(dataset: &str, store: &Arc<dyn AppliedLsnStore>, slot: &Arc<AckSlot>) {
+async fn write_one(
+    dataset: &str,
+    store: &Arc<dyn AppliedLsnStore>,
+    slot: &Arc<AckSlot>,
+    write_back_registry: Option<&Arc<XidRegistry>>,
+) {
     let pending = slot.pending();
     if pending == 0 || pending <= slot.recorded() {
         return;
     }
     match store.save(AppliedLsn { lsn: pending }).await {
-        Ok(()) => slot.note_recorded(pending),
+        Ok(()) => {
+            slot.note_recorded(pending);
+            // The durable applied floor for this member has advanced to `pending`.
+            // Any registered write-back whose echo committed at or below it is now
+            // durably consumed and can never be replayed, so drop it — the only
+            // steady-state removal path (GC covers the rest). Persisting here is
+            // best-effort inside `prune_acked`; a failure leaves the entry for the
+            // next prune or startup GC.
+            if let Some(registry) = write_back_registry {
+                registry.prune_acked(pending).await;
+            }
+        }
         Err(e) => tracing::warn!(
             dataset = %dataset,
             "could not record how far this acceleration has been advanced (lsn={pending}); a restart before it is recorded rebuilds from the source rather than resuming: {e}"
@@ -3153,6 +3195,12 @@ async fn run_pump(source: Arc<SharedSource>) {
         // consumer decodes + builds them (see `PgChangeRows`).
         let mut txn: TxnBuffer = TxnBuffer::default();
         let mut txn_open = false;
+        // The `xid` of the open transaction, captured at its Begin and held across
+        // the transaction exactly like `txn_open` (Commit carries no xid). At Commit
+        // this is matched against each member's write-back registry to drop the
+        // echo of that member's own delivery. A fresh binding per connection resets
+        // it on reconnect, and it is cleared at every Commit.
+        let mut current_txn_xid: Option<u32> = None;
         // Unpublished envelopes, one per member, folding consecutive commits for
         // the same table. Dropped on reconnect: a held envelope was `deliver`ed
         // but never `commit`ted, so it pins this member's ack floor and the slot
@@ -3331,9 +3379,12 @@ async fn run_pump(source: Arc<SharedSource>) {
             // downstream back-pressure is not our decode cost.
             let mut send_wait_us: u64 = 0;
             match event {
-                ReplicationEvent::Begin { .. } => {
+                ReplicationEvent::Begin { xid, .. } => {
                     txn_open = true;
                     txn.clear();
+                    // Held until this transaction's Commit, where it selects the
+                    // arbitrated member whose echo is dropped.
+                    current_txn_xid = Some(xid);
                 }
                 ReplicationEvent::XLogData { data, wal_end, .. } => {
                     max_wal_end = max_wal_end.max(wal_end.0);
@@ -3401,6 +3452,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     ..
                 } => {
                     txn_open = false;
+                    let txn_xid = current_txn_xid.take();
                     send_wait_us = deliver_commit(
                         &source,
                         &mut eager_hold,
@@ -3412,6 +3464,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                             end_lsn: end_lsn.0,
                             commit_time_micros,
                         },
+                        txn_xid,
                     )
                     .await;
                     // The ack floor + freshness watermark are published to every
@@ -4086,6 +4139,7 @@ async fn deliver_commit(
     routes: &RouteMap,
     txn: TxnBuffer,
     boundary: CommitBoundary,
+    current_txn_xid: Option<u32>,
 ) -> u64 {
     let commit_time = client::pg_epoch_to_system_time(boundary.commit_time_micros);
     // Unix-epoch ms for the per-batch replication-lag signal carried into the
@@ -4098,6 +4152,13 @@ async fn deliver_commit(
     // Total time blocked awaiting member mailboxes this commit, returned to the
     // caller for the reader-processing subtraction.
     let mut total_send_wait_us: u64 = 0;
+
+    // Members whose changes this commit are the echo of their own write-back,
+    // dropped above and acked below with a zero-row envelope. Keyed by member so a
+    // multi-relation echo produces a single ack. Each entry keeps the resolved
+    // route pieces needed to build that envelope. Empty (and never allocated) for
+    // the overwhelmingly common case of a transaction Spice did not write.
+    let mut arbitrated: FxHashMap<MemberKey, ArbitratedAck> = FxHashMap::default();
 
     for (relation_id, raw) in txn {
         if raw.is_empty() {
@@ -4127,6 +4188,36 @@ async fn deliver_commit(
         if slot.already_committed(boundary.end_lsn) {
             // Reconnect replay of a commit this member already durably
             // applied (replays start at the minimum floor across members).
+            continue;
+        }
+        // Echo suppression: if this transaction's xid is one this member's
+        // write-back delivery registered, these changes are the echo of that
+        // delivery. Drop them here — before any tuple decode or Arrow build — and
+        // remember the member so its commit is acked with a zero-row envelope
+        // below. Only the arbitrated member's relations are dropped; changes to
+        // other members in the same transaction (a cascade from our DELETE leg, a
+        // trigger-written audit table) are foreign to that member's registry and
+        // fall through to normal delivery. A member with no registry never
+        // matches, so non-write-back datasets are untouched.
+        if let Some(xid) = current_txn_xid
+            && member
+                .write_back_registry
+                .as_ref()
+                .is_some_and(|registry| registry.contains(xid))
+        {
+            let ack = arbitrated
+                .entry(member_key.clone())
+                .or_insert_with(|| ArbitratedAck {
+                    member: Arc::clone(member),
+                    slot: Arc::clone(slot),
+                    working_schema: Arc::clone(working_schema),
+                    relation: None,
+                });
+            // Keep one decoded relation generation for the zero-row build; any
+            // relation of the member serves, since the ack carries no rows.
+            if ack.relation.is_none() {
+                ack.relation = decoder.relation(relation_id).map(Arc::clone);
+            }
             continue;
         }
         let Some(rel) = decoder.relation(relation_id) else {
@@ -4193,12 +4284,79 @@ async fn deliver_commit(
         );
     }
 
+    // Ack each arbitrated member whose echo was dropped above. The zero-row
+    // envelope carries a `SharedLsnCommitter { flush_to: end_lsn }` (built by
+    // `PendingPgEnvelope::into_envelope`), so the filtered echo still advances the
+    // member's ack floor — a filtered echo is real source progress. Routing it
+    // through the eager hold like any data envelope keeps it behind any changes
+    // still held for the member (never overtaking a lower-LSN commit) and inherits
+    // the committer's deferral, so under an in-memory durability tier it drains
+    // behind the checkpoint fence rather than acking rows that exist only in RAM.
+    for (member_key, ack) in arbitrated {
+        // Record the echo's commit LSN so the entry becomes prunable once the
+        // durable floor reaches it (`write_one` -> `prune_acked`). Never removed
+        // here: the slot replays everything after `confirmed_flush` on a reconnect,
+        // so an entry dropped at commit-observation would re-admit the replayed echo.
+        if let (Some(xid), Some(registry)) =
+            (current_txn_xid, ack.member.write_back_registry.as_ref())
+        {
+            registry.mark_commit_observed(xid, boundary.end_lsn).await;
+        }
+        let Some(relation) = ack.relation else {
+            // No decoded relation to shape the (empty) batch against. The floor is
+            // carried forward by the next commit or idle credit instead; nothing is
+            // lost, only this filtered txn's standalone ack is skipped.
+            continue;
+        };
+        let is_ready =
+            crate::cdc::source_commit_within_ready_lag(commit_ts_ms, ack.member.ready_lag);
+        let envelope = PendingPgEnvelope {
+            rows: PgChangeRows::new(ack.working_schema, relation, Vec::new(), commit_ts_ms),
+            slot: Arc::clone(&ack.slot),
+            flush_to: boundary.end_lsn,
+            dataset: ack.member.dataset_name.clone(),
+            watermark_notify: Arc::clone(&ack.member.watermark_notify),
+            is_dataset_ready: is_ready,
+            first_received_at: std::time::Instant::now(),
+        };
+        ack.slot.deliver(boundary.end_lsn);
+        total_send_wait_us = total_send_wait_us.saturating_add(
+            push_eager_envelope(
+                source,
+                eager_hold,
+                &member_key,
+                EagerPendingEnvelope {
+                    member: ack.member,
+                    envelope,
+                },
+                eager_settings,
+            )
+            .await,
+        );
+    }
+
     // The slot-level freshness watermark for this commit is published to every
     // member by the caller's consolidated boundary flush
     // (`BoundaryMetrics::commit_watermark`), not a separate per-member pass.
     source.ack.credit_idle(boundary.end_lsn);
 
     total_send_wait_us
+}
+
+/// One member whose changes in a commit were the echo of its own durable
+/// write-back, dropped by [`deliver_commit`]'s per-relation filter. Carries the
+/// route pieces needed to ack the commit with a zero-row envelope after the
+/// delivery loop.
+struct ArbitratedAck {
+    member: Arc<MemberHandle>,
+    slot: Arc<AckSlot>,
+    /// The member's working schema, to shape the zero-row `PgChangeRows`.
+    working_schema: SchemaRef,
+    /// A decoded relation generation of the member, for the same build. `None`
+    /// only if the decoder had no relation for the dropped changes (not expected —
+    /// buffered changes always followed a decoded `Relation`), in which case the
+    /// standalone ack is skipped and the floor advances on the next commit.
+    relation: Option<Arc<pgoutput::Relation>>,
 }
 
 #[cfg(test)]
@@ -4548,6 +4706,7 @@ mod tests {
                     sender,
                     metrics: Arc::clone(&metrics),
                     ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: None,
                 }),
             );
             probes.push((member_key, metrics, receiver));
@@ -4587,6 +4746,7 @@ mod tests {
                 sender,
                 metrics: ReplicationMetricsCollector::new(),
                 ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: None,
             }),
         );
         source.ack.register(&member_key, false);
@@ -6248,6 +6408,433 @@ mod tests {
             ack.flush_lsn(),
             final_committed,
             "floor converged to the member's committed"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Echo-drop filter (`deliver_commit` with a write-back registry) — #13348.
+    // ---------------------------------------------------------------------
+
+    /// In-memory [`BlobCheckpointStore`] backing an [`XidRegistry`] under test.
+    #[derive(Default)]
+    struct EchoFakeStore {
+        data: ParkingMutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl runtime_checkpoint_api::BlobCheckpointStore for EchoFakeStore {
+        async fn get(
+            &self,
+        ) -> std::result::Result<
+            Option<runtime_checkpoint_api::BlobCheckpoint>,
+            runtime_checkpoint_api::CheckpointError,
+        > {
+            Ok(self
+                .data
+                .lock()
+                .clone()
+                .map(|data| runtime_checkpoint_api::BlobCheckpoint {
+                    data,
+                    updated_at: None,
+                }))
+        }
+
+        async fn upsert(
+            &self,
+            data: &str,
+        ) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+            *self.data.lock() = Some(data.to_string());
+            Ok(())
+        }
+    }
+
+    /// A registry holding `xid` as an outstanding write-back transaction. The low
+    /// 32 bits are what the stream carries, so a `u32` promoted to `u64` matches.
+    async fn registry_with_xid(xid: u32) -> Arc<XidRegistry> {
+        let registry = XidRegistry::load(
+            Arc::new(EchoFakeStore::default()),
+            "localhost:5432/db/public.t0".to_string(),
+            "t0".to_string(),
+        )
+        .await
+        .expect("registry loads from an empty store");
+        registry
+            .register(u64::from(xid))
+            .await
+            .expect("register the write-back xid");
+        registry
+    }
+
+    /// Hand-built pgoutput `Relation` message: one key `id` `int4` column, matching
+    /// [`tiny_schema`]. Same wire layout the decoder's own fixtures use.
+    fn relation_msg(relation_id: u32, table: &str) -> Bytes {
+        let mut out = vec![b'R'];
+        out.extend_from_slice(&relation_id.to_be_bytes());
+        out.extend_from_slice(b"public\0");
+        out.extend_from_slice(table.as_bytes());
+        out.push(0);
+        out.push(b'd');
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.push(0x01);
+        out.extend_from_slice(b"id\0");
+        out.extend_from_slice(&23u32.to_be_bytes());
+        out.extend_from_slice(&(-1i32).to_be_bytes());
+        Bytes::from(out)
+    }
+
+    /// Hand-built pgoutput `Insert` message with a single text `id` value.
+    fn insert_msg(relation_id: u32, value: &str) -> Bytes {
+        let mut out = vec![b'I'];
+        out.extend_from_slice(&relation_id.to_be_bytes());
+        out.push(b'N');
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.push(b't');
+        out.extend_from_slice(
+            &u32::try_from(value.len())
+                .expect("value fits u32")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(value.as_bytes());
+        Bytes::from(out)
+    }
+
+    /// A two-member source for the echo-drop tests: `t0` (relation 100, carrying
+    /// `t0_registry`) and `t1` (relation 101, never a write-back target). Both are
+    /// promoted to streaming, their relations decoded into `decoder`, and their
+    /// routes built. Returns the source, decoder, routes, and the two members'
+    /// mailbox receivers in `[t0, t1]` order.
+    fn echo_scenario(
+        t0_registry: Option<Arc<XidRegistry>>,
+    ) -> (
+        Arc<SharedSource>,
+        pgoutput::Decoder,
+        RouteMap,
+        Vec<MemberMailboxReceiver>,
+    ) {
+        let source = Arc::new(SharedSource::new(
+            SourceKey::from_params(&test_params()),
+            test_params(),
+        ));
+        let schema = tiny_schema();
+        let mut receivers = Vec::new();
+        for (table, registry) in [("t0", t0_registry), ("t1", None)] {
+            let member_key = key(table);
+            let (sender, receiver) = member_mailbox(8);
+            lock(&source.members).insert(
+                member_key.clone(),
+                Arc::new(MemberHandle {
+                    applied_lsn_store: Arc::new(crate::postgres_replication::NoopAppliedLsnStore),
+                    watermark_notify: Arc::new(Notify::new()),
+                    dataset_name: table.to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_keys: vec!["id".into()],
+                    generated_columns: vec![],
+                    policy: SchemaEvolutionPolicy::Block,
+                    sender,
+                    metrics: ReplicationMetricsCollector::new(),
+                    ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: registry,
+                }),
+            );
+            source.ack.register(&member_key, false);
+            receivers.push(receiver);
+        }
+        source.ack.promote_ready_members();
+
+        let mut decoder = pgoutput::Decoder::new();
+        let mut routes = RouteMap::default();
+        for (relation_id, table) in [(100u32, "t0"), (101u32, "t1")] {
+            decoder
+                .decode(relation_msg(relation_id, table))
+                .expect("decode relation");
+            let member_key = key(table);
+            let member = source.member(&member_key).expect("member present");
+            let slot = source.ack.slot(&member_key).expect("ack slot present");
+            routes.insert(
+                relation_id,
+                Route {
+                    key: member_key,
+                    member,
+                    slot,
+                    working_schema: Arc::clone(&schema),
+                },
+            );
+        }
+        (source, decoder, routes, receivers)
+    }
+
+    /// Coalescing limits with the eager hold disabled, so `deliver_commit`
+    /// publishes each envelope straight to its mailbox and a test can read it
+    /// without driving the pump's age-based flush.
+    fn immediate_eager_settings() -> EagerSettings {
+        eager_settings(CoalescingLimits {
+            max_envelope_age: std::time::Duration::ZERO,
+            eager_max_rows: 1024,
+            backpressure_max_rows: 1024,
+            max_mailbox_bytes: usize::MAX,
+        })
+    }
+
+    /// Run one commit through `deliver_commit` with a fresh (empty) eager hold.
+    async fn deliver_one_commit(
+        source: &Arc<SharedSource>,
+        decoder: &pgoutput::Decoder,
+        routes: &RouteMap,
+        txn: TxnBuffer,
+        end_lsn: u64,
+        xid: Option<u32>,
+    ) {
+        let mut hold = EagerHold::default();
+        deliver_commit(
+            source,
+            &mut hold,
+            immediate_eager_settings(),
+            decoder,
+            routes,
+            txn,
+            CommitBoundary {
+                end_lsn,
+                commit_time_micros: 0,
+            },
+            xid,
+        )
+        .await;
+    }
+
+    fn txn_with(entries: &[(RelationId, &str)]) -> TxnBuffer {
+        let mut txn = TxnBuffer::default();
+        for &(relation_id, value) in entries {
+            txn.entry(relation_id)
+                .or_default()
+                .push(insert_msg(relation_id, value));
+        }
+        txn
+    }
+
+    /// A registered xid drops only the arbitrated member's changes; a second
+    /// member's changes in the same transaction are delivered intact.
+    #[tokio::test]
+    async fn registered_xid_drops_arbitrated_relation_and_delivers_others() {
+        let xid = 4242u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+        let end_lsn = 900u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1"), (101, "2")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // t1 (no registry) delivers its one change unchanged.
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("t1 envelope is not an error");
+        assert_eq!(
+            t1.num_rows_hint(),
+            1,
+            "the non-arbitrated change is delivered"
+        );
+
+        // t0 (arbitrated) delivers a zero-row ack instead of its dropped echo, and
+        // that ack carries the commit LSN forward.
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("t0 ack envelope is not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            0,
+            "the echo is dropped; only a zero-row ack is sent"
+        );
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        assert_eq!(
+            t0_slot.delivered(),
+            end_lsn,
+            "the ack staged the commit LSN"
+        );
+        t0.commit().await.expect("commit the zero-row ack");
+        assert_eq!(
+            t0_slot.committed(),
+            end_lsn,
+            "committing the ack advances the arbitrated member's floor"
+        );
+    }
+
+    /// A transaction that is *only* the arbitrated member's echo still advances its
+    /// watermark via the zero-row ack — a filtered echo is real source progress.
+    #[tokio::test]
+    async fn filtered_empty_transaction_advances_watermark() {
+        let xid = 77u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+        let end_lsn = 500u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(
+            ack.num_rows_hint(),
+            0,
+            "a filtered-empty txn delivers no rows"
+        );
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        assert_eq!(
+            t0_slot.delivered(),
+            end_lsn,
+            "flush_to is the commit end LSN"
+        );
+        ack.commit().await.expect("commit the ack");
+        assert_eq!(t0_slot.committed(), end_lsn, "the watermark advances");
+    }
+
+    /// With no registry on the member, `deliver_commit` behaves exactly as before:
+    /// every relation's changes are delivered, and no zero-row ack is produced.
+    #[tokio::test]
+    async fn absent_registry_delivers_every_change() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1"), (101, "2")]),
+            700,
+            // An xid is present, but no member registers one, so nothing matches.
+            Some(4242),
+        )
+        .await;
+
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "no registry means no filtering for t0"
+        );
+        assert_eq!(t1.num_rows_hint(), 1, "t1 delivers as usual");
+    }
+
+    /// The commit is observed (so the entry becomes prunable at its LSN) but the
+    /// entry survives until the durable floor reaches that LSN — never removed at
+    /// commit-observation.
+    #[tokio::test]
+    async fn commit_observed_entry_survives_until_prune_reaches_it() {
+        let xid = 909u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, _receivers) = echo_scenario(Some(Arc::clone(&registry)));
+        let end_lsn = 640u64;
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        assert!(
+            registry.contains(xid),
+            "the entry is not removed at commit-observation"
+        );
+        // A floor below the observed commit LSN leaves it in place...
+        registry.prune_acked(end_lsn - 1).await;
+        assert!(
+            registry.contains(xid),
+            "the entry survives while the durable floor is below its commit LSN"
+        );
+        // ...and reaching it prunes the entry (only possible because the commit was
+        // observed at `end_lsn`; an unobserved entry would never prune).
+        registry.prune_acked(end_lsn).await;
+        assert!(
+            !registry.contains(xid),
+            "the entry is pruned once the durable floor reaches its observed commit LSN"
+        );
+    }
+
+    /// Reconnect replay: replaying the same transaction without an intervening
+    /// `prune_acked` (the slot resends everything after `confirmed_flush` on any
+    /// reconnect) drops the echo again — the ordering regression the design guards.
+    #[tokio::test]
+    async fn reconnect_replay_without_prune_drops_echo_again() {
+        let xid = 313u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+        let end_lsn = 800u64;
+
+        // First delivery: echo dropped, zero-row ack produced. The ack is NOT
+        // committed here, modelling a durability floor that has not yet passed it.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // Reconnect replay of the very same transaction, no prune in between.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            end_lsn,
+            Some(xid),
+        )
+        .await;
+
+        // Both passes produced a zero-row ack for t0, never a data envelope: the
+        // echo was dropped on the replay just as on the first delivery.
+        let first = receivers[0]
+            .next()
+            .await
+            .expect("first ack")
+            .expect("not an error");
+        let second = receivers[0]
+            .next()
+            .await
+            .expect("replayed ack")
+            .expect("not an error");
+        assert_eq!(
+            first.num_rows_hint(),
+            0,
+            "the echo is dropped on first delivery"
+        );
+        assert_eq!(
+            second.num_rows_hint(),
+            0,
+            "the echo is dropped again on reconnect replay, never re-applied"
         );
     }
 }
