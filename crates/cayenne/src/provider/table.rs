@@ -8321,6 +8321,21 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Live-row hint for sizing a PK bloom, from the cached table statistics — a
+    /// plain `RwLock` read, no I/O, so it is safe on the apply path. `Inexact` is
+    /// good enough: it only sizes a filter, and the byte budget remains the cap.
+    ///
+    /// Read this BEFORE taking `sharded_pk_keyset_cache`: every degrade site holds
+    /// that mutex, and acquiring the statistics lock underneath it would introduce a
+    /// second lock order over the pair.
+    fn live_rows_size_hint(&self) -> Option<usize> {
+        let stats = self.cached_table_statistics_for_optimizer()?;
+        match stats.num_rows {
+            DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => Some(rows),
+            DFPrecision::Absent => None,
+        }
+    }
+
     /// Count a preserved sharded bloom, by which invalidation site spared it, so a
     /// run shows whether the discards it removed were checkpoint-driven or
     /// compaction-driven.
@@ -8802,6 +8817,8 @@ impl CayenneTableProvider {
         // long-lived sharded exact keyset and upserts of those keys would
         // duplicate instead of superseding. Runs before the single keyset's
         // checked-out early-return; the two locks are never held together.
+        // Sized before the lock below: see `live_rows_size_hint`.
+        let size_hint = self.live_rows_size_hint();
         {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             let mut drop_index = false;
@@ -8834,7 +8851,7 @@ impl CayenneTableProvider {
                 if !within_budget {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
-                        index.degrade_to_blooms(per_shard);
+                        index.degrade_to_blooms(per_shard, size_hint);
                         self.sample_sharded_index_shape(index);
                         // The bounded insert stopped at the budget and the
                         // degrade only converted what was already held, so the
@@ -8945,6 +8962,8 @@ impl CayenneTableProvider {
     /// `store_cached_pk_index` — see there for why an index that is missing a live
     /// key must be dropped rather than cached).
     fn store_sharded_pk_index(&self, index: ShardedPkIndex) {
+        // Sized before the lock below: see `live_rows_size_hint`.
+        let size_hint = self.live_rows_size_hint();
         let max_bytes = self.effective_sharded_keyset_budget();
         // Held from closing the checkout window through the store — see
         // `store_cached_pk_index`.
@@ -8976,7 +8995,7 @@ impl CayenneTableProvider {
                     break;
                 }
                 let per_shard = max_bytes / index.shard_count().max(1);
-                index.degrade_to_blooms(per_shard);
+                index.degrade_to_blooms(per_shard, size_hint);
                 // The bounded insert stopped at the budget, so the keys after the
                 // stop are absent from the blooms it converted — backfill the whole
                 // batch (see `record_keys_after_degrade`).
@@ -11778,6 +11797,8 @@ impl CayenneTableProvider {
         //    account apply back-pressure is the lesser evil; bounding a
         //    `DoNothing` keyset needs a sound exact eviction, not a bloom.
         if !validated_keys.is_empty() {
+            // Sized before the lock below: see `live_rows_size_hint`.
+            let size_hint = self.live_rows_size_hint();
             let mut sharded = self.sharded_pk_keyset_cache.lock();
             // Gate on the variant, not just the tally: only an `Exact` index grows
             // per recorded key and only it can be degraded, so this fires on the
@@ -11794,7 +11815,7 @@ impl CayenneTableProvider {
                         budget_bytes = max_bytes,
                         "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
                     );
-                    index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
+                    index.degrade_to_blooms(max_bytes / index.shard_count().max(1), size_hint);
                     self.sample_sharded_index_shape(index);
                 } else {
                     bytes = Some(resident);

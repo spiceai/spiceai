@@ -1900,8 +1900,12 @@ impl ShardedPkIndex {
     /// running total exceeds its byte budget degrades here instead of growing
     /// unbounded. Safe only under upsert semantics (a bloom false positive
     /// yields a harmless redundant delete) — the caller gates on that.
-    pub(crate) fn degrade_to_blooms(&mut self, per_shard_max_bytes: usize) {
-        self.degrade_to_blooms_observed(per_shard_max_bytes, |_, _| {});
+    pub(crate) fn degrade_to_blooms(
+        &mut self,
+        per_shard_max_bytes: usize,
+        expected_keys: Option<usize>,
+    ) {
+        self.degrade_to_blooms_observed(per_shard_max_bytes, expected_keys, |_, _| {});
     }
 
     /// [`Self::degrade_to_blooms`], reporting each shard as it converts.
@@ -1915,9 +1919,11 @@ impl ShardedPkIndex {
     fn degrade_to_blooms_observed(
         &mut self,
         per_shard_max_bytes: usize,
+        expected_keys: Option<usize>,
         mut observe: impl FnMut(usize, usize),
     ) {
         if let Self::Exact(keysets) = self {
+            let n_shards = keysets.len().max(1);
             let mut exact_bytes_held = keysets
                 .iter()
                 .map(|k| k.approx_bytes)
@@ -1926,13 +1932,19 @@ impl ShardedPkIndex {
                 .iter_mut()
                 .enumerate()
                 .map(|(shard, keyset)| {
-                    // Right-size per shard: conversion-time keys with 4× growth
-                    // headroom, capped by the per-shard budget split (rationale:
-                    // `bloom_from_keyset`).
-                    let mut bloom = PkBloom::with_expected_keys(
-                        keyset.len().saturating_mul(4),
-                        per_shard_max_bytes,
+                    // Size per shard for the table's LIVE cardinality when it is
+                    // known. Falling back to the conversion-time key count times four
+                    // under-sizes badly whenever the degrade fires mid-fill: those
+                    // keys are only the ones that FIT the budget, so on a table many
+                    // times larger the "4x headroom" is really making up a 10x
+                    // shortfall — measured at SF1000 on `order_line` as ~6.4 bits per
+                    // key against the ~10 this call targets. The budget split stays
+                    // the cap either way.
+                    let expected = expected_keys.map_or_else(
+                        || keyset.len().saturating_mul(4),
+                        |keys| keys.div_ceil(n_shards).max(keyset.len()),
                     );
+                    let mut bloom = PkBloom::with_expected_keys(expected, per_shard_max_bytes);
                     for key in keyset.rows() {
                         bloom.insert(key.as_ref());
                     }
@@ -2053,7 +2065,7 @@ mod tests {
         );
 
         let per_shard = max_bytes / index.shard_count().max(1);
-        index.degrade_to_blooms(per_shard);
+        index.degrade_to_blooms(per_shard, None);
         index.record_keys_after_degrade(&keys);
 
         let n = index.shard_count();
@@ -2144,7 +2156,7 @@ mod tests {
 
         // (shard converted, exact bytes still held) after each conversion.
         let mut steps: Vec<(usize, usize)> = Vec::new();
-        index.degrade_to_blooms_observed(64 * 1024, |shard, still_held| {
+        index.degrade_to_blooms_observed(64 * 1024, None, |shard, still_held| {
             steps.push((shard, still_held));
         });
 
@@ -2213,7 +2225,7 @@ mod tests {
             ShardedPkIndex::Bloom(_) => panic!("recording alone must not degrade"),
         }
 
-        index.degrade_to_blooms(1024);
+        index.degrade_to_blooms(1024, None);
         match &index {
             ShardedPkIndex::Bloom(blooms) => {
                 for i in 0..32u64 {
