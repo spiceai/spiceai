@@ -1688,6 +1688,11 @@ pub struct CayenneTableProvider {
     /// representation cached (or degraded into) and is a sound answer for whatever is
     /// currently out.
     sharded_index_is_bloom: Arc<AtomicBool>,
+    /// Bloom load (milli-bits per inserted key) sampled the last time the sharded
+    /// index was cached or degraded. Read at the invalidation sites, which may run
+    /// while the index is checked out and cannot inspect it directly. `u64::MAX`
+    /// means "not a bloom / not yet sampled".
+    sharded_bloom_load_milli: Arc<AtomicU64>,
     /// Resident-byte components of the two PK caches, published as their SUM
     /// through `table_memory.set_keyset_bytes` (a single slot — writing one
     /// cache's size alone would under-account the other by up to a full budget
@@ -6465,6 +6470,7 @@ impl CayenneTableProvider {
             sharded_pk_keyset_pending: Arc::new(ParkingMutex::new(PendingPkKeys::default())),
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             sharded_index_is_bloom: Arc::new(AtomicBool::new(false)),
+            sharded_bloom_load_milli: Arc::new(AtomicU64::new(u64::MAX)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
@@ -7693,6 +7699,7 @@ impl CayenneTableProvider {
             sharded_pk_keyset_pending: Arc::clone(&self.sharded_pk_keyset_pending),
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             sharded_index_is_bloom: Arc::clone(&self.sharded_index_is_bloom),
+            sharded_bloom_load_milli: Arc::clone(&self.sharded_bloom_load_milli),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
@@ -8222,19 +8229,76 @@ impl CayenneTableProvider {
     /// positive costs a redundant delete, the same trade the bloom fallback already
     /// makes. Unsound for an exact keyset, whose per-key `RowLocation`s the move
     /// invalidates, so this never applies to one.
-    fn preserve_bloom_on_relocation() -> bool {
-        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("SPICE_CAYENNE_PRESERVE_BLOOM_ON_RELOCATION")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    /// Minimum bloom load, in bits per inserted key, at which a bloomed sharded
+    /// index is still worth preserving across a relocation-only invalidation.
+    ///
+    /// Unset disables the whole experiment (today's behaviour: always drop). `0`
+    /// preserves unconditionally — never rebuild, the maximum-benefit /
+    /// maximum-false-positive arm. A positive `N` preserves only while the filter
+    /// still carries at least `N` bits per key, so the rebuild it eventually allows
+    /// is the one that restores the false-positive rate rather than one triggered by
+    /// an unrelated checkpoint. `PkBloom` targets ~10 bits/key.
+    ///
+    /// A load bound, not a deletion bound, because a bloom's bits are only ever SET:
+    /// every INSERT raises the load and no deletion lowers it. Deleting a key leaves
+    /// a stale positive but costs no bits, so deletions cannot saturate the filter —
+    /// they only matter for a workload that REUSES deleted keys.
+    fn preserve_bloom_min_bits_per_key() -> Option<u64> {
+        static SETTING: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            std::env::var("SPICE_CAYENNE_BLOOM_MIN_BITS_PER_KEY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
         });
-        *ENABLED
+        *SETTING
     }
 
     /// Whether this relocation-only invalidation may leave the sharded index alone:
-    /// the feature is on and the index is (or was checked out as) a bloom.
+    /// the experiment is on, the index is (or was checked out as) a bloom, and its
+    /// last sampled load is still at or above the configured floor.
     fn may_preserve_sharded_bloom(&self) -> bool {
-        Self::preserve_bloom_on_relocation()
-            && self.sharded_index_is_bloom.load(Ordering::Acquire)
+        let Some(floor_bits) = Self::preserve_bloom_min_bits_per_key() else {
+            return false;
+        };
+        if !self.sharded_index_is_bloom.load(Ordering::Acquire) {
+            return false;
+        }
+        let load = self.sharded_bloom_load_milli.load(Ordering::Acquire);
+        // Never sampled reads as "no evidence to preserve on"; a zero floor is the
+        // unconditional arm and does not need a sample at all.
+        floor_bits == 0 || (load != u64::MAX && load >= floor_bits.saturating_mul(1000))
+    }
+
+    /// Sample the sharded index's representation and bloom load for the invalidation
+    /// sites, and publish the load so a run shows the filter saturating.
+    fn sample_sharded_index_shape(&self, index: &ShardedPkIndex) {
+        let is_bloom = matches!(index, ShardedPkIndex::Bloom(_));
+        self.sharded_index_is_bloom.store(is_bloom, Ordering::Release);
+        let load = index.bloom_load_milli();
+        self.sharded_bloom_load_milli
+            .store(load.unwrap_or(u64::MAX), Ordering::Release);
+        if let (Some(load), Some(keys)) = (load, index.bloom_inserted_keys()) {
+            telemetry::cayenne::track_pk_bloom_load(
+                load,
+                keys,
+                &[telemetry::KeyValue::new(
+                    "table",
+                    self.table_metadata.table_name.clone(),
+                )],
+            );
+        }
+    }
+
+    /// Record one bloom-split outcome: rows the filter proved new (`miss`) versus
+    /// rows it sent to full on-conflict validation (`hit`).
+    fn track_pk_bloom_split(&self, miss: u64, hit: u64) {
+        telemetry::cayenne::track_pk_bloom_split(
+            miss,
+            hit,
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
     }
 
     /// Count a preserved sharded bloom, by which invalidation site spared it, so a
@@ -8538,6 +8602,8 @@ impl CayenneTableProvider {
                 self.sharded_pk_keyset_pending.lock().invalidate();
                 *sharded = None;
                 self.sharded_index_is_bloom.store(false, Ordering::Release);
+                self.sharded_bloom_load_milli
+                    .store(u64::MAX, Ordering::Release);
             }
         }
         // The cold-tier PK existence view is tied to the same keyset generation
@@ -8744,7 +8810,7 @@ impl CayenneTableProvider {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
-                        self.sharded_index_is_bloom.store(true, Ordering::Release);
+                        self.sample_sharded_index_shape(index);
                         // The bounded insert stopped at the budget and the
                         // degrade only converted what was already held, so the
                         // rest of this batch is missing from the bloom. An
@@ -8900,8 +8966,7 @@ impl CayenneTableProvider {
             return;
         }
         let bytes = index.approx_bytes();
-        self.sharded_index_is_bloom
-            .store(matches!(index, ShardedPkIndex::Bloom(_)), Ordering::Release);
+        self.sample_sharded_index_shape(&index);
         *guard = Some(index);
         drop(guard);
         self.publish_sharded_keyset_bytes(bytes);
@@ -11245,6 +11310,15 @@ impl CayenneTableProvider {
                         converter,
                         &incoming_keys,
                     )?;
+                    // Split outcome is the false-positive proxy: a MISS row is
+                    // PROVABLY new, so on a table that never deletes a key, every
+                    // HIT that is not a real update is a bloom false positive. The
+                    // miss fraction is therefore comparable across runs and shows
+                    // directly how much a saturating (or stale) filter costs.
+                    self.track_pk_bloom_split(
+                        miss.as_ref().map_or(0, |b| b.num_rows() as u64),
+                        hit.as_ref().map_or(0, |b| b.num_rows() as u64),
+                    );
                     // MISS rows are kept verbatim (new keys are never dropped),
                     // recorded so a later same-shard HIT row observes them.
                     if let Some(miss) = miss
@@ -11684,7 +11758,7 @@ impl CayenneTableProvider {
                         "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
                     );
                     index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
-                    self.sharded_index_is_bloom.store(true, Ordering::Release);
+                    self.sample_sharded_index_shape(index);
                 } else {
                     bytes = Some(resident);
                 }

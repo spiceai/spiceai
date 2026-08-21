@@ -1592,6 +1592,39 @@ pub(crate) enum ShardedPkIndex {
 }
 
 impl ShardedPkIndex {
+    /// Bloom load in milli-bits-per-inserted-key, summed across shards; `None` for
+    /// an exact index. This is the quantity that governs a bloom's false-positive
+    /// rate: bits are only ever SET, so every insert raises the load and no deletion
+    /// lowers it. `PkBloom` is sized for ~10 bits/key, so `10_000` here is the design
+    /// point and a falling number is a filter saturating toward useless.
+    pub(crate) fn bloom_load_milli(&self) -> Option<u64> {
+        let Self::Bloom(blooms) = self else {
+            return None;
+        };
+        let bits: u64 = blooms
+            .iter()
+            .map(|b| (b.size_bytes() as u64).saturating_mul(8))
+            .fold(0, u64::saturating_add);
+        let keys: u64 = blooms
+            .iter()
+            .map(|b| b.inserted_keys as u64)
+            .fold(0, u64::saturating_add);
+        Some(bits.saturating_mul(1000) / keys.max(1))
+    }
+
+    /// Keys inserted across every shard bloom; `None` for an exact index.
+    pub(crate) fn bloom_inserted_keys(&self) -> Option<u64> {
+        let Self::Bloom(blooms) = self else {
+            return None;
+        };
+        Some(
+            blooms
+                .iter()
+                .map(|b| b.inserted_keys as u64)
+                .fold(0, u64::saturating_add),
+        )
+    }
+
     /// Representation name for the `kind` dimension of
     /// `cayenne_pk_index_discard_total`. A sharded index is wholly one or the
     /// other — degrading converts every shard — so one name covers it.

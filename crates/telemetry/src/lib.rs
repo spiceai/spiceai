@@ -1308,6 +1308,73 @@ pub mod cayenne {
         .add(1, dimensions);
     }
 
+    static PK_BLOOM_BITS_PER_KEY: OnceLock<Gauge<f64>> = OnceLock::new();
+    static PK_BLOOM_INSERTED_KEYS: OnceLock<Gauge<u64>> = OnceLock::new();
+
+    /// Publish a bloomed PK index's load: bits per inserted key, and the key count
+    /// it was reached with. `dimensions` should carry `table`.
+    ///
+    /// This is the quantity that governs a bloom's false-positive rate, and it only
+    /// ever falls: bits are set and never cleared, so every insert raises the load
+    /// and no deletion lowers it. `PkBloom` sizes for ~10 bits/key, so that is the
+    /// design point; a filter drifting well below it is saturating, and until now
+    /// nothing exported either number — the sizing could only be inferred from a
+    /// one-off WARN at degrade time plus an outside row count.
+    pub fn track_pk_bloom_load(load_milli_bits_per_key: u64, inserted_keys: u64, dimensions: &[KeyValue]) {
+        #[expect(clippy::cast_precision_loss, reason = "a load ratio needs no more than f64 precision")]
+        let bits_per_key = load_milli_bits_per_key as f64 / 1000.0;
+        PK_BLOOM_BITS_PER_KEY
+            .get_or_init(|| {
+                operational_meter()
+                    .f64_gauge("cayenne_pk_bloom_bits_per_key")
+                    .with_description(
+                        "Bits per inserted key in a bloomed PK existence index — the quantity that governs its false-positive rate. Falls with every insert; ~10 is the sizing target.",
+                    )
+                    .build()
+            })
+            .record(bits_per_key, dimensions);
+        PK_BLOOM_INSERTED_KEYS
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_pk_bloom_inserted_keys")
+                    .with_description("Keys inserted into a bloomed PK existence index across all of its shards.")
+                    .build()
+            })
+            .record(inserted_keys, dimensions);
+    }
+
+    static PK_BLOOM_SPLIT_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Count a bloom-split outcome by `outcome`: `miss` rows the filter proved new
+    /// (appended with no validation and no tombstone) versus `hit` rows it sent to
+    /// full on-conflict validation. `dimensions` should carry `table`.
+    ///
+    /// The false-positive proxy. A MISS is provably new, so on a table that never
+    /// deletes a primary key every HIT is either a real update or a bloom false
+    /// positive — and the miss fraction is comparable across runs, which makes the
+    /// cost of a saturating or deliberately-stale filter measurable rather than
+    /// argued.
+    pub fn track_pk_bloom_split(miss: u64, hit: u64, dimensions: &[KeyValue]) {
+        let counter = PK_BLOOM_SPLIT_ROWS.get_or_init(|| {
+            operational_meter()
+                .u64_counter("cayenne_pk_bloom_split_rows_total")
+                .with_description(
+                    "Rows classified by the PK bloom split: `miss` proved new and skipped validation, `hit` went to full on-conflict validation.",
+                )
+                .build()
+        });
+        if miss > 0 {
+            let mut dims = dimensions.to_vec();
+            dims.push(KeyValue::new("outcome", "miss"));
+            counter.add(miss, &dims);
+        }
+        if hit > 0 {
+            let mut dims = dimensions.to_vec();
+            dims.push(KeyValue::new("outcome", "hit"));
+            counter.add(hit, &dims);
+        }
+    }
+
     static PK_INDEX_PRESERVED: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Counts a bloomed sharded PK existence index that a relocation-only
