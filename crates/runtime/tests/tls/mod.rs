@@ -74,7 +74,8 @@ use arrow_flight::{
 };
 use prost::Message;
 use rand::RngExt;
-use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_tls::TlsConfig;
 use tonic::transport::Channel;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);

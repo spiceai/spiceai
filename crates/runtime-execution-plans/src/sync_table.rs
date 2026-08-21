@@ -82,7 +82,7 @@ const SYNC_CASTS: &[SyncCast] = &[
 ///
 /// This is the centralized entry point: anything that needs a table without an
 /// async context calls here rather than matching on schema-provider types.
-pub(crate) fn resolve_table_sync(
+pub fn resolve_table_sync(
     schema_provider: &dyn SchemaProvider,
     name: &str,
 ) -> Option<Arc<dyn TableProvider>> {

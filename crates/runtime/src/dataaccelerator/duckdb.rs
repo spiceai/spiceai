@@ -1023,7 +1023,7 @@ impl DataAccelerator for DuckDBAccelerator {
 
         // Coordinated auto memory limit: when the operator did not set
         // `duckdb_memory_limit` on this dataset, apply the runtime-computed
-        // per-instance cap (see `accelerator_memory_budget`) so this DuckDB
+        // per-instance cap (see `runtime_acceleration::memory_budget`) so this DuckDB
         // instance's ceiling — DuckDB's own default is ~80% of host RAM — plus the
         // query pool and the other DuckDB instances can't over-commit the memory
         // available to this process (the cgroup limit in a container, which is what
@@ -1035,7 +1035,7 @@ impl DataAccelerator for DuckDBAccelerator {
         // auto-capping an un-limited sibling there would clobber the explicit value.
         if !cmd.options.contains_key("memory_limit")
             && let Some(auto_limit) =
-                crate::accelerator_memory_budget::duckdb_auto_memory_limit_option()
+                runtime_acceleration::memory_budget::duckdb_auto_memory_limit_option()
         {
             let has_explicit_sibling = match source {
                 Some(src) => self.instance_has_explicit_limit_sibling(src).await,

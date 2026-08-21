@@ -271,8 +271,35 @@ impl CloudClient {
     /// is also where a "wrong org" mistake is caught: an app that exists under a
     /// different org produces a switch hint rather than a bare "not found".
     pub async fn get_project(&self, target: &ProjectTarget) -> Result<Project> {
-        let project_id = self.resolve_id(target).await?;
-        self.get_project_by_id(project_id).await
+        let (project_id, listing_org) = self.resolve_id_and_org(target).await?;
+        let project = self.get_project_by_id(project_id).await?;
+        Ok(self.attribute(project, listing_org.as_deref()))
+    }
+
+    /// Stamp the org a project belongs to onto a payload that omits it.
+    ///
+    /// Spice Cloud returns no `org` on a project, so a command would otherwise
+    /// print a bare name and serialize `"org": ""` for the very project whose
+    /// org it just used to find it — while `spice cloud projects`, run against
+    /// the same credential, named the org for that same project.
+    fn attribute(&self, mut project: Project, org: Option<&str>) -> Project {
+        if project.org.is_empty()
+            && let Some(org) = org.or(self.org.as_deref()).filter(|org| !org.is_empty())
+        {
+            project.org = org.to_string();
+        }
+        project
+    }
+
+    /// The org whose projects this credential sees when no command named one.
+    ///
+    /// `None` for a service-account token, which has no user identity to ask.
+    async fn credential_org(&self) -> Result<Option<String>> {
+        Ok(self
+            .optional_user_auth_context()
+            .await?
+            .map(|context| context.org_name)
+            .filter(|org| !org.is_empty()))
     }
 
     /// Resolve a target to its numeric id without fetching the full project.
@@ -281,11 +308,35 @@ impl CloudClient {
     /// whole project for that costs a round trip per call, and the id cannot
     /// change for the life of a command.
     pub async fn resolve_id(&self, target: &ProjectTarget) -> Result<i64> {
-        // The listing and the identity are independent; overlap them.
+        Ok(self.resolve_id_and_org(target).await?.0)
+    }
+
+    /// Resolve a target to its id and to the org of the listing that resolved
+    /// it, so a caller can attribute a payload Spice Cloud returns without one.
+    ///
+    /// The org is a by-product of the resolution rather than a second lookup:
+    /// discarding it here is what left the default path unable to name an org
+    /// it had already been told.
+    async fn resolve_id_and_org(&self, target: &ProjectTarget) -> Result<(i64, Option<String>)> {
+        // A listing this client asked an organization for describes that
+        // organization, so the identity is not worth a round trip: it would
+        // answer with the org the credential is bound to, and every project
+        // would be attributed to it.
+        if let Some(org) = self.org.as_deref() {
+            let projects = self.list_projects().await?;
+            let listing_org = resolve_listing_org(Some(org), None);
+            let id = resolve_project_id(&projects, target, listing_org)?;
+            return Ok((id, listing_org.map(ToString::to_string)));
+        }
+
+        // Nothing named an organization, so the listing is the credential's
+        // own. The listing and the identity are independent; overlap them.
         let (context, projects) =
             tokio::try_join!(self.optional_user_auth_context(), self.list_projects())?;
-        let context_org = context.as_ref().map(|c| c.org_name.as_str());
-        resolve_project_id(&projects, target, context_org)
+        let credential_org = context.as_ref().map(|c| c.org_name.as_str());
+        let listing_org = resolve_listing_org(None, credential_org);
+        let id = resolve_project_id(&projects, target, listing_org)?;
+        Ok((id, listing_org.map(ToString::to_string)))
     }
 
     /// List deployments for an already-resolved project.
@@ -356,40 +407,33 @@ impl CloudClient {
             .map_err(|error| self.err(error))
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub async fn create_project(
         &self,
         name: &str,
-        region: &str,
-        kind: ProjectKind,
         description: Option<&str>,
         visibility: &str,
-        replicas: Option<i32>,
-        cpu: Option<i32>,
-        memory: Option<NumBytes>,
-        storage_size_gb: Option<f64>,
-        executor_replicas: Option<i32>,
-        executor_cpu: Option<i32>,
-        executor_memory: Option<NumBytes>,
+        placement: CreateProjectPlacement,
     ) -> Result<Project> {
-        let request = build_create_project_request(
-            name,
-            region,
-            kind,
-            description,
-            visibility,
-            replicas,
-            cpu,
-            memory,
-            storage_size_gb,
-            executor_replicas,
-            executor_cpu,
-            executor_memory,
-        );
-        self.inner
+        // Spice Cloud creates the project in the org this client acts on, so
+        // that org is its org. There is no listing here to learn it from, so
+        // when the command named none, ask the identity for the credential's
+        // own — and ask *before* the create, so that a failed lookup stays
+        // side-effect free instead of reporting a project that now exists as a
+        // failure and sending the caller into a duplicate retry. The org is a
+        // label on the answer rather than part of it, so a lookup that fails
+        // anyway leaves the project unattributed rather than uncreated.
+        let created_in = match self.org {
+            Some(_) => None,
+            None => self.credential_org().await.ok().flatten(),
+        };
+
+        let request = build_create_project_request(name, description, visibility, placement);
+        let project = self
+            .inner
             .create_project(&request)
             .await
-            .map_err(|error| self.err(error))
+            .map_err(|error| self.err(error))?;
+        Ok(self.attribute(project, created_in.as_deref()))
     }
 
     pub async fn update_project(
@@ -419,10 +463,15 @@ impl CloudClient {
             storage_size_gb: params.storage_size_gb,
             spicepod: params.spicepod,
         };
-        self.inner
+        let project = self
+            .inner
             .update_project(app.id, &request)
             .await
-            .map_err(|error| self.err(error))
+            .map_err(|error| self.err(error))?;
+        // The project this update just read is the same one, already attributed
+        // by the resolution above, so the update response costs no extra lookup
+        // to name.
+        Ok(self.attribute(project, Some(app.org.as_str())))
     }
 
     pub async fn delete_project(&self, target: &ProjectTarget) -> Result<()> {
@@ -719,11 +768,27 @@ pub fn parse_org_project(org_app: &str) -> (Option<String>, String) {
     }
 }
 
+/// The organization a project listing describes.
+///
+/// Spice Cloud scopes `/v1/apps` to the organization named in the request
+/// header, so the org a client acts on is the org its listing belongs to. The
+/// credential's own org answers only when nothing named one: the identity
+/// endpoint reports the org the *token* is bound to, which is a different
+/// organization whenever a command names one, and labelling one org's projects
+/// with another's name is wrong in the table, in `--output json`, and in every
+/// name resolved from it.
+pub(super) fn resolve_listing_org<'a>(
+    client_org: Option<&'a str>,
+    credential_org: Option<&'a str>,
+) -> Option<&'a str> {
+    client_org.or(credential_org).filter(|org| !org.is_empty())
+}
+
 /// The org an app belongs to: its own when the payload carries one, otherwise
-/// the credential's org, which is the only org `/v1/apps` can be listing.
-fn effective_project_org<'a>(app: &'a Project, context_org: Option<&'a str>) -> Option<&'a str> {
+/// the org whose listing it arrived in.
+fn effective_project_org<'a>(app: &'a Project, listing_org: Option<&'a str>) -> Option<&'a str> {
     if app.org.is_empty() {
-        context_org.filter(|org| !org.is_empty())
+        listing_org.filter(|org| !org.is_empty())
     } else {
         Some(app.org.as_str())
     }
@@ -740,12 +805,12 @@ fn effective_project_org<'a>(app: &'a Project, context_org: Option<&'a str>) -> 
 fn resolve_project_id(
     apps: &[Project],
     target: &ProjectTarget,
-    context_org: Option<&str>,
+    listing_org: Option<&str>,
 ) -> Result<i64> {
     let wanted_org = target
         .org
         .as_deref()
-        .or(context_org)
+        .or(listing_org)
         .filter(|o| !o.is_empty());
 
     let mut org_unknown_matches = Vec::new();
@@ -756,7 +821,7 @@ fn resolve_project_id(
             continue;
         }
 
-        match (effective_project_org(app, context_org), wanted_org) {
+        match (effective_project_org(app, listing_org), wanted_org) {
             (Some(app_org), Some(wanted)) if app_org.eq_ignore_ascii_case(wanted) => {
                 return Ok(app.id);
             }
@@ -802,7 +867,7 @@ fn resolve_project_id(
 
     let visible_orgs: Vec<String> = apps
         .iter()
-        .filter_map(|app| effective_project_org(app, context_org).map(ToString::to_string))
+        .filter_map(|app| effective_project_org(app, listing_org).map(ToString::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -897,46 +962,92 @@ fn map_cloud_error(org: Option<&str>) -> impl Fn(spice_cloud_client::error::Erro
 
 use super::bytes::NumBytes;
 
-#[expect(clippy::too_many_arguments)]
+/// The placement `POST /v1/projects` is asked for, and everything that only
+/// means something once a placement exists.
+///
+/// Spice Cloud resolves the project's kind from whether the request names a
+/// region source at all, and refuses a client-supplied `kind`. Modelling the
+/// two answers as separate variants is what makes the standalone request
+/// unable to carry a region, replica count, resource limit, or executor: those
+/// fields exist only on [`ManagedProjectPlacement`], so there is no path that
+/// sets one and still omits the region source.
+#[derive(Debug)]
+pub enum CreateProjectPlacement {
+    /// A Spice-managed project: a region, and the hosted runtime that region
+    /// provisions.
+    Managed(ManagedProjectPlacement),
+    /// A Cloud Connect project. The request names no region source, so Spice
+    /// Cloud creates the project with no instance attached; the operator's own
+    /// `spiced` becomes its runtime when the instance is attached, and the
+    /// region follows from the stamp that instance's control stream terminates
+    /// on.
+    Standalone,
+}
+
+/// Region and hosted-runtime configuration for a Spice-managed project.
+#[derive(Debug)]
+pub struct ManagedProjectPlacement {
+    /// Data region name, already normalized (e.g. `us-east-1-prod-aws-data`).
+    pub region: String,
+    pub kind: ProjectKind,
+    pub replicas: Option<i32>,
+    pub cpu: Option<i32>,
+    pub memory: Option<NumBytes>,
+    pub storage_size_gb: Option<f64>,
+    pub executor_replicas: Option<i32>,
+    pub executor_cpu: Option<i32>,
+    pub executor_memory: Option<NumBytes>,
+}
+
 fn build_create_project_request(
     name: &str,
-    region: &str,
-    kind: ProjectKind,
     description: Option<&str>,
     visibility: &str,
-    replicas: Option<i32>,
-    cpu: Option<i32>,
-    memory: Option<NumBytes>,
-    storage_size_gb: Option<f64>,
-    executor_replicas: Option<i32>,
-    executor_cpu: Option<i32>,
-    executor_memory: Option<NumBytes>,
+    placement: CreateProjectPlacement,
 ) -> CreateProjectRequest {
-    let resources = build_resources(cpu, memory);
-    let executor = build_executor(executor_replicas, executor_cpu, executor_memory);
+    let base = CreateProjectRequest {
+        name: name.to_string(),
+        description: description.map(String::from),
+        visibility: visibility.to_string(),
+        cname: None,
+        cluster_name: None,
+        tags: None,
+        replicas: None,
+        resources: None,
+        executor: None,
+        storage_size_gb: None,
+    };
 
-    let (tags, replicas) = match kind {
+    // Every field left unset is skipped on the wire, so this is the request
+    // with no region source in it — which is what Spice Cloud reads as a
+    // request for a Cloud Connect project.
+    let CreateProjectPlacement::Managed(managed) = placement else {
+        return base;
+    };
+
+    let (tags, replicas) = match managed.kind {
         ProjectKind::Cluster => {
             let mut tags = BTreeMap::new();
             tags.insert("kind".to_string(), "cluster".to_string());
             (Some(tags), Some(1))
         }
-        ProjectKind::Set => (None, replicas),
+        ProjectKind::Set => (None, managed.replicas),
     };
 
     CreateProjectRequest {
-        name: name.to_string(),
-        description: description.map(String::from),
-        visibility: visibility.to_string(),
         // The Cloud create-app endpoint currently accepts the target deployment region
         // in the legacy `cname` request field; update-app uses the newer `region` field.
-        cname: Some(region.to_string()),
-        cluster_name: None,
+        cname: Some(managed.region),
         tags,
         replicas,
-        resources,
-        executor,
-        storage_size_gb,
+        resources: build_resources(managed.cpu, managed.memory),
+        executor: build_executor(
+            managed.executor_replicas,
+            managed.executor_cpu,
+            managed.executor_memory,
+        ),
+        storage_size_gb: managed.storage_size_gb,
+        ..base
     }
 }
 
@@ -1019,21 +1130,27 @@ mod tests {
         assert!(resources.limits.memory.is_none());
     }
 
+    fn managed_placement(region: &str) -> ManagedProjectPlacement {
+        ManagedProjectPlacement {
+            region: region.to_string(),
+            kind: ProjectKind::Set,
+            replicas: None,
+            cpu: None,
+            memory: None,
+            storage_size_gb: None,
+            executor_replicas: None,
+            executor_cpu: None,
+            executor_memory: None,
+        }
+    }
+
     #[test]
     fn create_project_request_sends_region_as_cname() {
         let request = build_create_project_request(
             "app",
-            "us-east-1-prod-aws-data",
-            ProjectKind::Set,
             None,
             "private",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            CreateProjectPlacement::Managed(managed_placement("us-east-1-prod-aws-data")),
         );
 
         let value = serde_json::to_value(request).expect("create app request should serialize");
@@ -1048,11 +1165,36 @@ mod tests {
         );
     }
 
+    /// Spice Cloud reads "no region source at all" as the request for a Cloud
+    /// Connect project, so the absence of every one of `cname`, `cluster_name`
+    /// and `region` is the wire contract — not an incidental empty field.
+    #[test]
+    fn standalone_create_project_request_names_no_region_source() {
+        let request = build_create_project_request(
+            "app",
+            Some("analytics"),
+            "private",
+            CreateProjectPlacement::Standalone,
+        );
+
+        let value = serde_json::to_value(request).expect("create app request should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "name": "app",
+                "description": "analytics",
+                "visibility": "private"
+            })
+        );
+    }
+
     fn test_app(id: i64, name: &str, org: &str) -> Project {
         Project {
             id,
             name: name.to_string(),
             org: org.to_string(),
+            kind: None,
             description: None,
             visibility: None,
             created_at: None,
@@ -1129,9 +1271,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_id_uses_context_org_when_the_listing_omits_it() {
-        // `/v1/apps` does not populate `org`, so the credential's own org is
-        // the only evidence of which org the listing describes.
+    fn resolve_project_id_uses_the_listing_org_when_the_payload_omits_it() {
+        // `/v1/apps` does not populate `org`, so the org the listing was
+        // requested for is the only evidence of which org it describes.
         let apps = vec![test_app(7, "dashboard", "")];
 
         let id = resolve_project_id(
@@ -1139,9 +1281,46 @@ mod tests {
             &target(Some("analytics"), "dashboard"),
             Some("analytics"),
         )
-        .expect("should match via auth context org");
+        .expect("should match via the listing org");
 
         assert_eq!(id, 7);
+    }
+
+    #[test]
+    fn the_listing_org_is_the_org_the_client_acted_on() {
+        // Regression for the cross-org mis-attribution this replaced: Spice
+        // Cloud scopes `/v1/apps` to the requested org but returns no `org` on
+        // any row, so preferring the credential's org labelled another
+        // organization's projects with the caller's own — and every name
+        // resolved from that listing then failed, or hit a same-named project
+        // in the wrong org.
+        assert_eq!(
+            resolve_listing_org(Some("spiceai"), Some("lukekim")),
+            Some("spiceai")
+        );
+    }
+
+    #[test]
+    fn the_listing_org_falls_back_to_the_credential_when_no_org_was_named() {
+        assert_eq!(resolve_listing_org(None, Some("lukekim")), Some("lukekim"));
+        assert_eq!(resolve_listing_org(None, None), None);
+        // A service-account credential reports no org rather than an empty one.
+        assert_eq!(resolve_listing_org(None, Some("")), None);
+    }
+
+    #[test]
+    fn a_project_in_a_named_org_resolves_from_that_orgs_listing() {
+        // End of the same regression, one layer up: the listing Spice Cloud
+        // returned for 'spiceai' carries no org, and resolving 'spiceai/docs'
+        // against it must find the project rather than report it as living
+        // somewhere else.
+        let apps = vec![test_app(680, "docs", "")];
+        let listing_org = resolve_listing_org(Some("spiceai"), Some("lukekim"));
+
+        let id = resolve_project_id(&apps, &target(Some("spiceai"), "docs"), listing_org)
+            .expect("a project in the org the listing was fetched for should resolve");
+
+        assert_eq!(id, 680);
     }
 
     #[test]
@@ -1265,6 +1444,45 @@ mod tests {
             rendered.contains("'spicehq'") && rendered.contains("login token --org spicehq"),
             "the error must name the org and how to authenticate for it: {rendered}"
         );
+    }
+
+    /// A client that names no org, as `spice cloud project get <name>` builds.
+    fn client_without_an_org() -> CloudClient {
+        CloudClient::with_token_for_org_at("token", None, "https://api.spice.ai")
+            .expect("cloud client should build")
+    }
+
+    #[test]
+    fn a_payload_is_attributed_to_the_org_that_resolved_it() {
+        // Regression for the default path: with no `--org` and no active org,
+        // both the target and the client name no org, and the org the
+        // resolution had already learned from the identity was discarded — so
+        // `project get <name>` printed a bare name and serialized `"org": ""`
+        // for a project `spice cloud projects`, on the same credential, had
+        // just listed as `<org>/<name>`.
+        let attributed =
+            client_without_an_org().attribute(test_app(812, "docs", ""), Some("lukekim"));
+
+        assert_eq!(attributed.org, "lukekim");
+        assert_eq!(attributed.full_name(), "lukekim/docs");
+    }
+
+    #[test]
+    fn attribution_never_overrides_an_org_the_payload_carries() {
+        let attributed =
+            client_without_an_org().attribute(test_app(1, "docs", "spiceai"), Some("lukekim"));
+
+        assert_eq!(attributed.org, "spiceai");
+    }
+
+    #[test]
+    fn attribution_is_absent_rather_than_guessed_when_no_org_is_known() {
+        // A service-account credential has no user identity, so nothing can
+        // name an org — a bare name is the honest answer, not a made-up one.
+        let attributed = client_without_an_org().attribute(test_app(1, "docs", ""), None);
+
+        assert_eq!(attributed.org, "");
+        assert_eq!(attributed.full_name(), "docs");
     }
 
     #[test]

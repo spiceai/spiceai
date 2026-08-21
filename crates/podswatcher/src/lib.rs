@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,6 +43,12 @@ impl PodsWatcher {
         }
     }
 
+    /// Start watching for Spicepod changes under the configured root path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying platform watcher fails to
+    /// register the root path (see [`watch_root`]).
     pub async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
         let root_path = self.root_path.clone();
         let runtime_handle = Handle::current();

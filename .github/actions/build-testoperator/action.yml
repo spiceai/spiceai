@@ -141,6 +141,8 @@ runs:
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         os: ${{ steps.detect-os.outputs.os }}
+        minio_access_key: ${{ inputs.minio_access_key }}
+        minio_secret_key: ${{ inputs.minio_secret_key }}
 
     - name: Build testoperator
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true')

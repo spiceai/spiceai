@@ -98,10 +98,8 @@ pub fn publish_duckdb_budget(per_instance_cap_bytes: u64, total_reservation_byte
 /// (floored whole MiB, e.g. `"1234MiB"`), or `None` when unset. `MiB` parses under
 /// both `byte_unit::Byte::parse_str(_, true)` and `DuckDB`'s own `SET memory_limit`.
 ///
-/// Only the `DuckDB` accelerator reads this (`#[cfg(feature = "duckdb")]`), so it —
-/// and its formatter — are gated to that feature to stay dead-code-free when the
-/// accelerator is not compiled in.
-#[cfg(feature = "duckdb")]
+/// Only the `DuckDB` accelerator reads this; as public API of this crate it stays
+/// dead-code-free even when the runtime is built without the `DuckDB` accelerator.
 #[must_use]
 pub fn duckdb_auto_memory_limit_option() -> Option<String> {
     format_duckdb_memory_limit(DUCKDB_AUTO_MEMORY_LIMIT_BYTES.load(Ordering::Relaxed))
@@ -109,7 +107,6 @@ pub fn duckdb_auto_memory_limit_option() -> Option<String> {
 
 /// Formats a per-instance cap as a floored whole-MiB `DuckDB` `memory_limit` string
 /// (`0` ⇒ `None`). Split out from the global read so it can be unit-tested purely.
-#[cfg(feature = "duckdb")]
 fn format_duckdb_memory_limit(bytes: u64) -> Option<String> {
     match bytes {
         0 => None,
@@ -734,7 +731,6 @@ mod tests {
 
     /// The published cap formats as a floored whole-MiB `DuckDB` `memory_limit`
     /// string (and `0` clears it). Tested on the pure formatter, not the global.
-    #[cfg(feature = "duckdb")]
     #[test]
     fn cap_formats_as_floored_mib() {
         assert_eq!(super::format_duckdb_memory_limit(0), None);

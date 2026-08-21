@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::common::runtime::JoinSetTracer;
+use datafusion_common_runtime::JoinSetTracer;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::any::Any;
@@ -89,6 +89,6 @@ impl JoinSetTracer for TaskHistorySpanTracer {
 /// Returns an error if a tracer has already been set. This is a programming error
 /// and indicates the function was called multiple times.
 pub fn init_datafusion_tracer() -> Result<(), Box<dyn std::error::Error>> {
-    datafusion::common::runtime::set_join_set_tracer(&TaskHistorySpanTracer)
+    datafusion_common_runtime::set_join_set_tracer(&TaskHistorySpanTracer)
         .map_err(|e| format!("Failed to set DataFusion JoinSet tracer: {e}").into())
 }
