@@ -414,22 +414,25 @@ impl CloudClient {
         visibility: &str,
         placement: CreateProjectPlacement,
     ) -> Result<Project> {
+        // Spice Cloud creates the project in the org this client acts on, so
+        // that org is its org. There is no listing here to learn it from, so
+        // when the command named none, ask the identity for the credential's
+        // own — and ask *before* the create, so that a failed lookup stays
+        // side-effect free instead of reporting a project that now exists as a
+        // failure and sending the caller into a duplicate retry. The org is a
+        // label on the answer rather than part of it, so a lookup that fails
+        // anyway leaves the project unattributed rather than uncreated.
+        let created_in = match self.org {
+            Some(_) => None,
+            None => self.credential_org().await.ok().flatten(),
+        };
+
         let request = build_create_project_request(name, description, visibility, placement);
         let project = self
             .inner
             .create_project(&request)
             .await
             .map_err(|error| self.err(error))?;
-
-        // Spice Cloud creates the project in the org this client acts on, so
-        // that org is its org. There is no listing here to learn it from, so
-        // when the command named none it is worth asking the identity for the
-        // credential's own — a create is a one-off, and the alternative is a
-        // `--output json` payload that cannot say where the project now lives.
-        let created_in = match self.org {
-            Some(_) => None,
-            None => self.credential_org().await?,
-        };
         Ok(self.attribute(project, created_in.as_deref()))
     }
 
