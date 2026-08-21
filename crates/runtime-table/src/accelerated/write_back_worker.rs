@@ -259,11 +259,6 @@ impl WriteBackWorker {
             .clear_dirty_keys(&claimed)
             .await
             .map_err(to_df_err)?;
-        tracing::debug!(
-            dataset = %self.dataset_name,
-            cleared_at_or_below = claimed.len(),
-            "durable write-back markers compare-and-cleared"
-        );
         Ok(claimed.len())
     }
 }
