@@ -19,6 +19,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-duckdb"
+version = "2.2.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "byte-unit",
+ "cpu-budget",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-duckdb",
+ "runtime-datafusion",
+ "runtime-parameters",
+ "runtime-table",
+ "runtime-table-partition",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "accelerator-postgres"
 version = "2.2.0-unstable"
 dependencies = [
@@ -6146,6 +6182,7 @@ dependencies = [
 name = "data-accelerator-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "arrow-schema",
  "arrow_tools",
@@ -17062,6 +17099,7 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
  "accelerator-turso",
@@ -19777,6 +19815,7 @@ dependencies = [
 name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
  "accelerator-turso",
@@ -19905,6 +19944,10 @@ dependencies = [
 name = "spicepodschema"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
+ "accelerator-postgres",
+ "accelerator-sqlite",
+ "accelerator-turso",
  "connector-abfs",
  "connector-clickhouse",
  "connector-cosmosdb",

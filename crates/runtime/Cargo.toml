@@ -266,6 +266,7 @@ connector-oracle = { path = "../data-connectors/connector-oracle" }
 accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
 accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
 accelerator-turso = { path = "../accelerators/accelerator-turso" }
+accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
 turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }

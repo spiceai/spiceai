@@ -25,8 +25,6 @@ limitations under the License.
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 pub mod partitioned_arrow;
 
 pub(crate) mod imds;
@@ -717,7 +715,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "duckdb")]
                 Engine::DuckDB => {
-                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                    use accelerator_duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -1972,7 +1970,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "duckdb")]
                     Engine::DuckDB => {
-                        use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                        use accelerator_duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await

@@ -39,6 +39,8 @@ use tracing_subscriber::EnvFilter;
 // the entry in this test binary — the linker drops the unreferenced static — so force the
 // link the same way `spiced` does. `accelerator_crates_register_their_engines` below
 // fails if one of these lines is ever dropped.
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
@@ -68,6 +70,11 @@ fn accelerator_crates_register_their_engines() {
     assert!(
         engines.iter().any(|engine| engine == "turso"),
         "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "duckdb")]
+    assert!(
+        engines.iter().any(|engine| engine == "duckdb"),
+        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
     let _ = &engines;
 }

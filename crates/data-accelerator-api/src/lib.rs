@@ -495,6 +495,25 @@ pub trait DataAccelerator: Send + Sync {
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
 
+    /// This engine's contribution to the coordinated memory budget, summarised from the
+    /// pod's configuration *before* initialization.
+    ///
+    /// The runtime plans that budget (see
+    /// [`runtime_acceleration::memory_budget::plan`]) and must know how many distinct
+    /// engine instances a pod declares, which only the engine can say: instance identity
+    /// follows its own path-resolution rules. Answering here keeps that rule in one
+    /// place — a second implementation in the planner could key instances differently
+    /// and mis-size every cap.
+    ///
+    /// Defaults to no contribution, which is correct for an engine whose instances do
+    /// not compete for a shared memory ceiling.
+    fn memory_budget_inputs(
+        &self,
+        _app: Option<&Arc<app::App>>,
+    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
+        runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
+    }
+
     /// A sidecar over a database this engine owns at `path`, for state that belongs to
     /// the runtime rather than to a dataset — the Cayenne metastore's `cayenne.db`.
     ///
