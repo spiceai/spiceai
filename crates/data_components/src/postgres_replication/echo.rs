@@ -62,8 +62,10 @@ limitations under the License.
 //!   entry removed at commit-observation would re-admit the replayed echo.
 //! - [`prune_acked`](XidRegistry::prune_acked) — remove an entry only once the
 //!   durable applied position has advanced past the echo's observed commit LSN.
-//! - [`gc`](XidRegistry::gc) — startup safety net for entries that will never be
-//!   pruned normally (aborted delivery, lost unregister, slot far behind).
+//! - [`gc`](XidRegistry::gc) — safety net for entries that will never be pruned
+//!   normally (aborted delivery, lost unregister, slot far behind, rewound
+//!   source). Runs at startup and periodically thereafter, driven by the
+//!   connector.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -434,15 +436,27 @@ impl XidRegistry {
         }
     }
 
-    /// Startup garbage collection — the safety net for entries that will never be
-    /// pruned normally. Applies all three design rules; any one is sufficient to drop
+    /// Reconciliation garbage collection — the safety net for entries that will
+    /// never be pruned normally. The connector runs it at startup and periodically
+    /// thereafter. Applies all four design rules; any one is sufficient to drop
     /// an entry:
     ///
     /// 1. `pg_xact_status(xid8) == aborted` — the delivery `COMMIT` failed, so no echo
     ///    will ever arrive.
-    /// 2. `applied_lsn >= commit_lsn_upper_bound` — the echo's commit is provably
-    ///    consumed (covers a lost unregister).
-    /// 3. The entry is more than ~2^31 transactions behind `current_xid8` — a slot
+    /// 2. The echo's commit is provably consumed: either its `observed_commit_lsn`
+    ///    or its `commit_lsn_upper_bound` is at or below `applied_lsn` — the same
+    ///    two rules as [`prune_acked`](Self::prune_acked). The observed-LSN half
+    ///    covers a crash after the applied watermark was saved but before the
+    ///    steady-state prune persisted; the upper-bound half covers a lost
+    ///    unregister.
+    /// 3. The entry is at or ahead of `current_xid8` — the server's first
+    ///    as-yet-unassigned transaction id, so an id at or above it was never
+    ///    assigned in the source's current history. It can only come from a source
+    ///    restored or rewound (for example point-in-time recovery) since the entry
+    ///    was recorded, and once the restored server's ids catch up, its low 32
+    ///    bits would suppress a genuine, unrelated change. It emits a user-facing
+    ///    `warn!`.
+    /// 4. The entry is more than ~2^31 transactions behind `current_xid8` — a slot
     ///    that far behind would long since have been invalidated; keeping the entry
     ///    risks a 32-bit xid-wraparound collision that would suppress a genuine,
     ///    unrelated source change. This rule alone bounds entries whose upper bound
@@ -451,8 +465,8 @@ impl XidRegistry {
     ///
     /// `statuses` maps each entry's full `xid8` to its resolved [`XactStatus`]; an
     /// entry absent from the map is treated as [`XactStatus::Unknown`]. The registry
-    /// stays connection-free: the connector resolves these and `current_xid8` from a
-    /// live connection and passes them in.
+    /// stays connection-free: the connector resolves these and `current_xid8` (the
+    /// snapshot xmax) from a live connection and passes them in.
     pub async fn gc(
         &self,
         statuses: &HashMap<u64, XactStatus>,
@@ -463,15 +477,25 @@ impl XidRegistry {
 
         let mut to_remove: Vec<u64> = Vec::new();
         let mut safety_valve: Vec<u64> = Vec::new();
+        let mut rewound: Vec<u64> = Vec::new();
         for (&xid8, entry) in &guard.entries {
             let aborted = matches!(statuses.get(&xid8), Some(XactStatus::Aborted));
             let consumed = entry
-                .commit_lsn_upper_bound
-                .is_some_and(|upper_bound| applied_lsn >= upper_bound);
+                .observed_commit_lsn
+                .is_some_and(|observed| applied_lsn >= observed)
+                || entry
+                    .commit_lsn_upper_bound
+                    .is_some_and(|upper_bound| applied_lsn >= upper_bound);
+            // `current_xid8` is the first as-yet-unassigned id (snapshot xmax), so
+            // an id at or above it was never assigned in this server history.
+            let ahead_of_current = xid8 >= current_xid8;
             let too_far_behind = current_xid8.saturating_sub(xid8) > XID_WRAPAROUND_SAFETY_DISTANCE;
 
             if aborted || consumed {
                 to_remove.push(xid8);
+            } else if ahead_of_current {
+                to_remove.push(xid8);
+                rewound.push(xid8);
             } else if too_far_behind {
                 to_remove.push(xid8);
                 safety_valve.push(xid8);
@@ -480,6 +504,16 @@ impl XidRegistry {
 
         if to_remove.is_empty() {
             return;
+        }
+
+        for &xid8 in &rewound {
+            let dataset = self.dataset.as_str();
+            warn!(
+                dataset,
+                xid8,
+                current_xid8,
+                "Durable write-back for dataset '{dataset}' is discarding an outstanding change-echo suppression entry (transaction {xid8}) that is ahead of the source's current transaction id {current_xid8}; a transaction id from the future means the source was restored or rewound (for example from a backup or point-in-time recovery), so the entry cannot describe its current history and is dropped to prevent it from suppressing an unrelated future change. Verify the dataset's replication slot exists on the restored source and re-synchronize if needed. See: https://spiceai.org/docs/components/data-connectors/postgres",
+            );
         }
 
         for &xid8 in &safety_valve {
@@ -872,7 +906,66 @@ mod tests {
         );
     }
 
-    /// GC rule 3: an entry strictly more than 2^31 transactions behind the server's
+    /// GC rule 2, observed-LSN half: an entry whose observed commit LSN the durable
+    /// applied position has reached is dropped even with no upper bound recorded —
+    /// the crash-between-watermark-save-and-prune case `prune_acked` would
+    /// otherwise leave to the next steady-state prune.
+    #[tokio::test]
+    async fn gc_drops_entries_with_consumed_observed_commit() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+        registry.register(10).await.expect("register 10");
+        registry.register(20).await.expect("register 20");
+        registry.mark_commit_observed(low32(10), 1000).await;
+        registry.mark_commit_observed(low32(20), 3000).await;
+
+        let statuses = std::collections::HashMap::new();
+        // applied_lsn 2000: entry 10 (observed 1000) consumed, entry 20 (observed
+        // 3000) not.
+        registry.gc(&statuses, 30, 2000).await;
+
+        assert!(
+            !registry.contains(low32(10)),
+            "entry with consumed observed commit LSN dropped"
+        );
+        assert!(
+            registry.contains(low32(20)),
+            "entry whose observed commit is still ahead of the floor retained"
+        );
+    }
+
+    /// GC rule 3: an entry at or ahead of the server's current xid8 (the first
+    /// as-yet-unassigned id) cannot belong to the current server history — it
+    /// survives only a restore/rewind — and is dropped; an entry just behind the
+    /// current id is a legitimately outstanding delivery and is retained.
+    #[tokio::test]
+    async fn gc_drops_entries_ahead_of_current_xid() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+
+        let current_xid8: u64 = 1000;
+        registry.register(1000).await.expect("register at current");
+        registry.register(1500).await.expect("register ahead");
+        registry.register(999).await.expect("register just behind");
+
+        let statuses = std::collections::HashMap::new();
+        registry.gc(&statuses, current_xid8, 0).await;
+
+        assert!(
+            !registry.contains(low32(1000)),
+            "an entry at the first unassigned id was never assigned here and is dropped"
+        );
+        assert!(
+            !registry.contains(low32(1500)),
+            "an entry ahead of the current id is dropped"
+        );
+        assert!(
+            registry.contains(low32(999)),
+            "an entry just behind the current id is retained"
+        );
+    }
+
+    /// GC rule 4: an entry strictly more than 2^31 transactions behind the server's
     /// current `xid8` is dropped by the wraparound safety valve; an entry exactly at
     /// the 2^31 boundary is kept (the rule is `>`, not `>=`).
     #[tokio::test]

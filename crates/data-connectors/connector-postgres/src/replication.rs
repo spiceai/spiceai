@@ -178,9 +178,11 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 /// follow-up can hand the *same* `Arc` to the replication member registration for
 /// the pump's echo filter.
 ///
-/// Garbage collection runs separately, once, in the caller's cache-miss path
-/// (see [`Postgres::write_back_xid_registry`](crate::Postgres::write_back_xid_registry))
-/// — not here — so a cached hit never repeats it.
+/// Garbage collection runs separately — startup reconciliation in the caller's
+/// cache-miss path (see
+/// [`Postgres::write_back_xid_registry`](crate::Postgres::write_back_xid_registry)),
+/// repeated periodically by [`spawn_write_back_registry_reconciliation`] — never
+/// here, so a cached hit never repeats it.
 ///
 /// # Errors
 ///
@@ -211,12 +213,14 @@ pub(crate) async fn load_write_back_xid_registry(
 
 /// Startup garbage collection for a freshly-loaded write-back registry.
 ///
-/// Runs once, before the registry is shared with the delivery path or the pump.
-/// Resolves what the registry cannot on its own — each outstanding entry's
-/// `pg_xact_status` and the server's current transaction id — and hands them to
-/// [`XidRegistry::gc`] together with the dataset's durably-applied LSN, so an
-/// aborted delivery, a lost unregister, or an entry stranded far behind the
-/// server is dropped rather than lingering into a 32-bit xid wraparound.
+/// Runs before the registry is shared with the delivery path or the pump;
+/// [`spawn_write_back_registry_reconciliation`] then repeats the reconciliation
+/// periodically for the life of the process. Resolves what the registry cannot
+/// on its own — each outstanding entry's `pg_xact_status` and the server's
+/// current transaction id — and hands them to [`XidRegistry::gc`] together with
+/// the dataset's durably-applied LSN, so an aborted delivery, a lost unregister,
+/// an entry from a rewound source, or an entry stranded far behind the server is
+/// dropped rather than lingering into a 32-bit xid wraparound.
 ///
 /// # Errors
 ///
@@ -234,6 +238,86 @@ pub(crate) async fn run_write_back_registry_gc(
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
     registry: &Arc<XidRegistry>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if registry.outstanding_xid8s().await.is_empty() {
+        // Nothing to reconcile, so skip the server and sidecar round trips.
+        return Ok(());
+    }
+
+    // The durably-applied LSN, so garbage collection can drop an entry whose echo
+    // the applied floor has provably consumed. An unresolvable watermark reads as
+    // 0, which only makes that one rule conservative (the aborted, rewind, and
+    // epoch-distance rules still apply).
+    let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
+    reconcile_registry(pool, &dataset.name.to_string(), registry, applied_lsn).await
+}
+
+/// How often [`spawn_write_back_registry_reconciliation`]'s task re-runs
+/// reconciliation. The wraparound safety valve needs a pass to run well within
+/// the time the source takes to assign 2^31 transaction ids; at one hour the
+/// source would have to sustain ~600k write transactions per second to cross
+/// that between passes. A pass with nothing outstanding skips the server round
+/// trip entirely, so the steady-state cost of the cadence is a map lookup.
+const WRITE_BACK_REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Spawn the periodic re-run of write-back registry reconciliation for one
+/// dataset.
+///
+/// Startup reconciliation alone leaves a hole on a long-lived process: an entry
+/// whose delivery `COMMIT` failed ambiguously and actually aborted server-side
+/// has no observed commit LSN and no upper bound, so no steady-state prune ever
+/// removes it — only reconciliation against `pg_xact_status` does, and a process
+/// that never restarts would otherwise never repeat that. Left alone past ~2^31
+/// source transactions, the entry's low 32 bits collide with a fresh xid and
+/// suppress a genuine, unrelated change. The same cadence re-applies the rewind
+/// and epoch-distance rules.
+///
+/// The task holds only weak references, so it exits at its next tick once the
+/// connector (pool) or registry is gone, and keeps neither alive. The
+/// applied-LSN floor is passed as 0: resolving it needs the setup-time
+/// `ConnectorContext`, which cannot outlive setup, and 0 only makes the
+/// consumed rule conservative — consumed entries are already removed in steady
+/// state by `prune_acked`, while the rules this task exists for (aborted,
+/// rewind, epoch-distance) do not use the floor.
+pub(crate) fn spawn_write_back_registry_reconciliation(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: String,
+    registry: &Arc<XidRegistry>,
+) {
+    let pool = Arc::downgrade(pool);
+    let registry = Arc::downgrade(registry);
+    drop(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(WRITE_BACK_REGISTRY_RECONCILE_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick resolves immediately, and startup reconciliation
+        // already ran; consume it so the first re-run is one interval out.
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let (Some(pool), Some(registry)) = (pool.upgrade(), registry.upgrade()) else {
+                return;
+            };
+            if let Err(e) = reconcile_registry(&pool, &dataset_name, &registry, 0).await {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    error = %e,
+                    "Durable write-back for dataset '{dataset_name}' failed a periodic reconciliation of its change-echo suppression registry, so a stale entry may linger until the next pass or restart. Cause: {e}"
+                );
+            }
+        }
+    }));
+}
+
+/// One reconciliation pass: resolve every outstanding entry's `pg_xact_status`
+/// and the server's current transaction id, and hand them to
+/// [`XidRegistry::gc`] with the given durably-applied floor. Shared by startup
+/// ([`run_write_back_registry_gc`], which resolves the real floor) and the
+/// periodic task (which passes 0).
+async fn reconcile_registry(
+    pool: &Arc<PostgresConnectionPool>,
+    dataset_name: &str,
+    registry: &Arc<XidRegistry>,
+    applied_lsn: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let outstanding = registry.outstanding_xid8s().await;
     if outstanding.is_empty() {
@@ -255,23 +339,25 @@ pub(crate) async fn run_write_back_registry_gc(
     let (current_xid_sql, status_sql) = if pg13_plus {
         (
             "SELECT pg_snapshot_xmax(pg_current_snapshot())::text",
-            "SELECT pg_xact_status($1::xid8)::text",
+            "SELECT pg_xact_status($1::text::xid8)::text",
         )
     } else {
         (
             "SELECT txid_snapshot_xmax(txid_current_snapshot())::text",
-            "SELECT txid_status($1::bigint)::text",
+            "SELECT txid_status($1::text::bigint)::text",
         )
     };
 
     let current_xid8 = read_u64_text(&db.conn, current_xid_sql).await?;
 
-    let dataset_name = dataset.name.to_string();
     let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
     for xid8 in outstanding {
-        // Bind the id as its decimal text and cast in SQL (`$1::xid8` /
-        // `$1::bigint`), so no `xid8` `ToSql`/`FromSql` is needed; the status is
-        // likewise read as text.
+        // Bind the id as its decimal text. The inner `::text` keeps the inferred
+        // parameter type `text` — the driver can encode a `String` as `text` but
+        // has no `xid8` (or, for the bound `String`, `bigint`) pairing, so an
+        // `xid8`/`bigint` parameter would be rejected client-side before the
+        // query ran — and the SQL side casts onward. The status likewise comes
+        // back as text.
         let param = xid8.to_string();
         let status = match db.conn.query_one(status_sql, &[&param]).await {
             Ok(row) => {
@@ -290,12 +376,6 @@ pub(crate) async fn run_write_back_registry_gc(
         };
         statuses.insert(xid8, status);
     }
-
-    // The durably-applied LSN, so garbage collection can drop an entry whose echo
-    // the applied floor has provably consumed. An unresolvable watermark reads as
-    // 0, which only makes that one rule conservative (the aborted and
-    // epoch-distance rules still apply).
-    let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
 
     registry.gc(&statuses, current_xid8, applied_lsn).await;
     Ok(())

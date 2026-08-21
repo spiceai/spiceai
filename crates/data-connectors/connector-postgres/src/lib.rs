@@ -1034,8 +1034,10 @@ impl Postgres {
     ///
     /// Loaded once and cached, so the delivery path and the CDC pump share the
     /// **same** `Arc`: the deliverer registers each write-back xid into it and the
-    /// pump reads it to drop the matching echo. Startup garbage collection runs on
-    /// the first load, before the registry is handed to either path.
+    /// pump reads it to drop the matching echo. Garbage collection runs on the
+    /// first load, before the registry is handed to either path, and then
+    /// periodically for the life of the registry (see
+    /// [`replication::spawn_write_back_registry_reconciliation`]).
     async fn write_back_xid_registry(
         &self,
         context: &dyn ConnectorContext,
@@ -1082,6 +1084,15 @@ impl Postgres {
                     &registry,
                 )
                 .await?;
+                // Startup reconciliation alone would leave an ambiguously-failed,
+                // actually-aborted delivery's entry unpruned for the life of the
+                // process; repeat it periodically. Spawned only here, on the
+                // single successful initialization of this dataset's cell.
+                replication::spawn_write_back_registry_reconciliation(
+                    &self.pool,
+                    dataset.name.to_string(),
+                    &registry,
+                );
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(registry)
             })
             .await;
