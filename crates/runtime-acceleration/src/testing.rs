@@ -23,7 +23,7 @@ limitations under the License.
 //! this provides.
 //!
 //! It does **not** provide the runtime-backed answers. `initialized_sources` keeps the
-//! trait's empty default, so a test that needs peer datasets — DuckDB attaching other
+//! trait's empty default, so a test that needs peer datasets — `DuckDB` attaching other
 //! file-mode instances is the case in the tree — sees none, and belongs in the runtime's
 //! own tests rather than here. `checkpointer_factory` reports that there is no
 //! accelerator to checkpoint rather than handing back a no-op, which a snapshot
@@ -115,11 +115,11 @@ impl AccelerationSource for TestAccelerationSource {
     }
 
     /// Mirrors `DatasetSpec::is_file_accelerated`, including its two quirks and the
-    /// order they apply in: a PostgreSQL acceleration counts as file-backed whatever its
+    /// order they apply in: a `PostgreSQL` acceleration counts as file-backed whatever its
     /// mode *and even when disabled*, because that check short-circuits first; for every
     /// other engine, a disabled acceleration counts as nothing. A double that answered
     /// otherwise would send a test down an initialization path the runtime skips.
-    /// (`View`'s implementation deliberately differs on PostgreSQL; this stands in for a
+    /// (`View`'s implementation deliberately differs on `PostgreSQL`; this stands in for a
     /// dataset.)
     fn is_file_accelerated(&self) -> bool {
         let Some(acceleration) = self.acceleration.as_ref() else {
