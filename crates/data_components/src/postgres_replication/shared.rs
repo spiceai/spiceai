@@ -6628,6 +6628,46 @@ mod tests {
         );
     }
 
+    /// A registry-bearing member that receives a transaction it did *not* write
+    /// back delivers every row unchanged. Regression test for #13350: an earlier
+    /// `drop_echoed` drained the chunk buffers up front and only restored them
+    /// when something was echoed, so a normal (non-echo) transaction on a
+    /// write-back dataset lost all of its CDC rows.
+    #[tokio::test]
+    async fn unregistered_xid_delivers_all_rows_on_write_back_member() {
+        // t0 carries a registry, but for a *different* transaction than the one
+        // delivered, so the delivered transaction is not an echo.
+        let registered_xid = 4242u32;
+        let foreign_xid = 7777u32;
+        let registry = registry_with_xid(registered_xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            900,
+            Some(foreign_xid),
+        )
+        .await;
+
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("t0 envelope is not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "a transaction this member did not write back is delivered unchanged"
+        );
+        assert!(
+            !registry.contains(foreign_xid),
+            "the foreign transaction was never a registry member"
+        );
+    }
+
     /// A transaction that is *only* the arbitrated member's echo still advances its
     /// watermark via the zero-row ack — a filtered echo is real source progress.
     #[tokio::test]

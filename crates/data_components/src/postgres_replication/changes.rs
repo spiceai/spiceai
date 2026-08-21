@@ -19,6 +19,7 @@ limitations under the License.
 //! apply.
 
 use std::borrow::Cow;
+use std::num::NonZeroU32;
 use std::sync::{Arc, atomic::AtomicU64};
 
 use arrow::{
@@ -345,9 +346,11 @@ pub struct PgChangeRows {
     raw_chunks: Vec<Vec<bytes::Bytes>>,
     /// The source transaction id (pgoutput's 32-bit stream xid) that produced
     /// each entry of `raw_chunks`, same length and index-aligned. `None` for a
-    /// chunk built with no known xid (e.g. a test fixture). See
-    /// [`Self::drop_echoed`] for what this drives.
-    chunk_xids: Vec<Option<u32>>,
+    /// chunk built with no known xid (e.g. a test fixture); `xid` 0 is Postgres's
+    /// "no transaction assigned" sentinel and is likewise stored as `None`, which
+    /// is why the slot is a `NonZeroU32` — it also keeps the tag a compact 32 bits
+    /// with no separate discriminant. See [`Self::drop_echoed`] for what this drives.
+    chunk_xids: Vec<Option<NonZeroU32>>,
     source_commit_ts_ms: Option<i64>,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
@@ -383,7 +386,9 @@ impl PgChangeRows {
     #[must_use]
     pub(super) fn with_source_xid(mut self, xid: Option<u32>) -> Self {
         if let Some(slot) = self.chunk_xids.first_mut() {
-            *slot = xid;
+            // `xid` 0 is Postgres's "no transaction assigned" sentinel, so it
+            // collapses to `None` alongside a genuinely absent xid.
+            *slot = xid.and_then(NonZeroU32::new);
         }
         self
     }
@@ -475,26 +480,39 @@ impl PgChangeRows {
     /// [`XidRegistry::mark_commit_observed`] — this method only reads the
     /// registry's lock-free membership mirror, never its own (async) state.
     pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> Vec<u32> {
+        // Compact both index-aligned vectors in place: keep a write cursor at the
+        // next surviving slot, shift each kept chunk down over the gaps an echo
+        // leaves, then truncate. When nothing echoes — the common case, since most
+        // transactions carry an xid this dataset never wrote — the cursor stays in
+        // lockstep with the scan, no swap runs, and the buffers (and their hints)
+        // are left untouched, so a clean pop pays nothing beyond the membership
+        // reads.
         let mut dropped = Vec::new();
-        let mut kept_chunks = Vec::with_capacity(self.raw_chunks.len());
-        let mut kept_xids = Vec::with_capacity(self.chunk_xids.len());
-        for (chunk, xid) in self.raw_chunks.drain(..).zip(self.chunk_xids.drain(..)) {
-            match xid {
-                Some(x) if registry.contains(x) => dropped.push(x),
-                _ => {
-                    kept_chunks.push(chunk);
-                    kept_xids.push(xid);
+        let mut kept = 0;
+        for read in 0..self.chunk_xids.len() {
+            if let Some(xid) = self.chunk_xids[read] {
+                if registry.contains(xid.get()) {
+                    // Leave the echoed chunk behind the write cursor; the final
+                    // `truncate` discards it. Record its xid for the caller.
+                    dropped.push(xid.get());
+                    continue;
                 }
             }
+            if read != kept {
+                self.raw_chunks.swap(read, kept);
+                self.chunk_xids.swap(read, kept);
+            }
+            kept += 1;
         }
-        if !dropped.is_empty() {
-            let (row_hint, byte_len) =
-                Self::compute_hints(&self.schema, kept_chunks.iter().flatten());
-            self.raw_chunks = kept_chunks;
-            self.chunk_xids = kept_xids;
-            self.row_hint = row_hint;
-            self.byte_len = byte_len;
+        if dropped.is_empty() {
+            return dropped;
         }
+        self.raw_chunks.truncate(kept);
+        self.chunk_xids.truncate(kept);
+        let (row_hint, byte_len) =
+            Self::compute_hints(&self.schema, self.raw_chunks.iter().flatten());
+        self.row_hint = row_hint;
+        self.byte_len = byte_len;
         dropped
     }
 }

@@ -26,7 +26,6 @@ pub mod bootstrap;
 pub mod changes;
 pub mod client;
 pub mod config;
-pub mod echo;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
@@ -34,6 +33,7 @@ pub mod retention;
 pub mod schema_evolution;
 pub mod shared;
 pub mod slot;
+pub mod xid_registry;
 
 use std::sync::Arc;
 
@@ -43,11 +43,11 @@ use snafu::Snafu;
 use crate::cdc::{ChangesStream, StreamError};
 
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
-pub use echo::{XactStatus, XidEntry, XidRegistry};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
 pub use slot::{SlotInfo, SlotSetupOutcome};
+pub use xid_registry::{XactStatus, XidEntry, XidRegistry};
 
 /// Extracts a human-readable message from a `tokio_postgres::Error`.
 ///
@@ -409,7 +409,7 @@ pub struct ReplicationStreamInput {
     /// `Some` only for a durable-write-back dataset, and it is the **same**
     /// [`XidRegistry`] `Arc` the connector's delivery path registers into — the
     /// pump drops the echo of each registered transaction (the arbitrated table's
-    /// changes) before they become Arrow. See `echo.rs` and
+    /// changes) before they become Arrow. See `xid_registry.rs` and
     /// `cdc-echo-drop-xid-design.md`.
     pub write_back_registry: Option<Arc<XidRegistry>>,
 }
