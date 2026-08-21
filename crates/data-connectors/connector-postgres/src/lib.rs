@@ -78,9 +78,17 @@ pub struct Postgres {
     /// share the **same** `Arc` for a dataset — the deliverer registers each xid,
     /// the pump drops its echo. Loaded (and startup-garbage-collected) once, on
     /// whichever path first asks. Keyed by dataset name.
+    ///
+    /// Each value is its own single-flight cell: the outer mutex is held only
+    /// long enough to get-or-insert a dataset's cell, never across the load/GC
+    /// I/O that initializes it, so one dataset's slow or unavailable connection
+    /// cannot serialize every other dataset's setup behind this connector.
     write_back_registries: Arc<
         tokio::sync::Mutex<
-            HashMap<String, Arc<data_components::postgres_replication::XidRegistry>>,
+            HashMap<
+                String,
+                Arc<tokio::sync::OnceCell<Arc<data_components::postgres_replication::XidRegistry>>>,
+            >,
         >,
     >,
 }
@@ -1042,29 +1050,42 @@ impl Postgres {
         // gets no registry (and so no echo filtering).
         durable_write_back_on_conflict(dataset)?;
 
+        // Get (or create) this dataset's single-flight cell and release the map
+        // lock immediately — the load-and-GC I/O below must not run while holding
+        // it, or one dataset's slow or unavailable connection would serialize
+        // every other dataset's initialization behind this connector.
         let key = dataset.name.to_string();
-        let mut cache = self.write_back_registries.lock().await;
-        if let Some(existing) = cache.get(&key) {
-            return Some(Ok(Arc::clone(existing)));
-        }
-        let registry =
-            match replication::load_write_back_xid_registry(&self.params, dataset, context).await {
-                Ok(registry) => registry,
-                Err(e) => return Some(Err(e)),
-            };
-        // Reconcile stale entries against the source before the registry is shared,
-        // so a wrapped-around or aborted-delivery entry cannot suppress an unrelated
-        // change. Best-effort: never blocks setup.
-        replication::run_write_back_registry_gc(
-            &self.pool,
-            &self.params,
-            dataset,
-            context,
-            &registry,
-        )
-        .await;
-        cache.insert(key, Arc::clone(&registry));
-        Some(Ok(registry))
+        let cell = {
+            let mut cache = self.write_back_registries.lock().await;
+            Arc::clone(
+                cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+
+        let result = cell
+            .get_or_try_init(|| async {
+                let registry =
+                    replication::load_write_back_xid_registry(&self.params, dataset, context)
+                        .await?;
+                // Reconcile stale entries against the source before the registry
+                // is shared. A failure here must not activate an unvalidated
+                // registry for either the delivery path or the pump — it aborts
+                // initialization (nothing is cached, so a later call retries)
+                // rather than continuing best-effort.
+                replication::run_write_back_registry_gc(
+                    &self.pool,
+                    &self.params,
+                    dataset,
+                    context,
+                    &registry,
+                )
+                .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(registry)
+            })
+            .await;
+        Some(result.map(Arc::clone))
     }
 }
 
@@ -1102,7 +1123,7 @@ async fn build_write_back_deliverer(
         .pool
         .connect_direct()
         .await
-        .map_err(|e| setup_error(Box::new(e)))?;
+        .map_err(|e| setup_error(e))?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
@@ -1293,9 +1314,12 @@ impl DataConnector for Postgres {
     ) -> Option<data_components::cdc::ChangesStream> {
         // Hand the pump the same registry the delivery path registers into (only
         // for a durable-write-back dataset), so it can drop the echo of each
-        // write-back transaction. `None` for every other dataset — nothing is
-        // filtered. A registry that failed to set up degrades the same way: the
-        // pump just does not filter for this dataset, logged so it is visible.
+        // write-back transaction. `None` for every other dataset — nothing needs
+        // filtering. A durable-write-back dataset whose registry failed to set up
+        // must NOT fall back to an unfiltered stream — that would replay its own
+        // write-back echoes into the accelerator, the exact corruption this
+        // feature exists to prevent. No stream at all is the safe degradation:
+        // logged here, and retried whenever setup for this dataset runs again.
         let write_back_registry = match self.write_back_xid_registry(context, dataset).await {
             None => None,
             Some(Ok(registry)) => Some(registry),
@@ -1303,10 +1327,10 @@ impl DataConnector for Postgres {
                 tracing::warn!(
                     dataset = %dataset.name,
                     error = %e,
-                    "durable write-back for dataset '{}' could not set up its change-echo suppression registry, so the CDC pump will not filter its own write-back echoes for this dataset",
+                    "durable write-back for dataset '{}' could not set up its change-echo suppression registry; no CDC stream is started for it this pass rather than risk replaying its own write-back echoes",
                     dataset.name
                 );
-                None
+                return None;
             }
         };
         Some(

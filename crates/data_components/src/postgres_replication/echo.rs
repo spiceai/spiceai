@@ -398,20 +398,35 @@ impl XidRegistry {
         }
     }
 
-    /// Drop every entry whose observed commit LSN the durable applied position has
-    /// now reached. This is the only steady-state removal path.
+    /// Drop every entry the durable applied position has now provably consumed.
+    /// This is the only steady-state removal path, so it applies both rules
+    /// [`gc`](Self::gc) uses to recognize a consumed echo:
     ///
-    /// Entries without an `observed_commit_lsn` are left untouched — their echo has
-    /// not yet been seen, so the durable floor passing an LSN says nothing about
-    /// them. Best-effort persistence: a persistence failure leaves the entry on disk
-    /// to be re-pruned (its echo is already consumed, so no echo re-arrives).
+    /// 1. An **observed** commit LSN at or below the floor — the pump saw the
+    ///    echo's `Commit` and the applied position has since passed it.
+    /// 2. A `commit_lsn_upper_bound` at or below the floor, even with no
+    ///    observed commit — a delivery whose echo affects zero rows (for
+    ///    example an absent-key `DELETE` that matches nothing at the source)
+    ///    never appears in the change stream, so `observed_commit_lsn` never
+    ///    gets set; without this rule such an entry survives every steady-state
+    ///    prune and waits on the once-per-process startup [`gc`](Self::gc),
+    ///    risking a 32-bit xid-wraparound collision on a long-lived process.
+    ///
+    /// An entry with neither field set is left untouched — nothing here says
+    /// whether its echo is still pending. Best-effort persistence: a
+    /// persistence failure leaves the entry on disk to be re-pruned (it is
+    /// already consumed, so no echo re-arrives).
     pub async fn prune_acked(&self, durably_applied_lsn: u64) {
         let mut guard = self.state.lock().await;
         let before = guard.entries.len();
         guard.entries.retain(|_, entry| {
-            entry
+            let observed_consumed = entry
                 .observed_commit_lsn
-                .is_none_or(|commit_lsn| commit_lsn > durably_applied_lsn)
+                .is_some_and(|commit_lsn| commit_lsn <= durably_applied_lsn);
+            let upper_bound_consumed = entry
+                .commit_lsn_upper_bound
+                .is_some_and(|upper_bound| upper_bound <= durably_applied_lsn);
+            !(observed_consumed || upper_bound_consumed)
         });
         if guard.entries.len() != before {
             self.rebuild_mirror(&guard.entries);

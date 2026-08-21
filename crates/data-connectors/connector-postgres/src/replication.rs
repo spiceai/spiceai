@@ -218,49 +218,36 @@ pub(crate) async fn load_write_back_xid_registry(
 /// aborted delivery, a lost unregister, or an entry stranded far behind the
 /// server is dropped rather than lingering into a 32-bit xid wraparound.
 ///
-/// Best-effort: a resolution failure is logged and leaves the entries in place
-/// (steady-state pruning still bounds them); it never blocks or fails setup.
+/// # Errors
+///
+/// Returns an error if a connection cannot be opened, the server version cannot
+/// be read, or the current transaction id cannot be resolved. Each of these is
+/// an input `gc` needs to be sound, so the caller must not cache or activate an
+/// unvalidated registry on failure — running unreconciled would risk suppressing
+/// a genuine, unrelated transaction via a stale entry. A single entry's own
+/// `pg_xact_status` lookup failing is not one of these inputs: it degrades that
+/// one entry to [`XactStatus::Unknown`] and continues, since the epoch-distance
+/// safety valve still bounds it.
 pub(crate) async fn run_write_back_registry_gc(
     pool: &Arc<PostgresConnectionPool>,
     params: &Parameters,
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
     registry: &Arc<XidRegistry>,
-) {
-    let dataset_name = dataset.name.to_string();
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let outstanding = registry.outstanding_xid8s().await;
     if outstanding.is_empty() {
         // Nothing to reconcile, so skip the server round trip entirely.
-        return;
+        return Ok(());
     }
 
-    let db = match pool.connect_direct().await {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                error = %e,
-                "durable write-back for dataset '{dataset_name}' could not open a connection to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
-            );
-            return;
-        }
-    };
+    let db = pool.connect_direct().await?;
 
-    let server_version_num: i32 = match db
+    let server_version_num: i32 = db
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
-        .await
-    {
-        Ok(row) => row.get(0),
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                error = %e,
-                "durable write-back for dataset '{dataset_name}' could not read the source server version to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
-            );
-            return;
-        }
-    };
+        .await?
+        .get(0);
     // `pg_xact_status`/`pg_snapshot_xmax` are PG13+; PG10-12 use the `txid_*`
     // equivalents (same semantics). `pg_snapshot_xmax` reads the current xid8
     // without assigning one, so garbage collection never consumes an xid.
@@ -277,18 +264,9 @@ pub(crate) async fn run_write_back_registry_gc(
         )
     };
 
-    let current_xid8 = match read_u64_text(&db.conn, current_xid_sql).await {
-        Ok(value) => value,
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                error = %e,
-                "durable write-back for dataset '{dataset_name}' could not read the source's current transaction id to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
-            );
-            return;
-        }
-    };
+    let current_xid8 = read_u64_text(&db.conn, current_xid_sql).await?;
 
+    let dataset_name = dataset.name.to_string();
     let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
     for xid8 in outstanding {
         // Bind the id as its decimal text and cast in SQL (`$1::xid8` /
@@ -320,6 +298,7 @@ pub(crate) async fn run_write_back_registry_gc(
     let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
 
     registry.gc(&statuses, current_xid8, applied_lsn).await;
+    Ok(())
 }
 
 /// Read a single decimal `u64` returned as text (used for xid8 values, whose
