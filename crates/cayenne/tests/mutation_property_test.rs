@@ -437,8 +437,13 @@ async fn settle(table: &Arc<CayenneTableProvider>, durability: Durability) -> Te
     table.flush_pending_maintenance().await?;
     if durability == Durability::Memory {
         table.checkpoint_mem_tier().await?;
-        let _ = table.bake_seq_prefix_protected_snapshots().await?;
     }
+    // Unconditional: the bake gates itself on key-mode deletion (it re-checks
+    // `should_capture_positions` / `is_position_based` and early-outs otherwise),
+    // NOT on durability. Running it only under memory durability left every
+    // file-durability config never attempting one, so the seq-prefix rewrite went
+    // entirely unexercised by this harness on 16 of its 18 configs.
+    let _ = table.bake_seq_prefix_protected_snapshots().await?;
     table.maybe_compact_small_files().await?;
     Ok(())
 }
@@ -457,8 +462,9 @@ async fn settle_protected_maintenance_only(
     table.flush_pending_maintenance().await?;
     if durability == Durability::Memory {
         table.checkpoint_mem_tier().await?;
-        let _ = table.bake_seq_prefix_protected_snapshots().await?;
     }
+    // Unconditional — see `settle`.
+    let _ = table.bake_seq_prefix_protected_snapshots().await?;
     table.compact_protected_snapshots_subset(usize::MAX).await?;
     Ok(())
 }

@@ -19038,6 +19038,24 @@ impl CayenneTableProvider {
     /// `run_compaction_trigger`.
     #[doc(hidden)]
     pub async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        self.bake_seq_prefix_protected_snapshots_with_shape(
+            super::compaction::per_file_bake_concurrency(),
+        )
+        .await
+    }
+
+    /// Drive a bake with an EXPLICIT rewrite shape, bypassing the environment.
+    ///
+    /// `per_file` is `Some(concurrency)` for the per-file shape, `None` for the
+    /// union. Exposed (hidden) so a test can exercise both shapes in ONE process and
+    /// assert they agree: the environment knob is a process-global `LazyLock`, so an
+    /// env-only switch can never be A/B'd in-process, and a test that merely *hoped*
+    /// the configured shape was reached would pass without exercising it.
+    #[doc(hidden)]
+    pub async fn bake_seq_prefix_protected_snapshots_with_shape(
+        &self,
+        per_file: Option<usize>,
+    ) -> Result<bool> {
         let pass_start = std::time::Instant::now();
         // Boxed so the whole bake body lives on the heap rather than in the caller's
         // frame. This is one of the largest async fns in the crate, and its future is
@@ -19046,7 +19064,7 @@ impl CayenneTableProvider {
         // put a `#[tokio::test(flavor = "multi_thread")]` worker over the default 2 MiB
         // stack; issue #12436 records the same budget for neighbouring tests in this
         // family. One allocation per pass on a background path.
-        let result = Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await;
+        let result = Box::pin(self.bake_seq_prefix_protected_snapshots_inner(per_file)).await;
 
         // Count only passes that did real work (committed a bake merge) or attempted
         // one and failed, matching the subset path's convention
@@ -19426,7 +19444,10 @@ impl CayenneTableProvider {
         }
     }
 
-    async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
+    async fn bake_seq_prefix_protected_snapshots_inner(
+        &self,
+        per_file: Option<usize>,
+    ) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
         // against writers — neither is the seq-prefix bake's domain.
@@ -19681,9 +19702,7 @@ impl CayenneTableProvider {
             bytes
         };
 
-        let write_result = if let Some(concurrency) =
-            super::compaction::per_file_bake_concurrency()
-        {
+        let write_result = if let Some(concurrency) = per_file {
             self.bake_rewrite_per_file(
                 &state,
                 &selected,
@@ -27817,8 +27836,16 @@ impl CayenneTableProvider {
     /// whole point: parallelism comes from running many of these concurrently, not
     /// from splitting one.
     ///
-    /// Statistics are reported unknown. They only steer planning heuristics here;
-    /// the file's true row count comes back from the write.
+    /// Statistics are reported unknown, which is conservative rather than free:
+    /// `int64_branch_disjoint_from_deletions` reads `partition_statistics` to skip
+    /// the deletion filter entirely when a branch's Int64 PK range cannot intersect
+    /// any deleted key, and unknown stats mean that skip never fires — so an
+    /// Int64-PK table probes every row here where the union shape might have skipped
+    /// a whole branch. Never unsound (it only ever adds probing), and a no-op for
+    /// composite PKs, which have no branch range to compare. Populating real
+    /// per-file ranges costs one Vortex footer open against a file this pass is
+    /// about to read in full, so it is cheap to add if an Int64-PK table measures
+    /// worse.
     async fn create_single_file_rewrite_scan_plan(
         &self,
         state: &dyn Session,
@@ -40749,6 +40776,87 @@ mod tests {
     fn install_int64_deletes(provider: &CayenneTableProvider, deletes: &[(i64, i64)]) {
         let index = DeletionIndex::from_map(deletes.iter().copied().collect::<HashMap<i64, i64>>());
         store_int64_tombstones(provider, index);
+    }
+
+    /// PER-FILE REWRITE EQUIVALENCE. The per-file rewrite shape must produce the
+    /// SAME live rows and the SAME pruned deletion index as the union shape, on
+    /// byte-identical input.
+    ///
+    /// Both shapes are driven through
+    /// [`CayenneTableProvider::bake_seq_prefix_protected_snapshots_with_shape`]
+    /// rather than the `SPICE_CAYENNE_PER_FILE_BAKE` environment knob, because that
+    /// knob is a process-global `LazyLock`: an env-driven test could not A/B the two
+    /// shapes in one process, and — worse — would silently pass while exercising
+    /// only whichever shape the environment happened to select.
+    ///
+    /// Two fixtures rather than one re-baked twice: a bake is not idempotent (it
+    /// consumes its inputs and prunes the index), so the second shape has to start
+    /// from the same initial state, not from the first shape's output.
+    #[tokio::test]
+    async fn seq_prefix_bake_per_file_matches_union() {
+        const SEQS: [i64; 5] = [10, 20, 30, 40, 50];
+        // Key 0 (written at 10) is deleted at 15, inside the baked prefix (T = 20),
+        // so a shape that fails to apply the filter resurrects it. Key 3 is deleted
+        // at 45, ABOVE T, so its tombstone must SURVIVE both shapes.
+        const DELETES: [(i64, i64); 2] = [(0, 15), (3, 45)];
+
+        let ctx = SessionContext::new();
+        let mut observed = Vec::new();
+        for (label, per_file) in [("union", None), ("per_file", Some(4usize))] {
+            let (provider, _tmp, _ids) =
+                build_seq_prefix_fixture(label, ctx.runtime_env(), &SEQS).await;
+            install_int64_deletes(&provider, &DELETES);
+
+            let baked = provider
+                .bake_seq_prefix_protected_snapshots_with_shape(per_file)
+                .await
+                .expect("bake should not error");
+            assert!(baked, "{label}: the older prefix must bake (>= 2 snapshots)");
+
+            let rows = collect_id_value_pairs(&ctx, &provider, label).await;
+            let tombstones = int64_tombstones(&provider);
+            let mut surviving: Vec<(i64, i64)> = DELETES
+                .iter()
+                .filter_map(|(key, _)| {
+                    tombstones
+                        .get(*key)
+                        .map(|t| (*key, t.delete_sequence))
+                })
+                .collect();
+            surviving.sort_unstable();
+            observed.push((label, rows, surviving, tombstones.delete_len()));
+        }
+
+        let (_, union_rows, union_tombstones, union_len) = &observed[0];
+        let (_, per_file_rows, per_file_tombstones, per_file_len) = &observed[1];
+
+        // The shapes must agree with each other...
+        assert_eq!(
+            per_file_rows, union_rows,
+            "per-file and union rewrites must yield identical live rows"
+        );
+        assert_eq!(
+            per_file_tombstones, union_tombstones,
+            "per-file and union rewrites must retain identical tombstones"
+        );
+        assert_eq!(
+            per_file_len, union_len,
+            "per-file and union rewrites must prune the index to the same length"
+        );
+
+        // ...and both must agree with what the workload actually means, so the test
+        // still fails if BOTH shapes regress the same way.
+        assert_eq!(
+            union_rows,
+            &vec![(1, 10), (2, 20), (4, 40)],
+            "key 0 stays deleted (tombstone <= T applied), key 3 stays hidden by its \
+             surviving > T tombstone, the rest survive"
+        );
+        assert_eq!(
+            union_tombstones,
+            &vec![(3, 45)],
+            "only the > T tombstone survives the prune"
+        );
     }
 
     /// STAGE-2 DELIVERABLE TEST (1). After a bake, a tombstone with
