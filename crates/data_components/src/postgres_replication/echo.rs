@@ -345,6 +345,24 @@ impl XidRegistry {
         }
     }
 
+    /// Remove a single entry eagerly — the unregister path for a delivery whose
+    /// `COMMIT` the source *unambiguously* aborted, so no echo will ever arrive
+    /// (a retry registers a fresh xid). A missing entry is ignored.
+    ///
+    /// Reserved for a definite server-side rollback: an ambiguous failure (a
+    /// connection drop mid-`COMMIT`) must **not** call this, because the
+    /// transaction may have committed and its echo is still coming — startup
+    /// [`gc`](Self::gc) resolves that case instead. Best-effort persistence: on
+    /// failure the entry stays on disk and GC re-resolves it from
+    /// `pg_xact_status`.
+    pub async fn unregister(&self, xid8: u64) {
+        let mut guard = self.state.lock().await;
+        if guard.entries.remove(&xid8).is_some() {
+            self.rebuild_mirror(&guard.entries);
+            self.persist_or_warn(&guard.entries).await;
+        }
+    }
+
     /// Hot-path membership test for the pump, once per source transaction.
     ///
     /// Reads only the low-32-bit mirror, never the async state lock or the store, so

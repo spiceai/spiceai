@@ -3194,6 +3194,15 @@ impl DataFusion {
             }
             AcceleratedWriteMode::WriteBack => {
                 accelerated_table_builder.write_back();
+                // Give the delivery worker a connector-owned deliverer when the
+                // source provides one (Postgres owns each delivery transaction so
+                // it can stamp its id for the CDC echo filter). `None` keeps the
+                // worker's `TableProvider` delivery unchanged. A non-durable or
+                // non-Postgres source returns `None` here without connecting.
+                let write_back_deliverer = source
+                    .write_back_deliverer(&RuntimeConnectorContext::for_dataset(dataset), dataset)
+                    .await;
+                accelerated_table_builder.write_back_deliverer(write_back_deliverer);
             }
             AcceleratedWriteMode::WriteThrough => {
                 // Source-sync write; the accelerator catches up through the refresh

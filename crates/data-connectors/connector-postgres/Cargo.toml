@@ -24,6 +24,8 @@ description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
 linkme.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 serde.workspace = true

@@ -4864,6 +4864,8 @@ dependencies = [
 name = "connector-postgres"
 version = "2.2.0-unstable"
 dependencies = [
+ "arrow",
+ "arrow-schema",
  "async-stream",
  "async-trait",
  "data-connector-api",

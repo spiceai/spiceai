@@ -30,7 +30,7 @@ use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotM
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream,
+    SchemaEvolutionPolicy, XidRegistry, config, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
@@ -163,6 +163,54 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
         // what the slot can supply resolves to a rebuild, which is what clearing
         // is for.
         self.save(AppliedLsn { lsn: 0 }).await
+    }
+}
+
+/// Load the outstanding-write-back-transaction registry for a dataset.
+///
+/// The registry persists into `spice_sys_postgres_write_back_xids`, a sibling of
+/// the applied-LSN watermark in the dataset's own accelerator, keyed by the same
+/// [`source_identity`] so a repointed accelerator discards a foreign set. This is
+/// the single construction site: the deliverer takes the returned `Arc`, and a
+/// follow-up can hand the *same* `Arc` to the replication member registration for
+/// the pump's echo filter.
+///
+/// `None` when there is no usable accelerator connection to persist into, or the
+/// connection params cannot be parsed — the caller then disables connector-owned
+/// delivery for the dataset and falls back to the worker's `TableProvider` path.
+pub(crate) async fn load_write_back_xid_registry(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> Option<Arc<XidRegistry>> {
+    let dataset_name = dataset.name.to_string();
+    let repl_params = match replication_params_from_connector_params(params, &dataset_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                "durable write-back for dataset '{dataset_name}' could not resolve its source identity, so change-echo suppression is disabled for it: {e}"
+            );
+            return None;
+        }
+    };
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let identity = source_identity(&repl_params, &schema_name, &table_name);
+
+    let store = context
+        .blob_checkpoint_store(dataset, crate::write_back::WRITE_BACK_XID_TABLE)
+        .await?;
+
+    match XidRegistry::load(store, identity, dataset_name.clone()).await {
+        Ok(registry) => Some(registry),
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not load its change-echo suppression registry, so suppression is disabled for it until restart"
+            );
+            None
+        }
     }
 }
 

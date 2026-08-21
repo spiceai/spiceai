@@ -38,6 +38,7 @@ use runtime_parameters::ParameterSpec;
 use crate::accelerated::{AcceleratorSetup, RegisteredAcceleratedTable};
 use crate::federated::FederatedTableProvider;
 use crate::parameters::{ConnectorContext, ConnectorParams};
+use crate::write_back::WriteBackDeliverer;
 use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
@@ -319,6 +320,31 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// perfectly safe inner connector as unsafe and reject a valid dataset.
     fn supports_durable_write_back_delivery(&self) -> bool {
         false
+    }
+
+    /// A connector-owned durable write-back deliverer for `dataset`, or `None`
+    /// to keep the worker's `TableProvider`-driven delivery.
+    ///
+    /// A connector returns `Some` when it must own the transaction each delivery
+    /// runs in — `PostgreSQL` stamps every delivery transaction with its id so
+    /// the CDC pump can drop the echo it will later stream back, which it cannot
+    /// do from behind the `TableProvider`. See [`WriteBackDeliverer`].
+    ///
+    /// Defaults to `None`: the worker drives delivery through the source's
+    /// `TableProvider` exactly as before, so a connector that does not override
+    /// this is unaffected.
+    ///
+    /// **Wrappers must forward this.** Inheriting the default would report a
+    /// connector that owns its delivery as if it did not, silently dropping back
+    /// to the `TableProvider` path and, for `PostgreSQL`, never capturing the
+    /// transaction id the echo filter needs — the defaulted-no-op wrapper bug
+    /// (#10460) applied to this capability.
+    async fn write_back_deliverer(
+        &self,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
+    ) -> Option<Arc<dyn WriteBackDeliverer>> {
+        None
     }
 
     async fn metadata_provider(

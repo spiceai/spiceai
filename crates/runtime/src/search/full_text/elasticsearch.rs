@@ -272,6 +272,16 @@ impl DataConnector for ElasticsearchFullTextConnector {
         self.inner_connector.supports_durable_write_back_delivery()
     }
 
+    async fn write_back_deliverer(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<Arc<dyn data_connector_api::WriteBackDeliverer>> {
+        self.inner_connector
+            .write_back_deliverer(context, dataset)
+            .await
+    }
+
     async fn changes_stream(
         &self,
         context: &dyn ConnectorContext,

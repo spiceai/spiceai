@@ -57,12 +57,18 @@ use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef;
 use cayenne::CayenneTableProvider;
+use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
@@ -81,6 +87,10 @@ pub(crate) struct WriteBackWorker {
     /// the point scan observe committed state.
     provider: Arc<CayenneTableProvider>,
     federated: Arc<FederatedTable>,
+    /// Connector-owned delivery, when the source provides it (`PostgreSQL`, so it
+    /// can stamp each delivery transaction's id for the CDC echo filter). `None`
+    /// keeps the `TableProvider` delivery path below, byte-identical.
+    deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
@@ -93,11 +103,13 @@ impl WriteBackWorker {
         provider: CayenneTableProvider,
         federated: Arc<FederatedTable>,
         dataset_name: String,
+        deliverer: Option<Arc<dyn WriteBackDeliverer>>,
     ) -> JoinHandle<()> {
         let pk_columns = provider.pk_column_names();
         let worker = Self {
             provider: Arc::new(provider),
             federated,
+            deliverer,
             pk_columns,
             dataset_name,
         };
@@ -195,63 +207,97 @@ impl WriteBackWorker {
         let absent = absent_claimed_keys(pk_col, &pk_values, &current)?;
         let has_present = current.iter().any(|batch| batch.num_rows() > 0);
 
-        let federated_provider = self.federated.table_provider().await;
-
-        // Attempt a Upsert. If federated source does not support it `DataFusionError::NotImplemented`
-        // Fallback to delete and append.
-        let mut fallback_delivered = false;
-        if has_present {
-            match execute_insert(
-                Arc::clone(&federated_provider),
-                self.provider.table_schema(),
-                current.clone(),
-                InsertOp::Replace,
-                &session_state,
-                None,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if matches!(e, DataFusionError::NotImplemented(_)) => {
-                    tracing::warn!(
-                        dataset = %self.dataset_name,
-                        error = %e,
-                        "durable write-back: source does not support InsertOp::Replace; falling back to delete-then-insert delivery"
-                    );
-                    let _ = datafusion::physical_plan::collect(
-                        federated_provider
-                            .delete_from(&session_state, vec![filter])
-                            .await?,
-                        session_state.task_ctx(),
-                    )
-                    .await?;
-                    execute_insert(
-                        Arc::clone(&federated_provider),
-                        self.provider.table_schema(),
-                        current,
-                        InsertOp::Append,
-                        &session_state,
-                        None,
-                    )
-                    .await?;
-                    // The blanket delete above already removed the absent keys, so
-                    // skip the absent-only delete below.
-                    fallback_delivered = true;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Absent keys → delete. Genuinely gone from the accelerator (the read did
-        // not return them), so this delete is correct rather than a blanket first
-        // step. Skipped when the fallback above already deleted every claimed key.
-        if !fallback_delivered && !absent.is_empty() {
-            let absent_filter = col(pk_col).in_list(absent.into_iter().map(lit).collect(), false);
-            let delete_plan = federated_provider
-                .delete_from(&session_state, vec![absent_filter])
+        if let Some(deliverer) = &self.deliverer {
+            // Connector-owned delivery (Postgres): the connector owns each
+            // delivery transaction so it can stamp the transaction id for the CDC
+            // echo filter. The upsert leg covers all present rows in one source
+            // transaction; the absent keys delete in their own. Both are
+            // idempotent, so a failed pass replays the whole thing.
+            if has_present {
+                // Match the `TableProvider` path's cast: the fallback below wraps
+                // the batches in `SchemaCastScanExec` to the source schema before
+                // insert, so the deliverer receives equivalently-cast rows. The
+                // deliverer reports the source schema so the worker need not
+                // resolve the federated `TableProvider`'s schema itself.
+                let cast = cast_batches_to(
+                    deliverer.target_schema(),
+                    self.provider.table_schema(),
+                    current.clone(),
+                    &session_state,
+                )
                 .await?;
-            let _ =
-                datafusion::physical_plan::collect(delete_plan, session_state.task_ctx()).await?;
+                deliverer
+                    .deliver_upserts(cast)
+                    .await
+                    .map_err(delivery_to_df_err)?;
+            }
+            if !absent.is_empty() {
+                let keys = keys_to_array(absent)?;
+                deliverer
+                    .deliver_deletes(keys, pk_col)
+                    .await
+                    .map_err(delivery_to_df_err)?;
+            }
+        } else {
+            let federated_provider = self.federated.table_provider().await;
+
+            // Attempt a Upsert. If federated source does not support it `DataFusionError::NotImplemented`
+            // Fallback to delete and append.
+            let mut fallback_delivered = false;
+            if has_present {
+                match execute_insert(
+                    Arc::clone(&federated_provider),
+                    self.provider.table_schema(),
+                    current.clone(),
+                    InsertOp::Replace,
+                    &session_state,
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) if matches!(e, DataFusionError::NotImplemented(_)) => {
+                        tracing::warn!(
+                            dataset = %self.dataset_name,
+                            error = %e,
+                            "durable write-back: source does not support InsertOp::Replace; falling back to delete-then-insert delivery"
+                        );
+                        let _ = datafusion::physical_plan::collect(
+                            federated_provider
+                                .delete_from(&session_state, vec![filter])
+                                .await?,
+                            session_state.task_ctx(),
+                        )
+                        .await?;
+                        execute_insert(
+                            Arc::clone(&federated_provider),
+                            self.provider.table_schema(),
+                            current,
+                            InsertOp::Append,
+                            &session_state,
+                            None,
+                        )
+                        .await?;
+                        // The blanket delete above already removed the absent keys, so
+                        // skip the absent-only delete below.
+                        fallback_delivered = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Absent keys → delete. Genuinely gone from the accelerator (the read did
+            // not return them), so this delete is correct rather than a blanket first
+            // step. Skipped when the fallback above already deleted every claimed key.
+            if !fallback_delivered && !absent.is_empty() {
+                let absent_filter =
+                    col(pk_col).in_list(absent.into_iter().map(lit).collect(), false);
+                let delete_plan = federated_provider
+                    .delete_from(&session_state, vec![absent_filter])
+                    .await?;
+                let _ = datafusion::physical_plan::collect(delete_plan, session_state.task_ctx())
+                    .await?;
+            }
         }
 
         // Ack: clear only markers still at/below the claimed sequence.
@@ -312,4 +358,137 @@ fn absent_claimed_keys(
 )]
 fn to_df_err(e: cayenne::provider::Error) -> DataFusionError {
     DataFusionError::Execution(format!("durable write-back: {e}"))
+}
+
+/// Map a connector-owned delivery failure into the worker's error type. The
+/// worker only needs the message for its log and its retry backoff — a failed
+/// pass replays whole, so the variant is immaterial.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "passed to `Result::map_err`, which moves the error value in"
+)]
+fn delivery_to_df_err(e: data_connector_api::write_back::DeliveryError) -> DataFusionError {
+    DataFusionError::Execution(format!("durable write-back: {e}"))
+}
+
+/// Cast `batches` from `input_schema` to `target_schema`, collecting the result.
+///
+/// Mirrors [`execute_insert`]'s cast (`SchemaCastScanExec` to the source
+/// provider's schema) so the connector-owned deliverer receives rows shaped
+/// exactly as the `TableProvider` path would have inserted them — a type or
+/// column difference between the accelerator and the source is reconciled here,
+/// not left to fail mid-delivery.
+async fn cast_batches_to(
+    target_schema: SchemaRef,
+    input_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    session_state: &SessionState,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
+    let source: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        Arc::new(DataSourceExec::new(Arc::new(memory_source)));
+    let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        Arc::new(SchemaCastScanExec::new(source, target_schema));
+    datafusion::physical_plan::collect(input, session_state.task_ctx()).await
+}
+
+/// Build a single-column key array from the absent primary keys, for the
+/// deliverer's delete leg.
+fn keys_to_array(keys: Vec<ScalarValue>) -> DataFusionResult<ArrayRef> {
+    ScalarValue::iter_to_array(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absent_claimed_keys, keys_to_array, pk_in_filter};
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
+    use std::sync::Arc;
+
+    fn id_batch(ids: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))])
+            .expect("id batch builds")
+    }
+
+    /// Absent = claimed − present: keys the post-claim read did not return.
+    #[test]
+    fn absent_is_claimed_minus_present() {
+        let claimed: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+        // The read returned rows for 1 and 3 only.
+        let present = vec![id_batch(vec![1, 3])];
+
+        let absent = absent_claimed_keys("id", &claimed, &present).expect("partitions");
+        assert_eq!(
+            absent,
+            vec![ScalarValue::Int32(Some(2)), ScalarValue::Int32(Some(4))],
+            "only the keys absent from the read are returned, in claim order"
+        );
+    }
+
+    /// Every claimed key still present → nothing to delete.
+    #[test]
+    fn no_absent_keys_when_all_present() {
+        let claimed: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let present = vec![id_batch(vec![1, 2])];
+        let absent = absent_claimed_keys("id", &claimed, &present).expect("partitions");
+        assert!(
+            absent.is_empty(),
+            "no key is absent when all were read back"
+        );
+    }
+
+    /// An empty read → every claimed key is absent (all deleted at the source).
+    #[test]
+    fn all_absent_when_read_is_empty() {
+        let claimed: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![5, 6, 7]));
+        let present: Vec<RecordBatch> = vec![];
+        let absent = absent_claimed_keys("id", &claimed, &present).expect("partitions");
+        assert_eq!(absent.len(), 3, "all claimed keys are absent");
+    }
+
+    /// A missing primary-key column in the read is an error, not a silent
+    /// misclassification of every key as absent.
+    #[test]
+    fn missing_pk_column_in_read_is_an_error() {
+        let claimed: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Utf8, true)]));
+        let present = vec![
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![Some("x")]))])
+                .expect("batch"),
+        ];
+        absent_claimed_keys("id", &claimed, &present)
+            .expect_err("a missing pk column must error rather than delete every key");
+    }
+
+    /// The absent keys round-trip back into an array for the deliverer's delete
+    /// leg, preserving order and count.
+    #[test]
+    fn keys_to_array_round_trips_absent_scalars() {
+        let keys = vec![ScalarValue::Int32(Some(2)), ScalarValue::Int32(Some(4))];
+        let array = keys_to_array(keys).expect("array builds");
+        assert_eq!(array.len(), 2);
+        let ints = array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 array");
+        assert_eq!(ints.value(0), 2);
+        assert_eq!(ints.value(1), 4);
+    }
+
+    /// The delete filter is `pk IN (keys…)`, the same shape the fallback delete
+    /// builds.
+    #[test]
+    fn pk_in_filter_lists_the_keys() {
+        let values: arrow::array::ArrayRef = Arc::new(Int32Array::from(vec![8, 9]));
+        let expr = pk_in_filter("id", &values).expect("filter builds");
+        let rendered = format!("{expr}");
+        assert!(rendered.contains("id"), "names the pk column: {rendered}");
+        assert!(
+            rendered.contains('8') && rendered.contains('9'),
+            "lists the keys: {rendered}"
+        );
+    }
 }
