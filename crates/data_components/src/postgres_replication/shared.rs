@@ -2290,7 +2290,7 @@ async fn attach_member(
     // This member's own echo-drop registry, if it is a durable write-back
     // dataset (see `MemberMailboxReceiver::pop`) — cloned here because
     // `write_back_registry` itself is moved into `MemberHandle` below.
-    receiver.write_back_registry = write_back_registry.clone();
+    receiver.write_back_registry.clone_from(&write_back_registry);
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` below.)
     metrics.set_slot_name(source.key.slot_name.clone());
