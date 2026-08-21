@@ -103,12 +103,12 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
-use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -478,7 +478,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 }
 
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
-/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// process-wide [`runtime_tls::TlsControl`] to reload every TLS
 /// material the runtime is watching. Mirrors the `nginx -s reload` /
 /// `kill -HUP <pid>` convention.
 ///
@@ -491,7 +491,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 ///
 /// On Windows or other targets without SIGHUP semantics this is a
 /// no-op: rotation still works via the polling filesystem watcher.
-fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime_tls::TlsControl>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -727,7 +727,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // callbacks here so we have one watcher, one dispatcher thread, one
     // SIGHUP target. Created lazily on success of `TlsControl::new`; if
     // the watcher fails to spawn we surface the error eagerly.
-    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+    let tls_control = std::sync::Arc::new(runtime_tls::TlsControl::new().map_err(|e| {
         Error::UnableToInitializeTls {
             source: Box::new(e),
         }
@@ -761,7 +761,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
-        Some(runtime::metrics_reader::MetricsReader::new())
+        Some(telemetry::metrics_reader::MetricsReader::new())
     } else {
         None
     };
@@ -777,7 +777,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // already loaded and validated while building the app, and that same
     // decision gates log capture.
     let cloud_connect_metrics = if cloud_connect_configured {
-        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+        Some(telemetry::metrics_reader::MetricsReader::new_cumulative())
     } else {
         None
     };
@@ -1648,9 +1648,9 @@ struct MetricsInit<'a> {
     otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     /// On-demand reader for cluster metrics collection.
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     /// On-demand reader for the metrics pushed over Cloud Connect.
-    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    cloud_connect_metrics: Option<telemetry::metrics_reader::MetricsReader>,
     /// `runtime.telemetry.properties`, as dimensions on every exported metric.
     resource_attributes: Vec<KeyValue>,
     /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.

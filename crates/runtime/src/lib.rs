@@ -71,9 +71,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use status::ComponentStatus;
-use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -100,7 +100,6 @@ pub(crate) mod drasi;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
 pub use runtime_table::federated;
@@ -115,7 +114,6 @@ mod init;
 pub mod internal_table;
 pub mod jobs;
 mod management;
-pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
@@ -133,7 +131,6 @@ pub mod resource_monitor {
 // layering guard cannot see a path that hides inside a legal crate-level edge.
 pub(crate) use runtime_parameters as parameters;
 
-pub mod podswatcher;
 pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
@@ -149,10 +146,8 @@ mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
-pub mod tls;
 pub mod token_providers;
 pub mod tools;
-pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;
 mod view;
@@ -640,7 +635,7 @@ pub struct Runtime {
     prometheus_registry: Option<prometheus::Registry>,
     /// On-demand metrics reader for cluster observability.
     /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
-    metrics_reader: Option<metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
@@ -1235,7 +1230,7 @@ impl Runtime {
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
     #[must_use]
-    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+    pub fn metrics_reader(&self) -> Option<&telemetry::metrics_reader::MetricsReader> {
         self.metrics_reader.as_ref()
     }
 
@@ -1418,7 +1413,7 @@ impl Runtime {
                     Arc::new(move || {
                         metrics_reader_for_collector
                             .as_ref()
-                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .map(telemetry::metrics_reader::MetricsReader::collect_otlp)
                             .unwrap_or_default()
                     });
                 (

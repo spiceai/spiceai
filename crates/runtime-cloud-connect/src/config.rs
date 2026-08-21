@@ -82,9 +82,9 @@ pub const DEFAULT_TELEMETRY_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Default cadence for `ExportMetrics` frames on an established stream.
 ///
-/// Matches the heartbeat cadence: the payload carries cumulative totals, so the
-/// interval sets chart resolution rather than what is or is not recorded.
-pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(30);
+/// The payload carries cumulative totals, so the interval sets chart resolution
+/// rather than what is or is not recorded.
+pub const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default ceiling on a single `ExecuteQuery`.
 ///

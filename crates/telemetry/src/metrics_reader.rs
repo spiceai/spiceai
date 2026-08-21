@@ -57,7 +57,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Add this reader to your `SdkMeterProvider`:
 ///
 /// ```ignore
-/// use runtime::metrics_reader::MetricsReader;
+/// use telemetry::metrics_reader::MetricsReader;
 /// use opentelemetry_sdk::metrics::SdkMeterProvider;
 ///
 /// let metrics_reader = MetricsReader::new();
