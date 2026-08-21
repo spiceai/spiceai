@@ -1096,7 +1096,7 @@ impl DataConnector for Postgres {
         // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
         // PG10–12 equivalent. Read the server version at setup so delivery does
         // not re-decide per pass.
-        let mut conn = match self.pool.connect_direct().await {
+        let conn = match self.pool.connect_direct().await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::warn!(

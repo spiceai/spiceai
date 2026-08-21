@@ -241,7 +241,7 @@ pub(crate) async fn run_write_back_registry_gc(
         return;
     }
 
-    let mut db = match pool.connect_direct().await {
+    let db = match pool.connect_direct().await {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(
