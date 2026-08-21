@@ -488,7 +488,8 @@ impl PgChangeRows {
             }
         }
         if !dropped.is_empty() {
-            let (row_hint, byte_len) = Self::compute_hints(&self.schema, kept_chunks.iter().flatten());
+            let (row_hint, byte_len) =
+                Self::compute_hints(&self.schema, kept_chunks.iter().flatten());
             self.raw_chunks = kept_chunks;
             self.chunk_xids = kept_xids;
             self.row_hint = row_hint;

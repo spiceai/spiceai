@@ -851,7 +851,7 @@ mod tests {
             registry.register(555).await.expect("register 555");
         }
         // Reload under a different source identity.
-        let store_dyn: Arc<dyn BlobCheckpointStore> = Arc::clone(&store);
+        let store_dyn: Arc<dyn BlobCheckpointStore> = Arc::<FakeBlobStore>::clone(&store);
         let reloaded = XidRegistry::load(
             store_dyn,
             "otherhost:5432/db/public.orders".to_string(),

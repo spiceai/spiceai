@@ -4268,8 +4268,13 @@ async fn deliver_commit(
         // this shared per-commit loop — a member with no registry never matches,
         // so a non-write-back dataset pays only the tag itself (an `Option<u32>`
         // copy), never a lookup.
-        let rows = PgChangeRows::new(Arc::clone(working_schema), Arc::clone(rel), raw, commit_ts_ms)
-            .with_source_xid(current_txn_xid);
+        let rows = PgChangeRows::new(
+            Arc::clone(working_schema),
+            Arc::clone(rel),
+            raw,
+            commit_ts_ms,
+        )
+        .with_source_xid(current_txn_xid);
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
         // its source commit time is within the member's `ready_lag` of now, i.e.
