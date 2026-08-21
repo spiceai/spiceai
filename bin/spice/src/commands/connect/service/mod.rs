@@ -16,7 +16,7 @@ limitations under the License.
 
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
 
-//! `spice connect service`: run `spiced` as a persistent service for an
+//! `spice cloud service`: run `spiced` as a persistent service for an
 //! enrolled instance directory, and manage its lifecycle.
 //!
 //! A deployment applies to the running instance and never ends its process, so
@@ -86,8 +86,8 @@ use sha2::{Digest as _, Sha256};
 use crate::error::{Error, Result};
 
 pub(crate) use backend::{InstallRequest, LogRequest, ServiceBackend, for_host as backend};
-pub(crate) use manifest::{ServiceManifest, ServiceOwner};
-pub(crate) use model::{ServiceScope, ServiceState, ServiceStatus};
+pub(crate) use manifest::{PinnedConfigDir, ServiceManifest, ServiceOwner};
+pub(crate) use model::{ServiceScope, ServiceStatus};
 
 /// Longest directory-name fragment carried into a service name, so a deeply-named
 /// instance directory cannot produce an unwieldy name. The appended digest is
@@ -167,7 +167,7 @@ fn service_account(instance_dir: &Path, root_fallback: RootFallback) -> Result<S
             return Ok(ServiceAccount { uid, gid });
         }
         return Err(Error::InvalidArgument {
-            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice connect service install`.".to_string(),
+            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice cloud service install`.".to_string(),
         });
     }
 
@@ -192,7 +192,7 @@ fn service_account(instance_dir: &Path, root_fallback: RootFallback) -> Result<S
 
     Err(Error::InvalidArgument {
         message: format!(
-            "Failed to install the Spice Cloud Connect service: {} is owned by uid {} and gid {}, so the account the service should run as cannot be determined. Give the directory to one account (`chown <user>:<group> {}`), or re-run the command from the intended operator account with `sudo spice connect service install`.",
+            "Failed to install the Spice Cloud Connect service: {} is owned by uid {} and gid {}, so the account the service should run as cannot be determined. Give the directory to one account (`chown <user>:<group> {}`), or re-run the command from the intended operator account with `sudo spice cloud service install`.",
             instance_dir.display(),
             metadata.uid(),
             metadata.gid(),
@@ -378,9 +378,9 @@ impl PreflightFailure {
             Self::SystemdUserManagerUnavailable => format!(
                 "Failed to install the Spice Cloud Connect service: this account has no systemd \
                  user manager to install a user service into (no {}). Log in as the account that \
-                 will run the instance and re-run `spice connect service install`, enable one for \
+                 will run the instance and re-run `spice cloud service install`, enable one for \
                  it (`sudo loginctl enable-linger <user>`), or install a host-wide service with \
-                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                 `sudo spice cloud service install`. See: https://spiceai.org/docs",
                 std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/<uid>".to_string())
             ),
             #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
@@ -396,9 +396,9 @@ impl PreflightFailure {
                 "Failed to install the Spice Cloud Connect service: this account has no macOS \
                  login session for a LaunchAgent to run in (launchd has no {domain} domain, which \
                  is normal over SSH or in a headless session). Log in to this Mac as {account} at \
-                 the desktop and re-run `spice connect service install`, or install a system \
+                 the desktop and re-run `spice cloud service install`, or install a system \
                  service that starts at boot without any login with \
-                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                 `sudo spice cloud service install`. See: https://spiceai.org/docs",
                 domain = launchd::gui_domain(),
                 account = account_name(nix::unistd::Uid::effective().as_raw())
                     .unwrap_or_else(|| format!("uid {}", nix::unistd::Uid::effective().as_raw())),
@@ -464,7 +464,12 @@ pub(crate) fn resolve(
     instance_dir: &Path,
     config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    resolve_with_state(backend, instance_dir, config_dir, config_dir)
+    resolve_with_state(
+        backend,
+        instance_dir,
+        &PinnedConfigDir::unlocked(config_dir),
+        config_dir,
+    )
 }
 
 /// Resolve a manifest through the retained state directory while comparing
@@ -472,14 +477,10 @@ pub(crate) fn resolve(
 pub(crate) fn resolve_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     service_config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    let loaded = if state_config_dir == service_config_dir {
-        ServiceManifest::load(state_config_dir, instance_dir, backend)?
-    } else {
-        ServiceManifest::load_from_pinned_directory(state_config_dir, instance_dir, backend)?
-    };
+    let loaded = ServiceManifest::load(state_config_dir, instance_dir, backend)?;
     if let Some(manifest) = loaded {
         validate_manifest_definition(backend, instance_dir, service_config_dir, &manifest)?;
         return Ok(Some(manifest));
@@ -683,7 +684,7 @@ pub(crate) fn install(
         backend,
         instance_dir,
         config_dir,
-        config_dir,
+        &PinnedConfigDir::unlocked(config_dir),
         spiced_path,
         runtime_version,
         health_url,
@@ -694,7 +695,7 @@ pub(crate) fn install_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     spiced_path: &Path,
     runtime_version: &str,
     health_url: &str,
@@ -832,7 +833,7 @@ fn probe_runtime_version(spiced: &Path, owner: &ServiceOwner) -> Result<String> 
         message: format!(
             "Failed to install the Spice Cloud Connect service: the runtime at {spiced} could \
              not be run to read its version: {source}. Check that it is executable by {account}, \
-             then re-run `spice connect service install`. See: https://spiceai.org/docs",
+             then re-run `spice cloud service install`. See: https://spiceai.org/docs",
             spiced = spiced.display(),
             account = owner
                 .name
@@ -890,7 +891,7 @@ fn ensure_same_domain(
     }
     let retry = match existing.scope {
         ServiceScope::System => format!(
-            "Re-run it as `sudo spice connect service install --dir {}`",
+            "Re-run it as `cd {} && sudo spice cloud service install`",
             instance_dir.display()
         ),
         ServiceScope::User => format!("Run it as {} without sudo", existing.owner.describe()),
@@ -900,7 +901,7 @@ fn ensure_same_domain(
             "Failed to install the Spice Cloud Connect service for {instance}: a {existing_scope} \
              service ({name}) is already installed for this directory, and this invocation would \
              install a {scope} one alongside it. {retry}, or remove the installed service first \
-             with `spice connect service uninstall`. Nothing was changed. \
+             with `spice cloud service uninstall`. Nothing was changed. \
              See: https://spiceai.org/docs",
             instance = instance_dir.display(),
             existing_scope = existing.scope,
@@ -950,7 +951,7 @@ fn ensure_name_unclaimed(
             message: format!(
                 "Failed to install the Spice Cloud Connect service for {instance}: the service \
                  definition {definition} already exists and {reason}. Remove or repair it, then \
-                 re-run `spice connect service install`. Nothing was changed. \
+                 re-run `spice cloud service install`. Nothing was changed. \
                  See: https://spiceai.org/docs",
                 instance = instance_dir.display(),
                 definition = path.display(),
@@ -996,8 +997,8 @@ fn definition_ownership_problem(
 /// Stop and remove the service for `instance_dir`, and forget it.
 ///
 /// Idempotent: a directory with no service succeeds and returns `None`. This
-/// is the one primitive both `spice connect service uninstall` and
-/// `spice connect remove` use, so they cannot diverge on which assets a
+/// is the one primitive both `spice cloud service uninstall` and
+/// `spice cloud unlink` use, so they cannot diverge on which assets a
 /// removal touches. What they do *not* share is identity: uninstall preserves
 /// the Cloud identity, and `remove` is the command that releases it.
 ///
@@ -1013,13 +1014,18 @@ pub(crate) fn uninstall(
     instance_dir: &Path,
     config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
-    uninstall_with_state(backend, instance_dir, config_dir, config_dir)
+    uninstall_with_state(
+        backend,
+        instance_dir,
+        &PinnedConfigDir::unlocked(config_dir),
+        config_dir,
+    )
 }
 
 pub(crate) fn uninstall_with_state(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
     service_config_dir: &Path,
 ) -> Result<Option<ServiceManifest>> {
     let Some(manifest) =
@@ -1038,7 +1044,7 @@ pub(crate) fn uninstall_with_state(
 pub(crate) fn uninstall_resolved(
     backend: &dyn ServiceBackend,
     manifest: &ServiceManifest,
-    state_config_dir: &Path,
+    state_config_dir: &PinnedConfigDir,
 ) -> Result<()> {
     backend.uninstall(manifest)?;
     manifest.remove(state_config_dir)
@@ -1178,7 +1184,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                  The runtime staging is managed by root, so it must use a real, root-owned \
                  directory. Replace the symlink with a directory owned by root \
                  (`chown root {dir}`, `chmod 755 {dir}`) and re-run \
-                 `sudo spice connect service install`.",
+                 `sudo spice cloud service install`.",
                 dir = dir.display()
             ),
         });
@@ -1200,7 +1206,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                     "Failed to install the Spice Cloud Connect service: {component} is owned by uid {uid} with mode {mode:04o}, \
                      so a non-root user can change what the service executes as root. Restrict it \
                      (`sudo chown root {component}` and `sudo chmod go-w {component}`) and re-run \
-                     `sudo spice connect service install`.",
+                     `sudo spice cloud service install`.",
                     component = component.display(),
                     uid = meta.uid(),
                     mode = mode & 0o7777,
@@ -1263,7 +1269,7 @@ fn ensure_account_only_dir(dir: &Path) -> Result<()> {
                  a real directory owned by this account (uid {uid}) that no other account can \
                  write, so the runtime the service executes cannot be replaced behind it. Fix it \
                  (`chown {uid} {dir}` and `chmod go-w {dir}`) and re-run \
-                 `spice connect service install`.",
+                 `spice cloud service install`.",
                 dir = dir.display(),
             ),
         });
@@ -1651,7 +1657,7 @@ mod tests {
         // A host with no user manager still has a way to install: say which.
         let no_manager = PreflightFailure::SystemdUserManagerUnavailable.message();
         assert!(
-            no_manager.contains("sudo spice connect service install"),
+            no_manager.contains("sudo spice cloud service install"),
             "{no_manager}"
         );
         assert!(no_manager.contains("enable-linger"), "{no_manager}");
@@ -1711,9 +1717,13 @@ mod tests {
         assert_eq!(manifest.directory, instance_dir);
         assert_eq!(manifest.runtime_version, "v2.2.0");
         assert_eq!(
-            ServiceManifest::load(&config_dir, &instance_dir, &fake)
-                .expect("load")
-                .as_ref(),
+            ServiceManifest::load(
+                &PinnedConfigDir::unlocked(&config_dir),
+                &instance_dir,
+                &fake
+            )
+            .expect("load")
+            .as_ref(),
             Some(&manifest)
         );
 
@@ -1860,15 +1870,13 @@ mod tests {
                 .expect_err("a domain switch must be refused");
             assert!(error.to_string().contains("already installed"), "{error}");
             assert!(
-                error
-                    .to_string()
-                    .contains("spice connect service uninstall"),
+                error.to_string().contains("spice cloud service uninstall"),
                 "{error}"
             );
             // The retry is the operator's to run, never an elevation Spice
             // performs for them.
             let expected_retry = match existing {
-                ServiceScope::System => "sudo spice connect service install",
+                ServiceScope::System => "sudo spice cloud service install",
                 ServiceScope::User => "without sudo",
             };
             assert!(error.to_string().contains(expected_retry), "{error}");
@@ -2089,7 +2097,7 @@ mod tests {
     /// supervisor.
     fn write_manifest_for(backend: &FakeBackend, instance_dir: &Path, config_dir: &Path) {
         manifest_for(backend, instance_dir)
-            .write(config_dir)
+            .write(&PinnedConfigDir::unlocked(config_dir))
             .expect("write manifest");
     }
 
@@ -2111,11 +2119,12 @@ mod tests {
         );
     }
 
-    /// Only Linux pins the locked directory by descriptor
-    /// (`/proc/self/fd/<n>`); elsewhere `descriptor_relative_config_dir`
-    /// falls back to the pathname, so the redirection this rules out is not
-    /// ruled out there. The guarantee is scoped the same way the mechanism is.
-    #[cfg(target_os = "linux")]
+    /// A privileged uninstall applies to the instance its lock was taken for.
+    /// The locked directory is named by the descriptor the lock retains, so
+    /// this holds on every Unix — including where `/proc/self/fd` cannot be
+    /// traversed and a pathname would be re-resolved after the lock's identity
+    /// check.
+    #[cfg(unix)]
     #[tokio::test]
     async fn locked_uninstall_cannot_be_redirected_by_config_path_replacement() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -2130,9 +2139,12 @@ mod tests {
         )
         .await
         .expect("acquire mutation lock");
-        let state_config_dir = mutation_lock
-            .descriptor_relative_config_dir()
-            .expect("pin state directory");
+        let state_config_dir = PinnedConfigDir::locked(
+            config_dir.clone(),
+            mutation_lock
+                .pinned_directory()
+                .expect("retain the locked directory"),
+        );
         let moved_config_dir = instance_dir.join("locked-spice");
         std::fs::rename(&config_dir, &moved_config_dir).expect("rename locked directory");
         std::fs::create_dir_all(&config_dir).expect("create replacement directory");
