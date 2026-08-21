@@ -1579,10 +1579,19 @@ impl BoundedShardedPkIndexBuilder {
         // previous behaviour.
         let n = self.shards.len();
         let per_shard_budget = max_bytes / n;
+        // Floor the hint by what this shard must hold RIGHT NOW. The hint is a live
+        // count sampled elsewhere, so mid-load it can lag far behind the keys already
+        // in hand, and sizing a filter below its own contents is the one way this can
+        // do real harm: a filter that small answers "present" for nearly everything,
+        // which pushes every incoming row onto the full validation path.
         let per_shard_expected = self.expected_keys.map(|keys| keys.div_ceil(n));
-        let mut blooms: Vec<PkBloom> = (0..n)
-            .map(|_| match per_shard_expected {
-                Some(expected) => PkBloom::with_expected_keys(expected, per_shard_budget),
+        let mut blooms: Vec<PkBloom> = self
+            .shards
+            .iter()
+            .map(|keyset| match per_shard_expected {
+                Some(expected) => {
+                    PkBloom::with_expected_keys(expected.max(keyset.len()), per_shard_budget)
+                }
                 None => PkBloom::with_byte_budget(per_shard_budget),
             })
             .collect();

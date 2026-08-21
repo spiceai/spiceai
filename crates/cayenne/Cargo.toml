@@ -154,6 +154,10 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
+name = "pk_index_rebuild_breakdown"
+
+[[bench]]
+harness = false
 name = "zorder_clustering"
 
 [[bench]]

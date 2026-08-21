@@ -1704,6 +1704,16 @@ pub struct CayenneTableProvider {
     /// The denominator for the stale-key fraction, read at the invalidation sites
     /// where the index itself may be checked out.
     sharded_bloom_inserted_keys: Arc<AtomicU64>,
+    /// Live rows the table is believed to hold, published by the row-count
+    /// maintenance path and read (relaxed, lock-free) by the bloom degrade sites to
+    /// size a filter. `0` means unknown.
+    ///
+    /// An atomic rather than a read of the statistics cache because the degrade sites
+    /// are on the PER-COMMIT write path: `cached_table_statistics_for_optimizer` is a
+    /// query-planning helper that takes `table_statistics` and inspects pending
+    /// deletions, mem-tier tombstones and the post-write maintenance queue, none of
+    /// which a write should be paying for or ordering against.
+    live_rows_hint: Arc<AtomicI64>,
     /// Resident-byte components of the two PK caches, published as their SUM
     /// through `table_memory.set_keyset_bytes` (a single slot — writing one
     /// cache's size alone would under-account the other by up to a full budget
@@ -6484,6 +6494,7 @@ impl CayenneTableProvider {
             sharded_bloom_load_milli: Arc::new(AtomicU64::new(u64::MAX)),
             sharded_bloom_stale_keys: Arc::new(AtomicU64::new(0)),
             sharded_bloom_inserted_keys: Arc::new(AtomicU64::new(0)),
+            live_rows_hint: Arc::new(AtomicI64::new(0)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
@@ -7715,6 +7726,7 @@ impl CayenneTableProvider {
             sharded_bloom_load_milli: Arc::clone(&self.sharded_bloom_load_milli),
             sharded_bloom_stale_keys: Arc::clone(&self.sharded_bloom_stale_keys),
             sharded_bloom_inserted_keys: Arc::clone(&self.sharded_bloom_inserted_keys),
+            live_rows_hint: Arc::clone(&self.live_rows_hint),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
@@ -8321,18 +8333,27 @@ impl CayenneTableProvider {
         );
     }
 
-    /// Live-row hint for sizing a PK bloom, from the cached table statistics — a
-    /// plain `RwLock` read, no I/O, so it is safe on the apply path. `Inexact` is
-    /// good enough: it only sizes a filter, and the byte budget remains the cap.
+    /// Live-row hint for sizing a PK bloom: a relaxed load of `live_rows_hint`,
+    /// which the row-count maintenance path publishes. `None` until one has been
+    /// published, which keeps the previous sizing.
     ///
-    /// Read this BEFORE taking `sharded_pk_keyset_cache`: every degrade site holds
-    /// that mutex, and acquiring the statistics lock underneath it would introduce a
-    /// second lock order over the pair.
+    /// Deliberately NOT a read of the statistics cache. These call sites are on the
+    /// per-commit write path, and `cached_table_statistics_for_optimizer` is a
+    /// query-planning helper: it takes `table_statistics` and inspects pending
+    /// deletions, mem-tier tombstones and the post-write maintenance queue. Paying
+    /// that per commit — and ordering a write against those locks — stalled dataset
+    /// readiness past its 900 s budget in the SF1000 benchmark.
     fn live_rows_size_hint(&self) -> Option<usize> {
-        let stats = self.cached_table_statistics_for_optimizer()?;
-        match stats.num_rows {
-            DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => Some(rows),
-            DFPrecision::Absent => None,
+        usize::try_from(self.live_rows_hint.load(Ordering::Relaxed))
+            .ok()
+            .filter(|rows| *rows > 0)
+    }
+
+    /// Publish the live row count for [`Self::live_rows_size_hint`]. Called from the
+    /// row-count maintenance funnel, which is async and off the write path.
+    fn publish_live_rows_hint(&self, live_rows: i64) {
+        if live_rows > 0 {
+            self.live_rows_hint.store(live_rows, Ordering::Relaxed);
         }
     }
 
@@ -21767,6 +21788,10 @@ impl CayenneTableProvider {
         let df_stats_inexact = df_stats
             .as_ref()
             .map(|s| Self::statistics_to_inexact(s.clone()));
+        // Publish the bloom-sizing hint from the same funnel: this is where a fresh
+        // live count lands, and it is off the write path, so the degrade sites can
+        // read it as a plain atomic instead of taking these locks themselves.
+        self.publish_live_rows_hint(stats.num_rows);
         let mut cache = self.table_statistics.write();
         cache.optimizer = df_stats;
         cache.optimizer_inexact = df_stats_inexact;
