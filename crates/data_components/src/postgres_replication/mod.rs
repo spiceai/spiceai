@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub mod changes;
 pub mod client;
 pub mod config;
+pub mod echo;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
@@ -42,6 +43,7 @@ use snafu::Snafu;
 use crate::cdc::{ChangesStream, StreamError};
 
 pub use config::{ReplicationParams, SchemaEvolutionPolicy};
+pub use echo::{XactStatus, XidEntry, XidRegistry};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use pgwire_replication::{CaCertificate, PgOutputFormat};
 pub use retention::{SlotRemoval, SlotRetentionPosture};
