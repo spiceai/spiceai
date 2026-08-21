@@ -43,6 +43,8 @@ pub mod replication;
 pub mod replication_shared;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_tpch;
+#[cfg(feature = "postgres")]
+pub mod replication_write_back_echo;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod schema_inference;
 
