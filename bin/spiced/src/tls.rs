@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use app::spicepod::component::runtime::TlsConfig as SpicepodTlsConfig;
-use runtime::tls::{TlsConfig, TlsControl};
 use runtime_secrets::{ExposeSecret, ParamStr, Secrets};
+use runtime_tls::{TlsConfig, TlsControl};
 use tokio::sync::RwLock;
 
 use crate::{Args, ClientAuthMode};
@@ -241,15 +241,15 @@ pub(crate) struct ResolvedClientAuth {
 }
 
 /// Translate the binary-level [`ClientAuthMode`] into the runtime's
-/// [`runtime::tls::ClientAuthEnforcement`]. The two enums live in
+/// [`runtime_tls::ClientAuthEnforcement`]. The two enums live in
 /// different crates because the binary mirrors the spicepod surface
 /// (clap-derivable) while the runtime carries the per-listener
 /// behavior bit.
-fn client_auth_enforcement(mode: ClientAuthMode) -> runtime::tls::ClientAuthEnforcement {
+fn client_auth_enforcement(mode: ClientAuthMode) -> runtime_tls::ClientAuthEnforcement {
     match mode {
-        ClientAuthMode::None => runtime::tls::ClientAuthEnforcement::Disabled,
-        ClientAuthMode::Request => runtime::tls::ClientAuthEnforcement::Requested,
-        ClientAuthMode::Required => runtime::tls::ClientAuthEnforcement::Required,
+        ClientAuthMode::None => runtime_tls::ClientAuthEnforcement::Disabled,
+        ClientAuthMode::Request => runtime_tls::ClientAuthEnforcement::Requested,
+        ClientAuthMode::Required => runtime_tls::ClientAuthEnforcement::Required,
     }
 }
 

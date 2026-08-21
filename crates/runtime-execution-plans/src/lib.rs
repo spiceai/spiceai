@@ -14,9 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Custom execution plans for the Spice runtime.
+//! Custom serializable `DataFusion` execution plans for the Spice runtime.
+//!
+//! - [`udtf_exec::UdtfExec`] — a leaf plan that invokes a user-defined table
+//!   function, encodable for distributed execution.
+//! - [`iceberg_scan_exec::IcebergScanExec`] — a deferred Iceberg-scan "recipe"
+//!   plan that materializes on a remote executor.
+//! - [`sync_table`] — synchronous table resolution used when rebuilding a
+//!   registered scan during (synchronous) distributed-plan decode.
 
 pub mod iceberg_scan_exec;
+pub mod sync_table;
 pub mod udtf_exec;
 
 pub use iceberg_scan_exec::{IcebergScanExec, session_is_distributed};
