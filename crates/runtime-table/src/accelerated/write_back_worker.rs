@@ -195,6 +195,30 @@ impl WriteBackWorker {
         let absent = absent_claimed_keys(pk_col, &pk_values, &current)?;
         let has_present = current.iter().any(|batch| batch.num_rows() > 0);
 
+        let present_rows: usize = current.iter().map(RecordBatch::num_rows).sum();
+        let claimed_seq_min = claimed.iter().map(|(_, seq)| *seq).min();
+        let claimed_seq_max = claimed.iter().map(|(_, seq)| *seq).max();
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            claimed = claimed.len(),
+            claimed_seq_min = ?claimed_seq_min,
+            claimed_seq_max = ?claimed_seq_max,
+            present_rows,
+            absent = absent.len(),
+            "durable write-back delivery pass"
+        );
+        if !absent.is_empty() {
+            let sample: Vec<String> = absent.iter().take(8).map(ToString::to_string).collect();
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                absent = absent.len(),
+                keys = ?sample,
+                "durable write-back: {} claimed key(s) of dataset {} are absent from the accelerator, so their rows will be deleted from the federated source to match",
+                absent.len(),
+                self.dataset_name
+            );
+        }
+
         let federated_provider = self.federated.table_provider().await;
 
         // Attempt a Upsert. If federated source does not support it `DataFusionError::NotImplemented`
@@ -259,6 +283,11 @@ impl WriteBackWorker {
             .clear_dirty_keys(&claimed)
             .await
             .map_err(to_df_err)?;
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            cleared_at_or_below = claimed.len(),
+            "durable write-back markers compare-and-cleared"
+        );
         Ok(claimed.len())
     }
 }
