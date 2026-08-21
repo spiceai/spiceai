@@ -296,7 +296,14 @@ impl XidRegistry {
             // Already registered and previously persisted — nothing to write.
             return Ok(());
         }
-        guard.entries.insert(
+
+        // Mutate a candidate map, not `guard.entries`, and only publish it (map and
+        // mirror) after `upsert` succeeds. If this call is cancelled while the await
+        // below is pending, dropping the future releases the lock without touching
+        // `guard.entries` or the mirror, so a retry starts from the untouched state
+        // instead of skipping persistence on a `contains_key` false positive.
+        let mut candidate = guard.entries.clone();
+        candidate.insert(
             xid8,
             XidEntry {
                 xid8,
@@ -304,27 +311,15 @@ impl XidRegistry {
                 observed_commit_lsn: None,
             },
         );
+        let payload = self.serialize(&candidate)?;
 
-        let payload = match self.serialize(&guard.entries) {
-            Ok(payload) => payload,
-            Err(e) => {
-                guard.entries.remove(&xid8);
-                return Err(e);
-            }
-        };
-
-        match self.store.upsert(&payload).await.context(PersistSnafu {
+        self.store.upsert(&payload).await.context(PersistSnafu {
             dataset: self.dataset.clone(),
-        }) {
-            Ok(()) => {
-                self.rebuild_mirror(&guard.entries);
-                Ok(())
-            }
-            Err(e) => {
-                guard.entries.remove(&xid8);
-                Err(e)
-            }
-        }
+        })?;
+
+        self.rebuild_mirror(&candidate);
+        guard.entries = candidate;
+        Ok(())
     }
 
     /// Record the post-`COMMIT` WAL upper bound for an entry (best-effort).
@@ -549,11 +544,15 @@ mod tests {
 
     /// In-memory [`BlobCheckpointStore`] for the registry state-machine tests. Holds
     /// the single persisted blob and can be armed to fail the next `upsert`, so the
-    /// register-must-persist path is exercised.
+    /// register-must-persist path is exercised. `gate` can also be held by a test to
+    /// suspend `upsert` indefinitely (signalling `reached_gate` right before
+    /// blocking), so a caller can cancel `register` mid-persist.
     #[derive(Default)]
     struct FakeBlobStore {
         data: SyncMutex<Option<String>>,
         fail_next_upsert: SyncMutex<bool>,
+        gate: tokio::sync::Mutex<()>,
+        reached_gate: tokio::sync::Notify,
     }
 
     impl FakeBlobStore {
@@ -587,6 +586,9 @@ mod tests {
                     source: "injected upsert failure".into(),
                 });
             }
+            drop(fail);
+            self.reached_gate.notify_one();
+            let _permit = self.gate.lock().await;
             *self.data.lock() = Some(data.to_string());
             Ok(())
         }
@@ -677,6 +679,55 @@ mod tests {
         );
         let state = registry.state.lock().await;
         assert!(state.entries.is_empty(), "no in-memory entry lingers");
+    }
+
+    /// Cancelling `register` while its `upsert` is in flight must leave the
+    /// in-memory map and mirror exactly as they were: a candidate is only published
+    /// after persistence succeeds, so dropping the future mid-`upsert` touches
+    /// neither. A retry must then actually persist, rather than short-circuiting on
+    /// a stale `contains_key`.
+    #[tokio::test]
+    async fn register_cancelled_mid_persist_leaves_state_untouched() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+
+        let gate_guard = store.gate.lock().await;
+        let task_registry = Arc::clone(&registry);
+        let handle = tokio::spawn(async move { task_registry.register(99).await });
+
+        // Wait until `upsert` is blocked on the gate, then cancel `register` while
+        // it is suspended mid-persist.
+        store.reached_gate.notified().await;
+        handle.abort();
+        drop(handle.await);
+        drop(gate_guard);
+
+        assert!(
+            !registry.contains(low32(99)),
+            "a cancelled register must not leave the mirror as if it had succeeded"
+        );
+        {
+            let state = registry.state.lock().await;
+            assert!(
+                !state.entries.contains_key(&99),
+                "a cancelled register must not leave a half-registered in-memory entry"
+            );
+        }
+        assert!(
+            store.stored().is_none(),
+            "a cancelled register must not have persisted anything"
+        );
+
+        registry
+            .register(99)
+            .await
+            .expect("a retry after cancellation persists successfully");
+        assert!(registry.contains(low32(99)), "the retry is a member");
+        let persisted = store.stored().expect("the retry wrote the blob");
+        assert!(
+            persisted.contains("\"xid8\":99"),
+            "the retry's persisted blob names the registered xid: {persisted}"
+        );
     }
 
     /// The whole point of persistence: a reloaded registry sees exactly what was
