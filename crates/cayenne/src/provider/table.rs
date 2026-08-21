@@ -40969,7 +40969,10 @@ mod tests {
 
         // No pending mem-tier delete yet: the fence is the durable max unchanged.
         assert_eq!(provider.min_pending_mem_tier_delete_sequence(), None);
-        assert_eq!(provider.protected_snapshot_merge_fence_and_floor(32), (32, None));
+        assert_eq!(
+            provider.protected_snapshot_merge_fence_and_floor(32),
+            (32, None)
+        );
 
         // Durable deletion index max = 32 (a later apply's delete folded ahead).
         install_int64_deletes(&provider, &[(999, 32)]);
@@ -40998,7 +41001,10 @@ mod tests {
         );
         // When the durable max is already below the pending floor there is no
         // reorder gap, so the fence stays the durable max (no needless re-apply).
-        assert_eq!(provider.protected_snapshot_merge_fence_and_floor(10), (10, Some(30)));
+        assert_eq!(
+            provider.protected_snapshot_merge_fence_and_floor(10),
+            (10, Some(30))
+        );
     }
 
     /// REGRESSION (hot-key live-row vanish): the fast subset compaction must not
@@ -41195,8 +41201,7 @@ mod tests {
             .collect();
         thresholds.sort_unstable();
         let pending_floor = thresholds[1] + 1;
-        let mut seg =
-            crate::provider::mem_tier::SegmentTombstones::from_int64_keys([999_i64]);
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([999_i64]);
         seg.stamp(pending_floor);
         let cur = provider.mem_tier.shard(0).load();
         let next = cur.append_segment(Arc::new(vec![]), pending_floor, seg, 0, 0, 0);
