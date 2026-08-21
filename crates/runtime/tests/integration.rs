@@ -34,20 +34,8 @@ use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
-// Accelerator engines are their own crates and self-register via
-// `register_data_accelerator!` into a linkme slice. A dev-dependency alone does not put
-// the entry in this test binary — the linker drops the unreferenced static — so force the
-// link the same way `spiced` does. `accelerator_crates_register_their_engines` below
-// fails if one of these lines is ever dropped.
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
-#[cfg(feature = "postgres-accel")]
-use accelerator_postgres as _;
-#[cfg(feature = "sqlite")]
-use accelerator_sqlite as _;
-#[cfg(feature = "turso")]
-use accelerator_turso as _;
-
+// The force-links these tests depend on live in `utils`, which every binary sharing
+// these helpers includes; the guard below is what proves they are working.
 /// An engine reaches the registry only if its crate is linked into this binary, which a
 /// Cargo dependency does not guarantee — the linker drops the unreferenced slice static.
 /// Asserted here rather than left to the first accelerated test of each engine, which

@@ -755,7 +755,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         }
         #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
-            use runtime::dataaccelerator::sqlite::SqliteAccelerator;
+            use accelerator_sqlite::SqliteAccelerator;
 
             let mut options = HashMap::new();
             options.insert("file".to_string(), db_file.display().to_string());
