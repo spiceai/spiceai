@@ -386,9 +386,9 @@ impl XidRegistry {
         let mut guard = self.state.lock().await;
         let before = guard.entries.len();
         guard.entries.retain(|_, entry| {
-            !entry
+            entry
                 .observed_commit_lsn
-                .is_some_and(|commit_lsn| commit_lsn <= durably_applied_lsn)
+                .is_none_or(|commit_lsn| commit_lsn > durably_applied_lsn)
         });
         if guard.entries.len() != before {
             self.rebuild_mirror(&guard.entries);
