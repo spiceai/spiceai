@@ -405,8 +405,21 @@ impl PreparedTxnCommit {
                         self.publish.snapshot_sequence,
                     )
                     .await?;
+                tracing::debug!(
+                    table = self.table.table_name(),
+                    dirty_marked = dirty_pk_bytes.len(),
+                    snapshot_sequence = self.publish.snapshot_sequence,
+                    "Durable write-back keys marked dirty in commit transaction"
+                );
             }
         }
+        tracing::debug!(
+            table = self.table.table_name(),
+            snapshot_sequence = self.publish.snapshot_sequence,
+            rows = self.row_count,
+            superseded = self.superseded,
+            "Transaction upsert applied in shared metastore transaction"
+        );
         Ok(())
     }
 
@@ -427,6 +440,13 @@ impl PreparedTxnCommit {
     /// Returns an error only if swapping the in-memory deletion caches fails.
     pub fn finish(self) -> Result<u64> {
         let sequence = self.publish.snapshot_sequence;
+        tracing::debug!(
+            table = self.table.table_name(),
+            snapshot_sequence = sequence,
+            rows = self.row_count,
+            superseded = self.superseded,
+            "Transaction upsert visibility flipped"
+        );
         self.table
             .publish_prepared_on_conflict_deletions(self.publish);
         // The fused transaction publish just made this transaction's staged rows

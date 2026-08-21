@@ -861,6 +861,14 @@ impl<'a> AppendMutationWriter<'a> {
         let record_seq = self.table.sequence_high_water().await;
         self.table
             .record_inlined_pk_keys(&validated_keys, record_seq);
+        tracing::debug!(
+            table = self.table.table_name(),
+            epoch,
+            rows = incoming_rows,
+            superseded,
+            record_seq,
+            "In-memory CDC apply completed"
+        );
 
         drop(write_guard);
         record_cayenne_write_phase(self.table.table_name(), "cdc_path_inmemory", write_start);

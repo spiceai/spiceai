@@ -18370,21 +18370,6 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
 
-            // Protected snapshot ids are UUIDv7, so lexical order == creation
-            // order. Consider the oldest `max_inputs` (at least 2) snapshots.
-            let mut ids: Vec<String> = protected.keys().cloned().collect();
-            ids.sort();
-            let take = ids.len().min(max_inputs.max(2));
-            ids.truncate(take);
-
-            let candidates: Vec<(String, i64)> = ids
-                .into_iter()
-                .map(|id| {
-                    let threshold = protected.get(&id).copied().unwrap_or(0);
-                    (id, threshold)
-                })
-                .collect();
-
             let deletion_snapshot = self.pk_deletion_snapshot();
             // Derive the fence from the SAME loaded deletion snapshot used for
             // the Phase 2 rewrite. A separate `get_max_delete_sequence()` load
@@ -18396,11 +18381,56 @@ impl CayenneTableProvider {
             //
             // The durable max still over-claims a delete that is pending in the
             // mem tier below it (cross-shard / off-fence commit reorder), so cap
-            // the fence strictly below that pending floor — see
-            // `protected_snapshot_merge_fence`.
-            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
-                deletion_snapshot.max_sequence_number().unwrap_or(0),
-            );
+            // the fence strictly below that pending floor
+            // (`protected_snapshot_merge_fence`, inlined so one pending-floor
+            // load drives both the cap and the eligibility filter below).
+            let durable_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            let pending_floor = self.min_pending_mem_tier_delete_sequence();
+            let fence_max_delete_seq = pending_floor.map_or(durable_max_delete_seq, |floor| {
+                durable_max_delete_seq.min(floor - 1)
+            });
+
+            // While a pending mem-tier delete exists, fold only inputs with
+            // `threshold <= fence`: the output is tagged with the fence and
+            // scans re-apply every deletion above it, so folding an input
+            // tagged higher would demote rows exempt from deletions in
+            // `(fence, threshold]` and mask them — a hot upsert key loses its
+            // only live version until the next commit. Excluded inputs become
+            // eligible when the pending floor advances at the next checkpoint.
+            // With no pending floor the fence is the durable max: no deletion
+            // above it exists, and filtering would only starve compaction.
+            //
+            // Protected snapshot ids are UUIDv7, so lexical order == creation
+            // order. Consider the oldest `max_inputs` (at least 2) eligible
+            // snapshots.
+            let mut ids: Vec<String> = protected
+                .iter()
+                .filter(|&(_, &threshold)| {
+                    pending_floor.is_none() || threshold <= fence_max_delete_seq
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if ids.len() < 2 {
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    fence_max_delete_seq,
+                    above_fence = protected.len() - ids.len(),
+                    "Skipping protected-snapshot subset compaction: fewer than two inputs at or below the delete fence",
+                );
+                return Ok(false);
+            }
+            ids.sort();
+            let take = ids.len().min(max_inputs.max(2));
+            ids.truncate(take);
+
+            let candidates: Vec<(String, i64)> = ids
+                .into_iter()
+                .map(|id| {
+                    let threshold = protected.get(&id).copied().unwrap_or(0);
+                    (id, threshold)
+                })
+                .collect();
             (
                 candidates,
                 fence_max_delete_seq,
@@ -40943,6 +40973,115 @@ mod tests {
         // When the durable max is already below the pending floor there is no
         // reorder gap, so the fence stays the durable max (no needless re-apply).
         assert_eq!(provider.protected_snapshot_merge_fence(10), 10);
+    }
+
+    /// REGRESSION (hot-key live-row vanish): the fast subset compaction must not
+    /// fold a protected snapshot whose merge-on-read threshold exceeds the pass's
+    /// delete fence. When a pending mem-tier delete caps the fence below
+    /// already-durable supersede tombstones (the steady state for a CDC table
+    /// between checkpoints), folding the NEWEST snapshot — the only live version
+    /// of a hot upsert key — retags its rows at the fence; scans then re-apply
+    /// the `(fence, tombstone]` supersede deletes to the merged output and the
+    /// live row vanishes until the next commit publishes a fresher snapshot.
+    /// Observed end-to-end as transiently-empty point reads on a write-back CDC
+    /// table, which the durable write-back delivery worker escalated into
+    /// source-row DELETEs.
+    #[tokio::test]
+    async fn subset_compaction_excludes_inputs_above_delete_fence() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "subset_fence_exclusion",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_trigger_protected_snapshots: 2,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Hold the compaction lock across setup so the debounced post-write pass
+        // cannot merge the snapshots this test arranges (same rationale as
+        // `build_seq_prefix_fixture`).
+        let setup_guard = provider.compaction_lock.lock().await;
+        // Three upserts of ONE key: each publishes its own protected snapshot,
+        // and the second/third durably record a supersede key-delete for the
+        // prior version — the hot-key shape of a CDC write-back counter.
+        for value in [10_i64, 20, 30] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[1], &[value]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        drop(setup_guard);
+
+        // Bounded poll: protected-snapshot registration can lag the awaited
+        // inserts under parallel test load (see `build_seq_prefix_fixture`).
+        let mut protected_count = 0;
+        for _ in 0..100 {
+            protected_count = provider.protected_snapshots.load_full().len();
+            if protected_count >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(protected_count, 3, "one protected snapshot per upsert");
+
+        let durable_max = provider
+            .deletion_index_max_sequence()
+            .expect("the supersede deletes are durable");
+
+        // Plant a PENDING mem-tier tombstone (unrelated key) at the durable max:
+        // the merge fence caps strictly below it, i.e. below the newest durable
+        // supersede delete — the steady state for a CDC table between
+        // checkpoints (echo applies keep un-checkpointed deletes in RAM).
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([999_i64]);
+        seg.stamp(durable_max);
+        let cur = provider.mem_tier.shard(0).load();
+        let next = cur.append_segment(Arc::new(vec![]), durable_max, seg, 0, 0, 0);
+        provider.mem_tier.shard(0).store(Arc::new(next));
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            Some(durable_max),
+            "the pending floor must cap the fence below the newest supersede delete"
+        );
+
+        let merged = provider
+            .compact_protected_snapshots_subset(8)
+            .await
+            .expect("subset compaction pass");
+
+        // THE INVARIANT: the live row stays visible across the pass. Folding the
+        // newest snapshot under the capped fence made this scan come back EMPTY.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "subset_fence_exclusion").await;
+        assert_eq!(
+            pairs,
+            vec![(1, 30)],
+            "live row must survive a subset compaction whose fence is capped by a \
+             pending mem-tier delete (merged={merged})"
+        );
+
+        // The pass must still merge the at-or-below-fence inputs rather than
+        // declining outright: two eligible inputs fold into one output while the
+        // above-fence snapshot stays live untouched.
+        assert!(merged, "the at-or-below-fence snapshots must still merge");
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            2,
+            "eligible inputs merge into one output; the above-fence snapshot stays live"
+        );
     }
 
     /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate
