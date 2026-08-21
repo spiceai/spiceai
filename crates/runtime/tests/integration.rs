@@ -64,6 +64,11 @@ fn accelerator_crates_register_their_engines() {
         engines.iter().any(|engine| engine == "duckdb"),
         "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
     );
+    #[cfg(not(windows))]
+    assert!(
+        engines.iter().any(|engine| engine == "cayenne"),
+        "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
     let _ = &engines;
 }
 

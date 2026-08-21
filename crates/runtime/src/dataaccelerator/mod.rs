@@ -23,16 +23,11 @@ limitations under the License.
 //! re-exports the contract so existing `crate::dataaccelerator::…` paths keep resolving.
 
 pub mod arrow;
-#[cfg(not(windows))]
-pub mod cayenne;
 pub mod partitioned_arrow;
 
-pub(crate) mod imds;
-pub(crate) mod snapshot_validation;
 pub mod spice_sys;
 pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
 pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
-pub use snapshot_validation::validate_cayenne_snapshot_consistency;
 
 // The accelerator contract lives in `data-accelerator-api`; re-exported so
 // `crate::dataaccelerator::…` paths resolve inside this crate. Deliberately
@@ -54,6 +49,66 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// `DataConnector::resolve_refresh_mode` fills in an unset `refresh_mode`
+    /// (`debezium`/`cdc` → `changes`, `sink` → `disabled`, everything else → `full`) and
+    /// its result is never written back into the `Acceleration`, so both the runtime
+    /// builder and the accelerators have to recover it themselves.
+    ///
+    /// They reach it by different routes: the builder parses the raw Spicepod `from:`
+    /// value before any component exists, while an accelerator asks the initialized
+    /// component for its connector name. Agreeing on every case is what proves a pod
+    /// cannot be budgeted as one shape and configured as another — and it is asserted
+    /// here, with a real `Dataset`, because it is a claim about the pair rather than
+    /// about either side.
+    #[tokio::test]
+    async fn the_two_routes_to_an_unset_refresh_mode_agree() {
+        use crate::component::dataset::acceleration::RefreshMode;
+        use app::AppBuilder;
+
+        let app = Arc::new(AppBuilder::new("connector-unset-refresh-mode").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let both_agree = |from: &str| {
+            let mut dataset =
+                crate::component::dataset::builder::DatasetBuilder::try_new(from.to_string(), "ds")
+                    .expect("dataset builder")
+                    .with_app(Arc::clone(&app))
+                    .with_runtime(Arc::clone(&rt))
+                    .build()
+                    .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                // No `refresh_mode`: the connector decides, and this is what recovers it.
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+
+            // Post-init: through `Dataset::connector_name`, so `DatasetSpec::source()` is
+            // the code under test rather than a hand-rolled parse.
+            let post_init = runtime_acceleration::acceleration_source::resolved_refresh_mode(
+                &dataset,
+                acceleration,
+            );
+            // Pre-init: the builder's parse of the same raw `from:`.
+            let pre_init = crate::builder::connector_unset_refresh_mode(from);
+            assert_eq!(
+                post_init, pre_init,
+                "the accelerator and the runtime builder must resolve `from: {from}` identically"
+            );
+            post_init
+        };
+
+        // `debezium/topic` is the case a `split_once(':')` would miss: `DatasetSpec::source`
+        // treats `/` as a delimiter too, so both routes must agree on it.
+        assert_eq!(both_agree("debezium:my.topic"), RefreshMode::Changes);
+        assert_eq!(both_agree("debezium/topic"), RefreshMode::Changes);
+        assert_eq!(both_agree("cdc:stream"), RefreshMode::Changes);
+        assert_eq!(both_agree("sink"), RefreshMode::Disabled);
+        assert_eq!(both_agree("s3://bucket/path"), RefreshMode::Full);
+        assert_eq!(both_agree("postgres:public.orders"), RefreshMode::Full);
+    }
 
     #[test]
     fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
@@ -743,7 +798,7 @@ mod accelerator_compat_tests {
                 #[cfg(not(windows))]
                 Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
-                    use crate::dataaccelerator::cayenne::CayenneAccelerator;
+                    use accelerator_cayenne::CayenneAccelerator;
 
                     // Clean up any existing .cayenne files and Cayenne metadata
                     // Cayenne only supports appends, so we need a clean state for each test
@@ -1986,7 +2041,7 @@ mod accelerator_compat_tests {
                     #[cfg(not(windows))]
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
-                        use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
+                        use accelerator_cayenne::CayenneAccelerator; // Clean up any existing files and metadata
                         if mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {

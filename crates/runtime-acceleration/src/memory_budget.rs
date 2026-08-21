@@ -121,6 +121,33 @@ pub fn duckdb_total_reservation_bytes() -> u64 {
     DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Relaxed)
 }
 
+/// Sentinel for "the runtime published nothing", kept distinct from `Some(0)`, which is a
+/// real setting — no footer cache at all — rather than an absent one.
+const CAYENNE_FOOTER_CACHE_UNSET: u64 = u64::MAX;
+
+/// The operator's `cayenne_footer_cache_mb`, published for the Cayenne engine to read.
+static CAYENNE_FOOTER_CACHE_MB: AtomicU64 = AtomicU64::new(CAYENNE_FOOTER_CACHE_UNSET);
+
+/// Publishes `runtime.params.cayenne_footer_cache_mb` for the engine.
+///
+/// The engine is built by its registration constructor, which takes no arguments, so a
+/// setting resolved from the Spicepod cannot be passed in — it is published here and read
+/// at construction instead. **Must run before the accelerator engines are registered**,
+/// or the engine is built before the value exists and silently uses its default.
+pub fn publish_cayenne_footer_cache_mb(footer_cache_mb: Option<usize>) {
+    let value = footer_cache_mb.map_or(CAYENNE_FOOTER_CACHE_UNSET, |mb| mb as u64);
+    CAYENNE_FOOTER_CACHE_MB.store(value, Ordering::Relaxed);
+}
+
+/// The published `cayenne_footer_cache_mb`, or `None` when the operator set none.
+#[must_use]
+pub fn cayenne_footer_cache_mb() -> Option<usize> {
+    match CAYENNE_FOOTER_CACHE_MB.load(Ordering::Relaxed) {
+        CAYENNE_FOOTER_CACHE_UNSET => None,
+        mb => Some(usize::try_from(mb).unwrap_or(usize::MAX)),
+    }
+}
+
 /// A deduped-by-instance summary of the `DuckDB` accelerators in an app. Built by a
 /// thin adapter over `app.datasets` and `app.views` — either can carry an
 /// `acceleration` block, and every `DuckDB` instance they declare is counted here

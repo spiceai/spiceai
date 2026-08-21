@@ -19,3 +19,38 @@ pub mod registry;
 pub mod store;
 
 pub use builder::{build_azure_object_store, build_gcs_object_store};
+
+/// Whether `path` addresses an S3 Express One Zone bucket.
+///
+/// Those buckets are named `{base}--{zone-id}--x-s3`, which is the only way to tell one
+/// from a standard S3 path. Lives here rather than with a single caller because both the
+/// Cayenne engine and the runtime's query planner branch on it, and a second copy of the
+/// convention could drift from the first.
+#[must_use]
+pub fn is_s3_express_path(path: &str) -> bool {
+    path.starts_with("s3://") && path.contains("--x-s3")
+}
+
+#[cfg(test)]
+mod s3_express_path_tests {
+    use super::is_s3_express_path;
+
+    #[test]
+    fn only_the_zone_suffixed_naming_convention_counts() {
+        assert!(is_s3_express_path("s3://mybucket--usw2-az1--x-s3/prefix/"));
+        assert!(is_s3_express_path("s3://data-bucket--use1-az4--x-s3/"));
+        assert!(is_s3_express_path(
+            "s3://my-bucket-name--euw1-az2--x-s3/some/nested/path/"
+        ));
+
+        // Standard S3, including the shapes that look close: dashes in the bucket name
+        // and a partial `--` that never reaches the zone suffix.
+        assert!(!is_s3_express_path("s3://mybucket/prefix/"));
+        assert!(!is_s3_express_path("s3://mybucket-with-dashes/prefix/"));
+        assert!(!is_s3_express_path("s3://mybucket--partial/prefix/"));
+
+        // Not S3 at all, and the suffix without a scheme.
+        assert!(!is_s3_express_path("/local/path/"));
+        assert!(!is_s3_express_path("mybucket--usw2-az1--x-s3"));
+    }
+}
