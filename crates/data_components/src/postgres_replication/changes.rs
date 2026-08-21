@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use snafu::ensure;
 
 use super::pgoutput::{Relation, TupleData, Value};
-use super::{PgOutputDecodeSnafu, Result};
+use super::{PgOutputDecodeSnafu, Result, XidRegistry};
 use crate::cdc::{
     ChangeBatch, ChangeBatchError, ChangeEnvelope, ChangeRows, CommitChange, CommitError,
     changes_schema,
@@ -343,6 +343,11 @@ pub struct PgChangeRows {
     /// merging pushes a `Vec` instead of moving every `Bytes` while holding the
     /// member mailbox lock.
     raw_chunks: Vec<Vec<bytes::Bytes>>,
+    /// The source transaction id (pgoutput's 32-bit stream xid) that produced
+    /// each entry of `raw_chunks`, same length and index-aligned. `None` for a
+    /// chunk built with no known xid (e.g. a test fixture). See
+    /// [`Self::drop_echoed`] for what this drives.
+    chunk_xids: Vec<Option<u32>>,
     source_commit_ts_ms: Option<i64>,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
@@ -358,13 +363,52 @@ impl PgChangeRows {
         raw: Vec<bytes::Bytes>,
         source_commit_ts_ms: Option<i64>,
     ) -> Self {
-        // Computed once here (per commit-per-relation) so the metadata accessors
-        // are O(1): the consumer calls them on the coalescing/metric hot path,
-        // possibly several times per envelope. Upper bound = one row per message,
-        // plus one more per UPDATE ('U') since a primary-key-changing UPDATE
-        // expands to a delete + upsert.
-        let updates = raw.iter().filter(|m| m.first() == Some(&b'U')).count();
-        let row_hint = raw.len() + updates;
+        let (row_hint, byte_len) = Self::compute_hints(&schema, raw.iter());
+        Self {
+            schema,
+            relation,
+            raw_chunks: vec![raw],
+            chunk_xids: vec![None],
+            source_commit_ts_ms,
+            row_hint,
+            byte_len,
+        }
+    }
+
+    /// Tag this instance's one transaction chunk with the source `xid` that
+    /// produced it (pgoutput's 32-bit stream xid), so a later
+    /// [`Self::drop_echoed`] can recognize whether it is the echo of this
+    /// dataset's own write-back delivery. Called once, immediately after
+    /// [`Self::new`], before any [`Self::try_append`].
+    #[must_use]
+    pub(super) fn with_source_xid(mut self, xid: Option<u32>) -> Self {
+        if let Some(slot) = self.chunk_xids.first_mut() {
+            *slot = xid;
+        }
+        self
+    }
+
+    /// Compute `(row_hint, byte_len)` for a set of raw pgoutput messages
+    /// against `schema` — see [`Self::new`]'s doc for what each term
+    /// estimates. Shared with [`Self::drop_echoed`], which must recompute both
+    /// after removing echoed chunks.
+    fn compute_hints<'a>(
+        schema: &SchemaRef,
+        raw: impl Iterator<Item = &'a bytes::Bytes>,
+    ) -> (usize, usize) {
+        // Upper bound = one row per message, plus one more per UPDATE ('U')
+        // since a primary-key-changing UPDATE expands to a delete + upsert.
+        let mut count = 0usize;
+        let mut updates = 0usize;
+        let mut wire_bytes = 0usize;
+        for message in raw {
+            count += 1;
+            if message.first() == Some(&b'U') {
+                updates += 1;
+            }
+            wire_bytes += message.len();
+        }
+        let row_hint = count + updates;
 
         // Coalescing byte-budget estimate. Raw wire bytes alone under-count the
         // eventual Arrow memory for NULL / unchanged-TOAST / DELETE-key-only rows
@@ -373,22 +417,13 @@ impl PgChangeRows {
         // footprint derived from the schema. `max` tracks Arrow in both regimes
         // without a per-value scan: value-heavy rows → wire dominates;
         // NULL/delete-heavy → the fixed-width floor dominates.
-        let wire_bytes: usize = raw.iter().map(bytes::Bytes::len).sum();
         let per_row_fixed: usize = schema
             .fields()
             .iter()
             .map(|f| arrow_fixed_width(f.data_type()))
             .sum();
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
-
-        Self {
-            schema,
-            relation,
-            raw_chunks: vec![raw],
-            source_commit_ts_ms,
-            row_hint,
-            byte_len,
-        }
+        (row_hint, byte_len)
     }
 
     /// Append a compatible committed transaction without decoding or moving
@@ -416,6 +451,7 @@ impl PgChangeRows {
         }
 
         self.raw_chunks.append(&mut other.raw_chunks);
+        self.chunk_xids.append(&mut other.chunk_xids);
         self.row_hint = self.row_hint.saturating_add(other.row_hint);
         self.byte_len = self.byte_len.saturating_add(other.byte_len);
         self.source_commit_ts_ms = match (self.source_commit_ts_ms, other.source_commit_ts_ms) {
@@ -424,6 +460,41 @@ impl PgChangeRows {
             (None, right) => right,
         };
         None
+    }
+
+    /// Drop every buffered transaction chunk whose xid the registry recognizes
+    /// as one of this dataset's own write-back deliveries — the echo of a
+    /// commit Spice itself issued. Called by the per-dataset consumer
+    /// ([`super::shared::MemberMailboxReceiver::pop`]), not the shared pump:
+    /// [`XidRegistry::contains`] is a lock-free read of a small mirror, so
+    /// filtering here costs nothing on the shared demux, and only the one
+    /// dataset that actually produced the echo pays for decoding (and
+    /// immediately discarding) it, rather than every table sharing the pump.
+    ///
+    /// Returns the dropped chunks' xids, for the caller to persist via
+    /// [`XidRegistry::mark_commit_observed`] — this method only reads the
+    /// registry's lock-free membership mirror, never its own (async) state.
+    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> Vec<u32> {
+        let mut dropped = Vec::new();
+        let mut kept_chunks = Vec::with_capacity(self.raw_chunks.len());
+        let mut kept_xids = Vec::with_capacity(self.chunk_xids.len());
+        for (chunk, xid) in self.raw_chunks.drain(..).zip(self.chunk_xids.drain(..)) {
+            match xid {
+                Some(x) if registry.contains(x) => dropped.push(x),
+                _ => {
+                    kept_chunks.push(chunk);
+                    kept_xids.push(xid);
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            let (row_hint, byte_len) = Self::compute_hints(&self.schema, kept_chunks.iter().flatten());
+            self.raw_chunks = kept_chunks;
+            self.chunk_xids = kept_xids;
+            self.row_hint = row_hint;
+            self.byte_len = byte_len;
+        }
+        dropped
     }
 }
 

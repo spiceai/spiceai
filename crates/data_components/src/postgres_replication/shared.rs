@@ -1522,6 +1522,10 @@ impl<T> MailboxSendOutcome<T> {
 struct MemberMailboxReceiver {
     shared: Arc<MemberMailbox>,
     draining: Vec<PendingItem>,
+    /// This member's write-back registry, if it is a durable write-back
+    /// dataset. `None` for every other dataset, which makes `pop`'s echo-drop
+    /// check a single pointer read.
+    write_back_registry: Option<Arc<XidRegistry>>,
 }
 
 impl MemberMailboxReceiver {
@@ -1533,14 +1537,50 @@ impl MemberMailboxReceiver {
     }
 
     fn pop(&mut self) -> Option<std::result::Result<ChangeEnvelope, StreamError>> {
-        let item = self.draining.pop()?;
+        let mut item = self.draining.pop()?;
         self.shared.buffered_items.fetch_sub(1, Ordering::AcqRel);
         // Release exactly what the publishes contributed: an envelope's final
         // `encoded_len` is the sum of its own and every operand merged into it.
+        // Computed on the as-buffered size, before any echo-drop below — the
+        // mailbox byte budget accounts for what was admitted, not what a
+        // dataset-specific filter later discards.
         self.shared
             .buffered_bytes
             .fetch_sub(item.buffered_bytes(), Ordering::AcqRel);
         self.shared.capacity_notify.notify_one();
+        // Echo suppression, decided here rather than in the shared pump: drop
+        // every chunk of this envelope whose xid this member's own registry
+        // recognizes as one of its own write-back deliveries. `contains` is a
+        // lock-free mirror read, so this never blocks; a member with no
+        // registry (the overwhelming majority of datasets) skips straight past.
+        if let (PendingItem::Changes(pending), Some(registry)) =
+            (&mut item, self.write_back_registry.as_ref())
+        {
+            let dropped = pending.rows.drop_echoed(registry);
+            if !dropped.is_empty() {
+                // `flush_to` is this envelope's *latest* folded commit
+                // (coalescing takes the max — see `try_merge`), which can be
+                // at or after an earlier-folded dropped chunk's real commit
+                // LSN. Recording too-high an observed LSN only delays that
+                // entry's prune until the floor also reaches the later
+                // commits, never prunes it early — safe, same direction as
+                // `commit_lsn_upper_bound`'s existing best-effort tolerance.
+                //
+                // Best-effort persistence, matching every other bookkeeping
+                // write in this registry (see `set_upper_bound`): a failure is
+                // covered by GC, so it is logged there, not surfaced here.
+                // Spawned rather than awaited because `pop` drives a sync
+                // `Stream::poll_next` — `mark_commit_observed` cannot run
+                // inline without blocking it on the registry's async state.
+                let registry = Arc::clone(registry);
+                let flush_to = pending.flush_to;
+                tokio::spawn(async move {
+                    for xid in dropped {
+                        registry.mark_commit_observed(xid, flush_to).await;
+                    }
+                });
+            }
+        }
         Some(item.into_stream_item())
     }
 }
@@ -1633,6 +1673,11 @@ fn member_mailbox_with_limits(
         MemberMailboxReceiver {
             shared,
             draining: Vec::new(),
+            // Set by the caller after construction for a write-back dataset
+            // (see the member registration call site); every other caller
+            // (including every test that isn't exercising echo-drop) leaves
+            // this `None`, matching the pre-refactor absence of a registry.
+            write_back_registry: None,
         },
     )
 }
@@ -2241,7 +2286,11 @@ async fn attach_member(
     // `register` also takes over any hold installed for this table through its rejoin
     // branch, keeping the held floor — so the replay this member is owed starts where
     // the slot resumed, not where a slot-mate was credited.
-    let (sender, receiver) = member_mailbox(params.member_channel_capacity);
+    let (sender, mut receiver) = member_mailbox(params.member_channel_capacity);
+    // This member's own echo-drop registry, if it is a durable write-back
+    // dataset (see `MemberMailboxReceiver::pop`) — cloned here because
+    // `write_back_registry` itself is moved into `MemberHandle` below.
+    receiver.write_back_registry = write_back_registry.clone();
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` below.)
     metrics.set_slot_name(source.key.slot_name.clone());
@@ -4154,13 +4203,6 @@ async fn deliver_commit(
     // caller for the reader-processing subtraction.
     let mut total_send_wait_us: u64 = 0;
 
-    // Members whose changes this commit are the echo of their own write-back,
-    // dropped above and acked below with a zero-row envelope. Keyed by member so a
-    // multi-relation echo produces a single ack. Each entry keeps the resolved
-    // route pieces needed to build that envelope. Empty (and never allocated) for
-    // the overwhelmingly common case of a transaction Spice did not write.
-    let mut arbitrated: FxHashMap<MemberKey, ArbitratedAck> = FxHashMap::default();
-
     for (relation_id, raw) in txn {
         if raw.is_empty() {
             continue;
@@ -4191,36 +4233,6 @@ async fn deliver_commit(
             // applied (replays start at the minimum floor across members).
             continue;
         }
-        // Echo suppression: if this transaction's xid is one this member's
-        // write-back delivery registered, these changes are the echo of that
-        // delivery. Drop them here — before any tuple decode or Arrow build — and
-        // remember the member so its commit is acked with a zero-row envelope
-        // below. Only the arbitrated member's relations are dropped; changes to
-        // other members in the same transaction (a cascade from our DELETE leg, a
-        // trigger-written audit table) are foreign to that member's registry and
-        // fall through to normal delivery. A member with no registry never
-        // matches, so non-write-back datasets are untouched.
-        if let Some(xid) = current_txn_xid
-            && member
-                .write_back_registry
-                .as_ref()
-                .is_some_and(|registry| registry.contains(xid))
-        {
-            let ack = arbitrated
-                .entry(member_key.clone())
-                .or_insert_with(|| ArbitratedAck {
-                    member: Arc::clone(member),
-                    slot: Arc::clone(slot),
-                    working_schema: Arc::clone(working_schema),
-                    relation: None,
-                });
-            // Keep one decoded relation generation for the zero-row build; any
-            // relation of the member serves, since the ack carries no rows.
-            if ack.relation.is_none() {
-                ack.relation = decoder.relation(relation_id).map(Arc::clone);
-            }
-            continue;
-        }
         let Some(rel) = decoder.relation(relation_id) else {
             member_fatal(
                 source,
@@ -4248,12 +4260,16 @@ async fn deliver_commit(
         // Build against the member's *working* schema (registered schema plus any
         // adopted mid-stream widening — see `handle_relation`), not the fixed
         // registered schema, so an adopted column reaches the accelerator.
-        let rows = PgChangeRows::new(
-            Arc::clone(working_schema),
-            Arc::clone(rel),
-            raw,
-            commit_ts_ms,
-        );
+        //
+        // Echo suppression is tagged, not decided, here: every relation's changes
+        // are always forwarded, tagged with this commit's xid. Whether a tagged
+        // chunk is actually this member's own write-back echo is decided by
+        // `MemberMailboxReceiver::pop` against that member's own registry, off
+        // this shared per-commit loop — a member with no registry never matches,
+        // so a non-write-back dataset pays only the tag itself (an `Option<u32>`
+        // copy), never a lookup.
+        let rows = PgChangeRows::new(Arc::clone(working_schema), Arc::clone(rel), raw, commit_ts_ms)
+            .with_source_xid(current_txn_xid);
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
         // its source commit time is within the member's `ready_lag` of now, i.e.
@@ -4285,79 +4301,12 @@ async fn deliver_commit(
         );
     }
 
-    // Ack each arbitrated member whose echo was dropped above. The zero-row
-    // envelope carries a `SharedLsnCommitter { flush_to: end_lsn }` (built by
-    // `PendingPgEnvelope::into_envelope`), so the filtered echo still advances the
-    // member's ack floor — a filtered echo is real source progress. Routing it
-    // through the eager hold like any data envelope keeps it behind any changes
-    // still held for the member (never overtaking a lower-LSN commit) and inherits
-    // the committer's deferral, so under an in-memory durability tier it drains
-    // behind the checkpoint fence rather than acking rows that exist only in RAM.
-    for (member_key, ack) in arbitrated {
-        // Record the echo's commit LSN so the entry becomes prunable once the
-        // durable floor reaches it (`write_one` -> `prune_acked`). Never removed
-        // here: the slot replays everything after `confirmed_flush` on a reconnect,
-        // so an entry dropped at commit-observation would re-admit the replayed echo.
-        if let (Some(xid), Some(registry)) =
-            (current_txn_xid, ack.member.write_back_registry.as_ref())
-        {
-            registry.mark_commit_observed(xid, boundary.end_lsn).await;
-        }
-        let Some(relation) = ack.relation else {
-            // No decoded relation to shape the (empty) batch against. The floor is
-            // carried forward by the next commit or idle credit instead; nothing is
-            // lost, only this filtered txn's standalone ack is skipped.
-            continue;
-        };
-        let is_ready =
-            crate::cdc::source_commit_within_ready_lag(commit_ts_ms, ack.member.ready_lag);
-        let envelope = PendingPgEnvelope {
-            rows: PgChangeRows::new(ack.working_schema, relation, Vec::new(), commit_ts_ms),
-            slot: Arc::clone(&ack.slot),
-            flush_to: boundary.end_lsn,
-            dataset: ack.member.dataset_name.clone(),
-            watermark_notify: Arc::clone(&ack.member.watermark_notify),
-            is_dataset_ready: is_ready,
-            first_received_at: std::time::Instant::now(),
-        };
-        ack.slot.deliver(boundary.end_lsn);
-        total_send_wait_us = total_send_wait_us.saturating_add(
-            push_eager_envelope(
-                source,
-                eager_hold,
-                &member_key,
-                EagerPendingEnvelope {
-                    member: ack.member,
-                    envelope,
-                },
-                eager_settings,
-            )
-            .await,
-        );
-    }
-
     // The slot-level freshness watermark for this commit is published to every
     // member by the caller's consolidated boundary flush
     // (`BoundaryMetrics::commit_watermark`), not a separate per-member pass.
     source.ack.credit_idle(boundary.end_lsn);
 
     total_send_wait_us
-}
-
-/// One member whose changes in a commit were the echo of its own durable
-/// write-back, dropped by [`deliver_commit`]'s per-relation filter. Carries the
-/// route pieces needed to ack the commit with a zero-row envelope after the
-/// delivery loop.
-struct ArbitratedAck {
-    member: Arc<MemberHandle>,
-    slot: Arc<AckSlot>,
-    /// The member's working schema, to shape the zero-row `PgChangeRows`.
-    working_schema: SchemaRef,
-    /// A decoded relation generation of the member, for the same build. `None`
-    /// only if the decoder had no relation for the dropped changes (not expected —
-    /// buffered changes always followed a decoded `Relation`), in which case the
-    /// standalone ack is skipped and the floor advances on the next commit.
-    relation: Option<Arc<pgoutput::Relation>>,
 }
 
 #[cfg(test)]
@@ -4868,6 +4817,7 @@ mod tests {
                     sender,
                     metrics: ReplicationMetricsCollector::new(),
                     ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                    write_back_registry: None,
                 }),
             );
             source.ack.register(&member_key, false);
@@ -6520,7 +6470,11 @@ mod tests {
         let mut receivers = Vec::new();
         for (table, registry) in [("t0", t0_registry), ("t1", None)] {
             let member_key = key(table);
-            let (sender, receiver) = member_mailbox(8);
+            let (sender, mut receiver) = member_mailbox(8);
+            // The echo-drop decision now lives on the receiver (see
+            // `MemberMailboxReceiver::pop`), so the test's registry must be
+            // attached here too, matching the real member-registration path.
+            receiver.write_back_registry = registry.clone();
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
@@ -6750,7 +6704,7 @@ mod tests {
     async fn commit_observed_entry_survives_until_prune_reaches_it() {
         let xid = 909u32;
         let registry = registry_with_xid(xid).await;
-        let (source, decoder, routes, _receivers) = echo_scenario(Some(Arc::clone(&registry)));
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(Arc::clone(&registry)));
         let end_lsn = 640u64;
 
         deliver_one_commit(
@@ -6763,6 +6717,16 @@ mod tests {
         )
         .await;
 
+        // Popping the envelope is what triggers the echo-drop and its (spawned,
+        // best-effort) `mark_commit_observed` — see `MemberMailboxReceiver::pop`.
+        // Commit-observation no longer happens inline in `deliver_commit`.
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(ack.num_rows_hint(), 0, "the echo is dropped");
+
         assert!(
             registry.contains(xid),
             "the entry is not removed at commit-observation"
@@ -6774,12 +6738,21 @@ mod tests {
             "the entry survives while the durable floor is below its commit LSN"
         );
         // ...and reaching it prunes the entry (only possible because the commit was
-        // observed at `end_lsn`; an unobserved entry would never prune).
-        registry.prune_acked(end_lsn).await;
-        assert!(
-            !registry.contains(xid),
-            "the entry is pruned once the durable floor reaches its observed commit LSN"
-        );
+        // observed at `end_lsn`; an unobserved entry would never prune). The
+        // observation lands on a task `pop` spawned rather than awaited, so poll
+        // for it rather than assuming one `prune_acked` call already sees it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            registry.prune_acked(end_lsn).await;
+            if !registry.contains(xid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "entry was never pruned: mark_commit_observed's spawned task never landed"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Reconnect replay: replaying the same transaction without an intervening

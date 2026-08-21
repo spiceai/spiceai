@@ -629,14 +629,24 @@ mod tests {
         }
 
         async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
-            let mut fail = self.fail_next_upsert.lock();
-            if *fail {
-                *fail = false;
+            // Scoped so the sync guard's lifetime unambiguously ends here, well
+            // before the `.await` below — a guard merely `drop`ped mid-function
+            // can still widen the async block's Send-ness analysis for some
+            // control-flow shapes.
+            let should_fail = {
+                let mut fail = self.fail_next_upsert.lock();
+                if *fail {
+                    *fail = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
                 return Err(CheckpointError::Store {
                     source: "injected upsert failure".into(),
                 });
             }
-            drop(fail);
             self.reached_gate.notify_one();
             let _permit = self.gate.lock().await;
             *self.data.lock() = Some(data.to_string());
@@ -841,8 +851,9 @@ mod tests {
             registry.register(555).await.expect("register 555");
         }
         // Reload under a different source identity.
+        let store_dyn: Arc<dyn BlobCheckpointStore> = Arc::clone(&store);
         let reloaded = XidRegistry::load(
-            Arc::clone(&store),
+            store_dyn,
             "otherhost:5432/db/public.orders".to_string(),
             DATASET.to_string(),
         )
