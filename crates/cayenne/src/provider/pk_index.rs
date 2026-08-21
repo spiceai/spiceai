@@ -1467,6 +1467,11 @@ pub(crate) struct BoundedShardedPkIndexBuilder {
     blooms: Option<Vec<PkBloom>>,
     /// Total byte budget across all shards; `None` = exact answer required.
     max_bytes: Option<usize>,
+    /// Live rows the scan feeding this builder is expected to yield, when the plan
+    /// could report it. Sizes the blooms a degrade produces: without it the degrade
+    /// can only take the whole budget split, which on a large table over-allocates
+    /// by an order of magnitude.
+    expected_keys: Option<usize>,
 }
 
 impl BoundedShardedPkIndexBuilder {
@@ -1478,7 +1483,16 @@ impl BoundedShardedPkIndexBuilder {
                 .collect(),
             blooms: None,
             max_bytes,
+            expected_keys: None,
         }
+    }
+
+    /// Tell the builder how many live rows the scan will yield, so a degrade can
+    /// right-size its blooms instead of claiming the whole byte budget.
+    #[must_use]
+    pub(crate) fn with_expected_keys(mut self, expected_keys: Option<usize>) -> Self {
+        self.expected_keys = expected_keys;
+        self
     }
 
     /// Shard routing in exact mode (bloom mode routes by `blooms.len()` at the
@@ -1553,9 +1567,24 @@ impl BoundedShardedPkIndexBuilder {
         // pathologically small split (under 8 bytes per shard) still allocates
         // a usable filter, overshooting the budget by at most 8 bytes per
         // shard rather than degrading to an always-positive zero-bit bloom.
+        //
+        // Prefer sizing for the rows the scan will actually yield. Taking the whole
+        // budget split is blind to cardinality and over-allocates by an order of
+        // magnitude on a large table: measured at SF1000, a rebuilt `order_line`
+        // filter landed at ~113 bits per key against the ~10 `with_expected_keys`
+        // targets, which is where ~110 GB of resident memory went. The budget split
+        // stays the CEILING, and `with_expected_keys` rounds the bit count UP to a
+        // power of two, so the round-up supplies the slack for rows committed while
+        // the scan runs. No hint (the plan could not report a row count) keeps the
+        // previous behaviour.
         let n = self.shards.len();
+        let per_shard_budget = max_bytes / n;
+        let per_shard_expected = self.expected_keys.map(|keys| keys.div_ceil(n));
         let mut blooms: Vec<PkBloom> = (0..n)
-            .map(|_| PkBloom::with_byte_budget(max_bytes / n))
+            .map(|_| match per_shard_expected {
+                Some(expected) => PkBloom::with_expected_keys(expected, per_shard_budget),
+                None => PkBloom::with_byte_budget(per_shard_budget),
+            })
             .collect();
         for (shard, bloom) in self.shards.drain(..).zip(&mut blooms) {
             for key in shard.rows() {
@@ -1954,6 +1983,54 @@ mod tests {
     ///
     /// A bloom may answer `true` for a key it never saw; it must never answer
     /// `false` for one it did.
+    /// A degrade sizes its blooms for the rows the scan will yield, not for the
+    /// whole byte budget.
+    ///
+    /// Regression: `degrade_if_over_budget` allocated `max_bytes / n` per shard
+    /// regardless of cardinality, so a table far smaller than its budget still got a
+    /// budget-sized filter. Measured at SF1000 that was ~113 bits per key against a
+    /// ~10 target, and ~110 GB of resident memory. The budget split must remain the
+    /// ceiling, so the no-hint path is asserted alongside it.
+    #[test]
+    fn a_degrade_sizes_its_blooms_for_the_expected_key_count() {
+        // The budget has to be small enough that these keys exceed it as an exact
+        // keyset (~110 B/entry, so ~330 KB) and large enough that its split still
+        // dwarfs a right-sized filter: 3k keys at ~10 bits/key rounds to 4 KiB,
+        // against a 64 KiB budget split.
+        const BUDGET: usize = 64 * 1024;
+        const KEYS: usize = 3_000;
+
+        let build = |expected: Option<usize>| {
+            let mut builder =
+                BoundedShardedPkIndexBuilder::new(1, Some(BUDGET)).with_expected_keys(expected);
+            for i in 0..KEYS as u64 {
+                builder.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+            }
+            builder
+        };
+
+        let sized = build(Some(KEYS)).finish();
+        let unsized_ = build(None).finish();
+        let bytes = |index: &ShardedPkIndex| match index {
+            ShardedPkIndex::Bloom(blooms) => blooms.iter().map(PkBloom::size_bytes).sum::<usize>(),
+            ShardedPkIndex::Exact(_) => panic!("the budget was exceeded, so it must have degraded"),
+        };
+        let (sized_bytes, unsized_bytes) = (bytes(&sized), bytes(&unsized_));
+
+        assert!(
+            sized_bytes < unsized_bytes / 8,
+            "a sized degrade must be far smaller than a budget-sized one: {sized_bytes} vs {unsized_bytes}"
+        );
+        assert!(
+            sized_bytes * 8 >= KEYS * 10,
+            "and still at least ~10 bits/key: {sized_bytes} bytes for {KEYS} keys"
+        );
+        assert!(
+            unsized_bytes <= BUDGET,
+            "the budget split stays the ceiling: {unsized_bytes} > {BUDGET}"
+        );
+    }
+
     #[test]
     fn degrading_after_a_mid_batch_stop_still_records_every_key() {
         let keysets: Vec<CachedPkKeyset> =

@@ -9659,7 +9659,19 @@ impl CayenneTableProvider {
         let budget = self
             .upsert_bloom_eligible()
             .then(|| self.effective_sharded_keyset_budget());
-        let mut keyset = BoundedShardedPkIndexBuilder::new(shards, budget);
+        // Cardinality hint for a degrade's bloom sizing, from the plan's own
+        // statistics — the manifest already carries per-file live row counts, so this
+        // costs no extra I/O. Inexact is fine: it only sizes a filter, and the
+        // budget split remains the ceiling.
+        let expected_keys = scan_plan
+            .partition_statistics(None)
+            .ok()
+            .and_then(|stats| match stats.num_rows {
+                DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => Some(rows),
+                DFPrecision::Absent => None,
+            });
+        let mut keyset =
+            BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys);
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
