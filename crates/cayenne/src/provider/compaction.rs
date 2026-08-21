@@ -375,6 +375,33 @@ fn resolve_maintenance_encode_shards(override_value: Option<&str>) -> Option<usi
     }
 }
 
+/// How many of a seq-prefix bake's input files to rewrite concurrently, or
+/// `None` to keep the single-stream union rewrite.
+///
+/// The bake's cost is not its byte count but its *duration*: the deletion index
+/// it exists to shrink grows at the tombstone rate for as long as a pass runs, so
+/// a pass that takes minutes leaves an index proportional to those minutes. The
+/// union rewrite funnels every input through one `CoalescePartitionsExec` stream,
+/// which is why a pass moves 120-205 MB/s on a host whose encode budget is 95%
+/// idle.
+///
+/// Per-file is the right shape rather than a wider encode fan-out: the
+/// `encode_fanout` bench lane is monotonically WORSE with more shards per write
+/// (1 shard 71.7 ms -> 64 shards 173.2 ms on the `stock` shape), so the win has to
+/// come from concurrent single-shard writes, not from splitting one.
+static PER_FILE_BAKE_CONCURRENCY: LazyLock<Option<usize>> = LazyLock::new(|| {
+    resolve_pinned_usize(
+        "SPICE_CAYENNE_PER_FILE_BAKE",
+        std::env::var("SPICE_CAYENNE_PER_FILE_BAKE").ok().as_deref(),
+    )
+});
+
+/// Concurrency for the per-file seq-prefix bake, or `None` when it is off.
+#[must_use]
+pub(crate) fn per_file_bake_concurrency() -> Option<usize> {
+    *PER_FILE_BAKE_CONCURRENCY
+}
+
 /// Shards a maintenance write should use, or `None` to size it from its bytes.
 #[must_use]
 pub(crate) fn maintenance_encode_shards() -> Option<usize> {

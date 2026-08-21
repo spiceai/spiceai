@@ -19115,6 +19115,194 @@ impl CayenneTableProvider {
         ]);
     }
 
+    /// The bake's original rewrite shape: union every selected input (each behind
+    /// its own partial deletion filter) into ONE streaming pass, written as a
+    /// single output.
+    ///
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one rewrite shape's inputs; the alternative is a struct used at exactly one call site"
+    )]
+    async fn bake_rewrite_union(
+        &self,
+        state: &datafusion::execution::session_state::SessionState,
+        selected: &[(String, i64)],
+        pk_indices: &[usize],
+        deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
+        new_snapshot_id: &str,
+        target_size_bytes: usize,
+        total_input_bytes: u64,
+    ) -> Result<u64> {
+        // A bake is invisible in per-phase telemetry: `write_to_snapshot` times only
+        // `encode_permit_wait` and `write`, so a pass whose p90 is minutes cannot be
+        // split into planning, merge-and-write, and publish. Time each part under
+        // `bake_*` phases so the 22-phase attribution table covers the pass instead
+        // of leaving its cost unaccounted for.
+        let bake_plan_start = Instant::now();
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
+        for (snapshot_id, threshold) in selected {
+            let plan = self
+                .create_snapshot_scan_plan(state, snapshot_id, None, &[], None)
+                .await?;
+            let filtered = self.apply_partial_deletion_filter(
+                plan,
+                pk_indices,
+                *threshold,
+                deletion_snapshot,
+            )?;
+            plans.push(filtered);
+        }
+        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        // `execute_stream` collapses a multi-arm union through `CoalescePartitionsExec`
+        // (all arms are driven concurrently, then funnelled into one stream), so the
+        // merge cost lands in `bake_merge_write` below rather than here.
+        let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_plan",
+            bake_plan_start,
+        );
+
+        // The bake is gated to key mode, so the position single-writer cases do
+        // not apply; size the parallel-encode fan-out from the selected inputs'
+        // on-disk bytes exactly as the size-tier path does.
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            /* keeps_positions_serial */ false,
+            state.config().target_partitions(),
+            total_input_bytes,
+        );
+        // Covers draining the coalesced union AND the Vortex encode, because the
+        // sink pulls the stream: the read and the write are one interleaved cost and
+        // cannot be split from outside.
+        let bake_merge_write_start = Instant::now();
+        let result = self
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
+            .await;
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_merge_write",
+            bake_merge_write_start,
+        );
+        result.map(|(rows, _writer_ops, _stats)| rows)
+    }
+
+    /// Rewrite the selected prefix ONE INPUT FILE AT A TIME, `concurrency` files in
+    /// flight, all writing into the single staged `new_snapshot_id`.
+    ///
+    /// Each unit is an independent `scan(one file) -> partial deletion filter ->
+    /// write` pipeline. Correctness rests on the same argument as the union shape:
+    /// the deletion filter applied to a file is the SAME filter at the SAME
+    /// `threshold` the union would have applied to that file's snapshot, and every
+    /// selected input file is rewritten exactly once, so the output row set is
+    /// identical. What changes is only how the work is scheduled.
+    ///
+    /// Ordering stays sound without any global sort. Scan-side ordering is
+    /// advertised only when per-file statistics prove the file set forms
+    /// non-overlapping runs; a per-file rewrite maps one input file to output
+    /// file(s) covering a SUBSET of that input's own key range, so non-overlap is
+    /// preserved by construction rather than re-established by a single writer.
+    ///
+    /// Each write takes ONE encode shard. That is deliberate: the `encode_fanout`
+    /// bench lane is monotonically worse with more shards per write, so widening a
+    /// single encode is the wrong lever and concurrency across files is the right
+    /// one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one rewrite shape's inputs; the alternative is a struct used at exactly one call site"
+    )]
+    async fn bake_rewrite_per_file(
+        &self,
+        state: &datafusion::execution::session_state::SessionState,
+        selected: &[(String, i64)],
+        pk_indices: &[usize],
+        deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
+        new_snapshot_id: &str,
+        target_size_bytes: usize,
+        concurrency: usize,
+    ) -> Result<u64> {
+        use futures::stream::StreamExt;
+
+        let bake_plan_start = Instant::now();
+        // One unit per input data file, carrying its own snapshot's deletion
+        // threshold. A snapshot with an EMPTY listing contributes no units: it holds
+        // no physical rows to rewrite, and the union shape reaches the same outcome
+        // by scanning it to zero rows. Its `<= T` coverage comes from being in
+        // `selected` (the prune cutoff), not from any bytes written here.
+        let mut units: Vec<(String, String, u64, i64)> = Vec::new();
+        for (snapshot_id, threshold) in selected {
+            let files = self.list_snapshot_files_with_sizes(snapshot_id).await?;
+            for (file_name, size) in files {
+                units.push((snapshot_id.clone(), file_name, size, *threshold));
+            }
+        }
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_plan",
+            bake_plan_start,
+        );
+
+        if units.is_empty() {
+            return Ok(0);
+        }
+
+        let bake_merge_write_start = Instant::now();
+        let rows = futures::stream::iter(units.into_iter().map(
+            |(snapshot_id, file_name, size, threshold)| async move {
+                let plan = self
+                    .create_single_file_rewrite_scan_plan(state, &snapshot_id, &file_name, size)
+                    .await?;
+                let filtered = self.apply_partial_deletion_filter(
+                    plan,
+                    pk_indices,
+                    threshold,
+                    deletion_snapshot,
+                )?;
+                let stream =
+                    datafusion_physical_plan::execute_stream(filtered, state.task_ctx())?;
+                // One shard: this unit is already the parallel unit.
+                self.write_to_snapshot(
+                    stream,
+                    target_size_bytes,
+                    new_snapshot_id,
+                    1,
+                    Some(size),
+                    super::delta_encoding::WriteClass::Maintenance,
+                )
+                .await
+                .map(|(rows, _writer_ops, _stats)| rows)
+            },
+        ))
+        .buffer_unordered(concurrency.max(1))
+        .collect::<Vec<Result<u64>>>()
+        .await;
+        record_cayenne_write_phase(
+            self.table_metadata.table_name.as_str(),
+            "bake_merge_write",
+            bake_merge_write_start,
+        );
+
+        // Fail the whole pass on ANY unit failure. A partial sweep must never be
+        // published: its output would hold the surviving rows of only some inputs
+        // while Phase 3 retires tombstones for the whole prefix, which is row loss.
+        // The caller discards the staged directory.
+        let mut total: u64 = 0;
+        for row_count in rows {
+            total = total.saturating_add(row_count?);
+        }
+        Ok(total)
+    }
+
     async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
@@ -19319,62 +19507,45 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        // --- Phase 2: rewrite outside the lock (identical to the size-tier
-        // path): union over selected inputs, each with its own partial deletion
-        // filter, streamed into one fresh snapshot whose dead rows are removed. ---
+        // --- Phase 2: rewrite outside the lock. ---
+        // Two shapes, same inputs, same output snapshot, same Phase-3 commit:
+        //
+        // - UNION (default): one streaming pass over the whole selected prefix,
+        //   collapsed through `CoalescePartitionsExec` into a single stream.
+        // - PER-FILE: one independent read -> filter -> write pipeline per input
+        //   data file, several in flight, all writing into the SAME staged output
+        //   snapshot. Phase 3 authors the manifest from a directory listing and
+        //   swaps once, so it does not care how many writes produced the files.
+        //
+        // Why per-file is the shape that helps: the bake's cost to the system is
+        // its DURATION, not its byte count. The deletion index it exists to shrink
+        // grows at the tombstone rate for as long as a pass runs, so a pass lasting
+        // minutes leaves an index proportional to those minutes. The union funnels
+        // every input through one stream, which is why a pass sustains only a
+        // fraction of a host's encode budget. Per-file removes the funnel without
+        // widening any single encode — the `encode_fanout` bench lane is
+        // monotonically worse with more shards per write, so the parallelism has to
+        // come from concurrent single-shard writes.
         let ctx = self.create_compaction_session_context_for_output(selected_input_bytes);
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
-        // A bake is invisible in per-phase telemetry: `write_to_snapshot` times only
-        // `encode_permit_wait` and `write`, so a pass whose p90 is minutes cannot be
-        // split into planning, merge-and-write, and publish. Time each part under
-        // `bake_*` phases so the 22-phase attribution table covers the pass instead
-        // of leaving its cost unaccounted for. Only the outer wrapper counts a pass
-        // (`kind="bake"` on the compaction histogram); these are the breakdown.
-        let bake_plan_start = Instant::now();
-        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
-        for (snapshot_id, threshold) in &selected {
-            let plan = self
-                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
-                .await?;
-            let filtered = self.apply_partial_deletion_filter(
-                plan,
-                &pk_indices,
-                *threshold,
-                &deletion_snapshot,
-            )?;
-            plans.push(filtered);
-        }
-        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
-            plans.remove(0)
-        } else {
-            UnionExec::try_new(plans)?
-        };
-        // `execute_stream` collapses a multi-arm union through `CoalescePartitionsExec`
-        // (all arms are driven concurrently, then funnelled into one stream), so the
-        // merge cost lands in `bake_merge_write` below rather than here.
-        let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
-        record_cayenne_write_phase(
-            self.table_metadata.table_name.as_str(),
-            "bake_plan",
-            bake_plan_start,
-        );
-
+        // Staged output snapshot: allocated before either rewrite shape so the
+        // per-file writers share one destination directory.
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let is_s3 = self.table_metadata.path.starts_with("s3://");
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
-
         let target_size_bytes = self.context.target_file_size_bytes();
-        // The bake is gated to key mode, so the position single-writer cases do
-        // not apply; size the parallel-encode fan-out from the selected inputs'
-        // on-disk bytes exactly as the size-tier path does. `is_position_based()`
-        // is false here (gated above), so `keeps_positions_serial` is false.
+
+        // On-disk bytes this pass reads. The budgeted selection above already
+        // summed them; without a budget (unbounded pool) they are listed here. Both
+        // rewrite shapes need the figure — the union to size its encode fan-out,
+        // and the merged-bytes metric below as its fallback when the OUTPUT cannot
+        // be sized.
         let total_input_bytes = if max_pass_bytes.is_some() {
-            // Summed by the budget-bounded selection above.
             selected_input_bytes
         } else {
             let mut bytes: u64 = 0;
@@ -19386,36 +19557,40 @@ impl CayenneTableProvider {
             }
             bytes
         };
-        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
-            /* keeps_positions_serial */ false,
-            state.config().target_partitions(),
-            total_input_bytes,
-        );
-        // Covers draining the coalesced union AND the Vortex encode, because the
-        // sink pulls the stream: the read and the write are one interleaved cost and
-        // cannot be split from outside. `write` (inside `write_to_snapshot`) is the
-        // encode-side subset, so `bake_merge_write - write` is the read-and-filter
-        // residual — which is what tells us whether the funnel or the encode
-        // dominates a minutes-long pass.
-        let bake_merge_write_start = Instant::now();
-        let write_result = self
-            .write_to_snapshot(
-                stream,
-                target_size_bytes,
+
+        let write_result = if let Some(concurrency) =
+            super::compaction::per_file_bake_concurrency()
+        {
+            self.bake_rewrite_per_file(
+                &state,
+                &selected,
+                &pk_indices,
+                &deletion_snapshot,
                 &new_snapshot_id,
-                target_partitions,
-                estimated_bytes,
-                super::delta_encoding::WriteClass::Maintenance,
+                target_size_bytes,
+                concurrency,
             )
-            .await;
-        record_cayenne_write_phase(
-            self.table_metadata.table_name.as_str(),
-            "bake_merge_write",
-            bake_merge_write_start,
-        );
-        let (total_rows, _writer_ops, _stats_acc) = match write_result {
-            Ok(result) => result,
+            .await
+        } else {
+            self.bake_rewrite_union(
+                &state,
+                &selected,
+                &pk_indices,
+                &deletion_snapshot,
+                &new_snapshot_id,
+                target_size_bytes,
+                total_input_bytes,
+            )
+            .await
+        };
+
+        let total_rows = match write_result {
+            Ok(rows) => rows,
             Err(e) => {
+                // Both shapes stage into `new_snapshot_id` and nothing has been
+                // published yet, so discarding the whole directory is the complete
+                // rollback — a per-file sweep that failed partway leaves only
+                // orphaned staged files, never a half-committed snapshot.
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 return Err(e);
@@ -27508,6 +27683,73 @@ impl CayenneTableProvider {
     /// < ~5 MiB at 48 partitions, so a Vortex footer-open per split costs more
     /// than the decode parallelism it buys.
     const SMALL_GROUP_REPARTITION_OPT_OUT_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Scan plan over exactly ONE data file of `snapshot_id`, for a per-file
+    /// maintenance rewrite.
+    ///
+    /// Deliberately not a narrowed [`Self::create_snapshot_scan_plan`]: a rewrite
+    /// scan wants none of what that path provides. It advertises no ordering (the
+    /// rewrite output is not attested sorted), pushes no filter or limit (a rewrite
+    /// reads every row and decides row-by-row via the deletion filter above it), and
+    /// opts out of byte-range repartitioning — one file is one stream, which is the
+    /// whole point: parallelism comes from running many of these concurrently, not
+    /// from splitting one.
+    ///
+    /// Statistics are reported unknown. They only steer planning heuristics here;
+    /// the file's true row count comes back from the write.
+    async fn create_single_file_rewrite_scan_plan(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+        file_name: &str,
+        file_size: u64,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let snapshot_dir_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let base_schema = self.table_schema();
+        let scan_schema = Self::snapshot_scan_schema(&base_schema, &options);
+
+        // The object-store path the scan opens is the snapshot directory's own
+        // prefix joined with the file name, matching how the directory listing
+        // would have produced it.
+        let mut path = table_url.prefix().clone();
+        path = path.join(file_name);
+        let partitioned_file = PartitionedFile::new(path.to_string(), file_size);
+
+        let mut file_source = options
+            .format
+            .file_source(Self::snapshot_file_table_schema(&base_schema, &options));
+        // One file, one stream (see the doc comment): keep the Vortex source out of
+        // `repartition_file_scans` so it is not byte-range-split, which would pay a
+        // footer open per split for no added parallelism this pass can use.
+        if let Some(vortex) = file_source
+            .downcast_ref::<VortexSource>()
+            .map(|vs| Arc::new(vs.clone().with_repartitioning(false)) as Arc<dyn FileSource>)
+        {
+            file_source = vortex;
+        }
+
+        options
+            .format
+            .create_physical_plan(
+                state,
+                FileScanConfigBuilder::new(table_url.object_store(), file_source)
+                    .with_file_groups(vec![FileGroup::new(vec![partitioned_file])])
+                    .with_constraints(Constraints::default())
+                    .with_statistics(Statistics::new_unknown(&scan_schema))
+                    .build(),
+            )
+            .await
+    }
 
     async fn create_snapshot_scan_plan(
         &self,
