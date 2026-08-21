@@ -162,7 +162,6 @@ pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
-pub(crate) mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
@@ -1131,7 +1130,10 @@ impl DataFusion {
         // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
         // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
         // another catalog.
-        sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
+        runtime_execution_plans::sync_table::resolve_table_sync(
+            schema_provider.as_ref(),
+            table_reference.table(),
+        )
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.

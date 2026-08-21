@@ -29,7 +29,6 @@ use crate::config::Config;
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
 use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
-use crate::metrics_reader::MetricsReader;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
@@ -38,9 +37,8 @@ use crate::{
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
-    podswatcher,
     secrets::{self, Secrets},
-    status, tracers,
+    status,
 };
 use app::App;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
@@ -50,6 +48,7 @@ use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
@@ -325,7 +324,7 @@ impl RuntimeBuilder {
 
     pub async fn build(self) -> Runtime {
         // Initialize DataFusion tracer for span context propagation across async boundaries
-        if let Err(e) = tracers::init_datafusion_tracer() {
+        if let Err(e) = telemetry::tracers::init_datafusion_tracer() {
             tracing::warn!(
                 "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
             );
