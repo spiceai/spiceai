@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::resolved_refresh_mode;
+use data_accelerator_api::make_spice_data_directory;
+use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
+use data_accelerator_api::storage::{
+    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
+};
+
 use std::sync::Arc;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{
-        AcceleratorEngineRegistry, FilePathError,
-        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
-        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
-    },
+    dataaccelerator::FilePathError,
     datafusion::udf::deny_spice_functions_for_table_providers,
-    make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path,
 };
@@ -49,7 +51,12 @@ use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
-use super::{AccelerationSource, BootstrapStatus, DataAccelerator, upsert_dedup};
+use super::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+};
+use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_sqlite::SqliteSidecar;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -378,10 +385,39 @@ impl DataAccelerator for SqliteAccelerator {
     /// If the dataset is not file-accelerated, this is a no-op
     /// This step is required for federation, as `SQLite` connections attach to all other configured `SQLite` databases.
     /// Federation then requires that all attached databases exist before dataset registration.
+    async fn sidecar(
+        &self,
+        source: &dyn AccelerationSource,
+        _registry: Arc<AcceleratorEngineRegistry>,
+        open_option: OpenOption,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let sqlite_file =
+            self.sqlite_file_path(source)
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        if open_option == OpenOption::OpenExisting && !std::path::Path::new(&sqlite_file).exists() {
+            return Err(CheckpointError::Store {
+                source: format!("SQLite file does not exist at {sqlite_file}").into(),
+            });
+        }
+
+        let pool = self
+            .get_shared_pool(source)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        Ok(Arc::new(SqliteSidecar::new(
+            Arc::new(pool),
+            source.name().to_string(),
+        )))
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-        registry: Arc<AcceleratorEngineRegistry>,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
@@ -416,13 +452,14 @@ impl DataAccelerator for SqliteAccelerator {
                 if file_path.exists() {
                     snapshot_before_recreate(
                         acceleration,
-                        source,
+                        &source.name().to_string(),
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
                             &path,
                         )),
                         AccelerationEngine::Sqlite,
                         Arc::new(arrow_schema::Schema::empty()),
                         None,
+                        resolved_refresh_mode(source, acceleration),
                     )
                     .await;
 
@@ -439,10 +476,10 @@ impl DataAccelerator for SqliteAccelerator {
             let bootstrap_status = download_snapshot_if_needed(
                 acceleration,
                 source,
-                registry,
                 runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
                 AccelerationEngine::Sqlite,
                 None,
+                resolved_refresh_mode(source, acceleration),
             )
             .await;
 
@@ -1030,7 +1067,7 @@ mod tests {
         assert!(!accelerator.is_initialized(&dataset));
 
         accelerator
-            .init(&dataset, dataset.runtime.accelerator_engine_registry())
+            .init(&dataset)
             .await
             .expect("initialization should be successful");
 

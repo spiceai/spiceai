@@ -52,7 +52,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use super::Error;
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::delta_encoding::WriteClass;
+use super::delta_encoding::WritePolicy;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::pk_index::PkDigestSet;
 use super::table::CayenneTableProvider;
@@ -541,7 +541,7 @@ impl CayenneTableProvider {
                 // Unknown size (the validation stream is consumed lazily); shard
                 // across the full write concurrency, matching `begin_staged_append`.
                 None,
-                WriteClass::Delta,
+                WritePolicy::DELTA,
             )
             .await
         {

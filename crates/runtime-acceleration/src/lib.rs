@@ -17,12 +17,17 @@ pub mod acceleration_source;
 pub mod dataset_checkpoint;
 mod engine;
 pub mod layout;
+pub mod memory_budget;
+pub mod schema_change;
+pub mod sidecar;
 pub mod snapshot;
 
 pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;
 pub use acceleration_source::AccelerationSource;
 pub use engine::Engine;
+pub use schema_change::OnSchemaChange;
+pub use sidecar::{AcceleratorSidecar, OpenOption};
 pub use snapshot::SnapshotDownloadInfo;
 
 #[derive(Debug, Snafu)]

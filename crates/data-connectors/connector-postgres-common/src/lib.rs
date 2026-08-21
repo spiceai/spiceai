@@ -30,17 +30,37 @@ use datafusion_common::utils::quote_identifier;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
 
+/// Connection parameters and role grants behave identically for a dataset using
+/// the `PostgreSQL` data connector, and are documented with the connector, so the
+/// connector's page is the one that answers these for a catalog user too -- the
+/// same page the CDC prerequisite errors below already link.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
+
+/// Every variant is worded to read as the `Cause:` clause of the message that
+/// reports it: the caller states the problem -- naming the catalog, schema or
+/// table and the step that failed -- and its impact, and these supply the
+/// specific failure and its fix. A variant that named a resource or a step
+/// itself would duplicate the caller's.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the catalog or dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    // Reports Spice's own queries -- never anything the user wrote -- so the
+    // fix is never "check your SQL". Every caller in this crate raises it,
+    // including the CDC prerequisite checks that read settings (`SHOW
+    // wal_level`) rather than catalogs, so the action has to cover both, and a
+    // query can fail after connecting (a dropped connection), so reachability
+    // stays in it. The step being performed is named by the message reporting
+    // this, and the object the server objected to by `source`; the query text
+    // itself is debug detail and stays out.
     #[snafu(display(
-        "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read the system catalogs and settings Spice inspects, and that the database is still reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 

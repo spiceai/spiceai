@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::acceleration::Acceleration;
+use crate::schema_change::OnSchemaChange;
 use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -53,11 +54,36 @@ pub trait AccelerationSource: Send + Sync {
     /// `acceleration().refresh_mode` is still `None` for a genuine `debezium:`/`cdc:`
     /// stream. A consumer that must know the mode the source will actually run with
     /// maps this name through the connector-default table instead of reading the
-    /// field raw (see `runtime::builder::unset_refresh_mode_for_connector`).
+    /// field raw (see [`crate::acceleration::unset_refresh_mode_for_connector`]).
     ///
     /// Deliberately has NO default implementation: every impl states its own answer,
     /// so a new source cannot silently inherit a wrong `None` and misclassify itself.
     fn connector_name(&self) -> Option<&str>;
+
+    /// The `on_schema_change` policy this source declares, or `None` for a source that
+    /// has no such policy — a view, or a table created by DDL.
+    ///
+    /// An engine that can widen its stored schema in place asks here instead of
+    /// downcasting to the source's concrete type: `None` is the answer that keeps schema
+    /// evolution off, which is what a source with no policy to state must resolve to.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default would let a new source silently inherit
+    /// somebody else's schema-change policy.
+    fn on_schema_change(&self) -> Option<OnSchemaChange>;
+
+    /// Whether rows can reach this source through anything other than its refresh path
+    /// — `access: read_write` on a dataset, or DML against a DDL-created table.
+    ///
+    /// Load-bearing for scan freshness: only a source that provably takes no writes of
+    /// its own can serve a scan from a slightly older view of its accelerator, because
+    /// for anything else a pre-mutation view is a stale (wrong) result. A source that
+    /// cannot prove it is write-free answers `true`.
+    ///
+    /// Deliberately has NO default implementation: the safe answer here is the
+    /// permissive one, and a default would hand a new source the *restrictive* answer
+    /// and with it a silently stale read.
+    fn allows_write(&self) -> bool;
 
     /// Returns the time column name if configured, None otherwise.
     /// Views always return None as they don't support time-based append mode.
@@ -71,4 +97,24 @@ pub trait AccelerationSource: Send + Sync {
     fn initialized_sources(&self) -> InitializedSourcesFuture<'_> {
         Box::pin(async { vec![] })
     }
+
+    /// Opens this source's acceleration checkpoint, read-only, for the snapshot
+    /// bootstrap to compare a downloaded snapshot against.
+    ///
+    /// Returns a factory rather than the checkpointer itself because opening one
+    /// touches the accelerator, which the caller may decide not to do.
+    ///
+    /// The source resolves the accelerator itself instead of taking a registry
+    /// parameter, and that is load-bearing rather than stylistic: the registry type
+    /// lives in `data-accelerator-api`, which sits **above** this crate, so a
+    /// signature naming it would not compile. Keeping the resolution on the impl
+    /// side is what lets the snapshot bootstrap live below `runtime`.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default returning a no-op checkpointer would
+    /// silently disable snapshot-vs-checkpoint reconciliation for any new source.
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: crate::snapshot::SnapshotBehavior,
+    ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
 }

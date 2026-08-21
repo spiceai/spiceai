@@ -9,7 +9,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-accelerator-memory-budget = { path = "../accelerator-memory-budget" }
 cpu-budget = { path = "../cpu-budget" }
 podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }

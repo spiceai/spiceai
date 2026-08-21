@@ -16,7 +16,7 @@ limitations under the License.
 
 //! `<config-dir>/service.json`: what this instance directory's service is.
 //!
-//! Every `spice connect service` action resolves the service it operates on
+//! Every `spice cloud service` action resolves the service it operates on
 //! from the canonical instance directory and this file, and from nothing else.
 //! There is no name argument and no host-wide scan, because both can name a
 //! service belonging to a different instance — and a lifecycle command that
@@ -37,12 +37,95 @@ use crate::error::{Error, Result};
 /// File name (relative to the resolved Spice config dir) of the manifest.
 pub(crate) const SERVICE_MANIFEST_FILE: &str = "service.json";
 
+/// [`SERVICE_MANIFEST_FILE`] as a C string, for the descriptor-relative
+/// syscalls. Spelled as a literal rather than built with `CString::new` so this
+/// fixed production path cannot trip the workspace's denied `expect_used` lint;
+/// `the_two_manifest_file_names_agree` keeps the two spellings in step.
+const SERVICE_MANIFEST_FILE_C: &std::ffi::CStr = c"service.json";
+
 /// Current manifest schema. A manifest from a newer CLI is refused rather
 /// than partially understood: acting on half a description of a service is
 /// how the wrong process gets stopped.
 pub(crate) const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 const MAX_SERVICE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// The config directory a manifest operation applies to.
+///
+/// A [`runtime_cloud_connect::MutationLock`] holds its directory open for the
+/// whole operation, and that descriptor is the one name for the directory its
+/// owner cannot replace. Carrying it here is what lets an install or uninstall
+/// resolve the instance by inode: a pathname re-resolved after the lock's
+/// identity check can still name a *different* directory the same owner
+/// created, and the ownership test alone cannot tell the two apart. Without a
+/// lock there is nothing to pin, and the pathname is all a read has.
+pub(crate) struct PinnedConfigDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    directory: Option<std::fs::File>,
+}
+
+impl PinnedConfigDir {
+    /// A directory reached by pathname, for a caller holding no mutation lock.
+    pub(crate) fn unlocked(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            #[cfg(unix)]
+            directory: None,
+        }
+    }
+
+    /// The directory a mutation lock retains, named by the descriptor it holds
+    /// open. `path` is what messages show; every lookup goes through
+    /// `directory`.
+    #[cfg(unix)]
+    pub(crate) fn locked(path: impl Into<PathBuf>, directory: std::fs::File) -> Self {
+        Self {
+            path: path.into(),
+            directory: Some(directory),
+        }
+    }
+
+    /// The directory a mutation lock holds, taking the descriptor it retains
+    /// where the platform has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained descriptor cannot be duplicated.
+    pub(crate) fn for_lock(
+        path: impl Into<PathBuf>,
+        lock: &runtime_cloud_connect::MutationLock,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let directory = lock
+                .pinned_directory()
+                .map_err(|source| Error::CloudConnectIo {
+                    message: format!("pin the locked Cloud Connect config directory: {source}"),
+                })?;
+            Ok(Self::locked(path, directory))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock;
+            Ok(Self::unlocked(path))
+        }
+    }
+
+    /// What messages call this directory. When it is pinned this is only a
+    /// name for the operator to read: the directory it resolves to is exactly
+    /// what a locked operation must not trust, so every lookup goes through
+    /// [`PinnedConfigDir::descriptor`] instead.
+    fn display_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The retained descriptor, when this directory is held by a lock.
+    #[cfg(unix)]
+    fn descriptor(&self) -> Option<&std::fs::File> {
+        self.directory.as_ref()
+    }
+}
 
 /// The account the installed runtime runs as.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,42 +203,18 @@ impl ServiceManifest {
     /// Returns an error when the file cannot be read, does not parse, is not
     /// owner-only, or does not describe `instance_dir`.
     pub(crate) fn load(
-        config_dir: &Path,
+        config: &PinnedConfigDir,
         instance_dir: &Path,
         backend: &dyn ServiceBackend,
     ) -> Result<Option<Self>> {
-        Self::load_with_directory_binding(config_dir, instance_dir, backend, false)
-    }
-
-    /// Read through a directory descriptor retained by the caller's mutation
-    /// lock. On Unix that descriptor is spelled `/proc/self/fd/<n>` or
-    /// `/dev/fd/<n>` and is itself a magic symlink; the followed metadata is the
-    /// already-pinned directory inode, not a pathname lookup to reject.
-    pub(crate) fn load_from_pinned_directory(
-        config_dir: &Path,
-        instance_dir: &Path,
-        backend: &dyn ServiceBackend,
-    ) -> Result<Option<Self>> {
-        Self::load_with_directory_binding(config_dir, instance_dir, backend, true)
-    }
-
-    fn load_with_directory_binding(
-        config_dir: &Path,
-        instance_dir: &Path,
-        backend: &dyn ServiceBackend,
-        directory_is_pinned: bool,
-    ) -> Result<Option<Self>> {
-        let path = Self::path_in(config_dir);
-        let (bytes, metadata) = match super::super::state::read_bounded_regular_file_with_metadata(
-            &path,
-            MAX_SERVICE_MANIFEST_BYTES,
-        ) {
-            Ok(contents) => contents,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        let path = Self::path_in(config.display_path());
+        let (bytes, metadata) = match read_manifest_bytes(config, &path) {
+            Ok(Some(contents)) => contents,
+            Ok(None) => return Ok(None),
             Err(e) if is_symlink_loop(&e) => {
                 return Err(Error::InvalidArgument {
                     message: format!(
-                        "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink. Remove it and re-run `spice connect service install`.",
+                        "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink. Remove it and re-run `spice cloud service install`.",
                         path.display()
                     ),
                 });
@@ -170,14 +229,14 @@ impl ServiceManifest {
             serde_json::from_slice(&bytes).map_err(|e| Error::InvalidArgument {
                 message: format!(
                     "Failed to read the Spice Cloud Connect service manifest {}: {e}. \
-                 Re-run `spice connect service install` to rewrite it, or delete the file to \
+                 Re-run `spice cloud service install` to rewrite it, or delete the file to \
                  forget the installed service. See: https://spiceai.org/docs",
                     path.display()
                 ),
             })?;
         ensure_owner_only(&path, &metadata, &manifest.owner)?;
 
-        manifest.validate(&path, instance_dir, backend, directory_is_pinned)?;
+        manifest.validate(&path, instance_dir, backend, config)?;
         Ok(Some(manifest))
     }
 
@@ -194,13 +253,13 @@ impl ServiceManifest {
         path: &Path,
         instance_dir: &Path,
         backend: &dyn ServiceBackend,
-        directory_is_pinned: bool,
+        config: &PinnedConfigDir,
     ) -> Result<()> {
         let reject = |reason: String| {
             Err(Error::InvalidArgument {
                 message: format!(
                     "Failed to resolve the Spice Cloud Connect service for {instance}: \
-                     its manifest {manifest} {reason}. Re-run `spice connect service install` \
+                     its manifest {manifest} {reason}. Re-run `spice cloud service install` \
                      from this directory to rewrite it. See: https://spiceai.org/docs",
                     instance = instance_dir.display(),
                     manifest = path.display(),
@@ -231,19 +290,21 @@ impl ServiceManifest {
         {
             use std::os::unix::fs::MetadataExt as _;
 
-            let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let metadata = if directory_is_pinned {
-                std::fs::metadata(config_dir)
-            } else {
-                std::fs::symlink_metadata(config_dir)
-            }
-            .map_err(|source| Error::CloudConnectIo {
+            let config_dir = config.display_path();
+            // A pinned directory is described by the descriptor the lock holds
+            // open, so there is no name here to be a symlink or to be replaced
+            // between this check and the operation that follows it.
+            let (metadata, pinned) = match config.descriptor() {
+                Some(directory) => (directory.metadata(), true),
+                None => (std::fs::symlink_metadata(config_dir), false),
+            };
+            let metadata = metadata.map_err(|source| Error::CloudConnectIo {
                 message: format!(
                     "inspect service manifest directory {}: {source}",
                     config_dir.display()
                 ),
             })?;
-            if (!directory_is_pinned && metadata.file_type().is_symlink())
+            if (!pinned && metadata.file_type().is_symlink())
                 || !metadata.is_dir()
                 || metadata.uid() != self.owner.uid
             {
@@ -307,7 +368,8 @@ impl ServiceManifest {
     /// # Errors
     ///
     /// Returns an error when the manifest cannot be serialized or written.
-    pub(crate) fn write(&self, config_dir: &Path) -> Result<()> {
+    pub(crate) fn write(&self, config: &PinnedConfigDir) -> Result<()> {
+        let config_dir = config.display_path();
         let path = Self::path_in(config_dir);
         let json = serde_json::to_vec_pretty(self).map_err(|e| Error::CloudConnectIo {
             message: format!("serialize the service manifest for {}: {e}", path.display()),
@@ -328,7 +390,12 @@ impl ServiceManifest {
             // subsequent operation relative to its descriptor. The owner can
             // rename the directory or replace its pathname with a symlink, but
             // neither can redirect this privileged write after validation.
-            if !nix::unistd::Uid::effective().is_root() {
+            //
+            // A pinned directory needs no creating — taking the lock created
+            // it — and creating it by name here would build whatever the
+            // pathname now points at, which is what the descriptor exists to
+            // stop being trusted.
+            if config.descriptor().is_none() && !nix::unistd::Uid::effective().is_root() {
                 std::fs::create_dir_all(config_dir).map_err(|e| Error::CloudConnectIo {
                     message: format!(
                         "create the Spice config directory {}: {e}",
@@ -336,7 +403,7 @@ impl ServiceManifest {
                     ),
                 })?;
             }
-            let directory = open_pinned_manifest_directory(config_dir, &self.owner)?;
+            let directory = open_pinned_manifest_directory(config, &self.owner)?;
             write_manifest_in_directory(&directory, &path, &json, &self.owner)
         }
 
@@ -373,7 +440,8 @@ impl ServiceManifest {
     ///
     /// Returns an error when the file exists and cannot be removed — a
     /// manifest left behind would claim a service that is no longer installed.
-    pub(crate) fn remove(&self, config_dir: &Path) -> Result<()> {
+    pub(crate) fn remove(&self, config: &PinnedConfigDir) -> Result<()> {
+        let config_dir = config.display_path();
         let path = Self::path_in(config_dir);
 
         #[cfg(unix)]
@@ -382,7 +450,7 @@ impl ServiceManifest {
             // it relative to the same descriptor. A service account may rename
             // its config directory while a root uninstall is in progress; no
             // path lookup after this point may follow that replacement.
-            let directory = open_pinned_manifest_directory(config_dir, &self.owner)?;
+            let directory = open_pinned_manifest_directory(config, &self.owner)?;
             remove_manifest_in_directory(&directory, &path, self)
         }
 
@@ -445,7 +513,7 @@ fn ensure_owner_only(
             message: format!(
                 "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink, \
                  so it cannot be trusted to describe this directory's service. Replace it with \
-                 a real file by re-running `spice connect service install`. \
+                 a real file by re-running `spice cloud service install`. \
                  See: https://spiceai.org/docs",
                 path.display()
             ),
@@ -472,7 +540,7 @@ fn ensure_owner_only(
             message: format!(
                 "Failed to read the Spice Cloud Connect service manifest {}: it is owned by uid \
                  {owner}, but it records the intended operator as uid {}. Re-run \
-                 `spice connect service install` from that operator account to rewrite it. \
+                 `spice cloud service install` from that operator account to rewrite it. \
                  See: https://spiceai.org/docs",
                 path.display(),
                 intended_owner.uid,
@@ -493,7 +561,7 @@ fn ensure_owner_only(
 
 #[cfg(unix)]
 fn open_pinned_manifest_directory(
-    config_dir: &Path,
+    config: &PinnedConfigDir,
     owner: &ServiceOwner,
 ) -> Result<std::fs::File> {
     use std::ffi::CString;
@@ -501,19 +569,21 @@ fn open_pinned_manifest_directory(
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
+    let config_dir = config.display_path();
     let io_error = |e: std::io::Error| Error::CloudConnectIo {
         message: format!(
             "open the service manifest directory {} safely: {e}",
             config_dir.display()
         ),
     };
-    let directory = if is_retained_descriptor_path(config_dir) {
-        // `MutationLock::descriptor_relative_config_dir` is already the
-        // authority for which inode is protected. Opening that procfs/devfs
-        // handle duplicates the retained directory; canonicalizing it first
-        // would turn it back into an ordinary pathname and reintroduce a
-        // rename-to-replacement race before this privileged open.
-        std::fs::File::open(config_dir).map_err(io_error)?
+    let directory = if let Some(retained) = config.descriptor() {
+        // The mutation lock already holds the protected directory open, and
+        // that descriptor is the authority for which inode is protected.
+        // Duplicating it keeps the identity this operation was authorized
+        // against; resolving the pathname again would let the owner point it
+        // at another directory they also own, which the ownership test below
+        // cannot distinguish.
+        retained.try_clone().map_err(io_error)?
     } else {
         let canonical = std::fs::canonicalize(config_dir).map_err(io_error)?;
         if !canonical.is_absolute() {
@@ -599,25 +669,87 @@ fn open_pinned_manifest_directory(
     Ok(directory)
 }
 
+/// Read `service.json` under `config`, applying the type, size, and link-count
+/// bounds a manifest read applies however the directory was reached.
+///
+/// `Ok(None)` means there is no manifest. A pinned directory is read relative
+/// to its retained descriptor, so the file that is read belongs to the
+/// instance the lock was taken for and not to whatever the config directory's
+/// pathname names by the time the read happens.
+fn read_manifest_bytes(
+    config: &PinnedConfigDir,
+    path: &Path,
+) -> std::io::Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+    #[cfg(unix)]
+    if let Some(directory) = config.descriptor() {
+        return read_manifest_in_directory(directory);
+    }
+
+    match super::super::state::read_bounded_regular_file_with_metadata(
+        path,
+        MAX_SERVICE_MANIFEST_BYTES,
+    ) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Read `service.json` relative to an already-pinned directory descriptor.
+///
+/// No pathname lookup escapes the pinned config directory: only the final
+/// component is named, and `O_NOFOLLOW` is what keeps that name from being a
+/// symlink out of the directory.
 #[cfg(unix)]
-fn is_retained_descriptor_path(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
+fn read_manifest_in_directory(
+    directory: &std::fs::File,
+) -> std::io::Result<Option<(Vec<u8>, std::fs::Metadata)>> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
 
-    #[cfg(target_os = "linux")]
-    let base = Path::new("/proc/self/fd");
-    #[cfg(not(target_os = "linux"))]
-    let base = Path::new("/dev/fd");
-
-    let Ok(relative) = path.strip_prefix(base) else {
-        return false;
+    let fd = unsafe {
+        nix::libc::openat(
+            directory.as_raw_fd(),
+            SERVICE_MANIFEST_FILE_C.as_ptr(),
+            nix::libc::O_RDONLY
+                | nix::libc::O_CLOEXEC
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_NONBLOCK,
+        )
     };
-    let mut components = relative.components();
-    let Some(std::path::Component::Normal(descriptor)) = components.next() else {
-        return false;
-    };
-    components.next().is_none()
-        && !descriptor.as_bytes().is_empty()
-        && descriptor.as_bytes().iter().all(u8::is_ascii_digit)
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_SERVICE_MANIFEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the Cloud Connect state file was not a bounded regular file",
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the Cloud Connect state file must not be hard-linked",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    (&mut file)
+        .take(MAX_SERVICE_MANIFEST_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SERVICE_MANIFEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the Cloud Connect state file exceeded its size limit",
+        ));
+    }
+    Ok(Some((bytes, metadata)))
 }
 
 /// Create a unique owner-only staging inode and publish it relative to the
@@ -643,9 +775,7 @@ fn write_manifest_in_directory(
         message: "construct the service manifest staging name: generated name contains a NUL byte"
             .to_string(),
     })?;
-    // Kept as a C literal so this fixed production path cannot trip the
-    // workspace's denied `expect_used` lint.
-    let destination = c"service.json";
+    let destination = SERVICE_MANIFEST_FILE_C;
     let fd = unsafe {
         nix::libc::openat(
             directory.as_raw_fd(),
@@ -712,8 +842,7 @@ fn remove_manifest_in_directory(
     display_path: &Path,
     expected: &ServiceManifest,
 ) -> Result<()> {
-    use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let io_error = |error: std::io::Error| Error::CloudConnectIo {
@@ -722,46 +851,17 @@ fn remove_manifest_in_directory(
             display_path.display()
         ),
     };
-    let name = c"service.json";
-    let fd = unsafe {
-        nix::libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            nix::libc::O_RDONLY | nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW,
-        )
+    // The same bounded read the load path uses, so the type, link-count and
+    // size limits an uninstall re-checks cannot drift from the ones a load
+    // applies. An absent manifest is the idempotent case, not a failure.
+    let Some((bytes, metadata)) = read_manifest_in_directory(directory).map_err(&io_error)? else {
+        return directory.sync_all().map_err(io_error);
     };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return directory.sync_all().map_err(io_error);
-        }
-        return Err(io_error(error));
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let metadata = file.metadata().map_err(&io_error)?;
     let mode = metadata.permissions().mode() & 0o7777;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != expected.owner.uid
-        || mode & 0o077 != 0
-        || metadata.len() > MAX_SERVICE_MANIFEST_BYTES
-    {
+    if metadata.uid() != expected.owner.uid || mode & 0o077 != 0 {
         return Err(Error::InvalidArgument {
             message: format!(
-                "Refusing to remove the re-opened service manifest {} because its type, owner, permissions, link count, or size changed during uninstall.",
-                display_path.display()
-            ),
-        });
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    (&mut file)
-        .take(MAX_SERVICE_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(&io_error)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SERVICE_MANIFEST_BYTES {
-        return Err(Error::InvalidArgument {
-            message: format!(
-                "Refusing to remove the re-opened service manifest {} because it grew beyond the {MAX_SERVICE_MANIFEST_BYTES}-byte limit during uninstall.",
+                "Refusing to remove the re-opened service manifest {} because its owner or permissions changed during uninstall.",
                 display_path.display()
             ),
         });
@@ -782,7 +882,8 @@ fn remove_manifest_in_directory(
             ),
         });
     }
-    let removed = unsafe { nix::libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    let removed =
+        unsafe { nix::libc::unlinkat(directory.as_raw_fd(), SERVICE_MANIFEST_FILE_C.as_ptr(), 0) };
     if removed != 0 {
         return Err(io_error(std::io::Error::last_os_error()));
     }
@@ -833,6 +934,17 @@ mod tests {
     }
 
     #[test]
+    fn the_two_manifest_file_names_agree() {
+        // The descriptor-relative syscalls name the manifest with the C
+        // spelling, so a rename that missed it would leave them opening a file
+        // nothing else writes.
+        assert_eq!(
+            SERVICE_MANIFEST_FILE_C.to_bytes(),
+            SERVICE_MANIFEST_FILE.as_bytes()
+        );
+    }
+
+    #[test]
     fn a_written_manifest_round_trips() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let fake = FakeBackend::new(dir.path());
@@ -840,10 +952,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let manifest = manifest_for(&fake, &instance_dir);
 
-        manifest.write(&config_dir).expect("write manifest");
-        let loaded = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect("load manifest")
-            .expect("a manifest was written");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
+        let loaded = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect("load manifest")
+        .expect("a manifest was written");
         assert_eq!(loaded, manifest);
     }
 
@@ -852,7 +970,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let fake = FakeBackend::new(dir.path());
         assert_eq!(
-            ServiceManifest::load(dir.path(), &dir.path().join("edge-1"), &fake).expect("load"),
+            ServiceManifest::load(
+                &PinnedConfigDir::unlocked(dir.path()),
+                &dir.path().join("edge-1"),
+                &fake
+            )
+            .expect("load"),
             None
         );
     }
@@ -867,11 +990,15 @@ mod tests {
         let instance_dir = dir.path().join("edge-1");
         let config_dir = dir.path().join("edge-2").join(".spice");
         manifest_for(&fake, &instance_dir)
-            .write(&config_dir)
+            .write(&PinnedConfigDir::unlocked(&config_dir))
             .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &dir.path().join("edge-2"), &fake)
-            .expect_err("a manifest naming another directory must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &dir.path().join("edge-2"),
+            &fake,
+        )
+        .expect_err("a manifest naming another directory must not resolve");
         assert!(
             error.to_string().contains("describes the service for"),
             "{error}"
@@ -888,10 +1015,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.name = "spiced-cloud-connect-someone-else.service".to_string();
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a forged service name must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a forged service name must not resolve");
         assert!(error.to_string().contains("derives"), "{error}");
     }
 
@@ -907,10 +1040,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.supervisor = Supervisor::Launchd;
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a manifest for another supervisor must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a manifest for another supervisor must not resolve");
         assert!(
             error.to_string().contains("this host is managed by"),
             "{error}"
@@ -925,10 +1064,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.schema_version = MANIFEST_SCHEMA_VERSION + 1;
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a future schema must not be half-understood");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a future schema must not be half-understood");
         assert!(error.to_string().contains("schema version"), "{error}");
     }
 
@@ -940,10 +1085,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.runtime_path = PathBuf::from("relative/spiced");
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a relative runtime path must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a relative runtime path must not resolve");
         assert!(
             error.to_string().contains("relative runtime path"),
             "{error}"
@@ -960,10 +1111,16 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.definition_path = PathBuf::from("/etc/passwd");
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("an unrelated definition path must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("an unrelated definition path must not resolve");
         assert!(error.to_string().contains("/etc/passwd"), "{error}");
         assert!(
             error.to_string().contains("records the definition"),
@@ -981,10 +1138,16 @@ mod tests {
         let config_dir = dir.path().join("edge-1").join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
         manifest.directory = instance_dir.clone();
-        manifest.write(&config_dir).expect("write manifest");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a relative instance directory must not resolve");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a relative instance directory must not resolve");
         assert!(
             error.to_string().contains("relative instance directory"),
             "{error}"
@@ -1000,8 +1163,12 @@ mod tests {
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         std::fs::write(ServiceManifest::path_in(&config_dir), "not json").expect("write");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a manifest that describes something unreadable must be reported");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a manifest that describes something unreadable must be reported");
         assert!(error.to_string().contains("service manifest"), "{error}");
     }
 
@@ -1011,7 +1178,7 @@ mod tests {
         let fake = FakeBackend::new(dir.path());
         let instance_dir = dir.path().join("edge-1");
         manifest_for(&fake, &instance_dir)
-            .remove(dir.path())
+            .remove(&PinnedConfigDir::unlocked(dir.path()))
             .expect("idempotent removal");
     }
 
@@ -1025,14 +1192,18 @@ mod tests {
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
         manifest_for(&fake, &instance_dir)
-            .write(&config_dir)
+            .write(&PinnedConfigDir::unlocked(&config_dir))
             .expect("write manifest");
 
         let path = ServiceManifest::path_in(&config_dir);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("widen the mode");
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a manifest others can change must not decide what Spice controls");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a manifest others can change must not decide what Spice controls");
         assert!(error.to_string().contains("0644"), "{error}");
     }
 
@@ -1046,7 +1217,7 @@ mod tests {
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
         manifest_for(&fake, &instance_dir)
-            .write(&config_dir)
+            .write(&PinnedConfigDir::unlocked(&config_dir))
             .expect("write manifest");
 
         let mode = std::fs::metadata(ServiceManifest::path_in(&config_dir))
@@ -1072,7 +1243,8 @@ mod tests {
             name: None,
         };
         let pinned =
-            open_pinned_manifest_directory(&config_dir, &owner).expect("pin original config dir");
+            open_pinned_manifest_directory(&PinnedConfigDir::unlocked(&config_dir), &owner)
+                .expect("pin original config dir");
 
         std::fs::rename(&config_dir, &moved_config_dir).expect("move original config dir");
         std::os::unix::fs::symlink(&attacker_dir, &config_dir)
@@ -1096,9 +1268,13 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    /// The pinned directory has to be the inode the lock retained even after
+    /// the config directory's pathname names a *different* directory with the
+    /// same owner — which is what a re-resolved pathname cannot distinguish,
+    /// on every Unix rather than only where `/proc/self/fd` can be traversed.
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_mutation_lock_descriptor_is_duplicated_without_path_canonicalization() {
+    async fn a_pinned_directory_is_the_locked_inode_after_a_same_owner_replacement() {
         use std::os::unix::fs::MetadataExt as _;
 
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1107,24 +1283,129 @@ mod tests {
         let lock = runtime_cloud_connect::MutationLock::acquire(&config_dir, "manifest-test")
             .await
             .expect("lock config dir");
-        let descriptor_path = lock
-            .descriptor_relative_config_dir()
-            .expect("derive retained descriptor path");
-        assert!(is_retained_descriptor_path(&descriptor_path));
+        let locked = std::fs::metadata(&config_dir).expect("stat the locked config dir");
+        let pinned = PinnedConfigDir::locked(
+            config_dir.clone(),
+            lock.pinned_directory()
+                .expect("retain the locked directory"),
+        );
         let owner = ServiceOwner {
             uid: nix::unistd::Uid::effective().as_raw(),
             gid: nix::unistd::Gid::effective().as_raw(),
             name: None,
         };
 
-        let duplicated = open_pinned_manifest_directory(&descriptor_path, &owner)
-            .expect("duplicate the mutation lock directory descriptor");
-        let retained = std::fs::metadata(&descriptor_path).expect("stat retained descriptor");
-        let opened = duplicated.metadata().expect("stat duplicated descriptor");
+        let moved_config_dir = dir.path().join("instance").join("moved-spice");
+        std::fs::rename(&config_dir, &moved_config_dir).expect("move the locked config dir");
+        std::fs::create_dir_all(&config_dir).expect("create the replacement config dir");
+        let replacement = std::fs::metadata(&config_dir).expect("stat the replacement");
+        assert_ne!(
+            (replacement.dev(), replacement.ino()),
+            (locked.dev(), locked.ino()),
+            "the replacement must be a different directory for this test to mean anything"
+        );
+        assert_eq!(
+            replacement.uid(),
+            owner.uid,
+            "the replacement is owned by the same account, so ownership cannot discriminate"
+        );
+
+        let opened = open_pinned_manifest_directory(&pinned, &owner)
+            .expect("open the pinned directory")
+            .metadata()
+            .expect("stat the pinned directory");
 
         assert_eq!(
             (opened.dev(), opened.ino()),
-            (retained.dev(), retained.ino())
+            (locked.dev(), locked.ino()),
+            "a pinned manifest operation must resolve the directory the lock was taken for"
+        );
+    }
+
+    /// The write and the read that an install performs both have to land in
+    /// the locked instance's directory, not in whichever directory its
+    /// pathname names by the time they run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_locked_manifest_is_published_and_read_back_from_the_locked_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fake = FakeBackend::new(dir.path());
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let manifest = manifest_for(&fake, &instance_dir);
+
+        let lock = runtime_cloud_connect::MutationLock::acquire(&config_dir, "manifest-test")
+            .await
+            .expect("lock config dir");
+        let pinned = PinnedConfigDir::locked(
+            config_dir.clone(),
+            lock.pinned_directory()
+                .expect("retain the locked directory"),
+        );
+
+        let moved_config_dir = instance_dir.join("moved-spice");
+        std::fs::rename(&config_dir, &moved_config_dir).expect("move the locked config dir");
+        std::fs::create_dir_all(&config_dir).expect("create the replacement config dir");
+
+        manifest.write(&pinned).expect("publish through the lock");
+
+        assert!(
+            !ServiceManifest::path_in(&config_dir).exists(),
+            "the replacement pathname must not receive the manifest"
+        );
+        assert_eq!(
+            ServiceManifest::load(&pinned, &instance_dir, &fake)
+                .expect("read back through the lock"),
+            Some(manifest),
+            "the read must come from the locked directory"
+        );
+        assert!(
+            ServiceManifest::path_in(&moved_config_dir).exists(),
+            "the locked directory must hold the manifest"
+        );
+    }
+
+    /// Nothing a locked operation does may depend on the config directory's
+    /// pathname still resolving: the owner can move it out from under a root
+    /// install or uninstall, and the descriptor the lock holds is what names
+    /// the instance.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_locked_manifest_is_read_and_removed_after_its_pathname_is_gone() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fake = FakeBackend::new(dir.path());
+        let instance_dir = dir.path().join("edge-1");
+        let config_dir = instance_dir.join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let manifest = manifest_for(&fake, &instance_dir);
+
+        let lock = runtime_cloud_connect::MutationLock::acquire(&config_dir, "manifest-test")
+            .await
+            .expect("lock config dir");
+        let pinned = PinnedConfigDir::locked(
+            config_dir.clone(),
+            lock.pinned_directory()
+                .expect("retain the locked directory"),
+        );
+        manifest.write(&pinned).expect("publish through the lock");
+
+        let moved_config_dir = instance_dir.join("moved-spice");
+        std::fs::rename(&config_dir, &moved_config_dir).expect("move the locked config dir");
+        assert!(
+            !config_dir.exists(),
+            "the config directory's pathname must name nothing for this test to mean anything"
+        );
+
+        assert_eq!(
+            ServiceManifest::load(&pinned, &instance_dir, &fake).expect("read through the lock"),
+            Some(manifest.clone()),
+            "a locked read must not depend on the pathname"
+        );
+        manifest.remove(&pinned).expect("remove through the lock");
+        assert!(
+            !ServiceManifest::path_in(&moved_config_dir).exists(),
+            "the manifest in the locked directory must be removed"
         );
     }
 
@@ -1137,15 +1418,19 @@ mod tests {
         let config_dir = instance_dir.join(".spice");
         let elsewhere = dir.path().join("elsewhere.json");
         manifest_for(&fake, &instance_dir)
-            .write(dir.path())
+            .write(&PinnedConfigDir::unlocked(dir.path()))
             .expect("write manifest");
         std::fs::rename(ServiceManifest::path_in(dir.path()), &elsewhere).expect("move it aside");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         std::os::unix::fs::symlink(&elsewhere, ServiceManifest::path_in(&config_dir))
             .expect("symlink the manifest");
 
-        let error = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect_err("a symlinked manifest must not resolve a service");
+        let error = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect_err("a symlinked manifest must not resolve a service");
         assert!(error.to_string().contains("symlink"), "{error}");
     }
 
@@ -1158,13 +1443,21 @@ mod tests {
         let instance_dir = dir.path().join("edge-1");
         let config_dir = instance_dir.join(".spice");
         let mut manifest = manifest_for(&fake, &instance_dir);
-        manifest.write(&config_dir).expect("first write");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("first write");
         manifest.runtime_version = "v2.3.0".to_string();
-        manifest.write(&config_dir).expect("second write");
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("second write");
 
-        let loaded = ServiceManifest::load(&config_dir, &instance_dir, &fake)
-            .expect("load")
-            .expect("a manifest is present");
+        let loaded = ServiceManifest::load(
+            &PinnedConfigDir::unlocked(&config_dir),
+            &instance_dir,
+            &fake,
+        )
+        .expect("load")
+        .expect("a manifest is present");
         assert_eq!(loaded.runtime_version, "v2.3.0");
     }
 }

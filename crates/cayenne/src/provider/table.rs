@@ -2939,6 +2939,26 @@ impl ProtectedMergeSelection {
     }
 }
 
+/// Whether a write may fan its encode across shards at all.
+///
+/// The partition count a caller passes alongside this is a *hint*: ordinary
+/// writes inherit it from whichever session is executing them, so it can be
+/// small for reasons that have nothing to do with this write, and a configured
+/// `cayenne_write_concurrency` is meant to survive that. A write whose output
+/// shape is load-bearing therefore states it here instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeFanOut {
+    /// Size the fan-out from the configured write concurrency and the byte
+    /// estimate. The overwhelming majority of writes.
+    Sized,
+    /// One encoder, whatever the configuration says. Required where the output
+    /// must be a single sequence of files: a position-delete table's merge
+    /// (its tombstones are file-path scoped and the rewrite's position bake-in
+    /// assumes one output sequence), and a Z-order-clustered cold promotion
+    /// (sharding scatters the clustering the promotion exists to create).
+    Serial,
+}
+
 /// Write shape — encoder fan-out cap and size estimate — for the
 /// subset-merge output (see `compact_protected_snapshots_subset`).
 ///
@@ -5253,6 +5273,44 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Move write-time footer-cache entries along with staged files.
+    ///
+    /// The Vortex sink caches each written file's footer under the path it
+    /// wrote — for staged writes, the staging directory — while scans look up
+    /// the post-move location, so without this the entries are unreachable and
+    /// the first post-publish scan pays the cold footer read anyway. Each
+    /// `(source, dst_meta)` pair removes the staging-keyed entry and, when the
+    /// post-move listing meta is known (`Some`), re-inserts the same footer
+    /// under the moved location with exactly the meta the delta-applied
+    /// listing will present (`is_valid_for` compares size and mtime exactly).
+    /// Best-effort in every direction: a missing source entry, or a `None`
+    /// meta, degrades to the cold footer read the scan always paid.
+    pub(super) fn rekey_moved_footer_cache_entries(
+        &self,
+        moves: Vec<(object_store::path::Path, Option<ObjectMeta>)>,
+    ) {
+        use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
+
+        let cache = self
+            .context
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
+        for (source, dst_meta) in moves {
+            let Some(entry) = cache.remove(&source) else {
+                continue;
+            };
+            let Some(dst_meta) = dst_meta else {
+                continue;
+            };
+            let dst = dst_meta.location.clone();
+            cache.put(
+                &dst,
+                CachedFileMetadataEntry::new(dst_meta, entry.file_metadata),
+            );
+        }
+    }
+
     fn record_current_snapshot_files_added(&self, file_count: usize) {
         if file_count == 0 {
             return;
@@ -5339,36 +5397,64 @@ impl CayenneTableProvider {
             Self::sync_snapshot_dir(&target_dir).await?;
             self.record_current_snapshot_files_added(moved_count);
 
-            // Record the moved files' ObjectMeta in the side-channel so the
-            // caller's `publish_current_snapshot_files_changed_under_held_fence`
-            // can delta-apply them onto the list-files cache instead of evicting
-            // the whole directory listing. Best-effort: if stat fails for any
-            // file we skip the side-channel entirely (leaving `None`), so the
-            // publish falls back to a full eviction + re-LIST — never wrong, just
-            // not incremental.
+            // Stat the moved files for the list-files-cache delta-apply below.
+            // Best-effort: if stat fails for any file this stays `None`, so the
+            // publish falls back to a full eviction + re-LIST — never wrong,
+            // just not incremental.
             //
             // ONLY when the move target is the live current snapshot. A
             // compaction/overwrite move targets a not-yet-current snapshot and is
             // followed by `refresh_listing_table_under_held_fence` (which evicts),
             // NOT this delta path — recording its files would let a later
             // current-snapshot publish apply the WRONG snapshot's additions.
-            if self.get_current_snapshot_id() == current_snapshot {
+            let delta_metas = if self.get_current_snapshot_id() == current_snapshot {
                 let snapshot_dir_url = Self::snapshot_dir_url(
                     &self.table_metadata.path,
                     &self.table_metadata.table_id,
                     current_snapshot,
                 );
-                if let Some(metas) = self
-                    .stat_moved_files_as_object_metas(
-                        &snapshot_dir_url,
-                        &target_dir,
-                        &moved_file_names,
-                    )
-                    .await
-                {
-                    *self.last_moved_snapshot_files.lock() =
-                        Some((current_snapshot.to_string(), metas));
-                }
+                self.stat_moved_files_as_object_metas(
+                    &snapshot_dir_url,
+                    &target_dir,
+                    &moved_file_names,
+                )
+                .await
+            } else {
+                None
+            };
+
+            // Move the write-time footer-cache entries along with the files
+            // (see `rekey_moved_footer_cache_entries`). `delta_metas` is
+            // index-aligned with `moved_file_names` when present.
+            let staging_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                staging_snapshot_id,
+            ))
+            .ok()
+            .map(|url| url.prefix().clone());
+            if let Some(staging_prefix) = staging_prefix {
+                let moves = moved_file_names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, name)| {
+                        let name = name.to_str()?;
+                        Some((
+                            staging_prefix.clone().join(name),
+                            delta_metas.as_ref().and_then(|metas| metas.get(i).cloned()),
+                        ))
+                    })
+                    .collect();
+                self.rekey_moved_footer_cache_entries(moves);
+            }
+
+            // Record the moved files' ObjectMeta in the side-channel so the
+            // caller's `publish_current_snapshot_files_changed_under_held_fence`
+            // can delta-apply them onto the list-files cache instead of evicting
+            // the whole directory listing.
+            if let Some(metas) = delta_metas {
+                *self.last_moved_snapshot_files.lock() =
+                    Some((current_snapshot.to_string(), metas));
             }
         }
 
@@ -5553,6 +5639,17 @@ impl CayenneTableProvider {
         );
 
         self.record_current_snapshot_files_added(file_moves.len());
+
+        // Move the write-time footer-cache entries along with the objects (see
+        // `rekey_moved_footer_cache_entries`). `moved_metas` is index-aligned
+        // with `file_moves` when the cache prefix parsed; otherwise this
+        // degrades to removing the now-stale staging-keyed entries.
+        let footer_cache_moves = file_moves
+            .iter()
+            .enumerate()
+            .map(|(i, (source, _))| (source.clone(), moved_metas.get(i).cloned()))
+            .collect();
+        self.rekey_moved_footer_cache_entries(footer_cache_moves);
 
         // Record the moved files for the list-files-cache delta-apply (see
         // `last_moved_snapshot_files`). Only when (a) the move target is the live
@@ -5802,7 +5899,7 @@ impl CayenneTableProvider {
                 staging_snapshot_id,
                 target_partitions,
                 None,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
         Ok(row_count)
@@ -6845,8 +6942,13 @@ impl CayenneTableProvider {
     /// * `stream` - The stream of record batches to write
     /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
-    /// * `target_partitions` - Upper bound on intra-write shard writers (the
-    ///   host's logical-core count); also the ceiling the Vortex sink clamps to.
+    /// * `target_partitions` - Hard ceiling on intra-write shard writers, and the
+    ///   caller's statement of intent: usually the host's logical-core count, but
+    ///   `1` where the write must stay serial (the sorted rewrites, and the
+    ///   protected-snapshot merge for position-delete tables), or
+    ///   `ceil(bytes / target_file_size)` where it bounds file roll-over instead.
+    ///   Enforced by `snapshot_write_concurrency` — see there for why the Vortex
+    ///   sink cannot enforce it.
     /// * `estimated_bytes` - Caller's estimate of the total bytes this write will
     ///   produce, used to size the intra-write shard count (small writes stay a
     ///   single file). `None` ⇒ unknown size ⇒ shard across the full write
@@ -6867,10 +6969,15 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         target_partitions: usize,
         estimated_bytes: Option<u64>,
-        write_class: super::delta_encoding::WriteClass,
+        policy: super::delta_encoding::WritePolicy,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
+
+        let super::delta_encoding::WritePolicy {
+            class: write_class,
+            fan_out,
+        } = policy;
 
         // Materialize the snapshot directory before the write, unconditionally.
         // The Vortex sink creates it lazily when it writes its first file, so a
@@ -6900,16 +7007,18 @@ impl CayenneTableProvider {
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
-        let shard_count =
-            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
-        // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
-        // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
-        // Acquire permits for that clamped count so a `cayenne_write_concurrency`
-        // configured above `target_partitions` can't over-subscribe the global
-        // budget and throttle other tables. (`acquire_encode_permits` also caps to
-        // the budget total, but clamping here keeps the request honest even if the
-        // budget is ever sized below the core count, e.g. reserved query threads.)
-        let encode_shards = shard_count.min(target_partitions.max(1));
+        let shard_count = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            fan_out,
+        );
+        // `snapshot_write_concurrency` already clamps the fan-out to
+        // `target_partitions`, so there is no second clamp here — one place owns
+        // the rule. Permitting for that count is what keeps a
+        // `cayenne_write_concurrency` above the caller's cap from
+        // over-subscribing the global budget and throttling other tables.
+        // (`acquire_encode_permits` caps to the budget total besides.)
         // Class-aware: `Delta` (CDC staged appends, mem-tier checkpoints) may
         // use the whole budget; `Maintenance` (compaction outputs, sorted
         // rewrites, overwrites) is capped below it so a latency-bound delta
@@ -6926,7 +7035,7 @@ impl CayenneTableProvider {
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
         let _encode_permits = super::write_budget::acquire_encode_permits(
-            encode_shards,
+            shard_count,
             write_class,
             self.context.is_coupled_writer(),
         )
@@ -6964,9 +7073,19 @@ impl CayenneTableProvider {
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self.context.write_format_with_strategy(
                 strategy,
-                self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
+                self.write_shard_config(
+                    target_partitions,
+                    target_size_bytes,
+                    estimated_bytes,
+                    fan_out,
+                ),
             ),
-            None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+            None => self.write_shard_format(
+                target_partitions,
+                target_size_bytes,
+                estimated_bytes,
+                fan_out,
+            ),
         };
 
         // Create a new ListingTable pointing to the snapshot directory
@@ -7115,16 +7234,13 @@ impl CayenneTableProvider {
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         // Files added ≈ number of concurrent shard writers (each writes ≥1 file
         // when it receives rows). Drives only the compaction-trigger heuristic.
-        // This is `encode_shards` — the size-aware request ALREADY CLAMPED to
-        // `target_partitions` (the Vortex sink clamps to it via `build_shard_spec`),
-        // so it matches the files actually produced. Using the raw
-        // `snapshot_shard_count` would over-count whenever `target_partitions` caps
-        // the fan-out below the size-based request — e.g. the concurrent per-shard
-        // checkpoint encode pins `target_partitions = 1` (one file per shard), where
-        // the raw request would report the full write concurrency and over-trigger
-        // compaction by the fan-out ratio. For every caller whose `target_partitions`
-        // already meets the size-based count, this is unchanged.
-        let writer_ops = if total_rows > 0 { encode_shards } else { 0 };
+        // `shard_count` is already clamped to `target_partitions` by
+        // `snapshot_write_concurrency`, so it matches the files actually produced.
+        // That clamp is why this can be counted at all: the per-shard checkpoint
+        // encode pins `target_partitions = 1` (one file per shard), and an
+        // unclamped request would report the full write concurrency and
+        // over-trigger compaction by the fan-out ratio.
+        let writer_ops = if total_rows > 0 { shard_count } else { 0 };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -7250,7 +7366,7 @@ impl CayenneTableProvider {
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await
             }));
@@ -7340,7 +7456,13 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> usize {
+        // The caller requires a single sequence of output files. Checked before
+        // the configured concurrency, which must not be able to override it.
+        if matches!(fan_out, EncodeFanOut::Serial) {
+            return 1;
+        }
         // A sorted write must go through ONE writer, or the global order is
         // scattered across shard files and each file's zone maps span the whole
         // range — forfeiting exactly the pruning the sort was for.
@@ -7401,12 +7523,14 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
         match self.write_shard_config(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            fan_out,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
@@ -7428,11 +7552,13 @@ impl CayenneTableProvider {
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
+        fan_out: EncodeFanOut,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
+            fan_out,
         );
         if shard_count <= 1 {
             return None;
@@ -7489,12 +7615,13 @@ impl CayenneTableProvider {
     /// explicitly when a table needs more encode parallelism (and the process-wide
     /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
-    /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
-    /// it to the write session's `target_partitions` — the CPU budget's core count
-    /// (see [`Self::create_session_context`]) — so a configured value above
-    /// the core count is capped, not honored. That ceiling is intentional:
-    /// parallel encode is CPU-bound, so extra shards would only add files (read
-    /// amplification) without speeding the write.
+    /// This is the *requested* count, sized against the caller's partition hint
+    /// only when nothing is configured. A write that must not fan out at all
+    /// says so with [`EncodeFanOut::Serial`] rather than by passing a small
+    /// `session_target_partitions` — the hint cannot carry that meaning, because
+    /// an ordinary write inherits it from whatever session is executing
+    /// (`runtime.query.target_partitions`, or a cluster's executor-slot count),
+    /// and a configured `cayenne_write_concurrency` must survive that.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
         self.context.write_concurrency().unwrap_or(default).max(1)
@@ -13879,7 +14006,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 1,
                 None,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await?;
 
@@ -14321,7 +14448,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
 
@@ -16695,7 +16822,7 @@ impl CayenneTableProvider {
                 // file is the whole point), so the shard count is forced to 1
                 // regardless; no size estimate needed.
                 None,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
 
@@ -17205,6 +17332,7 @@ impl CayenneTableProvider {
         cold_config: Option<&crate::metadata::ObjectStoreConfig>,
         stream: SendableRecordBatchStream,
         max_sequence: i64,
+        fan_out: EncodeFanOut,
     ) -> Result<(Vec<crate::metadata::ColdTierFile>, u64)> {
         let promotion_id = uuid::Uuid::now_v7().to_string();
         let cold_base = cold_location.trim_end_matches('/');
@@ -17227,7 +17355,7 @@ impl CayenneTableProvider {
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
-        let shard = self.write_shard_config(1, target_size_bytes, None);
+        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out);
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -17840,6 +17968,7 @@ impl CayenneTableProvider {
 
         // Z-order cluster for a read-optimized cold layout.
         let clustering = self.resolve_cold_clustering_indices();
+        let clustering_is_empty = clustering.is_empty();
         let task_ctx = ctx.task_ctx();
         let stream = self.zorder_sort_stream(stream, clustering, &task_ctx);
 
@@ -17850,6 +17979,14 @@ impl CayenneTableProvider {
                 self.cold_object_store_config.as_ref(),
                 stream,
                 max_sequence,
+                // `zorder_sort_stream` returned the stream untouched when no
+                // clustering key resolved; otherwise sharding would scatter the
+                // clustering this promotion exists to create.
+                if clustering_is_empty {
+                    EncodeFanOut::Sized
+                } else {
+                    EncodeFanOut::Serial
+                },
             )
             .await?;
         tracing::debug!(
@@ -18501,7 +18638,15 @@ impl CayenneTableProvider {
                 estimated_bytes,
                 // Compaction re-encodes for the long term: always the full
                 // (Maintenance) encoding cascade, never the cheap delta tier.
-                super::delta_encoding::WriteClass::Maintenance,
+                // A position-delete table's tombstones are file-path scoped and
+                // the position bake-in assumes one output sequence, so this
+                // merge must not fan out however the table is configured. The
+                // partition hint alone cannot say that.
+                if keeps_positions_serial {
+                    super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
+                } else {
+                    super::delta_encoding::WritePolicy::MAINTENANCE
+                },
             )
             .await;
 
@@ -19118,7 +19263,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Maintenance,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
             )
             .await;
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
@@ -24925,7 +25070,7 @@ impl CayenneTableProvider {
                     &self.get_current_snapshot_id(),
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
-                    super::delta_encoding::WriteClass::Delta,
+                    super::delta_encoding::WritePolicy::DELTA,
                 )
                 .await?;
             // Clear under the publish locks (inner to the held fence), uniform
@@ -24970,7 +25115,7 @@ impl CayenneTableProvider {
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await?;
                 (files, stats)
@@ -25900,7 +26045,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
 
@@ -26083,7 +26228,7 @@ impl CayenneTableProvider {
                         &self.get_current_snapshot_id(),
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await?;
                 stats
@@ -27506,13 +27651,10 @@ impl CayenneTableProvider {
             if object_store_url.is_none() {
                 object_store_url = Some(listing_url.clone());
             }
-            let object_meta = ObjectMeta {
-                location: listing_url.prefix().clone(),
-                last_modified: chrono::DateTime::UNIX_EPOCH,
-                size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                e_tag: None,
-                version: None,
-            };
+            let object_meta = vortex_datafusion::synthetic_object_meta(
+                listing_url.prefix().clone(),
+                u64::try_from(file.file_size_bytes).unwrap_or(0),
+            );
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
@@ -27651,16 +27793,14 @@ impl CayenneTableProvider {
             // (if any) are excluded identically.
             .filter(|file| file.file_size_bytes > 0)
             .map(|file| {
-                let object_meta = ObjectMeta {
-                    location: prefix.clone().join(file.file_path.as_str()),
-                    // `last_modified` is unused by the Vortex scan (it reads
-                    // footer stats by location/size); a fixed epoch keeps the
-                    // value deterministic without an extra stat round-trip.
-                    last_modified: chrono::DateTime::UNIX_EPOCH,
-                    size: u64::try_from(file.file_size_bytes).unwrap_or(0),
-                    e_tag: None,
-                    version: None,
-                };
+                // `synthetic_object_meta` stamps the epoch mtime the Vortex
+                // write path also stamps on its footer-cache entries, so
+                // `is_valid_for` matches and post-write scans reuse the
+                // just-written footers instead of re-reading them cold.
+                let object_meta = vortex_datafusion::synthetic_object_meta(
+                    prefix.clone().join(file.file_path.as_str()),
+                    u64::try_from(file.file_size_bytes).unwrap_or(0),
+                );
                 // Same conversion `pruned_partition_list` uses for the
                 // unpartitioned case (`object_meta.into()`).
                 PartitionedFile::from(object_meta)
@@ -34097,7 +34237,7 @@ mod tests {
         let guard = provider.pk_keyset_cache.lock();
         match guard.as_ref() {
             Some(CachedPkIndex::Bloom(bloom)) => {
-                let bloom_bytes = bloom.bits.len() * 8;
+                let bloom_bytes = bloom.size_bytes();
                 assert!(
                     bloom_bytes <= budget_bytes / 4,
                     "conversion bloom must be right-sized, got {bloom_bytes} bytes for a {budget_bytes}-byte budget"
@@ -38238,8 +38378,11 @@ mod tests {
         // requested writer count for parallel encode (no key clustering).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            4
+        );
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -38270,20 +38413,29 @@ mod tests {
         // count is capped at `snapshot_write_concurrency` = DEFAULT_WRITE_CONCURRENCY
         // (4) clamped to session_target_partitions (8) ⇒ 4.
         // A small exact delta (< one unit) stays a single file.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(2 * mib), EncodeFanOut::Sized),
+            1
+        );
         // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16
         // unit-shards, capped to the write-concurrency ceiling (4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib)), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(256 * mib), EncodeFanOut::Sized),
+            4
+        );
         // Mid-size flush: 48 MiB / 16 MiB = 3 shards (under the cap ⇒ unit-driven).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib)), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(48 * mib), EncodeFanOut::Sized),
+            3
+        );
         // A tiny configured target (≤ 16 MiB) keeps the old whole-file unit.
         let small_tsb = 8 * 1024 * 1024usize;
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib), EncodeFanOut::Sized),
             1
         );
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib)),
+            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), EncodeFanOut::Sized),
             2
         );
     }
@@ -38308,8 +38460,11 @@ mod tests {
         // output file is PK-clustered (tight per-file zone maps).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 4);
-        let format = provider.write_shard_format(4, tsb, None);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            4
+        );
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
@@ -38340,7 +38495,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38369,7 +38524,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38401,18 +38556,112 @@ mod tests {
             "test",
         );
 
-        // The explicit `write_concurrency` override wins over the session's
-        // target-partition count. `estimated_bytes = None` ⇒ full fan-out, so
-        // the override (2) is honored unclamped by size.
+        // The explicit `write_concurrency` override wins over the default the
+        // session's target-partition count would have produced, up to that
+        // count as a ceiling (2 <= 4 here, so it is honored in full).
+        // `estimated_bytes = None` ⇒ full fan-out, so it is unclamped by size.
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None), 2);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
+            2
+        );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None)
+                .write_shard_format(4, tsb, None, EncodeFanOut::Sized)
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
             2
+        );
+    }
+
+    /// `EncodeFanOut::Serial` forces one encoder however high
+    /// `cayenne_write_concurrency` is set.
+    ///
+    /// The protected-snapshot merge needs this for position-delete tables: their
+    /// tombstones are file-path scoped and the position bake-in assumes one
+    /// output sequence. It cannot be expressed as a small partition hint, because
+    /// an ordinary write inherits that hint from whatever session executes it.
+    ///
+    /// The fixture declares no sort columns on purpose: `snapshot_shard_count`
+    /// returns 1 outright for a sorted table, which would mask the intent.
+    #[tokio::test]
+    async fn test_serial_fan_out_overrides_configured_write_concurrency() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "serial_fan_out",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        // Both size-estimate shapes the merge can pass: `None` (its serial
+        // position-delete shape) and a large estimate, which would otherwise earn
+        // the full fan-out.
+        let huge = Some(tsb as u64 * 64);
+        for estimated in [None, huge] {
+            assert_eq!(
+                provider.snapshot_shard_count(8, tsb, estimated, EncodeFanOut::Serial),
+                1,
+                "Serial must override the configured write concurrency \
+                 (estimated_bytes={estimated:?})"
+            );
+            assert!(
+                provider
+                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial)
+                    .write_shard()
+                    .is_none(),
+                "a Serial write must produce the unsharded base format \
+                 (estimated_bytes={estimated:?})"
+            );
+        }
+    }
+
+    /// A LOW partition hint must not serialize an ordinary write.
+    ///
+    /// The hint is inherited from whichever session is executing — a low
+    /// `runtime.query.target_partitions`, or a cluster's executor-slot count — so
+    /// treating it as a hard ceiling would silently disable a configured
+    /// `cayenne_write_concurrency` on the CDC, DML, staged and overwrite paths.
+    /// `write_to_snapshot` builds its own `SessionConfig::default()` session for
+    /// the sink, so the sink would still have encoded at the configured width;
+    /// only the accelerator's request would have collapsed.
+    #[tokio::test]
+    async fn test_low_partition_hint_does_not_serialize_a_sized_write() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "low_partition_hint",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
+            8,
+            "a configured write concurrency must survive a low partition hint"
+        );
+        assert_eq!(
+            provider
+                .write_shard_format(1, tsb, None, EncodeFanOut::Sized)
+                .write_shard()
+                .expect("a sized write keeps its shard config")
+                .write_concurrency,
+            8
         );
     }
 
@@ -38433,10 +38682,13 @@ mod tests {
         // regardless of the size estimate, so pass a large `estimated_bytes`.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
-        assert_eq!(provider.snapshot_shard_count(4, tsb, huge), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            1
+        );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
                 .write_shard()
                 .is_none(),
             "sorted writes fall back to the unsharded base format"
@@ -38463,13 +38715,13 @@ mod tests {
         // A few KiB — far below one 256 MiB target file.
         let small = Some(4 * 1024);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, small),
+            provider.snapshot_shard_count(4, tsb, small, EncodeFanOut::Sized),
             1,
             "a sub-target-file write must stay a single shard"
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small)
+                .write_shard_format(4, tsb, small, EncodeFanOut::Sized)
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -38495,11 +38747,11 @@ mod tests {
         // clamp to 4.
         let large = Some(tsb as u64 * 100);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, large),
+            provider.snapshot_shard_count(4, tsb, large, EncodeFanOut::Sized),
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large);
+        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized);
         assert_eq!(
             format
                 .write_shard()
@@ -38532,19 +38784,36 @@ mod tests {
         let unit = (target / 16).clamp((16 * 1024 * 1024u64).min(target), target);
 
         // < 1 unit ⇒ 1 shard (need to *fill* a unit to earn a second).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit - 1), EncodeFanOut::Sized),
+            1
+        );
         // Exactly 1 unit ⇒ 1 shard.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit)), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit), EncodeFanOut::Sized),
+            1
+        );
         // 3 units' worth ⇒ 3 shards (below the concurrency cap of 4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3)), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit * 3), EncodeFanOut::Sized),
+            3
+        );
         // 3.9 units' worth still floors to 3 shards.
         assert_eq!(
-            provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10)),
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit * 3 + unit * 9 / 10),
+                EncodeFanOut::Sized
+            ),
             3
         );
         // 12 units' worth, but with no per-table override the default
         // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(8, tsb, Some(unit * 12), EncodeFanOut::Sized),
+            4
+        );
     }
 
     #[tokio::test]
@@ -38566,10 +38835,13 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(6, tsb, None), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(6, tsb, None, EncodeFanOut::Sized),
+            4
+        );
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None)
+                .write_shard_format(6, tsb, None, EncodeFanOut::Sized)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
@@ -41436,7 +41708,7 @@ mod tests {
     #[tokio::test]
     async fn object_store_refcounted_cleanup_invalidates_only_retired_cached_path() {
         use crate::metadata::ObjectStoreConfig;
-        use crate::provider::delta_encoding::WriteClass;
+        use crate::provider::delta_encoding::WritePolicy;
         use object_store::memory::InMemory;
 
         let temp_dir = tempfile::tempdir().expect("temp dir created");
@@ -41493,7 +41765,7 @@ mod tests {
                 &snapshot_id,
                 1,
                 None,
-                WriteClass::Delta,
+                WritePolicy::DELTA,
             )
             .await
             .expect("write source Vortex object");
@@ -46809,7 +47081,7 @@ mod tests {
             deserialize_pk_bloom_sidecar(&bytes).expect("sidecar roundtrips");
 
         assert_eq!(snapshot_id, "snap-abc-123");
-        assert_eq!(restored.bit_mask, bloom.bit_mask);
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
         assert_eq!(restored.inserted_keys, bloom.inserted_keys);
         for key in &keys {
             assert!(

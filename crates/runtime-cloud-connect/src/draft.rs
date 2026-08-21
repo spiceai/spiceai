@@ -544,18 +544,7 @@ fn open_unix_publication_lock(lock_path: &Path) -> std::io::Result<(std::fs::Fil
             "the enrollment transaction lock name contains a NUL byte",
         )
     })?;
-    let lock_descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if lock_descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let lock = unsafe { std::fs::File::from_raw_fd(lock_descriptor) };
+    let lock = crate::lock_file::create_or_open_lock_at(&directory, &name)?;
     Ok((lock, directory))
 }
 
