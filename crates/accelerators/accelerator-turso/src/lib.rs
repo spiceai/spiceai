@@ -574,26 +574,13 @@ impl DataAccelerator for TursoAccelerator {
         self.has_existing_file(source)
     }
 
-    /// Initializes a Turso database for the dataset.
+    /// A sidecar over the Turso database at `path`, for state the runtime owns rather
+    /// than a dataset — the Cayenne metastore's `cayenne.db`.
     ///
-    /// Supports two acceleration modes:
-    /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
-    /// - **File mode**: Creates a file-based database at the specified or default path
-    ///
-    /// # Accelerator-Specific Limitation
-    ///
-    /// This method will reject configurations with remote Turso parameters (`turso_url` or
-    /// `turso_auth_token`). This limitation is specific to using Turso as an **accelerator**
-    /// and does not apply to general Turso usage. Accelerators require local database access
-    /// for optimal performance.
-    ///
-    /// Remote Turso databases will be supported when Turso is implemented as a data connector,
-    /// where remote access is the primary use case.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
-    /// parameters are provided in the acceleration configuration.
+    /// Goes through [`Self::get_shared_pool_for_path`] rather than opening the file,
+    /// because the lock that serializes sidecar DDL against a concurrent
+    /// `BEGIN CONCURRENT` write lives on the pool instance: a second pool over the same
+    /// file would hold a lock no other sidecar observes.
     async fn sidecar_for_path(
         &self,
         path: &str,
@@ -638,6 +625,26 @@ impl DataAccelerator for TursoAccelerator {
         Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
     }
 
+    /// Initializes a Turso database for the dataset.
+    ///
+    /// Supports two acceleration modes:
+    /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
+    /// - **File mode**: Creates a file-based database at the specified or default path
+    ///
+    /// # Accelerator-Specific Limitation
+    ///
+    /// This method will reject configurations with remote Turso parameters (`turso_url` or
+    /// `turso_auth_token`). This limitation is specific to using Turso as an **accelerator**
+    /// and does not apply to general Turso usage. Accelerators require local database access
+    /// for optimal performance.
+    ///
+    /// Remote Turso databases will be supported when Turso is implemented as a data connector,
+    /// where remote access is the primary use case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
+    /// parameters are provided in the acceleration configuration.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
