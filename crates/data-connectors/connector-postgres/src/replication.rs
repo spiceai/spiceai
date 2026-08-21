@@ -47,8 +47,6 @@ use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, Observ
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
-use crate::write_back::XidFunction;
-
 // Standby status feedback cadence. Kept well below Postgres's default
 // `wal_sender_timeout` (60s) so that — combined with the worker's
 // feedback-while-backpressured behavior — a slow apply loop never lets the
