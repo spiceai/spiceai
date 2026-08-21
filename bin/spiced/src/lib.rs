@@ -428,15 +428,15 @@ pub struct Args {
     /// Write the console log to bounded, rotating files in this directory
     /// instead of relying on the supervisor to store it.
     ///
-    /// Set by `spice connect service install` on a supervisor that owns no log
+    /// Set by `spice cloud service install` on a supervisor that owns no log
     /// store of its own — launchd writes whatever a job prints to the files its
     /// definition names and never bounds them, so the runtime bounds its own
     /// output instead. The policy is fixed
-    /// (`runtime_cloud_connect::service_log`) because `spice connect service
+    /// (`runtime_cloud_connect::service_log`) because `spice cloud service
     /// logs` reads these files back against the same constants.
     ///
     /// Hidden: this is the service installer's interface to the runtime, not an
-    /// operator's. `spice connect service logs` is how the files are read.
+    /// operator's. `spice cloud logs` is how the files are read.
     #[arg(long, value_name = "PATH", hide = true)]
     pub service_log_dir: Option<PathBuf>,
 
@@ -1428,7 +1428,7 @@ impl DeploymentNote {
     /// deployment, and why a deployment to the portal is what makes it stick.
     fn local_awaiting_deployment(path: &Path) -> String {
         format!(
-            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. Copy it to the project's Spicepod in Spice Cloud to avoid being overwritten. See: https://spiceai.org/docs",
+            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. See: https://spiceai.org/docs",
             display_path(path)
         )
     }
@@ -1592,9 +1592,8 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                 None
             } else if tolerates_missing_spicepod(args, &e, cloud_managed_state) {
                 // A cloud-managed instance that has connected but not yet
-                // received a deployment has no spicepod anywhere: none was
-                // deployed, and `spice connect` writes nothing to the instance
-                // directory. Come up on an empty spicepod so the control plane
+                // received a deployment and has no local spicepod has no
+                // spicepod anywhere. Come up on an empty spicepod so the control plane
                 // can reach it and deploy one, rather than exiting with the
                 // "run spice init" guidance that does not apply here.
                 deployment_note = Some(DeploymentNote::NoSpicepod);
@@ -2219,7 +2218,7 @@ mod tests {
         let message = DeploymentNote::local_awaiting_deployment(Path::new("/tmp/spicepod.yaml"));
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("will be replaced by Spice Cloud"));
-        assert!(message.contains("Copy it to the project's Spicepod in Spice Cloud"));
+        assert!(!message.contains("Copy it to the project's Spicepod in Spice Cloud"));
         assert!(message.contains("https://spiceai.org/docs"));
         assert!(!message.contains('\n'));
     }

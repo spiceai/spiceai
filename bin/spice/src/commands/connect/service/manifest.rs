@@ -16,7 +16,7 @@ limitations under the License.
 
 //! `<config-dir>/service.json`: what this instance directory's service is.
 //!
-//! Every `spice connect service` action resolves the service it operates on
+//! Every `spice cloud service` action resolves the service it operates on
 //! from the canonical instance directory and this file, and from nothing else.
 //! There is no name argument and no host-wide scan, because both can name a
 //! service belonging to a different instance — and a lifecycle command that
@@ -214,7 +214,7 @@ impl ServiceManifest {
             Err(e) if is_symlink_loop(&e) => {
                 return Err(Error::InvalidArgument {
                     message: format!(
-                        "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink. Remove it and re-run `spice connect service install`.",
+                        "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink. Remove it and re-run `spice cloud service install`.",
                         path.display()
                     ),
                 });
@@ -229,7 +229,7 @@ impl ServiceManifest {
             serde_json::from_slice(&bytes).map_err(|e| Error::InvalidArgument {
                 message: format!(
                     "Failed to read the Spice Cloud Connect service manifest {}: {e}. \
-                 Re-run `spice connect service install` to rewrite it, or delete the file to \
+                 Re-run `spice cloud service install` to rewrite it, or delete the file to \
                  forget the installed service. See: https://spiceai.org/docs",
                     path.display()
                 ),
@@ -259,7 +259,7 @@ impl ServiceManifest {
             Err(Error::InvalidArgument {
                 message: format!(
                     "Failed to resolve the Spice Cloud Connect service for {instance}: \
-                     its manifest {manifest} {reason}. Re-run `spice connect service install` \
+                     its manifest {manifest} {reason}. Re-run `spice cloud service install` \
                      from this directory to rewrite it. See: https://spiceai.org/docs",
                     instance = instance_dir.display(),
                     manifest = path.display(),
@@ -513,7 +513,7 @@ fn ensure_owner_only(
             message: format!(
                 "Failed to read the Spice Cloud Connect service manifest {}: it is a symlink, \
                  so it cannot be trusted to describe this directory's service. Replace it with \
-                 a real file by re-running `spice connect service install`. \
+                 a real file by re-running `spice cloud service install`. \
                  See: https://spiceai.org/docs",
                 path.display()
             ),
@@ -540,7 +540,7 @@ fn ensure_owner_only(
             message: format!(
                 "Failed to read the Spice Cloud Connect service manifest {}: it is owned by uid \
                  {owner}, but it records the intended operator as uid {}. Re-run \
-                 `spice connect service install` from that operator account to rewrite it. \
+                 `spice cloud service install` from that operator account to rewrite it. \
                  See: https://spiceai.org/docs",
                 path.display(),
                 intended_owner.uid,

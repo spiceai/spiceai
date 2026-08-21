@@ -16,7 +16,7 @@ limitations under the License.
 
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), expect(dead_code))]
 
-//! `spice connect service`: run `spiced` as a persistent service for an
+//! `spice cloud service`: run `spiced` as a persistent service for an
 //! enrolled instance directory, and manage its lifecycle.
 //!
 //! A deployment applies to the running instance and never ends its process, so
@@ -87,7 +87,7 @@ use crate::error::{Error, Result};
 
 pub(crate) use backend::{InstallRequest, LogRequest, ServiceBackend, for_host as backend};
 pub(crate) use manifest::{PinnedConfigDir, ServiceManifest, ServiceOwner};
-pub(crate) use model::{ServiceScope, ServiceState, ServiceStatus};
+pub(crate) use model::{ServiceScope, ServiceStatus};
 
 /// Longest directory-name fragment carried into a service name, so a deeply-named
 /// instance directory cannot produce an unwieldy name. The appended digest is
@@ -167,7 +167,7 @@ fn service_account(instance_dir: &Path, root_fallback: RootFallback) -> Result<S
             return Ok(ServiceAccount { uid, gid });
         }
         return Err(Error::InvalidArgument {
-            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice connect service install`.".to_string(),
+            message: "Failed to install the Spice Cloud Connect service: SUDO_UID and SUDO_GID must identify the non-root operator who will run spiced. Re-run from that account with `sudo spice cloud service install`.".to_string(),
         });
     }
 
@@ -192,7 +192,7 @@ fn service_account(instance_dir: &Path, root_fallback: RootFallback) -> Result<S
 
     Err(Error::InvalidArgument {
         message: format!(
-            "Failed to install the Spice Cloud Connect service: {} is owned by uid {} and gid {}, so the account the service should run as cannot be determined. Give the directory to one account (`chown <user>:<group> {}`), or re-run the command from the intended operator account with `sudo spice connect service install`.",
+            "Failed to install the Spice Cloud Connect service: {} is owned by uid {} and gid {}, so the account the service should run as cannot be determined. Give the directory to one account (`chown <user>:<group> {}`), or re-run the command from the intended operator account with `sudo spice cloud service install`.",
             instance_dir.display(),
             metadata.uid(),
             metadata.gid(),
@@ -378,9 +378,9 @@ impl PreflightFailure {
             Self::SystemdUserManagerUnavailable => format!(
                 "Failed to install the Spice Cloud Connect service: this account has no systemd \
                  user manager to install a user service into (no {}). Log in as the account that \
-                 will run the instance and re-run `spice connect service install`, enable one for \
+                 will run the instance and re-run `spice cloud service install`, enable one for \
                  it (`sudo loginctl enable-linger <user>`), or install a host-wide service with \
-                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                 `sudo spice cloud service install`. See: https://spiceai.org/docs",
                 std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/<uid>".to_string())
             ),
             #[cfg(any(target_os = "macos", all(target_os = "linux", test)))]
@@ -396,9 +396,9 @@ impl PreflightFailure {
                 "Failed to install the Spice Cloud Connect service: this account has no macOS \
                  login session for a LaunchAgent to run in (launchd has no {domain} domain, which \
                  is normal over SSH or in a headless session). Log in to this Mac as {account} at \
-                 the desktop and re-run `spice connect service install`, or install a system \
+                 the desktop and re-run `spice cloud service install`, or install a system \
                  service that starts at boot without any login with \
-                 `sudo spice connect service install`. See: https://spiceai.org/docs",
+                 `sudo spice cloud service install`. See: https://spiceai.org/docs",
                 domain = launchd::gui_domain(),
                 account = account_name(nix::unistd::Uid::effective().as_raw())
                     .unwrap_or_else(|| format!("uid {}", nix::unistd::Uid::effective().as_raw())),
@@ -833,7 +833,7 @@ fn probe_runtime_version(spiced: &Path, owner: &ServiceOwner) -> Result<String> 
         message: format!(
             "Failed to install the Spice Cloud Connect service: the runtime at {spiced} could \
              not be run to read its version: {source}. Check that it is executable by {account}, \
-             then re-run `spice connect service install`. See: https://spiceai.org/docs",
+             then re-run `spice cloud service install`. See: https://spiceai.org/docs",
             spiced = spiced.display(),
             account = owner
                 .name
@@ -891,7 +891,7 @@ fn ensure_same_domain(
     }
     let retry = match existing.scope {
         ServiceScope::System => format!(
-            "Re-run it as `sudo spice connect service install --dir {}`",
+            "Re-run it as `cd {} && sudo spice cloud service install`",
             instance_dir.display()
         ),
         ServiceScope::User => format!("Run it as {} without sudo", existing.owner.describe()),
@@ -901,7 +901,7 @@ fn ensure_same_domain(
             "Failed to install the Spice Cloud Connect service for {instance}: a {existing_scope} \
              service ({name}) is already installed for this directory, and this invocation would \
              install a {scope} one alongside it. {retry}, or remove the installed service first \
-             with `spice connect service uninstall`. Nothing was changed. \
+             with `spice cloud service uninstall`. Nothing was changed. \
              See: https://spiceai.org/docs",
             instance = instance_dir.display(),
             existing_scope = existing.scope,
@@ -951,7 +951,7 @@ fn ensure_name_unclaimed(
             message: format!(
                 "Failed to install the Spice Cloud Connect service for {instance}: the service \
                  definition {definition} already exists and {reason}. Remove or repair it, then \
-                 re-run `spice connect service install`. Nothing was changed. \
+                 re-run `spice cloud service install`. Nothing was changed. \
                  See: https://spiceai.org/docs",
                 instance = instance_dir.display(),
                 definition = path.display(),
@@ -997,8 +997,8 @@ fn definition_ownership_problem(
 /// Stop and remove the service for `instance_dir`, and forget it.
 ///
 /// Idempotent: a directory with no service succeeds and returns `None`. This
-/// is the one primitive both `spice connect service uninstall` and
-/// `spice connect remove` use, so they cannot diverge on which assets a
+/// is the one primitive both `spice cloud service uninstall` and
+/// `spice cloud unlink` use, so they cannot diverge on which assets a
 /// removal touches. What they do *not* share is identity: uninstall preserves
 /// the Cloud identity, and `remove` is the command that releases it.
 ///
@@ -1184,7 +1184,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                  The runtime staging is managed by root, so it must use a real, root-owned \
                  directory. Replace the symlink with a directory owned by root \
                  (`chown root {dir}`, `chmod 755 {dir}`) and re-run \
-                 `sudo spice connect service install`.",
+                 `sudo spice cloud service install`.",
                 dir = dir.display()
             ),
         });
@@ -1206,7 +1206,7 @@ fn ensure_root_only_dir(dir: &Path) -> Result<()> {
                     "Failed to install the Spice Cloud Connect service: {component} is owned by uid {uid} with mode {mode:04o}, \
                      so a non-root user can change what the service executes as root. Restrict it \
                      (`sudo chown root {component}` and `sudo chmod go-w {component}`) and re-run \
-                     `sudo spice connect service install`.",
+                     `sudo spice cloud service install`.",
                     component = component.display(),
                     uid = meta.uid(),
                     mode = mode & 0o7777,
@@ -1269,7 +1269,7 @@ fn ensure_account_only_dir(dir: &Path) -> Result<()> {
                  a real directory owned by this account (uid {uid}) that no other account can \
                  write, so the runtime the service executes cannot be replaced behind it. Fix it \
                  (`chown {uid} {dir}` and `chmod go-w {dir}`) and re-run \
-                 `spice connect service install`.",
+                 `spice cloud service install`.",
                 dir = dir.display(),
             ),
         });
@@ -1657,7 +1657,7 @@ mod tests {
         // A host with no user manager still has a way to install: say which.
         let no_manager = PreflightFailure::SystemdUserManagerUnavailable.message();
         assert!(
-            no_manager.contains("sudo spice connect service install"),
+            no_manager.contains("sudo spice cloud service install"),
             "{no_manager}"
         );
         assert!(no_manager.contains("enable-linger"), "{no_manager}");
@@ -1870,15 +1870,13 @@ mod tests {
                 .expect_err("a domain switch must be refused");
             assert!(error.to_string().contains("already installed"), "{error}");
             assert!(
-                error
-                    .to_string()
-                    .contains("spice connect service uninstall"),
+                error.to_string().contains("spice cloud service uninstall"),
                 "{error}"
             );
             // The retry is the operator's to run, never an elevation Spice
             // performs for them.
             let expected_retry = match existing {
-                ServiceScope::System => "sudo spice connect service install",
+                ServiceScope::System => "sudo spice cloud service install",
                 ServiceScope::User => "without sudo",
             };
             assert!(error.to_string().contains(expected_retry), "{error}");

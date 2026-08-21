@@ -64,12 +64,12 @@ pub(super) enum Error {
     Quarantined { journal: PathBuf },
 
     #[snafu(display(
-        "A retry-safe Cloud Connect enrollment is already pending for different parameters ({reason}). Retry with the original organization and endpoint, or run `spice connect remove --force --yes` to explicitly abandon it. The exact-replay state was preserved."
+        "A retry-safe Cloud Connect enrollment is already pending for different parameters ({reason}). Retry with the original organization and endpoint, or run `spice cloud unlink` to explicitly abandon it. The exact-replay state was preserved."
     ))]
     PendingRequestMismatch { reason: String },
 
     #[snafu(display(
-        "A retry-safe Cloud Connect project assignment is already pending for different parameters ({reason}). Retry the original command or run `spice connect remove --force --yes` to explicitly abandon it. The exact-replay state was preserved."
+        "A retry-safe Cloud Connect project assignment is already pending for different parameters ({reason}). Retry the original command or run `spice cloud unlink` to explicitly abandon it. The exact-replay state was preserved."
     ))]
     PendingProjectMismatch { reason: String },
 
@@ -326,6 +326,7 @@ pub(super) struct ProjectOperation {
     pub directory: PathBuf,
     pub endpoint: String,
     pub organization: String,
+    pub project_name: String,
     pub request: ProjectMutation,
 }
 
@@ -335,6 +336,7 @@ impl ProjectOperation {
         directory: &Path,
         endpoint: &str,
         organization: &str,
+        project_name: &str,
         request: ProjectMutation,
     ) -> Result<Self> {
         if let Some(existing) = Self::load_optional(config_dir)? {
@@ -342,7 +344,8 @@ impl ProjectOperation {
                 && existing.endpoint == endpoint
                 && existing.organization.eq_ignore_ascii_case(organization)
                 && existing.request.instance_id == request.instance_id
-                && existing.request.name == request.name
+                && existing.request.project_id == request.project_id
+                && existing.project_name == project_name
             {
                 return Ok(existing);
             }
@@ -352,7 +355,7 @@ impl ProjectOperation {
                     existing.organization,
                     existing.endpoint,
                     existing.request.instance_id,
-                    existing.request.name
+                    existing.project_name
                 ),
             });
         }
@@ -361,6 +364,7 @@ impl ProjectOperation {
             directory: directory.to_path_buf(),
             endpoint: endpoint.to_string(),
             organization: organization.to_string(),
+            project_name: project_name.to_string(),
             request,
         };
         operation.store(config_dir)?;
@@ -390,7 +394,7 @@ impl ProjectOperation {
                     operation.organization,
                     operation.endpoint,
                     operation.request.instance_id,
-                    operation.request.name
+                    operation.project_name
                 ),
             });
         }
@@ -404,7 +408,7 @@ impl ProjectOperation {
                 .org_name
                 .as_deref()
                 .is_some_and(|org| org.eq_ignore_ascii_case(&operation.organization))
-                && identity.app_name.as_deref() == Some(operation.request.name.as_str());
+                && identity.app_name.as_deref() == Some(operation.project_name.as_str());
             if matches_attachment {
                 Self::delete(config_dir)?;
                 return Ok(None);
@@ -582,10 +586,6 @@ fn quarantine(config_dir: &Path, path: &Path) -> Result<PathBuf> {
     Ok(quarantined)
 }
 
-pub(super) fn remove_durable_file(path: &Path) -> Result<()> {
-    remove_if_exists(path)
-}
-
 fn remove_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => sync_parent(path),
@@ -595,6 +595,10 @@ fn remove_if_exists(path: &Path) -> Result<()> {
             source,
         }),
     }
+}
+
+pub(crate) fn remove_durable_file(path: &Path) -> Result<()> {
+    remove_if_exists(path)
 }
 
 #[cfg(unix)]
@@ -925,7 +929,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let request = ProjectMutation {
             instance_id: "inst_1".to_string(),
-            name: "retail".to_string(),
+            project_id: 314,
+            location: Some("us-east-1".to_string()),
             cert_pem: "certificate".to_string(),
             pop_sig: "signature".to_string(),
         };
@@ -934,6 +939,7 @@ mod tests {
             dir.path(),
             "https://api.spice.ai",
             "acme",
+            "retail",
             request.clone(),
         )
         .expect("prepare project operation");
@@ -942,6 +948,7 @@ mod tests {
             dir.path(),
             "https://api.spice.ai",
             "acme",
+            "retail",
             request,
         )
         .expect("recover exact operation");

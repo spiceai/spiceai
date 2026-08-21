@@ -150,6 +150,16 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub org: String,
+    /// Which kind of project this is (`managed`, `standalone`, ...), as Spice
+    /// Cloud resolved it.
+    ///
+    /// Carried verbatim rather than parsed into a closed set: the kind is the
+    /// server's to decide, the set of kinds grows without a new CLI, and a
+    /// binary already in the field must still be able to read a project whose
+    /// kind it has never heard of. Absent when the control plane predates the
+    /// field.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub description: Option<String>,
     pub visibility: Option<String>,
     pub created_at: Option<String>,

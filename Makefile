@@ -144,8 +144,13 @@ endif
 # `integration*.yml` they need no credentials and no external service. They are
 # also the only coverage of the enrollment, reconnect, command-dispatch and
 # heartbeat wire paths; `--lib` cannot reach a running client at all.
+#
+# The credential-free Spice CLI integration binaries exercise the shipped
+# command surface. `cloud_integration` needs live credentials and remains in
+# the nightly gate, so select the other two binaries by name rather than every
+# integration test in the `spice` package.
 NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + binary(=metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
