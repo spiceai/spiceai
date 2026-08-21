@@ -376,7 +376,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
 | `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
-| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Alpha | PostgreSQL Wire Protocol |
+| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Beta | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
 
