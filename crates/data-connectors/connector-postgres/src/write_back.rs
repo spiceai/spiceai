@@ -64,7 +64,7 @@ pub(crate) const WRITE_BACK_XID_TABLE: &str = "spice_sys_postgres_write_back_xid
 
 /// The server version at or above which `pg_current_xact_id()` exists (PG13).
 /// Below it, `txid_current()` returns the same epoch-qualified 64-bit id.
-const PG13_SERVER_VERSION_NUM: i32 = 130_000;
+pub(crate) const PG13_SERVER_VERSION_NUM: i32 = 130_000;
 
 /// Build the wrapped delivery error carrying an actionable message and its cause.
 fn delivery_error(

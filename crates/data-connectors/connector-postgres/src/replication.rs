@@ -25,16 +25,18 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::write_back::PG13_SERVER_VERSION_NUM;
 use async_stream::try_stream;
 use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, XidRegistry, config, start_replication_stream,
+    SchemaEvolutionPolicy, XactStatus, XidRegistry, config, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
@@ -214,6 +216,171 @@ pub(crate) async fn load_write_back_xid_registry(
     }
 }
 
+/// Startup garbage collection for a freshly-loaded write-back registry.
+///
+/// Runs once, before the registry is shared with the delivery path or the pump.
+/// Resolves what the registry cannot on its own — each outstanding entry's
+/// `pg_xact_status` and the server's current transaction id — and hands them to
+/// [`XidRegistry::gc`] together with the dataset's durably-applied LSN, so an
+/// aborted delivery, a lost unregister, or an entry stranded far behind the
+/// server is dropped rather than lingering into a 32-bit xid wraparound.
+///
+/// Best-effort: a resolution failure is logged and leaves the entries in place
+/// (steady-state pruning still bounds them); it never blocks or fails setup.
+pub(crate) async fn run_write_back_registry_gc(
+    pool: &Arc<PostgresConnectionPool>,
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+    registry: &Arc<XidRegistry>,
+) {
+    let dataset_name = dataset.name.to_string();
+    let outstanding = registry.outstanding_xid8s().await;
+    if outstanding.is_empty() {
+        // Nothing to reconcile, so skip the server round trip entirely.
+        return;
+    }
+
+    let mut db = match pool.connect_direct().await {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not open a connection to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
+            );
+            return;
+        }
+    };
+
+    let server_version_num: i32 = match db
+        .conn
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+    {
+        Ok(row) => row.get(0),
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not read the source server version to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
+            );
+            return;
+        }
+    };
+    // `pg_xact_status`/`pg_snapshot_xmax` are PG13+; PG10-12 use the `txid_*`
+    // equivalents (same semantics). `pg_snapshot_xmax` reads the current xid8
+    // without assigning one, so garbage collection never consumes an xid.
+    let pg13_plus = server_version_num >= PG13_SERVER_VERSION_NUM;
+    let (current_xid_sql, status_sql) = if pg13_plus {
+        (
+            "SELECT pg_snapshot_xmax(pg_current_snapshot())::text",
+            "SELECT pg_xact_status($1::xid8)::text",
+        )
+    } else {
+        (
+            "SELECT txid_snapshot_xmax(txid_current_snapshot())::text",
+            "SELECT txid_status($1::bigint)::text",
+        )
+    };
+
+    let current_xid8 = match read_u64_text(&db.conn, current_xid_sql).await {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not read the source's current transaction id to garbage-collect its change-echo suppression registry, so stale entries are left for steady-state pruning"
+            );
+            return;
+        }
+    };
+
+    let mut statuses: std::collections::HashMap<u64, XactStatus> =
+        std::collections::HashMap::with_capacity(outstanding.len());
+    for xid8 in outstanding {
+        // Bind the id as its decimal text and cast in SQL (`$1::xid8` /
+        // `$1::bigint`), so no `xid8` `ToSql`/`FromSql` is needed; the status is
+        // likewise read as text.
+        let param = xid8.to_string();
+        let status = match db.conn.query_one(status_sql, &[&param]).await {
+            Ok(row) => {
+                let raw: Option<String> = row.get(0);
+                xact_status_from_text(raw.as_deref())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    xid8,
+                    error = %e,
+                    "durable write-back for dataset '{dataset_name}' could not read a transaction's status while garbage-collecting its change-echo suppression registry; that entry is left to the epoch-distance safety valve"
+                );
+                XactStatus::Unknown
+            }
+        };
+        statuses.insert(xid8, status);
+    }
+
+    // The durably-applied LSN, so garbage collection can drop an entry whose echo
+    // the applied floor has provably consumed. An unresolvable watermark reads as
+    // 0, which only makes that one rule conservative (the aborted and
+    // epoch-distance rules still apply).
+    let applied_lsn = resolve_applied_lsn(params, dataset, context).await;
+
+    registry.gc(&statuses, current_xid8, applied_lsn).await;
+}
+
+/// Read a single decimal `u64` returned as text (used for xid8 values, whose
+/// `FromSql` the driver does not provide).
+async fn read_u64_text(
+    conn: &tokio_postgres::Client,
+    sql: &str,
+) -> std::result::Result<u64, String> {
+    let row = conn.query_one(sql, &[]).await.map_err(|e| e.to_string())?;
+    let raw: String = row.get(0);
+    raw.trim().parse::<u64>().map_err(|e| e.to_string())
+}
+
+/// Map `pg_xact_status`/`txid_status` text to the registry's [`XactStatus`]. A
+/// NULL result (too old to resolve) is [`XactStatus::Unknown`], handled by the
+/// epoch-distance safety valve rather than the aborted rule.
+fn xact_status_from_text(status: Option<&str>) -> XactStatus {
+    match status {
+        Some("committed") => XactStatus::Committed,
+        Some("aborted") => XactStatus::Aborted,
+        Some("in progress") => XactStatus::InProgress,
+        _ => XactStatus::Unknown,
+    }
+}
+
+/// The dataset's durably-applied LSN, read from the same sidecar watermark the
+/// pump resumes from. Returns 0 when nothing durable is recorded (ephemeral
+/// accelerator, unreachable store, foreign source) — the conservative input for
+/// the applied-floor garbage-collection rule.
+async fn resolve_applied_lsn(
+    params: &Parameters,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+) -> u64 {
+    let Ok(repl_params) =
+        replication_params_from_connector_params(params, &dataset.name.to_string())
+    else {
+        return 0;
+    };
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let Some(blobs) = resolve_watermark_store(context, dataset).await else {
+        return 0;
+    };
+    let store = SidecarAppliedLsnStore {
+        blobs,
+        identity: source_identity(&repl_params, &schema_name, &table_name),
+    };
+    match store.load().await {
+        Ok(RecordedPosition::At(applied)) => applied.lsn,
+        _ => 0,
+    }
+}
+
 /// `async` so the watermark store is resolved here, before the stream is built: the
 /// generator then holds only the resolved store, which owns a connection pool and no
 /// runtime and so cannot pin the runtime for as long as the stream lives.
@@ -224,6 +391,7 @@ pub async fn build_changes_stream(
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
     acceleration: AccelerationContents,
+    write_back_registry: Option<Arc<XidRegistry>>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -425,6 +593,7 @@ pub async fn build_changes_stream(
             metrics,
             policy: schema_evolution_policy,
             applied_lsn_store,
+            write_back_registry,
         };
 
         let mut inner = start_replication_stream(input);

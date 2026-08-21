@@ -73,6 +73,16 @@ pub struct Postgres {
     params: Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
+    /// Per-dataset outstanding-write-back-transaction registries, cached so the
+    /// delivery path (`write_back_deliverer`) and the CDC pump (`changes_stream`)
+    /// share the **same** `Arc` for a dataset — the deliverer registers each xid,
+    /// the pump drops its echo. Loaded (and startup-garbage-collected) once, on
+    /// whichever path first asks. Keyed by dataset name.
+    write_back_registries: Arc<
+        tokio::sync::Mutex<
+            HashMap<String, Arc<data_components::postgres_replication::XidRegistry>>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -301,6 +311,7 @@ impl DataConnectorFactory for PostgresFactory {
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
+                        write_back_registries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                     }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
@@ -1008,6 +1019,47 @@ fn durable_write_back_on_conflict(dataset: &DatasetSpec) -> Option<OnConflict> {
     Some(OnConflict::Upsert(ColumnReference::new(columns)))
 }
 
+impl Postgres {
+    /// The dataset's outstanding-write-back-transaction registry, or `None` when
+    /// the dataset does not deliver durable write-back or nothing durable can hold
+    /// the set.
+    ///
+    /// Loaded once and cached, so the delivery path and the CDC pump share the
+    /// **same** `Arc`: the deliverer registers each write-back xid into it and the
+    /// pump reads it to drop the matching echo. Startup garbage collection runs on
+    /// the first load, before the registry is handed to either path.
+    async fn write_back_xid_registry(
+        &self,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
+    ) -> Option<Arc<data_components::postgres_replication::XidRegistry>> {
+        // Only a durable-write-back dataset registers xids; every other dataset
+        // gets no registry (and so no echo filtering).
+        durable_write_back_on_conflict(dataset)?;
+
+        let key = dataset.name.to_string();
+        let mut cache = self.write_back_registries.lock().await;
+        if let Some(existing) = cache.get(&key) {
+            return Some(Arc::clone(existing));
+        }
+        let registry =
+            replication::load_write_back_xid_registry(&self.params, dataset, context).await?;
+        // Reconcile stale entries against the source before the registry is shared,
+        // so a wrapped-around or aborted-delivery entry cannot suppress an unrelated
+        // change. Best-effort: never blocks setup.
+        replication::run_write_back_registry_gc(
+            &self.pool,
+            &self.params,
+            dataset,
+            context,
+            &registry,
+        )
+        .await;
+        cache.insert(key, Arc::clone(&registry));
+        Some(registry)
+    }
+}
+
 #[async_trait]
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
@@ -1089,10 +1141,9 @@ impl DataConnector for Postgres {
             }
         };
 
-        // The single construction site for the registry: a follow-up hands this
-        // same `Arc` to the replication member registration for the pump filter.
-        let registry =
-            replication::load_write_back_xid_registry(&self.params, dataset, context).await?;
+        // The same `Arc` the CDC pump reads for its echo filter (cached, loaded
+        // once): the deliverer registers each xid, the pump drops its echo.
+        let registry = self.write_back_xid_registry(context, dataset).await?;
 
         let deliverer = Arc::new(write_back::PostgresWriteBackDeliverer::new(
             Arc::clone(&self.pool),
@@ -1215,6 +1266,11 @@ impl DataConnector for Postgres {
         dataset: &DatasetSpec,
         acceleration: data_components::cdc::AccelerationContents,
     ) -> Option<data_components::cdc::ChangesStream> {
+        // Hand the pump the same registry the delivery path registers into (only
+        // for a durable-write-back dataset), so it can drop the echo of each
+        // write-back transaction. `None` for every other dataset — nothing is
+        // filtered.
+        let write_back_registry = self.write_back_xid_registry(context, dataset).await;
         Some(
             replication::build_changes_stream(
                 &self.params,
@@ -1223,6 +1279,7 @@ impl DataConnector for Postgres {
                 federated_table,
                 Arc::clone(&self.replication_metrics),
                 acceleration,
+                write_back_registry,
             )
             .await,
         )

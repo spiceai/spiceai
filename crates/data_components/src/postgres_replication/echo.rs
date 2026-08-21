@@ -372,6 +372,15 @@ impl XidRegistry {
         self.mirror.read().contains(&stream_xid)
     }
 
+    /// The full `xid8` of every outstanding entry, for the connector to resolve
+    /// per-entry `pg_xact_status` before calling [`gc`](Self::gc). The registry
+    /// stays connection-free, so it hands out the ids and takes back the resolved
+    /// statuses rather than querying the server itself. Returns an empty vector
+    /// when nothing is outstanding, letting the caller skip the server round trip.
+    pub async fn outstanding_xid8s(&self) -> Vec<u64> {
+        self.state.lock().await.entries.keys().copied().collect()
+    }
+
     /// Record the echo's observed commit LSN when the pump sees its `Commit`.
     ///
     /// Matches on the low 32 bits (the stream's `xid` width). The entry is **not**
