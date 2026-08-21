@@ -19197,26 +19197,93 @@ impl CayenneTableProvider {
         result.map(|(rows, _writer_ops, _stats)| rows)
     }
 
+    /// Rewrite ONE input data file into the staged output snapshot: scan just that
+    /// file, apply its snapshot's partial deletion filter, write it back.
+    ///
+    /// One encode shard, deliberately: the `encode_fanout` bench lane is
+    /// monotonically worse with more shards per write (1 shard 71.7 ms -> 64 shards
+    /// 173.2 ms on the `stock` shape), so a file IS the parallel unit and widening
+    /// its encode is the wrong lever.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one rewrite unit's inputs, shared by the spawned and inline paths"
+    )]
+    async fn bake_rewrite_one_file(
+        &self,
+        state: &datafusion::execution::session_state::SessionState,
+        snapshot_id: &str,
+        file_name: &str,
+        file_size: u64,
+        threshold: i64,
+        deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
+        new_snapshot_id: &str,
+        target_size_bytes: usize,
+    ) -> Result<u64> {
+        let plan = self
+            .create_single_file_rewrite_scan_plan(state, snapshot_id, file_name, file_size)
+            .await?;
+        let filtered = self.apply_partial_deletion_filter(
+            plan,
+            &self.pk_column_indices,
+            threshold,
+            deletion_snapshot,
+        )?;
+        let stream = datafusion_physical_plan::execute_stream(filtered, state.task_ctx())?;
+        self.write_to_snapshot(
+            stream,
+            target_size_bytes,
+            new_snapshot_id,
+            1,
+            Some(file_size),
+            super::delta_encoding::WriteClass::Maintenance,
+        )
+        .await
+        .map(|(rows, _writer_ops, _stats)| rows)
+    }
+
+    /// One rewrite unit per input data file of the selected prefix, each carrying
+    /// its own snapshot's deletion threshold.
+    ///
+    /// A snapshot with an EMPTY listing contributes no units: it holds no physical
+    /// rows to rewrite, and the union shape reaches the same outcome by scanning it
+    /// to zero rows. Its `<= T` coverage comes from being in `selected` (which sets
+    /// the prune cutoff), not from any bytes written here.
+    async fn bake_rewrite_units(
+        &self,
+        selected: &[(String, i64)],
+    ) -> Result<Vec<(String, String, u64, i64)>> {
+        let mut units: Vec<(String, String, u64, i64)> = Vec::new();
+        for (snapshot_id, threshold) in selected {
+            let files = self.list_snapshot_files_with_sizes(snapshot_id).await?;
+            for (file_name, size) in files {
+                units.push((snapshot_id.clone(), file_name, size, *threshold));
+            }
+        }
+        Ok(units)
+    }
+
     /// Rewrite the selected prefix ONE INPUT FILE AT A TIME, `concurrency` files in
     /// flight, all writing into the single staged `new_snapshot_id`.
     ///
     /// Each unit is an independent `scan(one file) -> partial deletion filter ->
-    /// write` pipeline. Correctness rests on the same argument as the union shape:
-    /// the deletion filter applied to a file is the SAME filter at the SAME
-    /// `threshold` the union would have applied to that file's snapshot, and every
-    /// selected input file is rewritten exactly once, so the output row set is
-    /// identical. What changes is only how the work is scheduled.
+    /// write` pipeline, spawned as its own task on the dedicated compaction runtime
+    /// so the units are genuinely parallel rather than merely concurrent. Awaiting
+    /// them from one task would not be enough: each unit opts its Vortex source out
+    /// of byte-range repartitioning (one file is one stream), so with nothing to
+    /// spawn internally the pipeline would poll inline and N units would take turns
+    /// on the polling thread.
+    ///
+    /// Correctness rests on the same argument as the union shape: the deletion
+    /// filter applied to a file is the SAME filter at the SAME `threshold` the union
+    /// would have applied to that file's snapshot, and every selected input file is
+    /// rewritten exactly once, so the output row set is identical. What changes is
+    /// only how the work is scheduled.
     ///
     /// Ordering stays sound without any global sort. Scan-side ordering is
     /// advertised only when per-file statistics prove the file set forms
     /// non-overlapping runs; a per-file rewrite maps one input file to output
     /// file(s) covering a SUBSET of that input's own key range, so non-overlap is
     /// preserved by construction rather than re-established by a single writer.
-    ///
-    /// Each write takes ONE encode shard. That is deliberate: the `encode_fanout`
-    /// bench lane is monotonically worse with more shards per write, so widening a
-    /// single encode is the wrong lever and concurrency across files is the right
-    /// one.
     #[expect(
         clippy::too_many_arguments,
         reason = "one rewrite shape's inputs; the alternative is a struct used at exactly one call site"
@@ -19225,82 +19292,138 @@ impl CayenneTableProvider {
         &self,
         state: &datafusion::execution::session_state::SessionState,
         selected: &[(String, i64)],
-        pk_indices: &[usize],
         deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
         new_snapshot_id: &str,
         target_size_bytes: usize,
         concurrency: usize,
     ) -> Result<u64> {
-        use futures::stream::StreamExt;
-
         let bake_plan_start = Instant::now();
-        // One unit per input data file, carrying its own snapshot's deletion
-        // threshold. A snapshot with an EMPTY listing contributes no units: it holds
-        // no physical rows to rewrite, and the union shape reaches the same outcome
-        // by scanning it to zero rows. Its `<= T` coverage comes from being in
-        // `selected` (the prune cutoff), not from any bytes written here.
-        let mut units: Vec<(String, String, u64, i64)> = Vec::new();
-        for (snapshot_id, threshold) in selected {
-            let files = self.list_snapshot_files_with_sizes(snapshot_id).await?;
-            for (file_name, size) in files {
-                units.push((snapshot_id.clone(), file_name, size, *threshold));
-            }
-        }
+        let units = self.bake_rewrite_units(selected).await?;
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
             "bake_plan",
             bake_plan_start,
         );
-
         if units.is_empty() {
             return Ok(0);
         }
 
         let bake_merge_write_start = Instant::now();
-        let rows = futures::stream::iter(units.into_iter().map(
-            |(snapshot_id, file_name, size, threshold)| async move {
-                let plan = self
-                    .create_single_file_rewrite_scan_plan(state, &snapshot_id, &file_name, size)
-                    .await?;
-                let filtered = self.apply_partial_deletion_filter(
-                    plan,
-                    pk_indices,
-                    threshold,
+        let outcome = match self.weak_self.get().and_then(std::sync::Weak::upgrade) {
+            Some(provider) => {
+                self.bake_rewrite_per_file_spawned(
+                    &provider,
+                    state,
+                    units,
                     deletion_snapshot,
-                )?;
-                let stream =
-                    datafusion_physical_plan::execute_stream(filtered, state.task_ctx())?;
-                // One shard: this unit is already the parallel unit.
-                self.write_to_snapshot(
-                    stream,
-                    target_size_bytes,
                     new_snapshot_id,
-                    1,
-                    Some(size),
-                    super::delta_encoding::WriteClass::Maintenance,
+                    target_size_bytes,
+                    concurrency,
                 )
                 .await
-                .map(|(rows, _writer_ops, _stats)| rows)
-            },
-        ))
-        .buffer_unordered(concurrency.max(1))
-        .collect::<Vec<Result<u64>>>()
-        .await;
+            }
+            None => {
+                // No `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
+                // path. Rewrite the units inline: correct and identical in output,
+                // just not parallel.
+                let mut total: u64 = 0;
+                for (snapshot_id, file_name, size, threshold) in units {
+                    total = total.saturating_add(
+                        self.bake_rewrite_one_file(
+                            state,
+                            &snapshot_id,
+                            &file_name,
+                            size,
+                            threshold,
+                            deletion_snapshot,
+                            new_snapshot_id,
+                            target_size_bytes,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(total)
+            }
+        };
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
             "bake_merge_write",
             bake_merge_write_start,
         );
+        outcome
+    }
 
-        // Fail the whole pass on ANY unit failure. A partial sweep must never be
-        // published: its output would hold the surviving rows of only some inputs
-        // while Phase 3 retires tombstones for the whole prefix, which is row loss.
-        // The caller discards the staged directory.
-        let mut total: u64 = 0;
-        for row_count in rows {
-            total = total.saturating_add(row_count?);
+    /// Spawn every rewrite unit onto the dedicated compaction runtime, at most
+    /// `concurrency` running at once, and join them all.
+    ///
+    /// Fails the whole pass on ANY unit failure. A partial sweep must never be
+    /// published: its output would hold the surviving rows of only some inputs while
+    /// Phase 3 retires tombstones for the whole prefix, which is row loss. The
+    /// caller discards the staged directory, so a failed pass leaves only orphaned
+    /// staged files. Every unit is still joined before returning, so no writer is
+    /// left running against a directory the caller is about to delete.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one rewrite shape's inputs; the alternative is a struct used at exactly one call site"
+    )]
+    async fn bake_rewrite_per_file_spawned(
+        &self,
+        provider: &Arc<CayenneTableProvider>,
+        state: &datafusion::execution::session_state::SessionState,
+        units: Vec<(String, String, u64, i64)>,
+        deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
+        new_snapshot_id: &str,
+        target_size_bytes: usize,
+        concurrency: usize,
+    ) -> Result<u64> {
+        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+        let mut handles = Vec::with_capacity(units.len());
+        for (snapshot_id, file_name, file_size, threshold) in units {
+            let provider = Arc::clone(provider);
+            let state = state.clone();
+            let deletion_snapshot = deletion_snapshot.clone();
+            let output = new_snapshot_id.to_string();
+            let permits = Arc::clone(&permits);
+            handles.push(super::compaction::spawn_compaction(async move {
+                // The semaphore is never closed, so acquiring cannot fail; treat a
+                // closed semaphore as "no permit needed" rather than failing a pass.
+                let _permit = permits.acquire_owned().await.ok();
+                provider
+                    .bake_rewrite_one_file(
+                        &state,
+                        &snapshot_id,
+                        &file_name,
+                        file_size,
+                        threshold,
+                        &deletion_snapshot,
+                        &output,
+                        target_size_bytes,
+                    )
+                    .await
+            }));
         }
-        Ok(total)
+
+        // Join EVERY handle before returning the first error, so a failing pass never
+        // leaves a writer running against the directory the caller then deletes.
+        let mut total: u64 = 0;
+        let mut first_error: Option<Error> = None;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(rows)) => total = total.saturating_add(rows),
+                Ok(Err(error)) => first_error = first_error.or(Some(error)),
+                Err(join_error) => {
+                    first_error = first_error.or(Some(Error::DataFusion {
+                        source: DataFusionError::Execution(format!(
+                            "seq-prefix bake rewrite task failed to join: {join_error}"
+                        )),
+                    }));
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(total),
+        }
     }
 
     async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
@@ -19564,7 +19687,6 @@ impl CayenneTableProvider {
             self.bake_rewrite_per_file(
                 &state,
                 &selected,
-                &pk_indices,
                 &deletion_snapshot,
                 &new_snapshot_id,
                 target_size_bytes,
