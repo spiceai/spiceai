@@ -1008,6 +1008,77 @@ fn durable_write_back_on_conflict(dataset: &DatasetSpec) -> Option<OnConflict> {
     Some(OnConflict::Upsert(ColumnReference::new(columns)))
 }
 
+/// Build the connector-owned durable write-back deliverer for a dataset already
+/// confirmed to need one (`on_conflict` resolved). Every step here opens a
+/// connection or reads source state, so a failure is surfaced rather than
+/// swallowed: silently falling back to the `TableProvider` path for a durable
+/// write-back dataset would commit writes without registering their xids and
+/// reopen the double-apply window this feature exists to close.
+///
+/// # Errors
+///
+/// Returns an error if a setup connection cannot be opened, the source server
+/// version or schema cannot be read, or the change-echo suppression registry
+/// cannot be loaded.
+async fn build_write_back_deliverer(
+    pool: &Arc<PostgresConnectionPool>,
+    factory: &PostgresTableFactory,
+    params: &Parameters,
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+    on_conflict: OnConflict,
+) -> DataConnectorResult<Arc<dyn WriteBackDeliverer>> {
+    let connector_component = ConnectorComponent::from(dataset);
+    let setup_error = |source: Box<dyn std::error::Error + Send + Sync>| {
+        DataConnectorError::UnableToGetWriteBackDeliverer {
+            dataconnector: "postgres".to_string(),
+            connector_component: connector_component.clone(),
+            source,
+        }
+    };
+
+    // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
+    // PG10–12 equivalent. Read the server version at setup so delivery does
+    // not re-decide per pass.
+    let mut conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| setup_error(Box::new(e)))?;
+    let server_version_num: i32 = conn
+        .conn
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await
+        .map_err(|e| setup_error(Box::new(e)))?
+        .get(0);
+    let xid_fn = write_back::XidFunction::from(server_version_num);
+
+    // The source table schema, for the upsert leg's conflict target and for
+    // casting each accelerator batch onto it. Same schema the read provider
+    // reports.
+    let schema = factory
+        .table_provider(dataset.path().into())
+        .await
+        .map_err(setup_error)?
+        .schema();
+
+    // The single construction site for the registry: a follow-up hands this
+    // same `Arc` to the replication member registration for the pump filter.
+    let registry =
+        replication::load_write_back_xid_registry(pool, params, dataset, context, xid_fn)
+            .await
+            .map_err(setup_error)?;
+
+    let deliverer = Arc::new(write_back::PostgresWriteBackDeliverer::new(
+        Arc::clone(pool),
+        dataset.path().into(),
+        schema,
+        on_conflict,
+        registry,
+        xid_fn,
+    ));
+    Ok(deliverer as Arc<dyn WriteBackDeliverer>)
+}
+
 #[async_trait]
 impl DataConnector for Postgres {
     fn as_any(&self) -> &dyn Any {
@@ -1035,74 +1106,22 @@ impl DataConnector for Postgres {
         &self,
         context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
-    ) -> Option<Arc<dyn WriteBackDeliverer>> {
+    ) -> Option<DataConnectorResult<Arc<dyn WriteBackDeliverer>>> {
         // Only a durable-write-back dataset delivers through the connector; every
         // other dataset keeps the worker's `TableProvider` path (returns `None`
         // here). Checked first so a non-durable dataset never opens a connection.
         let on_conflict = durable_write_back_on_conflict(dataset)?;
-
-        // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
-        // PG10–12 equivalent. Read the server version at setup so delivery does
-        // not re-decide per pass.
-        let mut conn = match self.pool.connect_direct().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!(
-                    dataset = %dataset.name,
-                    error = %e,
-                    "durable write-back for dataset '{}' could not open a setup connection, so connector-owned delivery is disabled for it; the worker falls back to its TableProvider delivery",
-                    dataset.name
-                );
-                return None;
-            }
-        };
-        let server_version_num: i32 = match conn
-            .conn
-            .query_one("SELECT current_setting('server_version_num')::int4", &[])
-            .await
-        {
-            Ok(row) => row.get(0),
-            Err(e) => {
-                tracing::warn!(
-                    dataset = %dataset.name,
-                    error = %e,
-                    "durable write-back for dataset '{}' could not read the source server version, so connector-owned delivery is disabled for it; the worker falls back to its TableProvider delivery",
-                    dataset.name
-                );
-                return None;
-            }
-        };
-        let xid_fn = write_back::xid_function_for_server_version(server_version_num);
-
-        // The source table schema, for the upsert leg's conflict target and its
-        // schema-equivalence check. Same schema the read provider reports.
-        let schema = match self.factory.table_provider(dataset.path().into()).await {
-            Ok(provider) => provider.schema(),
-            Err(e) => {
-                tracing::warn!(
-                    dataset = %dataset.name,
-                    error = %e,
-                    "durable write-back for dataset '{}' could not resolve its source schema, so connector-owned delivery is disabled for it; the worker falls back to its TableProvider delivery",
-                    dataset.name
-                );
-                return None;
-            }
-        };
-
-        // The single construction site for the registry: a follow-up hands this
-        // same `Arc` to the replication member registration for the pump filter.
-        let registry =
-            replication::load_write_back_xid_registry(&self.params, dataset, context).await?;
-
-        let deliverer = Arc::new(write_back::PostgresWriteBackDeliverer::new(
-            Arc::clone(&self.pool),
-            dataset.path().into(),
-            schema,
-            on_conflict,
-            registry,
-            xid_fn,
-        ));
-        Some(deliverer as Arc<dyn WriteBackDeliverer>)
+        Some(
+            build_write_back_deliverer(
+                &self.pool,
+                &self.factory,
+                &self.params,
+                context,
+                dataset,
+                on_conflict,
+            )
+            .await,
+        )
     }
 
     async fn read_write_provider(

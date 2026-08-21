@@ -358,6 +358,15 @@ impl XidRegistry {
         }
     }
 
+    /// The full `xid8`s of every currently outstanding entry, for the connector
+    /// to resolve each one's [`XactStatus`] against before calling
+    /// [`gc`](Self::gc). The registry stays connection-free (see the module
+    /// docs), so it cannot resolve these itself.
+    #[must_use]
+    pub async fn outstanding_xids(&self) -> Vec<u64> {
+        self.state.lock().await.entries.keys().copied().collect()
+    }
+
     /// Hot-path membership test for the pump, once per source transaction.
     ///
     /// Reads only the low-32-bit mirror, never the async state lock or the store, so
@@ -592,6 +601,33 @@ mod tests {
         XidRegistry::load(store, SOURCE.to_string(), DATASET.to_string())
             .await
             .expect("fresh registry loads from an empty store")
+    }
+
+    /// The connector resolves each outstanding entry's `pg_xact_status` from this
+    /// listing before calling `gc` — it must name every registered xid and none
+    /// that were never registered or already pruned.
+    #[tokio::test]
+    async fn outstanding_xids_lists_every_registered_entry() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+        assert!(
+            registry.outstanding_xids().await.is_empty(),
+            "a fresh registry has no outstanding entries"
+        );
+
+        registry.register(10).await.expect("register 10");
+        registry.register(20).await.expect("register 20");
+        let mut outstanding = registry.outstanding_xids().await;
+        outstanding.sort_unstable();
+        assert_eq!(outstanding, vec![10, 20]);
+
+        registry.mark_commit_observed(low32(10), 100).await;
+        registry.prune_acked(100).await;
+        assert_eq!(
+            registry.outstanding_xids().await,
+            vec![20],
+            "a pruned entry is no longer outstanding"
+        );
     }
 
     /// The full happy path: register a delivery xid, observe its echo's commit, then

@@ -35,7 +35,6 @@ limitations under the License.
 
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use snafu::Snafu;
 
@@ -44,7 +43,7 @@ use snafu::Snafu;
 /// the worker needs the message for its log, not the variant.
 #[derive(Debug, Snafu)]
 pub enum DeliveryError {
-    #[snafu(display("{message}"))]
+    #[snafu(display("{message}: {source}"))]
     Delivery {
         message: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -65,17 +64,9 @@ pub type DeliveryResult<T = ()> = std::result::Result<T, DeliveryError>;
 /// be replayed.
 #[async_trait]
 pub trait WriteBackDeliverer: Send + Sync {
-    /// The schema the deliverer expects `rows` in — the source table's schema.
-    /// The worker casts each pass's rows to this before calling
-    /// [`deliver_upserts`](Self::deliver_upserts), so a type or column difference
-    /// between the accelerator and the source is reconciled up front rather than
-    /// left to fail mid-delivery. Exposing it here keeps the worker from having to
-    /// resolve the source `TableProvider`'s schema itself.
-    fn target_schema(&self) -> SchemaRef;
-
-    /// Upsert every batch of `rows` into the source in **one** transaction. The
-    /// rows are already cast to [`target_schema`](Self::target_schema) by the
-    /// worker.
+    /// Upsert every batch of `rows` into the source in **one** transaction. `rows`
+    /// are in the accelerator's schema; casting them to the source table's schema
+    /// (if needed) is the deliverer's own concern, not the worker's.
     ///
     /// # Errors
     ///

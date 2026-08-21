@@ -22,6 +22,7 @@ limitations under the License.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,11 +31,12 @@ use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotM
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, XidRegistry, config, start_replication_stream,
+    SchemaEvolutionPolicy, XactStatus, XidRegistry, config, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
@@ -43,6 +45,8 @@ use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
+
+use crate::write_back::XidFunction;
 
 // Standby status feedback cadence. Kept well below Postgres's default
 // `wal_sender_timeout` (60s) so that — combined with the worker's
@@ -175,41 +179,179 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 /// follow-up can hand the *same* `Arc` to the replication member registration for
 /// the pump's echo filter.
 ///
-/// `None` when there is no usable accelerator connection to persist into, or the
-/// connection params cannot be parsed — the caller then disables connector-owned
-/// delivery for the dataset and falls back to the worker's `TableProvider` path.
+/// Runs startup garbage collection on the loaded registry (best-effort — a GC
+/// failure is logged, not surfaced) before returning it, so an entry that will
+/// never be pruned normally (aborted delivery, lost unregister, a slot far
+/// behind) does not survive indefinitely and risk a 32-bit xid-wraparound
+/// collision. See [`XidRegistry::gc`].
+///
+/// # Errors
+///
+/// Returns an error if the connection params cannot be resolved, there is no
+/// usable accelerator connection to persist into, or the persisted registry
+/// cannot be loaded. Any of these means change-echo suppression cannot be set
+/// up for this dataset — the caller must fail dataset setup rather than fall
+/// back to unsuppressed delivery.
 pub(crate) async fn load_write_back_xid_registry(
+    pool: &Arc<PostgresConnectionPool>,
     params: &Parameters,
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
-) -> Option<Arc<XidRegistry>> {
+    xid_fn: XidFunction,
+) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     let dataset_name = dataset.name.to_string();
-    let repl_params = match replication_params_from_connector_params(params, &dataset_name) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                "durable write-back for dataset '{dataset_name}' could not resolve its source identity, so change-echo suppression is disabled for it: {e}"
-            );
-            return None;
-        }
-    };
+    let repl_params = replication_params_from_connector_params(params, &dataset_name)?;
     let (schema_name, table_name) = split_schema_table(&dataset.from);
     let identity = source_identity(&repl_params, &schema_name, &table_name);
 
     let store = context
         .blob_checkpoint_store(dataset, crate::write_back::WRITE_BACK_XID_TABLE)
-        .await?;
+        .await
+        .ok_or(
+            "no usable accelerator connection to persist the change-echo suppression registry into",
+        )?;
 
-    match XidRegistry::load(store, identity, dataset_name.clone()).await {
-        Ok(registry) => Some(registry),
+    let registry = XidRegistry::load(store, identity.clone(), dataset_name.clone()).await?;
+
+    gc_write_back_xid_registry(&registry, pool, xid_fn, context, dataset, &identity).await;
+
+    Ok(registry)
+}
+
+/// Startup garbage collection for the outstanding-write-back-transaction
+/// registry: resolve each outstanding entry's transaction status, the source's
+/// current `xid8`, and the durable applied LSN from a live connection, then run
+/// [`XidRegistry::gc`] (the registry itself stays connection-free).
+///
+/// Best-effort: any failure here is logged, not surfaced. The registry is fully
+/// usable for echo suppression either way — skipping GC only delays cleanup of
+/// an already-consumed or crash-orphaned entry to the next restart.
+async fn gc_write_back_xid_registry(
+    registry: &Arc<XidRegistry>,
+    pool: &Arc<PostgresConnectionPool>,
+    xid_fn: XidFunction,
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+    identity: &str,
+) {
+    let dataset_name = dataset.name.as_str();
+    let outstanding = registry.outstanding_xids().await;
+    if outstanding.is_empty() {
+        return;
+    }
+
+    let conn = match pool.connect_direct().await {
+        Ok(conn) => conn,
         Err(e) => {
             tracing::warn!(
-                dataset = %dataset_name,
+                dataset = dataset_name,
                 error = %e,
-                "durable write-back for dataset '{dataset_name}' could not load its change-echo suppression registry, so suppression is disabled for it until restart"
+                "durable write-back for dataset '{dataset_name}' could not open a connection for change-echo suppression registry garbage collection; a stale entry may persist until the next restart"
             );
-            None
+            return;
+        }
+    };
+
+    let current_xid8 = match read_current_xid8(&conn.conn, xid_fn).await {
+        Ok(xid8) => xid8,
+        Err(e) => {
+            tracing::warn!(
+                dataset = dataset_name,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not read the source's current transaction id for change-echo suppression registry garbage collection; a stale entry may persist until the next restart"
+            );
+            return;
+        }
+    };
+
+    let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
+    for xid8 in outstanding {
+        match read_xact_status(&conn.conn, xid_fn, xid8).await {
+            Ok(status) => {
+                statuses.insert(xid8, status);
+            }
+            Err(e) => tracing::warn!(
+                dataset = dataset_name,
+                xid8,
+                error = %e,
+                "durable write-back for dataset '{dataset_name}' could not resolve the status of an outstanding change-echo suppression entry (transaction {xid8}); it is treated as unresolved for this garbage-collection pass"
+            ),
+        }
+    }
+    drop(conn);
+
+    let applied_lsn = resolve_durable_applied_lsn(context, dataset, identity).await;
+
+    registry.gc(&statuses, current_xid8, applied_lsn).await;
+}
+
+/// Read the source's current `xid8` on `client`, through `::text` to avoid
+/// needing a driver `FromSql` for the `xid8` type.
+async fn read_current_xid8(
+    client: &tokio_postgres::Client,
+    xid_fn: XidFunction,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let sql = format!("SELECT {}()::text", xid_fn.as_sql());
+    let row = client.query_one(&sql, &[]).await?;
+    let raw: String = row.get(0);
+    Ok(raw.trim().parse::<u64>()?)
+}
+
+/// Resolve one outstanding entry's transaction status via `pg_xact_status`
+/// (PG13+) or `txid_status` (PG10–12). Both return `NULL` when the status
+/// cannot be determined (the transaction is older than the server's tracked
+/// range) — mapped to [`XactStatus::Unknown`], handled by the GC epoch-distance
+/// safety valve rather than the aborted rule.
+async fn read_xact_status(
+    client: &tokio_postgres::Client,
+    xid_fn: XidFunction,
+    xid8: u64,
+) -> Result<XactStatus, Box<dyn std::error::Error + Send + Sync>> {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "xid8 round-trips through i64 losslessly via its bit pattern; PostgreSQL has no unsigned integer parameter type"
+    )]
+    let param = xid8 as i64;
+    let sql = match xid_fn {
+        XidFunction::PgCurrentXactId => "SELECT pg_xact_status($1::xid8)",
+        XidFunction::TxidCurrent => "SELECT txid_status($1)",
+    };
+    let row = client.query_one(sql, &[&param]).await?;
+    let status: Option<String> = row.get(0);
+    Ok(match status.as_deref() {
+        Some("committed") => XactStatus::Committed,
+        Some("aborted") => XactStatus::Aborted,
+        Some("in progress") => XactStatus::InProgress,
+        _ => XactStatus::Unknown,
+    })
+}
+
+/// The durable applied-LSN watermark for `identity`, or `0` (precedes every
+/// real LSN) when it cannot be resolved — the conservative direction, since GC
+/// rule 2 (`applied_lsn >= commit_lsn_upper_bound`) then simply never fires.
+async fn resolve_durable_applied_lsn(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+    identity: &str,
+) -> u64 {
+    let Some(blobs) = resolve_watermark_store(context, dataset).await else {
+        return 0;
+    };
+    let store = SidecarAppliedLsnStore {
+        blobs,
+        identity: identity.to_string(),
+    };
+    match store.load().await {
+        Ok(RecordedPosition::At(AppliedLsn { lsn })) => lsn,
+        Ok(_) => 0,
+        Err(e) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                error = %e,
+                "durable write-back for dataset '{}' could not read its durable applied-LSN watermark for change-echo suppression registry garbage collection; treating it as unadvanced for this pass",
+                dataset.name
+            );
+            0
         }
     }
 }
