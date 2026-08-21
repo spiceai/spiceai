@@ -22,6 +22,7 @@ limitations under the License.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -177,43 +178,35 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
 /// follow-up can hand the *same* `Arc` to the replication member registration for
 /// the pump's echo filter.
 ///
-/// `None` when there is no usable accelerator connection to persist into, or the
-/// connection params cannot be parsed — the caller then disables connector-owned
-/// delivery for the dataset and falls back to the worker's `TableProvider` path.
+/// Garbage collection runs separately, once, in the caller's cache-miss path
+/// (see [`Postgres::write_back_xid_registry`](crate::Postgres::write_back_xid_registry))
+/// — not here — so a cached hit never repeats it.
+///
+/// # Errors
+///
+/// Returns an error if the connection params cannot be resolved, there is no
+/// usable accelerator connection to persist into, or the persisted registry
+/// cannot be loaded. Any of these means change-echo suppression cannot be set
+/// up for this dataset — the caller must fail dataset setup rather than fall
+/// back to unsuppressed delivery.
 pub(crate) async fn load_write_back_xid_registry(
     params: &Parameters,
     dataset: &DatasetSpec,
     context: &dyn ConnectorContext,
-) -> Option<Arc<XidRegistry>> {
+) -> Result<Arc<XidRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     let dataset_name = dataset.name.to_string();
-    let repl_params = match replication_params_from_connector_params(params, &dataset_name) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                "durable write-back for dataset '{dataset_name}' could not resolve its source identity, so change-echo suppression is disabled for it: {e}"
-            );
-            return None;
-        }
-    };
+    let repl_params = replication_params_from_connector_params(params, &dataset_name)?;
     let (schema_name, table_name) = split_schema_table(&dataset.from);
     let identity = source_identity(&repl_params, &schema_name, &table_name);
 
     let store = context
         .blob_checkpoint_store(dataset, crate::write_back::WRITE_BACK_XID_TABLE)
-        .await?;
+        .await
+        .ok_or(
+            "no usable accelerator connection to persist the change-echo suppression registry into",
+        )?;
 
-    match XidRegistry::load(store, identity, dataset_name.clone()).await {
-        Ok(registry) => Some(registry),
-        Err(e) => {
-            tracing::warn!(
-                dataset = %dataset_name,
-                error = %e,
-                "durable write-back for dataset '{dataset_name}' could not load its change-echo suppression registry, so suppression is disabled for it until restart"
-            );
-            None
-        }
-    }
+    Ok(XidRegistry::load(store, identity, dataset_name).await?)
 }
 
 /// Startup garbage collection for a freshly-loaded write-back registry.
@@ -296,8 +289,7 @@ pub(crate) async fn run_write_back_registry_gc(
         }
     };
 
-    let mut statuses: std::collections::HashMap<u64, XactStatus> =
-        std::collections::HashMap::with_capacity(outstanding.len());
+    let mut statuses: HashMap<u64, XactStatus> = HashMap::with_capacity(outstanding.len());
     for xid8 in outstanding {
         // Bind the id as its decimal text and cast in SQL (`$1::xid8` /
         // `$1::bigint`), so no `xid8` `ToSql`/`FromSql` is needed; the status is

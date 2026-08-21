@@ -330,6 +330,14 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     /// the CDC pump can drop the echo it will later stream back, which it cannot
     /// do from behind the `TableProvider`. See [`WriteBackDeliverer`].
     ///
+    /// `None` means "this connector never delivers through a connector-owned
+    /// transaction for this dataset" (the common case: every dataset that does
+    /// not need echo suppression). `Some(Err(_))` means "this dataset needs one
+    /// but it could not be set up" — the caller fails dataset setup rather than
+    /// silently falling back to the `TableProvider` path, which for a durable
+    /// write-back `PostgreSQL` dataset would commit writes without registering
+    /// their xids and reopen the double-apply window this exists to close.
+    ///
     /// Defaults to `None`: the worker drives delivery through the source's
     /// `TableProvider` exactly as before, so a connector that does not override
     /// this is unaffected.
@@ -343,7 +351,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         &self,
         _context: &dyn ConnectorContext,
         _dataset: &DatasetSpec,
-    ) -> Option<Arc<dyn WriteBackDeliverer>> {
+    ) -> Option<DataConnectorResult<Arc<dyn WriteBackDeliverer>>> {
         None
     }
 

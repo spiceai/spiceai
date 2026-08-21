@@ -192,7 +192,9 @@ impl DataConnector for FullTextConnector {
         &self,
         context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
-    ) -> Option<Arc<dyn data_connector_api::WriteBackDeliverer>> {
+    ) -> Option<
+        data_connector_api::DataConnectorResult<Arc<dyn data_connector_api::WriteBackDeliverer>>,
+    > {
         self.inner_connector
             .write_back_deliverer(context, dataset)
             .await
