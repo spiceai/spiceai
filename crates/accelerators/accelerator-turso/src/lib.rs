@@ -1932,4 +1932,44 @@ mod tests {
         cleanup_turso_test_files(&metastore);
         cleanup_turso_test_files(&unrelated);
     }
+    /// Cayenne asks for its metastore sidecar through `&dyn DataAccelerator`, so what
+    /// matters is that the Turso engine *answers* `sidecar_for_path` rather than falling
+    /// through to the trait's unsupported default — the silent version of this bug is a
+    /// metastore reporting "no accelerator hosts databases" at run time.
+    ///
+    /// It must also arrive over the shared, path-keyed pool: the lock serializing sidecar
+    /// DDL against a concurrent `BEGIN CONCURRENT` write lives on the pool instance, so a
+    /// sidecar over a pool of its own would hold a lock nothing else observes.
+    #[tokio::test]
+    async fn sidecar_for_path_answers_through_the_trait_and_shares_the_pool() {
+        let dir = std::env::temp_dir().join("spice_turso_sidecar_for_path");
+        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let metastore = dir.join("cayenne.db").to_string_lossy().to_string();
+        cleanup_turso_test_files(&metastore);
+
+        let engine: Arc<dyn DataAccelerator> = Arc::new(TursoAccelerator::new());
+        assert!(
+            engine
+                .sidecar_for_path(&metastore, "spice_sys_dataset_checkpoint")
+                .await
+                .is_ok(),
+            "the Turso engine must answer sidecar_for_path, not take the unsupported default"
+        );
+
+        let accelerator = TursoAccelerator::new();
+        let first = accelerator
+            .get_shared_pool_for_path(&metastore)
+            .await
+            .expect("a pool should resolve for the metastore path");
+        let second = accelerator
+            .get_shared_pool_for_path(&metastore)
+            .await
+            .expect("a second request for the same path should resolve");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one pool per file, or the DDL lock is not shared"
+        );
+
+        cleanup_turso_test_files(&metastore);
+    }
 }

@@ -17,9 +17,17 @@ limitations under the License.
 //! An [`AccelerationSource`] for tests that run below `runtime`.
 //!
 //! An accelerator engine takes a `&dyn AccelerationSource`, and the runtime's own
-//! implementation of it — `Dataset` — carries an `Arc<Runtime>`. A test in an engine
-//! crate therefore cannot build one, even though the engines only ever ask their source
-//! for configuration: `name`, `acceleration`, `is_file_accelerated`, `app`.
+//! implementation of it — `Dataset` — carries an `Arc<Runtime>`, so a test in an engine
+//! crate cannot build one. What the engines ask their source for is mostly
+//! configuration — `name`, `acceleration`, `is_file_accelerated`, `app` — which is what
+//! this provides.
+//!
+//! It does **not** provide the runtime-backed answers. `initialized_sources` keeps the
+//! trait's empty default, so a test that needs peer datasets — DuckDB attaching other
+//! file-mode instances is the case in the tree — sees none, and belongs in the runtime's
+//! own tests rather than here. `checkpointer_factory` reports that there is no
+//! accelerator to checkpoint rather than handing back a no-op, which a snapshot
+//! bootstrap would read as "checkpoint present and empty".
 //!
 //! This lives here, below every engine crate, deliberately. A test-support crate that
 //! depended on the engines and was dev-depended on by them would make cargo build two
@@ -32,6 +40,7 @@ use datafusion::common::TableReference;
 use runtime_secrets::Secrets;
 use tokio::sync::RwLock;
 
+use crate::Engine;
 use crate::acceleration::{Acceleration, Mode};
 use crate::acceleration_source::AccelerationSource;
 use crate::schema_change::OnSchemaChange;
@@ -105,13 +114,23 @@ impl AccelerationSource for TestAccelerationSource {
         Arc::new(self.clone())
     }
 
+    /// Mirrors `DatasetSpec::is_file_accelerated`, including its two quirks: a
+    /// PostgreSQL acceleration counts as file-backed whatever its mode, and a disabled
+    /// acceleration counts as nothing at all. A double that answered otherwise would
+    /// send a test down an initialization path the runtime skips. (`View`'s
+    /// implementation deliberately differs on PostgreSQL; this stands in for a dataset.)
     fn is_file_accelerated(&self) -> bool {
-        self.acceleration.as_ref().is_some_and(|acceleration| {
-            matches!(
+        let Some(acceleration) = self.acceleration.as_ref() else {
+            return false;
+        };
+        if acceleration.engine == Engine::PostgreSQL {
+            return true;
+        }
+        acceleration.enabled
+            && matches!(
                 acceleration.mode,
                 Mode::File | Mode::FileCreate | Mode::FileUpdate
             )
-        })
     }
 
     fn app(&self) -> Arc<app::App> {
