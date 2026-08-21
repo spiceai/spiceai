@@ -2996,6 +2996,30 @@ const fn subset_merge_write_shape(
     }
 }
 
+/// Write policy for a snapshot rewrite, chosen by whether the rewrite actually
+/// sorted its stream. Pure so the decision is unit-testable without spinning a
+/// full provider, mirroring [`subset_merge_write_shape`].
+///
+/// A sorted rewrite must reach the sink through ONE writer, or the global order
+/// is scattered across shard files and every file's zone maps span the whole
+/// range — forfeiting exactly the pruning the sort exists for. Passing a low
+/// `session_target_partitions` does NOT secure that: the hint bounds only the
+/// unset default, while a configured `cayenne_write_concurrency` is honored
+/// above it (see `CayenneTableProvider::snapshot_write_concurrency`, and the
+/// deliberate reasoning on `test_low_partition_hint_does_not_serialize_a_sized_write`).
+/// So the requirement is declared with [`EncodeFanOut::Serial`].
+///
+/// An unsorted consolidation carries nothing a reader depends on and is free to
+/// fan its encode out across cores.
+#[must_use]
+const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePolicy {
+    if is_sorted {
+        super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
+    } else {
+        super::delta_encoding::WritePolicy::MAINTENANCE
+    }
+}
+
 /// Pure gate for the current-snapshot small-file **subset** rewrite (hardlink
 /// unpicked + re-encode only the picker candidate). Extracted so every branch
 /// is unit-testable without spinning a full provider.
@@ -7409,9 +7433,12 @@ impl CayenneTableProvider {
     }
 
     /// Effective number of concurrent shard writers the Vortex sink will use for
-    /// a snapshot write. Returns `1` for sorted rewrites (sharding a
-    /// globally-sorted stream would scatter its order across files); otherwise
-    /// the count is *size-aware*:
+    /// a snapshot write. Returns `1` when the caller declares
+    /// [`EncodeFanOut::Serial`] — the way a write that must not fan out states
+    /// it, and the only thing that holds a globally-sorted stream on one writer
+    /// (`session_target_partitions` is a hint that bounds the unset default, not
+    /// a ceiling on a configured `cayenne_write_concurrency`). Otherwise the
+    /// count is *size-aware*:
     ///
     /// - `estimated_bytes == Some(n)`: shard into `n / encode_shard_unit`
     ///   writers, clamped to `[1, write_concurrency]`, where the unit is
@@ -7463,25 +7490,24 @@ impl CayenneTableProvider {
         if matches!(fan_out, EncodeFanOut::Serial) {
             return 1;
         }
-        // A sorted write must go through ONE writer, or the global order is
-        // scattered across shard files and each file's zone maps span the whole
-        // range — forfeiting exactly the pruning the sort was for.
+        // Whether the encode may fan out is a property of the WRITE, not of the
+        // table's declared sort order. Schema inference fills `sort_columns` on
+        // every catalog-visible CDC table (the key the background rewrite sorts
+        // by), so keying the fan-out off the table would serialize the two write
+        // paths that never sort — the CDC delta write (staged appends and
+        // mem-tier checkpoints) and the protected-snapshot merge, which unions
+        // its input scans.
         //
-        // KNOWN GAP (pre-existing, deliberately not fixed here): this asks the
-        // CONFIGURED list, but an adaptive (observed-filter) layout sorts the
-        // compaction rewrite too, with no configured columns — so that rewrite
-        // gets sharded and its clustering is diluted. The blunt fix (key off
-        // `effective_sort_columns_for_rewrite`) is wrong: this function also
-        // serves DELTA writes (`table.rs:5708`), which are NOT sorted, so it
-        // would serialize the CDC encode fan-out and regress ingest. The real fix
-        // threads `write_class` in so only maintenance writes force one shard.
-        // Until then the adaptive layout's clustering is per-shard-file rather
-        // than global — weaker pruning, but never a wrong `output_ordering`
-        // (the attestation in `rewrite_current_snapshot_for_compaction` declines
-        // to attest whenever the effective key is not the configured one).
-        if self.context.has_sort_columns() {
-            return 1;
-        }
+        // A sorted write must still go through ONE writer, or the global order
+        // is scattered across shard files and each file's zone maps span the
+        // whole range — forfeiting exactly the pruning the sort was for. Every
+        // stream that goes through `sort_stream_by_columns` or
+        // `zorder_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // is handled above. A low `session_target_partitions` is NOT a
+        // substitute: it bounds only the unset default, while a configured
+        // `cayenne_write_concurrency` is honored above it (see
+        // `snapshot_write_concurrency`), so a caller that merely passed 1 would
+        // still fan out on a table that raised the knob.
         let write_concurrency = self.snapshot_write_concurrency(session_target_partitions);
         match estimated_bytes {
             Some(bytes) => {
@@ -13998,15 +14024,16 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count, _stats_acc) = self
-            // Sorted rewrite: `has_sort_columns()` already forces a single shard
-            // (and `target_partitions = 1`), so no size estimate is needed.
+            // The stream went through `sort_stream_by_columns`, so it is sorted
+            // and the fan-out must be pinned. No size estimate is needed once it
+            // is. See `rewrite_write_policy` for why the hint cannot carry this.
             .write_to_snapshot(
                 sorted_stream,
                 target_size_bytes,
                 &new_snapshot_id,
                 1,
                 None,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                rewrite_write_policy(true),
             )
             .await?;
 
@@ -16786,7 +16813,8 @@ impl CayenneTableProvider {
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
-        if !rewrite_sort_columns.is_empty() {
+        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
+        if rewrite_is_sorted {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -16818,11 +16846,10 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
-                // Compaction already pins `target_partitions = 1` (single output
-                // file is the whole point), so the shard count is forced to 1
-                // regardless; no size estimate needed.
+                // Compaction consolidates into a single output file, so it needs
+                // no size estimate.
                 None,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                rewrite_write_policy(rewrite_is_sorted),
             )
             .await;
 
@@ -38624,6 +38651,90 @@ mod tests {
         }
     }
 
+    /// A sorted rewrite must declare a serial fan-out; an unsorted one must not.
+    ///
+    /// This is the gate that keeps a globally sorted stream on one writer. If it
+    /// ever returns a `Sized` policy for a sorted rewrite, the order is split
+    /// across shard files and every file's zone maps span the whole range — the
+    /// pruning the sort exists for is silently lost, with no failure anywhere.
+    #[test]
+    fn rewrite_write_policy_pins_the_fan_out_only_for_sorted_rewrites() {
+        use crate::provider::delta_encoding::{WriteClass, WritePolicy};
+
+        assert_eq!(
+            rewrite_write_policy(true),
+            WritePolicy::MAINTENANCE_SERIAL,
+            "a sorted rewrite must pin the encode to one writer"
+        );
+        assert_eq!(
+            rewrite_write_policy(true).fan_out,
+            EncodeFanOut::Serial,
+            "the pin must be the fan-out, not merely the write class"
+        );
+        assert_eq!(
+            rewrite_write_policy(false),
+            WritePolicy::MAINTENANCE,
+            "an unsorted consolidation is free to fan out"
+        );
+        assert_eq!(rewrite_write_policy(false).fan_out, EncodeFanOut::Sized,);
+        // Both are maintenance writes: only the fan-out differs, so the encoding
+        // level and the encode-budget class stay the same either way.
+        assert_eq!(rewrite_write_policy(true).class, WriteClass::Maintenance);
+        assert_eq!(rewrite_write_policy(false).class, WriteClass::Maintenance);
+    }
+
+    /// Regression test: a sorted rewrite must stay serial even when the table
+    /// raises `cayenne_write_concurrency`.
+    ///
+    /// `snapshot_write_concurrency` honors a configured concurrency ABOVE the
+    /// caller's `session_target_partitions` (that hint bounds only the unset
+    /// default), so the sorted rewrites cannot secure a single writer by passing
+    /// `target_partitions = 1` — they must declare `EncodeFanOut::Serial`.
+    /// Without that, a globally sorted stream is split across shard files and
+    /// every file's zone maps span the whole range, silently forfeiting the
+    /// pruning the sort exists for.
+    #[tokio::test]
+    async fn test_sorted_rewrite_stays_serial_under_write_concurrency_override() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "sorted_rewrite_concurrency_override",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                sort_columns: vec!["id".to_string()],
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+
+        // The pin the sorted rewrites actually pass.
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Serial),
+            1,
+            "a declared-serial write must ignore the configured write concurrency"
+        );
+        assert!(
+            provider
+                .write_shard_format(1, tsb, None, EncodeFanOut::Serial)
+                .write_shard()
+                .is_none(),
+            "a declared-serial write must not carry a shard config"
+        );
+
+        // Demonstrates why the declaration is load-bearing: the hint alone does
+        // not hold, so a sorted rewrite that only passed `1` would fan out.
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
+            8,
+            "the partition hint alone does not bound a configured concurrency"
+        );
+    }
+
     /// A LOW partition hint must not serialize an ordinary write.
     ///
     /// The hint is inherited from whichever session is executing — a low
@@ -38666,7 +38777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_sorted_single_writer() {
+    async fn test_declared_sort_order_does_not_serialize_an_unsorted_write() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -38677,21 +38788,39 @@ mod tests {
         )
         .await;
 
-        // Sorted rewrites must stay on a single writer: sharding a globally
-        // sorted stream would scatter its order across files. This holds
-        // regardless of the size estimate, so pass a large `estimated_bytes`.
+        // A sorted rewrite states its requirement with `EncodeFanOut::Serial`
+        // and stays on a single writer, whatever the size estimate says.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Serial),
             1
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Serial)
                 .write_shard()
                 .is_none(),
-            "sorted writes fall back to the unsharded base format"
+            "a serial write falls back to the unsharded base format"
+        );
+
+        // The table DECLARING a sort order does not make every write it makes a
+        // sorted one. Schema inference fills `sort_columns` on every
+        // catalog-visible CDC table, so a table property here would serialize
+        // the CDC delta write and the protected-snapshot merge, neither of which
+        // sorts. A `Sized` write on the same table fans out.
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            4,
+            "a table's declared sort order must not serialize an unsorted write"
+        );
+        assert_eq!(
+            provider
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
+                .write_shard()
+                .expect("an unsorted sized write keeps its shard config")
+                .write_concurrency,
+            4
         );
     }
 
