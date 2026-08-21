@@ -2676,6 +2676,20 @@ fn protected_merge_input_budget_for_pool(
 /// there is no settled prefix and the bake is a no-op.
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 
+/// One input data file of a seq-prefix bake's selected prefix, with the deletion
+/// threshold of the snapshot it belongs to.
+///
+/// The threshold travels WITH the file rather than with its group: a group may span
+/// snapshots, and each file must receive exactly the filter it would have received
+/// alone (see [`CayenneTableProvider::bake_rewrite_group`]).
+#[derive(Debug, Clone)]
+struct BakeRewriteFile {
+    snapshot_id: String,
+    file_name: String,
+    size: u64,
+    threshold: i64,
+}
+
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
 /// or above which a seq-prefix bake is worth triggering. The bake exists to
 /// shrink this index, so it is gated on the very quantity it reduces: below this
@@ -19215,69 +19229,119 @@ impl CayenneTableProvider {
         result.map(|(rows, _writer_ops, _stats)| rows)
     }
 
-    /// Rewrite ONE input data file into the staged output snapshot: scan just that
-    /// file, apply its snapshot's partial deletion filter, write it back.
+    /// Rewrite ONE GROUP of input data files into the staged output snapshot: scan
+    /// each file, apply ITS OWN snapshot's partial deletion filter, union the group,
+    /// write one output.
     ///
-    /// One encode shard, deliberately: the `encode_fanout` bench lane is
-    /// monotonically worse with more shards per write (1 shard 71.7 ms -> 64 shards
-    /// 173.2 ms on the `stock` shape), so a file IS the parallel unit and widening
-    /// its encode is the wrong lever.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one rewrite unit's inputs, shared by the spawned and inline paths"
-    )]
-    async fn bake_rewrite_one_file(
+    /// Per-file filters under a union, rather than one filter over the union, because
+    /// a group may span snapshots with different deletion thresholds — applying a
+    /// single threshold to the group would either under-apply deletions to one file
+    /// (leaving dead rows) or over-apply to another (this is the resurrection-adjacent
+    /// direction, so it fails closed by construction: each file keeps its own).
+    ///
+    /// One encode shard: the `encode_fanout` bench lane is monotonically worse with
+    /// more shards per write (1 shard 71.7 ms -> 64 shards 173.2 ms on the `stock`
+    /// shape), so a GROUP is the parallel unit and widening its encode is the wrong
+    /// lever.
+    async fn bake_rewrite_group(
         &self,
         state: &datafusion::execution::session_state::SessionState,
-        snapshot_id: &str,
-        file_name: &str,
-        file_size: u64,
-        threshold: i64,
+        group: &[BakeRewriteFile],
         deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
         new_snapshot_id: &str,
         target_size_bytes: usize,
     ) -> Result<u64> {
-        let plan = self
-            .create_single_file_rewrite_scan_plan(state, snapshot_id, file_name, file_size)
-            .await?;
-        let filtered = self.apply_partial_deletion_filter(
-            plan,
-            &self.pk_column_indices,
-            threshold,
-            deletion_snapshot,
-        )?;
-        let stream = datafusion_physical_plan::execute_stream(filtered, state.task_ctx())?;
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(group.len());
+        let mut group_bytes: u64 = 0;
+        for file in group {
+            let plan = self
+                .create_single_file_rewrite_scan_plan(
+                    state,
+                    &file.snapshot_id,
+                    &file.file_name,
+                    file.size,
+                )
+                .await?;
+            plans.push(self.apply_partial_deletion_filter(
+                plan,
+                &self.pk_column_indices,
+                file.threshold,
+                deletion_snapshot,
+            )?);
+            group_bytes = group_bytes.saturating_add(file.size);
+        }
+        let merged: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        let stream = datafusion_physical_plan::execute_stream(merged, state.task_ctx())?;
         self.write_to_snapshot(
             stream,
             target_size_bytes,
             new_snapshot_id,
             1,
-            Some(file_size),
+            Some(group_bytes),
             super::delta_encoding::WriteClass::Maintenance,
         )
         .await
         .map(|(rows, _writer_ops, _stats)| rows)
     }
 
-    /// One rewrite unit per input data file of the selected prefix, each carrying
-    /// its own snapshot's deletion threshold.
+    /// Group the selected prefix's input data files into rewrite units of roughly
+    /// `target_bytes` each.
     ///
-    /// A snapshot with an EMPTY listing contributes no units: it holds no physical
-    /// rows to rewrite, and the union shape reaches the same outcome by scanning it
-    /// to zero rows. Its `<= T` coverage comes from being in `selected` (which sets
-    /// the prune cutoff), not from any bytes written here.
+    /// A unit is a GROUP, not a single file, because **the bake is also a file-count
+    /// reduction pass**. The union shape merged every input into one stream and
+    /// rolled output files at the target size, so a pass consolidated; rewriting one
+    /// output per input file preserves the input file count instead, and a measured
+    /// SF1000 pair showed what that costs — `scan_files_listed` rose 64% on `stock`
+    /// and 178% on `order_line`, carrying replication-lag p99 up 18% even though
+    /// every pass itself got faster. Grouping keeps the parallelism (units run
+    /// concurrently) while restoring the consolidation.
+    ///
+    /// Grouping is by INPUT bytes, so a unit's output lands at or below the target
+    /// once dead rows are dropped — the same direction the union's roll-at-target
+    /// produced, never above it.
+    ///
+    /// Files are grouped in snapshot order and each keeps its own snapshot's deletion
+    /// threshold, so a unit spanning two snapshots still applies exactly the filter
+    /// each of its files would have received alone. A snapshot with an EMPTY listing
+    /// contributes no files: it holds no physical rows to rewrite, and its `<= T`
+    /// coverage comes from being in `selected` (which sets the prune cutoff), not
+    /// from any bytes written here.
     async fn bake_rewrite_units(
         &self,
         selected: &[(String, i64)],
-    ) -> Result<Vec<(String, String, u64, i64)>> {
-        let mut units: Vec<(String, String, u64, i64)> = Vec::new();
+        target_bytes: u64,
+    ) -> Result<Vec<Vec<BakeRewriteFile>>> {
+        let target = target_bytes.max(1);
+        let mut groups: Vec<Vec<BakeRewriteFile>> = Vec::new();
+        let mut current: Vec<BakeRewriteFile> = Vec::new();
+        let mut current_bytes: u64 = 0;
         for (snapshot_id, threshold) in selected {
             let files = self.list_snapshot_files_with_sizes(snapshot_id).await?;
             for (file_name, size) in files {
-                units.push((snapshot_id.clone(), file_name, size, *threshold));
+                current.push(BakeRewriteFile {
+                    snapshot_id: snapshot_id.clone(),
+                    file_name,
+                    size,
+                    threshold: *threshold,
+                });
+                current_bytes = current_bytes.saturating_add(size);
+                // Close the group once it reaches the target. A single file already
+                // at or above the target becomes its own group, which is what the
+                // union's roll would also have produced.
+                if current_bytes >= target {
+                    groups.push(std::mem::take(&mut current));
+                    current_bytes = 0;
+                }
             }
         }
-        Ok(units)
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        Ok(groups)
     }
 
     /// Rewrite the selected prefix ONE INPUT FILE AT A TIME, `concurrency` files in
@@ -19316,7 +19380,11 @@ impl CayenneTableProvider {
         concurrency: usize,
     ) -> Result<u64> {
         let bake_plan_start = Instant::now();
-        let units = self.bake_rewrite_units(selected).await?;
+        // Group to the SAME target the union's output roll used, so a pass consolidates
+        // rather than reproducing its input file count.
+        let units = self
+            .bake_rewrite_units(selected, target_size_bytes as u64)
+            .await?;
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
             "bake_plan",
@@ -19345,14 +19413,11 @@ impl CayenneTableProvider {
                 // path. Rewrite the units inline: correct and identical in output,
                 // just not parallel.
                 let mut total: u64 = 0;
-                for (snapshot_id, file_name, size, threshold) in units {
+                for group in units {
                     total = total.saturating_add(
-                        self.bake_rewrite_one_file(
+                        self.bake_rewrite_group(
                             state,
-                            &snapshot_id,
-                            &file_name,
-                            size,
-                            threshold,
+                            &group,
                             deletion_snapshot,
                             new_snapshot_id,
                             target_size_bytes,
@@ -19388,7 +19453,7 @@ impl CayenneTableProvider {
         &self,
         provider: &Arc<CayenneTableProvider>,
         state: &datafusion::execution::session_state::SessionState,
-        units: Vec<(String, String, u64, i64)>,
+        units: Vec<Vec<BakeRewriteFile>>,
         deletion_snapshot: &super::on_conflict::PkDeletionSnapshot,
         new_snapshot_id: &str,
         target_size_bytes: usize,
@@ -19396,7 +19461,7 @@ impl CayenneTableProvider {
     ) -> Result<u64> {
         let permits = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         let mut handles = Vec::with_capacity(units.len());
-        for (snapshot_id, file_name, file_size, threshold) in units {
+        for group in units {
             let provider = Arc::clone(provider);
             let state = state.clone();
             let deletion_snapshot = deletion_snapshot.clone();
@@ -19407,12 +19472,9 @@ impl CayenneTableProvider {
                 // closed semaphore as "no permit needed" rather than failing a pass.
                 let _permit = permits.acquire_owned().await.ok();
                 provider
-                    .bake_rewrite_one_file(
+                    .bake_rewrite_group(
                         &state,
-                        &snapshot_id,
-                        &file_name,
-                        file_size,
-                        threshold,
+                        &group,
                         &deletion_snapshot,
                         &output,
                         target_size_bytes,
@@ -40776,6 +40838,96 @@ mod tests {
     fn install_int64_deletes(provider: &CayenneTableProvider, deletes: &[(i64, i64)]) {
         let index = DeletionIndex::from_map(deletes.iter().copied().collect::<HashMap<i64, i64>>());
         store_int64_tombstones(provider, index);
+    }
+
+    /// CONSOLIDATION INVARIANT. The per-file shape must consolidate as hard as the
+    /// union shape — no more output files for the same inputs.
+    ///
+    /// This is the property the first per-file prototype broke and no test caught:
+    /// the bake is not only a deletion-applying rewrite, it is also a file-count
+    /// reduction pass. Rewriting one output per input file preserved row-set
+    /// equivalence — so the equivalence test stayed green — while preserving the
+    /// input file count, and an SF1000 pair then showed `scan_files_listed` up 64%
+    /// on `stock` and 178% on `order_line`, carrying replication-lag p99 up 18%.
+    /// Row equivalence alone is not a sufficient contract for this pass.
+    ///
+    /// Compared against the UNION's output count rather than against the input count:
+    /// with one file per input snapshot, "no more files than I consumed" is satisfied
+    /// by the very bug this guards (N inputs -> N outputs), so it would pass
+    /// vacuously. The union is the reference for how hard a pass should consolidate.
+    #[tokio::test]
+    async fn seq_prefix_bake_consolidates_as_hard_as_the_union() {
+        // EIGHT snapshots, so the pass consumes FIVE input files (K = 3 kept), of
+        // which four still hold a surviving row. A five-snapshot fixture cannot
+        // detect this: it consumes two files, one of them holds the only deleted
+        // key, so a single output survives whatever the grouping did and the
+        // comparison is degenerate.
+        const SEQS: [i64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let ctx = SessionContext::new();
+        let mut counts = Vec::new();
+        for (label, per_file) in [("consol_union", None), ("consol_perfile", Some(4usize))] {
+            let (provider, _tmp, _ids) =
+                build_seq_prefix_fixture(label, ctx.runtime_env(), &SEQS).await;
+            install_int64_deletes(&provider, &[(0, 15)]);
+
+            let before_ids: Vec<String> = {
+                let mut v: Vec<String> = provider.protected_snapshots.load().keys().cloned().collect();
+                v.sort();
+                v
+            };
+            let mut inputs = 0usize;
+            for id in &before_ids[..before_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS] {
+                inputs += provider
+                    .list_snapshot_files_with_sizes(id)
+                    .await
+                    .expect("list input snapshot files")
+                    .len();
+            }
+            assert!(
+                inputs >= 4,
+                "{label}: the fixture must consume >= 4 input files with surviving rows, or \
+                 one-output-per-input is indistinguishable from consolidation (got {inputs})"
+            );
+
+            let baked = provider
+                .bake_seq_prefix_protected_snapshots_with_shape(per_file)
+                .await
+                .expect("bake should not error");
+            assert!(baked, "{label}: the older prefix must bake");
+
+            let published: Vec<String> = provider
+                .protected_snapshots
+                .load()
+                .keys()
+                .filter(|id| !before_ids.contains(id))
+                .cloned()
+                .collect();
+            assert_eq!(
+                published.len(),
+                1,
+                "{label}: a committed bake publishes exactly one new protected snapshot"
+            );
+            let outputs = provider
+                .list_snapshot_files_with_sizes(&published[0])
+                .await
+                .expect("list output snapshot files")
+                .len();
+            counts.push((label, inputs, outputs));
+        }
+
+        let (_, union_inputs, union_outputs) = counts[0];
+        let (_, per_file_inputs, per_file_outputs) = counts[1];
+        assert_eq!(
+            per_file_inputs, union_inputs,
+            "both shapes must consume the same inputs for the comparison to mean anything"
+        );
+        assert!(
+            per_file_outputs <= union_outputs,
+            "per-file wrote {per_file_outputs} files where the union wrote {union_outputs} \
+             from the same {union_inputs} inputs; the bake is a file-count reduction pass \
+             as well as a deletion-applying rewrite, so per-file must group its inputs \
+             rather than emit one output per input"
+        );
     }
 
     /// PER-FILE REWRITE EQUIVALENCE. The per-file rewrite shape must produce the
