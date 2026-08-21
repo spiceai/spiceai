@@ -62,6 +62,22 @@ pub(super) enum ShardSpec {
     Single,
     /// `n` writers, batches distributed round-robin (parallel encode, no clustering).
     RoundRobin(usize),
+    /// `n` writers, each fed CONTIGUOUS runs of the input (parallel encode +
+    /// arrival-clustered files).
+    ///
+    /// Whole batches go to one shard until `bytes_per_run` uncompressed bytes
+    /// have been routed to it, then the next shard takes over. Every output file
+    /// therefore covers a contiguous slice of the arrival order, so its min/max
+    /// zone maps stay narrow on any column correlated with that order — where
+    /// `RoundRobin` and `Hash` both interleave, giving every file a range that
+    /// spans the whole write.
+    ///
+    /// The run size only balances the shards; contiguity holds whatever it is,
+    /// including when a run spills into more than one rolled file.
+    ContiguousRuns {
+        partitions: usize,
+        bytes_per_run: u64,
+    },
     /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
     Hash {
         exprs: Vec<PhysicalExprRef>,
@@ -76,22 +92,89 @@ impl ShardSpec {
         match self {
             ShardSpec::Single => 1,
             ShardSpec::RoundRobin(n) => *n,
-            ShardSpec::Hash { partitions, .. } => *partitions,
+            ShardSpec::ContiguousRuns { partitions, .. } | ShardSpec::Hash { partitions, .. } => {
+                *partitions
+            }
         }
     }
 
-    /// Build a `BatchPartitioner` that routes each input batch to one of
-    /// `num_shards` shards according to this spec. `Single`/`RoundRobin` route
-    /// whole batches; `Hash` splits batches row-wise on the key expressions.
-    fn batch_partitioner(&self, num_shards: usize) -> DFResult<BatchPartitioner> {
+    /// Build the router that assigns each input batch to one of `num_shards`
+    /// shards according to this spec.
+    fn router(&self, num_shards: usize) -> DFResult<ShardRouter> {
         let timer = Time::default();
         match self {
-            ShardSpec::Hash { exprs, .. } => {
-                BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)
-            }
-            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(
+            ShardSpec::Hash { exprs, .. } => Ok(ShardRouter::Partitioned(
+                BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)?,
+            )),
+            ShardSpec::ContiguousRuns { bytes_per_run, .. } => Ok(ShardRouter::ContiguousRuns {
+                shard: 0,
+                routed_bytes: 0,
+                // A zero run size would advance the shard on every batch, which
+                // is round-robin with extra steps; keep at least one byte so a
+                // run always holds the batch that opened it.
+                bytes_per_run: (*bytes_per_run).max(1),
+                num_shards,
+            }),
+            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(ShardRouter::Partitioned(
                 BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1),
-            ),
+            )),
+        }
+    }
+}
+
+/// Assigns input batches to shard writers.
+///
+/// Split out from [`ShardSpec`] because the contiguous-run policy is stateful
+/// (it tracks how much has been routed to the current shard) and whole-batch,
+/// which `BatchPartitioner` cannot express — its round-robin advances on every
+/// batch.
+enum ShardRouter {
+    /// Delegate to `DataFusion`'s partitioner: round-robin over whole batches,
+    /// or a row-wise hash split on the key expressions.
+    Partitioned(BatchPartitioner),
+    /// Fill one shard with a contiguous run of whole batches, then advance.
+    ContiguousRuns {
+        shard: usize,
+        routed_bytes: u64,
+        bytes_per_run: u64,
+        num_shards: usize,
+    },
+}
+
+impl ShardRouter {
+    /// Append this batch's `(shard, batch)` assignments to `routed`.
+    ///
+    /// Collected rather than sent directly because `BatchPartitioner::partition`
+    /// invokes its closure synchronously, so the sends must be awaited after it
+    /// returns.
+    fn route(
+        &mut self,
+        batch: RecordBatch,
+        routed: &mut Vec<(usize, RecordBatch)>,
+    ) -> DFResult<()> {
+        match self {
+            ShardRouter::Partitioned(partitioner) => partitioner.partition(batch, |idx, sub| {
+                routed.push((idx, sub));
+                Ok(())
+            }),
+            ShardRouter::ContiguousRuns {
+                shard,
+                routed_bytes,
+                bytes_per_run,
+                num_shards,
+            } => {
+                let batch_bytes = batch_uncompressed_bytes(&batch)?;
+                routed.push((*shard, batch));
+                // Advance AFTER placing the batch, so the run that a batch opens
+                // always contains it, and saturate rather than wrap so a very
+                // large batch cannot roll the counter back under the threshold.
+                *routed_bytes = routed_bytes.saturating_add(batch_bytes);
+                if *routed_bytes >= *bytes_per_run {
+                    *routed_bytes = 0;
+                    *shard = (*shard + 1) % (*num_shards).max(1);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -440,8 +523,8 @@ async fn write_record_batch_stream_to_files(
         )));
     }
 
-    let mut partitioner = (num_shards > 1)
-        .then(|| output_options.shard_spec.batch_partitioner(num_shards))
+    let mut router = (num_shards > 1)
+        .then(|| output_options.shard_spec.router(num_shards))
         .transpose()?;
 
     // A failed send means a shard writer already dropped its receiver — i.e. it
@@ -462,22 +545,17 @@ async fn write_record_batch_stream_to_files(
                 remove_partition_columns(&batch, output_options.partition_column_names)?
             };
 
-            match partitioner.as_mut() {
+            match router.as_mut() {
                 None => {
                     if senders[0].send(batch).await.is_err() {
                         shard_closed_early = true;
                         break;
                     }
                 }
-                Some(partitioner) => {
-                    // `partition` invokes the closure synchronously, so collect
-                    // the (shard, sub-batch) pairs and await the sends afterward.
-                    let mut routed: Vec<(usize, RecordBatch)> = Vec::new();
-                    partitioner.partition(batch, |idx, sub| {
-                        routed.push((idx, sub));
-                        Ok(())
-                    })?;
-                    for (idx, sub) in routed {
+                Some(router) => {
+                    let mut assignments: Vec<(usize, RecordBatch)> = Vec::new();
+                    router.route(batch, &mut assignments)?;
+                    for (idx, sub) in assignments {
                         if senders[idx].send(sub).await.is_err() {
                             shard_closed_early = true;
                             break;
@@ -911,6 +989,7 @@ mod tests {
     use crate::persistent::sink::ActiveFileWriter;
     use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::WriteOutputOptions;
+    use crate::persistent::sink::batch_uncompressed_bytes;
     use crate::persistent::sink::finish_file_writer;
     use crate::persistent::sink::write_record_batch_stream_to_files;
 
@@ -2442,6 +2521,112 @@ mod tests {
     fn one_col_batch(schema: &SchemaRef, values: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
             .expect("single-column i64 batch")
+    }
+
+    /// Contiguous runs must keep consecutive input together on one shard.
+    ///
+    /// This is the whole point of the spec: round-robin hands shard 0 batches
+    /// 0, N, 2N..., so every output file spans the full range of a monotonic
+    /// column and a point lookup can prune none of them. A run-based router
+    /// gives each shard an unbroken slice instead.
+    #[test]
+    fn contiguous_runs_route_consecutive_batches_to_one_shard() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let batch = one_col_batch(&schema, vec![0_i64; 16]);
+        let batch_bytes = batch_uncompressed_bytes(&batch)?;
+
+        // Three batches per run, four shards.
+        let mut router = ShardSpec::ContiguousRuns {
+            partitions: 4,
+            bytes_per_run: batch_bytes * 3,
+        }
+        .router(4)?;
+
+        let mut shards = Vec::new();
+        for _ in 0..12 {
+            let mut assignments = Vec::new();
+            router.route(batch.clone(), &mut assignments)?;
+            assert_eq!(
+                assignments.len(),
+                1,
+                "runs route whole batches, never split them"
+            );
+            shards.push(assignments[0].0);
+        }
+
+        assert_eq!(
+            shards,
+            vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3],
+            "each shard must take an unbroken run before the next one starts"
+        );
+        Ok(())
+    }
+
+    /// The run counter wraps back to shard 0, so a write longer than
+    /// `partitions * bytes_per_run` keeps cycling rather than piling onto the
+    /// last shard.
+    #[test]
+    fn contiguous_runs_wrap_around_the_shards() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let batch = one_col_batch(&schema, vec![0_i64; 16]);
+        let batch_bytes = batch_uncompressed_bytes(&batch)?;
+
+        let mut router = ShardSpec::ContiguousRuns {
+            partitions: 2,
+            bytes_per_run: batch_bytes,
+        }
+        .router(2)?;
+
+        let mut shards = Vec::new();
+        for _ in 0..5 {
+            let mut assignments = Vec::new();
+            router.route(batch.clone(), &mut assignments)?;
+            shards.push(assignments[0].0);
+        }
+        assert_eq!(shards, vec![0, 1, 0, 1, 0]);
+        Ok(())
+    }
+
+    /// Routing changed, so pin the invariant that matters most: every input row
+    /// reaches exactly one shard.
+    #[tokio::test]
+    async fn test_contiguous_run_sharding_preserves_every_row() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        let batches: Vec<RecordBatch> = (0i64..12)
+            .map(|i| one_col_batch(&schema, vec![i; 16]))
+            .collect();
+        let batch_bytes = batch_uncompressed_bytes(&batches[0])?;
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::ContiguousRuns {
+                partitions: 4,
+                bytes_per_run: batch_bytes * 3,
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 12 * 16, "no row may be dropped or duplicated");
+
+        let segments: HashSet<String> = results
+            .iter()
+            .filter_map(|(p, _)| shard_segment(p))
+            .collect();
+        assert_eq!(
+            segments.len(),
+            4,
+            "12 batches at 3 per run should reach all 4 shards, got files {:?}",
+            results
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     #[tokio::test]

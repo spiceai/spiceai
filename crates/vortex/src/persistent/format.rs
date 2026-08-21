@@ -262,8 +262,19 @@ pub struct WriteShardConfig {
     pub write_concurrency: usize,
     /// Optional key columns to hash-partition rows by (e.g. primary key or
     /// partition value), resolved by name against the write schema. Empty ⇒
-    /// round-robin distribution.
+    /// distribute whole batches instead of splitting them row-wise.
     pub shard_key_columns: Vec<String>,
+    /// With no `shard_key_columns`, fill each shard with a CONTIGUOUS run of
+    /// this many uncompressed input bytes before moving to the next, so every
+    /// output file covers a contiguous slice of the arrival order and its
+    /// zone maps stay narrow on any column correlated with it. `None` ⇒
+    /// round-robin, which interleaves.
+    ///
+    /// Size it at or above one output file's worth of input: a run shorter than
+    /// a file lets a shard collect several non-adjacent runs into one file,
+    /// which is the interleaving this exists to avoid. Oversizing is safe —
+    /// contiguity holds, only the balance across shards coarsens.
+    pub contiguous_run_bytes: Option<u64>,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -511,8 +522,10 @@ impl VortexFormat {
 
     /// Returns a format that fans writes across `config.write_concurrency`
     /// concurrent shard writers (clamped to the session `target_partitions`),
-    /// routing rows hashed by `config.shard_key_columns` (or round-robin when
-    /// empty). Used by the Cayenne accelerator to parallelize the Vortex encode.
+    /// routing rows hashed by `config.shard_key_columns` when set, else in
+    /// contiguous runs of `config.contiguous_run_bytes` (round-robin when that
+    /// is also unset). Used by the Cayenne accelerator to parallelize the
+    /// Vortex encode.
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
@@ -607,7 +620,13 @@ impl VortexFormat {
             return ShardSpec::Single;
         }
         if write_shard.shard_key_columns.is_empty() {
-            return ShardSpec::RoundRobin(partitions);
+            return match write_shard.contiguous_run_bytes {
+                Some(bytes_per_run) => ShardSpec::ContiguousRuns {
+                    partitions,
+                    bytes_per_run,
+                },
+                None => ShardSpec::RoundRobin(partitions),
+            };
         }
         let mut exprs: Vec<PhysicalExprRef> =
             Vec::with_capacity(write_shard.shard_key_columns.len());
@@ -1233,9 +1252,18 @@ mod tests {
     }
 
     fn shard_format(write_concurrency: usize, keys: &[&str]) -> VortexFormat {
+        shard_format_with_runs(write_concurrency, keys, None)
+    }
+
+    fn shard_format_with_runs(
+        write_concurrency: usize,
+        keys: &[&str],
+        contiguous_run_bytes: Option<u64>,
+    ) -> VortexFormat {
         VortexFormat::new(VortexSession::default()).with_write_shard(WriteShardConfig {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
+            contiguous_run_bytes,
         })
     }
 
@@ -1270,11 +1298,39 @@ mod tests {
     }
 
     #[test]
-    fn build_shard_spec_no_keys_is_round_robin() {
+    fn build_shard_spec_no_keys_and_no_run_size_is_round_robin() {
         let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
         assert!(matches!(
             shard_format(4, &[]).build_shard_spec(&schema, 8),
             ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    /// A run size with no key selects contiguous runs: whole batches fill one
+    /// shard at a time so each output file covers a contiguous slice of the
+    /// input, instead of round-robin giving every file the full range.
+    #[test]
+    fn build_shard_spec_no_keys_with_run_size_is_contiguous_runs() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        match shard_format_with_runs(4, &[], Some(1024)).build_shard_spec(&schema, 8) {
+            ShardSpec::ContiguousRuns {
+                partitions,
+                bytes_per_run,
+            } => {
+                assert_eq!(partitions, 4);
+                assert_eq!(bytes_per_run, 1024);
+            }
+            other => panic!("expected ContiguousRuns, got {other:?}"),
+        }
+    }
+
+    /// An explicit key still wins: it is a request for key-clustered files.
+    #[test]
+    fn build_shard_spec_key_beats_run_size() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        assert!(matches!(
+            shard_format_with_runs(4, &["k"], Some(1024)).build_shard_spec(&schema, 8),
+            ShardSpec::Hash { .. }
         ));
     }
 

@@ -7569,10 +7569,19 @@ impl CayenneTableProvider {
     /// (`CayenneContext::write_format_with_strategy`) so the two write paths
     /// produce identically-sharded output formats.
     ///
-    /// The hash-clustering key is the configured `shard_key_columns` (e.g. the
-    /// source's declared partition/shard key, applied by extended schema
-    /// inference) when set and valid against the schema; otherwise the primary
-    /// key. PK-less tables without a configured key shard round-robin.
+    /// Rows are hash-partitioned when the operator configured
+    /// `cayenne_shard_key_columns` (or extended schema inference supplied the
+    /// source's declared shard key) and every column resolves against the
+    /// schema. That is an explicit request for key-clustered files, so it wins.
+    ///
+    /// Otherwise the shards are filled with CONTIGUOUS runs of the arrival
+    /// stream. This is the default because hashing destroys the arrival order,
+    /// and the arrival order is what a CDC table's zone maps are built on: with
+    /// a hash (or round-robin) split, every output file spans the whole range of
+    /// a monotonic column, so a point lookup can prune nothing and must open all
+    /// of them. A serial write never had that problem — it wrote one file per
+    /// range — and preserving contiguity is what keeps the parallel encode from
+    /// giving that pruning away.
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
@@ -7589,43 +7598,70 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
-        let shard_key_columns = self.resolved_shard_key_columns();
+        let shard_key_columns = self.configured_shard_key_columns();
+        let contiguous_run_bytes = shard_key_columns
+            .is_empty()
+            .then(|| Self::contiguous_run_bytes(shard_count, target_size_bytes, estimated_bytes));
         Some(WriteShardConfig {
             write_concurrency: shard_count,
             shard_key_columns,
+            contiguous_run_bytes,
         })
     }
 
+    /// Uncompressed input bytes to route to one shard before advancing.
+    ///
+    /// An even split of the write gives `shard_count` equal contiguous runs,
+    /// which is the balanced shape. It is floored at one target file size
+    /// because a run shorter than a file lets a shard gather several
+    /// non-adjacent runs into the same file — the interleaving contiguous runs
+    /// exist to prevent. Oversizing only coarsens the balance, so the floor is
+    /// the safe direction, and an unsized (opaque) stream takes it outright.
+    fn contiguous_run_bytes(
+        shard_count: usize,
+        target_size_bytes: usize,
+        estimated_bytes: Option<u64>,
+    ) -> u64 {
+        let floor = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
+        let even_split = estimated_bytes
+            .and_then(|bytes| bytes.checked_div(u64::try_from(shard_count).unwrap_or(1).max(1)))
+            .unwrap_or(0);
+        even_split.max(floor)
+    }
+
     /// The hash-clustering key for intra-write sharding: the configured
-    /// `shard_key_columns` when every column exists in the table schema, else
-    /// the primary-key columns. An invalid configured key warns and falls back
-    /// rather than failing the write.
+    /// `shard_key_columns`, when every column exists in the table schema. Empty
+    /// otherwise, which routes contiguous runs instead of hashing.
+    ///
+    /// An invalid configured key warns and degrades to contiguous runs rather
+    /// than failing the write. The primary key is deliberately NOT a fallback:
+    /// hashing on it would be an implicit choice to scatter the arrival order
+    /// across every output file, and a table that has not asked for
+    /// key-clustered files is better served by files that prune.
     ///
     /// Resolves names against the LIVE table schema ([`Self::table_schema`]),
     /// not the construction-time `table_metadata.schema`, so a column added by
     /// live widening evolution (`evolve_schema_live`) is observed here before
     /// the provider is reopened.
-    fn resolved_shard_key_columns(&self) -> Vec<String> {
-        let schema = self.table_schema();
+    fn configured_shard_key_columns(&self) -> Vec<String> {
         let configured = self.context.shard_key_columns();
-        if !configured.is_empty() {
-            let missing: Vec<&String> = configured
-                .iter()
-                .filter(|column| schema.field_with_name(column).is_err())
-                .collect();
-            if missing.is_empty() {
-                return configured.to_vec();
-            }
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                missing = ?missing,
-                "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
-            );
+        if configured.is_empty() {
+            return Vec::new();
         }
-        self.pk_column_indices
+        let schema = self.table_schema();
+        let missing: Vec<&String> = configured
             .iter()
-            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
-            .collect()
+            .filter(|column| schema.field_with_name(column).is_err())
+            .collect();
+        if missing.is_empty() {
+            return configured.to_vec();
+        }
+        tracing::warn!(
+            table = self.table_metadata.table_name.as_str(),
+            missing = ?missing,
+            "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; the write falls back to contiguous-run sharding, so its files are not key-clustered"
+        );
+        Vec::new()
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -38468,7 +38504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_keyed_hashes_by_primary_key() {
+    async fn test_write_shard_format_primary_key_is_not_an_implicit_hash_key() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("val", DataType::Int64, false),
@@ -38483,9 +38519,11 @@ mod tests {
         )
         .await;
 
-        // Keyed/upsert table: the sink hashes rows by the primary key so each
-        // output file is PK-clustered (tight per-file zone maps).
-        // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
+        // A primary key is NOT a request to hash on it. Hashing scatters the
+        // arrival order across every output file, so a monotonic key's zone maps
+        // all span the full range and a point lookup prunes nothing; the table
+        // never asked for key-clustered files, so it gets contiguous runs.
+        // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out.
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(
             provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
@@ -38496,7 +38534,14 @@ mod tests {
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
         assert_eq!(write_shard.write_concurrency, 4);
-        assert_eq!(write_shard.shard_key_columns, vec!["id".to_string()]);
+        assert!(
+            write_shard.shard_key_columns.is_empty(),
+            "the primary key must not be an implicit hash-shard key"
+        );
+        assert!(
+            write_shard.contiguous_run_bytes.is_some(),
+            "an unkeyed sharded write must route contiguous runs, not round-robin"
+        );
     }
 
     #[tokio::test]
@@ -38534,7 +38579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_invalid_configured_shard_key_falls_back_to_pk() {
+    async fn test_write_shard_format_invalid_configured_shard_key_degrades_to_runs() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let vortex_config = VortexConfig {
@@ -38555,10 +38600,13 @@ mod tests {
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
-        assert_eq!(
-            write_shard.shard_key_columns,
-            vec!["id".to_string()],
-            "a shard key referencing a missing column must fall back to the primary key"
+        assert!(
+            write_shard.shard_key_columns.is_empty(),
+            "a shard key referencing a missing column must degrade rather than fail the write"
+        );
+        assert!(
+            write_shard.contiguous_run_bytes.is_some(),
+            "the degraded write still routes contiguous runs, so its files keep pruning"
         );
     }
 
