@@ -224,15 +224,21 @@ impl DistributedSearchRewrite {
 
         // Project back to the scan's advertised schema (drops `_score` when the
         // caller passed `include_score => false`). Identity when the schemas match.
+        //
+        // Re-qualify each column with the scan's own table reference: the
+        // `Extension` node's schema is unqualified, but this subtree replaces
+        // `scan` in place (see `analyze` below), and the plan nodes above it
+        // were already built against `scan`'s qualified output columns (e.g. a
+        // wildcard-expanded `Projection` referencing `"text_search(...)".id`).
+        // Without matching that qualifier, resolving those parent expressions
+        // against this subtree's output fails with a "no field named" error.
+        let table_name = scan.table_name.clone();
         let plan = LogicalPlanBuilder::new(LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         }))
-        .project(
-            scan.projected_schema
-                .fields()
-                .iter()
-                .map(|f| col(f.name().clone())),
-        )?
+        .project(scan.projected_schema.fields().iter().map(|f| {
+            col(f.name().clone()).alias_qualified(Some(table_name.clone()), f.name().clone())
+        }))?
         .build()?;
 
         Ok(Some(RewrittenScan {
