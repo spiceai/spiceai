@@ -68,15 +68,15 @@ use runtime::dataconnector::s3 as _;
 use runtime::dataconnector::spiceai as _;
 
 // Force linkage of all data accelerator modules
+use accelerator_duckdb as _;
+use accelerator_postgres as _;
+use accelerator_sqlite as _;
+use accelerator_turso as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::arrow as _;
 #[cfg(not(windows))]
 #[expect(unused_imports)]
 use runtime::dataaccelerator::cayenne as _;
-use accelerator_duckdb as _;
-use accelerator_postgres as _;
-use accelerator_sqlite as _;
-use accelerator_turso as _;
 
 /// Schema information for a connector or accelerator.
 #[derive(Debug, Clone)]

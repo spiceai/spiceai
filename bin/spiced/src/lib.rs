@@ -100,14 +100,14 @@ use connector_spark as _;
 
 // Same force-linkage for accelerator engines, which self-register via
 // `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
 #[cfg(feature = "turso")]
 use accelerator_turso as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;

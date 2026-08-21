@@ -22,14 +22,14 @@ limitations under the License.
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism; this is where the
 // binaries that share these helpers get it.
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]
 use accelerator_postgres as _;
 #[cfg(feature = "sqlite")]
 use accelerator_sqlite as _;
 #[cfg(feature = "turso")]
 use accelerator_turso as _;
-#[cfg(feature = "duckdb")]
-use accelerator_duckdb as _;
 
 use std::{
     fmt::Display,
