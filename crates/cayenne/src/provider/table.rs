@@ -14656,10 +14656,15 @@ impl CayenneTableProvider {
         {
             // The overwhelmingly common outcome, and the denominator the other two
             // are read against: without it, "compaction never declined" cannot be
-            // told apart from "the trigger was never evaluated". It is also why
-            // `subset/skipped_below_trigger` reads ~0 — this gate and pass 3 read
-            // the same `compaction_trigger_protected_snapshots`, so a set that is
-            // under the floor stops here rather than reaching the pass.
+            // told apart from "the trigger was never evaluated".
+            //
+            // This gate does NOT make pass 3's own below-trigger count redundant,
+            // though an earlier version of this comment claimed it did. The
+            // background tick calls `run_compaction_trigger` directly and never
+            // passes through here, so pass 3 sees under-floor sets on every tick
+            // that finds nothing — at the controller's tuned 2s interval that is
+            // the single largest outcome on a quiet table (175 on `warehouse` in
+            // one 900s run).
             self.record_compaction_outcome("trigger", "not_yet_triggered");
             return;
         }
@@ -30459,6 +30464,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 compaction_interval_ms: actuators.compaction_background_interval_ms,
                 compaction_trigger_files: u64::try_from(actuators.compaction_trigger_files)
                     .unwrap_or(0),
+                // Read through the context so an experiment pin is reflected here
+                // too — a gauge that reported the controller's value while the pin
+                // overrode it would misattribute the whole run.
+                bake_deletion_index_trigger: u64::try_from(
+                    self.context.bake_deletion_index_trigger(),
+                )
+                .unwrap_or(0),
                 target_file_size_mb: u64::try_from(
                     self.context.target_file_size_bytes() / (1024 * 1024),
                 )

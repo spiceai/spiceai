@@ -512,6 +512,11 @@ impl CayenneContext {
     /// default), mirroring `config.write_concurrency == None`.
     #[must_use]
     pub fn write_concurrency(&self) -> Option<usize> {
+        // An experiment pin outranks the controller so an A/B arm holds still;
+        // see `compaction::pinned_write_concurrency`.
+        if let Some(pinned) = crate::provider::compaction::pinned_write_concurrency() {
+            return Some(pinned);
+        }
         let wc = self.live_actuators.write_concurrency();
         (wc != 0).then(|| wc.max(1))
     }
@@ -619,7 +624,8 @@ impl CayenneContext {
     /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
     #[must_use]
     pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
-        self.live_actuators.bake_deletion_index_trigger()
+        crate::provider::compaction::pinned_bake_deletion_index_trigger()
+            .unwrap_or_else(|| self.live_actuators.bake_deletion_index_trigger())
     }
 
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC

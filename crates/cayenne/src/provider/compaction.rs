@@ -381,6 +381,76 @@ pub(crate) fn maintenance_encode_shards() -> Option<usize> {
     *MAINTENANCE_ENCODE_SHARDS
 }
 
+/// Experiment pins for the two adaptive actuators an A/B on maintenance has to
+/// hold still.
+///
+/// The controller moves `write_concurrency` between 1 and 4 continuously, so a
+/// run's value is wherever it happened to be at scrape time. That is fine in
+/// production and fatal for a comparison: in a pinned-shard run and its control
+/// both arms spent time at both values and one table ended up inverted between
+/// them, so the treatment barely differed from the control and the result was
+/// uninterpretable. Pinning makes an arm mean what it says.
+///
+/// Unset leaves the controller in charge, so a run without these is the shipped
+/// behaviour.
+static PINNED_WRITE_CONCURRENCY: LazyLock<Option<usize>> = LazyLock::new(|| {
+    resolve_pinned_usize(
+        "SPICE_CAYENNE_PIN_WRITE_CONCURRENCY",
+        std::env::var("SPICE_CAYENNE_PIN_WRITE_CONCURRENCY")
+            .ok()
+            .as_deref(),
+    )
+});
+
+static PINNED_BAKE_DELETION_INDEX_TRIGGER: LazyLock<Option<usize>> = LazyLock::new(|| {
+    resolve_pinned_usize(
+        "SPICE_CAYENNE_PIN_BAKE_DELETION_INDEX_TRIGGER",
+        std::env::var("SPICE_CAYENNE_PIN_BAKE_DELETION_INDEX_TRIGGER")
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Encode concurrency the controller is not allowed to move, if pinned.
+#[must_use]
+pub(crate) fn pinned_write_concurrency() -> Option<usize> {
+    *PINNED_WRITE_CONCURRENCY
+}
+
+/// Tombstone count that triggers a bake, if pinned.
+///
+/// This is the knob that decides what a bake is worth. A committed bake rewrites
+/// the clean sequence prefix, which on the benchmark's large tables is most of the
+/// table: `stock` moved 175 GB across four committed bakes against a ~30 GB table,
+/// with zero `committed_prune_skipped`, so the cost is inherent to the design
+/// rather than a malfunction. A low trigger buys a small index shrink for a
+/// near-full rewrite.
+#[must_use]
+pub(crate) fn pinned_bake_deletion_index_trigger() -> Option<usize> {
+    *PINNED_BAKE_DELETION_INDEX_TRIGGER
+}
+
+/// Shared pure parser for the pins, so each is testable without mutating the
+/// process environment. Anything unusable leaves the controller in charge rather
+/// than pinning to a guess.
+fn resolve_pinned_usize(var: &str, raw: Option<&str>) -> Option<usize> {
+    let raw = raw?;
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => {
+            tracing::info!(
+                "Cayenne is pinning `{var}` to {value}; the adaptive controller will not move it."
+            );
+            Some(value)
+        }
+        _ => {
+            tracing::warn!(
+                "Ignoring `{var}={raw}`: expected a whole number above zero, so the adaptive controller keeps this actuator."
+            );
+            None
+        }
+    }
+}
+
 /// Prevent new Cayenne compaction-runtime maintenance passes from starting.
 /// Existing pass guards remain counted and can be drained via
 /// [`drain_compaction_tasks`].
@@ -1545,6 +1615,20 @@ mod tests {
             Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
         let semaphore = Arc::new(Semaphore::new(1));
         assert!(BackgroundCompactor::spawn(weak, Duration::ZERO, semaphore).is_none());
+    }
+
+    #[test]
+    fn actuator_pins_are_opt_in_and_reject_nonsense() {
+        assert_eq!(resolve_pinned_usize("V", None), None);
+        assert_eq!(resolve_pinned_usize("V", Some("4")), Some(4));
+        assert_eq!(resolve_pinned_usize("V", Some(" 16 ")), Some(16));
+        for raw in ["0", "-1", "", "auto"] {
+            assert_eq!(
+                resolve_pinned_usize("V", Some(raw)),
+                None,
+                "pin {raw:?} must leave the controller in charge"
+            );
+        }
     }
 
     #[test]

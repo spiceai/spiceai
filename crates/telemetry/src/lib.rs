@@ -705,6 +705,13 @@ pub struct CayenneAutotuneState {
     pub compaction_interval_ms: u64,
     /// Live small-file compaction trigger (file count).
     pub compaction_trigger_files: u64,
+    /// Live deletion-index tombstone count that triggers a seq-prefix bake.
+    ///
+    /// The most consequential maintenance knob and the only actuator that had no
+    /// gauge: a committed bake rewrites the clean sequence prefix, which on a
+    /// large table is most of the table, so this decides how much rewriting a
+    /// given amount of index shrink is worth.
+    pub bake_deletion_index_trigger: u64,
     /// Configured target Vortex file size (MB) — the reference compacted files
     /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
     pub target_file_size_mb: u64,
@@ -1557,6 +1564,7 @@ pub mod cayenne {
     static AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+    static AT_BAKE_DELETION_INDEX_TRIGGER: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1668,6 +1676,16 @@ pub mod cayenne {
                     .build()
             })
             .record(state.compaction_trigger_files, dimensions);
+        AT_BAKE_DELETION_INDEX_TRIGGER
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_autotune_bake_deletion_index_trigger")
+                    .with_description(
+                        "Current (live) deletion-index tombstone count that triggers a seq-prefix bake.",
+                    )
+                    .build()
+            })
+            .record(state.bake_deletion_index_trigger, dimensions);
         AT_TARGET_FILE_SIZE_MB
         .get_or_init(|| {
             operational_meter()
