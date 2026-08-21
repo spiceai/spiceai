@@ -904,9 +904,11 @@ impl CacheRefreshHelper {
         let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
-        // (e.g., timestamp precision conversion from Nanosecond to Microsecond for Cayenne)
-        let target_schema = accelerator.schema();
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator's
+        // WRITE schema (e.g., timestamp precision conversion from Nanosecond to
+        // Microsecond for Cayenne). Not always the schema it advertises — see
+        // `write_schema::write_target_schema`.
+        let target_schema = crate::accelerated::write_schema::write_target_schema(&accelerator);
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 
@@ -1125,9 +1127,11 @@ impl CacheRefreshHelper {
         let streaming_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(adapter)));
 
-        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
-        // (e.g., timestamp precision conversion from Nanosecond to Microsecond for Cayenne)
-        let target_schema = accelerator.schema();
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator's
+        // WRITE schema (e.g., timestamp precision conversion from Nanosecond to
+        // Microsecond for Cayenne). Not always the schema it advertises — see
+        // `write_schema::write_target_schema`.
+        let target_schema = crate::accelerated::write_schema::write_target_schema(accelerator);
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
 

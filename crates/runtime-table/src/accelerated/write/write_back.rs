@@ -421,7 +421,13 @@ pub(crate) async fn execute_insert(
 ) -> DataFusionResult<()> {
     let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
     let source: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
-    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, table.schema()));
+    // `table` is the accelerator on one call path and the federated source on the
+    // other, so resolve rather than assume: `write_target_schema` returns the
+    // accelerator's stored schema where that differs from what it advertises, and
+    // the provider's own schema for everything else — including the federated
+    // source, whose writes must keep targeting the federated schema.
+    let target_schema = crate::accelerated::write_schema::write_target_schema(&table);
+    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, target_schema));
 
     let plan = table.insert_into(session_state, input, overwrite).await?;
     let task_ctx = task_context.unwrap_or_else(|| session_state.task_ctx());
