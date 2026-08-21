@@ -1693,6 +1693,17 @@ pub struct CayenneTableProvider {
     /// while the index is checked out and cannot inspect it directly. `u64::MAX`
     /// means "not a bloom / not yet sampled".
     sharded_bloom_load_milli: Arc<AtomicU64>,
+    /// Keys removed from the table by a genuine CDC DELETE since the sharded bloom
+    /// was last built. These are the filter's stale positives: the bloom still
+    /// answers "present" for them, so this is exactly
+    /// `|preserved superset| - |rebuilt subset|`, the error preserving one accrues.
+    /// An UPDATE does not count — upsert rewrites the row but the key stays live, so
+    /// the bit was already correct.
+    sharded_bloom_stale_keys: Arc<AtomicU64>,
+    /// Keys the sharded bloom holds, sampled when it was last cached or degraded.
+    /// The denominator for the stale-key fraction, read at the invalidation sites
+    /// where the index itself may be checked out.
+    sharded_bloom_inserted_keys: Arc<AtomicU64>,
     /// Resident-byte components of the two PK caches, published as their SUM
     /// through `table_memory.set_keyset_bytes` (a single slot — writing one
     /// cache's size alone would under-account the other by up to a full budget
@@ -6471,6 +6482,8 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
             sharded_index_is_bloom: Arc::new(AtomicBool::new(false)),
             sharded_bloom_load_milli: Arc::new(AtomicU64::new(u64::MAX)),
+            sharded_bloom_stale_keys: Arc::new(AtomicU64::new(0)),
+            sharded_bloom_inserted_keys: Arc::new(AtomicU64::new(0)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
@@ -7700,6 +7713,8 @@ impl CayenneTableProvider {
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
             sharded_index_is_bloom: Arc::clone(&self.sharded_index_is_bloom),
             sharded_bloom_load_milli: Arc::clone(&self.sharded_bloom_load_milli),
+            sharded_bloom_stale_keys: Arc::clone(&self.sharded_bloom_stale_keys),
+            sharded_bloom_inserted_keys: Arc::clone(&self.sharded_bloom_inserted_keys),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
@@ -8229,23 +8244,21 @@ impl CayenneTableProvider {
     /// positive costs a redundant delete, the same trade the bloom fallback already
     /// makes. Unsound for an exact keyset, whose per-key `RowLocation`s the move
     /// invalidates, so this never applies to one.
-    /// Minimum bloom load, in bits per inserted key, at which a bloomed sharded
-    /// index is still worth preserving across a relocation-only invalidation.
+    /// How stale a preserved bloom may get, in per-mille of the keys it holds,
+    /// before a relocation-only invalidation is allowed through to rebuild it.
     ///
-    /// Unset disables the whole experiment (today's behaviour: always drop). `0`
-    /// preserves unconditionally — never rebuild, the maximum-benefit /
-    /// maximum-false-positive arm. A positive `N` preserves only while the filter
-    /// still carries at least `N` bits per key, so the rebuild it eventually allows
-    /// is the one that restores the false-positive rate rather than one triggered by
-    /// an unrelated checkpoint. `PkBloom` targets ~10 bits/key.
+    /// Unset disables the experiment (today's behaviour: always drop). A value is the
+    /// ceiling on `stale_keys / inserted_keys`; `1000` or more never rebuilds.
     ///
-    /// A load bound, not a deletion bound, because a bloom's bits are only ever SET:
-    /// every INSERT raises the load and no deletion lowers it. Deleting a key leaves
-    /// a stale positive but costs no bits, so deletions cannot saturate the filter —
-    /// they only matter for a workload that REUSES deleted keys.
-    fn preserve_bloom_min_bits_per_key() -> Option<u64> {
+    /// Staleness, not bloom load, is what a rebuild actually fixes. A rebuild scans
+    /// live keys only, so it drops the stale positives — but it re-inserts the same
+    /// surviving keys, so it does NOT relieve a filter that is merely full. Bounding
+    /// staleness therefore bounds the one error preserving introduces, and leaves
+    /// under-sizing to be fixed where it is caused (`degrade_to_blooms`) rather than
+    /// paid for with an O(live-rows) stall.
+    fn preserve_bloom_max_stale_permille() -> Option<u64> {
         static SETTING: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
-            std::env::var("SPICE_CAYENNE_BLOOM_MIN_BITS_PER_KEY")
+            std::env::var("SPICE_CAYENNE_BLOOM_MAX_STALE_PERMILLE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
         });
@@ -8253,19 +8266,24 @@ impl CayenneTableProvider {
     }
 
     /// Whether this relocation-only invalidation may leave the sharded index alone:
-    /// the experiment is on, the index is (or was checked out as) a bloom, and its
-    /// last sampled load is still at or above the configured floor.
+    /// the experiment is on, the index is (or was checked out as) a bloom, and it has
+    /// not accrued more stale keys than the configured fraction allows.
     fn may_preserve_sharded_bloom(&self) -> bool {
-        let Some(floor_bits) = Self::preserve_bloom_min_bits_per_key() else {
+        let Some(ceiling_permille) = Self::preserve_bloom_max_stale_permille() else {
             return false;
         };
         if !self.sharded_index_is_bloom.load(Ordering::Acquire) {
             return false;
         }
-        let load = self.sharded_bloom_load_milli.load(Ordering::Acquire);
-        // Never sampled reads as "no evidence to preserve on"; a zero floor is the
-        // unconditional arm and does not need a sample at all.
-        floor_bits == 0 || (load != u64::MAX && load >= floor_bits.saturating_mul(1000))
+        let stale = self.sharded_bloom_stale_keys.load(Ordering::Relaxed);
+        if stale == 0 {
+            // Nothing has been removed, so the preserved filter and a rebuilt one
+            // describe the same key set: rebuilding buys exactly nothing.
+            return true;
+        }
+        let held = self.sharded_bloom_inserted_keys.load(Ordering::Acquire);
+        // No key count sampled yet: refuse rather than preserve on no evidence.
+        held > 0 && stale.saturating_mul(1000) / held <= ceiling_permille
     }
 
     /// Sample the sharded index's representation and bloom load for the invalidation
@@ -8276,6 +8294,8 @@ impl CayenneTableProvider {
         let load = index.bloom_load_milli();
         self.sharded_bloom_load_milli
             .store(load.unwrap_or(u64::MAX), Ordering::Release);
+        self.sharded_bloom_inserted_keys
+            .store(index.bloom_inserted_keys().unwrap_or(0), Ordering::Release);
         if let (Some(load), Some(keys)) = (load, index.bloom_inserted_keys()) {
             telemetry::cayenne::track_pk_bloom_load(
                 load,
@@ -8604,6 +8624,11 @@ impl CayenneTableProvider {
                 self.sharded_index_is_bloom.store(false, Ordering::Release);
                 self.sharded_bloom_load_milli
                     .store(u64::MAX, Ordering::Release);
+                // The rebuild this invalidation forces scans live keys only, so the
+                // filter it produces carries no stale positives: reset the tally the
+                // preserve decision reads.
+                self.sharded_bloom_stale_keys.store(0, Ordering::Relaxed);
+                self.sharded_bloom_inserted_keys.store(0, Ordering::Release);
             }
         }
         // The cold-tier PK existence view is tied to the same keyset generation
@@ -24288,6 +24313,12 @@ impl CayenneTableProvider {
                 self.table_name().to_string(),
             )],
         );
+        // These are CDC Delete-event keys, not upsert supersedes, so each one is a
+        // key the table no longer has and a preserved bloom still claims. Tracked
+        // here rather than at the on-conflict deletion sites precisely because those
+        // cannot tell an update's tombstone from a real removal.
+        self.sharded_bloom_stale_keys
+            .fetch_add(key_count, Ordering::Relaxed);
         Ok(Some(epoch))
     }
 
