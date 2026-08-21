@@ -25965,6 +25965,7 @@ impl CayenneTableProvider {
                 };
                 // No-op cheap reschema when the projection has no string/binary
                 // columns; casts Utf8/Binary -> view otherwise.
+                ensure_castable_to_view(&projected, &proj_schema, &self.table_metadata.table_name)?;
                 arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema)).map_err(
                     |e| {
                         datafusion_common::DataFusionError::Execution(format!(
@@ -28561,6 +28562,66 @@ impl CayenneTableProvider {
 ///
 /// Only top-level fields are mapped. Returns the input schema unchanged (same
 /// `Arc`) when it has no string columns, so all-scalar tables pay nothing.
+/// Reject a string value too large for an Arrow view *before* the cast to the
+/// view read schema would panic on it.
+///
+/// Arrow builds a view array from a byte array one of two ways
+/// (`GenericByteViewArray: From<&GenericByteArray>`): when the source's whole
+/// value buffer fits under `u32::MAX` it reuses that buffer and appends views
+/// unchecked, which cannot fail; past that it falls back to an element-wise
+/// builder whose `append_value` is infallible and `unwrap()`s a value longer than
+/// `u32::MAX`. Only the second path can panic, and only for a *single* value over
+/// the limit — a `LargeUtf8` column whose total exceeds 4 GiB across many small
+/// values converts fine.
+///
+/// So the check is O(1) in every ordinary case: it looks at the last offset, and
+/// only walks the offsets when the buffer is already past the point where Arrow
+/// would take the fallible path. `Utf8` cannot reach it at all (i32 offsets cap
+/// the whole buffer below `u32::MAX`), so only `LargeUtf8` is inspected.
+fn ensure_castable_to_view(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+    table_name: &str,
+) -> datafusion_common::Result<()> {
+    use arrow::array::LargeStringArray;
+
+    for (idx, target_field) in target_schema.fields().iter().enumerate() {
+        if target_field.data_type() != &DataType::Utf8View {
+            continue;
+        }
+        let Some(column) = batch.columns().get(idx) else {
+            continue;
+        };
+        let Some(large) = column.as_any().downcast_ref::<LargeStringArray>() else {
+            continue;
+        };
+        let offsets = large.value_offsets();
+        // O(1): under this bound Arrow reuses the buffer and never appends fallibly.
+        // Compare in `i64`, the offsets' own type: `u32::MAX` widens losslessly and
+        // no cast can lose a sign on the way.
+        let view_max = i64::from(u32::MAX);
+        let Some(last) = offsets.last() else { continue };
+        if *last < view_max {
+            continue;
+        }
+        for (row, window) in offsets.windows(2).enumerate() {
+            let length = window[1] - window[0];
+            if length > view_max {
+                return Err(datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read column '{}' of table '{}': the value in row {row} is {length} bytes, \
+                     which exceeds the {} byte limit of the Arrow view types this table is configured to \
+                     read with. Remove `cayenne_force_view_types` from the acceleration params to read \
+                     this column at its stored width. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    target_field.name(),
+                    table_name,
+                    view_max,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
@@ -29228,6 +29289,11 @@ impl TableProvider for CayenneTableProvider {
                     };
                     // No-op cheap reschema when the projection has no
                     // string/binary columns; casts Utf8/Binary -> view otherwise.
+                    ensure_castable_to_view(
+                        &projected,
+                        &proj_schema,
+                        &self.table_metadata.table_name,
+                    )?;
                     arrow_tools::record_batch::try_cast_to(projected, Arc::clone(&proj_schema))
                         .map_err(|e| {
                             datafusion_common::DataFusionError::Execution(format!(
@@ -31392,6 +31458,50 @@ mod tests {
                 "scan must emit StringViewArray under force_view_read_schema"
             );
         }
+    }
+
+    /// The view-size guard returns a structured error rather than letting Arrow
+    /// panic, and stays out of the way otherwise.
+    ///
+    /// A value over `u32::MAX` cannot be built in a test at reasonable memory, so
+    /// what is pinned here is the guard's cheap half: ordinary values take the O(1)
+    /// exit, and a non-view target is never inspected. The oversized branch itself
+    /// is covered by reading, not by a test — materializing 4 GiB to reach it is
+    /// not worth the runtime.
+    #[test]
+    fn view_size_guard_errors_instead_of_panicking() {
+        use arrow::array::{ArrayRef, LargeStringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let view_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
+
+        // Ordinary data: the last offset is far below the bound, so the guard
+        // returns without walking anything.
+        let small: ArrayRef = Arc::new(LargeStringArray::from(vec!["alice", "bob"]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                DataType::LargeUtf8,
+                true,
+            )])),
+            vec![Arc::clone(&small)],
+        )
+        .expect("batch");
+        assert!(
+            ensure_castable_to_view(&batch, &view_schema, "t").is_ok(),
+            "ordinary values must pass the guard untouched"
+        );
+
+        // A non-view target is never inspected, whatever the data.
+        let stored_schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        assert!(
+            ensure_castable_to_view(&batch, &stored_schema, "t").is_ok(),
+            "a write to the stored schema is not a view cast"
+        );
     }
 
     /// End-to-end gate for the `LargeUtf8` half of the view mapping, through BOTH
