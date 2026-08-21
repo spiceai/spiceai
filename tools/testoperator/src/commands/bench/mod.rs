@@ -346,24 +346,34 @@ const SNAPSHOTTED_CLICKBENCH_QUERIES: &[&str] = &[
     "clickbench_q30", // 90 integer SUMs
 ];
 
-/// The scenario whose `ClickBench` source data no longer matches the row counts
-/// and values recorded in [`S3_ARROW_PARTITIONED_UNSNAPSHOTTED_CLICKBENCH_QUERIES`] —
-/// e.g. q2's `COUNT(*)` and q5/q6's `COUNT(DISTINCT)` returned different numbers
-/// than every other scenario sharing the same dataset, indicating the backing S3
-/// data was reloaded or changed independently of the query engine.
-const S3_ARROW_PARTITIONED_SCENARIO: &str = "s3[parquet]-arrow-partitioned";
-
-/// `ClickBench` queries excluded from snapshotting for
-/// [`S3_ARROW_PARTITIONED_SCENARIO`] only — every other scenario in
-/// [`SNAPSHOTTED_CLICKBENCH_QUERIES`] still asserts these results.
-const S3_ARROW_PARTITIONED_UNSNAPSHOTTED_CLICKBENCH_QUERIES: &[&str] = &[
-    "clickbench_q2",
-    "clickbench_q5",
-    "clickbench_q6",
-    "clickbench_q21",
-    "clickbench_q26",
-    "clickbench_q30",
-];
+const IGNORED_SNAPSHOT_RESULT_QUERIES: &[(&str, &[&str])] = {
+    &[
+        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
+        (
+            "s3[parquet]-arrow-partitioned",
+            &[
+                "clickbench_q2",
+                "clickbench_q5",
+                "clickbench_q6",
+                "clickbench_q21",
+                "clickbench_q26",
+                "clickbench_q30",
+            ],
+        ),
+        // This scenario has refresh_sql with limit - which makes these queries non-deterministic
+        (
+            "s3[parquet]-postgres",
+            &[
+                "clickbench_q2",
+                "clickbench_q5",
+                "clickbench_q6",
+                "clickbench_q21",
+                "clickbench_q26",
+                "clickbench_q30",
+            ],
+        ),
+    ]
+};
 
 /// Scenario-name prefixes whose data sources surface numeric columns as floats
 /// (`DynamoDB` has no decimal type; Glue CSV and Iceberg Hadoop schema inference
@@ -391,8 +401,11 @@ const FLOAT_SOURCE_SCENARIO_PREFIXES: &[&str] = &[
 fn snapshot_predicate(scenario_name: &str, query_name: &str) -> SnapshotMode {
     let snapshotted = if query_name.starts_with("clickbench_q") {
         SNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name)
-            && !(scenario_name == S3_ARROW_PARTITIONED_SCENARIO
-                && S3_ARROW_PARTITIONED_UNSNAPSHOTTED_CLICKBENCH_QUERIES.contains(&query_name))
+            && !IGNORED_SNAPSHOT_RESULT_QUERIES
+                .iter()
+                .any(|(scenario, queries)| {
+                    *scenario == scenario_name && queries.contains(&query_name)
+                })
     } else {
         (query_name.starts_with("tpch_q") || query_name.starts_with("tpcds_q"))
             && !DISABLED_SNAPSHOT_QUERIES.contains(&query_name)
@@ -549,8 +562,8 @@ pub(crate) async fn prepare_chbench_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        S3_ARROW_PARTITIONED_SCENARIO, S3_ARROW_PARTITIONED_UNSNAPSHOTTED_CLICKBENCH_QUERIES,
-        SNAPSHOTTED_CLICKBENCH_QUERIES, SnapshotMode, snapshot_predicate,
+        IGNORED_SNAPSHOT_RESULT_QUERIES, SNAPSHOTTED_CLICKBENCH_QUERIES, SnapshotMode,
+        snapshot_predicate,
     };
 
     /// A decimal-source scenario: asserts exact rendered results.
@@ -652,36 +665,39 @@ mod tests {
         );
     }
 
-    /// `s3[parquet]-arrow-partitioned` skips the queries whose source data no
-    /// longer matches its previously recorded rows, but every other scenario
-    /// sharing the same allow-list keeps asserting them.
+    /// Scenarios in [`IGNORED_SNAPSHOT_RESULT_QUERIES`] skip only the queries
+    /// listed for them, whose source data no longer matches their previously
+    /// recorded rows; every other scenario sharing the same allow-list keeps
+    /// asserting them.
     #[test]
-    fn s3_arrow_partitioned_skips_its_unreproducible_clickbench_queries() {
-        for query in S3_ARROW_PARTITIONED_UNSNAPSHOTTED_CLICKBENCH_QUERIES {
+    fn stale_data_scenarios_skip_their_unreliable_clickbench_queries() {
+        for (scenario, queries) in IGNORED_SNAPSHOT_RESULT_QUERIES {
+            for query in *queries {
+                assert_eq!(
+                    snapshot_predicate(scenario, query),
+                    SnapshotMode::Skip,
+                    "{query} should not be snapshotted for {scenario}"
+                );
+                assert_eq!(
+                    snapshot_predicate(EXACT_SCENARIO, query),
+                    SnapshotMode::Exact,
+                    "{query} should still be snapshotted for {EXACT_SCENARIO}"
+                );
+            }
+            // Queries not on the scenario's exclusion list are unaffected.
             assert_eq!(
-                snapshot_predicate(S3_ARROW_PARTITIONED_SCENARIO, query),
-                SnapshotMode::Skip,
-                "{query} should not be snapshotted for {S3_ARROW_PARTITIONED_SCENARIO}"
+                snapshot_predicate(scenario, "clickbench_q1"),
+                SnapshotMode::Exact
             );
             assert_eq!(
-                snapshot_predicate(EXACT_SCENARIO, query),
-                SnapshotMode::Exact,
-                "{query} should still be snapshotted for other scenarios"
+                snapshot_predicate(scenario, "clickbench_q7"),
+                SnapshotMode::Exact
+            );
+            assert_eq!(
+                snapshot_predicate(scenario, "clickbench_q20"),
+                SnapshotMode::Exact
             );
         }
-        // Queries not on the scenario's exclusion list are unaffected.
-        assert_eq!(
-            snapshot_predicate(S3_ARROW_PARTITIONED_SCENARIO, "clickbench_q1"),
-            SnapshotMode::Exact
-        );
-        assert_eq!(
-            snapshot_predicate(S3_ARROW_PARTITIONED_SCENARIO, "clickbench_q7"),
-            SnapshotMode::Exact
-        );
-        assert_eq!(
-            snapshot_predicate(S3_ARROW_PARTITIONED_SCENARIO, "clickbench_q20"),
-            SnapshotMode::Exact
-        );
     }
 
     /// The allow-list matches whole names, so a listed query must not also enable
