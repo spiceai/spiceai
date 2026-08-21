@@ -69,11 +69,11 @@ const PG13_SERVER_VERSION_NUM: i32 = 130_000;
 /// Build the wrapped delivery error carrying an actionable message and its cause.
 fn delivery_error(
     message: impl Into<String>,
-    source: impl std::error::Error + Send + Sync + 'static,
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> DeliveryError {
     DeliveryError::Delivery {
         message: message.into(),
-        source: Box::new(source),
+        source: source.into(),
     }
 }
 
