@@ -4131,6 +4131,7 @@ async fn flush_expired_eager_envelopes(
 /// back-pressure is not misattributed to decode cost (it is carried per dataset
 /// by `member_send_wait_micros_total`). Returns ~0 whenever every member's
 /// mailbox had spare capacity.
+#[expect(clippy::too_many_arguments)]
 async fn deliver_commit(
     source: &Arc<SharedSource>,
     eager_hold: &mut EagerHold,
