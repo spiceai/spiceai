@@ -28511,12 +28511,19 @@ impl CayenneTableProvider {
     }
 }
 
-/// Map a stored Arrow schema's `Utf8` columns to `Utf8View` for the read/query
-/// path. ONLY `Utf8` is mapped:
-/// - `LargeUtf8`/`LargeBinary` already use i64 offsets (no 2 GiB overflow), so
-///   viewifying them is unnecessary — and a `LargeUtf8` → `Utf8View` write cast is
-///   flagged narrowing/lossy (e.g. a `MySQL` JSON column → `LargeUtf8`).
-/// - `Binary` is left as-is too: Vortex's `BinaryView` decode currently yields
+/// Map a stored Arrow schema's string columns to `Utf8View` for the read/query
+/// path. BOTH `Utf8` and `LargeUtf8` are mapped:
+/// - `Utf8` is the i32 2 GiB overflow case described below.
+/// - `LargeUtf8` does not overflow — it already uses i64 offsets — but it is what
+///   most sources actually deliver, so excluding it left this mapping inert on the
+///   commonest string shape (a 100M-row `ClickBench` load arrives entirely as
+///   `LargeUtf8`). Mapping it *is* a narrowing: an Arrow view's `length` and
+///   `offset` are `u32` (`arrow_data::ByteView`), so one value must stay under
+///   ~4 GiB, where `LargeUtf8`'s i64 offsets would have carried more. That is why
+///   this whole function is reached only through the opt-in
+///   `force_view_read_schema` — an operator forcing view types accepts that
+///   per-value ceiling.
+/// - `Binary` is left as-is: Vortex's `BinaryView` decode currently yields
 ///   `LargeBinary`, which would diverge from an advertised `BinaryView` and trip
 ///   the runtime's query-result `verify_schema` (e.g. a `MySQL` BLOB column).
 ///   `Binary` join keys are rare, so the 2 GiB concat risk there is acceptable.
@@ -28536,7 +28543,7 @@ impl CayenneTableProvider {
 /// see `scan()`).
 ///
 /// Only top-level fields are mapped. Returns the input schema unchanged (same
-/// `Arc`) when it has no `Utf8` columns, so all-scalar tables pay nothing.
+/// `Arc`) when it has no string columns, so all-scalar tables pay nothing.
 pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
     fn view_type(dt: &DataType) -> Option<DataType> {
         match dt {
@@ -28545,12 +28552,12 @@ pub(crate) fn viewify_read_schema(schema: &SchemaRef) -> SchemaRef {
             // made this flag a no-op on the shape it most needs to cover — a
             // 100M-row `ClickBench` load arrives entirely as `LargeUtf8`.
             //
-            // Mapping `LargeUtf8` narrows: a view's offset into its buffer is
-            // `i32`, so a single value above ~2 GiB (a `LONGTEXT`/JSON blob) no
-            // longer fits where `LargeUtf8`'s i64 offsets would have held it. That
-            // is why this is reached only through `force_view_read_schema`, which
-            // is opt-in — an operator asking to force view types is accepting the
-            // per-value ceiling that comes with them.
+            // Mapping `LargeUtf8` narrows: a view's `length` and `offset` are
+            // `u32` (`arrow_data::ByteView`), so a single value must stay under
+            // ~4 GiB, where `LargeUtf8`'s i64 offsets would have carried more.
+            // That is why this is reached only through `force_view_read_schema`,
+            // which is opt-in — an operator asking to force view types is
+            // accepting the per-value ceiling that comes with them.
             //
             // Binary is still NOT mapped: Vortex's `BinaryView` path yields
             // `LargeBinary`, which diverges from `verify_schema`.
@@ -31366,6 +31373,138 @@ mod tests {
                     .downcast_ref::<StringViewArray>()
                     .is_some(),
                 "scan must emit StringViewArray under force_view_read_schema"
+            );
+        }
+    }
+
+    /// End-to-end gate for the `LargeUtf8` half of the view mapping, through BOTH
+    /// scan branches.
+    ///
+    /// The sibling test above builds `Utf8`/`StringArray`, so on its own it cannot
+    /// catch a failure converting real `LargeUtf8` batches — which is the shape
+    /// most sources deliver and the one this mapping was extended to cover. This
+    /// asserts the emitted arrays and their VALUES, not just the advertised
+    /// schema, and pins that the stored schema stays `LargeUtf8` for the write /
+    /// CDC / keyset paths.
+    #[tokio::test]
+    async fn force_view_read_schema_scan_emits_utf8view_for_large_utf8() {
+        use arrow::array::{Int64Array, LargeStringArray, StringViewArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::LargeUtf8, false),
+        ]));
+
+        // `inline_max_rows: 0` sends the write straight to a Vortex file, so the
+        // two arms cover the inline branch (cast to match) and the file branch
+        // (Vortex decodes the view natively) respectively.
+        for (table_name, inline_max_rows, expect_inline) in [
+            ("large_utf8_inline", 1024, true),
+            ("large_utf8_file", 0, false),
+        ] {
+            let ctx = SessionContext::new();
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+            let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+            std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+            let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+            let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+                as Arc<dyn MetadataCatalog>;
+            catalog.init().await.expect("catalog init");
+
+            let vortex_config = VortexConfig {
+                force_view_read_schema: true,
+                inline_max_rows,
+                ..VortexConfig::default()
+            };
+            let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), table_name);
+            let options = CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                )),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config,
+            };
+            let provider =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                    .with_context(context)
+                    .create(options)
+                    .await
+                    .expect("table created");
+
+            // Advertised schema views the LargeUtf8 column; stored schema does not.
+            assert_eq!(
+                provider
+                    .schema()
+                    .field_with_name("name")
+                    .expect("name field")
+                    .data_type(),
+                &DataType::Utf8View,
+                "{table_name}: query schema must view a LargeUtf8 column"
+            );
+            assert_eq!(
+                provider
+                    .table_schema()
+                    .field_with_name("name")
+                    .expect("name field")
+                    .data_type(),
+                &DataType::LargeUtf8,
+                "{table_name}: stored schema must stay LargeUtf8 for writes/CDC"
+            );
+
+            insert_batch(
+                &provider,
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1_i64, 2])),
+                        Arc::new(LargeStringArray::from(vec!["alice", "bob"])),
+                    ],
+                )
+                .expect("batch"),
+            )
+            .await;
+            assert_eq!(
+                provider.cached_inlined_row_count() > 0,
+                expect_inline,
+                "{table_name}: fixture must exercise the intended branch"
+            );
+
+            let batches = read_all(&ctx, &provider, table_name).await;
+            let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total, 2, "{table_name}: both rows visible");
+
+            let mut seen: Vec<String> = Vec::new();
+            for b in &batches {
+                let idx = b.schema().index_of("name").expect("name col");
+                assert_eq!(
+                    b.schema().field(idx).data_type(),
+                    &DataType::Utf8View,
+                    "{table_name}: batch schema must be viewed"
+                );
+                let col = b
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap_or_else(|| {
+                        panic!("{table_name}: scan must emit StringViewArray for LargeUtf8")
+                    });
+                for i in 0..col.len() {
+                    seen.push(col.value(i).to_string());
+                }
+            }
+            seen.sort();
+            assert_eq!(
+                seen,
+                vec!["alice".to_string(), "bob".to_string()],
+                "{table_name}: values must survive the view conversion"
             );
         }
     }
