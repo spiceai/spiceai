@@ -3108,7 +3108,6 @@ fn release_endpoint<'a>(
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
     let active_org = resolve_org(flag_org)?;
     let client = CloudClient::connect(active_org.as_deref()).await?;
-    let context = client.optional_user_auth_context().await?;
     let mut projects = client.list_projects().await?;
 
     if projects.is_empty() {
@@ -3123,22 +3122,25 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         return Ok(());
     }
 
-    // Label with the org the *credential* reports, never the one that was
-    // requested. Stamping the requested org onto a listing the server actually
-    // produced for another org would assert an attribution the CLI has not
-    // verified — and `--output json` would carry it into scripts.
-    let context_org = context
-        .as_ref()
-        .map(|c| c.org_name.as_str())
-        .filter(|org| !org.is_empty())
-        .or(active_org.as_deref())
-        .unwrap_or("");
+    // Spice Cloud scoped this listing to the org the client asked for, so that
+    // org is what these projects belong to. Only when nothing named one does
+    // the credential's own org apply, and it is worth a round trip only then.
+    let credential_org = if active_org.is_some() {
+        None
+    } else {
+        client
+            .optional_user_auth_context()
+            .await?
+            .map(|context| context.org_name)
+    };
+    let listing_org =
+        client::resolve_listing_org(active_org.as_deref(), credential_org.as_deref()).unwrap_or("");
     // The Spice Cloud `/v1/apps` endpoint does not populate `org` per project, so
-    // backfill it from the auth-context org — the same fallback the table
-    // rendering applies via `display_project_name`. Without this, `--output json`
-    // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
-    // format parity and machine-readable scripting (see #11041).
-    backfill_project_orgs(&mut projects, context_org);
+    // backfill it from the listing's org — the same fallback the table rendering
+    // applies via `display_project_name`. Without this, `--output json` emitted
+    // `"org": ""` while the table showed `<org>/<name>`, breaking format parity
+    // and machine-readable scripting (see #11041).
+    backfill_project_orgs(&mut projects, listing_org);
 
     if args.output == OutputFormat::Json {
         return write_json(&projects);
@@ -3152,7 +3154,7 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         "CREATED",
     ]);
     for project in &projects {
-        let display_name = display_project_name(project, context_org);
+        let display_name = display_project_name(project, listing_org);
         table.add_row(vec![
             display_name,
             project.description.clone().unwrap_or_default(),
@@ -3172,29 +3174,29 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     Ok(())
 }
 
-/// Backfill each project's empty `org` from the auth-context org so machine-readable
-/// (`--output json`) output matches the human-readable table, which already
-/// applies this fallback when rendering via [`display_project_name`]. The Spice
-/// Cloud `/v1/apps` endpoint does not populate `org` on each project, so the auth
-/// context is the only source of truth for the user's org. A no-op when
-/// `context_org` is empty (nothing to fall back to) or the project already carries
-/// an org.
-fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], context_org: &str) {
-    if context_org.is_empty() {
+/// Backfill each project's empty `org` from the org whose listing it arrived in,
+/// so machine-readable (`--output json`) output matches the human-readable table,
+/// which already applies this fallback when rendering via [`display_project_name`].
+/// The Spice Cloud `/v1/apps` endpoint does not populate `org` on each project, so
+/// the org the listing was requested for is the only evidence of which org these
+/// projects belong to. A no-op when `listing_org` is empty (nothing to fall back
+/// to) or the project already carries an org.
+fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], listing_org: &str) {
+    if listing_org.is_empty() {
         return;
     }
     for project in projects.iter_mut() {
         if project.org.is_empty() {
-            project.org = context_org.to_string();
+            project.org = listing_org.to_string();
         }
     }
 }
 
-/// Format a project's display name as `org/name`, falling back to the auth
-/// context org when the project payload does not include one.
-fn display_project_name(project: &spice_cloud_client::types::Project, context_org: &str) -> String {
+/// Format a project's display name as `org/name`, falling back to the org whose
+/// listing it arrived in when the project payload does not include one.
+fn display_project_name(project: &spice_cloud_client::types::Project, listing_org: &str) -> String {
     let org = if project.org.is_empty() {
-        context_org
+        listing_org
     } else {
         project.org.as_str()
     };
@@ -5107,7 +5109,7 @@ mod tests {
     }
 
     #[test]
-    fn display_project_name_falls_back_to_context_org_when_project_org_is_empty() {
+    fn display_project_name_falls_back_to_the_listing_org_when_project_org_is_empty() {
         let project = test_project("", "dashboard");
         assert_eq!(
             display_project_name(&project, "analytics"),
@@ -5122,7 +5124,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_project_orgs_fills_empty_org_from_context() {
+    fn backfill_project_orgs_fills_empty_org_from_the_listing_org() {
         let mut projects = vec![
             test_project("", "ltd-mint"),
             test_project("", "zippy-cayenne"),
@@ -5144,10 +5146,31 @@ mod tests {
     }
 
     #[test]
-    fn backfill_project_orgs_noop_when_context_empty() {
+    fn backfill_project_orgs_noop_when_the_listing_org_is_empty() {
         let mut projects = vec![test_project("", "ltd-mint")];
         backfill_project_orgs(&mut projects, "");
         assert_eq!(projects[0].org, "");
+    }
+
+    #[test]
+    fn a_listing_requested_for_an_org_is_labelled_with_that_org() {
+        // Regression for the cross-org mis-attribution this replaced: Spice
+        // Cloud scopes the listing to the requested org but returns no `org` on
+        // any row, so preferring the credential's org labelled another
+        // organization's projects — table and `--output json` alike — with the
+        // caller's own, and a name copied from that listing addressed either
+        // nothing or a same-named project in the wrong org.
+        let listing_org = client::resolve_listing_org(Some("spiceai"), Some("lukekim"))
+            .expect("a requested org is a listing org");
+        let mut projects = vec![test_project("", "docs")];
+
+        backfill_project_orgs(&mut projects, listing_org);
+
+        assert_eq!(projects[0].org, "spiceai");
+        assert_eq!(
+            display_project_name(&projects[0], listing_org),
+            "spiceai/docs"
+        );
     }
 
     // ========================================================================
