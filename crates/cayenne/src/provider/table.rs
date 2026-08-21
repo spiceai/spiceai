@@ -30471,6 +30471,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                     self.context.bake_deletion_index_trigger(),
                 )
                 .unwrap_or(0),
+                // Emitted beside the trigger so a run can tell an index the bake is
+                // holding near the trigger apart from one parked orders of magnitude
+                // above it — the second means the gate fires every tick and the
+                // cadence is set by something else entirely.
+                deletion_index_len: u64::try_from(self.pk_deletion_snapshot().delete_len())
+                    .unwrap_or(u64::MAX),
+                deletion_index_bytes: u64::try_from(
+                    self.pk_deletion_strategy.approx_resident_bytes(),
+                )
+                .unwrap_or(u64::MAX),
                 target_file_size_mb: u64::try_from(
                     self.context.target_file_size_bytes() / (1024 * 1024),
                 )

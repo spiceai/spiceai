@@ -712,6 +712,17 @@ pub struct CayenneAutotuneState {
     /// large table is most of the table, so this decides how much rewriting a
     /// given amount of index shrink is worth.
     pub bake_deletion_index_trigger: u64,
+    /// Live deletion-index size (`delete_len()`, live PK tombstones) — the
+    /// quantity `bake_deletion_index_trigger` gates on and the bake exists to
+    /// shrink. Emitted beside the trigger because only the *ratio* says whether
+    /// the trigger is doing anything: an index parked orders of magnitude above
+    /// it means the gate fires on every tick and moving it changes nothing, and
+    /// the bake's real cadence is set elsewhere.
+    pub deletion_index_len: u64,
+    /// Approximate resident bytes of that index. It over-commits the query pool
+    /// infallibly and can never be dropped, so this is the quantity the
+    /// `deletion_index_over_memory_ceiling` OOM backstop compares against.
+    pub deletion_index_bytes: u64,
     /// Configured target Vortex file size (MB) — the reference compacted files
     /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
     pub target_file_size_mb: u64,
@@ -1565,6 +1576,8 @@ pub mod cayenne {
     static AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_BAKE_DELETION_INDEX_TRIGGER: OnceLock<Gauge<u64>> = OnceLock::new();
+    static AT_DELETION_INDEX_LEN: OnceLock<Gauge<u64>> = OnceLock::new();
+    static AT_DELETION_INDEX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
     static AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
@@ -1686,6 +1699,27 @@ pub mod cayenne {
                     .build()
             })
             .record(state.bake_deletion_index_trigger, dimensions);
+        AT_DELETION_INDEX_LEN
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_deletion_index_len")
+                    .with_description(
+                        "Live PK tombstone count in the merge-on-read deletion index (compare cayenne_autotune_bake_deletion_index_trigger).",
+                    )
+                    .build()
+            })
+            .record(state.deletion_index_len, dimensions);
+        AT_DELETION_INDEX_BYTES
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_gauge("cayenne_deletion_index_bytes")
+                    .with_description(
+                        "Approximate resident bytes of the merge-on-read deletion index (the OOM-backstop quantity).",
+                    )
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.deletion_index_bytes, dimensions);
         AT_TARGET_FILE_SIZE_MB
         .get_or_init(|| {
             operational_meter()
