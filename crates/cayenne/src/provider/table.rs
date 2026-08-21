@@ -2996,6 +2996,105 @@ const fn subset_merge_write_shape(
     }
 }
 
+/// Ascending split points that range-partition `column` across `shards`
+/// writers, derived from the min/max a plan reports for it.
+///
+/// `None` whenever the split cannot be trusted to spread rows: no statistics,
+/// a degenerate range (every row shares one value, so every row would land on
+/// one shard anyway), or a type the interpolation does not cover. The caller
+/// then hashes instead, which is the behavior that predates range
+/// partitioning — so a missing statistic costs clustering, never correctness.
+///
+/// Bounds are equi-width over `[min, max]` rather than quantiles: a plan's
+/// statistics carry the range but not the distribution, so this balances a
+/// uniform key well and a skewed one poorly. Skew costs shard balance — some
+/// writers get more rows — and never costs correctness, because every row still
+/// lands on exactly one shard and the shards still tile the domain in order.
+fn range_bounds_from_statistics(
+    stats: &Statistics,
+    column: usize,
+    shards: usize,
+) -> Option<Vec<ScalarValue>> {
+    if shards < 2 {
+        return None;
+    }
+    let column_stats = stats.column_statistics.get(column)?;
+    let min = column_stats.min_value.get_value()?;
+    let max = column_stats.max_value.get_value()?;
+
+    // Interpolate over the value domain. Only the integer and date families are
+    // covered: they are the CDC key shapes that matter (a monotonic id, a day
+    // bucket), and each divides exactly. Floats and decimals are deliberately
+    // left out rather than approximated into bounds that could collapse.
+    //
+    // Both ends must be the same variant, or the interpolation would compare
+    // across two different domains and produce bounds that match neither.
+    if std::mem::discriminant(min) != std::mem::discriminant(max) {
+        return None;
+    }
+    let (lo, hi) = (scalar_to_i128(min)?, scalar_to_i128(max)?);
+    if hi <= lo {
+        return None;
+    }
+
+    let span = hi.checked_sub(lo)?;
+    let divisions = i128::try_from(shards).ok()?;
+    let mut bounds = Vec::with_capacity(shards - 1);
+    let mut previous: Option<i128> = None;
+    for step in 1..divisions {
+        let cut = lo.checked_add(span.checked_mul(step)? / divisions)?;
+        // A narrow range over many shards repeats a cut. Duplicate bounds would
+        // leave a shard that no row can reach, so collapse them: fewer, wider
+        // shards is the honest outcome when the domain cannot be split further.
+        if previous == Some(cut) {
+            continue;
+        }
+        previous = Some(cut);
+        bounds.push(rebuild_scalar_like(min, cut)?);
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// Widen an integer or date scalar to `i128` for bound interpolation, or `None`
+/// for any other type.
+#[expect(
+    clippy::match_same_arms,
+    reason = "each arm widens a DIFFERENT integer type; the bodies are textually \
+              identical but cannot be merged, because the binding's type differs \
+              per variant"
+)]
+fn scalar_to_i128(value: &ScalarValue) -> Option<i128> {
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => i128::from(*v),
+        ScalarValue::Int16(Some(v)) => i128::from(*v),
+        ScalarValue::Int32(Some(v)) => i128::from(*v),
+        ScalarValue::Int64(Some(v)) => i128::from(*v),
+        ScalarValue::UInt8(Some(v)) => i128::from(*v),
+        ScalarValue::UInt16(Some(v)) => i128::from(*v),
+        ScalarValue::UInt32(Some(v)) => i128::from(*v),
+        ScalarValue::UInt64(Some(v)) => i128::from(*v),
+        ScalarValue::Date32(Some(v)) => i128::from(*v),
+        _ => return None,
+    })
+}
+
+/// Rebuild `value` as the same `ScalarValue` variant as `like`, so the bounds
+/// compare against the key column without a cast.
+fn rebuild_scalar_like(like: &ScalarValue, value: i128) -> Option<ScalarValue> {
+    Some(match like {
+        ScalarValue::Int8(_) => ScalarValue::Int8(Some(i8::try_from(value).ok()?)),
+        ScalarValue::Int16(_) => ScalarValue::Int16(Some(i16::try_from(value).ok()?)),
+        ScalarValue::Int32(_) => ScalarValue::Int32(Some(i32::try_from(value).ok()?)),
+        ScalarValue::Int64(_) => ScalarValue::Int64(Some(i64::try_from(value).ok()?)),
+        ScalarValue::UInt8(_) => ScalarValue::UInt8(Some(u8::try_from(value).ok()?)),
+        ScalarValue::UInt16(_) => ScalarValue::UInt16(Some(u16::try_from(value).ok()?)),
+        ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(u32::try_from(value).ok()?)),
+        ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+        ScalarValue::Date32(_) => ScalarValue::Date32(Some(i32::try_from(value).ok()?)),
+        _ => return None,
+    })
+}
+
 /// Write policy for a snapshot rewrite, chosen by whether the rewrite actually
 /// sorted its stream. Pure so the decision is unit-testable without spinning a
 /// full provider, mirroring [`subset_merge_write_shape`].
@@ -6995,6 +7094,36 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        self.write_to_snapshot_range_partitioned(
+            stream,
+            target_size_bytes,
+            snapshot_id,
+            target_partitions,
+            estimated_bytes,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_to_snapshot`], with ascending split points that
+    /// range-partition the shard key instead of hashing it.
+    ///
+    /// Only a caller that knows the key range of the rows it is about to write
+    /// can supply these — a rewrite reads them off the statistics of the plan it
+    /// is merging. A streaming write has no such view, passes `None`, and hashes
+    /// as before.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn write_to_snapshot_range_partitioned(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        policy: super::delta_encoding::WritePolicy,
+        range_bounds: Option<&[ScalarValue]>,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
@@ -7102,6 +7231,7 @@ impl CayenneTableProvider {
                     target_size_bytes,
                     estimated_bytes,
                     fan_out,
+                    range_bounds,
                 ),
             ),
             None => self.write_shard_format(
@@ -7109,6 +7239,7 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
+                range_bounds,
             ),
         };
 
@@ -7550,6 +7681,7 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        range_bounds: Option<&[ScalarValue]>,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
         match self.write_shard_config(
@@ -7557,10 +7689,31 @@ impl CayenneTableProvider {
             target_size_bytes,
             estimated_bytes,
             fan_out,
+            range_bounds,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
         }
+    }
+
+    /// Split points for range-partitioning a merge on its shard key, or `None`
+    /// when the key or its range cannot be resolved — in which case the write
+    /// hashes, exactly as it did before range partitioning existed.
+    ///
+    /// Restricted to a single key column, because ordering a composite key needs
+    /// a lexicographic comparison the sink's range split does not implement.
+    fn merge_range_bounds(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        shards: usize,
+    ) -> Option<Vec<ScalarValue>> {
+        let key = self.resolved_shard_key_columns();
+        let [column] = key.as_slice() else {
+            return None;
+        };
+        let index = self.table_schema().index_of(column).ok()?;
+        let stats = plan.partition_statistics(None).ok()?;
+        range_bounds_from_statistics(&stats, index, shards)
     }
 
     /// The intra-write shard configuration this write earns, or `None` for a
@@ -7588,6 +7741,7 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        range_bounds: Option<&[ScalarValue]>,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
@@ -7598,57 +7752,40 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
-        let shard_key_columns = self.configured_shard_key_columns();
-        let contiguous_run_bytes = shard_key_columns
-            .is_empty()
-            .then(|| Self::contiguous_run_bytes(shard_count, target_size_bytes, estimated_bytes));
         Some(WriteShardConfig {
             write_concurrency: shard_count,
-            shard_key_columns,
-            contiguous_run_bytes,
+            shard_key_columns: self.resolved_shard_key_columns(),
+            // Ascending split points, when the caller could derive them for a
+            // single key column. Their absence is not a failure: the write
+            // hashes the key instead, which is what every write did before
+            // range partitioning existed.
+            range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
         })
     }
 
-    /// Uncompressed input bytes to route to one shard before advancing.
+    /// The clustering key for intra-write sharding: the configured
+    /// `shard_key_columns` when every column exists in the table schema, else
+    /// the primary-key columns. An invalid configured key warns and falls back
+    /// rather than failing the write.
     ///
-    /// An even split of the write gives `shard_count` equal contiguous runs,
-    /// which is the balanced shape. It is floored at one target file size
-    /// because a run shorter than a file lets a shard gather several
-    /// non-adjacent runs into the same file — the interleaving contiguous runs
-    /// exist to prevent. Oversizing only coarsens the balance, so the floor is
-    /// the safe direction, and an unsized (opaque) stream takes it outright.
-    fn contiguous_run_bytes(
-        shard_count: usize,
-        target_size_bytes: usize,
-        estimated_bytes: Option<u64>,
-    ) -> u64 {
-        let floor = u64::try_from(target_size_bytes).unwrap_or(u64::MAX).max(1);
-        let even_split = estimated_bytes
-            .and_then(|bytes| bytes.checked_div(u64::try_from(shard_count).unwrap_or(1).max(1)))
-            .unwrap_or(0);
-        even_split.max(floor)
-    }
-
-    /// The hash-clustering key for intra-write sharding: the configured
-    /// `shard_key_columns`, when every column exists in the table schema. Empty
-    /// otherwise, which routes contiguous runs instead of hashing.
-    ///
-    /// An invalid configured key warns and degrades to contiguous runs rather
-    /// than failing the write. The primary key is deliberately NOT a fallback:
-    /// hashing on it would be an implicit choice to scatter the arrival order
-    /// across every output file, and a table that has not asked for
-    /// key-clustered files is better served by files that prune.
+    /// Empty means "the primary key" throughout — `apply_inferred_shard_key`
+    /// relies on it to omit a source shard key that already equals the PK, and
+    /// persisted tables encode an unset key as an empty vector.
     ///
     /// Resolves names against the LIVE table schema ([`Self::table_schema`]),
     /// not the construction-time `table_metadata.schema`, so a column added by
     /// live widening evolution (`evolve_schema_live`) is observed here before
     /// the provider is reopened.
-    fn configured_shard_key_columns(&self) -> Vec<String> {
+    fn resolved_shard_key_columns(&self) -> Vec<String> {
+        let schema = self.table_schema();
         let configured = self.context.shard_key_columns();
         if configured.is_empty() {
-            return Vec::new();
+            return self
+                .pk_column_indices
+                .iter()
+                .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+                .collect();
         }
-        let schema = self.table_schema();
         let missing: Vec<&String> = configured
             .iter()
             .filter(|column| schema.field_with_name(column).is_err())
@@ -7659,9 +7796,12 @@ impl CayenneTableProvider {
         tracing::warn!(
             table = self.table_metadata.table_name.as_str(),
             missing = ?missing,
-            "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; the write falls back to contiguous-run sharding, so its files are not key-clustered"
+            "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
         );
-        Vec::new()
+        self.pk_column_indices
+            .iter()
+            .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
+            .collect()
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -17418,7 +17558,8 @@ impl CayenneTableProvider {
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
-        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out);
+        // Cold promotion streams its rows, so it has no key range to split on.
+        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out, None);
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -18623,6 +18764,7 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
+        let target_partitions_hint = state.config().target_partitions();
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
         for (snapshot_id, threshold) in &inputs {
             let plan = self
@@ -18642,6 +18784,13 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // Range-partition the merge on its shard key when the plan can say what
+        // range it holds. This is the rewrite that produces the long-lived
+        // layout, and it is the only write with that view: a streaming CDC
+        // write knows nothing about the keys still to arrive, so it hashes.
+        // Hashing here would spread every key across every output file and
+        // leave a predicate on the key nothing to prune.
+        let range_bounds = self.merge_range_bounds(&merged_plan, target_partitions_hint);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
@@ -18685,12 +18834,12 @@ impl CayenneTableProvider {
             serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             keeps_positions_serial,
-            state.config().target_partitions(),
+            target_partitions_hint,
             total_input_bytes,
         );
         let write_start = std::time::Instant::now();
         let write_result = self
-            .write_to_snapshot(
+            .write_to_snapshot_range_partitioned(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -18710,6 +18859,7 @@ impl CayenneTableProvider {
                 } else {
                     super::delta_encoding::WritePolicy::MAINTENANCE
                 },
+                range_bounds.as_deref(),
             )
             .await;
 
@@ -38445,7 +38595,7 @@ mod tests {
             provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
             4
         );
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -38504,7 +38654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_primary_key_is_not_an_implicit_hash_key() {
+    async fn test_write_shard_format_keyed_hashes_by_primary_key() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("val", DataType::Int64, false),
@@ -38519,28 +38669,25 @@ mod tests {
         )
         .await;
 
-        // A primary key is NOT a request to hash on it. Hashing scatters the
-        // arrival order across every output file, so a monotonic key's zone maps
-        // all span the full range and a point lookup prunes nothing; the table
-        // never asked for key-clustered files, so it gets contiguous runs.
+        // Keyed/upsert table with no configured shard key: the sink hashes rows
+        // by the primary key. Empty means "the primary key" across the whole
+        // stack — `apply_inferred_shard_key` omits a source shard key equal to
+        // the PK on exactly that basis.
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out.
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(
             provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
             4
         );
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
         assert_eq!(write_shard.write_concurrency, 4);
+        assert_eq!(write_shard.shard_key_columns, vec!["id".to_string()]);
         assert!(
-            write_shard.shard_key_columns.is_empty(),
-            "the primary key must not be an implicit hash-shard key"
-        );
-        assert!(
-            write_shard.contiguous_run_bytes.is_some(),
-            "an unkeyed sharded write must route contiguous runs, not round-robin"
+            write_shard.range_bounds.is_none(),
+            "a streaming write has no key range to split on, so it hashes"
         );
     }
 
@@ -38567,7 +38714,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38579,7 +38726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_invalid_configured_shard_key_degrades_to_runs() {
+    async fn test_write_shard_format_invalid_configured_shard_key_falls_back_to_pk() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let vortex_config = VortexConfig {
@@ -38596,17 +38743,14 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
-        assert!(
-            write_shard.shard_key_columns.is_empty(),
-            "a shard key referencing a missing column must degrade rather than fail the write"
-        );
-        assert!(
-            write_shard.contiguous_run_bytes.is_some(),
-            "the degraded write still routes contiguous runs, so its files keep pruning"
+        assert_eq!(
+            write_shard.shard_key_columns,
+            vec!["id".to_string()],
+            "a shard key referencing a missing column must fall back to the primary key"
         );
     }
 
@@ -38642,7 +38786,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
@@ -38690,13 +38834,82 @@ mod tests {
             );
             assert!(
                 provider
-                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial)
+                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial, None)
                     .write_shard()
                     .is_none(),
                 "a Serial write must produce the unsharded base format \
                  (estimated_bytes={estimated:?})"
             );
         }
+    }
+
+    /// Bounds must tile the key domain, and must decline rather than produce a
+    /// split that cannot spread rows.
+    ///
+    /// Declining is the safe direction: the caller then hashes, which is what
+    /// every write did before range partitioning existed. A bad split would be
+    /// worse than no split — duplicate bounds leave a shard no row can reach,
+    /// and a degenerate range sends every row to one encoder while the write
+    /// still pays for the fan-out.
+    #[test]
+    fn range_bounds_from_statistics_tiles_the_domain_or_declines() {
+        use datafusion_common::stats::Precision;
+
+        fn stats(min: Option<i64>, max: Option<i64>) -> Statistics {
+            let mut column = datafusion_common::ColumnStatistics::new_unknown();
+            if let Some(min) = min {
+                column.min_value = Precision::Exact(ScalarValue::Int64(Some(min)));
+            }
+            if let Some(max) = max {
+                column.max_value = Precision::Exact(ScalarValue::Int64(Some(max)));
+            }
+            let mut stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "k",
+                DataType::Int64,
+                false,
+            )]));
+            stats.column_statistics = vec![column];
+            stats
+        }
+
+        assert_eq!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 0, 4),
+            Some(vec![
+                ScalarValue::Int64(Some(25)),
+                ScalarValue::Int64(Some(50)),
+                ScalarValue::Int64(Some(75)),
+            ]),
+            "four shards split an even domain at the quarter points"
+        );
+
+        assert!(
+            range_bounds_from_statistics(&stats(Some(7), Some(7)), 0, 4).is_none(),
+            "a single-valued column cannot be split, so hash instead"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(100), Some(0)), 0, 4).is_none(),
+            "an inverted range is not trustworthy"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(None, Some(100)), 0, 4).is_none(),
+            "an absent statistic declines rather than guessing"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 0, 1).is_none(),
+            "one shard needs no bounds"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 9, 4).is_none(),
+            "a column index outside the statistics declines"
+        );
+
+        // A domain narrower than the shard count repeats cuts; the duplicates
+        // collapse so no shard is left unreachable.
+        let narrow = range_bounds_from_statistics(&stats(Some(0), Some(2)), 0, 8)
+            .expect("a narrow but non-degenerate range still splits");
+        let mut sorted = narrow.clone();
+        sorted.dedup();
+        assert_eq!(sorted, narrow, "bounds must be strictly ascending");
     }
 
     /// A sorted rewrite must declare a serial fan-out; an unsorted one must not.
@@ -38768,7 +38981,7 @@ mod tests {
         );
         assert!(
             provider
-                .write_shard_format(1, tsb, None, EncodeFanOut::Serial)
+                .write_shard_format(1, tsb, None, EncodeFanOut::Serial, None)
                 .write_shard()
                 .is_none(),
             "a declared-serial write must not carry a shard config"
@@ -38816,7 +39029,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(1, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(1, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("a sized write keeps its shard config")
                 .write_concurrency,
@@ -38846,7 +39059,7 @@ mod tests {
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge, EncodeFanOut::Serial)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Serial, None)
                 .write_shard()
                 .is_none(),
             "a serial write falls back to the unsharded base format"
@@ -38864,7 +39077,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("an unsorted sized write keeps its shard config")
                 .write_concurrency,
@@ -38898,7 +39111,7 @@ mod tests {
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, small, EncodeFanOut::Sized, None)
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -38928,7 +39141,7 @@ mod tests {
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized, None);
         assert_eq!(
             format
                 .write_shard()
@@ -39018,7 +39231,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(6, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
