@@ -242,7 +242,10 @@ impl TableSink {
         );
 
         let ctx = SessionContext::new();
-        let target_schema = self.table_provider.schema();
+        // The schema to WRITE to, which is not always the one the provider
+        // advertises — see `write_schema::write_target_schema`.
+        let target_schema =
+            crate::accelerated::write_schema::write_target_schema(&self.table_provider);
         warn_on_narrowing_schema_cast(
             &self.dataset_name,
             &record_batch_stream.schema(),
@@ -389,6 +392,46 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+    /// A write must not be cast to a view-typed *read* schema.
+    ///
+    /// Cayenne advertises `Utf8View` under `cayenne_force_view_types` so queries
+    /// plan on view arrays, but its stored schema keeps the source string type.
+    /// Targeting the advertised schema would report `LargeUtf8 -> Utf8View` as a
+    /// narrowing that loses data (it is not a widening cast) and, worse, Arrow's
+    /// view builder panics once a single value exceeds `u32::MAX`. This pins the
+    /// classification half; `write_target_schema` is what keeps the cast itself
+    /// off the view schema.
+    #[test]
+    fn large_utf8_to_view_is_reported_as_narrowing() {
+        let source = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let advertised_view =
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
+        let changes =
+            narrowing_schema_cast_changes(&source, &advertised_view, CAYENNE_TYPE_REWRITE_RULES);
+        assert!(
+            !changes.narrowed.is_empty(),
+            "LargeUtf8 -> Utf8View must be treated as a narrowing cast, so a write \
+             that targeted the advertised read schema would be reported: {changes:?}"
+        );
+
+        // Against the STORED schema — what `write_target_schema` resolves to — the
+        // same source is an exact match and reports nothing.
+        let stored = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let clean = narrowing_schema_cast_changes(&source, &stored, CAYENNE_TYPE_REWRITE_RULES);
+        assert!(
+            clean.narrowed.is_empty() && clean.dropped.is_empty(),
+            "writing to the stored schema must be a no-op cast: {clean:?}"
+        );
+    }
 
     /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds — the
     /// engine rewrite these tests exercise. Spelled out rather than imported because

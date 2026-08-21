@@ -2512,7 +2512,8 @@ impl RefreshTask {
         self.maybe_evolve_schema_for_cdc(&data_batch.schema())
             .await?;
 
-        let target_schema = self.accelerator.schema();
+        let target_schema =
+            crate::accelerated::write_schema::write_target_schema(&self.accelerator);
 
         let selected_batch = select_rows(&data_batch, row_indices)?;
         // CDC sources may produce a nullable schema even for fields declared NOT NULL in the
@@ -2661,7 +2662,8 @@ impl RefreshTask {
         if matches!(evolution.policy, OnSchemaChange::Block) {
             return Ok(());
         }
-        let target_schema = self.accelerator.schema();
+        let target_schema =
+            crate::accelerated::write_schema::write_target_schema(&self.accelerator);
         // The accelerated table holds the engine's own creation-time rewrite by
         // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
         // comparison has to be made against what the engine would store from this input.

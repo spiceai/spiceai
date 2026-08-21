@@ -76,6 +76,7 @@ pub mod synchronized_table;
 pub mod timestamp_metrics_utils;
 pub mod write;
 pub mod write_back_worker;
+pub mod write_schema;
 
 pub(crate) use write::WriteMode;
 

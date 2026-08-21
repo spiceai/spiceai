@@ -3066,6 +3066,23 @@ impl CayenneTableProvider {
         self.table_schema.load_full()
     }
 
+    /// The schema a WRITE to this table must be cast to.
+    ///
+    /// Deliberately not [`TableProvider::schema`]. Under
+    /// `cayenne_force_view_types` the advertised schema maps string columns to
+    /// Arrow view types so `DataFusion` plans reads on view arrays, but the bytes
+    /// this table stores keep the source's own string type, and a writer that
+    /// targeted the advertised schema would be casting to a *narrower* type than
+    /// the one being stored: `LargeUtf8` -> `Utf8View` is not a widening cast, and
+    /// Arrow's view builder panics rather than erroring once a single value
+    /// exceeds `u32::MAX` (`GenericByteViewBuilder::append_value`).
+    ///
+    /// Reads therefore target [`Self::read_schema`] and writes target this one.
+    #[must_use]
+    pub fn write_schema(&self) -> SchemaRef {
+        self.table_schema()
+    }
+
     /// The schema advertised to query planning and produced by `scan()`: the
     /// stored [`Self::table_schema`] with string/binary columns mapped to Arrow
     /// view types (see [`viewify_read_schema`]). Decoupled from the stored
@@ -31457,6 +31474,34 @@ mod tests {
                     .data_type(),
                 &DataType::LargeUtf8,
                 "{table_name}: stored schema must stay LargeUtf8 for writes/CDC"
+            );
+            // The runtime casts every write to `write_schema()`, so it must be the
+            // stored type and never the view. Targeting the advertised schema
+            // would make `LargeUtf8 -> Utf8View` a narrowing cast on the write
+            // path, and Arrow's view builder panics past `u32::MAX` instead of
+            // returning an error.
+            assert_eq!(
+                provider
+                    .write_schema()
+                    .field_with_name("name")
+                    .expect("name field")
+                    .data_type(),
+                &DataType::LargeUtf8,
+                "{table_name}: writes must target the stored type, not the view"
+            );
+            assert_ne!(
+                provider
+                    .write_schema()
+                    .field_with_name("name")
+                    .ok()
+                    .map(|f| f.data_type().clone()),
+                provider
+                    .schema()
+                    .field_with_name("name")
+                    .ok()
+                    .map(|f| f.data_type().clone()),
+                "{table_name}: read and write schemas must be distinct here, or \
+                 this fixture is not exercising the force-view path"
             );
 
             insert_batch(
