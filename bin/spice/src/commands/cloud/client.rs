@@ -271,25 +271,35 @@ impl CloudClient {
     /// is also where a "wrong org" mistake is caught: an app that exists under a
     /// different org produces a switch hint rather than a bare "not found".
     pub async fn get_project(&self, target: &ProjectTarget) -> Result<Project> {
-        let project_id = self.resolve_id(target).await?;
+        let (project_id, listing_org) = self.resolve_id_and_org(target).await?;
         let project = self.get_project_by_id(project_id).await?;
-        Ok(self.attribute(project, target.org.as_deref()))
+        Ok(self.attribute(project, listing_org.as_deref()))
     }
 
-    /// Stamp the org a project was addressed by onto a payload that omits it.
+    /// Stamp the org a project belongs to onto a payload that omits it.
     ///
-    /// Spice Cloud returns no `org` on a project, so a command that resolved
-    /// `<org>/<project>` would otherwise print a bare name and serialize
-    /// `"org": ""` for the very project whose org it just used to find it.
-    fn attribute(&self, mut project: Project, target_org: Option<&str>) -> Project {
+    /// Spice Cloud returns no `org` on a project, so a command would otherwise
+    /// print a bare name and serialize `"org": ""` for the very project whose
+    /// org it just used to find it — while `spice cloud projects`, run against
+    /// the same credential, named the org for that same project.
+    fn attribute(&self, mut project: Project, org: Option<&str>) -> Project {
         if project.org.is_empty()
-            && let Some(org) = target_org
-                .or(self.org.as_deref())
-                .filter(|org| !org.is_empty())
+            && let Some(org) = org.or(self.org.as_deref()).filter(|org| !org.is_empty())
         {
             project.org = org.to_string();
         }
         project
+    }
+
+    /// The org whose projects this credential sees when no command named one.
+    ///
+    /// `None` for a service-account token, which has no user identity to ask.
+    async fn credential_org(&self) -> Result<Option<String>> {
+        Ok(self
+            .optional_user_auth_context()
+            .await?
+            .map(|context| context.org_name)
+            .filter(|org| !org.is_empty()))
     }
 
     /// Resolve a target to its numeric id without fetching the full project.
@@ -298,13 +308,25 @@ impl CloudClient {
     /// whole project for that costs a round trip per call, and the id cannot
     /// change for the life of a command.
     pub async fn resolve_id(&self, target: &ProjectTarget) -> Result<i64> {
+        Ok(self.resolve_id_and_org(target).await?.0)
+    }
+
+    /// Resolve a target to its id and to the org of the listing that resolved
+    /// it, so a caller can attribute a payload Spice Cloud returns without one.
+    ///
+    /// The org is a by-product of the resolution rather than a second lookup:
+    /// discarding it here is what left the default path unable to name an org
+    /// it had already been told.
+    async fn resolve_id_and_org(&self, target: &ProjectTarget) -> Result<(i64, Option<String>)> {
         // A listing this client asked an organization for describes that
         // organization, so the identity is not worth a round trip: it would
         // answer with the org the credential is bound to, and every project
         // would be attributed to it.
         if let Some(org) = self.org.as_deref() {
             let projects = self.list_projects().await?;
-            return resolve_project_id(&projects, target, resolve_listing_org(Some(org), None));
+            let listing_org = resolve_listing_org(Some(org), None);
+            let id = resolve_project_id(&projects, target, listing_org)?;
+            return Ok((id, listing_org.map(ToString::to_string)));
         }
 
         // Nothing named an organization, so the listing is the credential's
@@ -312,7 +334,9 @@ impl CloudClient {
         let (context, projects) =
             tokio::try_join!(self.optional_user_auth_context(), self.list_projects())?;
         let credential_org = context.as_ref().map(|c| c.org_name.as_str());
-        resolve_project_id(&projects, target, resolve_listing_org(None, credential_org))
+        let listing_org = resolve_listing_org(None, credential_org);
+        let id = resolve_project_id(&projects, target, listing_org)?;
+        Ok((id, listing_org.map(ToString::to_string)))
     }
 
     /// List deployments for an already-resolved project.
@@ -396,7 +420,17 @@ impl CloudClient {
             .create_project(&request)
             .await
             .map_err(|error| self.err(error))?;
-        Ok(self.attribute(project, None))
+
+        // Spice Cloud creates the project in the org this client acts on, so
+        // that org is its org. There is no listing here to learn it from, so
+        // when the command named none it is worth asking the identity for the
+        // credential's own — a create is a one-off, and the alternative is a
+        // `--output json` payload that cannot say where the project now lives.
+        let created_in = match self.org {
+            Some(_) => None,
+            None => self.credential_org().await?,
+        };
+        Ok(self.attribute(project, created_in.as_deref()))
     }
 
     pub async fn update_project(
@@ -431,7 +465,10 @@ impl CloudClient {
             .update_project(app.id, &request)
             .await
             .map_err(|error| self.err(error))?;
-        Ok(self.attribute(project, target.org.as_deref()))
+        // The project this update just read is the same one, already attributed
+        // by the resolution above, so the update response costs no extra lookup
+        // to name.
+        Ok(self.attribute(project, Some(app.org.as_str())))
     }
 
     pub async fn delete_project(&self, target: &ProjectTarget) -> Result<()> {
@@ -1404,6 +1441,45 @@ mod tests {
             rendered.contains("'spicehq'") && rendered.contains("login token --org spicehq"),
             "the error must name the org and how to authenticate for it: {rendered}"
         );
+    }
+
+    /// A client that names no org, as `spice cloud project get <name>` builds.
+    fn client_without_an_org() -> CloudClient {
+        CloudClient::with_token_for_org_at("token", None, "https://api.spice.ai")
+            .expect("cloud client should build")
+    }
+
+    #[test]
+    fn a_payload_is_attributed_to_the_org_that_resolved_it() {
+        // Regression for the default path: with no `--org` and no active org,
+        // both the target and the client name no org, and the org the
+        // resolution had already learned from the identity was discarded — so
+        // `project get <name>` printed a bare name and serialized `"org": ""`
+        // for a project `spice cloud projects`, on the same credential, had
+        // just listed as `<org>/<name>`.
+        let attributed =
+            client_without_an_org().attribute(test_app(812, "docs", ""), Some("lukekim"));
+
+        assert_eq!(attributed.org, "lukekim");
+        assert_eq!(attributed.full_name(), "lukekim/docs");
+    }
+
+    #[test]
+    fn attribution_never_overrides_an_org_the_payload_carries() {
+        let attributed =
+            client_without_an_org().attribute(test_app(1, "docs", "spiceai"), Some("lukekim"));
+
+        assert_eq!(attributed.org, "spiceai");
+    }
+
+    #[test]
+    fn attribution_is_absent_rather_than_guessed_when_no_org_is_known() {
+        // A service-account credential has no user identity, so nothing can
+        // name an org — a bare name is the honest answer, not a made-up one.
+        let attributed = client_without_an_org().attribute(test_app(1, "docs", ""), None);
+
+        assert_eq!(attributed.org, "");
+        assert_eq!(attributed.full_name(), "docs");
     }
 
     #[test]
