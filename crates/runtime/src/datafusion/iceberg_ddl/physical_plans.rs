@@ -144,6 +144,18 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         None
     }
 
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // An Iceberg `CREATE TABLE` declares no `on_schema_change`; the table's schema is
+        // the one the DDL states.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // The point of the table is to be written by DML, so a scan of it must always
+        // read its own writes.
+        true
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }
