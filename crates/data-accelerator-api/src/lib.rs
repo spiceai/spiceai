@@ -526,10 +526,14 @@ pub trait DataAccelerator: Send + Sync {
     /// Asking through this method is what keeps one engine from naming another's
     /// concrete type. Defaults to unsupported, which is the true answer for an engine
     /// that keeps no path-keyed databases of its own.
+    ///
+    /// `dataset_name` names the dataset whose state this sidecar holds — the sidecar
+    /// stores it as such and namespaces rows by it. It is NOT a `spice_sys_*` table
+    /// name; passing one would file a dataset's checkpoints under a table.
     async fn sidecar_for_path(
         &self,
         path: &str,
-        _table_name: &str,
+        _dataset_name: &str,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         Err(CheckpointError::Store {
             source: format!(

@@ -584,7 +584,7 @@ impl DataAccelerator for TursoAccelerator {
     async fn sidecar_for_path(
         &self,
         path: &str,
-        table_name: &str,
+        dataset_name: &str,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
         let pool = self
             .get_shared_pool_for_path(path)
@@ -594,7 +594,7 @@ impl DataAccelerator for TursoAccelerator {
             })?;
         Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
             pool,
-            table_name.to_string(),
+            dataset_name.to_string(),
         )))
     }
 
@@ -1932,14 +1932,19 @@ mod tests {
         cleanup_turso_test_files(&metastore);
         cleanup_turso_test_files(&unrelated);
     }
-    /// Cayenne asks for its metastore sidecar through `&dyn DataAccelerator`, so what
-    /// matters is that the Turso engine *answers* `sidecar_for_path` rather than falling
-    /// through to the trait's unsupported default — the silent version of this bug is a
-    /// metastore reporting "no accelerator hosts databases" at run time.
+    /// Cayenne asks for its metastore sidecar through `&dyn DataAccelerator`, so this
+    /// pins two things about that substitution.
     ///
-    /// It must also arrive over the shared, path-keyed pool: the lock serializing sidecar
-    /// DDL against a concurrent `BEGIN CONCURRENT` write lives on the pool instance, so a
-    /// sidecar over a pool of its own would hold a lock nothing else observes.
+    /// First, the Turso engine must *answer* `sidecar_for_path` rather than fall through
+    /// to the trait's unsupported default — the silent version of that bug is a metastore
+    /// reporting at run time that no accelerator hosts databases.
+    ///
+    /// Second, the sidecar must arrive over the engine's own path-keyed pool, because the
+    /// lock serializing sidecar DDL against a concurrent `BEGIN CONCURRENT` write lives on
+    /// the pool instance: a sidecar holding a private pool would hold a lock nothing else
+    /// observes. That is asserted by strong count on the cached `Arc`, taken from the SAME
+    /// accelerator instance the sidecar is built on — comparing pools across two instances
+    /// proves nothing, since the cache is per-instance and a private pool would pass.
     #[tokio::test]
     async fn sidecar_for_path_answers_through_the_trait_and_shares_the_pool() {
         let dir = std::env::temp_dir().join("spice_turso_sidecar_for_path");
@@ -1947,28 +1952,24 @@ mod tests {
         let metastore = dir.join("cayenne.db").to_string_lossy().to_string();
         cleanup_turso_test_files(&metastore);
 
-        let engine: Arc<dyn DataAccelerator> = Arc::new(TursoAccelerator::new());
-        assert!(
-            engine
-                .sidecar_for_path(&metastore, "spice_sys_dataset_checkpoint")
-                .await
-                .is_ok(),
-            "the Turso engine must answer sidecar_for_path, not take the unsupported default"
-        );
-
         let accelerator = TursoAccelerator::new();
-        let first = accelerator
+        let cached = accelerator
             .get_shared_pool_for_path(&metastore)
             .await
             .expect("a pool should resolve for the metastore path");
-        let second = accelerator
-            .get_shared_pool_for_path(&metastore)
+        let before = Arc::strong_count(&cached);
+
+        let engine: &dyn DataAccelerator = &accelerator;
+        let sidecar = engine
+            .sidecar_for_path(&metastore, "orders")
             .await
-            .expect("a second request for the same path should resolve");
+            .expect("the Turso engine must answer sidecar_for_path, not take the default");
+
         assert!(
-            Arc::ptr_eq(&first, &second),
-            "one pool per file, or the DDL lock is not shared"
+            Arc::strong_count(&cached) > before,
+            "the sidecar must hold the pool already cached for this path, not one of its own"
         );
+        drop(sidecar);
 
         cleanup_turso_test_files(&metastore);
     }
