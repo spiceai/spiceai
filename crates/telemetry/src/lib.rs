@@ -1308,6 +1308,30 @@ pub mod cayenne {
         .add(1, dimensions);
     }
 
+    static PK_INDEX_PRESERVED: OnceLock<Counter<u64>> = OnceLock::new();
+
+    /// Counts a bloomed sharded PK existence index that a relocation-only
+    /// invalidation SPARED instead of dropping, by the site that spared it.
+    /// `dimensions` should carry `table` and `site`.
+    ///
+    /// The counterpart to `cayenne_pk_index_discard_total`: together they say whether
+    /// the experiment removed the discards it was aimed at, and which invalidation
+    /// site was producing them. `site` is `"checkpoint_location_flip"` (a mem-tier or
+    /// inline checkpoint moving rows from the memtable into files, which has nothing
+    /// to flip on a bloom) or `"relocation"` (a compaction or snapshot rewrite).
+    pub fn track_pk_index_preserved(dimensions: &[KeyValue]) {
+        PK_INDEX_PRESERVED
+            .get_or_init(|| {
+                operational_meter()
+                    .u64_counter("cayenne_pk_index_preserved_total")
+                    .with_description(
+                        "Times a bloomed sharded PK existence index was preserved across a relocation-only invalidation instead of being dropped, by site.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+
     static PK_INDEX_DISCARD: OnceLock<Counter<u64>> = OnceLock::new();
 
     /// Counts a checked-out PK existence index that had to be dropped instead of

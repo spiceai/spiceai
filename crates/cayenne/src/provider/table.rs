@@ -1680,6 +1680,14 @@ pub struct CayenneTableProvider {
     /// re-armed by `clear_cached_pk_keyset`. Shared across clones so every
     /// writer observes the same probe state.
     pk_warm_probe_done: Arc<AtomicBool>,
+    /// Whether the sharded PK index is a `Bloom` rather than an exact keyset.
+    ///
+    /// Needed because the invalidation sites run while the index may be CHECKED OUT
+    /// — the cache cell is then `None`, so its representation cannot be inspected
+    /// there. Degrading is one-way for the life of an index, so this tracks the last
+    /// representation cached (or degraded into) and is a sound answer for whatever is
+    /// currently out.
+    sharded_index_is_bloom: Arc<AtomicBool>,
     /// Resident-byte components of the two PK caches, published as their SUM
     /// through `table_memory.set_keyset_bytes` (a single slot — writing one
     /// cache's size alone would under-account the other by up to a full budget
@@ -6456,6 +6464,7 @@ impl CayenneTableProvider {
             pk_keyset_pending: Arc::new(ParkingMutex::new(PendingPkKeys::default())),
             sharded_pk_keyset_pending: Arc::new(ParkingMutex::new(PendingPkKeys::default())),
             pk_warm_probe_done: Arc::new(AtomicBool::new(false)),
+            sharded_index_is_bloom: Arc::new(AtomicBool::new(false)),
             pk_keyset_bytes_single: Arc::new(AtomicUsize::new(0)),
             pk_keyset_bytes_sharded: Arc::new(AtomicUsize::new(0)),
             pk_keyset_publish_lock: Arc::new(ParkingMutex::new(())),
@@ -7683,6 +7692,7 @@ impl CayenneTableProvider {
             pk_keyset_pending: Arc::clone(&self.pk_keyset_pending),
             sharded_pk_keyset_pending: Arc::clone(&self.sharded_pk_keyset_pending),
             pk_warm_probe_done: Arc::clone(&self.pk_warm_probe_done),
+            sharded_index_is_bloom: Arc::clone(&self.sharded_index_is_bloom),
             pk_keyset_bytes_single: Arc::clone(&self.pk_keyset_bytes_single),
             pk_keyset_bytes_sharded: Arc::clone(&self.pk_keyset_bytes_sharded),
             pk_keyset_publish_lock: Arc::clone(&self.pk_keyset_publish_lock),
@@ -8203,6 +8213,40 @@ impl CayenneTableProvider {
         true
     }
 
+    /// Whether to preserve a bloomed sharded PK index across a relocation-only
+    /// invalidation (a mem-tier/inline checkpoint moving rows between locations, or a
+    /// compaction rewriting files) instead of dropping it.
+    ///
+    /// EXPERIMENTAL, default off. Sound for a `Bloom`: those events REMOVE keys and
+    /// move rows, they never ADD one, so the filter stays a valid superset — a stale
+    /// positive costs a redundant delete, the same trade the bloom fallback already
+    /// makes. Unsound for an exact keyset, whose per-key `RowLocation`s the move
+    /// invalidates, so this never applies to one.
+    fn preserve_bloom_on_relocation() -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("SPICE_CAYENNE_PRESERVE_BLOOM_ON_RELOCATION")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        });
+        *ENABLED
+    }
+
+    /// Whether this relocation-only invalidation may leave the sharded index alone:
+    /// the feature is on and the index is (or was checked out as) a bloom.
+    fn may_preserve_sharded_bloom(&self) -> bool {
+        Self::preserve_bloom_on_relocation()
+            && self.sharded_index_is_bloom.load(Ordering::Acquire)
+    }
+
+    /// Count a preserved sharded bloom, by which invalidation site spared it, so a
+    /// run shows whether the discards it removed were checkpoint-driven or
+    /// compaction-driven.
+    fn track_pk_index_preserved(&self, site: &'static str) {
+        telemetry::cayenne::track_pk_index_preserved(&[
+            telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+            telemetry::KeyValue::new("site", site),
+        ]);
+    }
+
     /// Count a dropped PK existence index against
     /// `cayenne_pk_index_discard_total`. `reason` comes from the restore and is
     /// `None` only when the index may be cached, which the callers have already
@@ -8453,6 +8497,20 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn clear_cached_pk_keyset(&self) {
+        self.clear_cached_pk_keyset_inner(false);
+    }
+
+    /// [`Self::clear_cached_pk_keyset`] for a RELOCATION-only event — a compaction or
+    /// snapshot rewrite that moves rows and folds tombstones. Such an event removes
+    /// keys and moves them; it never adds one, so a bloomed sharded index stays a
+    /// valid superset and is spared (behind
+    /// `SPICE_CAYENNE_PRESERVE_BLOOM_ON_RELOCATION`). Everything else — the exact
+    /// keyset, the cold view, the OCC flag — is cleared exactly as before.
+    pub(crate) fn clear_cached_pk_keyset_after_relocation(&self) {
+        self.clear_cached_pk_keyset_inner(self.may_preserve_sharded_bloom());
+    }
+
+    fn clear_cached_pk_keyset_inner(&self, preserve_sharded_bloom: bool) {
         {
             let mut guard = self.pk_keyset_cache.lock();
             // An index checked out for validation is not in the cell, so emptying it
@@ -8474,8 +8532,13 @@ impl CayenneTableProvider {
         // is never populated, so this is a no-op there.
         {
             let mut sharded = self.sharded_pk_keyset_cache.lock();
-            self.sharded_pk_keyset_pending.lock().invalidate();
-            *sharded = None;
+            if preserve_sharded_bloom {
+                self.track_pk_index_preserved("relocation");
+            } else {
+                self.sharded_pk_keyset_pending.lock().invalidate();
+                *sharded = None;
+                self.sharded_index_is_bloom.store(false, Ordering::Release);
+            }
         }
         // The cold-tier PK existence view is tied to the same keyset generation
         // (a promotion that changes the cold manifest calls this on commit), so
@@ -8483,7 +8546,9 @@ impl CayenneTableProvider {
         // manifest via `resolve_cold_keyset_source`.
         self.store_cold_pk_existence(None);
         self.publish_single_keyset_bytes(0);
-        self.publish_sharded_keyset_bytes(0);
+        if !preserve_sharded_bloom {
+            self.publish_sharded_keyset_bytes(0);
+        }
         // Re-arm the write-path warm-cache probe: if the event that cleared
         // the caches also emptied the table (delete-all/TRUNCATE), the next
         // write re-installs warm empty caches instead of paying a rebuild.
@@ -8535,8 +8600,16 @@ impl CayenneTableProvider {
             }
         } else if sharded.is_none() {
             // Checked out for validation (or cold, where this is a no-op) — see the
-            // single-index arm above.
-            self.sharded_pk_keyset_pending.lock().invalidate();
+            // single-index arm above. A checked-out BLOOM is exempt: it carries no
+            // per-key `RowLocation`, so this flip has nothing to apply to it and
+            // nothing to invalidate (the cached-bloom arm above is already a no-op
+            // for the same reason). Dropping it anyway costs a full O(live-rows)
+            // rebuild on the apply thread.
+            if self.may_preserve_sharded_bloom() {
+                self.track_pk_index_preserved("checkpoint_location_flip");
+            } else {
+                self.sharded_pk_keyset_pending.lock().invalidate();
+            }
         }
     }
 
@@ -8671,6 +8744,7 @@ impl CayenneTableProvider {
                     if self.upsert_bloom_eligible() {
                         let per_shard = max_bytes / index.shard_count().max(1);
                         index.degrade_to_blooms(per_shard);
+                        self.sharded_index_is_bloom.store(true, Ordering::Release);
                         // The bounded insert stopped at the budget and the
                         // degrade only converted what was already held, so the
                         // rest of this batch is missing from the bloom. An
@@ -8826,6 +8900,8 @@ impl CayenneTableProvider {
             return;
         }
         let bytes = index.approx_bytes();
+        self.sharded_index_is_bloom
+            .store(matches!(index, ShardedPkIndex::Bloom(_)), Ordering::Release);
         *guard = Some(index);
         drop(guard);
         self.publish_sharded_keyset_bytes(bytes);
@@ -11608,6 +11684,7 @@ impl CayenneTableProvider {
                         "sharded PK keyset exceeded its byte budget; degrading to bounded per-shard blooms (existence stays sound - a false positive costs only a redundant delete and a false negative cannot occur; per-key sequences and captured positions are dropped until the next rebuild)"
                     );
                     index.degrade_to_blooms(max_bytes / index.shard_count().max(1));
+                    self.sharded_index_is_bloom.store(true, Ordering::Release);
                 } else {
                     bytes = Some(resident);
                 }
@@ -20451,7 +20528,7 @@ impl CayenneTableProvider {
         // Clear protected snapshots - after compaction all data is in the main snapshot
         self.protected_snapshots.store(Arc::new(HashMap::new()));
 
-        self.clear_cached_pk_keyset();
+        self.clear_cached_pk_keyset_after_relocation();
 
         // Compaction folded the deletions into rewritten files, so the in-memory
         // key/position delete state is empty again — release its reservation.
@@ -20489,7 +20566,7 @@ impl CayenneTableProvider {
             });
         }
 
-        self.clear_cached_pk_keyset();
+        self.clear_cached_pk_keyset_after_relocation();
         self.table_memory.set_deletion_bytes(0);
 
         tracing::debug!(
@@ -20586,7 +20663,7 @@ impl CayenneTableProvider {
 
         // The visible PK set used for auto-conflict detection may reference rows
         // whose physical location just changed; drop it so it is rebuilt lazily.
-        self.clear_cached_pk_keyset();
+        self.clear_cached_pk_keyset_after_relocation();
 
         tracing::debug!(
             target: "cayenne::compaction",
