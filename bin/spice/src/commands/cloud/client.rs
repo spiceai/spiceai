@@ -1252,7 +1252,20 @@ pub async fn first_user_credential(
         return Ok(Some(token.clone()));
     }
 
-    Ok(undescribed.cloned())
+    let Some(token) = undescribed else {
+        return Ok(None);
+    };
+
+    // Confirm the fallback the same way, or the one credential that skips the
+    // check is the one nothing could describe — and both link stages choose
+    // independently, so an unconfirmed choice here is one the other stage may
+    // not make.
+    if let Some(org) = org {
+        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
+        confirm_org_access(&client, org).await?;
+    }
+
+    Ok(Some(token.clone()))
 }
 
 /// The auth-context endpoint did not describe a user for this credential.
