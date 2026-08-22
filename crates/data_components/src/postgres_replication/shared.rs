@@ -6657,8 +6657,15 @@ mod tests {
             .await
             .expect("t0 envelope")
             .expect("t0 envelope is not an error");
+        // Built, not hinted. `num_rows_hint` is an estimate precomputed beside
+        // the buffered chunks, so it keeps claiming a row after the chunks have
+        // been dropped — the exact shape of the regression this test names. Only
+        // the built batch proves the change survived the filter.
         assert_eq!(
-            t0.num_rows_hint(),
+            t0.change_batch()
+                .expect("the surviving change builds")
+                .record
+                .num_rows(),
             1,
             "a transaction this member did not write back is delivered unchanged"
         );
@@ -6822,6 +6829,17 @@ mod tests {
         )
         .await;
 
+        // Claim the first pass's envelope before replaying. An unclaimed
+        // `Changes` tail absorbs the next publish — `try_publish` folds a
+        // compatible envelope into it rather than appending an item — so leaving
+        // it unread would merge the replay into the first delivery and there
+        // would be only one envelope to read, not two.
+        let first = receivers[0]
+            .next()
+            .await
+            .expect("first ack")
+            .expect("not an error");
+
         // Reconnect replay of the very same transaction, no prune in between.
         deliver_one_commit(
             &source,
@@ -6835,11 +6853,6 @@ mod tests {
 
         // Both passes produced a zero-row ack for t0, never a data envelope: the
         // echo was dropped on the replay just as on the first delivery.
-        let first = receivers[0]
-            .next()
-            .await
-            .expect("first ack")
-            .expect("not an error");
         let second = receivers[0]
             .next()
             .await
