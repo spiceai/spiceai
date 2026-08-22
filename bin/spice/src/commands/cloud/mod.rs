@@ -4893,11 +4893,17 @@ mod tests {
         let reason = "its runtime is reachable only from that cluster";
 
         let instances = instances_not_inspected_note(&target, reason);
-        assert!(instances.contains("spicehq/team-app"), "note was: {instances}");
+        assert!(
+            instances.contains("spicehq/team-app"),
+            "note was: {instances}"
+        );
         assert!(instances.contains(reason), "note was: {instances}");
 
         let datasets = dataset_health_not_reported_note(&target, reason);
-        assert!(datasets.contains("spicehq/team-app"), "note was: {datasets}");
+        assert!(
+            datasets.contains("spicehq/team-app"),
+            "note was: {datasets}"
+        );
         assert!(datasets.contains(reason), "note was: {datasets}");
     }
 
