@@ -1173,6 +1173,20 @@ pub fn user_credential_candidates(requested: Option<&str>) -> Vec<String> {
     candidates
 }
 
+/// Whether an organization check refused this particular credential.
+///
+/// A refusal reaches us under two codes, because two different questions can
+/// ask it: the identity probe renders one as `OrgForbidden`, and the scoped
+/// project listing renders its own as `Forbidden`. Both say the same thing —
+/// *this* credential may not act there — which is a fact about the credential,
+/// not about the request, so another credential is still worth trying.
+fn is_org_refusal(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::OrgForbidden | CloudErrorCode::Forbidden)
+    )
+}
+
 /// Whether a failed organization probe leaves access undecided.
 ///
 /// The identity endpoint answers 404 for several conditions — including an
@@ -1229,43 +1243,57 @@ pub async fn first_user_credential(
     endpoint: &str,
     org: Option<&str>,
 ) -> Result<Option<String>> {
-    let mut undescribed: Option<&String> = None;
+    // A credential Spice Cloud describes wins, but only among those that may
+    // actually act on the organization: a refusal is a fact about one
+    // credential, so it disqualifies that candidate rather than the search.
+    let mut fallback: Option<&String> = None;
+    let mut refusal: Option<crate::error::Error> = None;
 
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if let Err(err) = client.get_auth_context().await {
-            match classify_identity_failure(&err) {
+
+        let described = match client.get_auth_context().await {
+            Ok(_) => true,
+            Err(err) => match classify_identity_failure(&err) {
                 IdentityFailure::Rejected => continue,
+                IdentityFailure::Fatal => return Err(err),
                 IdentityFailure::Undescribed => {
                     tracing::debug!(
-                        "Spice Cloud did not describe the identity behind a stored credential ({err}); keeping it as a fallback"
+                        "Spice Cloud did not describe the identity behind a stored credential ({err}); considering it a fallback"
                     );
-                    undescribed.get_or_insert(token);
-                    continue;
+                    false
                 }
-                IdentityFailure::Fatal => return Err(err),
+            },
+        };
+
+        if let Some(org) = org
+            && let Err(err) = confirm_org_access(&client, org).await
+        {
+            if !is_org_refusal(&err) {
+                return Err(err);
             }
+            tracing::debug!("A stored credential may not act on organization '{org}' ({err}); trying the next one");
+            refusal = Some(err);
+            continue;
         }
-        if let Some(org) = org {
-            confirm_org_access(&client, org).await?;
+
+        if described {
+            return Ok(Some(token.clone()));
         }
+        fallback.get_or_insert(token);
+    }
+
+    if let Some(token) = fallback {
         return Ok(Some(token.clone()));
     }
 
-    let Some(token) = undescribed else {
-        return Ok(None);
-    };
-
-    // Confirm the fallback the same way, or the one credential that skips the
-    // check is the one nothing could describe — and both link stages choose
-    // independently, so an unconfirmed choice here is one the other stage may
-    // not make.
-    if let Some(org) = org {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        confirm_org_access(&client, org).await?;
+    // Nothing was usable. A refusal explains that far better than the caller's
+    // "no user login" fallback message, so surface it.
+    if let Some(err) = refusal {
+        return Err(err);
     }
 
-    Ok(Some(token.clone()))
+    Ok(None)
 }
 
 /// The auth-context endpoint did not describe a user for this credential.
@@ -1715,6 +1743,21 @@ mod tests {
             !org_probe_is_inconclusive(&refused),
             "a refusal is conclusive and must be surfaced: {refused}"
         );
+    }
+
+    /// A refusal disqualifies one credential, not the search — and it arrives
+    /// under two codes, since the identity probe and the scoped listing render
+    /// theirs differently. Missing either would abort the search on a
+    /// credential that was merely the wrong one to try.
+    #[test]
+    fn both_renderings_of_a_refusal_disqualify_only_that_credential() {
+        let from_identity_probe = Error::cloud(CloudErrorCode::OrgForbidden, "not a member");
+        let from_scoped_listing = Error::cloud(CloudErrorCode::Forbidden, "not permitted");
+        let not_a_refusal = Error::cloud(CloudErrorCode::ApiError, "boom");
+
+        assert!(is_org_refusal(&from_identity_probe));
+        assert!(is_org_refusal(&from_scoped_listing));
+        assert!(!is_org_refusal(&not_a_refusal));
     }
 
     /// 401 is the one answer that disqualifies a credential; 404 leaves it
