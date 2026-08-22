@@ -2378,15 +2378,17 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
-        Err(err) if client::is_unauthorized_auth_context_error(&err) => {
-            // The auth-context endpoint requires a user token (subscription
-            // or PAT). Service-account tokens (OAuth client credentials) are
-            // valid for API calls but do not have a user identity.
+        Err(err) if client::is_absent_user_identity_error(&err) => {
+            // The auth-context endpoint answers for user tokens (subscription
+            // or PAT) only. A service-account token (OAuth client credentials)
+            // authenticates API calls but carries no user identity, and the
+            // endpoint can also have no user record to return. Both leave the
+            // credential usable, so report that rather than the raw failure.
             if client.list_projects().await.is_ok() {
                 return Err(Error::cloud_with_hint(
                     CloudErrorCode::Forbidden,
-                    "User identity is not available for this authentication method. The current credential is a valid service-account token and can be used for API calls, but has no user identity.",
-                    "Run 'spice cloud login subscription' or 'spice cloud login token' to obtain a user token.",
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself works: it listed this organization's projects, and 'spice cloud projects', 'deploy', and 'logs' will keep working.",
+                    "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
                 ));
             }
             return Err(err);
@@ -2799,14 +2801,34 @@ async fn user_token_for_cloud_connect(
         ));
     }
 
+    // A credential the identity endpoint cannot describe (404) is not the same
+    // as one it rejects (401): the first leaves the token's kind unknown, the
+    // second proves it unusable. Keep the unknown ones as a fallback so a
+    // silent identity endpoint cannot strand a user who is logged in, and let
+    // the server — the authority on what a token may do — answer for real.
+    let mut unidentified: Option<String> = None;
+
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
-            continue;
+        match client.get_auth_context().await {
+            Ok(_) => {}
+            Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => continue,
+            Err(err) if client::is_absent_user_identity_error(&err) => {
+                tracing::debug!(
+                    "Spice Cloud did not describe the identity behind a stored credential ({err}); keeping it as a fallback for {command}"
+                );
+                unidentified.get_or_insert(token);
+                continue;
+            }
+            Err(err) => return Err(err),
         }
         if let Some(org) = requested_org {
             client.get_auth_context_for_org(org).await?;
         }
+        return Ok(token);
+    }
+
+    if let Some(token) = unidentified {
         return Ok(token);
     }
 
@@ -4808,7 +4830,7 @@ mod tests {
     fn is_cloud_unauthorized_error_matches_a_rejected_credential() {
         let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired");
 
-        assert!(client::is_unauthorized_auth_context_error(&err));
+        assert!(client::is_absent_user_identity_error(&err));
     }
 
     #[test]
@@ -4817,7 +4839,7 @@ mod tests {
         // not allowed — that must not be mistaken for a missing user identity.
         let err = Error::cloud(CloudErrorCode::Forbidden, "Forbidden: missing scope");
 
-        assert!(!client::is_unauthorized_auth_context_error(&err));
+        assert!(!client::is_absent_user_identity_error(&err));
     }
 
     #[test]

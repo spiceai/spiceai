@@ -238,7 +238,7 @@ impl CloudClient {
     pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
         match self.get_auth_context().await {
             Ok(ctx) => Ok(Some(ctx)),
-            Err(err) if is_unauthorized_auth_context_error(&err) => Ok(None),
+            Err(err) if is_absent_user_identity_error(&err) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -1086,12 +1086,18 @@ fn build_executor(
     })
 }
 
-/// A rejected credential on the auth-context endpoint.
+/// The auth-context endpoint did not describe a user for this credential.
 ///
-/// Service-account tokens are valid for the management API but have no user
-/// identity, so callers that only want the identity treat this as "absent".
-pub fn is_unauthorized_auth_context_error(err: &crate::error::Error) -> bool {
-    err.cloud_code() == Some(CloudErrorCode::TokenExpired)
+/// Two answers mean the same thing to a caller that only wants the identity:
+/// the endpoint rejected the credential (401), or it has no user record to
+/// return for it (404). Service-account tokens are valid for the management
+/// API but have no user identity, so both are "absent" rather than fatal —
+/// a caller that needs the identity says so with its own error.
+pub fn is_absent_user_identity_error(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::TokenExpired | CloudErrorCode::NotFound)
+    )
 }
 
 pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool {
@@ -1492,6 +1498,19 @@ mod tests {
         });
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::TokenExpired));
-        assert!(is_unauthorized_auth_context_error(&err));
+        assert!(is_absent_user_identity_error(&err));
+    }
+
+    /// Spice Cloud answers the identity endpoint with 404 for credentials it
+    /// cannot describe. Treating that as fatal blocks `spice cloud link` and
+    /// `spice cloud whoami` behind an identity neither of them requires.
+    #[test]
+    fn not_found_is_an_absent_identity_rather_than_a_failure() {
+        let err = map_cloud_error(None)(spice_cloud_client::error::Error::NotFound {
+            message: "{}".to_string(),
+        });
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::NotFound));
+        assert!(is_absent_user_identity_error(&err));
     }
 }
