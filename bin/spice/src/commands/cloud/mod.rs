@@ -2387,7 +2387,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
             if client.list_projects().await.is_ok() {
                 return Err(Error::cloud_with_hint(
                     CloudErrorCode::Forbidden,
-                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself works: it listed this organization's projects, and 'spice cloud projects', 'deploy', and 'logs' will keep working.",
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself still authenticates — Spice Cloud accepted it for a project listing — so 'spice cloud orgs', 'projects', 'deploy', and 'logs' keep working.",
                     "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
                 ));
             }

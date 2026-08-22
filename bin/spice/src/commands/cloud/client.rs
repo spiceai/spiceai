@@ -133,12 +133,32 @@ impl CloudClient {
         let default = org::default_token().ok_or_else(|| org_credential_missing(org))?;
 
         let probe = Self::with_token_for_org(default.clone(), None)?;
-        match probe.optional_user_auth_context().await? {
-            Some(_) => {
+        // Ask for the identity directly rather than through
+        // [`Self::optional_user_auth_context`]: that helper folds "rejected"
+        // and "cannot describe" into one absent answer, and they mean opposite
+        // things here.
+        match probe.get_auth_context().await {
+            Ok(_) => {
                 probe.get_auth_context_for_org(org).await?;
                 Self::with_token_for_org(default, Some(org))
             }
-            None => Err(org_credential_missing(org)),
+            // A rejected credential has no user membership to spend on another
+            // organization: it is a machine token, which stays org-bound.
+            Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => {
+                Err(org_credential_missing(org))
+            }
+            // No identity came back, so whether this is a user token — usable
+            // for every member org — is unknown. Declining would refuse a
+            // member their own organization on the strength of a lookup that
+            // failed, so send the request and let the server, which is
+            // authoritative on membership, answer.
+            Err(err) if is_absent_user_identity_error(&err) => {
+                tracing::debug!(
+                    "Spice Cloud did not describe the identity behind the default credential ({err}); acting on organization '{org}' with it and letting the server decide"
+                );
+                Self::with_token_for_org(default, Some(org))
+            }
+            Err(err) => Err(err),
         }
     }
 
