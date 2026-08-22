@@ -270,7 +270,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f2dad23247908d284a226cbb294ef7c3c08b16f1" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "eeb4ef30df95df118a50b56f3b19f5a6528a4530" } # branch: fix/duckdb-attach-swap-race (PR #55); repoint to spiceai-54 once merged
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
