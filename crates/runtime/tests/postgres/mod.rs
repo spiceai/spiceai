@@ -45,6 +45,8 @@ pub mod replication_shared;
 pub mod replication_tpch;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod schema_inference;
+#[cfg(all(feature = "postgres", not(target_os = "windows")))]
+pub mod write_back_delivery;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {

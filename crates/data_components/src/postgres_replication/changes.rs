@@ -344,18 +344,49 @@ pub struct PgChangeRows {
     /// merging pushes a `Vec` instead of moving every `Bytes` while holding the
     /// member mailbox lock.
     raw_chunks: Vec<Vec<bytes::Bytes>>,
-    /// The source transaction id (pgoutput's 32-bit stream xid) that produced
-    /// each entry of `raw_chunks`, same length and index-aligned. `None` for a
-    /// chunk built with no known xid (e.g. a test fixture); `xid` 0 is Postgres's
-    /// "no transaction assigned" sentinel and is likewise stored as `None`, which
-    /// is why the slot is a `NonZeroU32` — it also keeps the tag a compact 32 bits
-    /// with no separate discriminant. See [`Self::drop_echoed`] for what this drives.
-    chunk_xids: Vec<Option<NonZeroU32>>,
+    /// The source transaction ids behind `raw_chunks`, tracked only for a member
+    /// that can act on them. See [`ChunkXids`].
+    chunk_xids: ChunkXids,
     source_commit_ts_ms: Option<i64>,
     /// Precomputed `num_rows_hint` (upper bound) and `encoded_len` so the
     /// consumer's coalescing/metric reads are O(1) rather than rescanning `raw`.
     row_hint: usize,
     byte_len: usize,
+}
+
+/// The source transaction ids behind [`PgChangeRows`]'s buffered chunks.
+///
+/// Tracking them serves exactly one purpose: letting a durable write-back
+/// dataset recognize the echo of its own delivery. The shared pump therefore
+/// tracks them per *member*, and only for a member that holds an echo-suppression
+/// registry — every other dataset (which is every dataset in a deployment that
+/// does not write through Spice) allocates nothing and does no per-commit
+/// bookkeeping for a feature it cannot use, even while sharing a slot with a
+/// write-back table.
+enum ChunkXids {
+    /// This member suppresses no echoes, so no xid was recorded. Holds no
+    /// allocation.
+    Untracked,
+    /// One entry per `raw_chunks` entry, same length and index-aligned. `None`
+    /// for a chunk built with no known xid (e.g. a test fixture); `xid` 0 is
+    /// Postgres's "no transaction assigned" sentinel and is likewise stored as
+    /// `None`, which is why the slot is a `NonZeroU32` — it also keeps the tag a
+    /// compact 32 bits with no separate discriminant.
+    Tracked(Vec<Option<NonZeroU32>>),
+}
+
+/// What one [`PgChangeRows::drop_echoed`] pass observed about the source
+/// transactions buffered in an envelope.
+#[derive(Default)]
+pub(super) struct EchoScan {
+    /// The xids dropped as this dataset's own write-back echo, for the caller to
+    /// persist via [`XidRegistry::mark_commit_observed`].
+    pub(super) dropped: Vec<u32>,
+    /// Whether a chunk survived the filter carrying a transaction id this dataset
+    /// did not issue — a write to this table from outside Spice. Drives the
+    /// one-time external-writer report in
+    /// [`super::shared::MemberMailboxReceiver::pop`].
+    pub(super) saw_foreign_txn: bool,
 }
 
 impl PgChangeRows {
@@ -371,25 +402,30 @@ impl PgChangeRows {
             schema,
             relation,
             raw_chunks: vec![raw],
-            chunk_xids: vec![None],
+            // Only a member that can act on the xids pays for them; see
+            // `with_source_xid`, which the pump calls for exactly those members.
+            chunk_xids: ChunkXids::Untracked,
             source_commit_ts_ms,
             row_hint,
             byte_len,
         }
     }
 
-    /// Tag this instance's one transaction chunk with the source `xid` that
-    /// produced it (pgoutput's 32-bit stream xid), so a later
-    /// [`Self::drop_echoed`] can recognize whether it is the echo of this
-    /// dataset's own write-back delivery. Called once, immediately after
-    /// [`Self::new`], before any [`Self::try_append`].
+    /// Track the source `xid` (pgoutput's 32-bit stream xid) that produced this
+    /// instance's one transaction chunk, so a later [`Self::drop_echoed`] can
+    /// recognize whether it is the echo of this dataset's own write-back
+    /// delivery. Called once, immediately after [`Self::new`] and before any
+    /// [`Self::try_append`], and **only** for a member holding an
+    /// echo-suppression registry — a member without one leaves the envelope
+    /// [`ChunkXids::Untracked`] and allocates nothing.
     #[must_use]
     pub(super) fn with_source_xid(mut self, xid: Option<u32>) -> Self {
-        if let Some(slot) = self.chunk_xids.first_mut() {
-            // `xid` 0 is Postgres's "no transaction assigned" sentinel, so it
-            // collapses to `None` alongside a genuinely absent xid.
-            *slot = xid.and_then(NonZeroU32::new);
-        }
+        // `xid` 0 is Postgres's "no transaction assigned" sentinel, so it
+        // collapses to `None` alongside a genuinely absent xid.
+        self.chunk_xids = ChunkXids::Tracked(vec![
+            xid.and_then(NonZeroU32::new);
+            self.raw_chunks.len()
+        ]);
         self
     }
 
@@ -455,8 +491,15 @@ impl PgChangeRows {
             return Some(other);
         }
 
+        // Both sides come from the same member, so both were built with the same
+        // tracking decision. Declining a mixed merge costs a coalescing
+        // opportunity at worst, and never mis-attributes an xid to a chunk.
+        match (&mut self.chunk_xids, &mut other.chunk_xids) {
+            (ChunkXids::Untracked, ChunkXids::Untracked) => {}
+            (ChunkXids::Tracked(ours), ChunkXids::Tracked(theirs)) => ours.append(theirs),
+            _ => return Some(other),
+        }
         self.raw_chunks.append(&mut other.raw_chunks);
-        self.chunk_xids.append(&mut other.chunk_xids);
         self.row_hint = self.row_hint.saturating_add(other.row_hint);
         self.byte_len = self.byte_len.saturating_add(other.byte_len);
         self.source_commit_ts_ms = match (self.source_commit_ts_ms, other.source_commit_ts_ms) {
@@ -476,10 +519,9 @@ impl PgChangeRows {
     /// dataset that actually produced the echo pays for decoding (and
     /// immediately discarding) it, rather than every table sharing the pump.
     ///
-    /// Returns the dropped chunks' xids, for the caller to persist via
-    /// [`XidRegistry::mark_commit_observed`] — this method only reads the
+    /// Returns what the pass observed ([`EchoScan`]) — this method only reads the
     /// registry's lock-free membership mirror, never its own (async) state.
-    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> Vec<u32> {
+    pub(super) fn drop_echoed(&mut self, registry: &XidRegistry) -> EchoScan {
         // Compact both index-aligned vectors in place: keep a write cursor at the
         // next surviving slot, shift each kept chunk down over the gaps an echo
         // leaves, then truncate. When nothing echoes — the common case, since most
@@ -487,33 +529,45 @@ impl PgChangeRows {
         // lockstep with the scan, no swap runs, and the buffers (and their hints)
         // are left untouched, so a clean pop pays nothing beyond the membership
         // reads.
-        let mut dropped = Vec::new();
+        // Unreachable in production: the pump tracks xids for exactly the members
+        // that hold a registry, and only such a member calls this. Keeping every
+        // chunk is the safe direction for a state that should not arise — it
+        // delivers a change rather than discarding one.
+        let ChunkXids::Tracked(xids) = &mut self.chunk_xids else {
+            return EchoScan::default();
+        };
+        let mut scan = EchoScan::default();
         let mut kept = 0;
-        for read in 0..self.chunk_xids.len() {
-            if let Some(xid) = self.chunk_xids[read] {
+        for read in 0..xids.len() {
+            if let Some(xid) = xids[read] {
                 if registry.contains(xid.get()) {
                     // Leave the echoed chunk behind the write cursor; the final
                     // `truncate` discards it. Record its xid for the caller.
-                    dropped.push(xid.get());
+                    scan.dropped.push(xid.get());
                     continue;
                 }
+                // Surviving with a transaction id this dataset did not issue:
+                // someone else wrote this table. A chunk with no xid is not
+                // counted either way — only a positively identified foreign
+                // transaction is.
+                scan.saw_foreign_txn = true;
             }
             if read != kept {
                 self.raw_chunks.swap(read, kept);
-                self.chunk_xids.swap(read, kept);
+                xids.swap(read, kept);
             }
             kept += 1;
         }
-        if dropped.is_empty() {
-            return dropped;
+        if scan.dropped.is_empty() {
+            return scan;
         }
         self.raw_chunks.truncate(kept);
-        self.chunk_xids.truncate(kept);
+        xids.truncate(kept);
         let (row_hint, byte_len) =
             Self::compute_hints(&self.schema, self.raw_chunks.iter().flatten());
         self.row_hint = row_hint;
         self.byte_len = byte_len;
-        dropped
+        scan
     }
 }
 

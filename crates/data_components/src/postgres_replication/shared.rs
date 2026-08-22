@@ -1522,10 +1522,64 @@ impl<T> MailboxSendOutcome<T> {
 struct MemberMailboxReceiver {
     shared: Arc<MemberMailbox>,
     draining: Vec<PendingItem>,
-    /// This member's write-back registry, if it is a durable write-back
-    /// dataset. `None` for every other dataset, which makes `pop`'s echo-drop
-    /// check a single pointer read.
-    write_back_registry: Option<Arc<XidRegistry>>,
+    /// This member's echo filter, if it is a durable write-back dataset. `None`
+    /// for every other dataset, which makes `pop`'s echo-drop check a single
+    /// pointer read.
+    echo_filter: Option<EchoFilter>,
+}
+
+/// A durable write-back member's view of its own change stream: the registry
+/// that recognizes the echo of its deliveries, plus the once-per-dataset report
+/// that someone *else* is writing the same table.
+struct EchoFilter {
+    registry: Arc<XidRegistry>,
+    /// Named in the external-writer report, so an operator knows which dataset
+    /// to act on.
+    dataset_name: String,
+    /// Whether [`external_write_warning`] has already been reported for this
+    /// dataset. The receiver is owned by the single per-dataset consumer and
+    /// `pop` takes `&mut self`, so a plain `bool` needs no synchronization.
+    warned_external_write: bool,
+}
+
+impl EchoFilter {
+    fn new(registry: Arc<XidRegistry>, dataset_name: String) -> Self {
+        Self {
+            registry,
+            dataset_name,
+            warned_external_write: false,
+        }
+    }
+
+    /// The external-writer report to log for one envelope, or `None` — either no
+    /// foreign transaction reached it, or the report has already been made for
+    /// this dataset. Split out from the logging so the once-only behaviour is
+    /// asserted directly rather than through a captured subscriber.
+    fn external_write_report(&mut self, saw_foreign_txn: bool) -> Option<String> {
+        if !saw_foreign_txn || self.warned_external_write {
+            return None;
+        }
+        self.warned_external_write = true;
+        Some(external_write_warning(&self.dataset_name))
+    }
+}
+
+/// The one-time report a durable write-back dataset makes the first time a
+/// change reaches it from a transaction Spice did not issue.
+///
+/// Durable write-back delivers each committed accelerator row to the source as an
+/// unconditional `INSERT ... ON CONFLICT (pk) DO UPDATE` — it never compares
+/// against what the source currently holds — so it is safe only while the
+/// accelerator is the sole writer of the rows it delivers. A foreign transaction
+/// on the table is the only evidence the runtime ever gets that a deployment has
+/// left that regime, and it is worth saying out loud once.
+///
+/// Built here, and asserted in this module's tests, so a reword cannot silently
+/// drop the dataset name, the consequence, or the docs link.
+fn external_write_warning(dataset_name: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' received a change from a transaction Spice did not issue, so this table has a writer other than Spice and durable write-back may overwrite that writer's row on its next delivery: it upserts each committed row by primary key without comparing against the source. Write to '{dataset_name}' only through Spice, or use a different `write_mode` for its acceleration. Reported once per dataset per run. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    )
 }
 
 impl MemberMailboxReceiver {
@@ -1553,11 +1607,19 @@ impl MemberMailboxReceiver {
         // recognizes as one of its own write-back deliveries. `contains` is a
         // lock-free mirror read, so this never blocks; a member with no
         // registry (the overwhelming majority of datasets) skips straight past.
-        if let (PendingItem::Changes(pending), Some(registry)) =
-            (&mut item, self.write_back_registry.as_ref())
+        if let (PendingItem::Changes(pending), Some(filter)) =
+            (&mut item, self.echo_filter.as_mut())
         {
-            let dropped = pending.rows.drop_echoed(registry);
-            if !dropped.is_empty() {
+            let scan = pending.rows.drop_echoed(&filter.registry);
+            // A change from a transaction this dataset did not issue means the
+            // accelerator is not the only writer of this table, the one condition
+            // durable write-back cannot make safe. Report it once: every later
+            // foreign write says the same thing, and a per-envelope log would
+            // drown the stream it is describing.
+            if let Some(report) = filter.external_write_report(scan.saw_foreign_txn) {
+                tracing::warn!(dataset = %filter.dataset_name, "{report}");
+            }
+            if !scan.dropped.is_empty() {
                 // `flush_to` is this envelope's *latest* folded commit
                 // (coalescing takes the max — see `try_merge`), which can be
                 // at or after an earlier-folded dropped chunk's real commit
@@ -1572,8 +1634,9 @@ impl MemberMailboxReceiver {
                 // Spawned rather than awaited because `pop` drives a sync
                 // `Stream::poll_next` — `mark_commit_observed` cannot run
                 // inline without blocking it on the registry's async state.
-                let registry = Arc::clone(registry);
+                let registry = Arc::clone(&filter.registry);
                 let flush_to = pending.flush_to;
+                let dropped = scan.dropped;
                 tokio::spawn(async move {
                     for xid in dropped {
                         registry.mark_commit_observed(xid, flush_to).await;
@@ -1676,8 +1739,8 @@ fn member_mailbox_with_limits(
             // Set by the caller after construction for a write-back dataset
             // (see the member registration call site); every other caller
             // (including every test that isn't exercising echo-drop) leaves
-            // this `None`, matching the pre-refactor absence of a registry.
-            write_back_registry: None,
+            // this `None`, so the filter costs one pointer read per envelope.
+            echo_filter: None,
         },
     )
 }
@@ -2287,10 +2350,12 @@ async fn attach_member(
     // branch, keeping the held floor — so the replay this member is owed starts where
     // the slot resumed, not where a slot-mate was credited.
     let (sender, mut receiver) = member_mailbox(params.member_channel_capacity);
-    // This member's own echo-drop registry, if it is a durable write-back
-    // dataset (see `MemberMailboxReceiver::pop`) — cloned here because
+    // This member's own echo filter, if it is a durable write-back dataset (see
+    // `MemberMailboxReceiver::pop`) — the registry is cloned here because
     // `write_back_registry` itself is moved into `MemberHandle` below.
-    receiver.write_back_registry.clone_from(&write_back_registry);
+    receiver.echo_filter = write_back_registry
+        .clone()
+        .map(|registry| EchoFilter::new(registry, dataset_name.clone()));
     // Grouping signal for the analysis: record which shared slot this dataset joined.
     // (Membership liveness is marked by `mark_member_attached` below.)
     metrics.set_slot_name(source.key.slot_name.clone());
@@ -4273,8 +4338,16 @@ async fn deliver_commit(
             Arc::clone(rel),
             raw,
             commit_ts_ms,
-        )
-        .with_source_xid(current_txn_xid);
+        );
+        // Tag only a member that holds a registry: one without it can never match
+        // an xid, so tagging would buy nothing and cost an allocation per relation
+        // per commit. A slot with no write-back member therefore does no xid
+        // bookkeeping at all, and on a mixed slot only the write-back table pays.
+        let rows = if member.write_back_registry.is_some() {
+            rows.with_source_xid(current_txn_xid)
+        } else {
+            rows
+        };
         member.metrics.inc_transaction();
         // Lag-based readiness: this WAL envelope marks the dataset Ready only if
         // its source commit time is within the member's `ready_lag` of now, i.e.
@@ -6479,7 +6552,9 @@ mod tests {
             // The echo-drop decision now lives on the receiver (see
             // `MemberMailboxReceiver::pop`), so the test's registry must be
             // attached here too, matching the real member-registration path.
-            receiver.write_back_registry = registry.clone();
+            receiver.echo_filter = registry
+                .clone()
+                .map(|registry| EchoFilter::new(registry, table.to_string()));
             lock(&source.members).insert(
                 member_key.clone(),
                 Arc::new(MemberHandle {
@@ -6657,8 +6732,15 @@ mod tests {
             .await
             .expect("t0 envelope")
             .expect("t0 envelope is not an error");
+        // Built, not hinted. `num_rows_hint` is an estimate precomputed beside
+        // the buffered chunks, so it keeps claiming a row after the chunks have
+        // been dropped — the exact shape of the regression this test names. Only
+        // the built batch proves the change survived the filter.
         assert_eq!(
-            t0.num_rows_hint(),
+            t0.change_batch()
+                .expect("the surviving change builds")
+                .record
+                .num_rows(),
             1,
             "a transaction this member did not write back is delivered unchanged"
         );
@@ -6742,6 +6824,136 @@ mod tests {
         assert_eq!(t1.num_rows_hint(), 1, "t1 delivers as usual");
     }
 
+    /// The report is made on the first foreign transaction and never again, and
+    /// it carries the three things an operator acts on: which dataset, what
+    /// delivery may do to the other writer's row, and where to read more.
+    /// Asserted on the string so a reword cannot quietly drop one.
+    #[tokio::test]
+    async fn an_external_write_is_reported_once_and_names_the_dataset() {
+        // The registry's contents are irrelevant here — this asserts only the
+        // once-only report and its wording.
+        let mut filter = EchoFilter::new(registry_with_xid(1).await, "orders_wb".to_string());
+
+        assert!(
+            filter.external_write_report(false).is_none(),
+            "an envelope with no foreign transaction reports nothing"
+        );
+
+        let report = filter
+            .external_write_report(true)
+            .expect("the first foreign transaction is reported");
+        assert!(report.contains("'orders_wb'"), "names the dataset: {report}");
+        assert!(
+            report.contains("overwrite"),
+            "states what delivery may do to the other writer's row: {report}"
+        );
+        assert!(
+            report.contains("https://spiceai.org/docs/"),
+            "links the docs: {report}"
+        );
+        assert!(!report.contains('\n'), "stays on a single line: {report}");
+
+        assert!(
+            filter.external_write_report(true).is_none(),
+            "every later foreign transaction says the same thing and is not repeated"
+        );
+    }
+
+    /// A transaction Spice did not issue is reported: the write-back table has a
+    /// second writer, the one condition the feature cannot make safe. (That such
+    /// a transaction is also *delivered* is
+    /// `unregistered_xid_delivers_all_rows_on_write_back_member`.)
+    #[tokio::test]
+    async fn a_foreign_transaction_is_reported() {
+        let registry = registry_with_xid(11).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            800,
+            Some(22),
+        )
+        .await;
+
+        receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope")
+            .expect("not an error");
+        assert!(
+            receivers[0]
+                .echo_filter
+                .as_ref()
+                .expect("t0 has an echo filter")
+                .warned_external_write,
+            "the external writer is reported"
+        );
+    }
+
+    /// A dataset's own write-back echo must not be mistaken for someone else's
+    /// write — that would warn about the very writes the feature is delivering.
+    #[tokio::test]
+    async fn a_datasets_own_echo_is_not_reported_as_external() {
+        let xid = 33u32;
+        let registry = registry_with_xid(xid).await;
+        let (source, decoder, routes, mut receivers) = echo_scenario(Some(registry));
+
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "1")]),
+            810,
+            Some(xid),
+        )
+        .await;
+
+        let ack = receivers[0]
+            .next()
+            .await
+            .expect("t0 ack envelope")
+            .expect("not an error");
+        assert_eq!(ack.num_rows_hint(), 0, "the echo is dropped");
+        assert!(
+            !receivers[0]
+                .echo_filter
+                .as_ref()
+                .expect("t0 has an echo filter")
+                .warned_external_write,
+            "the dataset's own delivery is not an external write"
+        );
+    }
+
+    /// An envelope built for a member that suppresses no echoes carries no xids,
+    /// and the filter must then keep every chunk. Unreachable through the pump
+    /// (it tags exactly the members that hold a registry), but it pins the safe
+    /// direction: deliver the change rather than discard it.
+    #[tokio::test]
+    async fn an_untracked_envelope_keeps_every_chunk() {
+        let registry = registry_with_xid(7).await;
+        let mut rows = PgChangeRows::new(
+            tiny_schema(),
+            Arc::clone(&TINY_RELATION),
+            vec![Bytes::from_static(b"I")],
+            Some(0),
+        );
+
+        let scan = rows.drop_echoed(&registry);
+
+        assert!(scan.dropped.is_empty(), "nothing can match an untagged chunk");
+        assert!(
+            !scan.saw_foreign_txn,
+            "an untagged chunk is not evidence of a foreign transaction"
+        );
+        assert!(
+            !ChangeRows::is_empty(&rows),
+            "the chunk survives an untracked pass"
+        );
+    }
+
     /// The commit is observed (so the entry becomes prunable at its LSN) but the
     /// entry survives until the durable floor reaches that LSN — never removed at
     /// commit-observation.
@@ -6822,6 +7034,17 @@ mod tests {
         )
         .await;
 
+        // Claim the first pass's envelope before replaying. An unclaimed
+        // `Changes` tail absorbs the next publish — `try_publish` folds a
+        // compatible envelope into it rather than appending an item — so leaving
+        // it unread would merge the replay into the first delivery and there
+        // would be only one envelope to read, not two.
+        let first = receivers[0]
+            .next()
+            .await
+            .expect("first ack")
+            .expect("not an error");
+
         // Reconnect replay of the very same transaction, no prune in between.
         deliver_one_commit(
             &source,
@@ -6835,11 +7058,6 @@ mod tests {
 
         // Both passes produced a zero-row ack for t0, never a data envelope: the
         // echo was dropped on the replay just as on the first delivery.
-        let first = receivers[0]
-            .next()
-            .await
-            .expect("first ack")
-            .expect("not an error");
         let second = receivers[0]
             .next()
             .await
