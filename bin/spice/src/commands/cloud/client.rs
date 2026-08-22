@@ -410,19 +410,28 @@ impl CloudClient {
         self.inner
             .get_auth_context_for_org(Some(org))
             .await
-            .map_err(|error| match error {
-                spice_cloud_client::error::Error::NotFound { .. } => Error::cloud_with_hint(
-                    CloudErrorCode::OrgNotFound,
-                    format!("Organization '{org}' was not found."),
-                    "Run 'spice cloud orgs' to list the organizations you can access.",
-                ),
-                spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
-                    CloudErrorCode::OrgForbidden,
-                    format!("You are not a member of organization '{org}'."),
-                    "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
-                ),
-                error => self.err(error),
-            })
+            .map_err(|error| self.map_org_probe_error(org, error))
+    }
+
+    /// Render a failed organization probe.
+    ///
+    /// Named rather than inline because [`org_probe_is_inconclusive`] has to
+    /// agree with the codes produced here: a rule that tolerates a code this
+    /// never emits reads as working and silently does nothing.
+    fn map_org_probe_error(&self, org: &str, error: spice_cloud_client::error::Error) -> Error {
+        match error {
+            spice_cloud_client::error::Error::NotFound { .. } => Error::cloud_with_hint(
+                CloudErrorCode::OrgNotFound,
+                format!("Organization '{org}' was not found."),
+                "Run 'spice cloud orgs' to list the organizations you can access.",
+            ),
+            spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
+                CloudErrorCode::OrgForbidden,
+                format!("You are not a member of organization '{org}'."),
+                "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
+            ),
+            error => self.err(error),
+        }
     }
 
     pub async fn get_project_by_id(&self, project_id: i64) -> Result<Project> {
@@ -1131,6 +1140,20 @@ fn classify_identity_failure(err: &crate::error::Error) -> IdentityFailure {
     }
 }
 
+/// Whether a failed organization probe leaves access undecided.
+///
+/// The identity endpoint answers 404 for several conditions — including an
+/// organization that exists but has no app — and the probe renders all of them
+/// as [`CloudErrorCode::OrgNotFound`]. None of them prove the credential may
+/// not act on the organization, so none of them should decide it here. A
+/// refusal arrives as `OrgForbidden`, which is conclusive and is not tolerated.
+fn org_probe_is_inconclusive(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::OrgNotFound | CloudErrorCode::NotFound)
+    )
+}
+
 /// Confirm this credential may act on `org`, or say why not.
 ///
 /// A 404 here is the identity endpoint declining to describe the credential,
@@ -1141,7 +1164,7 @@ fn classify_identity_failure(err: &crate::error::Error) -> IdentityFailure {
 pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
     match client.get_auth_context_for_org(org).await {
         Ok(_) => Ok(()),
-        Err(err) if err.cloud_code() == Some(CloudErrorCode::NotFound) => {
+        Err(err) if org_probe_is_inconclusive(&err) => {
             tracing::debug!(
                 "Spice Cloud did not describe this credential's access to organization '{org}' ({err}); continuing and letting the server decide"
             );
@@ -1605,6 +1628,40 @@ mod tests {
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::TokenExpired));
         assert!(is_absent_user_identity_error(&err));
+    }
+
+    /// The organization probe's own rendering decides what
+    /// [`org_probe_is_inconclusive`] must accept. Asserting the rule against a
+    /// hand-built error would pass while the two disagreed, which is exactly
+    /// how tolerating `NotFound` alone came to be a no-op: the probe renders
+    /// that response as `OrgNotFound`.
+    #[test]
+    fn the_org_probe_renders_a_missing_answer_as_something_the_rule_tolerates() {
+        let client = CloudClient::new_unauthenticated().expect("client should build");
+
+        let undescribed = client.map_org_probe_error(
+            "acme",
+            spice_cloud_client::error::Error::NotFound {
+                message: "{}".to_string(),
+            },
+        );
+        assert_eq!(undescribed.cloud_code(), Some(CloudErrorCode::OrgNotFound));
+        assert!(
+            org_probe_is_inconclusive(&undescribed),
+            "an undescribed organization must not decide access: {undescribed}"
+        );
+
+        let refused = client.map_org_probe_error(
+            "acme",
+            spice_cloud_client::error::Error::Forbidden {
+                message: "not a member".to_string(),
+            },
+        );
+        assert_eq!(refused.cloud_code(), Some(CloudErrorCode::OrgForbidden));
+        assert!(
+            !org_probe_is_inconclusive(&refused),
+            "a refusal is conclusive and must be surfaced: {refused}"
+        );
     }
 
     /// 401 is the one answer that disqualifies a credential; 404 leaves it
