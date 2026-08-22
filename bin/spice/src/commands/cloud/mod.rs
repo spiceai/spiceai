@@ -1950,7 +1950,7 @@ async fn verify_login_org(
     // Do not compare a user's default org with the requested org: doing so
     // rejects valid member access before the membership endpoint can decide.
     let _ = token_org;
-    client.get_auth_context_for_org(requested).await?;
+    client::confirm_org_access(client, requested).await?;
     Ok(Some(requested.to_string()))
 }
 
@@ -2387,7 +2387,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
             if client.list_projects().await.is_ok() {
                 return Err(Error::cloud_with_hint(
                     CloudErrorCode::Forbidden,
-                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself still authenticates — Spice Cloud accepted it for a project listing — so 'spice cloud orgs', 'projects', 'deploy', and 'logs' keep working.",
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command.",
                     "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
                 ));
             }
@@ -2777,22 +2777,7 @@ async fn user_token_for_cloud_connect(
     action: &str,
     command: &str,
 ) -> Result<String> {
-    let mut candidates = Vec::new();
-    for token in [
-        requested_org.and_then(org::token_for_org),
-        org::default_token(),
-        org::active_org()
-            .ok()
-            .flatten()
-            .and_then(|org| org::token_for_org(&org)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&token) {
-            candidates.push(token);
-        }
-    }
+    let candidates = client::user_credential_candidates(requested_org);
     if candidates.is_empty() {
         return Err(Error::cloud_with_hint(
             CloudErrorCode::NotAuthenticated,

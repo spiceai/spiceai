@@ -977,18 +977,10 @@ async fn stored_user_login(
     endpoint: &str,
     org_hint: Option<&str>,
 ) -> Result<Option<LoginCredential>> {
-    let mut candidates = Vec::new();
-    for token in [
-        org_hint.and_then(cloud_org::token_for_org),
-        cloud_org::default_token(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&token) {
-            candidates.push(token);
-        }
-    }
+    // Share the preflight's candidates and policy rather than restating them:
+    // `spice cloud link` chooses a credential before this transaction runs, and
+    // a list or a rule that differed would strand a link half-done.
+    let candidates = crate::commands::cloud::client::user_credential_candidates(org_hint);
     // Share the preflight's policy rather than restating it: `spice cloud link`
     // chooses a credential before this transaction runs, and a rule that
     // accepted one here but not there would strand a link half-done.

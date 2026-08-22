@@ -1140,6 +1140,31 @@ fn classify_identity_failure(err: &crate::error::Error) -> IdentityFailure {
     }
 }
 
+/// The stored credentials that could act as a user, most specific first.
+///
+/// Both link stages build this list, and they must build the same one: if the
+/// preflight considers a credential the enrollment transaction does not, a
+/// link passes its checks and then reports no credential at all.
+pub fn user_credential_candidates(requested: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for token in [
+        requested.and_then(org::token_for_org),
+        org::default_token(),
+        org::active_org()
+            .ok()
+            .flatten()
+            .and_then(|active| org::token_for_org(&active)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&token) {
+            candidates.push(token);
+        }
+    }
+    candidates
+}
+
 /// Whether a failed organization probe leaves access undecided.
 ///
 /// The identity endpoint answers 404 for several conditions — including an
