@@ -1216,11 +1216,11 @@ async fn execute_status(
     // — is reported: rendering it as "no instances are running" would make the
     // diagnosis command lie about the thing it exists to diagnose.
     let never_deployed = latest.is_none();
+    // Real health-read failures only. A data-plane refusal to inspect a
+    // self-hosted runtime deliberately never lands here (see
+    // `classify_health_failures`): this value feeds the degradation exit
+    // contract, and a healthy Cloud Connect project must exit 0.
     let mut runtime_error: Option<String> = None;
-    // Set when the health read failed only because the data plane refuses to
-    // inspect a self-hosted runtime: for a Cloud Connect project that is the
-    // project's shape, not an outage, and rendering it as a failure would make
-    // every status of a healthy Cloud Connect project read as degraded.
     let mut self_hosted = false;
 
     let (instances, datasets) =
@@ -1239,14 +1239,11 @@ async fn execute_status(
                 )
                 .await;
 
-                for failure in [instances.as_ref().err(), datasets.as_ref().err()] {
-                    if let Some(err) = failure
-                        && runtime_error.is_none()
-                    {
-                        self_hosted = health_not_served_for_self_hosted(err);
-                        runtime_error = Some(err.to_string());
-                    }
-                }
+                (runtime_error, self_hosted) = classify_health_failures(
+                    [instances.as_ref().err(), datasets.as_ref().err()]
+                        .into_iter()
+                        .flatten(),
+                );
 
                 (
                     instances
@@ -1280,6 +1277,10 @@ async fn execute_status(
             "datasets_total": datasets.len(),
             "datasets_unhealthy": unhealthy,
             "runtime_error": &runtime_error,
+            // Why `instances` can be empty with no `runtime_error`: the data
+            // plane does not inspect a self-hosted runtime, so its health is
+            // absent by design rather than unknown.
+            "self_hosted": self_hosted,
             "link": {
                 "connection": local.connection,
                 "service": local.service,
@@ -1315,19 +1316,17 @@ async fn execute_status(
     }
 
     println!();
-    if let Some(err) = &runtime_error
-        && !self_hosted
-    {
+    if let Some(err) = &runtime_error {
         // Say the fleet is unknown rather than empty.
         println!("Could not read instance or dataset health: {err}");
         println!("  Instance and dataset state below may be incomplete.");
         println!();
     }
     if instances.is_empty() {
-        if self_hosted {
-            println!("{}", self_hosted_instances_note(&target));
-        } else if runtime_error.is_some() {
+        if runtime_error.is_some() {
             println!("Instances: unknown.");
+        } else if self_hosted {
+            println!("{}", self_hosted_instances_note(&target));
         } else {
             println!("No instances are running.");
         }
@@ -4620,6 +4619,29 @@ fn health_not_served_for_self_hosted(error: &Error) -> bool {
     matches!(error, Error::RuntimeHttp { status: 501, .. })
 }
 
+/// Fold the health-read outcomes into what status reports: the first real
+/// failure, and whether the data plane declined because the runtime is
+/// self-hosted.
+///
+/// A refusal is the project's expected shape, not a failure — it never
+/// reaches the error slot, which feeds the degradation exit contract, so a
+/// healthy Cloud Connect project exits 0. Real failures still land there
+/// even when a refusal accompanies them: the two report unrelated facts.
+fn classify_health_failures<'a>(
+    failures: impl IntoIterator<Item = &'a Error>,
+) -> (Option<String>, bool) {
+    let mut first_failure = None;
+    let mut self_hosted = false;
+    for error in failures {
+        if health_not_served_for_self_hosted(error) {
+            self_hosted = true;
+        } else if first_failure.is_none() {
+            first_failure = Some(error.to_string());
+        }
+    }
+    (first_failure, self_hosted)
+}
+
 /// The status line for a project whose instances Spice Cloud cannot inspect.
 ///
 /// This line is the only explanation the user gets for an absent health
@@ -4767,6 +4789,34 @@ mod tests {
             body: String::new(),
         };
         assert!(!health_not_served_for_self_hosted(&failed));
+    }
+
+    #[test]
+    fn a_self_hosted_refusal_never_reaches_the_error_slot() {
+        let refused = Error::RuntimeHttp {
+            status: 501,
+            body: "not available for a self-hosted runtime".to_string(),
+        };
+        let failed = Error::RuntimeHttp {
+            status: 500,
+            body: "boom".to_string(),
+        };
+
+        // Refusal alone: nothing degrades, so status exits 0; the self-hosted
+        // note is the explanation the user gets instead.
+        let (error, self_hosted) = classify_health_failures([&refused]);
+        assert_eq!(error, None);
+        assert!(self_hosted);
+
+        // A real failure alongside the refusal must still degrade the command.
+        let (error, self_hosted) = classify_health_failures([&refused, &failed]);
+        assert!(error.is_some(), "a real failure must not be masked");
+        assert!(self_hosted);
+
+        // Real failures only: reported, with no self-hosted note.
+        let (error, self_hosted) = classify_health_failures([&failed]);
+        assert!(error.is_some());
+        assert!(!self_hosted);
     }
 
     #[test]
