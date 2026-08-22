@@ -139,7 +139,7 @@ impl CloudClient {
         // things here.
         match probe.get_auth_context().await {
             Ok(_) => {
-                probe.get_auth_context_for_org(org).await?;
+                confirm_org_access(&probe, org).await?;
                 Self::with_token_for_org(default, Some(org))
             }
             // A rejected credential has no user membership to spend on another
