@@ -2378,20 +2378,29 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
+        // Spice Cloud returned no user identity. That happens for a
+        // service-account token (OAuth client credentials), which authenticates
+        // API calls but has no user behind it, and when the endpoint has no
+        // user record to return at all. Neither says the credential is
+        // unusable, so neither should reach the user as a raw failure.
         Err(err) if client::is_absent_user_identity_error(&err) => {
-            // The auth-context endpoint answers for user tokens (subscription
-            // or PAT) only. A service-account token (OAuth client credentials)
-            // authenticates API calls but carries no user identity, and the
-            // endpoint can also have no user record to return. Both leave the
-            // credential usable, so report that rather than the raw failure.
-            if client.list_projects().await.is_ok() {
-                return Err(Error::cloud_with_hint(
-                    CloudErrorCode::Forbidden,
-                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command.",
-                    "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
-                ));
-            }
-            return Err(err);
+            // Whether other commands work is a separate question, and the
+            // answer only widens the guidance — it never withholds it, or a
+            // second failure here would put the unusable original message back
+            // in front of the user.
+            let usable = client.list_projects().await.is_ok();
+            let detail = if usable {
+                "The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command."
+            } else {
+                "Whether the credential works for anything else is unknown: listing this organization's projects did not succeed either, which a missing role or scope would also explain."
+            };
+            return Err(Error::cloud_with_hint(
+                CloudErrorCode::Forbidden,
+                format!(
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. {detail}"
+                ),
+                "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
+            ));
         }
         Err(err) => return Err(err),
     };
