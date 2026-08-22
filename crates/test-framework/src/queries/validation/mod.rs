@@ -1697,9 +1697,8 @@ mod test {
     #[test]
     fn test_midnight_normalization_is_limited_to_date_columns() {
         fn compare(data_type: DataType, expected: ArrayRef, actual: ArrayRef) -> String {
-            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-                "value", data_type, false,
-            )]));
+            let schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("value", data_type, false)]));
             let expected = RecordBatch::try_new(Arc::clone(&schema), vec![expected])
                 .expect("expected batch should build");
             // The actual batch carries the engine's own type for the column.
@@ -1722,7 +1721,10 @@ mod test {
             Arc::new(Date32Array::from(vec![9194])),
             Arc::new(TimestampSecondArray::from(vec![794_361_600])),
         );
-        assert!(result.contains("Pass"), "date vs midnight timestamp: {result}");
+        assert!(
+            result.contains("Pass"),
+            "date vs midnight timestamp: {result}"
+        );
 
         // The same two strings in a text column are still a mismatch.
         let result = compare(
