@@ -413,6 +413,14 @@ impl CloudClient {
             .map_err(|error| self.map_org_probe_error(org, error))
     }
 
+    /// This client, carrying `org` on every request it makes.
+    fn scoped_to_org(&self, org: &str) -> Self {
+        Self {
+            inner: self.inner.clone().with_org(org),
+            org: Some(org.to_string()),
+        }
+    }
+
     /// Render a failed organization probe.
     ///
     /// Named rather than inline because [`org_probe_is_inconclusive`] has to
@@ -1181,18 +1189,25 @@ fn org_probe_is_inconclusive(err: &crate::error::Error) -> bool {
 
 /// Confirm this credential may act on `org`, or say why not.
 ///
-/// A 404 here is the identity endpoint declining to describe the credential,
-/// not the organization refusing it — a refusal arrives as 403. Treating the
-/// two alike would deny a member their own organization on the strength of a
-/// lookup that failed, so an undescribed credential is allowed through and the
-/// server, which is authoritative on membership, answers the real request.
+/// The identity endpoint answers 404 for conditions that say nothing about
+/// access — an organization with no app reads the same as one that does not
+/// exist — so that answer decides nothing here. It is also not proof of
+/// access: callers store a credential under the organization this confirms,
+/// and filing one under an organization it cannot act on makes every later
+/// command fail obscurely.
+///
+/// So an inconclusive answer is followed by a question whose answer cannot be
+/// ambiguous: list the organization's projects. That is a read the server
+/// refuses for a non-member, so success requires membership and nothing else
+/// is inferred.
 pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
     match client.get_auth_context_for_org(org).await {
         Ok(_) => Ok(()),
         Err(err) if org_probe_is_inconclusive(&err) => {
             tracing::debug!(
-                "Spice Cloud did not describe this credential's access to organization '{org}' ({err}); continuing and letting the server decide"
+                "Spice Cloud did not describe this credential's access to organization '{org}' ({err}); confirming membership by listing that organization's projects instead"
             );
+            client.scoped_to_org(org).list_projects().await?;
             Ok(())
         }
         Err(err) => Err(err),
