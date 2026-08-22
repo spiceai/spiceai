@@ -10,6 +10,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app = { path = "../app" }
 arrow.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true

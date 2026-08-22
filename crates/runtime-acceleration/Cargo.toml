@@ -57,6 +57,8 @@ duckdb = ["dep:duckdb"]
 openapi = ["dep:utoipa"]
 snapshots = []
 sqlite = ["dep:rusqlite"]
+# An `AccelerationSource` the engine crates can build in their own tests.
+test-support = []
 turso = ["dep:turso"]
 
 [dev-dependencies]

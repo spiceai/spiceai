@@ -51,11 +51,11 @@ use super::{
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use data_accelerator_api::snapshots::download_snapshot_if_needed;
 use runtime_acceleration::OnSchemaChange;
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_checkpoint_api::CheckpointError;
@@ -3167,22 +3167,12 @@ impl DataAccelerator for CayenneAccelerator {
                         .ok_or_else(|| CheckpointError::Store {
                             source: "Turso accelerator engine not available".into(),
                         })?;
-                    let turso_accelerator = turso_engine
-                        .as_any()
-                        .downcast_ref::<crate::dataaccelerator::turso::TursoAccelerator>()
-                        .ok_or_else(|| CheckpointError::Store {
-                            source: "expected the registered Turso accelerator".into(),
-                        })?;
-                    let pool = turso_accelerator
-                        .get_shared_pool_for_path(&metadata_db_path)
-                        .await
-                        .map_err(|source| CheckpointError::Store {
-                            source: Box::new(source),
-                        })?;
-                    return Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
-                        pool,
-                        source.name().to_string(),
-                    )));
+                    // Through the contract, not a downcast: the Turso engine owns the
+                    // path-keyed pool whose lock serializes this sidecar's DDL, and asking
+                    // it for the sidecar is what keeps this engine from naming that one.
+                    return turso_engine
+                        .sidecar_for_path(&metadata_db_path, &source.name().to_string())
+                        .await;
                 }
             }
 

@@ -118,3 +118,27 @@ pub trait AccelerationSource: Send + Sync {
         snapshot_behavior: crate::snapshot::SnapshotBehavior,
     ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
 }
+
+/// The refresh mode `source` actually runs with, applying the connector's fill-in for an
+/// unset `refresh_mode`.
+///
+/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
+/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still `None`
+/// for a genuine `debezium:`/`cdc:` stream or a `sink:` dataset. Mapping the source's
+/// connector name through [`crate::acceleration::unset_refresh_mode_for_connector`] — the
+/// same table the runtime builder classifies the pod with — recovers it.
+///
+/// A source with no connector (a view, an Iceberg DDL table) has no default to apply and
+/// falls back to `full`, which is what those paths resolve an unset mode to.
+#[must_use]
+pub fn resolved_refresh_mode(
+    source: &dyn AccelerationSource,
+    acceleration: &Acceleration,
+) -> crate::acceleration::RefreshMode {
+    acceleration.refresh_mode.unwrap_or_else(|| {
+        source.connector_name().map_or(
+            crate::acceleration::RefreshMode::Full,
+            crate::acceleration::unset_refresh_mode_for_connector,
+        )
+    })
+}

@@ -14,26 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::resolved_refresh_mode;
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
 };
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 
-use super::{AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator};
-use crate::{
-    App,
-    component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode},
-    dataaccelerator::FilePathError,
-    datafusion::{
-        dialect::new_duckdb_dialect,
-        sort_columns::{SortColumn, parse_sort_columns},
-    },
-    parameters::ParameterSpec,
-    spice_data_base_path,
-};
+use app::App;
 use async_trait::async_trait;
+use data_accelerator_api::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
+};
+use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -67,10 +60,15 @@ use datafusion_table_providers::{
 use duckdb::AccessMode;
 use futures::StreamExt;
 use itertools::Itertools;
+use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_duckdb::DuckDbSidecar;
+use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::sort_columns::{SortColumn, parse_sort_columns};
+use runtime_parameters::ParameterSpec;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
@@ -120,7 +118,7 @@ pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
-use super::upsert_dedup;
+use data_accelerator_api::upsert_dedup;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -178,11 +176,20 @@ impl DuckDBAccelerator {
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
+    /// # Errors
+    ///
+    /// Returns [`Error::AccelerationNotEnabled`] when the source declares no
+    /// acceleration, and [`Error::InvalidConfiguration`] when the configured path cannot
+    /// be resolved to a `DuckDB` file.
     pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
+    /// # Errors
+    ///
+    /// Returns [`Error::AccelerationNotEnabled`] when the source declares no
+    /// acceleration, or a pool error when the instance cannot be opened.
     pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
@@ -590,6 +597,10 @@ async fn recover_interrupted_file_swap_once(
 /// * `duckdb_factory` - The `DuckDB` table provider factory used to generate the file path
 /// * `source` - The acceleration source (dataset or view) containing acceleration configuration
 /// * `default_db_name` - Default database file name to use if the `duckdb_file` parameter is not specified
+/// # Errors
+///
+/// Returns [`Error::InvalidConfiguration`] when the source is not file-accelerated, or
+/// when the factory cannot resolve the configured parameters to a path.
 pub fn duckdb_file_path(
     duckdb_factory: &DuckDBTableProviderFactory,
     source: &dyn AccelerationSource,
@@ -701,6 +712,13 @@ impl DataAccelerator for DuckDBAccelerator {
 
         // otherwise, we're initialized if the file exists
         self.has_existing_file(source)
+    }
+
+    fn memory_budget_inputs(
+        &self,
+        app: Option<&Arc<App>>,
+    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
+        duckdb_budget_inputs(self, app)
     }
 
     async fn sidecar(
@@ -830,7 +848,7 @@ impl DataAccelerator for DuckDBAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
+            data_accelerator_api::InvalidConfigurationSnafu {
                 msg: "DuckDB data accelerator does not support the `partition_by` parameter but it was provided. Use engine 'cayenne' or 'arrow' for partitioned acceleration, or remove `partition_by`. See: https://spiceai.org/docs/components/data-accelerators".to_string()
             }
         );
@@ -869,7 +887,7 @@ impl DataAccelerator for DuckDBAccelerator {
                 );
                 ensure!(
                     is_file_mode,
-                    super::InvalidConfigurationSnafu {
+                    data_accelerator_api::InvalidConfigurationSnafu {
                         msg: format!(
                             "Failed to register dataset {dataset_display_name} (duckdb accelerator): 'on_full_refresh: {behavior}' requires file-mode acceleration. Set 'mode: file' or remove 'on_full_refresh'. See: {DUCKDB_ACCELERATOR_DOCS}"
                         ),
@@ -890,7 +908,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         .insert("checkpoint_on_write".to_string(), "enabled".to_string());
                 }
             }
-            Some(other) => super::InvalidConfigurationSnafu {
+            Some(other) => data_accelerator_api::InvalidConfigurationSnafu {
                 msg: format!(
                     "Failed to register dataset {dataset_display_name} (duckdb accelerator): Invalid 'on_full_refresh' value '{other}'. Expected 'reuse_file', 'replace_file', or 'checkpoint_file'. See: {DUCKDB_ACCELERATOR_DOCS}"
                 ),
@@ -1076,7 +1094,7 @@ impl DataAccelerator for DuckDBAccelerator {
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         // Drop the caller's clone first so the only remaining strong refs to
         // the prior pool are the registry entry (which we are about to evict)
@@ -2014,6 +2032,113 @@ fn validate_unique_index_batches(
     Ok(())
 }
 
+fn duckdb_budget_inputs(
+    accelerator: &DuckDBAccelerator,
+    app: Option<&Arc<App>>,
+) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
+    use runtime_acceleration::memory_budget::DuckDbBudgetInputs;
+
+    /// Per-instance aggregation while grouping accelerations by `DbInstanceKey`.
+    #[derive(Default)]
+    struct InstanceAgg {
+        explicit_max: Option<u64>,
+        has_unset: bool,
+        /// Components sharing this instance set DIFFERENT explicit
+        /// `duckdb_memory_limit` values. Since the setting is per-instance (last one
+        /// created wins), the effective limit is ambiguous — surfaced in the warning.
+        conflicting_explicit: bool,
+    }
+
+    let mut inputs = DuckDbBudgetInputs::default();
+    let Some(app) = app else {
+        return inputs;
+    };
+    let mut instances: HashMap<String, InstanceAgg> = HashMap::new();
+
+    let accelerated_components = app
+        .datasets
+        .iter()
+        .map(|dataset| (dataset.name.as_str(), dataset.acceleration.as_ref()))
+        .chain(
+            app.views
+                .iter()
+                .map(|view| (view.name.as_str(), view.acceleration.as_ref())),
+        );
+
+    for (name, acceleration) in accelerated_components {
+        let Some(accel) = acceleration else {
+            continue;
+        };
+        if !accel.enabled
+            || !accel
+                .engine
+                .as_deref()
+                .is_some_and(|engine| engine.eq_ignore_ascii_case("duckdb"))
+        {
+            continue;
+        }
+        // Instance identity: memory-mode accelerations share ONE in-memory instance;
+        // file-mode ones group by their resolved DuckDB file path.
+        let key = if accel.mode == spicepod::acceleration::Mode::Memory {
+            "<in-memory>".to_string()
+        } else {
+            accelerator
+                .spicepod_duckdb_file_path(accel)
+                .unwrap_or_else(|| format!("<file:{name}>"))
+        };
+        let params = accel
+            .params
+            .as_ref()
+            .map(spicepod::param::Params::as_string_map)
+            .unwrap_or_default();
+        // Parse with binary units (`true`) to match the DuckDB fork's own
+        // `MemoryLimitSetting` validation; an unparseable explicit value is treated
+        // as unset so the instance still gets a safe auto-cap (the fork would reject
+        // the bad value at creation anyway).
+        let explicit = params
+            .get("duckdb_memory_limit")
+            .and_then(|v| byte_unit::Byte::parse_str(v.trim(), true).ok())
+            .map(byte_unit::Byte::as_u64);
+
+        let agg = instances.entry(key).or_default();
+        match explicit {
+            Some(bytes) => {
+                // A different explicit value than one already seen on this instance
+                // means the components disagree on the per-instance limit.
+                if let Some(prev) = agg.explicit_max
+                    && prev != bytes
+                {
+                    agg.conflicting_explicit = true;
+                }
+                agg.explicit_max = Some(agg.explicit_max.map_or(bytes, |m| m.max(bytes)));
+            }
+            None => agg.has_unset = true,
+        }
+    }
+
+    for (key, agg) in instances {
+        if let Some(bytes) = agg.explicit_max {
+            inputs.num_explicit_instances += 1;
+            inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
+            // Inconsistent per-instance limit: some components set it and some
+            // didn't, or they set different explicit values. Either way it's
+            // ambiguous.
+            if agg.has_unset || agg.conflicting_explicit {
+                inputs.has_mixed_instance = true;
+            }
+        } else {
+            inputs.num_unset_instances += 1;
+            inputs.unset_instance_labels.push(key);
+        }
+    }
+    // Deterministic warning output: `instances` is a `HashMap`, so its iteration
+    // order (and thus the pushed label order) varies run-to-run. Sort so identical
+    // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
+    // analysis and alert dedup stable.
+    inputs.unset_instance_labels.sort();
+    inputs
+}
+
 data_accelerator_api::register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
 
 fn normalize_schema_for_duckdb(cmd: &mut CreateExternalTable) -> datafusion::common::Result<()> {
@@ -2031,7 +2156,6 @@ fn normalize_schema_for_duckdb(cmd: &mut CreateExternalTable) -> datafusion::com
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
         array::{
             Int32Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
@@ -2047,12 +2171,12 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
+    use runtime_acceleration::testing::TestAccelerationSource;
 
-    use crate::component::dataset::acceleration::Acceleration;
-    use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::dataaccelerator::{
-        AcceleratorEngineRegistry, DataAccelerator, duckdb::DuckDBAccelerator,
-    };
+    use crate::DuckDBAccelerator;
+    use data_accelerator_api::{AcceleratorEngineRegistry, DataAccelerator};
+    use runtime_acceleration::Engine;
+    use runtime_acceleration::acceleration::{Acceleration, Mode};
     use runtime_acceleration::sidecar::OpenOption;
 
     fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
@@ -2668,19 +2792,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_file_initialization() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset = DatasetBuilder::try_new(
-            "duckdb_file_accelerator_init".to_string(),
-            "duckdb_file_accelerator_init",
-        )
-        .expect("to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("to build dataset");
-
         // Unique path so parallel DuckDB file-mode tests that share the default
         // `accelerated_duckdb` filename cannot race this test's is_initialized check.
         let unique_path = std::env::temp_dir().join(format!(
@@ -2691,15 +2802,16 @@ mod tests {
             std::fs::remove_file(&unique_path).expect("stale test file should be removed");
         }
 
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::DuckDB,
-            mode: Mode::File,
-            params: HashMap::from([(
-                "duckdb_file".to_string(),
-                unique_path.to_string_lossy().to_string(),
-            )]),
-            ..Default::default()
-        });
+        let dataset = TestAccelerationSource::new("duckdb_file_accelerator_init")
+            .with_acceleration(Acceleration {
+                engine: Engine::DuckDB,
+                mode: Mode::File,
+                params: HashMap::from([(
+                    "duckdb_file".to_string(),
+                    unique_path.to_string_lossy().to_string(),
+                )]),
+                ..Default::default()
+            });
 
         let accelerator = DuckDBAccelerator::new();
         assert!(!accelerator.is_initialized(&dataset));
@@ -2724,20 +2836,12 @@ mod tests {
     /// `acceleration::file_create_duckdb::test_file_create_reload_keeps_unchanged_datasets`).
     #[tokio::test]
     async fn duckdb_memory_mode_resolves_no_sidecar() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-        let mut dataset =
-            DatasetBuilder::try_new("duckdb_memory_sidecar".to_string(), "duckdb_memory_sidecar")
-                .expect("to create builder")
-                .with_app(Arc::new(app))
-                .with_runtime(Arc::new(rt))
-                .build()
-                .expect("to build dataset");
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::DuckDB,
-            mode: Mode::Memory,
-            ..Default::default()
-        });
+        let dataset =
+            TestAccelerationSource::new("duckdb_memory_sidecar").with_acceleration(Acceleration {
+                engine: Engine::DuckDB,
+                mode: Mode::Memory,
+                ..Default::default()
+            });
 
         // `Arc<dyn AcceleratorSidecar>` is not `Debug`, so assert on `is_err` rather
         // than `expect_err`.
@@ -2914,7 +3018,7 @@ mod tests {
 
     #[test]
     fn storage_profile_drives_setup_pragmas() {
-        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+        use data_accelerator_api::storage::ResolvedAccelerationStorage;
 
         // EBS bumps the checkpoint threshold to amortize remote-disk writes.
         let ebs = DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Ebs);
@@ -3343,9 +3447,7 @@ mod tests {
     // the whole runtime.
     use std::time::SystemTime;
 
-    #[cfg(feature = "duckdb")]
     use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
-    #[cfg(feature = "duckdb")]
     use duckdb::AccessMode;
     use runtime_table::accelerated::caching::{CACHE_REFRESHED_AT_COLUMN, CacheRefreshHelper};
 

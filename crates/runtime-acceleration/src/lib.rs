@@ -21,6 +21,9 @@ pub mod memory_budget;
 pub mod schema_change;
 pub mod sidecar;
 pub mod snapshot;
+// Test-only; behind a feature so it never reaches a shipped build.
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;

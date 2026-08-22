@@ -25,15 +25,7 @@ limitations under the License.
 pub mod arrow;
 #[cfg(not(windows))]
 pub mod cayenne;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "postgres-accel")]
-pub mod postgres;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
-#[cfg(feature = "turso")]
-pub mod turso;
 
 pub(crate) mod imds;
 pub(crate) mod snapshot_validation;
@@ -49,30 +41,6 @@ pub use snapshot_validation::validate_cayenne_snapshot_consistency;
 // `register_data_accelerator!` macro is invoked path-qualified as
 // `data_accelerator_api::register_data_accelerator!` by the engine modules.)
 pub(crate) use data_accelerator_api::*;
-
-/// The refresh mode a source actually runs with, applying the connector's fill-in
-/// for an unset `refresh_mode`.
-///
-/// `DataConnector::resolve_refresh_mode` decides that fill-in and its result is never
-/// written back into the [`Acceleration`], so `acceleration.refresh_mode` is still
-/// `None` for a genuine `debezium:`/`cdc:` stream or a `sink:` dataset. Mapping the
-/// source's connector name through
-/// [`runtime_acceleration::acceleration::unset_refresh_mode_for_connector`] — the same
-/// table the runtime builder classifies the pod with — recovers it.
-///
-/// A source with no connector (a view, an Iceberg DDL table) has no default to apply
-/// and falls back to `full`, which is what those paths resolve an unset mode to.
-pub(crate) fn resolved_refresh_mode(
-    source: &dyn AccelerationSource,
-    acceleration: &crate::component::dataset::acceleration::Acceleration,
-) -> crate::component::dataset::acceleration::RefreshMode {
-    acceleration.refresh_mode.unwrap_or_else(|| {
-        source.connector_name().map_or(
-            crate::component::dataset::acceleration::RefreshMode::Full,
-            runtime_acceleration::acceleration::unset_refresh_mode_for_connector,
-        )
-    })
-}
 
 #[cfg(test)]
 mod test {
@@ -719,7 +687,7 @@ mod accelerator_compat_tests {
             let table = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
-                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                    use accelerator_sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -733,7 +701,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "turso")]
                 Engine::Turso => {
-                    use crate::dataaccelerator::turso::TursoAccelerator;
+                    use accelerator_turso::TursoAccelerator;
                     match TursoAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -747,7 +715,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "duckdb")]
                 Engine::DuckDB => {
-                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                    use accelerator_duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -1986,7 +1954,7 @@ mod accelerator_compat_tests {
                 let bool_table: Arc<dyn TableProvider> = match engine {
                     #[cfg(feature = "sqlite")]
                     Engine::Sqlite => {
-                        use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                        use accelerator_sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await
@@ -1994,7 +1962,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "turso")]
                     Engine::Turso => {
-                        use crate::dataaccelerator::turso::TursoAccelerator;
+                        use accelerator_turso::TursoAccelerator;
                         TursoAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await
@@ -2002,7 +1970,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "duckdb")]
                     Engine::DuckDB => {
-                        use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                        use accelerator_duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await

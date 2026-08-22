@@ -34,6 +34,9 @@ tracked separately (a working plan, not part of these rules).
   │  connector         connector-* (30)                                    │  data sources — compile
   │                                                                        │  in parallel with runtime
   ├──────────────────────────────────────────────────────────────────────┤
+  │  accelerator       accelerator-* (4)                                   │  acceleration engines —
+  │                                                                        │  sibling of connector
+  ├──────────────────────────────────────────────────────────────────────┤
   │  shared-utility    data_components, cayenne, llms, search, app, cache, │  always-shipped libraries
   │                    data-connector-api, runtime-datafusion, workers…    │  runtime is built from
   ├──────────────────────────────────────────────────────────────────────┤
@@ -46,24 +49,37 @@ tracked separately (a working plan, not part of these rules).
 | Tier | Purpose | May depend on |
 |------|---------|---------------|
 | **foundation** | Leaf utilities, wire formats, config parsing, primitives. Ideally reusable outside Spice. Little or no internal dependency. | foundation |
-| **shared-utility** | The **always-shipped** shared libraries the runtime is built on — the accelerator (`cayenne`), inference (`llms`), search, the `runtime-*` support crates. Sits *below* `runtime`, so `runtime` may build on it. *Optional* / connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, shared-utility |
+| **shared-utility** | The **always-shipped** shared libraries the runtime is built on — the Cayenne storage engine (`cayenne`, the library the accelerator of that name is built on), inference (`llms`), search, the `runtime-*` support crates. Sits *below* `runtime`, so `runtime` may build on it. *Optional* / connector-specific building blocks do **not** belong here (see [Shared building blocks vs. extension-only code](#shared-building-blocks-vs-extension-only-code)); `data_components` sits here today only because it is still an undivided monolith. | foundation, shared-utility |
 | **connector** | The `connector-*` data-source crates. They implement the `DataConnector` contract, which lives in `data-connector-api` *below* `runtime`, so a connector names the contract and never the orchestrator. Being below `runtime` is what lets all 30 compile **in parallel with** it rather than behind it. `runtime` may **not** depend on one — see the `forbid` rule below. | foundation, shared-utility, connector |
-| **runtime** | The `runtime` crate and `runtime-table`: orchestration, component lifecycle, HTTP/Flight servers, and the accelerator/catalog trait definitions + registries. May **not** depend on `extension-utility` or on `connector`. | foundation, shared-utility |
+| **accelerator** | The `accelerator-*` acceleration engines. They implement the `DataAccelerator` contract, which lives in `data-accelerator-api` *below* `runtime`, and self-register through a `linkme` slice, so an engine names the contract and never the orchestrator. A **sibling** of `connector`, not a layer under it: the two sets are independent, and the linear order lists `accelerator` first only because the list must be linear. `runtime` may **not** depend on one, and neither may a connector — see the `forbid` rules below. | foundation, shared-utility, accelerator |
+| **runtime** | The `runtime` crate and `runtime-table`: orchestration, component lifecycle, HTTP/Flight servers, and the catalog trait definitions + registries. May **not** depend on `extension-utility`, `connector`, or `accelerator`. | foundation, shared-utility |
 | **extension-utility** | Connector-specific building blocks that only *extensions* depend on — never `runtime`. It is a low-level *building block*, so it must itself depend **only** on `foundation`/`shared-utility` (at most the `runtime-*-api` interface crates, which sit low) — **not on the `runtime` crate**; pulling in the orchestrator would defeat the point. Sits *above* `runtime` so an accidental `runtime → connector-utility` edge is caught as upward. **Empty today** (a target slot): every such crate — `pgwire-replication`, the `elasticsearch`/`dynamodb-streams`/`smb`/`libnfs` clients, `s3_vectors` — is still pulled in by the `data_components` monolith or `runtime` itself, so it can't move up yet. Populates as the monolith dissolves. | foundation, shared-utility (+ `runtime-*-api`) |
-| **extension** | Optional plug-ins that genuinely need the orchestrator: `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only extensions use** (`extension-utility`). Three connectors are still here — `connector-glue` and `connector-spiceai` are registration shims over connector bodies that still live inside `runtime`, and `connector-databricks` reaches `runtime::catalogconnector::databricks` + `runtime::token_providers::databricks`. Each joins `connector` when its remaining `runtime` reference is evacuated. | foundation, shared-utility, connector, runtime, extension-utility |
+| **extension** | Optional plug-ins that genuinely need the orchestrator: `spice-cloud`, `tpc-extension`, **plus the connector-specific building blocks only extensions use** (`extension-utility`). Three connectors are still here — `connector-glue` and `connector-spiceai` are registration shims over connector bodies that still live inside `runtime`, and `connector-databricks` reaches `runtime::catalogconnector::databricks` + `runtime::token_providers::databricks`. Each joins `connector` when its remaining `runtime` reference is evacuated. | foundation, shared-utility, accelerator, connector, runtime, extension-utility |
 | **binary** | The `spiced`/`spice` binaries and `tools/*` — link the whole graph. | anything |
+
+`extension` may depend on `accelerator` and `connector` because it sits above both and
+nothing forbids the edge; no extension does today. If that should never happen, it wants a
+`forbid` rule rather than a convention — the guard only enforces what `layers.toml` states.
 
 The two utility tiers encode a single rule: **`runtime-*` may depend only on
 `shared-utility`, while extensions may depend on both.** `shared-utility` is what
 we always ship and the runtime builds on; `extension-utility` is connector-only
 code the runtime must never pull in.
 
-**`runtime` must not depend on a `connector` either.** The linear order permits
-it — `connector` sits below `runtime` — but that edge is exactly what the
-inversion removed: one such dependency puts every connector back on `runtime`'s
-prerequisite path and the parallelism is gone. A second **`forbid`** rule
-(`["runtime", "connector"]`) rejects it. The connectors are linked only by the
-binaries and by `tools/spicepodschema`, which sit at the top.
+**`runtime` must not depend on a `connector` or an `accelerator` either.** The
+linear order permits both — each sits below `runtime` — but those edges are
+exactly what the inversion removed: one such dependency puts every connector or
+engine back on `runtime`'s prerequisite path and the parallelism is gone.
+**`forbid`** rules (`["runtime", "connector"]`, `["runtime", "accelerator"]`)
+reject them. `["connector", "accelerator"]` is forbidden for the same reason in
+the sibling direction, where the linear order can only reject the
+`accelerator → connector` half. Both sets are linked only by the binaries and by
+`tools/spicepodschema`, which sit at the top.
+
+An engine reaches its registry only if its crate is **linked**, and a Cargo
+dependency does not do that — the linker drops the unreferenced slice static. So
+every binary that must see an engine carries a `use accelerator_<name> as _;`,
+including each `runtime` integration-test binary separately.
 
 A corollary the guard cannot see: **`runtime` must not publicly re-export the
 connector contract.** `runtime::dataconnector`'s `pub use data_connector_api::*`

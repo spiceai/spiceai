@@ -19,6 +19,119 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-duckdb"
+version = "2.2.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "byte-unit",
+ "cpu-budget",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-duckdb",
+ "runtime-datafusion",
+ "runtime-parameters",
+ "runtime-table",
+ "runtime-table-partition",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "accelerator-postgres"
+version = "2.2.0-unstable"
+dependencies = [
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-postgres",
+ "runtime-datafusion",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "snafu",
+]
+
+[[package]]
+name = "accelerator-sqlite"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-sqlite",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "rusqlite",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "accelerator-turso"
+version = "2.2.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "futures",
+ "linkme",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-turso",
+ "runtime-parameters",
+ "runtime-table-partition",
+ "runtime-udfs-api",
+ "rusqlite",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tracing",
+ "turso",
+]
+
+[[package]]
 name = "adbc_core"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6069,6 +6182,7 @@ dependencies = [
 name = "data-accelerator-api"
 version = "2.2.0-unstable"
 dependencies = [
+ "app",
  "arrow",
  "arrow-schema",
  "arrow_tools",
@@ -16997,6 +17111,10 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
+ "accelerator-postgres",
+ "accelerator-sqlite",
+ "accelerator-turso",
  "adbc_core",
  "adbc_driver_manager",
  "anyhow",
@@ -17166,9 +17284,7 @@ dependencies = [
  "runtime-auth",
  "runtime-checkpoint-api",
  "runtime-checkpoint-duckdb",
- "runtime-checkpoint-postgres",
  "runtime-checkpoint-sqlite",
- "runtime-checkpoint-turso",
  "runtime-cluster",
  "runtime-component",
  "runtime-datafusion",
@@ -19747,6 +19863,10 @@ dependencies = [
 name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
+ "accelerator-postgres",
+ "accelerator-sqlite",
+ "accelerator-turso",
  "ansi_colors",
  "app",
  "arrow",
@@ -19874,6 +19994,10 @@ dependencies = [
 name = "spicepodschema"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-duckdb",
+ "accelerator-postgres",
+ "accelerator-sqlite",
+ "accelerator-turso",
  "connector-abfs",
  "connector-clickhouse",
  "connector-cosmosdb",
