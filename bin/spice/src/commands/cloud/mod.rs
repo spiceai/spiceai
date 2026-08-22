@@ -2697,7 +2697,7 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
         resolve_project_target(Some(project), flag_org).await?
     } else {
         let (requested_org, requested_source) = resolve_org_with_source(flag_org)?;
-        let token =
+        let (token, credential_org) =
             user_token_for_cloud_connect(&endpoint, requested_org.as_deref(), "Linking", "link")
                 .await?;
         let attach_client = crate::commands::connect::project::ProjectClient::new(&endpoint)
@@ -2710,7 +2710,7 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
             .map_err(|error| Error::CloudConnectIo {
                 message: error.to_string(),
             })?;
-        let selected = choose_attachable_project(projects).await?;
+        let selected = choose_attachable_project(projects, &credential_org).await?;
         if let Some(selected_org) = selected.org.as_deref() {
             ensure_orgs_agree(
                 selected_org,
@@ -2728,7 +2728,8 @@ async fn execute_link(ctx: &RuntimeContext, args: &LinkArgs, flag_org: Option<&s
             "Pass an explicit <org>/<project> target.",
         )
     })?;
-    let token = user_token_for_cloud_connect(&endpoint, Some(org), "Linking", "link").await?;
+    let (token, _credential_org) =
+        user_token_for_cloud_connect(&endpoint, Some(org), "Linking", "link").await?;
     let management_client = CloudClient::with_token_for_org_at(token, Some(org), &endpoint)?;
     let project = management_client.get_project(&target).await?;
 
@@ -2774,7 +2775,7 @@ async fn user_token_for_cloud_connect(
     requested_org: Option<&str>,
     action: &str,
     command: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let mut candidates = Vec::new();
     for token in [
         requested_org.and_then(org::token_for_org),
@@ -2801,13 +2802,15 @@ async fn user_token_for_cloud_connect(
 
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
+        let Some(auth_context) = client.optional_user_auth_context().await? else {
             continue;
-        }
+        };
         if let Some(org) = requested_org {
             client.get_auth_context_for_org(org).await?;
         }
-        return Ok(token);
+        // The credential's own organization is the one every org-unaware
+        // request (like listing attachable projects) is answered for.
+        return Ok((token, auth_context.org_name));
     }
 
     Err(Error::cloud_with_hint(
@@ -2830,12 +2833,20 @@ fn ensure_link_chooser_tty(is_terminal: bool) -> Result<()> {
 
 async fn choose_attachable_project(
     projects: Vec<crate::commands::connect::project::AttachableProject>,
+    credential_org: &str,
 ) -> Result<ProjectTarget> {
     if projects.is_empty() {
+        // Attachable projects are listed for the credential's own
+        // organization only; `org use` and `--org` do not change that, so
+        // say which organization was actually searched (#13379).
         return Err(Error::cloud_with_hint(
             CloudErrorCode::ProjectNotFound,
-            "Spice Cloud returned no projects that can be attached.",
-            "Create a project in Spice Cloud, then retry `spice cloud link`.",
+            format!(
+                "Spice Cloud returned no attachable projects in organization '{credential_org}',                  the organization this credential acts on."
+            ),
+            format!(
+                "Create a project in organization '{credential_org}', or attach to another                  organization with `spice cloud login token --org <org>` and retry."
+            ),
         ));
     }
     let items: Vec<String> = projects
@@ -3065,7 +3076,7 @@ async fn execute_unlink() -> Result<()> {
         &configured_endpoint,
     );
     let requested_org = identity.org_name.as_deref().filter(|org| !org.is_empty());
-    let token =
+    let (token, _credential_org) =
         user_token_for_cloud_connect(endpoint, requested_org, "Unlinking", "unlink").await?;
     match runtime_cloud_connect::release::release(endpoint, &identity, &token, None).await {
         Ok(_) => {}
