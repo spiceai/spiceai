@@ -30,6 +30,20 @@ limitations under the License.
 
 #![recursion_limit = "256"]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. A
+// dev-dependency alone does not put an entry in a test binary — the linker drops the
+// unreferenced static — and every integration binary links separately, so each one that
+// exercises an engine needs its own reference. `integration.rs`'s
+// `accelerator_crates_register_their_engines` guards the mechanism.
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
+
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},

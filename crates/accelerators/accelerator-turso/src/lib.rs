@@ -41,12 +41,12 @@ limitations under the License.
 //! connector** (for source datasets), where remote access patterns are the primary use case
 //! and local acceleration is not the goal.
 
-use super::resolved_refresh_mode;
 use data_accelerator_api::make_spice_data_directory;
 use data_accelerator_api::snapshots::{download_snapshot_if_needed, snapshot_before_recreate};
 use data_accelerator_api::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
 };
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -61,20 +61,17 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
-use crate::{
-    component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::FilePathError,
-    datafusion::udf::deny_spice_specific_functions,
-    parameters::ParameterSpec,
-    spice_data_base_path,
+use data_accelerator_api::{
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, FilePathError,
+    spice_data_base_path, upsert_dedup,
 };
-
-use super::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
-};
+use runtime_acceleration::Engine;
+use runtime_acceleration::acceleration::Mode;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_turso::TursoSidecar;
+use runtime_parameters::ParameterSpec;
+use runtime_udfs_api::deny_spice_specific_functions;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -356,6 +353,10 @@ impl TursoAccelerator {
     /// # Note
     ///
     /// This function will never return `":memory:"` when called with file mode.
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when the source is not file-accelerated,
+    /// and [`Error::RemoteDatabaseNotSupported`] when it names a remote Turso database.
     pub fn turso_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
         // Check acceleration mode first
         if !source.is_file_accelerated() {
@@ -392,6 +393,10 @@ impl TursoAccelerator {
     }
 
     /// Returns the shared connection pool for a `Turso` database
+    /// # Errors
+    ///
+    /// Returns the file-path and timestamp-format errors it resolves first, or a pool
+    /// error when the database cannot be opened.
     pub async fn get_shared_pool(
         &self,
         source: &dyn AccelerationSource,
@@ -471,6 +476,9 @@ impl TursoAccelerator {
     /// serializes DDL against an open `BEGIN CONCURRENT` write lives on the
     /// [`TursoConnectionPool`] instance, so two pools over one file hold two
     /// independent locks and exclude nothing.
+    /// # Errors
+    ///
+    /// Returns a pool error when the database at `db_path` cannot be opened.
     pub async fn get_shared_pool_for_path(
         &self,
         db_path: &str,
@@ -566,26 +574,30 @@ impl DataAccelerator for TursoAccelerator {
         self.has_existing_file(source)
     }
 
-    /// Initializes a Turso database for the dataset.
+    /// A sidecar over the Turso database at `path`, for state the runtime owns rather
+    /// than a dataset — the Cayenne metastore's `cayenne.db`.
     ///
-    /// Supports two acceleration modes:
-    /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
-    /// - **File mode**: Creates a file-based database at the specified or default path
-    ///
-    /// # Accelerator-Specific Limitation
-    ///
-    /// This method will reject configurations with remote Turso parameters (`turso_url` or
-    /// `turso_auth_token`). This limitation is specific to using Turso as an **accelerator**
-    /// and does not apply to general Turso usage. Accelerators require local database access
-    /// for optimal performance.
-    ///
-    /// Remote Turso databases will be supported when Turso is implemented as a data connector,
-    /// where remote access is the primary use case.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
-    /// parameters are provided in the acceleration configuration.
+    /// Goes through [`Self::get_shared_pool_for_path`] rather than opening the file,
+    /// because the lock that serializes sidecar DDL against a concurrent
+    /// `BEGIN CONCURRENT` write lives on the pool instance: a second pool over the same
+    /// file would hold a lock no other sidecar observes.
+    async fn sidecar_for_path(
+        &self,
+        path: &str,
+        dataset_name: &str,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        let pool = self
+            .get_shared_pool_for_path(path)
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
+            pool,
+            dataset_name.to_string(),
+        )))
+    }
+
     async fn sidecar(
         &self,
         source: &dyn AccelerationSource,
@@ -613,6 +625,26 @@ impl DataAccelerator for TursoAccelerator {
         Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
     }
 
+    /// Initializes a Turso database for the dataset.
+    ///
+    /// Supports two acceleration modes:
+    /// - **Memory mode**: Creates an in-memory database (path = ":memory:")
+    /// - **File mode**: Creates a file-based database at the specified or default path
+    ///
+    /// # Accelerator-Specific Limitation
+    ///
+    /// This method will reject configurations with remote Turso parameters (`turso_url` or
+    /// `turso_auth_token`). This limitation is specific to using Turso as an **accelerator**
+    /// and does not apply to general Turso usage. Accelerators require local database access
+    /// for optimal performance.
+    ///
+    /// Remote Turso databases will be supported when Turso is implemented as a data connector,
+    /// where remote access is the primary use case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::RemoteDatabaseNotSupported` if `turso_url` or `turso_auth_token`
+    /// parameters are provided in the acceleration configuration.
     async fn init(
         &self,
         source: &dyn AccelerationSource,
@@ -731,7 +763,7 @@ impl DataAccelerator for TursoAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
-            super::InvalidConfigurationSnafu {
+            data_accelerator_api::InvalidConfigurationSnafu {
                 msg: "Turso data accelerator does not support the `partition_by` parameter but it was provided".to_string()
             }
         );
@@ -798,7 +830,7 @@ impl DataAccelerator for TursoAccelerator {
 
                 // Create indexes
                 for (column_ref_str, index_type_str) in indexes {
-                    let index_type = crate::component::dataset::acceleration::IndexType::from(
+                    let index_type = runtime_acceleration::acceleration::IndexType::from(
                         index_type_str.as_str(),
                     );
                     let index_name = format!(
@@ -808,8 +840,8 @@ impl DataAccelerator for TursoAccelerator {
                     );
                     let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
                     let unique_clause = match &index_type {
-                        crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
-                        crate::component::dataset::acceleration::IndexType::Enabled => "",
+                        runtime_acceleration::acceleration::IndexType::Unique => "UNIQUE ",
+                        runtime_acceleration::acceleration::IndexType::Enabled => "",
                     };
 
                     let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
@@ -900,7 +932,7 @@ impl DataAccelerator for TursoAccelerator {
         &self,
         source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        provider_factory: super::ReloadProviderFactory,
+        provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         drop(previous_provider);
 
@@ -1004,9 +1036,6 @@ data_accelerator_api::register_data_accelerator!(Engine::Turso, TursoAccelerator
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Runtime;
-    use crate::component::dataset::acceleration::{Acceleration, Mode};
-    use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -1019,6 +1048,8 @@ mod tests {
         scalar::ScalarValue,
     };
     use datafusion_table_providers::util::test::MockExec;
+    use runtime_acceleration::acceleration::{Acceleration, Mode};
+    use runtime_acceleration::testing::TestAccelerationSource;
     use std::collections::HashMap;
 
     fn cleanup_turso_test_files(path: &str) {
@@ -1057,24 +1088,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_turso_file_initialization() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = Runtime::builder().build().await;
-
-        let mut dataset = DatasetBuilder::try_new(
-            "turso_file_accelerator_init".to_string(),
-            "turso_file_accelerator_init",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Turso,
-            mode: Mode::File,
-            ..Default::default()
-        });
+        let dataset = TestAccelerationSource::new("turso_file_accelerator_init").with_acceleration(
+            Acceleration {
+                engine: Engine::Turso,
+                mode: Mode::File,
+                ..Default::default()
+            },
+        );
 
         let accelerator = TursoAccelerator::new();
         let path = accelerator
@@ -1099,30 +1119,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_params_rejected() {
-        let app = app::AppBuilder::new("test").build();
-        let rt = Runtime::builder().build().await;
-
-        // Test with turso_url
-        let mut dataset =
-            DatasetBuilder::try_new("turso_remote_test_url".to_string(), "turso_remote_test_url")
-                .expect("Failed to create builder")
-                .with_app(Arc::new(app.clone()))
-                .with_runtime(Arc::new(rt.clone()))
-                .build()
-                .expect("Failed to build dataset");
-
         let mut params = HashMap::new();
         params.insert(
             "turso_url".to_string(),
             "libsql://test.turso.io".to_string(),
         );
 
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Turso,
-            mode: Mode::File,
-            params,
-            ..Default::default()
-        });
+        let dataset =
+            TestAccelerationSource::new("turso_remote_test_url").with_acceleration(Acceleration {
+                engine: Engine::Turso,
+                mode: Mode::File,
+                params,
+                ..Default::default()
+            });
 
         let accelerator = TursoAccelerator::new();
         let result = accelerator.init(&dataset).await;
@@ -1135,25 +1144,17 @@ mod tests {
         );
 
         // Test with turso_auth_token
-        let mut dataset2 = DatasetBuilder::try_new(
-            "turso_remote_test_token".to_string(),
-            "turso_remote_test_token",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
-
         let mut params2 = HashMap::new();
         params2.insert("turso_auth_token".to_string(), "secret_token".to_string());
 
-        dataset2.acceleration = Some(Acceleration {
-            engine: Engine::Turso,
-            mode: Mode::File,
-            params: params2,
-            ..Default::default()
-        });
+        let dataset2 = TestAccelerationSource::new("turso_remote_test_token").with_acceleration(
+            Acceleration {
+                engine: Engine::Turso,
+                mode: Mode::File,
+                params: params2,
+                ..Default::default()
+            },
+        );
 
         let result2 = accelerator.init(&dataset2).await;
         assert!(result2.is_err());
@@ -1500,24 +1501,13 @@ mod tests {
     #[tokio::test]
     async fn test_file_mode_turso_creation_default_path() {
         // Test that file mode creates a Turso database using default path when not specified
-        let app = app::AppBuilder::new("test").build();
-        let rt = Runtime::builder().build().await;
-
-        let mut dataset = DatasetBuilder::try_new(
-            "turso_default_path_test".to_string(),
-            "turso_default_path_test",
-        )
-        .expect("Failed to create builder")
-        .with_app(Arc::new(app))
-        .with_runtime(Arc::new(rt))
-        .build()
-        .expect("Failed to build dataset");
-
-        dataset.acceleration = Some(Acceleration {
-            engine: Engine::Turso,
-            mode: Mode::File,
-            ..Default::default()
-        });
+        let dataset = TestAccelerationSource::new("turso_default_path_test").with_acceleration(
+            Acceleration {
+                engine: Engine::Turso,
+                mode: Mode::File,
+                ..Default::default()
+            },
+        );
 
         let accelerator = TursoAccelerator::new();
         let file_path = accelerator
@@ -1941,5 +1931,46 @@ mod tests {
 
         cleanup_turso_test_files(&metastore);
         cleanup_turso_test_files(&unrelated);
+    }
+    /// Cayenne asks for its metastore sidecar through `&dyn DataAccelerator`, so this
+    /// pins two things about that substitution.
+    ///
+    /// First, the Turso engine must *answer* `sidecar_for_path` rather than fall through
+    /// to the trait's unsupported default — the silent version of that bug is a metastore
+    /// reporting at run time that no accelerator hosts databases.
+    ///
+    /// Second, the sidecar must arrive over the engine's own path-keyed pool, because the
+    /// lock serializing sidecar DDL against a concurrent `BEGIN CONCURRENT` write lives on
+    /// the pool instance: a sidecar holding a private pool would hold a lock nothing else
+    /// observes. That is asserted by strong count on the cached `Arc`, taken from the SAME
+    /// accelerator instance the sidecar is built on — comparing pools across two instances
+    /// proves nothing, since the cache is per-instance and a private pool would pass.
+    #[tokio::test]
+    async fn sidecar_for_path_answers_through_the_trait_and_shares_the_pool() {
+        let dir = std::env::temp_dir().join("spice_turso_sidecar_for_path");
+        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let metastore = dir.join("cayenne.db").to_string_lossy().to_string();
+        cleanup_turso_test_files(&metastore);
+
+        let accelerator = TursoAccelerator::new();
+        let cached = accelerator
+            .get_shared_pool_for_path(&metastore)
+            .await
+            .expect("a pool should resolve for the metastore path");
+        let before = Arc::strong_count(&cached);
+
+        let engine: &dyn DataAccelerator = &accelerator;
+        let sidecar = engine
+            .sidecar_for_path(&metastore, "orders")
+            .await
+            .expect("the Turso engine must answer sidecar_for_path, not take the default");
+
+        assert!(
+            Arc::strong_count(&cached) > before,
+            "the sidecar must hold the pool already cached for this path, not one of its own"
+        );
+        drop(sidecar);
+
+        cleanup_turso_test_files(&metastore);
     }
 }

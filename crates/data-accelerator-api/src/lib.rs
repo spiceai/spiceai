@@ -110,6 +110,41 @@ impl AcceleratorRegistration {
 #[distributed_slice]
 pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
 
+/// The accelerator engines this build actually linked, as the names a user writes in
+/// `acceleration.engine`, sorted and de-duplicated.
+///
+/// Reads the registration slice rather than a hand-maintained list, so a build that
+/// omits an engine crate cannot advertise it. `Engine::Arrow` and
+/// `Engine::PartitionedArrow` both spell "arrow", which is why this de-duplicates.
+#[must_use]
+pub fn registered_engine_names() -> Vec<String> {
+    let mut names: Vec<String> = DATA_ACCELERATOR_REGISTRATIONS
+        .iter()
+        .map(|registration| registration.engine.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// [`registered_engine_names`] as a user-facing list — `"arrow, duckdb, and sqlite"`.
+///
+/// Separate from the message that embeds it so the wording can be asserted directly;
+/// the link order of the registration slice is not stable, hence the sort above.
+#[must_use]
+pub fn registered_engine_list() -> String {
+    format_engine_list(&registered_engine_names())
+}
+
+fn format_engine_list(names: &[String]) -> String {
+    match names {
+        [] => "none — this build links no accelerator engine".to_string(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 /// Registers a data accelerator for a given engine.
 ///
 /// This macro creates a constructor function for the specified accelerator type and
@@ -459,6 +494,55 @@ pub trait DataAccelerator: Send + Sync {
         registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
+
+    /// This engine's contribution to the coordinated memory budget, summarised from the
+    /// pod's configuration *before* initialization.
+    ///
+    /// The runtime plans that budget (see
+    /// [`runtime_acceleration::memory_budget::plan`]) and must know how many distinct
+    /// engine instances a pod declares, which only the engine can say: instance identity
+    /// follows its own path-resolution rules. Answering here keeps that rule in one
+    /// place — a second implementation in the planner could key instances differently
+    /// and mis-size every cap.
+    ///
+    /// Defaults to no contribution, which is correct for an engine whose instances do
+    /// not compete for a shared memory ceiling.
+    fn memory_budget_inputs(
+        &self,
+        _app: Option<&Arc<app::App>>,
+    ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
+        runtime_acceleration::memory_budget::DuckDbBudgetInputs::default()
+    }
+
+    /// A sidecar over a database this engine owns at `path`, for state that belongs to
+    /// the runtime rather than to a dataset — the Cayenne metastore's `cayenne.db`.
+    ///
+    /// Distinct from [`Self::sidecar`], which derives the path from a source. The
+    /// caller has a path and no source to derive one from, and asks the owning engine
+    /// rather than opening the file itself: the lock that serializes sidecar DDL
+    /// against a concurrent write lives on the engine's pool instance, so a second
+    /// pool over the same file would hold a lock nothing else observes.
+    ///
+    /// Asking through this method is what keeps one engine from naming another's
+    /// concrete type. Defaults to unsupported, which is the true answer for an engine
+    /// that keeps no path-keyed databases of its own.
+    ///
+    /// `dataset_name` names the dataset whose state this sidecar holds — the sidecar
+    /// stores it as such and namespaces rows by it. It is NOT a `spice_sys_*` table
+    /// name; passing one would file a dataset's checkpoints under a table.
+    async fn sidecar_for_path(
+        &self,
+        path: &str,
+        _dataset_name: &str,
+    ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError> {
+        Err(CheckpointError::Store {
+            source: format!(
+                "the {} accelerator does not host databases of its own, so it cannot open '{path}'",
+                self.name()
+            )
+            .into(),
+        })
+    }
 
     /// Drops an existing table from the acceleration engine.
     ///
@@ -891,7 +975,7 @@ pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) 
 #[cfg(test)]
 mod tests {
     use super::{
-        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none,
+        AcceleratorExternalTableBuilder, cayenne_pk_conflict_detection_none, format_engine_list,
         get_primary_keys_from_constraints, upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -1103,5 +1187,32 @@ mod tests {
             ..Acceleration::default()
         };
         assert!(!cayenne_pk_conflict_detection_none(&acceleration));
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// The wording a user reads when they name an engine this build does not have.
+    #[test]
+    fn engine_list_reads_as_prose() {
+        assert_eq!(format_engine_list(&names(&["arrow"])), "arrow");
+        assert_eq!(
+            format_engine_list(&names(&["arrow", "duckdb"])),
+            "arrow and duckdb"
+        );
+        assert_eq!(
+            format_engine_list(&names(&["arrow", "cayenne", "duckdb"])),
+            "arrow, cayenne, and duckdb"
+        );
+    }
+
+    /// A build with no engine linked must not claim an empty set is valid.
+    #[test]
+    fn engine_list_says_so_when_empty() {
+        assert_eq!(
+            format_engine_list(&[]),
+            "none — this build links no accelerator engine"
+        );
     }
 }

@@ -1714,106 +1714,17 @@ fn duckdb_budget_inputs(
 ) -> runtime_acceleration::memory_budget::DuckDbBudgetInputs {
     use runtime_acceleration::memory_budget::DuckDbBudgetInputs;
 
-    /// Per-instance aggregation while grouping accelerations by `DbInstanceKey`.
-    #[derive(Default)]
-    struct InstanceAgg {
-        explicit_max: Option<u64>,
-        has_unset: bool,
-        /// Components sharing this instance set DIFFERENT explicit
-        /// `duckdb_memory_limit` values. Since the setting is per-instance (last one
-        /// created wins), the effective limit is ambiguous — surfaced in the warning.
-        conflicting_explicit: bool,
-    }
-
-    let mut inputs = DuckDbBudgetInputs::default();
-    let Some(app) = app else {
-        return inputs;
-    };
-    let accelerator = crate::dataaccelerator::duckdb::DuckDBAccelerator::default();
-    let mut instances: HashMap<String, InstanceAgg> = HashMap::new();
-
-    let accelerated_components = app
-        .datasets
+    // The instance-identity rule is `DuckDB`'s own — it resolves `duckdb_file`,
+    // `duckdb_data_dir` and the default filename through the same factory the engine
+    // opens databases with — so the engine answers, and the two cannot disagree about
+    // which accelerations share an instance. Asked through the registration slice
+    // rather than by naming the engine crate, which the runtime must not depend on.
+    data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
         .iter()
-        .map(|dataset| (dataset.name.as_str(), dataset.acceleration.as_ref()))
-        .chain(
-            app.views
-                .iter()
-                .map(|view| (view.name.as_str(), view.acceleration.as_ref())),
-        );
-
-    for (name, acceleration) in accelerated_components {
-        let Some(accel) = acceleration else {
-            continue;
-        };
-        if !accel.enabled
-            || !accel
-                .engine
-                .as_deref()
-                .is_some_and(|engine| engine.eq_ignore_ascii_case("duckdb"))
-        {
-            continue;
-        }
-        // Instance identity: memory-mode accelerations share ONE in-memory instance;
-        // file-mode ones group by their resolved DuckDB file path.
-        let key = if accel.mode == spicepod::acceleration::Mode::Memory {
-            "<in-memory>".to_string()
-        } else {
-            accelerator
-                .spicepod_duckdb_file_path(accel)
-                .unwrap_or_else(|| format!("<file:{name}>"))
-        };
-        let params = accel
-            .params
-            .as_ref()
-            .map(spicepod::param::Params::as_string_map)
-            .unwrap_or_default();
-        // Parse with binary units (`true`) to match the DuckDB fork's own
-        // `MemoryLimitSetting` validation; an unparseable explicit value is treated
-        // as unset so the instance still gets a safe auto-cap (the fork would reject
-        // the bad value at creation anyway).
-        let explicit = params
-            .get("duckdb_memory_limit")
-            .and_then(|v| byte_unit::Byte::parse_str(v.trim(), true).ok())
-            .map(byte_unit::Byte::as_u64);
-
-        let agg = instances.entry(key).or_default();
-        match explicit {
-            Some(bytes) => {
-                // A different explicit value than one already seen on this instance
-                // means the components disagree on the per-instance limit.
-                if let Some(prev) = agg.explicit_max
-                    && prev != bytes
-                {
-                    agg.conflicting_explicit = true;
-                }
-                agg.explicit_max = Some(agg.explicit_max.map_or(bytes, |m| m.max(bytes)));
-            }
-            None => agg.has_unset = true,
-        }
-    }
-
-    for (key, agg) in instances {
-        if let Some(bytes) = agg.explicit_max {
-            inputs.num_explicit_instances += 1;
-            inputs.sum_explicit_bytes = inputs.sum_explicit_bytes.saturating_add(bytes);
-            // Inconsistent per-instance limit: some components set it and some
-            // didn't, or they set different explicit values. Either way it's
-            // ambiguous.
-            if agg.has_unset || agg.conflicting_explicit {
-                inputs.has_mixed_instance = true;
-            }
-        } else {
-            inputs.num_unset_instances += 1;
-            inputs.unset_instance_labels.push(key);
-        }
-    }
-    // Deterministic warning output: `instances` is a `HashMap`, so its iteration
-    // order (and thus the pushed label order) varies run-to-run. Sort so identical
-    // Spicepods always log the same `duckdb_unset_instance_paths` list, keeping log
-    // analysis and alert dedup stable.
-    inputs.unset_instance_labels.sort();
-    inputs
+        .find(|registration| registration.engine == runtime_acceleration::Engine::DuckDB)
+        .map_or_else(DuckDbBudgetInputs::default, |registration| {
+            (registration.constructor)().memory_budget_inputs(app)
+        })
 }
 
 /// Without the `duckdb` feature no `DuckDB` accelerators can be configured, so the
