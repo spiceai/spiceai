@@ -2801,34 +2801,8 @@ async fn user_token_for_cloud_connect(
         ));
     }
 
-    // A credential the identity endpoint cannot describe (404) is not the same
-    // as one it rejects (401): the first leaves the token's kind unknown, the
-    // second proves it unusable. Keep the unknown ones as a fallback so a
-    // silent identity endpoint cannot strand a user who is logged in, and let
-    // the server — the authority on what a token may do — answer for real.
-    let mut unidentified: Option<String> = None;
-
-    for token in candidates {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        match client.get_auth_context().await {
-            Ok(_) => {}
-            Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => continue,
-            Err(err) if client::is_absent_user_identity_error(&err) => {
-                tracing::debug!(
-                    "Spice Cloud did not describe the identity behind a stored credential ({err}); keeping it as a fallback for {command}"
-                );
-                unidentified.get_or_insert(token);
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
-        if let Some(org) = requested_org {
-            client.get_auth_context_for_org(org).await?;
-        }
-        return Ok(token);
-    }
-
-    if let Some(token) = unidentified {
+    if let Some(token) = client::first_user_credential(&candidates, endpoint, requested_org).await?
+    {
         return Ok(token);
     }
 

@@ -35,7 +35,7 @@ use runtime_cloud_connect::identity::{AppAttachment, Identity, IdentityStore};
 use runtime_cloud_connect::{CloudConnectConfig, EnrollmentTransactionLock};
 use zeroize::Zeroizing;
 
-use crate::commands::cloud::{CloudClient, org as cloud_org};
+use crate::commands::cloud::org as cloud_org;
 use crate::context::RuntimeContext;
 use crate::error::{CloudErrorCode, Error, Result};
 
@@ -989,19 +989,16 @@ async fn stored_user_login(
             candidates.push(token);
         }
     }
-    for token in candidates {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
-            continue;
-        }
-        if let Some(org) = org_hint {
-            client.get_auth_context_for_org(org).await?;
-        }
-        return Ok(Some(LoginCredential {
-            token: SessionToken::new(token),
-        }));
-    }
-    Ok(None)
+    // Share the preflight's policy rather than restating it: `spice cloud link`
+    // chooses a credential before this transaction runs, and a rule that
+    // accepted one here but not there would strand a link half-done.
+    Ok(
+        crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
+            .await?
+            .map(|token| LoginCredential {
+                token: SessionToken::new(token),
+            }),
+    )
 }
 
 fn org_credential_missing(org: &str) -> Error {

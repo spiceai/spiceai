@@ -251,10 +251,15 @@ impl CloudClient {
             .map_err(|error| self.err(error))
     }
 
-    /// Returns user auth context when the token supports it.
+    /// Returns user auth context when Spice Cloud describes one.
     ///
-    /// Service-account tokens cannot access the auth-context endpoint; those
-    /// `Unauthorized` failures are treated as absent user context.
+    /// `None` means the identity endpoint did not describe a user, which
+    /// covers two different situations and does not distinguish them: it
+    /// rejected the credential (401 — a service-account token, which has no
+    /// user identity), or it had no user to return (404). A caller that must
+    /// tell those apart — because one proves the credential unusable and the
+    /// other proves nothing — should call [`Self::get_auth_context`] and match
+    /// the error itself.
     pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
         match self.get_auth_context().await {
             Ok(ctx) => Ok(Some(ctx)),
@@ -1106,6 +1111,87 @@ fn build_executor(
     })
 }
 
+/// What an identity-endpoint failure proves about a credential.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityFailure {
+    /// Spice Cloud rejected it: a machine token, with no user identity to spend.
+    Rejected,
+    /// Spice Cloud had no user to describe. The credential may still be a
+    /// perfectly good user token — this says nothing either way.
+    Undescribed,
+    /// Something the caller has to see, such as a refusal or a server error.
+    Fatal,
+}
+
+fn classify_identity_failure(err: &crate::error::Error) -> IdentityFailure {
+    match err.cloud_code() {
+        Some(CloudErrorCode::TokenExpired) => IdentityFailure::Rejected,
+        Some(CloudErrorCode::NotFound) => IdentityFailure::Undescribed,
+        _ => IdentityFailure::Fatal,
+    }
+}
+
+/// Confirm this credential may act on `org`, or say why not.
+///
+/// A 404 here is the identity endpoint declining to describe the credential,
+/// not the organization refusing it — a refusal arrives as 403. Treating the
+/// two alike would deny a member their own organization on the strength of a
+/// lookup that failed, so an undescribed credential is allowed through and the
+/// server, which is authoritative on membership, answers the real request.
+pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
+    match client.get_auth_context_for_org(org).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.cloud_code() == Some(CloudErrorCode::NotFound) => {
+            tracing::debug!(
+                "Spice Cloud did not describe this credential's access to organization '{org}' ({err}); continuing and letting the server decide"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The first credential in `candidates` that can act as a user, if any.
+///
+/// Both Cloud Connect entry points — the `spice cloud link` preflight and the
+/// enrollment transaction — choose a credential this way, and they must agree:
+/// one accepting a credential the other rejects strands a link half-done.
+///
+/// A credential the identity endpoint *rejects* has no user identity to spend
+/// (a machine token), so it is skipped. One it merely cannot *describe* is
+/// unknown rather than unusable, and is kept as a fallback behind any
+/// credential that does describe a user.
+pub async fn first_user_credential(
+    candidates: &[String],
+    endpoint: &str,
+    org: Option<&str>,
+) -> Result<Option<String>> {
+    let mut undescribed: Option<&String> = None;
+
+    for token in candidates {
+        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
+        if let Err(err) = client.get_auth_context().await {
+            match classify_identity_failure(&err) {
+                IdentityFailure::Rejected => continue,
+                IdentityFailure::Undescribed => {
+                    tracing::debug!(
+                        "Spice Cloud did not describe the identity behind a stored credential ({err}); keeping it as a fallback"
+                    );
+                    undescribed.get_or_insert(token);
+                    continue;
+                }
+                IdentityFailure::Fatal => return Err(err),
+            }
+        }
+        if let Some(org) = org {
+            confirm_org_access(&client, org).await?;
+        }
+        return Ok(Some(token.clone()));
+    }
+
+    Ok(undescribed.cloned())
+}
+
 /// The auth-context endpoint did not describe a user for this credential.
 ///
 /// Two answers mean the same thing to a caller that only wants the identity:
@@ -1519,6 +1605,40 @@ mod tests {
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::TokenExpired));
         assert!(is_absent_user_identity_error(&err));
+    }
+
+    /// 401 is the one answer that disqualifies a credential; 404 leaves it
+    /// unknown, and anything else is a failure the caller must see.
+    #[test]
+    fn identity_failures_are_classified_by_what_they_prove() {
+        let rejected = map_cloud_error(None)(spice_cloud_client::error::Error::Unauthorized {
+            message: "invalid or expired token".to_string(),
+        });
+        let undescribed = map_cloud_error(None)(spice_cloud_client::error::Error::NotFound {
+            message: "{}".to_string(),
+        });
+        let forbidden = map_cloud_error(None)(spice_cloud_client::error::Error::Forbidden {
+            message: "missing scope".to_string(),
+        });
+        let server_error = map_cloud_error(None)(spice_cloud_client::error::Error::Api {
+            status: 500,
+            message: "boom".to_string(),
+        });
+
+        assert_eq!(
+            classify_identity_failure(&rejected),
+            IdentityFailure::Rejected
+        );
+        assert_eq!(
+            classify_identity_failure(&undescribed),
+            IdentityFailure::Undescribed,
+            "a credential Spice Cloud cannot describe must stay usable"
+        );
+        assert_eq!(classify_identity_failure(&forbidden), IdentityFailure::Fatal);
+        assert_eq!(
+            classify_identity_failure(&server_error),
+            IdentityFailure::Fatal
+        );
     }
 
     /// Spice Cloud answers the identity endpoint with 404 for credentials it
