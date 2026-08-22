@@ -63,12 +63,15 @@ async fn test_postgres_avg_rounds_to_declared_scale_instead_of_erroring()
                 .execute("CREATE TABLE numeric_avg_test (qty NUMERIC(15,2));", &[])
                 .await
                 .expect("table is created");
-            // 4 / 3 = 1.3333... : Postgres's NUMERIC average carries far more
-            // than 6 fractional digits for this value.
+            // 5 / 3 = 1.66666... : the 7th fractional digit (6) forces a
+            // carry when rounded to 6 places (-> ...667), so this value
+            // actually distinguishes rounding from truncation -- unlike
+            // 4 / 3 = 1.333..., whose 7th digit (3) rounds the same as it
+            // truncates.
             db_conn
                 .conn
                 .execute(
-                    "INSERT INTO numeric_avg_test (qty) VALUES (1.00), (1.00), (2.00);",
+                    "INSERT INTO numeric_avg_test (qty) VALUES (1.00), (2.00), (2.00);",
                     &[],
                 )
                 .await
