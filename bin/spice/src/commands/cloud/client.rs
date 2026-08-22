@@ -1272,7 +1272,9 @@ pub async fn first_user_credential(
             if !is_org_refusal(&err) {
                 return Err(err);
             }
-            tracing::debug!("A stored credential may not act on organization '{org}' ({err}); trying the next one");
+            tracing::debug!(
+                "A stored credential may not act on organization '{org}' ({err}); trying the next one"
+            );
             refusal = Some(err);
             continue;
         }
@@ -1787,7 +1789,10 @@ mod tests {
             IdentityFailure::Undescribed,
             "a credential Spice Cloud cannot describe must stay usable"
         );
-        assert_eq!(classify_identity_failure(&forbidden), IdentityFailure::Fatal);
+        assert_eq!(
+            classify_identity_failure(&forbidden),
+            IdentityFailure::Fatal
+        );
         assert_eq!(
             classify_identity_failure(&server_error),
             IdentityFailure::Fatal
