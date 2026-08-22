@@ -142,8 +142,24 @@ pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_facto
     (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
 }
 
+/// True for a `Date32`/`Date64` against a timezone-free `Timestamp`, in either
+/// order. Oracle's `DATE` is a datetime, so a date column arrives as a
+/// `Timestamp`.
+fn is_date_and_timestamp_pair(left: &DataType, right: &DataType) -> bool {
+    matches!(
+        (left, right),
+        (
+            DataType::Date32 | DataType::Date64,
+            DataType::Timestamp(_, None)
+        ) | (
+            DataType::Timestamp(_, None),
+            DataType::Date32 | DataType::Date64
+        )
+    )
+}
+
 fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
-    if expected_type == actual_type {
+    if expected_type == actual_type || is_date_and_timestamp_pair(expected_type, actual_type) {
         return true;
     }
 
@@ -192,16 +208,6 @@ fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool
                     DataType::Date64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                 )
                 | (DataType::Date64, DataType::Date32)
-                // Oracle's `DATE` is a datetime, so a date column arrives as a
-                // `Timestamp`. Values must still match at midnight.
-                | (
-                    DataType::Date32 | DataType::Date64,
-                    DataType::Timestamp(_, None)
-                )
-                | (
-                    DataType::Timestamp(_, None),
-                    DataType::Date32 | DataType::Date64
-                )
         ),
     }
 }
@@ -457,6 +463,9 @@ pub fn validate_batches_as_strings(
         let data_type = field.data_type();
         let expected_array = expected.column(i).as_ref();
         let actual_array = actual.column(i).as_ref();
+        // Stringified values lose their type, so the midnight normalization below
+        // is limited to the columns it is meant for.
+        let date_vs_timestamp = is_date_and_timestamp_pair(data_type, actual_array.data_type());
 
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
@@ -517,7 +526,9 @@ pub fn validate_batches_as_strings(
                             continue;
                         }
 
-                        if date_and_midnight_timestamp_equivalent(&expected_val, &actual_val) {
+                        if date_vs_timestamp
+                            && date_and_midnight_timestamp_equivalent(&expected_val, &actual_val)
+                        {
                             continue;
                         }
 
@@ -978,8 +989,8 @@ mod test {
     use super::*;
     use arrow::{
         array::{
-            Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array, UInt8Array,
-            UInt16Array, UInt32Array, UInt64Array,
+            ArrayRef, Decimal128Builder, Decimal256Builder, Float32Array, Int8Array, Int16Array,
+            UInt8Array, UInt16Array, UInt32Array, UInt64Array,
         },
         datatypes::{Field, Schema, SchemaRef, i256},
     };
@@ -1681,6 +1692,45 @@ mod test {
             "1995-03-05",
             "1995-03-05T00:00:00"
         ));
+    }
+
+    #[test]
+    fn test_midnight_normalization_is_limited_to_date_columns() {
+        fn compare(data_type: DataType, expected: ArrayRef, actual: ArrayRef) -> String {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "value", data_type, false,
+            )]));
+            let expected = RecordBatch::try_new(Arc::clone(&schema), vec![expected])
+                .expect("expected batch should build");
+            // The actual batch carries the engine's own type for the column.
+            let actual_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                actual.data_type().clone(),
+                false,
+            )]));
+            let actual = RecordBatch::try_new(actual_schema, vec![actual])
+                .expect("actual batch should build");
+            format!(
+                "{:?}",
+                validate_batches_as_strings(&expected, &actual).expect("comparison should run")
+            )
+        }
+
+        // A date against the same date at midnight passes.
+        let result = compare(
+            DataType::Date32,
+            Arc::new(Date32Array::from(vec![9194])),
+            Arc::new(TimestampSecondArray::from(vec![794_361_600])),
+        );
+        assert!(result.contains("Pass"), "date vs midnight timestamp: {result}");
+
+        // The same two strings in a text column are still a mismatch.
+        let result = compare(
+            DataType::Utf8,
+            Arc::new(StringArray::from(vec!["1995-03-05"])),
+            Arc::new(StringArray::from(vec!["1995-03-05 00:00:00"])),
+        );
+        assert!(result.contains("DataMismatch"), "text column: {result}");
     }
 
     #[test]
