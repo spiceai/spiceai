@@ -1980,7 +1980,7 @@ async fn verify_login_org(
     // Do not compare a user's default org with the requested org: doing so
     // rejects valid member access before the membership endpoint can decide.
     let _ = token_org;
-    client.get_auth_context_for_org(requested).await?;
+    client::confirm_org_access(client, requested).await?;
     Ok(Some(requested.to_string()))
 }
 
@@ -2408,18 +2408,29 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
-        Err(err) if client::is_unauthorized_auth_context_error(&err) => {
-            // The auth-context endpoint requires a user token (subscription
-            // or PAT). Service-account tokens (OAuth client credentials) are
-            // valid for API calls but do not have a user identity.
-            if client.list_projects().await.is_ok() {
-                return Err(Error::cloud_with_hint(
-                    CloudErrorCode::Forbidden,
-                    "User identity is not available for this authentication method. The current credential is a valid service-account token and can be used for API calls, but has no user identity.",
-                    "Run 'spice cloud login subscription' or 'spice cloud login token' to obtain a user token.",
-                ));
-            }
-            return Err(err);
+        // Spice Cloud returned no user identity. That happens for a
+        // service-account token (OAuth client credentials), which authenticates
+        // API calls but has no user behind it, and when the endpoint has no
+        // user record to return at all. Neither says the credential is
+        // unusable, so neither should reach the user as a raw failure.
+        Err(err) if client::is_absent_user_identity_error(&err) => {
+            // Whether other commands work is a separate question, and the
+            // answer only widens the guidance — it never withholds it, or a
+            // second failure here would put the unusable original message back
+            // in front of the user.
+            let usable = client.list_projects().await.is_ok();
+            let detail = if usable {
+                "The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command."
+            } else {
+                "Whether the credential works for anything else is unknown: listing this organization's projects did not succeed either, which a missing role or scope would also explain."
+            };
+            return Err(Error::cloud_with_hint(
+                CloudErrorCode::Forbidden,
+                format!(
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. {detail}"
+                ),
+                "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
+            ));
         }
         Err(err) => return Err(err),
     };
@@ -2805,22 +2816,7 @@ async fn user_token_for_cloud_connect(
     action: &str,
     command: &str,
 ) -> Result<String> {
-    let mut candidates = Vec::new();
-    for token in [
-        requested_org.and_then(org::token_for_org),
-        org::default_token(),
-        org::active_org()
-            .ok()
-            .flatten()
-            .and_then(|org| org::token_for_org(&org)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&token) {
-            candidates.push(token);
-        }
-    }
+    let candidates = client::user_credential_candidates(requested_org);
     if candidates.is_empty() {
         return Err(Error::cloud_with_hint(
             CloudErrorCode::NotAuthenticated,
@@ -2829,14 +2825,8 @@ async fn user_token_for_cloud_connect(
         ));
     }
 
-    for token in candidates {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
-            continue;
-        }
-        if let Some(org) = requested_org {
-            client.get_auth_context_for_org(org).await?;
-        }
+    if let Some(token) = client::first_user_credential(&candidates, endpoint, requested_org).await?
+    {
         return Ok(token);
     }
 
@@ -5011,7 +5001,7 @@ mod tests {
     fn is_cloud_unauthorized_error_matches_a_rejected_credential() {
         let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired");
 
-        assert!(client::is_unauthorized_auth_context_error(&err));
+        assert!(client::is_absent_user_identity_error(&err));
     }
 
     #[test]
@@ -5020,7 +5010,7 @@ mod tests {
         // not allowed — that must not be mistaken for a missing user identity.
         let err = Error::cloud(CloudErrorCode::Forbidden, "Forbidden: missing scope");
 
-        assert!(!client::is_unauthorized_auth_context_error(&err));
+        assert!(!client::is_absent_user_identity_error(&err));
     }
 
     #[test]

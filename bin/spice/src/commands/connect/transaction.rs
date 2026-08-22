@@ -35,7 +35,7 @@ use runtime_cloud_connect::identity::{AppAttachment, Identity, IdentityStore};
 use runtime_cloud_connect::{CloudConnectConfig, EnrollmentTransactionLock};
 use zeroize::Zeroizing;
 
-use crate::commands::cloud::{CloudClient, org as cloud_org};
+use crate::commands::cloud::org as cloud_org;
 use crate::context::RuntimeContext;
 use crate::error::{CloudErrorCode, Error, Result};
 
@@ -977,31 +977,20 @@ async fn stored_user_login(
     endpoint: &str,
     org_hint: Option<&str>,
 ) -> Result<Option<LoginCredential>> {
-    let mut candidates = Vec::new();
-    for token in [
-        org_hint.and_then(cloud_org::token_for_org),
-        cloud_org::default_token(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&token) {
-            candidates.push(token);
-        }
-    }
-    for token in candidates {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
-            continue;
-        }
-        if let Some(org) = org_hint {
-            client.get_auth_context_for_org(org).await?;
-        }
-        return Ok(Some(LoginCredential {
-            token: SessionToken::new(token),
-        }));
-    }
-    Ok(None)
+    // Share the preflight's candidates and policy rather than restating them:
+    // `spice cloud link` chooses a credential before this transaction runs, and
+    // a list or a rule that differed would strand a link half-done.
+    let candidates = crate::commands::cloud::client::user_credential_candidates(org_hint);
+    // Share the preflight's policy rather than restating it: `spice cloud link`
+    // chooses a credential before this transaction runs, and a rule that
+    // accepted one here but not there would strand a link half-done.
+    Ok(
+        crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
+            .await?
+            .map(|token| LoginCredential {
+                token: SessionToken::new(token),
+            }),
+    )
 }
 
 fn org_credential_missing(org: &str) -> Error {
