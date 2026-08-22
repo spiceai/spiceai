@@ -192,6 +192,16 @@ fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool
                     DataType::Date64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                 )
                 | (DataType::Date64, DataType::Date32)
+                // Oracle's `DATE` is a datetime, so a date column arrives as a
+                // `Timestamp`. Values must still match at midnight.
+                | (
+                    DataType::Date32 | DataType::Date64,
+                    DataType::Timestamp(_, None)
+                )
+                | (
+                    DataType::Timestamp(_, None),
+                    DataType::Date32 | DataType::Date64
+                )
         ),
     }
 }
@@ -507,6 +517,10 @@ pub fn validate_batches_as_strings(
                             continue;
                         }
 
+                        if date_and_midnight_timestamp_equivalent(&expected_val, &actual_val) {
+                            continue;
+                        }
+
                         return Ok(QueryValidationResult::Fail(
                             QueryValidationFailReason::DataMismatch {
                                 column: column_name,
@@ -713,6 +727,52 @@ pub fn validate_row_count(
     }
 }
 
+/// True when `s` matches `shape`, where `#` marks a digit and every other byte
+/// is a literal at that offset.
+fn matches_shape(s: &str, shape: &[u8]) -> bool {
+    s.len() == shape.len()
+        && s.bytes().zip(shape).all(|(c, &want)| {
+            if want == b'#' {
+                c.is_ascii_digit()
+            } else {
+                c == want
+            }
+        })
+}
+
+/// True when one string is a plain date and the other is that date at midnight:
+/// the answer set's `1995-03-05` against the `1995-03-05 00:00:00` an engine
+/// whose `DATE` carries a time component (Oracle) returns.
+///
+/// Only midnight matches. A non-midnight time is a real difference in the data.
+fn date_and_midnight_timestamp_equivalent(a: &str, b: &str) -> bool {
+    /// Exactly `YYYY-MM-DD`, the form [`array_value_to_string`] emits for a date.
+    fn is_date(s: &str) -> bool {
+        matches_shape(s, b"####-##-##")
+    }
+
+    /// The date part of a `YYYY-MM-DD 00:00:00` timestamp, fractional second
+    /// permitted only if zero. `None` for anything else.
+    fn midnight_date(s: &str) -> Option<&str> {
+        let (date, time) = s.split_once(' ')?;
+        if !is_date(date) {
+            return None;
+        }
+        let fraction = time.strip_prefix("00:00:00")?;
+        let fraction_is_zero = match fraction.strip_prefix('.') {
+            Some(digits) => !digits.is_empty() && digits.bytes().all(|c| c == b'0'),
+            None => fraction.is_empty(),
+        };
+        fraction_is_zero.then_some(date)
+    }
+
+    match (is_date(a), is_date(b)) {
+        (true, false) => midnight_date(b) == Some(a),
+        (false, true) => midnight_date(a) == Some(b),
+        _ => false,
+    }
+}
+
 /// True when both strings are timestamps in the format [`array_value_to_string`]
 /// emits and differ only by fractional-second zero padding — a nanosecond engine's
 /// `2024-01-01 00:00:00.000000000` against a microsecond engine's
@@ -727,17 +787,7 @@ fn timestamp_strings_equivalent(a: &str, b: &str) -> bool {
     /// Exactly `YYYY-MM-DD HH:MM:SS`, the prefix [`array_value_to_string`] emits
     /// for every `Timestamp` unit.
     fn is_timestamp_prefix(s: &str) -> bool {
-        /// Literal separators at their exact offsets; `#` marks a digit slot.
-        const SHAPE: &[u8; 19] = b"####-##-## ##:##:##";
-
-        s.len() == SHAPE.len()
-            && s.bytes().zip(SHAPE).all(|(c, &want)| {
-                if want == b'#' {
-                    c.is_ascii_digit()
-                } else {
-                    c == want
-                }
-            })
+        matches_shape(s, b"####-##-## ##:##:##")
     }
 
     /// Splits into the `YYYY-MM-DD HH:MM:SS` prefix and its fractional digits with
@@ -1576,5 +1626,79 @@ mod test {
         assert!(!timestamp_strings_equivalent("12:30.100", "12:30.1"));
         // Decimals must fall through to the numeric comparison path.
         assert!(!timestamp_strings_equivalent("1.10", "1.1"));
+    }
+
+    #[test]
+    fn test_date_and_midnight_timestamp_equivalent() {
+        // Either argument may be the date.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05"
+        ));
+        // A zero fraction is still midnight.
+        assert!(date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.000"
+        ));
+
+        // Non-midnight times are real differences.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 06:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:01"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05 00:00:00.001"
+        ));
+        // A different day differs even at midnight.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-06 00:00:00"
+        ));
+        // Two dates, or two timestamps, are left to the caller's other rules.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05 00:00:00",
+            "1995-03-05 00:00:00"
+        ));
+        // Anything outside the emitted format falls through.
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-3-5",
+            "1995-03-05 00:00:00"
+        ));
+        assert!(!date_and_midnight_timestamp_equivalent(
+            "1995-03-05",
+            "1995-03-05T00:00:00"
+        ));
+    }
+
+    #[test]
+    fn test_datatype_equivalent_date_and_timestamp() {
+        // The answer set infers `Date32`; an Oracle `DATE` arrives as a
+        // second-resolution `Timestamp`.
+        assert!(datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, None)
+        ));
+        assert!(datatype_equivalent(
+            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Date32
+        ));
+        // A zoned timestamp against a date stays a mismatch.
+        assert!(!datatype_equivalent(
+            &DataType::Date32,
+            &DataType::Timestamp(TimeUnit::Second, Some("UTC".into()))
+        ));
     }
 }
