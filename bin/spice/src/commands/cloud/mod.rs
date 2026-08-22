@@ -2832,10 +2832,14 @@ async fn choose_attachable_project(
     projects: Vec<crate::commands::connect::project::AttachableProject>,
 ) -> Result<ProjectTarget> {
     if projects.is_empty() {
+        // A project only qualifies when it is a Cloud Connect project, in
+        // the organization this credential acts on, with no instance
+        // attached yet — naming the conditions lets the reader act instead
+        // of retrying into the same error (#13378).
         return Err(Error::cloud_with_hint(
             CloudErrorCode::ProjectNotFound,
             "Spice Cloud returned no projects that can be attached.",
-            "Create a project in Spice Cloud, then retry `spice cloud link`.",
+            "A linkable project is a Cloud Connect project (created by omitting `--kind` on `spice cloud project create`)              in the organization this credential acts on, with no instance attached yet.              Check `spice cloud projects` and retry `spice cloud link`.",
         ));
     }
     let items: Vec<String> = projects
