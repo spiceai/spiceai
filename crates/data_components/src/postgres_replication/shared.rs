@@ -646,6 +646,33 @@ impl AckSlot {
         advance_monotonic(&self.pending, lsn);
     }
 
+    /// Seat a member resuming on a position a previous process durably recorded
+    /// as applied. A recorded position means "everything at or below this LSN is
+    /// durably in the acceleration" (see [`Self::recorded`]), which makes it two
+    /// things at once:
+    ///
+    ///   * **recordable** — the idle carry-forward may extend it
+    ///     ([`publish_idle_positions`]), hence `note_recorded`/`note_pending`;
+    ///   * **the replay-suppression floor** — a reconnect replay must not
+    ///     re-deliver anything at or below it ([`Self::already_committed`]),
+    ///     hence `committed`/`delivered`.
+    ///
+    /// Seeding only the first half loses writes for a durable write-back dataset:
+    /// its echo registry prunes entries against this same recorded position, so a
+    /// crash while the slot's `confirmed_flush_lsn` lags it replays echoes whose
+    /// entries are already pruned — re-applied as ordinary changes, they regress
+    /// the acceleration to a stale echo image, and the next write-back delivery
+    /// then regresses the source too (#13368).
+    ///
+    /// `committed` before `delivered`, per the torn-read invariant on
+    /// [`AckTable::credit_idle`].
+    fn seat_recorded(&self, lsn: u64) {
+        self.note_recorded(lsn);
+        self.note_pending(lsn);
+        advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.delivered, lsn);
+    }
+
     /// Advance this member's committed floor (monotonic). Called lock-free from
     /// the consumer commit path via [`SharedLsnCommitter`].
     fn commit(&self, lsn: u64) {
@@ -2425,12 +2452,15 @@ async fn attach_member(
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
     // Seeding it lets an idle member carry that position forward (see
-    // `flush_idle_watermarks`) instead of waiting for a change that may never come.
+    // `flush_idle_watermarks`) instead of waiting for a change that may never come
+    // — and, through the member's `committed` floor, keeps the coming reconnect
+    // replay from re-delivering commits the acceleration durably holds (see
+    // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
+    // write-back dataset).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
         && !rebuild_via_consumer
     {
-        slot.note_recorded(resumed.lsn);
-        slot.note_pending(resumed.lsn);
+        slot.seat_recorded(resumed.lsn);
     }
     lock(&source.members).insert(
         member_key.clone(),
@@ -7078,6 +7108,70 @@ mod tests {
             second.num_rows_hint(),
             0,
             "the echo is dropped again on reconnect replay, never re-applied"
+        );
+    }
+
+    /// Restart replay must not re-deliver commits at or below the position a
+    /// member durably recorded as applied. The echo registry prunes its entries
+    /// against that same recorded position, so a replayed echo below it arrives
+    /// unregistered — re-applying it as an ordinary change regresses the
+    /// acceleration to the stale echo image, silently losing acknowledged
+    /// writes (regression test for #13368). `seat_recorded` is exactly what
+    /// `attach_member` runs for a member resuming without a rebuild.
+    #[tokio::test]
+    async fn resumed_member_suppresses_replay_below_recorded_position() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+        let recorded = 900u64;
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        t0_slot.seat_recorded(recorded);
+
+        // Replay of a commit at the recorded position: its registry entry was
+        // pruned before the restart, so only the seated floor protects it.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "72"), (101, "72")]),
+            recorded,
+            Some(4242),
+        )
+        .await;
+
+        // t1 never recorded a position — the replay is delivered to it as usual.
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("not an error");
+        assert_eq!(t1.num_rows_hint(), 1, "an unseated member gets the replay");
+
+        // t0 durably holds everything at or below `recorded`: nothing may be
+        // delivered, not even a zero-row ack (its floor already covers the LSN).
+        assert_eq!(
+            t0_slot.delivered(),
+            recorded,
+            "no envelope was staged for the seated member"
+        );
+
+        // A genuinely new commit above the recorded position flows normally.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "79")]),
+            recorded + 1,
+            Some(4243),
+        )
+        .await;
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope for the new commit")
+            .expect("not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "commits above the recorded position are delivered"
         );
     }
 }
