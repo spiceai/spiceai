@@ -48,7 +48,9 @@ use tokio::time::sleep;
 use tokio_postgres::{Client, NoTls};
 
 use crate::postgres::common;
-use crate::utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context};
+use crate::utils::{
+    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+};
 use crate::{configure_test_datafusion, init_tracing};
 
 /// How long to wait for a value to propagate in either direction — Spice → the
@@ -201,11 +203,17 @@ fn cdc_dataset(
     let mut accel_params = HashMap::new();
     accel_params.insert(
         "cayenne_file_path".to_string(),
-        accel_dir.join(format!("{table}_data")).display().to_string(),
+        accel_dir
+            .join(format!("{table}_data"))
+            .display()
+            .to_string(),
     );
     accel_params.insert(
         "cayenne_metadata_dir".to_string(),
-        accel_dir.join(format!("{table}_meta")).display().to_string(),
+        accel_dir
+            .join(format!("{table}_meta"))
+            .display()
+            .to_string(),
     );
 
     dataset.acceleration = Some(Acceleration {
@@ -289,7 +297,11 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
                 "CREATE TABLE public.wb_update (id int PRIMARY KEY, amount int NOT NULL)",
             )
             .await?;
-            exec(&source, "INSERT INTO public.wb_update VALUES (1, 10), (2, 20)").await?;
+            exec(
+                &source,
+                "INSERT INTO public.wb_update VALUES (1, 10), (2, 20)",
+            )
+            .await?;
 
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
@@ -345,8 +357,8 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
             )
             .await?;
             // The source agrees, so nothing was delivered twice or lost.
-            let source_sum = source_count(&source, "SELECT sum(amount)::int8 FROM public.wb_update")
-                .await?;
+            let source_sum =
+                source_count(&source, "SELECT sum(amount)::int8 FROM public.wb_update").await?;
             assert_eq!(source_sum, 116, "the source holds the same total");
 
             rt.shutdown().await;
@@ -438,9 +450,11 @@ async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow
 
             // The trigger's rewrite reaches the accelerator: both sides end up on
             // the source's value, not the one Spice committed.
-            wait_for("the trigger's rewrite in the accelerator", Some(100), || {
-                accel_scalar(&rt, "SELECT amount FROM wb_trigger WHERE id = 2")
-            })
+            wait_for(
+                "the trigger's rewrite in the accelerator",
+                Some(100),
+                || accel_scalar(&rt, "SELECT amount FROM wb_trigger WHERE id = 2"),
+            )
             .await?;
             // The sentinel is an external transaction, so its own rewrite is never
             // a suppression candidate — it confirms the stream is live rather than

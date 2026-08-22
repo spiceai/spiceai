@@ -422,10 +422,8 @@ impl PgChangeRows {
     pub(super) fn with_source_xid(mut self, xid: Option<u32>) -> Self {
         // `xid` 0 is Postgres's "no transaction assigned" sentinel, so it
         // collapses to `None` alongside a genuinely absent xid.
-        self.chunk_xids = ChunkXids::Tracked(vec![
-            xid.and_then(NonZeroU32::new);
-            self.raw_chunks.len()
-        ]);
+        self.chunk_xids =
+            ChunkXids::Tracked(vec![xid.and_then(NonZeroU32::new); self.raw_chunks.len()]);
         self
     }
 

@@ -6842,7 +6842,10 @@ mod tests {
         let report = filter
             .external_write_report(true)
             .expect("the first foreign transaction is reported");
-        assert!(report.contains("'orders_wb'"), "names the dataset: {report}");
+        assert!(
+            report.contains("'orders_wb'"),
+            "names the dataset: {report}"
+        );
         assert!(
             report.contains("overwrite"),
             "states what delivery may do to the other writer's row: {report}"
@@ -6943,7 +6946,10 @@ mod tests {
 
         let scan = rows.drop_echoed(&registry);
 
-        assert!(scan.dropped.is_empty(), "nothing can match an untagged chunk");
+        assert!(
+            scan.dropped.is_empty(),
+            "nothing can match an untagged chunk"
+        );
         assert!(
             !scan.saw_foreign_txn,
             "an untagged chunk is not evidence of a foreign transaction"
