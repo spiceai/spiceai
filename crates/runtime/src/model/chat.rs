@@ -51,6 +51,7 @@ use super::params::google::GoogleModelParams;
 #[cfg(feature = "models")]
 use super::params::huggingface::HuggingFaceModelParams;
 use super::params::openai::OpenAiModelParams;
+use super::params::orcarouter::OrcaRouterModelParams;
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
@@ -231,6 +232,12 @@ pub async fn construct_model(
             let p = typed_params::<SpiceAiModelParams>(component, params, source.clone(), secrets)
                 .await?;
             spiceai(model_id, &p)
+        }
+        ModelSource::OrcaRouter => {
+            let p =
+                typed_params::<OrcaRouterModelParams>(component, params, source.clone(), secrets)
+                    .await?;
+            orcarouter(model_id, &p)
         }
     }?;
 
@@ -604,6 +611,33 @@ fn spiceai(
     Ok(Arc::new(llms::spiceai::new_spiceai_client(
         model_id,
         Some(endpoint),
+        api_key,
+    )) as Arc<dyn Chat>)
+}
+
+/// Builds a chat model served by the OrcaRouter AI gateway, which exposes an
+/// `OpenAI`-compatible API under `/v1`.
+fn orcarouter(
+    model_id: Option<String>,
+    params: &OrcaRouterModelParams,
+) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id.filter(|id| !id.trim().is_empty()) else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "orcarouter".to_string(),
+        });
+    };
+
+    // The gateway always authenticates, so an unset key is a misconfiguration.
+    let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
+    if api_key.is_none() {
+        return Err(LlmError::FailedToLoadModel {
+            source: "Missing `orcarouter_api_key`. Models served by the OrcaRouter AI gateway require an API key. Set `orcarouter_api_key`. See: https://www.orcarouter.ai".into(),
+        });
+    }
+
+    Ok(Arc::new(llms::orcarouter::new_orcarouter_client(
+        model_id,
+        Some(params.endpoint.as_str()),
         api_key,
     )) as Arc<dyn Chat>)
 }

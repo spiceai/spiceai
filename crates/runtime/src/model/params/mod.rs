@@ -34,6 +34,7 @@ pub mod file;
 pub mod google;
 pub mod huggingface;
 pub mod openai;
+pub mod orcarouter;
 pub mod spiceai;
 pub mod xai;
 
@@ -57,6 +58,7 @@ source_specs!(ANTHROPIC_SPEC, anthropic::AnthropicModelParams);
 source_specs!(XAI_SPEC, xai::XaiModelParams);
 source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
 source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
+source_specs!(ORCAROUTER_SPEC, orcarouter::OrcaRouterModelParams);
 source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
 
 /// Returns the parameter specifications for a given model source, generated
@@ -75,6 +77,7 @@ pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
         ModelSource::Xai => &XAI_SPEC,
         ModelSource::Bedrock => &BEDROCK_SPEC,
         ModelSource::SpiceAI => &SPICEAI_SPEC,
+        ModelSource::OrcaRouter => &ORCAROUTER_SPEC,
         ModelSource::Google => &GOOGLE_SPEC,
     }
 }
@@ -217,6 +220,22 @@ mod tests {
         assert!(
             hf.iter()
                 .any(|s| s.name == "openai_temperature" && s.deprecation_message.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn orcarouter_defaults_and_key_are_accepted() {
+        let typed = orcarouter::OrcaRouterModelParams::try_from_params(
+            "model orcarouter",
+            params(&[("orcarouter_api_key", "sk-orca-1")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("orcarouter params should deserialize");
+        assert_eq!(typed.endpoint, "https://api.orcarouter.ai");
+        assert_eq!(
+            typed.api_key.as_ref().map(ExposeSecret::expose_secret),
+            Some("sk-orca-1")
         );
     }
 }

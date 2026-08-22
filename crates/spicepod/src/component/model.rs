@@ -89,6 +89,7 @@ pub enum ModelSource {
     Xai,
     HuggingFace,
     SpiceAI,
+    OrcaRouter,
     File,
     Databricks,
     Bedrock,
@@ -99,6 +100,10 @@ pub enum ModelSource {
 /// matches the parameter prefix (`spiceai_api_key`). Both are accepted so a `from` reads the same
 /// whether it names a dataset or a model.
 pub const SPICEAI_PREFIXES: [&str; 2] = ["spice.ai", "spiceai"];
+
+/// The prefix that selects [`ModelSource::OrcaRouter`]. Matches the parameter prefix
+/// (`orcarouter_api_key`), so a `from` reads the same way it is configured.
+pub const ORCAROUTER_PREFIX: &str = "orcarouter";
 
 impl ModelSource {
     pub fn parse_from(&self, from: &str) -> Option<String> {
@@ -113,6 +118,15 @@ impl ModelSource {
                     from.strip_prefix(&format!("{p}:"))
                         .or_else(|| from.strip_prefix(&format!("{p}/")))
                 })
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(std::string::ToString::to_string),
+            // A bare prefix (`orcarouter:`, `orcarouter/`) carries no model id. Report that as
+            // absent rather than as an empty id, so the caller raises "no model provided" instead
+            // of dialing the endpoint with an empty model name.
+            ModelSource::OrcaRouter => from
+                .strip_prefix(&format!("{ORCAROUTER_PREFIX}:"))
+                .or_else(|| from.strip_prefix(&format!("{ORCAROUTER_PREFIX}/")))
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(std::string::ToString::to_string),
@@ -222,6 +236,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Xai)
         } else if SPICEAI_PREFIXES.iter().any(|p| value.starts_with(p)) {
             Ok(ModelSource::SpiceAI)
+        } else if value.starts_with("orcarouter") {
+            Ok(ModelSource::OrcaRouter)
         } else if value.starts_with("databricks") {
             Ok(ModelSource::Databricks)
         } else if value.starts_with("bedrock") {
@@ -244,6 +260,7 @@ impl Display for ModelSource {
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
+            ModelSource::OrcaRouter => write!(f, "orcarouter"),
             ModelSource::Databricks => write!(f, "databricks"),
             ModelSource::Bedrock => write!(f, "bedrock"),
         }
@@ -262,6 +279,7 @@ impl ModelSource {
             ModelSource::HuggingFace => "hf",
             ModelSource::File => "file",
             ModelSource::SpiceAI => "spiceai",
+            ModelSource::OrcaRouter => "orcarouter",
             ModelSource::Databricks => "databricks",
             ModelSource::Bedrock => "bedrock",
         }
@@ -675,6 +693,52 @@ mod tests {
     fn spiceai_model_id_is_trimmed() {
         let model = Model::new("spice.ai: openai/gpt-4o ", "test");
         assert_eq!(model.get_model_id().as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn orcarouter_source_parses_prefix_and_model_id() {
+        for from in [
+            "orcarouter",
+            "orcarouter:orcarouter/auto",
+            "orcarouter/orcarouter/auto",
+        ] {
+            let model = Model::new(from, "test");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::OrcaRouter),
+                "for {from}"
+            );
+        }
+        assert_eq!(
+            Model::new("orcarouter:orcarouter/auto", "test")
+                .get_model_id()
+                .as_deref(),
+            Some("orcarouter/auto")
+        );
+        assert_eq!(
+            Model::new("orcarouter/orcarouter/auto", "test")
+                .get_model_id()
+                .as_deref(),
+            Some("orcarouter/auto")
+        );
+    }
+
+    #[test]
+    fn orcarouter_bare_prefix_reports_no_model_id() {
+        for from in [
+            "orcarouter:",
+            "orcarouter/",
+            "orcarouter:   ",
+            "orcarouter/ ",
+        ] {
+            let model = Model::new(from, "test");
+            assert_eq!(
+                model.get_source(),
+                Some(ModelSource::OrcaRouter),
+                "for {from}"
+            );
+            assert_eq!(model.get_model_id(), None, "unexpected model id for {from}");
+        }
     }
 
     #[test]

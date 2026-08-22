@@ -17,6 +17,7 @@ All criteria must be met for the model to be considered Stable.
 | Hugging Face            | ➖             |              |
 | Nvidia NIM              | ➖             |              |
 | OpenAI                  | ➖             |              |
+| OrcaRouter              | ➖             |              |
 | Spice.ai Cloud Platform | ➖             |              |
 | xAI (Grok)              | ➖             |              |
 

@@ -91,6 +91,15 @@ pub async fn get_available_models_hint(
                 return None;
             }
         },
+        ModelSource::OrcaRouter => {
+            match llms::orcarouter::OrcaRouterModelLister::from_params(params) {
+                Ok(lister) => Box::new(lister),
+                Err(e) => {
+                    tracing::debug!("Cannot create OrcaRouter model lister: {e}");
+                    return None;
+                }
+            }
+        }
         _ => {
             tracing::debug!("Model source {:?} does not support model listing", source);
             return None;
