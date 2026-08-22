@@ -1217,6 +1217,11 @@ async fn execute_status(
     // diagnosis command lie about the thing it exists to diagnose.
     let never_deployed = latest.is_none();
     let mut runtime_error: Option<String> = None;
+    // Set when the health read failed only because the data plane refuses to
+    // inspect a self-hosted runtime: for a Cloud Connect project that is the
+    // project's shape, not an outage, and rendering it as a failure would make
+    // every status of a healthy Cloud Connect project read as degraded.
+    let mut self_hosted = false;
 
     let (instances, datasets) =
         match project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await {
@@ -1238,6 +1243,7 @@ async fn execute_status(
                     if let Some(err) = failure
                         && runtime_error.is_none()
                     {
+                        self_hosted = health_not_served_for_self_hosted(err);
                         runtime_error = Some(err.to_string());
                     }
                 }
@@ -1309,14 +1315,18 @@ async fn execute_status(
     }
 
     println!();
-    if let Some(err) = &runtime_error {
+    if let Some(err) = &runtime_error
+        && !self_hosted
+    {
         // Say the fleet is unknown rather than empty.
         println!("Could not read instance or dataset health: {err}");
         println!("  Instance and dataset state below may be incomplete.");
         println!();
     }
     if instances.is_empty() {
-        if runtime_error.is_some() {
+        if self_hosted {
+            println!("{}", self_hosted_instances_note(&target));
+        } else if runtime_error.is_some() {
             println!("Instances: unknown.");
         } else {
             println!("No instances are running.");
@@ -4545,22 +4555,25 @@ async fn project_runtime_context(
 ) -> Result<RuntimeContext> {
     let project = client.get_project(target).await?;
 
-    let region = project.region.clone().ok_or_else(|| {
+    let region = project.data_plane_region().ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
             format!(
                 "Project {target} does not report a region, so its instance endpoint is unknown."
             ),
-            format!("Check it with 'spice cloud status --project {target}'."),
+            format!(
+                "A Cloud Connect project reports its region once an instance is linked and \
+                 connected: link this directory to {target} and start it with 'spice run'. \
+                 See: https://spiceai.org/docs/spice-cloud"
+            ),
         )
     })?;
-    let region =
-        spice_cloud_client::endpoints::normalize_data_region(&region).ok_or_else(|| {
-            Error::cloud(
-                CloudErrorCode::InvalidRequest,
-                format!("Project {target} reports an unrecognized region '{region}'."),
-            )
-        })?;
+    let region = spice_cloud_client::endpoints::normalize_data_region(region).ok_or_else(|| {
+        Error::cloud(
+            CloudErrorCode::InvalidRequest,
+            format!("Project {target} reports an unrecognized region '{region}'."),
+        )
+    })?;
 
     // Prefer the key the management API reports for this project; fall back to
     // a key stored for the same org only if the API withholds one. Never reach
@@ -4594,6 +4607,29 @@ async fn project_runtime_context(
     }
 
     Ok(runtime_ctx)
+}
+
+/// Whether a health read failed only because the data plane declines to
+/// inspect a self-hosted runtime.
+///
+/// Spice Cloud relays deployments and secrets to a runtime the user hosts
+/// themself, but answers HTTP 501 when asked to inspect it — that runtime is
+/// reachable only from the machine it runs on. For `spice cloud status` this
+/// is the expected shape of a Cloud Connect project, not a failure.
+fn health_not_served_for_self_hosted(error: &Error) -> bool {
+    matches!(error, Error::RuntimeHttp { status: 501, .. })
+}
+
+/// The status line for a project whose instances Spice Cloud cannot inspect.
+///
+/// This line is the only explanation the user gets for an absent health
+/// section on a healthy Cloud Connect project, so it must say where the
+/// health can actually be read.
+fn self_hosted_instances_note(target: &ProjectTarget) -> String {
+    format!(
+        "Instances: self-hosted — Spice Cloud does not inspect the runtime serving project \
+         {target}. Check it with 'spice status' on the machine that runs it."
+    )
 }
 
 /// Name what a report describes: one pinned instance, or the project as a whole.
@@ -4712,6 +4748,35 @@ fn dataset_needs_attention(status: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn only_a_501_reads_as_health_not_served_for_self_hosted() {
+        // The data plane answers 501 when asked to inspect a runtime the user
+        // hosts themself; every other failure is a real one and must keep
+        // rendering as a degradation, or status would hide genuine outages.
+        let refused = Error::RuntimeHttp {
+            status: 501,
+            body: "this endpoint is not available for an app attached to a self-hosted Spice \
+                   runtime"
+                .to_string(),
+        };
+        assert!(health_not_served_for_self_hosted(&refused));
+
+        let failed = Error::RuntimeHttp {
+            status: 500,
+            body: String::new(),
+        };
+        assert!(!health_not_served_for_self_hosted(&failed));
+    }
+
+    #[test]
+    fn self_hosted_note_names_the_project_and_where_health_lives() {
+        let target = ProjectTarget::new(Some("spicehq".to_string()), "team-app");
+        let note = self_hosted_instances_note(&target);
+        assert!(note.contains("spicehq/team-app"), "note was: {note}");
+        assert!(note.contains("'spice status'"), "note was: {note}");
+        assert!(note.contains("machine that runs it"), "note was: {note}");
+    }
 
     #[test]
     fn metrics_table_row_matches_header_count() {
