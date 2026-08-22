@@ -664,14 +664,43 @@ fn numbered_path(original: &Path, index: usize, extension: &str) -> Path {
         Path::from(format!("{s}_{index:05}.{extension}"))
     }
 }
+/// Depth of the sink -> Vortex-writer batch channel, i.e. the ceiling on how many
+/// chunks Vortex's per-chunk `spawn_cpu` compression can have in flight.
+///
+/// Default 1 preserves the shipped behaviour exactly. Override with
+/// `SPICE_CAYENNE_SINK_CHANNEL_DEPTH` to measure the effect; a value below 1 or an
+/// unparseable one falls back to the default rather than failing a write.
+fn sink_channel_depth() -> usize {
+    static DEPTH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("SPICE_CAYENNE_SINK_CHANNEL_DEPTH")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|depth| *depth >= 1)
+            .unwrap_or(1)
+    });
+    *DEPTH
+}
+
 fn start_file_writer(
     session: &VortexSession,
     object_store: Arc<dyn ObjectStore>,
     path: Path,
     dtype: DType,
 ) -> ActiveFileWriter {
-    // Use a small bounded channel to enforce backpressure and avoid unbounded buffering.
-    let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(1);
+    // Bounded channel: backpressure without unbounded buffering. The DEPTH also sets
+    // how much encode parallelism is reachable, which is why it is tunable.
+    //
+    // Vortex compresses chunks concurrently — `CompressingStrategy::write_stream` does
+    // `spawn_cpu` per chunk and `.buffered(get_available_parallelism())` — but
+    // `.buffered(N)` can only hold N futures if it can PULL N chunks. Upstream is this
+    // channel, and its sender awaits once full, so a depth of 1 leaves ~2 chunks in
+    // flight however many cores the compressor was sized for. That is the shape behind
+    // a maintenance pass sustaining a fraction of an otherwise idle encode budget.
+    //
+    // Deeper costs memory: at most `depth` `RecordBatch`es are resident per active
+    // writer, on top of what the compressor holds.
+    let (sender, receiver) =
+        futures::channel::mpsc::channel::<RecordBatch>(sink_channel_depth());
     let session = session.clone();
     let path_for_task = path.clone();
 
