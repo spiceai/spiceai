@@ -1217,11 +1217,14 @@ async fn execute_status(
     // diagnosis command lie about the thing it exists to diagnose.
     let never_deployed = latest.is_none();
     // Real health-read failures only. A data-plane refusal to inspect a
-    // self-hosted runtime deliberately never lands here (see
+    // runtime hosted outside Spice Cloud deliberately never lands here (see
     // `classify_health_failures`): this value feeds the degradation exit
-    // contract, and a healthy Cloud Connect project must exit 0.
+    // contract, and a healthy Cloud Connect or BYOC project must exit 0.
     let mut runtime_error: Option<String> = None;
-    let mut self_hosted = false;
+    // The server's stated reason when the data plane declined to inspect the
+    // runtime (HTTP 501), for the sections that would otherwise be missing
+    // with no explanation.
+    let mut health_refusal: Option<String> = None;
 
     let (instances, datasets) =
         match project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await {
@@ -1239,7 +1242,7 @@ async fn execute_status(
                 )
                 .await;
 
-                (runtime_error, self_hosted) = classify_health_failures(
+                (runtime_error, health_refusal) = classify_health_failures(
                     [instances.as_ref().err(), datasets.as_ref().err()]
                         .into_iter()
                         .flatten(),
@@ -1278,9 +1281,11 @@ async fn execute_status(
             "datasets_unhealthy": unhealthy,
             "runtime_error": &runtime_error,
             // Why `instances` can be empty with no `runtime_error`: the data
-            // plane does not inspect a self-hosted runtime, so its health is
-            // absent by design rather than unknown.
-            "self_hosted": self_hosted,
+            // plane does not inspect a runtime hosted outside Spice Cloud (a
+            // Cloud Connect instance, a BYOC cluster), so its health is absent
+            // by design rather than unknown. Carries the server's stated
+            // reason verbatim.
+            "health_not_reported": &health_refusal,
             "link": {
                 "connection": local.connection,
                 "service": local.service,
@@ -1325,8 +1330,15 @@ async fn execute_status(
     if instances.is_empty() {
         if runtime_error.is_some() {
             println!("Instances: unknown.");
-        } else if self_hosted {
-            println!("{}", self_hosted_instances_note(&target));
+        } else if let Some(reason) = &health_refusal {
+            // The CLI names the friendly Cloud Connect shape itself; for any
+            // other kind the server's reason says where the runtime actually
+            // is, so a new kind never gets mislabeled by an old binary.
+            if project.kind.as_deref() == Some("standalone") {
+                println!("{}", self_hosted_instances_note(&target));
+            } else {
+                println!("{}", instances_not_inspected_note(&target, reason));
+            }
         } else {
             println!("No instances are running.");
         }
@@ -1376,6 +1388,15 @@ async fn execute_status(
             println!();
             println!("  Logs: spice cloud logs --project {target} --level error");
         }
+    } else if let Some(reason) = &health_refusal
+        && !instances.is_empty()
+    {
+        // The instances table rendered, so the refusal came from the dataset
+        // read alone; without this line the section is silently missing and
+        // reads as "no datasets". When the instances section is also absent,
+        // its note already explains the whole health read.
+        println!();
+        println!("{}", dataset_health_not_reported_note(&target, reason));
     }
 
     println!();
@@ -4608,38 +4629,52 @@ async fn project_runtime_context(
     Ok(runtime_ctx)
 }
 
-/// Whether a health read failed only because the data plane declines to
-/// inspect a self-hosted runtime.
+/// The server's stated reason when the data plane declines to inspect the
+/// project's runtime, rather than failing to reach it.
 ///
-/// Spice Cloud relays deployments and secrets to a runtime the user hosts
-/// themself, but answers HTTP 501 when asked to inspect it — that runtime is
-/// reachable only from the machine it runs on. For `spice cloud status` this
-/// is the expected shape of a Cloud Connect project, not a failure.
-fn health_not_served_for_self_hosted(error: &Error) -> bool {
-    matches!(error, Error::RuntimeHttp { status: 501, .. })
+/// Spice Cloud relays deployments and secrets to a runtime hosted outside the
+/// platform — a Cloud Connect standalone instance, a BYOC cluster — but
+/// answers HTTP 501 when asked to inspect it, with a reason naming where that
+/// runtime actually is. The reason travels to the user verbatim: the server
+/// knows the deployment kind, and this binary may predate kinds the server
+/// has since learned.
+fn health_refusal_reason(error: &Error) -> Option<&str> {
+    match error {
+        Error::RuntimeHttp { status: 501, body } => Some(body.as_str()),
+        _ => None,
+    }
 }
 
 /// Fold the health-read outcomes into what status reports: the first real
-/// failure, and whether the data plane declined because the runtime is
-/// self-hosted.
+/// failure, and the server's reason when it declined to inspect the runtime.
 ///
 /// A refusal is the project's expected shape, not a failure — it never
 /// reaches the error slot, which feeds the degradation exit contract, so a
-/// healthy Cloud Connect project exits 0. Real failures still land there
-/// even when a refusal accompanies them: the two report unrelated facts.
+/// healthy Cloud Connect or BYOC project exits 0. Real failures still land
+/// there even when a refusal accompanies them: the two report unrelated
+/// facts. A refusal with no reason text gets a generic one, so the sections
+/// it explains never render an empty clause.
 fn classify_health_failures<'a>(
     failures: impl IntoIterator<Item = &'a Error>,
-) -> (Option<String>, bool) {
+) -> (Option<String>, Option<String>) {
     let mut first_failure = None;
-    let mut self_hosted = false;
+    let mut refusal = None;
     for error in failures {
-        if health_not_served_for_self_hosted(error) {
-            self_hosted = true;
+        if let Some(reason) = health_refusal_reason(error) {
+            if refusal.is_none() {
+                let reason = if reason.is_empty() {
+                    "the runtime is hosted outside Spice Cloud, which cannot reach it to \
+                     inspect it"
+                } else {
+                    reason
+                };
+                refusal = Some(reason.to_string());
+            }
         } else if first_failure.is_none() {
             first_failure = Some(error.to_string());
         }
     }
-    (first_failure, self_hosted)
+    (first_failure, refusal)
 }
 
 /// The status line for a project whose instances Spice Cloud cannot inspect.
@@ -4652,6 +4687,23 @@ fn self_hosted_instances_note(target: &ProjectTarget) -> String {
         "Instances: self-hosted — Spice Cloud does not inspect the runtime serving project \
          {target}. Check it with 'spice status' on the machine that runs it."
     )
+}
+
+/// The status line when Spice Cloud declines to inspect the runtime and the
+/// CLI cannot name the deployment kind — the server's reason says where the
+/// runtime actually is.
+fn instances_not_inspected_note(target: &ProjectTarget, reason: &str) -> String {
+    format!(
+        "Instances: not inspected — Spice Cloud cannot inspect the runtime serving project \
+         {target}: {reason}"
+    )
+}
+
+/// Explains an absent dataset-health section when the instances table
+/// rendered but the dataset read was declined — without it the section is
+/// silently missing and reads as "this project has no datasets".
+fn dataset_health_not_reported_note(target: &ProjectTarget, reason: &str) -> String {
+    format!("Dataset health is not reported for project {target}: {reason}")
 }
 
 /// Name what a report describes: one pinned instance, or the project as a whole.
@@ -4772,27 +4824,31 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn only_a_501_reads_as_health_not_served_for_self_hosted() {
-        // The data plane answers 501 when asked to inspect a runtime the user
-        // hosts themself; every other failure is a real one and must keep
-        // rendering as a degradation, or status would hide genuine outages.
+    fn only_a_501_carries_a_health_refusal_reason() {
+        // The data plane answers 501 when asked to inspect a runtime hosted
+        // outside Spice Cloud, and its body names where that runtime is —
+        // Cloud Connect and BYOC each get their own wording. Every other
+        // failure is a real one and must keep rendering as a degradation, or
+        // status would hide genuine outages.
         let refused = Error::RuntimeHttp {
             status: 501,
-            body: "this endpoint is not available for an app attached to a self-hosted Spice \
-                   runtime"
+            body: "this endpoint is not available for an app deployed to your own cluster"
                 .to_string(),
         };
-        assert!(health_not_served_for_self_hosted(&refused));
+        assert_eq!(
+            health_refusal_reason(&refused),
+            Some("this endpoint is not available for an app deployed to your own cluster")
+        );
 
         let failed = Error::RuntimeHttp {
             status: 500,
             body: String::new(),
         };
-        assert!(!health_not_served_for_self_hosted(&failed));
+        assert_eq!(health_refusal_reason(&failed), None);
     }
 
     #[test]
-    fn a_self_hosted_refusal_never_reaches_the_error_slot() {
+    fn a_refusal_never_reaches_the_error_slot() {
         let refused = Error::RuntimeHttp {
             status: 501,
             body: "not available for a self-hosted runtime".to_string(),
@@ -4802,21 +4858,47 @@ mod tests {
             body: "boom".to_string(),
         };
 
-        // Refusal alone: nothing degrades, so status exits 0; the self-hosted
-        // note is the explanation the user gets instead.
-        let (error, self_hosted) = classify_health_failures([&refused]);
+        // Refusal alone: nothing degrades, so status exits 0; the note built
+        // from the reason is the explanation the user gets instead.
+        let (error, refusal) = classify_health_failures([&refused]);
         assert_eq!(error, None);
-        assert!(self_hosted);
+        assert_eq!(
+            refusal.as_deref(),
+            Some("not available for a self-hosted runtime")
+        );
 
         // A real failure alongside the refusal must still degrade the command.
-        let (error, self_hosted) = classify_health_failures([&refused, &failed]);
+        let (error, refusal) = classify_health_failures([&refused, &failed]);
         assert!(error.is_some(), "a real failure must not be masked");
-        assert!(self_hosted);
+        assert!(refusal.is_some());
 
-        // Real failures only: reported, with no self-hosted note.
-        let (error, self_hosted) = classify_health_failures([&failed]);
+        // Real failures only: reported, with no refusal note.
+        let (error, refusal) = classify_health_failures([&failed]);
         assert!(error.is_some());
-        assert!(!self_hosted);
+        assert_eq!(refusal, None);
+
+        // A refusal with no reason text still explains itself.
+        let bare = Error::RuntimeHttp {
+            status: 501,
+            body: String::new(),
+        };
+        let (_, refusal) = classify_health_failures([&bare]);
+        let reason = refusal.expect("a bare refusal must still carry a reason");
+        assert!(!reason.is_empty(), "the fallback reason must not be empty");
+    }
+
+    #[test]
+    fn refusal_notes_name_the_project_and_carry_the_servers_reason() {
+        let target = ProjectTarget::new(Some("spicehq".to_string()), "team-app");
+        let reason = "its runtime is reachable only from that cluster";
+
+        let instances = instances_not_inspected_note(&target, reason);
+        assert!(instances.contains("spicehq/team-app"), "note was: {instances}");
+        assert!(instances.contains(reason), "note was: {instances}");
+
+        let datasets = dataset_health_not_reported_note(&target, reason);
+        assert!(datasets.contains("spicehq/team-app"), "note was: {datasets}");
+        assert!(datasets.contains(reason), "note was: {datasets}");
     }
 
     #[test]
