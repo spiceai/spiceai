@@ -133,12 +133,32 @@ impl CloudClient {
         let default = org::default_token().ok_or_else(|| org_credential_missing(org))?;
 
         let probe = Self::with_token_for_org(default.clone(), None)?;
-        match probe.optional_user_auth_context().await? {
-            Some(_) => {
-                probe.get_auth_context_for_org(org).await?;
+        // Ask for the identity directly rather than through
+        // [`Self::optional_user_auth_context`]: that helper folds "rejected"
+        // and "cannot describe" into one absent answer, and they mean opposite
+        // things here.
+        match probe.get_auth_context().await {
+            Ok(_) => {
+                confirm_org_access(&probe, org).await?;
                 Self::with_token_for_org(default, Some(org))
             }
-            None => Err(org_credential_missing(org)),
+            // A rejected credential has no user membership to spend on another
+            // organization: it is a machine token, which stays org-bound.
+            Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => {
+                Err(org_credential_missing(org))
+            }
+            // No identity came back, so whether this is a user token — usable
+            // for every member org — is unknown. Declining would refuse a
+            // member their own organization on the strength of a lookup that
+            // failed, so send the request and let the server, which is
+            // authoritative on membership, answer.
+            Err(err) if is_absent_user_identity_error(&err) => {
+                tracing::debug!(
+                    "Spice Cloud did not describe the identity behind the default credential ({err}); acting on organization '{org}' with it and letting the server decide"
+                );
+                Self::with_token_for_org(default, Some(org))
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -231,14 +251,19 @@ impl CloudClient {
             .map_err(|error| self.err(error))
     }
 
-    /// Returns user auth context when the token supports it.
+    /// Returns user auth context when Spice Cloud describes one.
     ///
-    /// Service-account tokens cannot access the auth-context endpoint; those
-    /// `Unauthorized` failures are treated as absent user context.
+    /// `None` means the identity endpoint did not describe a user, which
+    /// covers two different situations and does not distinguish them: it
+    /// rejected the credential (401 — a service-account token, which has no
+    /// user identity), or it had no user to return (404). A caller that must
+    /// tell those apart — because one proves the credential unusable and the
+    /// other proves nothing — should call [`Self::get_auth_context`] and match
+    /// the error itself.
     pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
         match self.get_auth_context().await {
             Ok(ctx) => Ok(Some(ctx)),
-            Err(err) if is_unauthorized_auth_context_error(&err) => Ok(None),
+            Err(err) if is_absent_user_identity_error(&err) => Ok(None),
             Err(err) => Err(err),
         }
     }
@@ -334,19 +359,36 @@ impl CloudClient {
         self.inner
             .get_auth_context_for_org(Some(org))
             .await
-            .map_err(|error| match error {
-                spice_cloud_client::error::Error::NotFound { .. } => Error::cloud_with_hint(
-                    CloudErrorCode::OrgNotFound,
-                    format!("Organization '{org}' was not found."),
-                    "Run 'spice cloud orgs' to list the organizations you can access.",
-                ),
-                spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
-                    CloudErrorCode::OrgForbidden,
-                    format!("You are not a member of organization '{org}'."),
-                    "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
-                ),
-                error => self.err(error),
-            })
+            .map_err(|error| self.map_org_probe_error(org, error))
+    }
+
+    /// This client, carrying `org` on every request it makes.
+    fn scoped_to_org(&self, org: &str) -> Self {
+        Self {
+            inner: self.inner.clone().with_org(org),
+            org: Some(org.to_string()),
+        }
+    }
+
+    /// Render a failed organization probe.
+    ///
+    /// Named rather than inline because [`org_probe_is_inconclusive`] has to
+    /// agree with the codes produced here: a rule that tolerates a code this
+    /// never emits reads as working and silently does nothing.
+    fn map_org_probe_error(&self, org: &str, error: spice_cloud_client::error::Error) -> Error {
+        match error {
+            spice_cloud_client::error::Error::NotFound { .. } => Error::cloud_with_hint(
+                CloudErrorCode::OrgNotFound,
+                format!("Organization '{org}' was not found."),
+                "Run 'spice cloud orgs' to list the organizations you can access.",
+            ),
+            spice_cloud_client::error::Error::Forbidden { .. } => Error::cloud_with_hint(
+                CloudErrorCode::OrgForbidden,
+                format!("You are not a member of organization '{org}'."),
+                "Ask an owner of that organization to add you, then run 'spice cloud orgs'.",
+            ),
+            error => self.err(error),
+        }
     }
 
     pub async fn get_project_by_id(&self, project_id: i64) -> Result<Project> {
@@ -999,12 +1041,188 @@ fn build_executor(
     })
 }
 
-/// A rejected credential on the auth-context endpoint.
+/// What an identity-endpoint failure proves about a credential.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentityFailure {
+    /// Spice Cloud rejected it: a machine token, with no user identity to spend.
+    Rejected,
+    /// Spice Cloud had no user to describe. The credential may still be a
+    /// perfectly good user token — this says nothing either way.
+    Undescribed,
+    /// Something the caller has to see, such as a refusal or a server error.
+    Fatal,
+}
+
+fn classify_identity_failure(err: &crate::error::Error) -> IdentityFailure {
+    match err.cloud_code() {
+        Some(CloudErrorCode::TokenExpired) => IdentityFailure::Rejected,
+        Some(CloudErrorCode::NotFound) => IdentityFailure::Undescribed,
+        _ => IdentityFailure::Fatal,
+    }
+}
+
+/// The stored credentials that could act as a user, most specific first.
 ///
-/// Service-account tokens are valid for the management API but have no user
-/// identity, so callers that only want the identity treat this as "absent".
-pub fn is_unauthorized_auth_context_error(err: &crate::error::Error) -> bool {
-    err.cloud_code() == Some(CloudErrorCode::TokenExpired)
+/// Both link stages build this list, and they must build the same one: if the
+/// preflight considers a credential the enrollment transaction does not, a
+/// link passes its checks and then reports no credential at all.
+pub fn user_credential_candidates(requested: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for token in [
+        requested.and_then(org::token_for_org),
+        org::default_token(),
+        org::active_org()
+            .ok()
+            .flatten()
+            .and_then(|active| org::token_for_org(&active)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&token) {
+            candidates.push(token);
+        }
+    }
+    candidates
+}
+
+/// Whether an organization check refused this particular credential.
+///
+/// A refusal reaches us under two codes, because two different questions can
+/// ask it: the identity probe renders one as `OrgForbidden`, and the scoped
+/// project listing renders its own as `Forbidden`. Both say the same thing —
+/// *this* credential may not act there — which is a fact about the credential,
+/// not about the request, so another credential is still worth trying.
+fn is_org_refusal(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::OrgForbidden | CloudErrorCode::Forbidden)
+    )
+}
+
+/// Whether a failed organization probe leaves access undecided.
+///
+/// The identity endpoint answers 404 for several conditions — including an
+/// organization that exists but has no app — and the probe renders all of them
+/// as [`CloudErrorCode::OrgNotFound`]. None of them prove the credential may
+/// not act on the organization, so none of them should decide it here. A
+/// refusal arrives as `OrgForbidden`, which is conclusive and is not tolerated.
+fn org_probe_is_inconclusive(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::OrgNotFound | CloudErrorCode::NotFound)
+    )
+}
+
+/// Confirm this credential may act on `org`, or say why not.
+///
+/// The identity endpoint answers 404 for conditions that say nothing about
+/// access — an organization with no app reads the same as one that does not
+/// exist — so that answer decides nothing here. It is also not proof of
+/// access: callers store a credential under the organization this confirms,
+/// and filing one under an organization it cannot act on makes every later
+/// command fail obscurely.
+///
+/// So an inconclusive answer is followed by a question whose answer cannot be
+/// ambiguous: list the organization's projects. That is a read the server
+/// refuses for a non-member, so success requires membership and nothing else
+/// is inferred.
+pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
+    match client.get_auth_context_for_org(org).await {
+        Ok(_) => Ok(()),
+        Err(err) if org_probe_is_inconclusive(&err) => {
+            tracing::debug!(
+                "Spice Cloud did not describe this credential's access to organization '{org}' ({err}); confirming membership by listing that organization's projects instead"
+            );
+            client.scoped_to_org(org).list_projects().await?;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The first credential in `candidates` that can act as a user, if any.
+///
+/// Both Cloud Connect entry points — the `spice cloud link` preflight and the
+/// enrollment transaction — choose a credential this way, and they must agree:
+/// one accepting a credential the other rejects strands a link half-done.
+///
+/// A credential the identity endpoint *rejects* has no user identity to spend
+/// (a machine token), so it is skipped. One it merely cannot *describe* is
+/// unknown rather than unusable, and is kept as a fallback behind any
+/// credential that does describe a user.
+pub async fn first_user_credential(
+    candidates: &[String],
+    endpoint: &str,
+    org: Option<&str>,
+) -> Result<Option<String>> {
+    // A credential Spice Cloud describes wins, but only among those that may
+    // actually act on the organization: a refusal is a fact about one
+    // credential, so it disqualifies that candidate rather than the search.
+    let mut fallback: Option<&String> = None;
+    let mut refusal: Option<crate::error::Error> = None;
+
+    for token in candidates {
+        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
+
+        let described = match client.get_auth_context().await {
+            Ok(_) => true,
+            Err(err) => match classify_identity_failure(&err) {
+                IdentityFailure::Rejected => continue,
+                IdentityFailure::Fatal => return Err(err),
+                IdentityFailure::Undescribed => {
+                    tracing::debug!(
+                        "Spice Cloud did not describe the identity behind a stored credential ({err}); considering it a fallback"
+                    );
+                    false
+                }
+            },
+        };
+
+        if let Some(org) = org
+            && let Err(err) = confirm_org_access(&client, org).await
+        {
+            if !is_org_refusal(&err) {
+                return Err(err);
+            }
+            tracing::debug!(
+                "A stored credential may not act on organization '{org}' ({err}); trying the next one"
+            );
+            refusal = Some(err);
+            continue;
+        }
+
+        if described {
+            return Ok(Some(token.clone()));
+        }
+        fallback.get_or_insert(token);
+    }
+
+    if let Some(token) = fallback {
+        return Ok(Some(token.clone()));
+    }
+
+    // Nothing was usable. A refusal explains that far better than the caller's
+    // "no user login" fallback message, so surface it.
+    if let Some(err) = refusal {
+        return Err(err);
+    }
+
+    Ok(None)
+}
+
+/// The auth-context endpoint did not describe a user for this credential.
+///
+/// Two answers mean the same thing to a caller that only wants the identity:
+/// the endpoint rejected the credential (401), or it has no user record to
+/// return for it (404). Service-account tokens are valid for the management
+/// API but have no user identity, so both are "absent" rather than fatal —
+/// a caller that needs the identity says so with its own error.
+pub fn is_absent_user_identity_error(err: &crate::error::Error) -> bool {
+    matches!(
+        err.cloud_code(),
+        Some(CloudErrorCode::TokenExpired | CloudErrorCode::NotFound)
+    )
 }
 
 pub fn is_device_authorization_denied_error(error: &crate::error::Error) -> bool {
@@ -1329,6 +1547,105 @@ mod tests {
         });
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::TokenExpired));
-        assert!(is_unauthorized_auth_context_error(&err));
+        assert!(is_absent_user_identity_error(&err));
+    }
+
+    /// The organization probe's own rendering decides what
+    /// [`org_probe_is_inconclusive`] must accept. Asserting the rule against a
+    /// hand-built error would pass while the two disagreed, which is exactly
+    /// how tolerating `NotFound` alone came to be a no-op: the probe renders
+    /// that response as `OrgNotFound`.
+    #[test]
+    fn the_org_probe_renders_a_missing_answer_as_something_the_rule_tolerates() {
+        let client = CloudClient::new_unauthenticated().expect("client should build");
+
+        let undescribed = client.map_org_probe_error(
+            "acme",
+            spice_cloud_client::error::Error::NotFound {
+                message: "{}".to_string(),
+            },
+        );
+        assert_eq!(undescribed.cloud_code(), Some(CloudErrorCode::OrgNotFound));
+        assert!(
+            org_probe_is_inconclusive(&undescribed),
+            "an undescribed organization must not decide access: {undescribed}"
+        );
+
+        let refused = client.map_org_probe_error(
+            "acme",
+            spice_cloud_client::error::Error::Forbidden {
+                message: "not a member".to_string(),
+            },
+        );
+        assert_eq!(refused.cloud_code(), Some(CloudErrorCode::OrgForbidden));
+        assert!(
+            !org_probe_is_inconclusive(&refused),
+            "a refusal is conclusive and must be surfaced: {refused}"
+        );
+    }
+
+    /// A refusal disqualifies one credential, not the search — and it arrives
+    /// under two codes, since the identity probe and the scoped listing render
+    /// theirs differently. Missing either would abort the search on a
+    /// credential that was merely the wrong one to try.
+    #[test]
+    fn both_renderings_of_a_refusal_disqualify_only_that_credential() {
+        let from_identity_probe = Error::cloud(CloudErrorCode::OrgForbidden, "not a member");
+        let from_scoped_listing = Error::cloud(CloudErrorCode::Forbidden, "not permitted");
+        let not_a_refusal = Error::cloud(CloudErrorCode::ApiError, "boom");
+
+        assert!(is_org_refusal(&from_identity_probe));
+        assert!(is_org_refusal(&from_scoped_listing));
+        assert!(!is_org_refusal(&not_a_refusal));
+    }
+
+    /// 401 is the one answer that disqualifies a credential; 404 leaves it
+    /// unknown, and anything else is a failure the caller must see.
+    #[test]
+    fn identity_failures_are_classified_by_what_they_prove() {
+        let rejected = map_cloud_error(None)(spice_cloud_client::error::Error::Unauthorized {
+            message: "invalid or expired token".to_string(),
+        });
+        let undescribed = map_cloud_error(None)(spice_cloud_client::error::Error::NotFound {
+            message: "{}".to_string(),
+        });
+        let forbidden = map_cloud_error(None)(spice_cloud_client::error::Error::Forbidden {
+            message: "missing scope".to_string(),
+        });
+        let server_error = map_cloud_error(None)(spice_cloud_client::error::Error::Api {
+            status: 500,
+            message: "boom".to_string(),
+        });
+
+        assert_eq!(
+            classify_identity_failure(&rejected),
+            IdentityFailure::Rejected
+        );
+        assert_eq!(
+            classify_identity_failure(&undescribed),
+            IdentityFailure::Undescribed,
+            "a credential Spice Cloud cannot describe must stay usable"
+        );
+        assert_eq!(
+            classify_identity_failure(&forbidden),
+            IdentityFailure::Fatal
+        );
+        assert_eq!(
+            classify_identity_failure(&server_error),
+            IdentityFailure::Fatal
+        );
+    }
+
+    /// Spice Cloud answers the identity endpoint with 404 for credentials it
+    /// cannot describe. Treating that as fatal blocks `spice cloud link` and
+    /// `spice cloud whoami` behind an identity neither of them requires.
+    #[test]
+    fn not_found_is_an_absent_identity_rather_than_a_failure() {
+        let err = map_cloud_error(None)(spice_cloud_client::error::Error::NotFound {
+            message: "{}".to_string(),
+        });
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::NotFound));
+        assert!(is_absent_user_identity_error(&err));
     }
 }
