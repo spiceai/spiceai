@@ -19288,54 +19288,78 @@ impl CayenneTableProvider {
         .map(|(rows, _writer_ops, _stats)| rows)
     }
 
-    /// Group the selected prefix's input data files into rewrite units of roughly
-    /// `target_bytes` each.
+    /// Partition the selected prefix's input data files into `concurrency`-many
+    /// rewrite units, each deliberately LARGER than one target file.
     ///
-    /// A unit is a GROUP, not a single file, because **the bake is also a file-count
-    /// reduction pass**. The union shape merged every input into one stream and
-    /// rolled output files at the target size, so a pass consolidated; rewriting one
-    /// output per input file preserves the input file count instead, and a measured
-    /// SF1000 pair showed what that costs — `scan_files_listed` rose 64% on `stock`
-    /// and 178% on `order_line`, carrying replication-lag p99 up 18% even though
-    /// every pass itself got faster. Grouping keeps the parallelism (units run
-    /// concurrently) while restoring the consolidation.
+    /// A unit is a group, not a single file, because **the bake is also a file-count
+    /// reduction pass** — one output per input file preserved the input file count and
+    /// an SF1000 pair measured `scan_files_listed` up 178% on `order_line`.
     ///
-    /// Grouping is by INPUT bytes, so a unit's output lands at or below the target
-    /// once dead rows are dropped — the same direction the union's roll-at-target
-    /// produced, never above it.
+    /// But sizing a group AT one target file is equally wrong, and for a subtler
+    /// reason: the sink writer already sizes output files itself, rolling whenever a
+    /// running compressed-size estimate reaches the target and re-learning the
+    /// compressed:uncompressed ratio from every file it finishes
+    /// (`CompressionEstimate`). That mechanism handles compression AND dropped dead
+    /// rows in one ratio, and self-corrects — strictly better than any fraction
+    /// guessed here. Feeding it exactly one target's worth of INPUT guarantees the
+    /// output lands below target, so the roll never fires and the estimate never
+    /// learns: every group emits one undersized file. That is the residual read
+    /// amplification the grouped arm still carried (+7% to +45% files per query).
     ///
-    /// Files are grouped in snapshot order and each keeps its own snapshot's deletion
-    /// threshold, so a unit spanning two snapshots still applies exactly the filter
-    /// each of its files would have received alone. A snapshot with an EMPTY listing
-    /// contributes no files: it holds no physical rows to rewrite, and its `<= T`
-    /// coverage comes from being in `selected` (which sets the prune cutoff), not
-    /// from any bytes written here.
+    /// So size units by COUNT and let the writer place the boundaries: at most
+    /// `concurrency` units (no more parallelism than asked for) and never more than
+    /// the union would have produced files (`ceil(total / target)`), which keeps a
+    /// small pass on one unit exactly as the union would. Each unit then spans
+    /// several targets, the roll fires inside it, and file sizing stays where it
+    /// already works.
+    ///
+    /// Files carry their own snapshot's deletion threshold, so a unit spanning
+    /// snapshots still applies exactly the filter each file would have received alone.
+    /// A snapshot with an EMPTY listing contributes no files: it holds no physical
+    /// rows to rewrite, and its `<= T` coverage comes from being in `selected` (which
+    /// sets the prune cutoff), not from bytes written here.
     async fn bake_rewrite_units(
         &self,
         selected: &[(String, i64)],
-        target_bytes: u64,
+        target_size_bytes: u64,
+        concurrency: usize,
     ) -> Result<Vec<Vec<BakeRewriteFile>>> {
-        let target = target_bytes.max(1);
-        let mut groups: Vec<Vec<BakeRewriteFile>> = Vec::new();
-        let mut current: Vec<BakeRewriteFile> = Vec::new();
-        let mut current_bytes: u64 = 0;
+        let mut files: Vec<BakeRewriteFile> = Vec::new();
+        let mut total: u64 = 0;
         for (snapshot_id, threshold) in selected {
-            let files = self.list_snapshot_files_with_sizes(snapshot_id).await?;
-            for (file_name, size) in files {
-                current.push(BakeRewriteFile {
+            for (file_name, size) in self.list_snapshot_files_with_sizes(snapshot_id).await? {
+                total = total.saturating_add(size);
+                files.push(BakeRewriteFile {
                     snapshot_id: snapshot_id.clone(),
                     file_name,
                     size,
                     threshold: *threshold,
                 });
-                current_bytes = current_bytes.saturating_add(size);
-                // Close the group once it reaches the target. A single file already
-                // at or above the target becomes its own group, which is what the
-                // union's roll would also have produced.
-                if current_bytes >= target {
-                    groups.push(std::mem::take(&mut current));
-                    current_bytes = 0;
-                }
+            }
+        }
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let target = target_size_bytes.max(1);
+        // `ceil(total / target)` is what the union's roll would have emitted; never
+        // exceed it, or grouping would ADD files rather than preserve the count.
+        let union_files = usize::try_from(total.div_ceil(target)).unwrap_or(usize::MAX);
+        let unit_count = concurrency.max(1).min(union_files.max(1)).min(files.len());
+        let unit_target = total.div_ceil(unit_count as u64).max(1);
+
+        let mut groups: Vec<Vec<BakeRewriteFile>> = Vec::new();
+        let mut current: Vec<BakeRewriteFile> = Vec::new();
+        let mut current_bytes: u64 = 0;
+        for file in files {
+            let size = file.size;
+            current.push(file);
+            current_bytes = current_bytes.saturating_add(size);
+            // Close on reaching the unit target, unless this is already the last unit
+            // (then take the remainder, rather than leaving a tiny trailing group).
+            if current_bytes >= unit_target && groups.len() + 1 < unit_count {
+                groups.push(std::mem::take(&mut current));
+                current_bytes = 0;
             }
         }
         if !current.is_empty() {
@@ -19383,7 +19407,7 @@ impl CayenneTableProvider {
         // Group to the SAME target the union's output roll used, so a pass consolidates
         // rather than reproducing its input file count.
         let units = self
-            .bake_rewrite_units(selected, target_size_bytes as u64)
+            .bake_rewrite_units(selected, target_size_bytes as u64, concurrency)
             .await?;
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
