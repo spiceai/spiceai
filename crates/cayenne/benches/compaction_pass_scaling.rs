@@ -312,9 +312,33 @@ fn selected_shapes() -> Vec<TableShape> {
     picked
 }
 
-fn logical_bytes(shape: &TableShape, inputs: usize, rows: usize) -> u64 {
-    let per = (shape.batch)(0, rows).get_array_memory_size() as u64;
-    per.saturating_mul(inputs as u64)
+/// On-disk `.vortex` bytes a lane's fixture actually holds, measured by building the
+/// fixture once and sizing it.
+///
+/// Costs one extra fixture build per lane config — the same order as a single
+/// benchmark iteration, against 10 samples plus warmup — and buys a throughput
+/// figure in the SAME unit as `cayenne_compaction_merged_bytes`, so a bench number
+/// and a production number can be compared without a compression-ratio correction.
+///
+/// The Arrow in-memory size this replaced (`get_array_memory_size()`) also ignored
+/// dictionary/offset sharing and the `inputs` multiplier assumed every input encodes
+/// identically, so it was an estimate of an incomparable quantity.
+async fn on_disk_bytes(
+    shape: &TableShape,
+    label: &str,
+    inputs: usize,
+    rows: usize,
+    supersede: bool,
+    runtime_env: Arc<RuntimeEnv>,
+) -> u64 {
+    let fixture = accumulate(shape, label, inputs, rows, supersede, None, runtime_env).await;
+    let bytes = vortex_bytes(&fixture.data_path);
+    assert!(
+        bytes > 0,
+        "{}: fixture wrote no .vortex bytes, so throughput would be meaningless",
+        shape.name
+    );
+    bytes
 }
 
 // ---- fixture ----
@@ -328,6 +352,33 @@ struct Fixture {
 
 /// Total `.vortex` files under a data dir. A merge strictly reduces this, which
 /// is how each lane proves it timed real work.
+/// Total on-disk `.vortex` bytes under a data dir.
+///
+/// This is the unit `cayenne_compaction_merged_bytes` reports in production, so a
+/// bench throughput denominated in these bytes is directly comparable to a real
+/// pass's MB/s. Denominating in Arrow's in-memory size is not: it inflates the
+/// bench by the compression ratio, which invited a false "the bench is 79-115x
+/// faster than production, so production must be bottlenecked on something the
+/// bench does not model" inference. It was the same code doing the same work in
+/// different units.
+fn vortex_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut bytes = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            bytes += vortex_bytes(&path);
+        } else if path.extension().is_some_and(|ext| ext == "vortex")
+            && let Ok(meta) = entry.metadata()
+        {
+            bytes += meta.len();
+        }
+    }
+    bytes
+}
+
 fn vortex_files(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -521,11 +572,15 @@ fn bench_maintenance_cost(c: &mut Criterion) {
 
     for shape in &shapes {
         for rows in row_ladder(shape) {
+            // Arrow IN-MEMORY size, for reading the shape ladder only. Deliberately
+            // not the throughput denominator: that is on-disk `.vortex` bytes, the
+            // unit `cayenne_compaction_merged_bytes` reports, so bench and production
+            // MB/s are the same quantity.
+            let arrow_mib = (shape.batch)(0, rows).get_array_memory_size() as f64
+                / (1024.0 * 1024.0);
             eprintln!(
-                "{} ({} cols): {rows} rows = {:.4} MiB Arrow/snapshot",
-                shape.name,
-                shape.columns,
-                logical_bytes(shape, 1, rows) as f64 / (1024.0 * 1024.0)
+                "{} ({} cols): {rows} rows = {arrow_mib:.4} MiB Arrow/snapshot",
+                shape.name, shape.columns,
             );
         }
     }
@@ -537,7 +592,15 @@ fn bench_maintenance_cost(c: &mut Criterion) {
     for shape in &shapes {
         for rows in row_ladder(shape) {
             for inputs in INPUT_COUNTS {
-                group.throughput(Throughput::Bytes(logical_bytes(shape, inputs, rows)));
+                lane += 1;
+                group.throughput(Throughput::Bytes(runtime.block_on(on_disk_bytes(
+                    shape,
+                    &format!("size_{lane}"),
+                    inputs,
+                    rows,
+                    false,
+                    Arc::clone(&env),
+                ))));
                 group.bench_function(format!("{}/{rows}rows_x{inputs}", shape.name), |b| {
                     b.iter_batched(
                         || {
@@ -568,7 +631,15 @@ fn bench_maintenance_cost(c: &mut Criterion) {
         let Some(rows) = row_ladder(shape).into_iter().last() else {
             continue;
         };
-        group.throughput(Throughput::Bytes(logical_bytes(shape, 8, rows)));
+        lane += 1;
+        group.throughput(Throughput::Bytes(runtime.block_on(on_disk_bytes(
+            shape,
+            &format!("fo_size_{lane}"),
+            8,
+            rows,
+            false,
+            Arc::clone(&env),
+        ))));
         for width in ENCODE_FANOUT {
             group.bench_function(format!("{}/{rows}rows/wc{width}", shape.name), |b| {
                 b.iter_batched(
@@ -599,7 +670,15 @@ fn bench_maintenance_cost(c: &mut Criterion) {
         let Some(rows) = row_ladder(shape).into_iter().last() else {
             continue;
         };
-        group.throughput(Throughput::Bytes(logical_bytes(shape, 8, rows)));
+        lane += 1;
+        group.throughput(Throughput::Bytes(runtime.block_on(on_disk_bytes(
+            shape,
+            &format!("bk_size_{lane}"),
+            8,
+            rows,
+            true,
+            Arc::clone(&env),
+        ))));
         group.bench_function(format!("{}/{rows}rows_x8_superseded", shape.name), |b| {
             b.iter_batched(
                 || {
@@ -642,7 +721,15 @@ fn bench_maintenance_cost(c: &mut Criterion) {
         let Some(rows) = row_ladder(shape).into_iter().last() else {
             continue;
         };
-        group.throughput(Throughput::Bytes(logical_bytes(shape, 8, rows)));
+        lane += 1;
+        group.throughput(Throughput::Bytes(runtime.block_on(on_disk_bytes(
+            shape,
+            &format!("ss_size_{lane}"),
+            8,
+            rows,
+            false,
+            Arc::clone(&env),
+        ))));
         for coalesced in [true, false] {
             let arm = if coalesced { "coalesced" } else { "partitioned" };
             group.bench_function(format!("{}/{rows}rows/{arm}", shape.name), |b| {

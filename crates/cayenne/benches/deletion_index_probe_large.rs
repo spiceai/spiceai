@@ -45,9 +45,17 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 /// Probed keys per iteration (one Arrow batch worth).
 const PROBES_PER_BATCH: usize = 8_192;
 
-/// Index entry counts. 1M ≈ tens of MB resident (out of L2), 4M ≈ out of L3
-/// on most parts.
-const INDEX_SIZES: &[usize] = &[1_000_000, 4_000_000];
+/// Index entry counts, chosen to BRACKET the gap between what a maintenance
+/// microbench sees and what production actually holds.
+///
+/// 100k is the regime `compaction_pass_scaling`'s bake lane runs in (~3 MB, L2/L3
+/// resident) — which is why that lane measures ~19 GiB/s while a real SF1000 bake
+/// sustains 169-247 MB/s. 1M is out of L2, 4M out of L3 on most parts, and 7M is
+/// what `stock` actually carried on an SF1000 run (221 MB resident, measured via
+/// `cayenne_deletion_index_len`). If probe throughput collapses across this range,
+/// the rewrite is probe-bound rather than encode-bound and every encode-shaped
+/// lever is measuring the wrong stage.
+const INDEX_SIZES: &[usize] = &[100_000, 1_000_000, 4_000_000, 7_000_000];
 
 /// Large odd stride so probe i touches an unpredictable slot of the key space.
 const SPREAD: u64 = 0x9E37_79B9_7F4A_7C15;
