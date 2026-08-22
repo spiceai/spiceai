@@ -14,24 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Regression test for a Postgres `NUMERIC` decimal-scale mismatch on a
+//! Regression test for a `Postgres` `NUMERIC` decimal-scale mismatch on a
 //! pushed-down aggregate.
 //!
-//! Federation pushes `AVG`/division on a `NUMERIC` column down to Postgres as
-//! a single query. The caller's schema commits to a scale ahead of execution
-//! (e.g. DataFusion's own decimal type-coercion for `AVG` widens the source
-//! column's scale by a fixed few digits), but Postgres computes the actual
-//! average with its own, wider `NUMERIC` scale. `rows_to_arrow` used to treat
-//! that as a hard error (`NumericScaleTooWide` / #13349) instead of rounding
-//! to the declared scale, which broke every benchmark query dividing a
-//! `NUMERIC` column against a live Postgres source (`tpch_q1`'s `avg_qty`,
-//! `tpch_q8`'s `mkt_share`).
+//! Federation pushes `AVG`/division on a `NUMERIC` column down to `Postgres`
+//! as a single query. The caller's schema commits to a scale ahead of
+//! execution (e.g. `DataFusion`'s own decimal type-coercion for `AVG` widens
+//! the source column's scale by a fixed few digits), but `Postgres` computes
+//! the actual average with its own, wider `NUMERIC` scale. `rows_to_arrow`
+//! used to treat that as a hard error (`NumericScaleTooWide` / #13349)
+//! instead of rounding to the declared scale, which broke every benchmark
+//! query dividing a `NUMERIC` column against a live `Postgres` source
+//! (`tpch_q1`'s `avg_qty`, `tpch_q8`'s `mkt_share`).
 //!
 //! This drives the exact conversion function the query engine calls
-//! (`rows_to_arrow`) with rows a real Postgres server returned for `AVG`, so
-//! the "more decimal places than declared" scale mismatch is genuine —
-//! Postgres computes it, this test doesn't synthesize it — rather than going
-//! through the full federation optimizer just to reach the same rows.
+//! (`rows_to_arrow`) with rows a real `Postgres` server returned for `AVG`,
+//! so the "more decimal places than declared" scale mismatch is genuine —
+//! `Postgres` computes it, this test doesn't synthesize it — rather than
+//! going through the full federation optimizer just to reach the same rows.
 
 use std::sync::Arc;
 
