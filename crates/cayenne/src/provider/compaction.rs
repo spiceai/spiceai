@@ -402,6 +402,50 @@ pub(crate) fn per_file_bake_concurrency() -> Option<usize> {
     *PER_FILE_BAKE_CONCURRENCY
 }
 
+/// Experiment pin for how many of the newest protected snapshots the bake leaves
+/// unbaked (`K`, default [`crate::provider::table::BAKE_KEEP_RECENT_SNAPSHOTS`]).
+///
+/// `K` is a TUNING parameter, not a correctness one: soundness rests on
+/// `bake_clean_prefix_holds`, which re-validates the prune against whatever prefix
+/// was selected, so lowering `K` can only make that gate decline — never resurrect
+/// a row. What `K` buys is a settled cutoff: the newest snapshots are still taking
+/// the live delete stream, so baking them rewrites rows about to be superseded.
+///
+/// Worth measuring because `K` bounds the deletion index's floor. The index retains
+/// every tombstone above `T`, and `T` stops at the snapshot older than this tail, so
+/// the floor is roughly `tombstone_rate x (K x snapshot_interval + pass_duration)`.
+/// For `stock` that measured `3 x 19.3s = 58s` of kept tail against a 128s pass.
+///
+/// Note what `K` does NOT buy: it is not the write-amplification lever its own
+/// comment implies. A pass re-reads the previous pass's consolidated output every
+/// time — measured at 69-96% of pass bytes — so excluding the K newest (small)
+/// snapshots leaves the dominant cost untouched.
+static PINNED_BAKE_KEEP_RECENT: LazyLock<Option<usize>> = LazyLock::new(|| {
+    // Accepts 0 (bake every protected snapshot), so this cannot reuse the
+    // positive-only pin parser.
+    let raw = std::env::var("SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT").ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(keep) => {
+            tracing::info!(
+                "Cayenne is pinning `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT` to {keep}; the bake will leave {keep} newest protected snapshot(s) unbaked."
+            );
+            Some(keep)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Ignoring `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT={raw}`: expected a whole number (0 or above)."
+            );
+            None
+        }
+    }
+});
+
+/// How many newest protected snapshots the bake leaves unbaked.
+#[must_use]
+pub(crate) fn bake_keep_recent_snapshots() -> usize {
+    PINNED_BAKE_KEEP_RECENT.unwrap_or(crate::provider::table::BAKE_KEEP_RECENT_SNAPSHOTS)
+}
+
 /// Shards a maintenance write should use, or `None` to size it from its bytes.
 #[must_use]
 pub(crate) fn maintenance_encode_shards() -> Option<usize> {

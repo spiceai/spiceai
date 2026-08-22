@@ -2674,7 +2674,7 @@ fn protected_merge_input_budget_for_pool(
 /// settled older prefix; the cutoff `T` is the highest `max_sequence` among the
 /// snapshots OLDER than this tail. With fewer than `K + 1` protected snapshots
 /// there is no settled prefix and the bake is a no-op.
-const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+pub(crate) const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 
 /// One input data file of a seq-prefix bake's selected prefix, with the deletion
 /// threshold of the snapshot it belongs to.
@@ -19559,6 +19559,10 @@ impl CayenneTableProvider {
 
         let compaction_start = std::time::Instant::now();
 
+        // How much of the newest tail to leave unbaked. Read ONCE per pass so the
+        // candidate-count gate and the prefix split cannot disagree.
+        let keep_recent = super::compaction::bake_keep_recent_snapshots();
+
         // --- Phase 1: short fence read — coherent input set. ---
         // Capture the protected set, each input's deletion threshold, the live
         // deletion snapshot, and its max delete sequence together under the read
@@ -19575,7 +19579,7 @@ impl CayenneTableProvider {
             let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
-            if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+            if protected.len() < keep_recent + 2 {
                 self.record_bake_outcome("skipped_no_candidates");
                 return Ok(false);
             }
@@ -19603,7 +19607,7 @@ impl CayenneTableProvider {
 
         // --- Seq-prefix selection (replaces size-tier selection). ---
         // Candidate prefix = all but the newest K (creation-/sequence-ordered).
-        let split = ordered_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS;
+        let split = ordered_ids.len() - keep_recent;
         let candidate_ids = &ordered_ids[..split];
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
         let mut cutoff: i64 = i64::MIN;
@@ -19684,7 +19688,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 candidates = candidate_ids.len(),
-                keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+                keep_recent,
                 stopped_early = stopped_early.unwrap_or("none"),
                 max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
                 "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
@@ -19703,7 +19707,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
             candidates = candidate_ids.len(),
-            keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+            keep_recent,
             prefix_cutoff,
             fence_max_delete_seq,
             deletion_index_len = deletion_snapshot.delete_len(),
