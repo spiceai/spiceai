@@ -9699,17 +9699,13 @@ impl CayenneTableProvider {
         let budget = self
             .upsert_bloom_eligible()
             .then(|| self.effective_sharded_keyset_budget());
-        // Cardinality hint for a degrade's bloom sizing, from the plan's own
-        // statistics — the manifest already carries per-file live row counts, so this
-        // costs no extra I/O. Inexact is fine: it only sizes a filter, and the
-        // budget split remains the ceiling.
-        let expected_keys = scan_plan
-            .partition_statistics(None)
-            .ok()
-            .and_then(|stats| match stats.num_rows {
-                DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => Some(rows),
-                DFPrecision::Absent => None,
-            });
+        // Cardinality hint for a degrade's bloom sizing. Read the published atomic,
+        // NOT `scan_plan.partition_statistics(…)`: this runs on the CDC apply path
+        // during the first upsert validation, and asking a scan plan for statistics
+        // is not the cheap manifest lookup it appears to be — Cayenne's own
+        // `statistics()` prefers the persisted blob and otherwise rescans Vortex
+        // footers. Sizing a filter must not be able to block an apply.
+        let expected_keys = self.live_rows_size_hint();
         let mut keyset =
             BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys);
         let mut row_id_base: i64 = 0;

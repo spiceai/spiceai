@@ -142,9 +142,9 @@ mod fixture {
 
 /// Rows in the fixture table. Large enough that per-row costs dominate fixture
 /// overhead, small enough to build in a local bench.
-const ROWS: usize = 2_000_000;
+const ROWS: usize = 200_000;
 /// Rows per insert batch.
-const BATCH: usize = 200_000;
+const BATCH: usize = 50_000;
 /// Fraction of keys placed in the deletion map for `plus_deletion_probe`.
 const DELETED_EVERY: usize = 20;
 
@@ -357,10 +357,12 @@ fn bench(c: &mut Criterion) {
                 .collect(),
         )
         .await;
+        eprintln!("[bench] fixture created");
         let mut start = 0i64;
         while (start as usize) < ROWS {
             fixture::insert(&f.table, pk_batch(&schema, start, BATCH)).await;
             start += BATCH as i64;
+            eprintln!("[bench] inserted {start}/{ROWS}");
         }
         f
     });
@@ -369,6 +371,7 @@ fn bench(c: &mut Criterion) {
     // `ROWS` (an insert path that dedups, a projection pushdown that elides work)
     // every per-row figure below is wrong by that factor. Measure it, and fail
     // loudly on a mismatch rather than reporting a throughput that is off by 10x.
+    eprintln!("[bench] planning serial verification drain");
     let observed = drain(
         &rt,
         &scan_plan(&rt, &fixture, vec![0, 1, 2, 3]),
@@ -376,6 +379,7 @@ fn bench(c: &mut Criterion) {
         &HashMap::new(),
         false,
     );
+    eprintln!("[bench] serial drain saw {observed}; planning partitioned drain");
     let observed_parallel = drain(
         &rt,
         &scan_plan(&rt, &fixture, vec![0, 1, 2, 3]),
