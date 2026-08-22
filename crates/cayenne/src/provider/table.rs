@@ -2988,8 +2988,11 @@ pub(crate) enum EncodeFanOut {
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
-    /// assumes one output sequence), and a Z-order-clustered cold promotion
-    /// (sharding scatters the clustering the promotion exists to create).
+    /// assumes one output sequence), a Z-order-clustered cold promotion
+    /// (sharding scatters the clustering the promotion exists to create), and a
+    /// globally sorted rewrite (splitting the sorted stream across shard files
+    /// would give each file the whole key range, forfeiting the pruning the
+    /// sort exists for — see `rewrite_write_policy`).
     Serial,
 }
 
@@ -3027,6 +3030,129 @@ const fn subset_merge_write_shape(
             session_target_partitions
         };
         (cap, Some(total_input_bytes))
+    }
+}
+
+/// Ascending split points that range-partition `column` across `shards`
+/// writers, derived from the min/max a plan reports for it.
+///
+/// `None` whenever the split cannot be trusted to spread rows: no statistics,
+/// a degenerate range (every row shares one value, so every row would land on
+/// one shard anyway), or a type the interpolation does not cover. The caller
+/// then hashes instead, which is the behavior that predates range
+/// partitioning — so a missing statistic costs clustering, never correctness.
+///
+/// Bounds are equi-width over `[min, max]` rather than quantiles: a plan's
+/// statistics carry the range but not the distribution, so this balances a
+/// uniform key well and a skewed one poorly. Skew costs shard balance — some
+/// writers get more rows — and never costs correctness, because every row still
+/// lands on exactly one shard and the shards still tile the domain in order.
+fn range_bounds_from_statistics(
+    stats: &Statistics,
+    column: usize,
+    shards: usize,
+) -> Option<Vec<ScalarValue>> {
+    if shards < 2 {
+        return None;
+    }
+    let column_stats = stats.column_statistics.get(column)?;
+    let min = column_stats.min_value.get_value()?;
+    let max = column_stats.max_value.get_value()?;
+
+    // Interpolate over the value domain. Only the integer and date families are
+    // covered: they are the CDC key shapes that matter (a monotonic id, a day
+    // bucket), and each divides exactly. Floats and decimals are deliberately
+    // left out rather than approximated into bounds that could collapse.
+    //
+    // Both ends must be the same variant, or the interpolation would compare
+    // across two different domains and produce bounds that match neither.
+    if std::mem::discriminant(min) != std::mem::discriminant(max) {
+        return None;
+    }
+    let (lo, hi) = (scalar_to_i128(min)?, scalar_to_i128(max)?);
+    if hi <= lo {
+        return None;
+    }
+
+    let span = hi.checked_sub(lo)?;
+    let divisions = i128::try_from(shards).ok()?;
+    let mut bounds = Vec::with_capacity(shards - 1);
+    let mut previous: Option<i128> = None;
+    for step in 1..divisions {
+        let cut = lo.checked_add(span.checked_mul(step)? / divisions)?;
+        // A narrow range over many shards repeats a cut. Duplicate bounds would
+        // leave a shard that no row can reach, so collapse them: fewer, wider
+        // shards is the honest outcome when the domain cannot be split further.
+        if previous == Some(cut) {
+            continue;
+        }
+        previous = Some(cut);
+        bounds.push(rebuild_scalar_like(min, cut)?);
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// Widen an integer or date scalar to `i128` for bound interpolation, or `None`
+/// for any other type.
+#[expect(
+    clippy::match_same_arms,
+    reason = "each arm widens a DIFFERENT integer type; the bodies are textually \
+              identical but cannot be merged, because the binding's type differs \
+              per variant"
+)]
+fn scalar_to_i128(value: &ScalarValue) -> Option<i128> {
+    Some(match value {
+        ScalarValue::Int8(Some(v)) => i128::from(*v),
+        ScalarValue::Int16(Some(v)) => i128::from(*v),
+        ScalarValue::Int32(Some(v)) => i128::from(*v),
+        ScalarValue::Int64(Some(v)) => i128::from(*v),
+        ScalarValue::UInt8(Some(v)) => i128::from(*v),
+        ScalarValue::UInt16(Some(v)) => i128::from(*v),
+        ScalarValue::UInt32(Some(v)) => i128::from(*v),
+        ScalarValue::UInt64(Some(v)) => i128::from(*v),
+        ScalarValue::Date32(Some(v)) => i128::from(*v),
+        _ => return None,
+    })
+}
+
+/// Rebuild `value` as the same `ScalarValue` variant as `like`, so the bounds
+/// compare against the key column without a cast.
+fn rebuild_scalar_like(like: &ScalarValue, value: i128) -> Option<ScalarValue> {
+    Some(match like {
+        ScalarValue::Int8(_) => ScalarValue::Int8(Some(i8::try_from(value).ok()?)),
+        ScalarValue::Int16(_) => ScalarValue::Int16(Some(i16::try_from(value).ok()?)),
+        ScalarValue::Int32(_) => ScalarValue::Int32(Some(i32::try_from(value).ok()?)),
+        ScalarValue::Int64(_) => ScalarValue::Int64(Some(i64::try_from(value).ok()?)),
+        ScalarValue::UInt8(_) => ScalarValue::UInt8(Some(u8::try_from(value).ok()?)),
+        ScalarValue::UInt16(_) => ScalarValue::UInt16(Some(u16::try_from(value).ok()?)),
+        ScalarValue::UInt32(_) => ScalarValue::UInt32(Some(u32::try_from(value).ok()?)),
+        ScalarValue::UInt64(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+        ScalarValue::Date32(_) => ScalarValue::Date32(Some(i32::try_from(value).ok()?)),
+        _ => return None,
+    })
+}
+
+/// Write policy for a snapshot rewrite, chosen by whether the rewrite actually
+/// sorted its stream. Pure so the decision is unit-testable without spinning a
+/// full provider, mirroring [`subset_merge_write_shape`].
+///
+/// A sorted rewrite must reach the sink through ONE writer, or the global order
+/// is scattered across shard files and every file's zone maps span the whole
+/// range — forfeiting exactly the pruning the sort exists for. Passing a low
+/// `session_target_partitions` does NOT secure that: the hint bounds only the
+/// unset default, while a configured `cayenne_write_concurrency` is honored
+/// above it (see `CayenneTableProvider::snapshot_write_concurrency`, and the
+/// deliberate reasoning on `test_low_partition_hint_does_not_serialize_a_sized_write`).
+/// So the requirement is declared with [`EncodeFanOut::Serial`].
+///
+/// An unsorted consolidation carries nothing a reader depends on and is free to
+/// fan its encode out across cores.
+#[must_use]
+const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePolicy {
+    if is_sorted {
+        super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL
+    } else {
+        super::delta_encoding::WritePolicy::MAINTENANCE
     }
 }
 
@@ -7010,6 +7136,36 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         policy: super::delta_encoding::WritePolicy,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
+        self.write_to_snapshot_range_partitioned(
+            stream,
+            target_size_bytes,
+            snapshot_id,
+            target_partitions,
+            estimated_bytes,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_to_snapshot`], with ascending split points that
+    /// range-partition the shard key instead of hashing it.
+    ///
+    /// Only a caller that knows the key range of the rows it is about to write
+    /// can supply these — a rewrite reads them off the statistics of the plan it
+    /// is merging. A streaming write has no such view, passes `None`, and hashes
+    /// as before.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn write_to_snapshot_range_partitioned(
+        &self,
+        stream: SendableRecordBatchStream,
+        target_size_bytes: usize,
+        snapshot_id: &str,
+        target_partitions: usize,
+        estimated_bytes: Option<u64>,
+        policy: super::delta_encoding::WritePolicy,
+        range_bounds: Option<&[ScalarValue]>,
+    ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
@@ -7117,6 +7273,7 @@ impl CayenneTableProvider {
                     target_size_bytes,
                     estimated_bytes,
                     fan_out,
+                    range_bounds,
                 ),
             ),
             None => self.write_shard_format(
@@ -7124,6 +7281,7 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
+                range_bounds,
             ),
         };
 
@@ -7448,9 +7606,12 @@ impl CayenneTableProvider {
     }
 
     /// Effective number of concurrent shard writers the Vortex sink will use for
-    /// a snapshot write. Returns `1` for sorted rewrites (sharding a
-    /// globally-sorted stream would scatter its order across files); otherwise
-    /// the count is *size-aware*:
+    /// a snapshot write. Returns `1` when the caller declares
+    /// [`EncodeFanOut::Serial`] — the way a write that must not fan out states
+    /// it, and the only thing that holds a globally-sorted stream on one writer
+    /// (`session_target_partitions` is a hint that bounds the unset default, not
+    /// a ceiling on a configured `cayenne_write_concurrency`). Otherwise the
+    /// count is *size-aware*:
     ///
     /// - `estimated_bytes == Some(n)`: shard into `n / encode_shard_unit`
     ///   writers, clamped to `[1, write_concurrency]`, where the unit is
@@ -7502,25 +7663,24 @@ impl CayenneTableProvider {
         if matches!(fan_out, EncodeFanOut::Serial) {
             return 1;
         }
-        // A sorted write must go through ONE writer, or the global order is
-        // scattered across shard files and each file's zone maps span the whole
-        // range — forfeiting exactly the pruning the sort was for.
+        // Whether the encode may fan out is a property of the WRITE, not of the
+        // table's declared sort order. Schema inference fills `sort_columns` on
+        // every catalog-visible CDC table (the key the background rewrite sorts
+        // by), so keying the fan-out off the table would serialize the two write
+        // paths that never sort — the CDC delta write (staged appends and
+        // mem-tier checkpoints) and the protected-snapshot merge, which unions
+        // its input scans.
         //
-        // KNOWN GAP (pre-existing, deliberately not fixed here): this asks the
-        // CONFIGURED list, but an adaptive (observed-filter) layout sorts the
-        // compaction rewrite too, with no configured columns — so that rewrite
-        // gets sharded and its clustering is diluted. The blunt fix (key off
-        // `effective_sort_columns_for_rewrite`) is wrong: this function also
-        // serves DELTA writes (`table.rs:5708`), which are NOT sorted, so it
-        // would serialize the CDC encode fan-out and regress ingest. The real fix
-        // threads `write_class` in so only maintenance writes force one shard.
-        // Until then the adaptive layout's clustering is per-shard-file rather
-        // than global — weaker pruning, but never a wrong `output_ordering`
-        // (the attestation in `rewrite_current_snapshot_for_compaction` declines
-        // to attest whenever the effective key is not the configured one).
-        if self.context.has_sort_columns() {
-            return 1;
-        }
+        // A sorted write must still go through ONE writer, or the global order
+        // is scattered across shard files and each file's zone maps span the
+        // whole range — forfeiting exactly the pruning the sort was for. Every
+        // stream that goes through `sort_stream_by_columns` or
+        // `zorder_sort_stream` states that with [`EncodeFanOut::Serial`], which
+        // is handled above. A low `session_target_partitions` is NOT a
+        // substitute: it bounds only the unset default, while a configured
+        // `cayenne_write_concurrency` is honored above it (see
+        // `snapshot_write_concurrency`), so a caller that merely passed 1 would
+        // still fan out on a table that raised the knob.
         let write_concurrency = self.snapshot_write_concurrency(session_target_partitions);
         match estimated_bytes {
             Some(bytes) => {
@@ -7563,6 +7723,7 @@ impl CayenneTableProvider {
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        range_bounds: Option<&[ScalarValue]>,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
         match self.write_shard_config(
@@ -7570,10 +7731,31 @@ impl CayenneTableProvider {
             target_size_bytes,
             estimated_bytes,
             fan_out,
+            range_bounds,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
         }
+    }
+
+    /// Split points for range-partitioning a merge on its shard key, or `None`
+    /// when the key or its range cannot be resolved — in which case the write
+    /// hashes, exactly as it did before range partitioning existed.
+    ///
+    /// Restricted to a single key column, because ordering a composite key needs
+    /// a lexicographic comparison the sink's range split does not implement.
+    fn merge_range_bounds(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        shards: usize,
+    ) -> Option<Vec<ScalarValue>> {
+        let key = self.resolved_shard_key_columns();
+        let [column] = key.as_slice() else {
+            return None;
+        };
+        let index = self.table_schema().index_of(column).ok()?;
+        let stats = plan.partition_statistics(None).ok()?;
+        range_bounds_from_statistics(&stats, index, shards)
     }
 
     /// The intra-write shard configuration this write earns, or `None` for a
@@ -7582,16 +7764,26 @@ impl CayenneTableProvider {
     /// (`CayenneContext::write_format_with_strategy`) so the two write paths
     /// produce identically-sharded output formats.
     ///
-    /// The hash-clustering key is the configured `shard_key_columns` (e.g. the
-    /// source's declared partition/shard key, applied by extended schema
-    /// inference) when set and valid against the schema; otherwise the primary
-    /// key. PK-less tables without a configured key shard round-robin.
+    /// Rows are hash-partitioned when the operator configured
+    /// `cayenne_shard_key_columns` (or extended schema inference supplied the
+    /// source's declared shard key) and every column resolves against the
+    /// schema. That is an explicit request for key-clustered files, so it wins.
+    ///
+    /// Otherwise the shards are filled with CONTIGUOUS runs of the arrival
+    /// stream. This is the default because hashing destroys the arrival order,
+    /// and the arrival order is what a CDC table's zone maps are built on: with
+    /// a hash (or round-robin) split, every output file spans the whole range of
+    /// a monotonic column, so a point lookup can prune nothing and must open all
+    /// of them. A serial write never had that problem — it wrote one file per
+    /// range — and preserving contiguity is what keeps the parallel encode from
+    /// giving that pruning away.
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        range_bounds: Option<&[ScalarValue]>,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
@@ -7602,17 +7794,25 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
-        let shard_key_columns = self.resolved_shard_key_columns();
         Some(WriteShardConfig {
             write_concurrency: shard_count,
-            shard_key_columns,
+            shard_key_columns: self.resolved_shard_key_columns(),
+            // Ascending split points, when the caller could derive them for a
+            // single key column. Their absence is not a failure: the write
+            // hashes the key instead, which is what every write did before
+            // range partitioning existed.
+            range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
         })
     }
 
-    /// The hash-clustering key for intra-write sharding: the configured
+    /// The clustering key for intra-write sharding: the configured
     /// `shard_key_columns` when every column exists in the table schema, else
     /// the primary-key columns. An invalid configured key warns and falls back
     /// rather than failing the write.
+    ///
+    /// Empty means "the primary key" throughout — `apply_inferred_shard_key`
+    /// relies on it to omit a source shard key that already equals the PK, and
+    /// persisted tables encode an unset key as an empty vector.
     ///
     /// Resolves names against the LIVE table schema ([`Self::table_schema`]),
     /// not the construction-time `table_metadata.schema`, so a column added by
@@ -7621,20 +7821,25 @@ impl CayenneTableProvider {
     fn resolved_shard_key_columns(&self) -> Vec<String> {
         let schema = self.table_schema();
         let configured = self.context.shard_key_columns();
-        if !configured.is_empty() {
-            let missing: Vec<&String> = configured
+        if configured.is_empty() {
+            return self
+                .pk_column_indices
                 .iter()
-                .filter(|column| schema.field_with_name(column).is_err())
+                .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
                 .collect();
-            if missing.is_empty() {
-                return configured.to_vec();
-            }
-            tracing::warn!(
-                table = self.table_metadata.table_name.as_str(),
-                missing = ?missing,
-                "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
-            );
         }
+        let missing: Vec<&String> = configured
+            .iter()
+            .filter(|column| schema.field_with_name(column).is_err())
+            .collect();
+        if missing.is_empty() {
+            return configured.to_vec();
+        }
+        tracing::warn!(
+            table = self.table_metadata.table_name.as_str(),
+            missing = ?missing,
+            "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
+        );
         self.pk_column_indices
             .iter()
             .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
@@ -14161,6 +14366,10 @@ impl CayenneTableProvider {
         let (stream, _) = self.visible_file_stream_for_rewrite(&ctx).await?;
 
         // Configured sort_columns win; default empty uses hottest observed filters (F4).
+        // An empty list resolves to no key at all, and `sort_stream_by_columns`
+        // then hands the stream back untouched — so whether this rewrite is
+        // sorted is a property of the resolved list, not of the entry point.
+        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
         let sorted_stream =
             self.sort_stream_by_columns(stream, &rewrite_sort_columns, &ctx.task_ctx())?;
 
@@ -14240,15 +14449,17 @@ impl CayenneTableProvider {
         }
 
         let (total_rows, chunk_count, _stats_acc) = self
-            // Sorted rewrite: `has_sort_columns()` already forces a single shard
-            // (and `target_partitions = 1`), so no size estimate is needed.
+            // Pin the fan-out only when the stream really was sorted; an
+            // unsorted rewrite is free to fan out. No size estimate is needed
+            // once pinned. See `rewrite_write_policy` for why the partition hint
+            // cannot carry this on its own.
             .write_to_snapshot(
                 sorted_stream,
                 target_size_bytes,
                 &new_snapshot_id,
                 1,
                 None,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                rewrite_write_policy(rewrite_is_sorted),
             )
             .await?;
 
@@ -17028,7 +17239,8 @@ impl CayenneTableProvider {
         // hottest observed filter columns so selective scans prune zone maps
         // without spicepod setup (F4 adaptive cold layout).
         let rewrite_sort_columns = self.effective_sort_columns_for_rewrite();
-        if !rewrite_sort_columns.is_empty() {
+        let rewrite_is_sorted = !rewrite_sort_columns.is_empty();
+        if rewrite_is_sorted {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -17060,11 +17272,10 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
-                // Compaction already pins `target_partitions = 1` (single output
-                // file is the whole point), so the shard count is forced to 1
-                // regardless; no size estimate needed.
+                // Compaction consolidates into a single output file, so it needs
+                // no size estimate.
                 None,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                rewrite_write_policy(rewrite_is_sorted),
             )
             .await;
 
@@ -17597,7 +17808,8 @@ impl CayenneTableProvider {
         let cold_target_file_size_mb = self.table_metadata.vortex_config.cold_target_file_size_mb;
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
-        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out);
+        // Cold promotion streams its rows, so it has no key range to split on.
+        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out, None);
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -18612,21 +18824,6 @@ impl CayenneTableProvider {
                 return Ok(false);
             }
 
-            // Protected snapshot ids are UUIDv7, so lexical order == creation
-            // order. Consider the oldest `max_inputs` (at least 2) snapshots.
-            let mut ids: Vec<String> = protected.keys().cloned().collect();
-            ids.sort();
-            let take = ids.len().min(max_inputs.max(2));
-            ids.truncate(take);
-
-            let candidates: Vec<(String, i64)> = ids
-                .into_iter()
-                .map(|id| {
-                    let threshold = protected.get(&id).copied().unwrap_or(0);
-                    (id, threshold)
-                })
-                .collect();
-
             let deletion_snapshot = self.pk_deletion_snapshot();
             // Derive the fence from the SAME loaded deletion snapshot used for
             // the Phase 2 rewrite. A separate `get_max_delete_sequence()` load
@@ -18638,11 +18835,54 @@ impl CayenneTableProvider {
             //
             // The durable max still over-claims a delete that is pending in the
             // mem tier below it (cross-shard / off-fence commit reorder), so cap
-            // the fence strictly below that pending floor — see
-            // `protected_snapshot_merge_fence`.
-            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
-                deletion_snapshot.max_sequence_number().unwrap_or(0),
-            );
+            // the fence strictly below that pending floor; the floor also gates
+            // the eligibility filter below.
+            let (fence_max_delete_seq, pending_floor) = self
+                .protected_snapshot_merge_fence_and_floor(
+                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                );
+
+            // While a pending mem-tier delete exists, fold only inputs with
+            // `threshold <= fence`: the output is tagged with the fence and
+            // scans re-apply every deletion above it, so folding an input
+            // tagged higher would demote rows exempt from deletions in
+            // `(fence, threshold]` and mask them — a hot upsert key loses its
+            // only live version until the next commit. Excluded inputs become
+            // eligible when the pending floor advances at the next checkpoint.
+            // With no pending floor the fence is the durable max: no deletion
+            // above it exists, and filtering would only starve compaction.
+            //
+            // Protected snapshot ids are UUIDv7, so lexical order == creation
+            // order. Consider the oldest `max_inputs` (at least 2) eligible
+            // snapshots.
+            let mut ids: Vec<String> = protected
+                .iter()
+                .filter(|&(_, &threshold)| {
+                    pending_floor.is_none() || threshold <= fence_max_delete_seq
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if ids.len() < 2 {
+                tracing::trace!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    fence_max_delete_seq,
+                    above_fence = protected.len() - ids.len(),
+                    "Skipping protected-snapshot subset compaction: fewer than two inputs at or below the delete fence",
+                );
+                return Ok(false);
+            }
+            ids.sort();
+            let take = ids.len().min(max_inputs.max(2));
+            ids.truncate(take);
+
+            let candidates: Vec<(String, i64)> = ids
+                .into_iter()
+                .map(|id| {
+                    let threshold = protected.get(&id).copied().unwrap_or(0);
+                    (id, threshold)
+                })
+                .collect();
             (
                 candidates,
                 fence_max_delete_seq,
@@ -18802,6 +19042,7 @@ impl CayenneTableProvider {
         let state = ctx.state();
         let pk_indices = self.pk_column_indices.clone();
 
+        let target_partitions_hint = state.config().target_partitions();
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
         for (snapshot_id, threshold) in &inputs {
             let plan = self
@@ -18821,6 +19062,13 @@ impl CayenneTableProvider {
         } else {
             UnionExec::try_new(plans)?
         };
+        // Range-partition the merge on its shard key when the plan can say what
+        // range it holds. This is the rewrite that produces the long-lived
+        // layout, and it is the only write with that view: a streaming CDC
+        // write knows nothing about the keys still to arrive, so it hashes.
+        // Hashing here would spread every key across every output file and
+        // leave a predicate on the key nothing to prune.
+        let range_bounds = self.merge_range_bounds(&merged_plan, target_partitions_hint);
         let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
         let plan_build_ms = phase2_start.elapsed().as_millis();
 
@@ -18864,12 +19112,12 @@ impl CayenneTableProvider {
             serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
             keeps_positions_serial,
-            state.config().target_partitions(),
+            target_partitions_hint,
             total_input_bytes,
         );
         let write_start = std::time::Instant::now();
         let write_result = self
-            .write_to_snapshot(
+            .write_to_snapshot_range_partitioned(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
@@ -18889,6 +19137,7 @@ impl CayenneTableProvider {
                 } else {
                     super::delta_encoding::WritePolicy::MAINTENANCE
                 },
+                range_bounds.as_deref(),
             )
             .await;
 
@@ -19273,7 +19522,14 @@ impl CayenneTableProvider {
         // a separate max-delete-seq load could observe a newer ArcSwap version
         // than `deletion_snapshot`, tagging an un-applied deletion as
         // already-applied and resurrecting the rows it deletes).
-        let (ordered_ids, thresholds, fence_max_delete_seq, deletion_snapshot, snapshot_at_capture) = {
+        let (
+            ordered_ids,
+            thresholds,
+            fence_max_delete_seq,
+            pending_floor,
+            deletion_snapshot,
+            snapshot_at_capture,
+        ) = {
             let _fence = self.listing_fence.read().await;
             // Captured for the Phase-3 overwrite guard (see the subset-merge
             // publish): an overwrite/promotion committing mid-pass must not be
@@ -19293,15 +19549,17 @@ impl CayenneTableProvider {
                 .collect();
             let deletion_snapshot = self.pk_deletion_snapshot();
             // Cap below the smallest still-pending mem-tier delete so a reordered
-            // pending delete below the durable max is never tagged as baked — see
-            // `protected_snapshot_merge_fence`.
-            let fence_max_delete_seq = self.protected_snapshot_merge_fence(
-                deletion_snapshot.max_sequence_number().unwrap_or(0),
-            );
+            // pending delete below the durable max is never tagged as baked; the
+            // floor also gates the prefix eligibility stop below.
+            let (fence_max_delete_seq, pending_floor) = self
+                .protected_snapshot_merge_fence_and_floor(
+                    deletion_snapshot.max_sequence_number().unwrap_or(0),
+                );
             (
                 ids,
                 thresholds,
                 fence_max_delete_seq,
+                pending_floor,
                 deletion_snapshot,
                 snapshot_at_capture,
             )
@@ -19336,6 +19594,19 @@ impl CayenneTableProvider {
                 .await
                 .unwrap_or_default();
             let threshold = thresholds.get(id).copied().unwrap_or(0);
+            // Same eligibility rule as the size-tier subset pass: while a pending
+            // mem-tier delete caps the fence, an input tagged above it must not
+            // be folded — the output is retagged at the fence, and scans would
+            // re-apply the `(fence, threshold]` deletions to its rows, masking a
+            // key's live version. Thresholds are allocated sequences in creation
+            // order and the `<= T` prune needs a contiguous oldest prefix, so
+            // stopping at the first above-fence input keeps the maximal sound
+            // prefix; the rest become eligible when the pending floor advances
+            // at the next checkpoint.
+            if pending_floor.is_some() && threshold > fence_max_delete_seq {
+                stopped_early = Some("above_fence");
+                break;
+            }
             if let Some(budget) = max_pass_bytes {
                 // On-disk bytes, sized as the size-tier path sizes its candidates.
                 // An unknown size must NOT count as 0: the budget is a memory ceiling,
@@ -20623,9 +20894,11 @@ impl CayenneTableProvider {
             .min()
     }
 
-    /// The deletion fence to tag a freshly-merged protected snapshot with: the
+    /// The deletion fence to tag a freshly-merged protected snapshot with — the
     /// just-loaded durable deletion-index max, CAPPED strictly below the smallest
-    /// still-pending mem-tier delete.
+    /// still-pending mem-tier delete — plus that pending floor itself, so ONE
+    /// coherent floor load drives both the cap and the caller's input-eligibility
+    /// rule (fold only inputs at or below the fence while a floor exists).
     ///
     /// The uncapped durable max over-claims. Under N>1 off-fence CDC a later
     /// apply's delete can fold into the durable index ahead of an earlier apply's
@@ -20644,11 +20917,15 @@ impl CayenneTableProvider {
     /// when a pending delete sits below the durable max (the reorder gap); with no
     /// pending mem-tier delete it is the durable max unchanged.
     #[must_use]
-    fn protected_snapshot_merge_fence(&self, durable_max_delete_seq: i64) -> i64 {
-        self.min_pending_mem_tier_delete_sequence()
-            .map_or(durable_max_delete_seq, |pending_floor| {
-                durable_max_delete_seq.min(pending_floor - 1)
-            })
+    fn protected_snapshot_merge_fence_and_floor(
+        &self,
+        durable_max_delete_seq: i64,
+    ) -> (i64, Option<i64>) {
+        let pending_floor = self.min_pending_mem_tier_delete_sequence();
+        let fence = pending_floor.map_or(durable_max_delete_seq, |floor| {
+            durable_max_delete_seq.min(floor - 1)
+        });
+        (fence, pending_floor)
     }
 
     /// Clear ALL cached deletion vectors, insert records, and protected
@@ -38634,7 +38911,7 @@ mod tests {
             provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
             4
         );
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -38708,20 +38985,26 @@ mod tests {
         )
         .await;
 
-        // Keyed/upsert table: the sink hashes rows by the primary key so each
-        // output file is PK-clustered (tight per-file zone maps).
-        // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
+        // Keyed/upsert table with no configured shard key: the sink hashes rows
+        // by the primary key. Empty means "the primary key" across the whole
+        // stack — `apply_inferred_shard_key` omits a source shard key equal to
+        // the PK on exactly that basis.
+        // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out.
         let tsb = provider.context.target_file_size_bytes();
         assert_eq!(
             provider.snapshot_shard_count(4, tsb, None, EncodeFanOut::Sized),
             4
         );
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
         assert_eq!(write_shard.write_concurrency, 4);
         assert_eq!(write_shard.shard_key_columns, vec!["id".to_string()]);
+        assert!(
+            write_shard.range_bounds.is_none(),
+            "a streaming write has no key range to split on, so it hashes"
+        );
     }
 
     #[tokio::test]
@@ -38747,7 +39030,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38776,7 +39059,7 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, None, EncodeFanOut::Sized, None);
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -38819,7 +39102,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
@@ -38867,13 +39150,166 @@ mod tests {
             );
             assert!(
                 provider
-                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial)
+                    .write_shard_format(8, tsb, estimated, EncodeFanOut::Serial, None)
                     .write_shard()
                     .is_none(),
                 "a Serial write must produce the unsharded base format \
                  (estimated_bytes={estimated:?})"
             );
         }
+    }
+
+    /// Bounds must tile the key domain, and must decline rather than produce a
+    /// split that cannot spread rows.
+    ///
+    /// Declining is the safe direction: the caller then hashes, which is what
+    /// every write did before range partitioning existed. A bad split would be
+    /// worse than no split — duplicate bounds leave a shard no row can reach,
+    /// and a degenerate range sends every row to one encoder while the write
+    /// still pays for the fan-out.
+    #[test]
+    fn range_bounds_from_statistics_tiles_the_domain_or_declines() {
+        use datafusion_common::stats::Precision;
+
+        fn stats(min: Option<i64>, max: Option<i64>) -> Statistics {
+            let mut column = datafusion_common::ColumnStatistics::new_unknown();
+            if let Some(min) = min {
+                column.min_value = Precision::Exact(ScalarValue::Int64(Some(min)));
+            }
+            if let Some(max) = max {
+                column.max_value = Precision::Exact(ScalarValue::Int64(Some(max)));
+            }
+            let mut stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "k",
+                DataType::Int64,
+                false,
+            )]));
+            stats.column_statistics = vec![column];
+            stats
+        }
+
+        assert_eq!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 0, 4),
+            Some(vec![
+                ScalarValue::Int64(Some(25)),
+                ScalarValue::Int64(Some(50)),
+                ScalarValue::Int64(Some(75)),
+            ]),
+            "four shards split an even domain at the quarter points"
+        );
+
+        assert!(
+            range_bounds_from_statistics(&stats(Some(7), Some(7)), 0, 4).is_none(),
+            "a single-valued column cannot be split, so hash instead"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(100), Some(0)), 0, 4).is_none(),
+            "an inverted range is not trustworthy"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(None, Some(100)), 0, 4).is_none(),
+            "an absent statistic declines rather than guessing"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 0, 1).is_none(),
+            "one shard needs no bounds"
+        );
+        assert!(
+            range_bounds_from_statistics(&stats(Some(0), Some(100)), 9, 4).is_none(),
+            "a column index outside the statistics declines"
+        );
+
+        // A domain narrower than the shard count repeats cuts; the duplicates
+        // collapse so no shard is left unreachable.
+        let narrow = range_bounds_from_statistics(&stats(Some(0), Some(2)), 0, 8)
+            .expect("a narrow but non-degenerate range still splits");
+        let mut sorted = narrow.clone();
+        sorted.dedup();
+        assert_eq!(sorted, narrow, "bounds must be strictly ascending");
+    }
+
+    /// A sorted rewrite must declare a serial fan-out; an unsorted one must not.
+    ///
+    /// This is the gate that keeps a globally sorted stream on one writer. If it
+    /// ever returns a `Sized` policy for a sorted rewrite, the order is split
+    /// across shard files and every file's zone maps span the whole range — the
+    /// pruning the sort exists for is silently lost, with no failure anywhere.
+    #[test]
+    fn rewrite_write_policy_pins_the_fan_out_only_for_sorted_rewrites() {
+        use crate::provider::delta_encoding::{WriteClass, WritePolicy};
+
+        assert_eq!(
+            rewrite_write_policy(true),
+            WritePolicy::MAINTENANCE_SERIAL,
+            "a sorted rewrite must pin the encode to one writer"
+        );
+        assert_eq!(
+            rewrite_write_policy(true).fan_out,
+            EncodeFanOut::Serial,
+            "the pin must be the fan-out, not merely the write class"
+        );
+        assert_eq!(
+            rewrite_write_policy(false),
+            WritePolicy::MAINTENANCE,
+            "an unsorted consolidation is free to fan out"
+        );
+        assert_eq!(rewrite_write_policy(false).fan_out, EncodeFanOut::Sized,);
+        // Both are maintenance writes: only the fan-out differs, so the encoding
+        // level and the encode-budget class stay the same either way.
+        assert_eq!(rewrite_write_policy(true).class, WriteClass::Maintenance);
+        assert_eq!(rewrite_write_policy(false).class, WriteClass::Maintenance);
+    }
+
+    /// Regression test: a sorted rewrite must stay serial even when the table
+    /// raises `cayenne_write_concurrency`.
+    ///
+    /// `snapshot_write_concurrency` honors a configured concurrency ABOVE the
+    /// caller's `session_target_partitions` (that hint bounds only the unset
+    /// default), so the sorted rewrites cannot secure a single writer by passing
+    /// `target_partitions = 1` — they must declare `EncodeFanOut::Serial`.
+    /// Without that, a globally sorted stream is split across shard files and
+    /// every file's zone maps span the whole range, silently forfeiting the
+    /// pruning the sort exists for.
+    #[tokio::test]
+    async fn test_sorted_rewrite_stays_serial_under_write_concurrency_override() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "sorted_rewrite_concurrency_override",
+            Arc::clone(&schema),
+            VortexConfig {
+                write_concurrency: Some(8),
+                sort_columns: vec!["id".to_string()],
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+
+        // The pin the sorted rewrites actually pass.
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Serial),
+            1,
+            "a declared-serial write must ignore the configured write concurrency"
+        );
+        assert!(
+            provider
+                .write_shard_format(1, tsb, None, EncodeFanOut::Serial, None)
+                .write_shard()
+                .is_none(),
+            "a declared-serial write must not carry a shard config"
+        );
+
+        // Demonstrates why the declaration is load-bearing: the hint alone does
+        // not hold, so a sorted rewrite that only passed `1` would fan out.
+        assert_eq!(
+            provider.snapshot_shard_count(1, tsb, None, EncodeFanOut::Sized),
+            8,
+            "the partition hint alone does not bound a configured concurrency"
+        );
     }
 
     /// A LOW partition hint must not serialize an ordinary write.
@@ -38909,7 +39345,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(1, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(1, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("a sized write keeps its shard config")
                 .write_concurrency,
@@ -38918,7 +39354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_shard_format_sorted_single_writer() {
+    async fn test_declared_sort_order_does_not_serialize_an_unsorted_write() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -38929,21 +39365,39 @@ mod tests {
         )
         .await;
 
-        // Sorted rewrites must stay on a single writer: sharding a globally
-        // sorted stream would scatter its order across files. This holds
-        // regardless of the size estimate, so pass a large `estimated_bytes`.
+        // A sorted rewrite states its requirement with `EncodeFanOut::Serial`
+        // and stays on a single writer, whatever the size estimate says.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Serial),
             1
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Serial, None)
                 .write_shard()
                 .is_none(),
-            "sorted writes fall back to the unsharded base format"
+            "a serial write falls back to the unsharded base format"
+        );
+
+        // The table DECLARING a sort order does not make every write it makes a
+        // sorted one. Schema inference fills `sort_columns` on every
+        // catalog-visible CDC table, so a table property here would serialize
+        // the CDC delta write and the protected-snapshot merge, neither of which
+        // sorts. A `Sized` write on the same table fans out.
+        assert_eq!(
+            provider.snapshot_shard_count(4, tsb, huge, EncodeFanOut::Sized),
+            4,
+            "a table's declared sort order must not serialize an unsorted write"
+        );
+        assert_eq!(
+            provider
+                .write_shard_format(4, tsb, huge, EncodeFanOut::Sized, None)
+                .write_shard()
+                .expect("an unsorted sized write keeps its shard config")
+                .write_concurrency,
+            4
         );
     }
 
@@ -38973,7 +39427,7 @@ mod tests {
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small, EncodeFanOut::Sized)
+                .write_shard_format(4, tsb, small, EncodeFanOut::Sized, None)
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -39003,7 +39457,7 @@ mod tests {
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized);
+        let format = provider.write_shard_format(4, tsb, large, EncodeFanOut::Sized, None);
         assert_eq!(
             format
                 .write_shard()
@@ -39093,7 +39547,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None, EncodeFanOut::Sized)
+                .write_shard_format(6, tsb, None, EncodeFanOut::Sized, None)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
@@ -41165,7 +41619,10 @@ mod tests {
 
         // No pending mem-tier delete yet: the fence is the durable max unchanged.
         assert_eq!(provider.min_pending_mem_tier_delete_sequence(), None);
-        assert_eq!(provider.protected_snapshot_merge_fence(32), 32);
+        assert_eq!(
+            provider.protected_snapshot_merge_fence_and_floor(32),
+            (32, None)
+        );
 
         // Durable deletion index max = 32 (a later apply's delete folded ahead).
         install_int64_deletes(&provider, &[(999, 32)]);
@@ -41188,13 +41645,248 @@ mod tests {
         // The fence must NOT reach the durable max (32) — that would skip delete@30
         // forever. It caps strictly below the pending floor.
         assert_eq!(
-            provider.protected_snapshot_merge_fence(32),
-            29,
+            provider.protected_snapshot_merge_fence_and_floor(32),
+            (29, Some(30)),
             "fence caps strictly below the pending mem-tier delete (30), not the durable max (32)"
         );
         // When the durable max is already below the pending floor there is no
         // reorder gap, so the fence stays the durable max (no needless re-apply).
-        assert_eq!(provider.protected_snapshot_merge_fence(10), 10);
+        assert_eq!(
+            provider.protected_snapshot_merge_fence_and_floor(10),
+            (10, Some(30))
+        );
+    }
+
+    /// REGRESSION (hot-key live-row vanish): the fast subset compaction must not
+    /// fold a protected snapshot whose merge-on-read threshold exceeds the pass's
+    /// delete fence. When a pending mem-tier delete caps the fence below
+    /// already-durable supersede tombstones (the steady state for a CDC table
+    /// between checkpoints), folding the NEWEST snapshot — the only live version
+    /// of a hot upsert key — retags its rows at the fence; scans then re-apply
+    /// the `(fence, tombstone]` supersede deletes to the merged output and the
+    /// live row vanishes until the next commit publishes a fresher snapshot.
+    /// Observed end-to-end as transiently-empty point reads on a write-back CDC
+    /// table, which the durable write-back delivery worker escalated into
+    /// source-row DELETEs.
+    #[tokio::test]
+    async fn subset_compaction_excludes_inputs_above_delete_fence() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "subset_fence_exclusion",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_trigger_protected_snapshots: 2,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Hold the compaction lock across setup so the debounced post-write pass
+        // cannot merge the snapshots this test arranges (same rationale as
+        // `build_seq_prefix_fixture`).
+        let setup_guard = provider.compaction_lock.lock().await;
+        // Three upserts of ONE key: each publishes its own protected snapshot,
+        // and the second/third durably record a supersede key-delete for the
+        // prior version — the hot-key shape of a CDC write-back counter.
+        for value in [10_i64, 20, 30] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[1], &[value]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        drop(setup_guard);
+
+        // Bounded poll: protected-snapshot registration can lag the awaited
+        // inserts under parallel test load (see `build_seq_prefix_fixture`).
+        let mut protected_count = 0;
+        for _ in 0..100 {
+            protected_count = provider.protected_snapshots.load_full().len();
+            if protected_count >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(protected_count, 3, "one protected snapshot per upsert");
+
+        let durable_max = provider
+            .deletion_index_max_sequence()
+            .expect("the supersede deletes are durable");
+
+        // Plant a PENDING mem-tier tombstone (unrelated key) at the durable max:
+        // the merge fence caps strictly below it, i.e. below the newest durable
+        // supersede delete — the steady state for a CDC table between
+        // checkpoints (echo applies keep un-checkpointed deletes in RAM).
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([999_i64]);
+        seg.stamp(durable_max);
+        let cur = provider.mem_tier.shard(0).load();
+        let next = cur.append_segment(Arc::new(vec![]), durable_max, seg, 0, 0, 0);
+        provider.mem_tier.shard(0).store(Arc::new(next));
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            Some(durable_max),
+            "the pending floor must cap the fence below the newest supersede delete"
+        );
+
+        let merged = provider
+            .compact_protected_snapshots_subset(8)
+            .await
+            .expect("subset compaction pass");
+
+        // THE INVARIANT: the live row stays visible across the pass. Folding the
+        // newest snapshot under the capped fence made this scan come back EMPTY.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "subset_fence_exclusion").await;
+        assert_eq!(
+            pairs,
+            vec![(1, 30)],
+            "live row must survive a subset compaction whose fence is capped by a \
+             pending mem-tier delete (merged={merged})"
+        );
+
+        // The pass must still merge the at-or-below-fence inputs rather than
+        // declining outright: two eligible inputs fold into one output while the
+        // above-fence snapshot stays live untouched.
+        assert!(merged, "the at-or-below-fence snapshots must still merge");
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            2,
+            "eligible inputs merge into one output; the above-fence snapshot stays live"
+        );
+    }
+
+    /// REGRESSION: the seq-prefix bake has the same above-fence hazard as the
+    /// size-tier subset pass — its older prefix can contain a snapshot whose
+    /// merge-on-read threshold exceeds the capped fence (a key updated at least
+    /// `BAKE_KEEP_RECENT_SNAPSHOTS` snapshots ago), and folding it retags that
+    /// key's live row at the fence, so scans re-apply the `(fence, threshold]`
+    /// supersede deletes and the row vanishes. The bake must stop its prefix at
+    /// the first above-fence input while a pending mem-tier delete caps the
+    /// fence, and still bake the eligible below-fence prefix.
+    #[tokio::test]
+    async fn bake_stops_prefix_at_first_input_above_delete_fence() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "bake_fence_exclusion",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_trigger_protected_snapshots: 2,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Bake prefix = all but the newest K. Arrange: an untouched key (10) in
+        // the oldest snapshot, key 1 superseded once so its LIVE version sits in
+        // the prefix's newest snapshot, then K filler snapshots on key 2 so the
+        // key-1 snapshots all land in the bake prefix.
+        let setup_guard = provider.compaction_lock.lock().await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[10], &[111]),
+        )
+        .await;
+        for value in [10_i64, 20] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[1], &[value]),
+            )
+            .await;
+        }
+        for value in [100_i64, 200, 300] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[2], &[value]),
+            )
+            .await;
+        }
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain pending post-write maintenance");
+        drop(setup_guard);
+
+        let expected_snapshots = BAKE_KEEP_RECENT_SNAPSHOTS + 3;
+        let mut protected_count = 0;
+        for _ in 0..100 {
+            protected_count = provider.protected_snapshots.load_full().len();
+            if protected_count >= expected_snapshots {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            protected_count, expected_snapshots,
+            "one protected snapshot per insert"
+        );
+
+        // Cap the fence at the second-oldest snapshot's threshold: a pending
+        // mem-tier tombstone (unrelated key) one above it makes the fence land
+        // exactly there — below key 1's supersede delete, so key 1's live
+        // snapshot is the first above-fence prefix input.
+        let mut thresholds: Vec<i64> = provider
+            .protected_snapshots
+            .load_full()
+            .values()
+            .copied()
+            .collect();
+        thresholds.sort_unstable();
+        let pending_floor = thresholds[1] + 1;
+        let mut seg = crate::provider::mem_tier::SegmentTombstones::from_int64_keys([999_i64]);
+        seg.stamp(pending_floor);
+        let cur = provider.mem_tier.shard(0).load();
+        let next = cur.append_segment(Arc::new(vec![]), pending_floor, seg, 0, 0, 0);
+        provider.mem_tier.shard(0).store(Arc::new(next));
+        assert_eq!(
+            provider.min_pending_mem_tier_delete_sequence(),
+            Some(pending_floor),
+            "the pending floor must cap the fence below key 1's supersede delete"
+        );
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("seq-prefix bake pass");
+
+        // THE INVARIANT: every live row stays visible. Folding key 1's live
+        // snapshot under the capped fence made key 1 vanish (its supersede
+        // delete sits above the fence the output is retagged with).
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_fence_exclusion").await;
+        assert_eq!(
+            pairs,
+            vec![(1, 20), (2, 300), (10, 111)],
+            "live rows must survive a seq-prefix bake whose fence is capped by a \
+             pending mem-tier delete (baked={baked})"
+        );
+
+        // The bake must still fold the eligible below-fence prefix rather than
+        // declining outright.
+        assert!(baked, "the below-fence prefix must still bake");
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            expected_snapshots - 1,
+            "the two below-fence inputs fold into one output; the above-fence \
+             snapshot stays live"
+        );
     }
 
     /// STAGE-2 DELIVERABLE TEST (6) — REGRESSION FIX. An OLDER-prefix candidate

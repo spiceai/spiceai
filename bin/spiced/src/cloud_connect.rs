@@ -79,7 +79,6 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
-use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 #[cfg(test)]
 use runtime_cloud_connect::config::IDENTITY_FILE;
@@ -98,6 +97,7 @@ use runtime_cloud_connect::{
     identity::{AppAttachment, AttachmentState, IdentityStore},
 };
 use runtime_secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
+use telemetry::metrics_reader::MetricsReader;
 use tokio::io::AsyncWriteExt;
 
 use crate::log_capture::LogRingBuffer;

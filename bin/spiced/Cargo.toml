@@ -42,6 +42,10 @@ connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optio
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
+accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres", optional = true }
+accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite", optional = true }
+accelerator-turso = { path = "../../crates/accelerators/accelerator-turso", optional = true }
+accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb", optional = true }
 connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
 connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
 connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
@@ -52,7 +56,9 @@ connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
 cpu-budget = { path = "../../crates/cpu-budget" }
 crash-handler.workspace = true
 event_stream = { path = "../../crates/event_stream" }
+podswatcher = { path = "../../crates/podswatcher" }
 repl = { path = "../../crates/repl" }
+runtime-tls = { path = "../../crates/runtime-tls" }
 futures.workspace = true
 libc = "0.2"
 mimalloc = { version = "0.1.48", optional = true }
@@ -171,7 +177,7 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["connector-duckdb", "runtime/duckdb"]
+duckdb = ["accelerator-duckdb", "connector-duckdb", "runtime/duckdb"]
 dynamodb = ["connector-dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
@@ -198,7 +204,7 @@ odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
-postgres-accel = ["runtime/postgres-accel"]
+postgres-accel = ["accelerator-postgres", "runtime/postgres-accel"]
 
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
@@ -210,9 +216,9 @@ client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
-sqlite = ["runtime/sqlite"]
+sqlite = ["accelerator-sqlite", "runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
-turso = ["runtime/turso"]
+turso = ["accelerator-turso", "runtime/turso"]
 vortex = ["runtime/vortex"]
 
 [lints]

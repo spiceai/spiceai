@@ -9,6 +9,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb" }
+accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres" }
+accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
+accelerator-turso = { path = "../../crates/accelerators/accelerator-turso" }
 data-connector-api = { path = "../../crates/data-connector-api" }
 schemars.workspace = true
 serde.workspace = true

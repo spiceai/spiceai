@@ -51,10 +51,11 @@ use super::{
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::FilePathError;
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::resolved_refresh_mode;
 use crate::parameters::ParameterSpec;
 use crate::spice_data_base_path;
 use data_accelerator_api::snapshots::download_snapshot_if_needed;
+use runtime_acceleration::OnSchemaChange;
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_checkpoint_api::CheckpointError;
@@ -777,7 +778,8 @@ impl RefreshWriteProfile {
     ///   default: `debezium` and `cdc` resolve it to `changes`, `sink` to
     ///   `disabled`, everything else to `full`. Assuming `full` here would classify
     ///   an unannotated CDC dataset as a whole-table replace and under-provision its
-    ///   memory. See `crate::builder::connector_unset_refresh_mode`.
+    ///   memory. See
+    ///   [`runtime_acceleration::acceleration::unset_refresh_mode_for_connector`].
     /// * `refresh_check_interval` is still an unparsed string. An unparseable one is
     ///   treated as absent — the same conservative direction the component builder
     ///   takes when it later rejects the value, and the same `fundu` parser it uses.
@@ -1746,11 +1748,12 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_seal_age_ms,
             );
 
-            // Widening schema evolution at table open is gated on the dataset's
-            // `on_schema_change` policy. The policy lives on the Dataset
-            // component (not on Acceleration), so downcast the source;
-            // non-Dataset sources (views, DDL) and `block`/`fail` keep the
-            // default Disabled = legacy pin-stored-schema behavior verbatim.
+            // Widening schema evolution at table open is gated on the source's
+            // `on_schema_change` policy. The policy is a source-level fact rather
+            // than part of `Acceleration`, so it comes from the accelerator
+            // contract (`AccelerationSource::on_schema_change`); a source that
+            // states none (a view, DDL) and `block`/`fail` keep the default
+            // Disabled = pin the stored schema.
             // `refresh_mode: caching` is excluded from in-place evolution in
             // v1: its hidden `__spice_cache_namespace` column is appended LAST
             // and evolution also appends at the end — the positional
@@ -1766,21 +1769,18 @@ impl CayenneAccelerator {
             let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
             let is_partitioned = !acceleration.partition_by.is_empty();
             config.schema_evolution = source
-                .as_any()
-                .downcast_ref::<crate::component::dataset::Dataset>()
+                .on_schema_change()
                 .filter(|_| !is_caching_mode && !is_partitioned)
                 .map_or(
                     cayenne::metadata::SchemaEvolutionMode::Disabled,
-                    |dataset| match dataset.on_schema_change {
-                        crate::component::dataset::OnSchemaChange::AppendNewColumns => {
+                    |on_schema_change| match on_schema_change {
+                        OnSchemaChange::AppendNewColumns => {
                             cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
                         }
-                        crate::component::dataset::OnSchemaChange::SyncAllColumns
-                        | crate::component::dataset::OnSchemaChange::DropAndRecreate => {
+                        OnSchemaChange::SyncAllColumns | OnSchemaChange::DropAndRecreate => {
                             cayenne::metadata::SchemaEvolutionMode::Widen
                         }
-                        crate::component::dataset::OnSchemaChange::Block
-                        | crate::component::dataset::OnSchemaChange::Fail => {
+                        OnSchemaChange::Block | OnSchemaChange::Fail => {
                             cayenne::metadata::SchemaEvolutionMode::Disabled
                         }
                     },
@@ -2567,14 +2567,10 @@ impl CayenneAccelerator {
         let is_cdc_replica = source
             .acceleration()
             .is_some_and(|acceleration| acceleration.refresh_mode == Some(RefreshMode::Changes));
-        let default_scan_freshness = match source
-            .as_any()
-            .downcast_ref::<crate::component::dataset::Dataset>()
-        {
-            Some(dataset) if is_cdc_replica && !dataset.access().allows_write() => {
-                read_only_scan_freshness()
-            }
-            _ => std::time::Duration::ZERO,
+        let default_scan_freshness = if is_cdc_replica && !source.allows_write() {
+            read_only_scan_freshness()
+        } else {
+            std::time::Duration::ZERO
         };
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
@@ -3171,22 +3167,12 @@ impl DataAccelerator for CayenneAccelerator {
                         .ok_or_else(|| CheckpointError::Store {
                             source: "Turso accelerator engine not available".into(),
                         })?;
-                    let turso_accelerator = turso_engine
-                        .as_any()
-                        .downcast_ref::<crate::dataaccelerator::turso::TursoAccelerator>()
-                        .ok_or_else(|| CheckpointError::Store {
-                            source: "expected the registered Turso accelerator".into(),
-                        })?;
-                    let pool = turso_accelerator
-                        .get_shared_pool_for_path(&metadata_db_path)
-                        .await
-                        .map_err(|source| CheckpointError::Store {
-                            source: Box::new(source),
-                        })?;
-                    return Ok(Arc::new(runtime_checkpoint_turso::TursoSidecar::new(
-                        pool,
-                        source.name().to_string(),
-                    )));
+                    // Through the contract, not a downcast: the Turso engine owns the
+                    // path-keyed pool whose lock serializes this sidecar's DDL, and asking
+                    // it for the sidecar is what keeps this engine from naming that one.
+                    return turso_engine
+                        .sidecar_for_path(&metadata_db_path, &source.name().to_string())
+                        .await;
                 }
             }
 
@@ -4093,22 +4079,18 @@ impl DataAccelerator for CayenneAccelerator {
     }
 }
 
-/// Whether the dataset's `on_schema_change` asks for in-place schema evolution.
+/// Whether the source's `on_schema_change` asks for in-place schema evolution.
 ///
-/// The policy lives on the `Dataset` component, so a non-`Dataset` source (a
-/// view, or DDL) never asks for it.
+/// A source that states no policy (a view, or DDL) never asks for it.
 fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
-    source
-        .as_any()
-        .downcast_ref::<crate::component::dataset::Dataset>()
-        .is_some_and(|dataset| {
-            matches!(
-                dataset.on_schema_change,
-                crate::component::dataset::OnSchemaChange::AppendNewColumns
-                    | crate::component::dataset::OnSchemaChange::SyncAllColumns
-                    | crate::component::dataset::OnSchemaChange::DropAndRecreate
-            )
-        })
+    source.on_schema_change().is_some_and(|on_schema_change| {
+        matches!(
+            on_schema_change,
+            OnSchemaChange::AppendNewColumns
+                | OnSchemaChange::SyncAllColumns
+                | OnSchemaChange::DropAndRecreate
+        )
+    })
 }
 
 /// Force partition child tables to encode serially (one write shard).

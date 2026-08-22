@@ -33,7 +33,7 @@ use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
-use crate::dataaccelerator::{self, BootstrapStatus, resolved_refresh_mode};
+use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -59,6 +59,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
@@ -138,12 +139,10 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
-// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
-// so a crate outside the runtime has to depend on `runtime-datafusion` directly
-// rather than route through here.
-#[cfg(any(feature = "duckdb", test))]
-pub(crate) use runtime_datafusion::dialect;
+// `error` and `refresh_sql` below are named throughout the runtime through these
+// aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
+// the runtime has to depend on `runtime-datafusion` directly rather than route
+// through here.
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
@@ -162,7 +161,6 @@ pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
-pub(crate) mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
@@ -1131,7 +1129,10 @@ impl DataFusion {
         // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
         // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
         // another catalog.
-        sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
+        runtime_execution_plans::sync_table::resolve_table_sync(
+            schema_provider.as_ref(),
+            table_reference.table(),
+        )
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -1830,7 +1831,7 @@ impl DataFusion {
                         total_memory,
                         pool_used,
                         compaction_used,
-                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                        runtime_acceleration::memory_budget::duckdb_total_reservation_bytes(),
                     )
                     .min(ceiling);
                     cayenne::update_global_mem_tier_total(dynamic);

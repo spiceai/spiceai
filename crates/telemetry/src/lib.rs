@@ -26,9 +26,11 @@ pub mod anonymous;
 pub mod exporter;
 pub mod hardware;
 pub mod meter;
+pub mod metrics_reader;
 pub mod noop;
 pub mod reader;
 pub mod timing;
+pub mod tracers;
 
 // As recommended by the OpenTelemetry Semantic Conventions:
 // https://opentelemetry.io/docs/specs/semconv/database/database-metrics/#metric-dbclientresponsereturned_rows
