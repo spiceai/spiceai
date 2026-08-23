@@ -4810,8 +4810,8 @@ mod tests {
     async fn unset_cdc_refresh_mode_keeps_background_compaction() {
         // Keyed by CONNECTOR NAME rather than a raw `from:` value: parsing one is
         // `DatasetSpec::source`'s job, and that the two agree is asserted by
-        // `accelerator_resolves_connector_unset_refresh_mode`, which lives with the
-        // runtime because it needs both sides.
+        // `the_two_routes_to_an_unset_refresh_mode_agree`, which lives with the runtime
+        // because it needs both sides.
         let interval_for = |connector: &str| {
             let mut dataset = TestAccelerationSource::new("ds").with_connector_name(connector);
             dataset.set_acceleration(Acceleration {
