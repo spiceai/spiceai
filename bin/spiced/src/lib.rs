@@ -1087,6 +1087,9 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
+        // Gated like the dependency itself: `accelerator-cayenne` is a
+        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
+        #[cfg(not(windows))]
         accelerator_cayenne::register_cayenne_telemetry();
     }
 

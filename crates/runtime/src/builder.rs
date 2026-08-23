@@ -1524,7 +1524,7 @@ fn cayenne_accelerations(
 /// Reached through the registration slice rather than by naming the engine crate, which
 /// the runtime must not depend on.
 #[cfg(not(windows))]
-fn cayenne_write_profile(
+pub(crate) fn cayenne_write_profile(
     acceleration: &spicepod::acceleration::Acceleration,
     unset_refresh_mode: RefreshMode,
 ) -> Option<data_accelerator_api::SpicepodWriteProfile> {

@@ -110,6 +110,96 @@ mod test {
         assert_eq!(both_agree("postgres:public.orders"), RefreshMode::Full);
     }
 
+    /// Pins what `DataAccelerator::spicepod_write_profile` answers, because the memory and
+    /// compaction budgets are computed from it: a wrong mapping would budget a pod as one
+    /// shape while the table is configured as another, and both sides would still look
+    /// internally consistent.
+    ///
+    /// Two things are asserted, and only the second is load-bearing on its own. The
+    /// pre-init and post-init routes agree — but both feed the *same* classifier, differing
+    /// only in how they recover an unset `refresh_mode` (the builder parses the raw `from:`,
+    /// the accelerator asks the initialized component), so that half re-proves the
+    /// resolution agreement rather than the mapping. The absolute expectations below are
+    /// what catch a wrong mapping. That the classification then reaches the table's actual
+    /// configuration is covered engine-side by
+    /// `unset_cdc_refresh_mode_keeps_background_compaction`.
+    #[tokio::test]
+    async fn the_pre_init_and_post_init_write_profiles_agree() {
+        use crate::component::dataset::acceleration::RefreshMode;
+        use app::AppBuilder;
+        use spicepod::acceleration::RefreshMode as SpicepodRefreshMode;
+
+        let app = Arc::new(AppBuilder::new("write-profile-agreement").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let both_agree = |from: &str, refresh_mode: Option<SpicepodRefreshMode>| {
+            // Pre-init: the Spicepod acceleration, classified through the capability the
+            // builder uses.
+            let spicepod_accel = spicepod::acceleration::Acceleration {
+                engine: Some("cayenne".to_string()),
+                mode: spicepod::acceleration::Mode::File,
+                refresh_mode: refresh_mode.clone(),
+                ..Default::default()
+            };
+            let unset = crate::builder::connector_unset_refresh_mode(from);
+            let pre_init = crate::builder::cayenne_write_profile(&spicepod_accel, unset)
+                .expect("the cayenne engine is linked in this test binary");
+
+            // Post-init: the same pod as an initialized dataset, classified by the engine
+            // the way it configures the table.
+            let mut dataset =
+                crate::component::dataset::builder::DatasetBuilder::try_new(from.to_string(), "ds")
+                    .expect("dataset builder")
+                    .with_app(Arc::clone(&app))
+                    .with_runtime(Arc::clone(&rt))
+                    .build()
+                    .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: refresh_mode.map(RefreshMode::from),
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            let resolved = runtime_acceleration::acceleration_source::resolved_refresh_mode(
+                &dataset,
+                acceleration,
+            );
+            let post_init = accelerator_cayenne::CayenneAccelerator::new()
+                .spicepod_write_profile(&spicepod_accel, resolved)
+                .expect("the cayenne engine classifies its own acceleration");
+
+            assert_eq!(
+                pre_init, post_init,
+                "pre-init and post-init classification of `from: {from}` must agree"
+            );
+            pre_init
+        };
+
+        // An unannotated CDC stream: the connector fills in `changes`, which is the case a
+        // raw-field read would misclassify as a whole-table replace.
+        let cdc = both_agree("debezium:my.topic", None);
+        assert!(
+            cdc.uses_cdc_tier,
+            "an unannotated debezium dataset is a CDC stream"
+        );
+        assert!(
+            cdc.needs_compaction,
+            "a CDC stream accumulates files to consolidate"
+        );
+
+        // A whole-table replace has nothing to consolidate.
+        let full = both_agree("s3://bucket/path", None);
+        assert!(!full.uses_cdc_tier);
+        assert!(!full.needs_compaction);
+
+        // Explicit modes are respected on both sides.
+        let explicit_changes = both_agree("s3://bucket/path", Some(SpicepodRefreshMode::Changes));
+        assert!(explicit_changes.uses_cdc_tier);
+        let _ = both_agree("debezium:my.topic", Some(SpicepodRefreshMode::Full));
+        let _ = both_agree("sink", None);
+    }
+
     #[test]
     fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
         let acceleration_settings = Acceleration {

@@ -3091,6 +3091,16 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
+    fn shared_store_key(
+        &self,
+        acceleration: &runtime_acceleration::acceleration::Acceleration,
+    ) -> Option<String> {
+        // Every Cayenne dataset in one metadata directory shares its SQLite catalog, so
+        // the directory is the identity `validate_snapshot_consistency` groups by. Absent
+        // this, that validation silently passes for every Cayenne dataset.
+        Some(Self::resolve_metadata_dir(Some(acceleration)))
+    }
+
     fn spicepod_write_profile(
         &self,
         acceleration: &spicepod::acceleration::Acceleration,
@@ -6471,6 +6481,73 @@ mod tests {
                 .await
                 .is_disabled(),
             "an unpartitioned dataset keeps in-place evolution"
+        );
+    }
+    /// Datasets sharing one metadata directory share its `SQLite` catalog, so a pod where
+    /// some snapshot and others do not cannot be restored consistently and must be refused
+    /// up front. That check is generic — it groups by
+    /// [`DataAccelerator::shared_store_key`] — so it silently passes for every Cayenne
+    /// dataset if this engine does not answer that question. Regression test for exactly
+    /// that: the validation moved out of `runtime` when the engine did, and an unimplemented
+    /// `shared_store_key` would leave it looking green while checking nothing.
+    #[tokio::test]
+    async fn mixed_snapshot_settings_in_one_metadata_dir_are_refused() {
+        use data_accelerator_api::validate_snapshot_consistency;
+        use runtime_acceleration::snapshot::SnapshotBehavior;
+        use runtime_acceleration::testing::TestAccelerationSource;
+        use spicepod::acceleration::SnapshotsCompaction;
+        use spicepod::component::snapshot::Snapshots;
+        use std::sync::Weak;
+
+        let dir = std::env::temp_dir()
+            .join("spice_cayenne_shared_metastore")
+            .to_string_lossy()
+            .to_string();
+        let acceleration = |snapshots: bool| {
+            let mut acceleration = Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params: [("cayenne_metadata_dir".to_string(), dir.clone())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            // `Disabled` is the default, so the *enabled* side is what has to be built
+            // explicitly — a test that left both at the default would compare nothing.
+            if snapshots {
+                acceleration.snapshot_behavior = SnapshotBehavior::Enabled(
+                    Arc::new(Snapshots::default()),
+                    Weak::new(),
+                    tokio::runtime::Handle::current(),
+                    SnapshotsCompaction::Disabled,
+                );
+            }
+            acceleration
+        };
+
+        // Both sides of the disagreement, in the same directory.
+        let sources: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(
+                TestAccelerationSource::new("snapshotting").with_acceleration(acceleration(true)),
+            ),
+            Arc::new(
+                TestAccelerationSource::new("not_snapshotting")
+                    .with_acceleration(acceleration(false)),
+            ),
+        ];
+        assert!(
+            validate_snapshot_consistency(&sources).is_err(),
+            "a metadata directory with both snapshotting and non-snapshotting datasets must be refused"
+        );
+
+        // Agreeing datasets in the same directory are supported.
+        let agreeing: Vec<Arc<dyn AccelerationSource>> = vec![
+            Arc::new(TestAccelerationSource::new("a").with_acceleration(acceleration(true))),
+            Arc::new(TestAccelerationSource::new("b").with_acceleration(acceleration(true))),
+        ];
+        assert!(
+            validate_snapshot_consistency(&agreeing).is_ok(),
+            "datasets that agree may share a metadata directory"
         );
     }
 }
