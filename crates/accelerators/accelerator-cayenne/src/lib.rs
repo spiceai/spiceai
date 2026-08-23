@@ -3106,6 +3106,18 @@ impl DataAccelerator for CayenneAccelerator {
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
+        // The contract is `None` unless the acceleration names this engine. The runtime
+        // enumerates Cayenne accelerations before asking, so this is the implementation
+        // holding up its own end: another consumer would otherwise get a confident
+        // Cayenne classification for a DuckDB or Arrow acceleration.
+        if !acceleration
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+        {
+            return None;
+        }
+
         let profile = RefreshWriteProfile::from_spicepod(acceleration, unset_refresh_mode);
         Some(data_accelerator_api::SpicepodWriteProfile {
             uses_cdc_tier: profile.uses_cdc_tier(),
@@ -4757,6 +4769,43 @@ mod tests {
         assert!(dims.contains(&1536));
     }
 
+    /// The write profile is the engine's answer about its *own* acceleration, so an
+    /// acceleration naming another engine must get `None` rather than a Cayenne
+    /// classification. The runtime filters by engine before asking, so only this test
+    /// stands between a second consumer and a silently wrong budget.
+    #[test]
+    fn the_write_profile_is_answered_only_for_a_cayenne_acceleration() {
+        let accelerator = CayenneAccelerator::new();
+        let named = |engine: Option<&str>| spicepod::acceleration::Acceleration {
+            engine: engine.map(ToString::to_string),
+            mode: spicepod::acceleration::Mode::File,
+            ..Default::default()
+        };
+
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(Some("cayenne")), RefreshMode::Full)
+                .is_some(),
+            "the engine must classify its own acceleration"
+        );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(Some("CAYENNE")), RefreshMode::Full)
+                .is_some(),
+            "the engine name is matched the way the runtime matches it: case-insensitively"
+        );
+
+        // `None` is the default Arrow engine, not an unspecified Cayenne one.
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+            assert!(
+                accelerator
+                    .spicepod_write_profile(&named(other), RefreshMode::Full)
+                    .is_none(),
+                "engine {other:?} is not Cayenne, so this engine must not classify it"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unset_cdc_refresh_mode_keeps_background_compaction() {
         // Keyed by CONNECTOR NAME rather than a raw `from:` value: parsing one is
@@ -5406,11 +5455,83 @@ mod tests {
         }
     }
 
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLogs {
+    thread_local! {
+        static CAPTURE_SINK: std::cell::RefCell<Option<CapturedLogs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writer that routes each event to the buffer registered for the emitting thread,
+    /// and discards events from threads that registered none.
+    #[derive(Clone, Default)]
+    struct ThreadCapture;
+
+    impl std::io::Write for ThreadCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURE_SINK.with(|sink| {
+                if let Some(logs) = sink.borrow().as_ref() {
+                    logs.0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for ThreadCapture {
         type Writer = Self;
 
         fn make_writer(&self) -> Self::Writer {
-            self.clone()
+            Self
+        }
+    }
+
+    /// Captures this thread's log lines until the guard drops.
+    ///
+    /// The subscriber is installed **globally**, once per test binary, rather than
+    /// scoped to the calling thread with `tracing::subscriber::set_default`. A scoped
+    /// subscriber cannot observe a callsite that other threads also reach: `tracing`
+    /// caches each callsite's interest process-wide, so whichever thread evaluates it
+    /// first decides for every thread — and a sibling test reaching it without a
+    /// subscriber caches it as "never", after which the event is dropped before any
+    /// subscriber sees it. That is invisible under `nextest` (one process per test) and
+    /// when the test runs alone, and shows up as a zero count under a parallel
+    /// `cargo test`. Installing globally keeps every callsite enabled; the thread-local
+    /// sink is what keeps concurrent tests from reading each other's lines.
+    fn capture_logs() -> CaptureGuard {
+        static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(ThreadCapture)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            )
+            .expect("no other global subscriber is installed in this test binary");
+        });
+
+        let logs = CapturedLogs::default();
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(logs.clone()));
+        CaptureGuard(logs)
+    }
+
+    struct CaptureGuard(CapturedLogs);
+
+    impl CaptureGuard {
+        fn occurrences_of(&self, needle: &str) -> usize {
+            self.0.occurrences_of(needle)
+        }
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
         }
     }
 
@@ -5540,17 +5661,10 @@ mod tests {
             dataset
         };
 
-        // Capture only the emits below: `#[tokio::test]` runs the whole test body on
-        // one thread, and `set_default` installs the subscriber on that thread only,
-        // so concurrent tests cannot contribute to the count.
-        let captured = CapturedLogs::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(captured.clone())
-                .with_ansi(false)
-                .with_max_level(tracing::Level::INFO)
-                .finish(),
-        );
+        // Capture only the emits below: `#[tokio::test]` runs the whole test body on one
+        // thread, and the sink is registered for that thread alone, so concurrent tests
+        // cannot contribute to the count.
+        let captured = capture_logs();
 
         let dataset = build(misconfigured());
         for _ in 0..3 {
