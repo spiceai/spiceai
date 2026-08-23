@@ -123,6 +123,7 @@ mod test {
     /// what catch a wrong mapping. That the classification then reaches the table's actual
     /// configuration is covered engine-side by
     /// `unset_cdc_refresh_mode_keeps_background_compaction`.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn the_pre_init_and_post_init_write_profiles_agree() {
         use crate::component::dataset::acceleration::RefreshMode;

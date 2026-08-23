@@ -43,6 +43,7 @@ limitations under the License.
 //! coordination. There is no config knob — coordination is always on and always
 //! warns when it engages.
 
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Share (%) of the splittable query region handed to the query pool when it is
@@ -137,6 +138,21 @@ static CAYENNE_FOOTER_CACHE_MB: AtomicU64 = AtomicU64::new(CAYENNE_FOOTER_CACHE_
 pub fn publish_cayenne_footer_cache_mb(footer_cache_mb: Option<usize>) {
     let value = footer_cache_mb.map_or(CAYENNE_FOOTER_CACHE_UNSET, |mb| mb as u64);
     CAYENNE_FOOTER_CACHE_MB.store(value, Ordering::Relaxed);
+}
+
+/// Serializes publishing the setting above with constructing the engines that read it.
+///
+/// The value is process-global because a registration constructor takes no arguments,
+/// while the registry it fills is per-`Runtime`. Two `Runtime`s built concurrently in one
+/// process — embedded hosts, and any test binary that builds more than one — could
+/// otherwise both publish before either constructs, leaving one runtime's engine holding
+/// the other's setting. Holding this across the registration pass makes the pair behave as
+/// if the setting were per-`Runtime`: a constructed engine owns its own copy, so a later
+/// publish cannot reach it.
+#[must_use]
+pub fn engine_construction_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &LOCK
 }
 
 /// The published `cayenne_footer_cache_mb`, or `None` when the operator set none.

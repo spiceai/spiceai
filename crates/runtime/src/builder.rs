@@ -345,6 +345,14 @@ impl RuntimeBuilder {
         // registration constructor, which takes no arguments: a setting resolved from the
         // Spicepod can only reach it this way. Registering a configured engine afterwards
         // instead would mean naming the concrete accelerator from here.
+        //
+        // The publish and the registration pass are one operation: the published value is
+        // process-global while the registry it fills belongs to this `Runtime`, so two
+        // concurrent builds must not interleave between them. The guard is dropped as soon
+        // as the engines exist, each holding its own copy of the setting.
+        let engine_construction = runtime_acceleration::memory_budget::engine_construction_lock()
+            .lock()
+            .await;
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         #[cfg(not(windows))]
@@ -353,6 +361,7 @@ impl RuntimeBuilder {
         );
 
         self.accelerator_engine_registry.register_all().await;
+        drop(engine_construction);
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
         document_parse::register_all().await;

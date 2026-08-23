@@ -78,6 +78,7 @@ mod acceleration;
 mod adbc;
 mod cache;
 mod catalog;
+#[cfg(not(windows))]
 mod cayenne;
 #[cfg(not(windows))]
 mod cayenne_catalog_ddl;
