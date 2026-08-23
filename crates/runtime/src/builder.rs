@@ -65,7 +65,7 @@ const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 /// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
 /// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `dataaccelerator::cayenne`). `cayenne_goal_qph`
+/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
 /// is the exception: QPH is a system-wide metric (a join spans datasets), so it
 /// is global-only and a per-dataset value is ignored. Declared here so the keys
 /// are part of the recognized `runtime.params` vocabulary and don't false-warn as
@@ -1296,7 +1296,7 @@ pub fn streams_cdc_changes(app: Option<&Arc<app::App>>) -> bool {
 /// [`cayenne_accelerations`]).
 ///
 /// Each acceleration is classified by `DataAccelerator::spicepod_write_profile` — the
-/// same mapping `dataaccelerator::cayenne` uses to configure the table — so the
+/// same mapping `accelerator_cayenne` uses to configure the table — so the
 /// budget can never disagree with the tables it is budgeting for.
 ///
 /// This enumerates component kinds by hand because it runs *before* initialization,
@@ -1317,8 +1317,8 @@ fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
     })
 }
 
-/// Cayenne is not compiled on Windows (`dataaccelerator::cayenne` is gated on
-/// `cfg(not(windows))`), so no acceleration there can demand anything of the host.
+/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
+/// dependency), so no acceleration there can demand anything of the host.
 #[cfg(windows)]
 fn cayenne_workload(_app: Option<&Arc<app::App>>) -> CayenneWorkload {
     CayenneWorkload::default()
@@ -1549,7 +1549,7 @@ pub(crate) fn cayenne_write_profile(
 /// `DataFusion` query pool. Each uses the explicit per-table param (matching the
 /// accelerator's key lists, incl. `cayenne_`-prefixed aliases) when set, else the
 /// accelerator's auto-derived cap (mirroring
-/// `dataaccelerator::cayenne::autotune::HardwareProfile` — keep the fractions in
+/// the Cayenne engine's `autotune::HardwareProfile` — keep the fractions in
 /// sync).
 ///
 /// Two tiers of consumer, because they scale differently:
@@ -1660,7 +1660,7 @@ fn estimate_cayenne_reservation_bytes(
             |mb| mb.saturating_mul(MIB),
         );
         // Inline memtable is byte-valued; match the accelerator's key list including
-        // the `cayenne_`-prefixed aliases (see dataaccelerator::cayenne mod.rs).
+        // the `cayenne_`-prefixed aliases (see the `accelerator-cayenne` crate).
         let inline = parse_u64(
             &params,
             &[
@@ -1698,8 +1698,8 @@ fn estimate_cayenne_reservation_bytes(
     total
 }
 
-/// Cayenne is not compiled on Windows (`dataaccelerator::cayenne` is gated on
-/// `cfg(not(windows))`), so nothing there holds an off-pool Cayenne cache.
+/// Cayenne is not compiled on Windows (`accelerator-cayenne` is a `cfg(not(windows))`
+/// dependency), so nothing there holds an off-pool Cayenne cache.
 #[cfg(windows)]
 fn estimate_cayenne_reservation_bytes(
     _app: Option<&Arc<app::App>>,

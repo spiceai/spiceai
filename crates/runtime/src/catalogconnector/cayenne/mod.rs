@@ -257,24 +257,31 @@ impl CayenneCatalogConnector {
             .iter()
             .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
             .map(|registration| (registration.constructor)());
-        let outcome = match tuning {
-            Some(engine) => {
-                engine
-                    .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
-                    .await
+        let outcome = if let Some(engine) = tuning {
+            engine
+                .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
+                .await
+        } else {
+            // This catalog builds its provider from the `cayenne` library, so it works in a
+            // binary that links no Cayenne *accelerator* — but only the engine can seed the
+            // controller, so `adaptive` cannot be honoured here. Say so rather than quietly
+            // serving a statically-tuned catalog, which is the same configuration an
+            // operator would get by asking for `auto`.
+            //
+            // The engine owns the `tuning` vocabulary; the two names are recognized here
+            // only to decide which warning a build that cannot ask should emit, so that a
+            // typo is still reported rather than passing as a valid mode.
+            let value = raw_tuning.map(str::trim).unwrap_or_default();
+            if value.eq_ignore_ascii_case("adaptive") {
+                tracing::warn!(
+                    "Cayenne catalog parameter `tuning` is 'adaptive', but this build links no Cayenne accelerator to size the controller, so the catalog runs with static tuning ('auto') instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
+                );
             }
-            None => {
-                // This catalog builds its provider from the `cayenne` library, so it works
-                // in a binary that links no Cayenne *accelerator* — but only the engine can
-                // seed the controller, so `adaptive` cannot be honoured here. Say so rather
-                // than quietly serving a statically-tuned catalog, which is the same
-                // configuration an operator would get by asking for `auto`.
-                if raw_tuning.is_some_and(|value| value.trim().eq_ignore_ascii_case("adaptive")) {
-                    tracing::warn!(
-                        "Cayenne catalog parameter `tuning` is 'adaptive', but this build links no Cayenne accelerator to size the controller, so the catalog runs with static tuning ('auto') instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
-                    );
-                }
-                data_accelerator_api::AdaptiveTuningOutcome::default()
+            data_accelerator_api::AdaptiveTuningOutcome {
+                tuning_value_invalid: !value.is_empty()
+                    && !value.eq_ignore_ascii_case("auto")
+                    && !value.eq_ignore_ascii_case("adaptive"),
+                seeds: None,
             }
         };
 
