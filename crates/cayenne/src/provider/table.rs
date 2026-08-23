@@ -34016,7 +34016,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Each drift bound must be able to force a rebuild on its own.
     ///
     /// They describe unrelated drift: a work-queue table churns its key set without
@@ -34069,6 +34068,7 @@ mod tests {
         assert!(!preserve(1, 0, 10_000));
     }
 
+    #[test]
     fn statistics_to_inexact_downgrades_exact_values_for_mutable_overlays() {
         let stats = Statistics {
             num_rows: datafusion_common::stats::Precision::Exact(3),
