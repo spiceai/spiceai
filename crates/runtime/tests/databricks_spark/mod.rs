@@ -27,6 +27,36 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
 
+/// `runtime/spark` gates the Spark Connect suites below, but `mode: spark_connect` is
+/// implemented in `connector-databricks` behind that crate's own `spark` feature. If the two
+/// drift apart, the suites still compile while the connector rejects every Spark Connect
+/// dataset with `InvalidMode`, and only a run with live Databricks credentials would notice.
+///
+/// This check needs none: it asserts the mode is advertised, and naming a
+/// `connector-databricks/spark`-only variant turns the drift into a compile error.
+#[test]
+fn databricks_advertises_the_spark_connect_mode_it_implements() {
+    let advertises_spark_connect = connector_databricks::factory()
+        .parameters()
+        .iter()
+        .find(|spec| spec.name == "mode")
+        .and_then(|spec| spec.one_of)
+        .is_some_and(|modes| modes.contains(&"spark_connect"));
+
+    assert!(
+        advertises_spark_connect,
+        "the databricks connector must advertise `spark_connect` among its `mode` values"
+    );
+
+    // Compiles only while `connector-databricks/spark` is enabled alongside `runtime/spark`.
+    let _implemented: fn(connector_databricks::Error) -> bool = |err| {
+        matches!(
+            err,
+            connector_databricks::Error::UnableToConstructDatabricksSpark { .. }
+        )
+    };
+}
+
 fn make_catalog(path: &str, name: &str) -> Catalog {
     let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());
     catalog.params = Some(get_params());
