@@ -154,6 +154,10 @@ loom = { workspace = true }
 
 [[bench]]
 harness = false
+name = "pk_rebuild_row_loop"
+
+[[bench]]
+harness = false
 name = "pk_index_rebuild_breakdown"
 
 [[bench]]

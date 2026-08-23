@@ -69,7 +69,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::row::{RowConverter, SortField};
+use cayenne::row_converter::{RowConverter, SortField};
+use hash_index::hash_key_128;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -204,17 +205,12 @@ impl Filter {
     }
 }
 
+/// The SHIPPED digest — `pk_digest` is `hash_key_128` over the encoded row bytes,
+/// and `hash_index` is a normal dependency, so the bench measures the real function
+/// rather than a stand-in whose cost is its own artifact.
 #[inline]
 fn digest(bytes: &[u8]) -> u64 {
-    // Stand-in for `pk_digest`'s XXH3 over the same encoded bytes.
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for chunk in bytes.chunks(8) {
-        let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        h ^= u64::from_le_bytes(buf);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    hash_key_128(bytes) as u64
 }
 
 /// What each stage of the pipeline does with a scanned batch.

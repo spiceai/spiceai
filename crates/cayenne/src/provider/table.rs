@@ -8482,25 +8482,77 @@ impl CayenneTableProvider {
         *SETTING
     }
 
-    /// Whether this relocation-only invalidation may leave the sharded index alone:
-    /// the experiment is on, the index is (or was checked out as) a bloom, and it has
-    /// not accrued more stale keys than the configured fraction allows.
+    /// Minimum bloom load, in bits per inserted key, below which a relocation-only
+    /// invalidation is allowed through so the rebuild can re-size the filter.
+    ///
+    /// The companion to the staleness ceiling, and it only became meaningful once the
+    /// degrade paths size from live cardinality: a rebuild re-inserts the same
+    /// surviving keys, so before that change it could not relieve a filter that was
+    /// merely full. Now it re-sizes for the table as it currently is, which is the
+    /// only thing that recovers a filter a growing table has diluted.
+    ///
+    /// Unset leaves growth unbounded (the previous behaviour). `PkBloom` targets ~10
+    /// bits/key, so a floor near half that is roughly "twice the design
+    /// false-positive rate, and no worse".
+    fn preserve_bloom_min_bits_per_key() -> Option<u64> {
+        static SETTING: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
+            std::env::var("SPICE_CAYENNE_BLOOM_MIN_BITS_PER_KEY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        });
+        *SETTING
+    }
+
+    /// Whether this relocation-only invalidation may leave the sharded index alone.
     fn may_preserve_sharded_bloom(&self) -> bool {
-        let Some(ceiling_permille) = Self::preserve_bloom_max_stale_permille() else {
-            return false;
-        };
         if !self.sharded_index_is_bloom.load(Ordering::Acquire) {
             return false;
         }
-        let stale = self.sharded_bloom_stale_keys.load(Ordering::Relaxed);
-        if stale == 0 {
-            // Nothing has been removed, so the preserved filter and a rebuilt one
-            // describe the same key set: rebuilding buys exactly nothing.
+        Self::should_preserve_bloom(
+            self.sharded_bloom_stale_keys.load(Ordering::Relaxed),
+            self.sharded_bloom_inserted_keys.load(Ordering::Acquire),
+            self.sharded_bloom_load_milli.load(Ordering::Acquire),
+            Self::preserve_bloom_max_stale_permille(),
+            Self::preserve_bloom_min_bits_per_key(),
+        )
+    }
+
+    /// The preserve decision, as a pure function of the two drift signals and their
+    /// bounds, so each bound can be tested for firing independently.
+    ///
+    /// The two describe unrelated drift and neither subsumes the other. STALENESS is
+    /// keys the table no longer has, which only a rebuild's live-key scan reclaims —
+    /// a work-queue table churns its key set and accrues this without growing. LOAD
+    /// is bits per key, which only ever falls as the table GROWS and which a rebuild
+    /// now fixes by re-sizing. A grow-only table never trips the first and eventually
+    /// trips the second; a steady-size queue does the reverse. So the invalidation is
+    /// allowed through when EITHER bound is exceeded.
+    fn should_preserve_bloom(
+        stale_keys: u64,
+        held_keys: u64,
+        load_milli: u64,
+        max_stale_permille: Option<u64>,
+        min_bits_per_key: Option<u64>,
+    ) -> bool {
+        // Unset disables preserving outright — today's always-drop behaviour.
+        let Some(ceiling_permille) = max_stale_permille else {
+            return false;
+        };
+        // Diluted past the floor: let the invalidation through so the rebuild
+        // re-sizes. `u64::MAX` is "never sampled", which is not evidence of dilution.
+        if let Some(floor) = min_bits_per_key
+            && load_milli != u64::MAX
+            && load_milli < floor.saturating_mul(1000)
+        {
+            return false;
+        }
+        if stale_keys == 0 {
+            // Nothing removed, so a rebuilt filter would describe the same key set:
+            // rebuilding buys nothing for an O(live-rows) scan on the apply thread.
             return true;
         }
-        let held = self.sharded_bloom_inserted_keys.load(Ordering::Acquire);
         // No key count sampled yet: refuse rather than preserve on no evidence.
-        held > 0 && stale.saturating_mul(1000) / held <= ceiling_permille
+        held_keys > 0 && stale_keys.saturating_mul(1000) / held_keys <= ceiling_permille
     }
 
     /// Sample the sharded index's representation and bloom load for the invalidation
@@ -33914,6 +33966,58 @@ mod tests {
     }
 
     #[test]
+    /// Each drift bound must be able to force a rebuild on its own.
+    ///
+    /// They describe unrelated drift: a work-queue table churns its key set without
+    /// growing (staleness, never load), and a grow-only table dilutes its filter
+    /// without ever removing a key (load, never staleness). A policy keyed on only
+    /// one leaves the other unbounded — which for `order_line`, whose key set only
+    /// grows, would mean a filter that degrades forever.
+    #[test]
+    fn either_drift_bound_alone_forces_a_rebuild() {
+        const NEVER_SAMPLED: u64 = u64::MAX;
+        let preserve = |stale, held, load| {
+            CayenneTableProvider::should_preserve_bloom(stale, held, load, Some(200), Some(5))
+        };
+
+        // Clean and well-loaded: rebuilding would re-insert the same keys into a
+        // filter that is already the right size.
+        assert!(preserve(0, 1_000_000, 10_000));
+
+        // Work-queue drift: a quarter of the keys are gone, past the 200-permille
+        // ceiling, while the filter is still amply sized.
+        assert!(
+            !preserve(250_000, 1_000_000, 10_000),
+            "staleness alone must force a rebuild"
+        );
+        assert!(
+            preserve(150_000, 1_000_000, 10_000),
+            "and must not fire below the ceiling"
+        );
+
+        // Growth drift: nothing removed, but the filter has been diluted below the
+        // 5 bits/key floor.
+        assert!(
+            !preserve(0, 1_000_000, 4_500),
+            "load alone must force a rebuild"
+        );
+        assert!(
+            preserve(0, 1_000_000, 5_000),
+            "and must not fire at exactly the floor"
+        );
+
+        // Never sampled is not evidence of dilution.
+        assert!(preserve(0, 1_000_000, NEVER_SAMPLED));
+
+        // Unset ceiling disables preserving entirely, whatever the signals say.
+        assert!(!CayenneTableProvider::should_preserve_bloom(
+            0, 1_000_000, 10_000, None, Some(5)
+        ));
+
+        // A stale count with no key count is no evidence: refuse.
+        assert!(!preserve(1, 0, 10_000));
+    }
+
     fn statistics_to_inexact_downgrades_exact_values_for_mutable_overlays() {
         let stats = Statistics {
             num_rows: datafusion_common::stats::Precision::Exact(3),
