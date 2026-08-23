@@ -21,8 +21,9 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeleteWriteBackMarkers, InlinedData,
+    InlinedDataStats, InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics,
+    TableMetadata, TableStatistics,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -313,12 +314,18 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Atomically commit deletion-vector rows and an inline-data rewrite for
     /// one logical delete. A failure leaves both catalog areas unchanged.
+    ///
+    /// `write_back_markers` carries the durable write-back delete markers for the
+    /// same delete, when the table has durable write-back enabled. They are
+    /// written inside this transaction so the accelerator cannot end up holding a
+    /// delete the federated source will never be told about.
     async fn commit_delete_files_with_inlined_rewrite(
         &self,
         delete_files: Vec<DeleteFile>,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        write_back_markers: Option<DeleteWriteBackMarkers>,
     ) -> CatalogResult<()>;
 
     /// Get all active delete files for a table (across all virtual files).

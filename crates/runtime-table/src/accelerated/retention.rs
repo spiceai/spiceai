@@ -121,7 +121,16 @@ pub(crate) async fn apply_retention_filters_once(
     }
 
     let raw_accelerator = strip_index_wrapper_layers(accelerator);
-    let plan = match raw_accelerator.delete_from(&ctx.state(), vec![expr]).await {
+    // Declare this delete as retention rather than letting it arrive as an
+    // anonymous `delete_from`: retention evicts rows from the accelerator and
+    // makes no claim about the federated source, so a durable-write-back table
+    // must not deliver these as source deletes. Only Cayenne distinguishes the
+    // two; every other accelerator takes the generic path unchanged.
+    let plan_result = match raw_accelerator.downcast_ref::<cayenne::CayenneTableProvider>() {
+        Some(cayenne) => cayenne.delete_for_retention(vec![expr]).await,
+        None => raw_accelerator.delete_from(&ctx.state(), vec![expr]).await,
+    };
+    let plan = match plan_result {
         Ok(plan) => plan,
         Err(e) => {
             tracing::error!("[retention] Error running retention check: {e}");

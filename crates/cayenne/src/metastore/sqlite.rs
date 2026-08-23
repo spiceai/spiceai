@@ -709,6 +709,13 @@ impl SqliteMetastore {
     /// no-ops. `first_marked_at` is the oldest-undelivered timestamp (lag metric)
     /// and is never overwritten on re-mark.
     ///
+    /// `op` records which operation dirtied the key — `0` upsert, `1` delete
+    /// ([`crate::WriteBackOp`]) — so delivery acts on the committed intent
+    /// instead of inferring a delete from a key's absence in the accelerator.
+    /// It moves with `sequence_number`: a re-mark keeps the op of the winning
+    /// (highest-sequence) commit. Legacy rows default to `0`, which is what they
+    /// were: before this column every marker came from an upsert commit.
+    ///
     /// Unlike `cayenne_insert_record`, this table is **never** cleared at
     /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
     /// `drop_table` deletes its rows explicitly.
@@ -718,6 +725,7 @@ impl SqliteMetastore {
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            op INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (table_id, pk_bytes)
         ) WITHOUT ROWID
     ";
@@ -1089,6 +1097,17 @@ impl MetastoreBackend for SqliteMetastore {
                 // last to match CREATE TABLE and EXPECTED_TABLES column order.
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
+                    [],
+                );
+
+                // Which operation dirtied a write-back marker (see
+                // PENDING_WRITE_BACK_TABLE_DDL). The DEFAULT 0 the ALTER applies
+                // to legacy rows is correct rather than merely safe: before this
+                // column only upsert commits marked keys. Forward- and
+                // downgrade-safe (an older binary ignores the extra column).
+                // Appended last to match CREATE TABLE and EXPECTED_TABLES.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_pending_write_back ADD COLUMN op INTEGER NOT NULL DEFAULT 0",
                     [],
                 );
 
@@ -2687,6 +2706,79 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    /// A catalog written before the marker `op` column gains it, and its existing
+    /// markers read back as upserts — which is what they are: before the column
+    /// only upsert commits marked keys, so defaulting them to `delete` would make
+    /// the next delivery pass delete live source rows.
+    #[tokio::test]
+    async fn test_pending_write_back_op_column_migrates_legacy_markers_to_upsert() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("baseline init schema");
+
+        // Downgrade just this table to its pre-`op` shape and seed a marker, the
+        // way an older deployment's catalog would look.
+        let table_id = uuid::Uuid::now_v7().to_string();
+        metastore
+            .execute_batch(
+                "DROP TABLE cayenne_pending_write_back; \
+                 CREATE TABLE cayenne_pending_write_back (\
+                    table_id BLOB NOT NULL, pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
+                    first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), \
+                    PRIMARY KEY (table_id, pk_bytes)) WITHOUT ROWID;",
+            )
+            .await
+            .expect("downgrade cayenne_pending_write_back to its pre-op schema");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO cayenne_pending_write_back (table_id, pk_bytes, sequence_number) \
+                      VALUES (?1, x'0a', 7)",
+                params: vec![MetastoreValue::Blob(
+                    crate::metastore::table_id_to_key_bytes(&table_id),
+                )],
+            })
+            .await
+            .expect("seed a legacy marker");
+        assert_eq!(
+            table_columns(&metastore, "cayenne_pending_write_back").await,
+            vec!["table_id", "pk_bytes", "sequence_number", "first_marked_at"],
+            "precondition: the legacy table has no op column"
+        );
+
+        metastore.init_schema().await.expect("init schema migrates");
+
+        // `op` is appended last, matching the DDL and EXPECTED_TABLES order that
+        // `validate_existing_schema` compares against.
+        assert_eq!(
+            table_columns(&metastore, "cayenne_pending_write_back").await,
+            vec![
+                "table_id",
+                "pk_bytes",
+                "sequence_number",
+                "first_marked_at",
+                "op"
+            ],
+            "the migrated table must carry op as its last column"
+        );
+
+        let ops: Vec<i64> = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT op FROM cayenne_pending_write_back",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read the migrated marker");
+        assert_eq!(
+            ops,
+            vec![crate::metadata::WriteBackOp::Upsert.as_i64()],
+            "a marker written before the op column must read back as an upsert"
+        );
     }
 
     async fn read_user_version(metastore: &SqliteMetastore) -> i64 {
