@@ -405,11 +405,12 @@ pub(crate) fn per_file_bake_concurrency() -> Option<usize> {
 /// Experiment pin for how many of the newest protected snapshots the bake leaves
 /// unbaked (`K`, default [`crate::provider::table::BAKE_KEEP_RECENT_SNAPSHOTS`]).
 ///
-/// `K` is a TUNING parameter, not a correctness one: soundness rests on
+/// `K` cannot resurrect a row: soundness against resurrection rests on
 /// `bake_clean_prefix_holds`, which re-validates the prune against whatever prefix
-/// was selected, so lowering `K` can only make that gate decline — never resurrect
-/// a row. What `K` buys is a settled cutoff: the newest snapshots are still taking
-/// the live delete stream, so baking them rewrites rows about to be superseded.
+/// was selected, so lowering `K` can only make that gate decline. It can still lose
+/// one, which is why `parse_bake_keep_recent` refuses `K = 0`. Above that floor `K`
+/// buys a settled cutoff: the newest snapshots are still taking the live delete
+/// stream, so baking them rewrites rows about to be superseded.
 ///
 /// Worth measuring because `K` bounds the deletion index's floor. The index retains
 /// every tombstone above `T`, and `T` stops at the snapshot older than this tail, so
@@ -421,10 +422,28 @@ pub(crate) fn per_file_bake_concurrency() -> Option<usize> {
 /// time — measured at 69-96% of pass bytes — so excluding the K newest (small)
 /// snapshots leaves the dominant cost untouched.
 static PINNED_BAKE_KEEP_RECENT: LazyLock<Option<usize>> = LazyLock::new(|| {
-    // Accepts 0 (bake every protected snapshot), so this cannot reuse the
-    // positive-only pin parser.
     let raw = std::env::var("SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT").ok()?;
+    parse_bake_keep_recent(&raw)
+});
+
+/// Parse the keep-recent pin, rejecting the values that are not safe to run.
+///
+/// `K = 0` is refused rather than clamped: on the memory-durability path it
+/// loses committed rows. With every protected snapshot eligible, a pass can
+/// retire the snapshot that is still the only record of rows not yet durable,
+/// and a restart then cannot recover them —
+/// `prop_sequential_memory_impl_sqlite` reproduces it at seed 7, reporting
+/// `missing(loss)` with an empty `extra(resurrect)`. `K >= 1` passes the same
+/// suite. So the newest-snapshot tail is a durability guard first; whatever it
+/// does to the deletion-index floor is secondary.
+fn parse_bake_keep_recent(raw: &str) -> Option<usize> {
     match raw.trim().parse::<usize>() {
+        Ok(0) => {
+            tracing::warn!(
+                "Ignoring `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT=0`: baking every protected snapshot loses rows that are not yet durable, so the accelerated table would return fewer rows than the source after a restart. Pin 1 or above."
+            );
+            None
+        }
         Ok(keep) => {
             tracing::info!(
                 "Cayenne is pinning `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT` to {keep}; the bake will leave {keep} newest protected snapshot(s) unbaked."
@@ -433,12 +452,12 @@ static PINNED_BAKE_KEEP_RECENT: LazyLock<Option<usize>> = LazyLock::new(|| {
         }
         Err(_) => {
             tracing::warn!(
-                "Ignoring `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT={raw}`: expected a whole number (0 or above)."
+                "Ignoring `SPICE_CAYENNE_PIN_BAKE_KEEP_RECENT={raw}`: expected a whole number of 1 or above."
             );
             None
         }
     }
-});
+}
 
 /// How many newest protected snapshots the bake leaves unbaked.
 #[must_use]
@@ -1316,6 +1335,22 @@ impl Drop for BackgroundColdTierPromoter {
 mod tests {
     use super::*;
 
+    /// `K = 0` is refused, not clamped. It is reachable only through the
+    /// experiment pin, and it loses committed rows on the memory-durability path
+    /// (`prop_sequential_memory_impl_sqlite`, seed 7, reports `missing(loss)`
+    /// with no `extra(resurrect)`), so a run that asked for it must fall back to
+    /// the shipped default rather than quietly run an unsound bake.
+    #[test]
+    fn bake_keep_recent_pin_refuses_the_value_that_loses_rows() {
+        assert_eq!(parse_bake_keep_recent("0"), None, "K=0 must be refused");
+        assert_eq!(parse_bake_keep_recent("1"), Some(1));
+        assert_eq!(parse_bake_keep_recent("3"), Some(3));
+        assert_eq!(parse_bake_keep_recent(" 2 "), Some(2), "trims whitespace");
+        assert_eq!(parse_bake_keep_recent("-1"), None, "not a whole number");
+        assert_eq!(parse_bake_keep_recent("two"), None, "not a number");
+        assert_eq!(parse_bake_keep_recent(""), None, "empty is not a number");
+    }
+
     fn entries(sizes: &[u64]) -> Vec<FileEntry<String>> {
         sizes
             .iter()
@@ -1779,8 +1814,16 @@ mod tests {
         // A 512 MiB target gives unit = max(512/16, 16) MiB = 32 MiB.
         const TARGET: usize = 512 * 1024 * 1024;
         const MIB: u64 = 1024 * 1024;
-        assert_eq!(estimated_output_files(0, TARGET), 1, "an empty write still writes one file");
-        assert_eq!(estimated_output_files(20 * MIB, TARGET), 1, "under one unit");
+        assert_eq!(
+            estimated_output_files(0, TARGET),
+            1,
+            "an empty write still writes one file"
+        );
+        assert_eq!(
+            estimated_output_files(20 * MIB, TARGET),
+            1,
+            "under one unit"
+        );
         assert_eq!(estimated_output_files(32 * MIB, TARGET), 1);
         assert_eq!(estimated_output_files(64 * MIB, TARGET), 2);
         assert_eq!(estimated_output_files(320 * MIB, TARGET), 10);
