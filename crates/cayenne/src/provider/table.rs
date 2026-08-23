@@ -61,7 +61,7 @@ use super::pk_index::{
     ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
     PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
     approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
-    serialize_pk_bloom_sidecar, shard_of_pk,
+    pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -78,6 +78,7 @@ use crate::provider::sink::CayenneDataSink;
 use crate::provider::{Error, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
+use arrow::buffer::NullBuffer;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
@@ -3198,6 +3199,14 @@ impl std::fmt::Debug for CayenneTableProvider {
             .finish_non_exhaustive()
     }
 }
+
+/// Batches the PK-index rebuild reads ahead of its row loop.
+///
+/// Two is enough to keep the scan busy while a batch encodes without materially
+/// raising peak memory: a third buffered batch buys nothing once the producer and
+/// consumer are already overlapped, and the rebuild already runs alongside a CDC
+/// apply that wants the headroom.
+const PK_REBUILD_PREFETCH_BATCHES: usize = 2;
 
 impl CayenneTableProvider {
     pub(crate) fn metadata_catalog(&self) -> &Arc<dyn MetadataCatalog> {
@@ -8452,6 +8461,67 @@ impl CayenneTableProvider {
         true
     }
 
+    /// Run `stream` on its own task, buffering up to `PK_REBUILD_PREFETCH_BATCHES`
+    /// batches ahead of the consumer.
+    ///
+    /// The rebuild's row loop is CPU-bound (row encoding, hashing, map inserts) and
+    /// sits between two polls of a scan that is I/O-bound (Vortex reads, and on the
+    /// cold tier object-store round trips). Consumed inline, the two strictly
+    /// alternate — the scan idles while rows encode and the loop idles while the next
+    /// batch is fetched. A bounded channel overlaps them without unbounding memory:
+    /// the producer parks once the buffer is full, so the scan can never outrun the
+    /// loop by more than the buffer.
+    fn prefetch_batches(mut stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        let (tx, rx) = tokio::sync::mpsc::channel(PK_REBUILD_PREFETCH_BATCHES);
+        tokio::spawn(async move {
+            while let Some(batch) = stream.next().await {
+                // A closed receiver means the consumer stopped early (an error, or a
+                // dropped rebuild); stop pulling rather than filling a dead channel.
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|batch| (batch, rx))
+            }),
+        ))
+    }
+
+    /// Combined validity of the primary-key columns for one batch: `None` when no
+    /// column carries nulls, so the caller can skip its row loop entirely.
+    ///
+    /// One bitwise AND over the batch, versus one virtual `is_null` per column per
+    /// row. `NullBuffer::union` combines validity, so a row is valid only where it is
+    /// valid in every column and `is_null(row)` on the result answers "some PK column
+    /// is null here" in a single bit test.
+    ///
+    /// A PK is almost never nullable in practice, so the common answer is `None` and
+    /// the check disappears: measured at ~3.9 ns/row of pure waste removed, and 16.7x
+    /// on the batches that do carry nulls.
+    fn pk_null_mask(pk_columns: &[ArrayRef]) -> Option<NullBuffer> {
+        let combined = pk_columns
+            .iter()
+            .fold(None, |acc: Option<NullBuffer>, column| {
+                NullBuffer::union(acc.as_ref(), column.nulls())
+            })?;
+        (combined.null_count() > 0).then_some(combined)
+    }
+
+    /// How many live rows to plan the PK index around: Cayenne's own published live
+    /// count when it has one, else the source's inferred row count.
+    ///
+    /// The decision to go bloomed and the sizing that follows it must read the SAME
+    /// figure — sizing a filter for one cardinality after deciding on another is how
+    /// a bloom ends up at the wrong bits per key.
+    fn expected_live_rows(&self) -> Option<usize> {
+        self.live_rows_size_hint()
+            .or_else(|| self.inferred_source_rows())
+    }
+
     /// Rows the source is expected to hold, from extended schema inference — known
     /// BEFORE any data is loaded, and today used only to report bootstrap progress.
     fn inferred_source_rows(&self) -> Option<usize> {
@@ -8480,7 +8550,7 @@ impl CayenneTableProvider {
         if !self.upsert_bloom_eligible() {
             return false;
         }
-        let Some(rows) = self.inferred_source_rows().filter(|rows| *rows > 0) else {
+        let Some(rows) = self.expected_live_rows().filter(|rows| *rows > 0) else {
             return false;
         };
         // Lower bound on one entry: the map key, the value, and the slot overhead.
@@ -8488,15 +8558,6 @@ impl CayenneTableProvider {
         rows.saturating_mul(super::pk_index::min_pk_keyset_entry_bytes()) > budget_bytes
     }
 
-    /// Whether to preserve a bloomed sharded PK index across a relocation-only
-    /// invalidation (a mem-tier/inline checkpoint moving rows between locations, or a
-    /// compaction rewriting files) instead of dropping it.
-    ///
-    /// EXPERIMENTAL, default off. Sound for a `Bloom`: those events REMOVE keys and
-    /// move rows, they never ADD one, so the filter stays a valid superset — a stale
-    /// positive costs a redundant delete, the same trade the bloom fallback already
-    /// makes. Unsound for an exact keyset, whose per-key `RowLocation`s the move
-    /// invalidates, so this never applies to one.
     /// How stale a preserved bloom may get, in per-mille of the keys it holds,
     /// before a relocation-only invalidation is allowed through to rebuild it.
     ///
@@ -8540,6 +8601,14 @@ impl CayenneTableProvider {
     }
 
     /// Whether this relocation-only invalidation may leave the sharded index alone.
+    ///
+    /// Sound only for a `Bloom`: a relocation REMOVES keys and moves rows, it never
+    /// ADDS one, so the filter stays a valid superset and a stale positive costs a
+    /// redundant delete — the same trade the bloom fallback already makes. An exact
+    /// keyset is never preserved, because the move invalidates the per-key
+    /// `RowLocation`s it stores. Both drift bounds must also hold: the staleness
+    /// ceiling is the switch — unset, nothing is ever preserved — and the bits-per-key
+    /// floor is an additional bound that unset simply does not apply.
     fn may_preserve_sharded_bloom(&self) -> bool {
         if !self.sharded_index_is_bloom.load(Ordering::Acquire) {
             return false;
@@ -8885,7 +8954,7 @@ impl CayenneTableProvider {
                 // paid during LOAD, where it competes with the bootstrap it delays.
                 ShardedPkIndex::blooms_for(
                     shards,
-                    self.inferred_source_rows().unwrap_or(0),
+                    self.expected_live_rows().unwrap_or(0),
                     budget / shards.max(1),
                 )
             } else {
@@ -8931,9 +9000,9 @@ impl CayenneTableProvider {
     /// [`Self::clear_cached_pk_keyset`] for a RELOCATION-only event — a compaction or
     /// snapshot rewrite that moves rows and folds tombstones. Such an event removes
     /// keys and moves them; it never adds one, so a bloomed sharded index stays a
-    /// valid superset and is spared (behind
-    /// `SPICE_CAYENNE_PRESERVE_BLOOM_ON_RELOCATION`). Everything else — the exact
-    /// keyset, the cold view, the OCC flag — is cleared exactly as before.
+    /// valid superset and is spared when both drift bounds hold (see
+    /// [`Self::may_preserve_sharded_bloom`]). Everything else — the exact keyset, the
+    /// cold view, the OCC flag — is cleared exactly as before.
     pub(crate) fn clear_cached_pk_keyset_after_relocation(&self) {
         self.clear_cached_pk_keyset_inner(self.may_preserve_sharded_bloom());
     }
@@ -10013,9 +10082,16 @@ impl CayenneTableProvider {
         // is not the cheap manifest lookup it appears to be — Cayenne's own
         // `statistics()` prefers the persisted blob and otherwise rescans Vortex
         // footers. Sizing a filter must not be able to block an apply.
-        let expected_keys = self.live_rows_size_hint();
-        let mut keyset =
-            BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys);
+        let expected_keys = self.expected_live_rows();
+        let mut keyset = match budget {
+            // Known up front to bust the budget: skip the exact phase rather than
+            // grow a keyset to the budget and convert it to the same filter, having
+            // first spent the memory (its peak holds both at once) and the time.
+            Some(max_bytes) if self.exact_keyset_provably_too_large(max_bytes) => {
+                BoundedShardedPkIndexBuilder::bloomed(shards, expected_keys, max_bytes)
+            }
+            _ => BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys),
+        };
         let mut row_id_base: i64 = 0;
 
         // After projection, batch columns are at indices 0..pk_indices.len()
@@ -10025,7 +10101,10 @@ impl CayenneTableProvider {
         // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
         // insert_records when protected snapshots exist.
         // min_delete_seq_threshold=None means ALL deletions apply.
-        let main_stream = datafusion_physical_plan::execute_stream(scan_plan, ctx.task_ctx())?;
+        let main_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+            scan_plan,
+            ctx.task_ctx(),
+        )?);
         Self::process_stream_into_keyset(
             main_stream,
             &self.pk_deletion_strategy,
@@ -10055,8 +10134,9 @@ impl CayenneTableProvider {
                 )
                 .await?;
 
-            let snapshot_stream =
-                datafusion_physical_plan::execute_stream(snapshot_plan, ctx.task_ctx())?;
+            let snapshot_stream = Self::prefetch_batches(
+                datafusion_physical_plan::execute_stream(snapshot_plan, ctx.task_ctx())?,
+            );
 
             Self::process_stream_into_keyset(
                 snapshot_stream,
@@ -10102,7 +10182,10 @@ impl CayenneTableProvider {
         {
             let scan_start = Instant::now();
             let keys_before = keyset.len();
-            let cold_stream = datafusion_physical_plan::execute_stream(cold_plan, ctx.task_ctx())?;
+            let cold_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+                cold_plan,
+                ctx.task_ctx(),
+            )?);
             Self::process_stream_into_keyset(
                 cold_stream,
                 &self.pk_deletion_strategy,
@@ -10589,6 +10672,11 @@ impl CayenneTableProvider {
 
             let rows = converter.convert_columns(&pk_columns)?;
 
+            // Hoisted out of the row loop: one bitwise AND over the batch instead of an
+            // `is_null` per PK column per row. `None` means no column carries a null,
+            // which is the usual case and removes the check entirely.
+            let pk_nulls = Self::pk_null_mask(&pk_columns);
+
             // For Int64Pk strategy, get the PK column as Int64Array for efficient lookup
             let int64_pk_array: Option<&arrow::array::Int64Array> =
                 if pk_deletion_strategy.is_int64_pk() && pk_indices.len() == 1 {
@@ -10644,8 +10732,7 @@ impl CayenneTableProvider {
                 }
 
                 // Enforce non-null primary key values
-                let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
-                if has_null {
+                if pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx)) {
                     return Err(Error::DataValidation {
                         table: table_name.to_string(),
                         message: format!(
@@ -11219,14 +11306,12 @@ impl CayenneTableProvider {
                 }
             };
 
-        // Hoist the PK-null check out of the per-row loop: an Arrow column with no
-        // null buffer reports `null_count() == 0` in O(1), so when no PK column is
-        // nullable we skip the per-row `is_null` scan across all PK columns
-        // entirely (the common case — PK columns are NOT NULL). Only when a PK
-        // column actually carries nulls do we pay the per-row check to locate and
-        // reject them. On the hot CDC apply path this removes an O(rows x pk_cols)
-        // scan from every coalesced batch (16K+ envelopes).
-        let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
+        // Combine the PK columns' validity once per batch (see `pk_null_mask`): the
+        // usual NOT NULL primary key yields `None` and the per-row check disappears,
+        // and a batch that does carry nulls answers with a single bit test instead of
+        // an `is_null` per PK column. On the hot CDC apply path this removes an
+        // O(rows x pk_cols) scan from every coalesced batch (16K+ envelopes).
+        let pk_nulls = Self::pk_null_mask(&pk_columns);
 
         // Build each row's PK key once, then run an IN-BATCH dedup pre-pass:
         // `ctx.incoming_keys` only covers PRIOR batches, so duplicate PKs WITHIN
@@ -11266,7 +11351,7 @@ impl CayenneTableProvider {
         };
 
         for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
-            if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
+            if pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Primary key values must be non-null".to_string(),
@@ -11542,23 +11627,30 @@ impl CayenneTableProvider {
         // A PK null is a validation error (the HIT path raises it); route any
         // null-PK row to the HIT side so the existing, single error site reports
         // it rather than silently fast-pathing an invalid row.
-        let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
+        let pk_nulls = Self::pk_null_mask(&pk_columns);
 
-        let mut miss_mask = Vec::with_capacity(batch.num_rows());
+        // A bit per row rather than a byte, and the HIT predicate is its complement
+        // — one negate kernel instead of a second `Vec<bool>` and a clone.
+        let mut miss_mask = arrow::array::BooleanBufferBuilder::new(batch.num_rows());
         // Sized to the row count: in the common split case most rows are MISSes,
         // so this keeps the set at one allocation on the CDC apply hot path.
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
-            let null_pk = any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx));
-            let key = rows.row(row_idx).owned();
+            let null_pk = pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx));
+            // Probe on the borrowed row bytes. Every probe below reads `&[u8]`, so
+            // the owning `Box<[u8]>` is only taken on the branch that keeps it —
+            // a HIT-heavy batch (the steady-state upsert shape) then allocates
+            // nothing at all here, instead of once per row.
+            let key = rows.row(row_idx);
+            let key_bytes = key.as_ref();
             // A datalake (cold) file MAY hold the key — route it to the HIT path
             // so `apply_on_conflict_to_batch` records the cold supersede. Without
             // this a cold-resident key would fast-path as brand-new and its cold
             // copy would survive, double-counting (blooms have no false
             // negatives, so a cold MISS here is safely fast-pathed).
-            let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key.as_ref()));
+            let cold_hit = cold_existence.is_some_and(|c| c.maybe_contains(key_bytes));
             // One hash per row, reused for both existence-set probes below.
-            let digest = pk_digest(&key);
+            let digest = pk_digest_bytes(key_bytes);
             // A concurrent writer committed this key after the index was checked
             // out, so the bloom cannot hold it — route it to the HIT path, which
             // supersedes the row it committed. Fast-pathing it as brand-new would
@@ -11570,16 +11662,17 @@ impl CayenneTableProvider {
             let is_miss = !null_pk
                 && !cold_hit
                 && !pending_hit
-                && !bloom.maybe_contains(key.as_ref())
+                && !bloom.maybe_contains(key_bytes)
                 && !incoming_keys.contains_digest(digest)
                 && !miss_keys.contains_digest(digest);
             if is_miss {
-                miss_keys.insert_with_digest(digest, key);
+                miss_keys.insert_with_digest(digest, key.owned());
             }
-            miss_mask.push(is_miss);
+            miss_mask.append(is_miss);
         }
 
-        let miss_count = miss_mask.iter().filter(|m| **m).count();
+        let miss_mask = miss_mask.finish();
+        let miss_count = miss_mask.count_set_bits();
         if miss_count == 0 {
             // No fast-path rows: the whole sub-batch is a HIT (preserves the
             // pre-Phase-6 behavior of routing everything through validation).
@@ -11590,9 +11683,8 @@ impl CayenneTableProvider {
             return Ok((Some(batch.clone()), None, miss_keys));
         }
 
-        let miss_pred = arrow::array::BooleanArray::from(miss_mask.clone());
-        let hit_mask: Vec<bool> = miss_mask.iter().map(|m| !*m).collect();
-        let hit_pred = arrow::array::BooleanArray::from(hit_mask);
+        let miss_pred = arrow::array::BooleanArray::new(miss_mask, None);
+        let hit_pred = arrow::compute::not(&miss_pred)?;
         let miss_batch = arrow::compute::filter_record_batch(batch, &miss_pred)?;
         let hit_batch = arrow::compute::filter_record_batch(batch, &hit_pred)?;
         Ok((Some(miss_batch), Some(hit_batch), miss_keys))

