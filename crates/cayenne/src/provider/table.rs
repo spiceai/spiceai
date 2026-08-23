@@ -120,6 +120,7 @@ use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, 
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -9970,7 +9971,7 @@ impl CayenneTableProvider {
     async fn load_existing_pk_index(
         &self,
         pk_indices: &[usize],
-        converter: &RowConverter,
+        converter: &Arc<RowConverter>,
         fold_cold: bool,
         cold_bloom_snapshot: Option<&str>,
         shards: usize,
@@ -10101,24 +10102,41 @@ impl CayenneTableProvider {
         // This mirrors scan()'s apply_deletion_filter() which uses all deletions without
         // insert_records when protected snapshots exist.
         // min_delete_seq_threshold=None means ALL deletions apply.
-        let main_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
-            scan_plan,
-            ctx.task_ctx(),
-        )?);
-        Self::process_stream_into_keyset(
-            main_stream,
+        let task_ctx = ctx.task_ctx();
+        if !Self::process_plan_into_blooms_in_parallel(
+            &scan_plan,
+            &task_ctx,
             &self.pk_deletion_strategy,
             pk_indices,
             converter,
             &projected_pk_indices,
-            deleted_pk_i64.as_deref(),
-            deleted_row_keys.as_deref(),
-            None, // all deletions apply to main listing table
+            deleted_pk_i64.as_ref(),
+            deleted_row_keys.as_ref(),
+            None,
             &self.table_metadata.table_name,
             &mut keyset,
-            &mut row_id_base,
         )
-        .await?;
+        .await?
+        {
+            let main_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+                scan_plan,
+                Arc::clone(&task_ctx),
+            )?);
+            Self::process_stream_into_keyset(
+                main_stream,
+                &self.pk_deletion_strategy,
+                pk_indices,
+                converter,
+                &projected_pk_indices,
+                deleted_pk_i64.as_deref(),
+                deleted_row_keys.as_deref(),
+                None, // all deletions apply to main listing table
+                &self.table_metadata.table_name,
+                &mut keyset,
+                &mut row_id_base,
+            )
+            .await?;
+        }
 
         // Process each protected snapshot with a PARTIAL deletion filter.
         // Only deletions with seq > max_delete_seq_at_creation apply, mirroring
@@ -10134,24 +10152,41 @@ impl CayenneTableProvider {
                 )
                 .await?;
 
-            let snapshot_stream = Self::prefetch_batches(
-                datafusion_physical_plan::execute_stream(snapshot_plan, ctx.task_ctx())?,
-            );
-
-            Self::process_stream_into_keyset(
-                snapshot_stream,
+            if !Self::process_plan_into_blooms_in_parallel(
+                &snapshot_plan,
+                &task_ctx,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
                 &projected_pk_indices,
-                deleted_pk_i64.as_deref(),
-                deleted_row_keys.as_deref(),
-                Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
+                deleted_pk_i64.as_ref(),
+                deleted_row_keys.as_ref(),
+                Some(*max_delete_seq_at_creation),
                 &self.table_metadata.table_name,
                 &mut keyset,
-                &mut row_id_base,
             )
-            .await?;
+            .await?
+            {
+                let snapshot_stream =
+                    Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+                        snapshot_plan,
+                        Arc::clone(&task_ctx),
+                    )?);
+                Self::process_stream_into_keyset(
+                    snapshot_stream,
+                    &self.pk_deletion_strategy,
+                    pk_indices,
+                    converter,
+                    &projected_pk_indices,
+                    deleted_pk_i64.as_deref(),
+                    deleted_row_keys.as_deref(),
+                    Some(*max_delete_seq_at_creation), // only deletions with seq > threshold apply
+                    &self.table_metadata.table_name,
+                    &mut keyset,
+                    &mut row_id_base,
+                )
+                .await?;
+            }
         }
 
         // Fold in the datalake (cold) tier: promoted rows are still live PK
@@ -10182,24 +10217,41 @@ impl CayenneTableProvider {
         {
             let scan_start = Instant::now();
             let keys_before = keyset.len();
-            let cold_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
-                cold_plan,
-                ctx.task_ctx(),
-            )?);
-            Self::process_stream_into_keyset(
-                cold_stream,
+            if !Self::process_plan_into_blooms_in_parallel(
+                &cold_plan,
+                &task_ctx,
                 &self.pk_deletion_strategy,
                 pk_indices,
                 converter,
                 &projected_pk_indices,
-                deleted_pk_i64.as_deref(),
-                deleted_row_keys.as_deref(),
-                None, // all deletions apply to cold-resident keys
+                deleted_pk_i64.as_ref(),
+                deleted_row_keys.as_ref(),
+                None,
                 &self.table_metadata.table_name,
                 &mut keyset,
-                &mut row_id_base,
             )
-            .await?;
+            .await?
+            {
+                let cold_stream =
+                    Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+                        cold_plan,
+                        Arc::clone(&task_ctx),
+                    )?);
+                Self::process_stream_into_keyset(
+                    cold_stream,
+                    &self.pk_deletion_strategy,
+                    pk_indices,
+                    converter,
+                    &projected_pk_indices,
+                    deleted_pk_i64.as_deref(),
+                    deleted_row_keys.as_deref(),
+                    None, // all deletions apply to cold-resident keys
+                    &self.table_metadata.table_name,
+                    &mut keyset,
+                    &mut row_id_base,
+                )
+                .await?;
+            }
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -10649,6 +10701,118 @@ impl CayenneTableProvider {
     ///
     /// Keys from later batches override earlier ones in the keyset, which is correct
     /// because protected snapshots contain data inserted at higher sequence numbers.
+    /// Fill `keyset` from `plan` across its scan partitions concurrently, or return
+    /// the plan unconsumed when the fan-out does not apply.
+    ///
+    /// The rebuild is an O(live-rows) scan taken on the CDC apply thread, and the
+    /// per-partition work — decode, row encode, digest, deletion probe — is where
+    /// almost all of it goes. Draining one coalesced stream leaves that work on one
+    /// core; one drain per partition spreads it across the CPU budget. Measured 3.26x
+    /// on the drain (`benches/pk_index_rebuild_breakdown.rs`).
+    ///
+    /// **Only for a bloomed builder**, which is what makes the merge sound. A bloom
+    /// is a bit set under union: an insert only sets bits and a probe only reads
+    /// them, so OR-ing the per-partition filters yields exactly what one pass over
+    /// all of them would have produced — commutative, idempotent, nothing to order.
+    /// Exact shards carry per-key `RowLocation`s whose scan-order override a merge
+    /// would have to reproduce, and merging them costs an O(keys) pass that spends
+    /// most of what the fan-out won; those keep the serial drain.
+    ///
+    /// Returns `false` when the caller must drain serially instead — an exact
+    /// builder, a single-partition plan, or a merge the builders refused (see
+    /// `merge_bloomed`, which refuses rather than half-merging, because a dropped key
+    /// reads as a new PK under upsert and writes a duplicate live row).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_plan_into_blooms_in_parallel(
+        plan: &Arc<dyn ExecutionPlan>,
+        task_ctx: &Arc<datafusion_execution::TaskContext>,
+        pk_deletion_strategy: &PkDeletionStrategyWithCache,
+        pk_indices: &[usize],
+        converter: &Arc<RowConverter>,
+        projected_pk_indices: &[usize],
+        deleted_pk_i64: Option<&Arc<DeletionIndex>>,
+        deleted_row_keys: Option<&Arc<KeyDeletionIndex>>,
+        min_delete_seq_threshold: Option<i64>,
+        table_name: &str,
+        keyset: &mut BoundedShardedPkIndexBuilder,
+    ) -> Result<bool> {
+        if !keyset.is_bloomed() {
+            return Ok(false);
+        }
+        let partitions = plan.output_partitioning().partition_count();
+        if partitions <= 1 {
+            return Ok(false);
+        }
+
+        let mut workers = Vec::with_capacity(partitions);
+        for partition in 0..partitions {
+            // Every worker's builder is constructed identically, which is what makes
+            // the shards mergeable pair-by-pair.
+            let mut shard = keyset.empty_clone();
+            let stream = plan.execute(partition, Arc::clone(task_ctx))?;
+            let strategy = pk_deletion_strategy.clone();
+            let pk_indices = pk_indices.to_vec();
+            let converter = Arc::clone(converter);
+            let projected = projected_pk_indices.to_vec();
+            let deleted_pk_i64 = deleted_pk_i64.map(Arc::clone);
+            let deleted_row_keys = deleted_row_keys.map(Arc::clone);
+            let table_name = table_name.to_string();
+            workers.push(tokio::spawn(async move {
+                let mut row_id_base = 0i64;
+                Self::process_stream_into_keyset(
+                    Self::prefetch_batches(stream),
+                    &strategy,
+                    &pk_indices,
+                    &converter,
+                    &projected,
+                    deleted_pk_i64.as_deref(),
+                    deleted_row_keys.as_deref(),
+                    min_delete_seq_threshold,
+                    &table_name,
+                    &mut shard,
+                    &mut row_id_base,
+                )
+                .await
+                .map(|()| shard)
+            }));
+        }
+
+        let mut filled = Vec::with_capacity(partitions);
+        let mut first_error = None;
+        for worker in workers {
+            // Join every worker even after one fails, so a failure cannot leave tasks
+            // writing into builders the caller is about to drop.
+            match worker.await {
+                Ok(Ok(shard)) => filled.push(shard),
+                Ok(Err(err)) => {
+                    first_error.get_or_insert(err);
+                }
+                Err(join_err) => {
+                    first_error.get_or_insert(Error::Internal {
+                        table: table_name.to_string(),
+                        message: format!(
+                            "Primary-key index rebuild worker failed to complete: {join_err}"
+                        ),
+                    });
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        // Merge into a scratch copy first: a refusal must leave `keyset` untouched so
+        // the caller's serial fallback starts from the same state it would have.
+        let mut merged = keyset.empty_clone();
+        if !filled.iter().all(|shard| merged.merge_bloomed(shard)) {
+            return Ok(false);
+        }
+        if !keyset.merge_bloomed(&merged) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     #[expect(clippy::too_many_arguments)]
     async fn process_stream_into_keyset(
         mut stream: SendableRecordBatchStream,
@@ -10817,11 +10981,14 @@ impl CayenneTableProvider {
         }
 
         let converter = self.build_pk_converter(&pk_indices)?;
+        // The rebuild fans its scan across partitions, so its workers need a shared
+        // handle; the validation stream below takes the converter itself.
+        let shared_converter = Arc::new(self.build_pk_converter(&pk_indices)?);
         // Off-lock staging must NOT take/store the shared cache (it runs without
         // `write_lock`); it builds a private keyset every time. The ordinary path
         // reuses the shared cache and stores it back on finish.
         let existing_keys = if offlock {
-            self.load_pk_index_for_validation(&pk_indices, &converter)
+            self.load_pk_index_for_validation(&pk_indices, &shared_converter)
                 .await?
         } else if let Some(existing_keys) = self.take_cached_pk_index() {
             tracing::trace!(
@@ -10835,7 +11002,7 @@ impl CayenneTableProvider {
             // if the rebuild fails: nothing will restore an index, and the keys it
             // would hold are read from the table by the next validation's rebuild.
             match self
-                .load_pk_index_for_validation(&pk_indices, &converter)
+                .load_pk_index_for_validation(&pk_indices, &shared_converter)
                 .await
             {
                 Ok(existing_keys) => existing_keys,
@@ -10880,7 +11047,7 @@ impl CayenneTableProvider {
     async fn load_pk_index_for_validation(
         &self,
         pk_indices: &[usize],
-        converter: &RowConverter,
+        converter: &Arc<RowConverter>,
     ) -> Result<CachedPkIndex> {
         // The full-table keyset rebuild is the dominant CDC-upsert cost for
         // tables whose keyset exceeds the cache budget, yet it runs *before*
@@ -10950,7 +11117,7 @@ impl CayenneTableProvider {
     async fn load_existing_pk_index_serial(
         &self,
         pk_indices: &[usize],
-        converter: &RowConverter,
+        converter: &Arc<RowConverter>,
         fold_cold: bool,
         cold_bloom_snapshot: Option<&str>,
     ) -> Result<CachedPkIndex> {
@@ -11054,7 +11221,7 @@ impl CayenneTableProvider {
     async fn build_sharded_pk_index(
         &self,
         pk_indices: &[usize],
-        converter: &RowConverter,
+        converter: &Arc<RowConverter>,
         n: usize,
     ) -> Result<ShardedPkIndex> {
         let n = n.max(1);
@@ -47668,7 +47835,7 @@ mod tests {
             .build_pk_converter(&pk_indices)
             .expect("build pk converter");
         let index = provider
-            .load_existing_pk_index_serial(&pk_indices, &pk_converter, true, None)
+            .load_existing_pk_index_serial(&pk_indices, &Arc::new(pk_converter), true, None)
             .await
             .expect("cold keyset rebuild");
         provider.store_cached_pk_index(index);
@@ -52092,9 +52259,11 @@ mod tests {
             .primary_key_indices()
             .expect("primary key indices resolve")
             .expect("the table declares a primary key");
-        let converter = provider
-            .build_pk_converter(&pk_indices)
-            .expect("primary key converter");
+        let converter = Arc::new(
+            provider
+                .build_pk_converter(&pk_indices)
+                .expect("primary key converter"),
+        );
         provider.maybe_install_warm_pk_caches().await;
 
         let checked_out = provider

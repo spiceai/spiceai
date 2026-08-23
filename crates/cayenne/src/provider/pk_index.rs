@@ -825,6 +825,78 @@ impl PkBloom {
         (block, masks)
     }
 
+    /// Fold `other`'s bits into this filter, returning whether the two were
+    /// compatible.
+    ///
+    /// A bloom is a bit set under union: OR-ing two filters over disjoint key sets
+    /// yields exactly the filter one pass over both would have produced, because an
+    /// insert only ever sets bits and a probe only ever reads them. That is what lets
+    /// a rebuild fan its scan out across partitions and combine the results, with no
+    /// ordering to preserve and no double-counting to avoid.
+    ///
+    /// Compatible means the same layout, the same size, and therefore the same
+    /// (hash, probe, layout) triple — bits written by one triple are meaningless to
+    /// another. Incompatible filters are refused rather than silently merged, since a
+    /// wrong union DROPS keys, and a dropped key reads as a new PK under upsert and
+    /// writes a duplicate live row.
+    ///
+    /// `inserted_keys` sums, so it stays the count of keys offered to the filter
+    /// (its purpose is false-positive-rate estimation, not cardinality).
+    /// Whether `other` was built by the same (hash, probe, layout) triple at the same
+    /// size, so the two can be unioned. See [`Self::union_with`].
+    pub(crate) fn is_same_shape_as(&self, other: &Self) -> bool {
+        match (&self.repr, &other.repr) {
+            (
+                PkBloomRepr::Scattered { bits, bit_mask },
+                PkBloomRepr::Scattered {
+                    bits: other_bits,
+                    bit_mask: other_mask,
+                },
+            ) => bit_mask == other_mask && bits.len() == other_bits.len(),
+            (
+                PkBloomRepr::SplitBlock { blocks, block_mask },
+                PkBloomRepr::SplitBlock {
+                    blocks: other_blocks,
+                    block_mask: other_mask,
+                },
+            ) => block_mask == other_mask && blocks.len() == other_blocks.len(),
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn union_with(&mut self, other: &Self) -> bool {
+        match (&mut self.repr, &other.repr) {
+            (
+                PkBloomRepr::Scattered { bits, bit_mask },
+                PkBloomRepr::Scattered {
+                    bits: other_bits,
+                    bit_mask: other_mask,
+                },
+            ) if bit_mask == other_mask && bits.len() == other_bits.len() => {
+                for (word, other_word) in bits.iter_mut().zip(other_bits) {
+                    *word |= *other_word;
+                }
+            }
+            (
+                PkBloomRepr::SplitBlock { blocks, block_mask },
+                PkBloomRepr::SplitBlock {
+                    blocks: other_blocks,
+                    block_mask: other_mask,
+                },
+            ) if block_mask == other_mask && blocks.len() == other_blocks.len() => {
+                for (block, other_block) in blocks.iter_mut().zip(other_blocks) {
+                    for (lane, other_lane) in block.iter_mut().zip(other_block) {
+                        *lane |= *other_lane;
+                    }
+                }
+            }
+            _ => return false,
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(other.inserted_keys);
+        true
+    }
+
     pub(crate) fn insert(&mut self, key: &[u8]) {
         match &mut self.repr {
             PkBloomRepr::Scattered { bits, bit_mask } => {
@@ -1593,6 +1665,64 @@ impl BoundedShardedPkIndexBuilder {
         self
     }
 
+    /// A builder shaped exactly like this one but holding nothing — the per-partition
+    /// accumulator the parallel rebuild fills.
+    ///
+    /// Shaped identically is the requirement, not merely similar: `merge_bloomed`
+    /// pairs shard i with shard i and refuses filters of differing shape, so the
+    /// workers must be built from the same shard count, budget and cardinality hint
+    /// as the builder they merge back into.
+    pub(crate) fn empty_clone(&self) -> Self {
+        match (&self.blooms, self.max_bytes) {
+            (Some(blooms), Some(max_bytes)) => {
+                Self::bloomed(blooms.len(), self.expected_keys, max_bytes)
+            }
+            _ => Self::new(self.shards.len(), self.max_bytes).with_expected_keys(self.expected_keys),
+        }
+    }
+
+    /// Whether this builder is filling blooms rather than exact keysets.
+    ///
+    /// Only a bloomed builder can be filled in parallel and merged: a bloom union is
+    /// commutative and idempotent, where exact shards carry per-key `RowLocation`s
+    /// whose scan-order override the merge would have to reproduce.
+    pub(crate) fn is_bloomed(&self) -> bool {
+        self.blooms.is_some()
+    }
+
+    /// Fold a sibling builder's blooms into this one, returning whether the two were
+    /// compatible (same shard count, and every shard pair the same filter shape).
+    ///
+    /// Both must have come from `bloomed` with the same arguments, which is what the
+    /// parallel rebuild does — one builder per scan partition, all sized alike. A
+    /// mismatch is refused rather than partially merged, because a refused merge is
+    /// recoverable (fall back to the serial drain) and a partial one silently drops
+    /// keys, which under upsert writes duplicate live rows.
+    #[must_use]
+    pub(crate) fn merge_bloomed(&mut self, other: &Self) -> bool {
+        let (Some(blooms), Some(other_blooms)) = (&mut self.blooms, &other.blooms) else {
+            return false;
+        };
+        if blooms.len() != other_blooms.len() {
+            return false;
+        }
+        // Check every pair BEFORE mutating: a merge that fails halfway leaves the
+        // filter holding some of the sibling's keys and not others, which is exactly
+        // the silently-wrong state the return value exists to prevent.
+        if !blooms
+            .iter()
+            .zip(other_blooms.iter())
+            .all(|(a, b)| a.is_same_shape_as(b))
+        {
+            return false;
+        }
+        for (bloom, other_bloom) in blooms.iter_mut().zip(other_blooms) {
+            // Shape already checked, so this cannot fail.
+            let _ = bloom.union_with(other_bloom);
+        }
+        true
+    }
+
     /// Shard routing in exact mode (bloom mode routes by `blooms.len()` at the
     /// call site — `shards` is drained once degraded).
     #[inline]
@@ -2170,6 +2300,97 @@ mod tests {
             }
             ShardedPkIndex::Exact(_) => panic!("must still build a bloom index"),
         }
+    }
+
+    /// A bloom union must be indistinguishable from one pass over both key sets.
+    ///
+    /// This is the whole correctness argument for the parallel rebuild: the workers
+    /// see disjoint slices of the scan, and the merged filter has to answer exactly
+    /// what a serial drain would have. A union that lost a key would read as a new PK
+    /// under upsert and write a duplicate live row.
+    #[test]
+    fn a_bloom_union_answers_exactly_as_one_pass_over_both_halves_would() {
+        const KEYS: usize = 4_000;
+        let mut whole = PkBloom::with_expected_keys(KEYS, 1 << 20);
+        let mut first = PkBloom::with_expected_keys(KEYS, 1 << 20);
+        let mut second = PkBloom::with_expected_keys(KEYS, 1 << 20);
+        for i in 0..KEYS as u64 {
+            whole.insert(&key(i));
+            if i % 2 == 0 { &mut first } else { &mut second }.insert(&key(i));
+        }
+        assert!(first.union_with(&second), "same-shape filters must union");
+
+        for i in 0..KEYS as u64 {
+            assert!(first.maybe_contains(&key(i)), "key {i} was lost by the union");
+        }
+        // Not just a superset: the union must have set the SAME bits, so it cannot
+        // answer positive where the one-pass filter answers negative either.
+        for i in KEYS as u64..(KEYS as u64) * 4 {
+            assert_eq!(
+                first.maybe_contains(&key(i)),
+                whole.maybe_contains(&key(i)),
+                "the union and the one-pass filter disagree on absent key {i}"
+            );
+        }
+    }
+
+    /// Filters of differing shape must be refused, not merged. Their bits are the
+    /// output of different (hash, probe, layout) triples, so OR-ing them is noise.
+    #[test]
+    fn a_union_of_differently_shaped_filters_is_refused() {
+        let mut small = PkBloom::with_expected_keys(100, 1 << 20);
+        let large = PkBloom::with_expected_keys(1_000_000, 1 << 20);
+        assert!(!small.is_same_shape_as(&large));
+        assert!(!small.union_with(&large), "a mismatched union must be refused");
+    }
+
+    /// The parallel rebuild's merge must reproduce the serial drain exactly, and must
+    /// refuse a builder it cannot merge rather than merging it partially — a half
+    /// merge silently drops keys, which is the one failure the caller cannot detect.
+    #[test]
+    fn merging_worker_builders_matches_a_single_builder_over_the_same_keys() {
+        const BUDGET: usize = 1 << 20;
+        const KEYS: usize = 6_000;
+        const WORKERS: usize = 4;
+
+        let mut serial = BoundedShardedPkIndexBuilder::bloomed(4, Some(KEYS), BUDGET);
+        for i in 0..KEYS as u64 {
+            serial.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+        }
+
+        let mut merged = BoundedShardedPkIndexBuilder::bloomed(4, Some(KEYS), BUDGET);
+        for worker in 0..WORKERS as u64 {
+            let mut shard = merged.empty_clone();
+            for i in (worker..KEYS as u64).step_by(WORKERS) {
+                shard.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
+            }
+            assert!(merged.merge_bloomed(&shard), "identically built shards merge");
+        }
+
+        let (ShardedPkIndex::Bloom(serial), ShardedPkIndex::Bloom(merged)) =
+            (serial.finish(), merged.finish())
+        else {
+            panic!("a bloomed builder must finish bloomed");
+        };
+        for i in 0..(KEYS as u64) * 3 {
+            let k = key(i);
+            let s = shard_of_pk(owned_key(&k).as_ref(), serial.len());
+            assert_eq!(
+                serial[s].maybe_contains(owned_key(&k).as_ref()),
+                merged[s].maybe_contains(owned_key(&k).as_ref()),
+                "the merged index disagrees with the serial one on key {i}"
+            );
+        }
+
+        // An exact builder has per-key locations a bloom union cannot carry, and a
+        // differently shaped one would drop keys: both must be refused.
+        let mut bloomed = BoundedShardedPkIndexBuilder::bloomed(4, Some(KEYS), BUDGET);
+        assert!(!bloomed.merge_bloomed(&BoundedShardedPkIndexBuilder::new(4, None)));
+        assert!(!bloomed.merge_bloomed(&BoundedShardedPkIndexBuilder::bloomed(
+            8,
+            Some(KEYS),
+            BUDGET
+        )));
     }
 
     /// The running byte total the budget check reads must equal a fresh sum of the
