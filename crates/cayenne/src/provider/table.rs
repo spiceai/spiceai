@@ -6866,17 +6866,31 @@ impl CayenneTableProvider {
     /// the primary-key column arrays, in key order — for the accelerator
     /// point-scan filter and the source delivery key.
     ///
+    /// A single-`Int64` primary key runs the converter-free [`PkDeletionStrategy::Int64Pk`]
+    /// deletion strategy, so `pk_row_converter` is `None` for it — while the write
+    /// path still encodes its marker keys through an ad-hoc converter over the same
+    /// columns ([`Self::build_pk_converter`]). Decoding therefore falls back to
+    /// building that same converter instead of refusing the table: without it,
+    /// durable write-back delivery fails on every pass for a `BIGINT`-keyed table
+    /// and its committed writes never reach the federated source.
+    ///
     /// # Errors
-    /// Returns an error if the table has no PK converter or the bytes are
-    /// malformed for its key schema.
+    /// Returns an error if the table has no primary key at all, or if the bytes
+    /// are malformed for its key schema.
     pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
-        let converter = self
-            .pk_row_converter
-            .as_ref()
-            .ok_or_else(|| Error::Internal {
-                table: self.table_name().to_string(),
-                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
-            })?;
+        let fallback;
+        let converter = if let Some(converter) = self.pk_row_converter.as_ref() {
+            converter.as_ref()
+        } else {
+            if self.pk_column_indices.is_empty() {
+                return Err(Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: "decode_pk_keys requires a primary key".to_string(),
+                });
+            }
+            fallback = self.build_pk_converter(&self.pk_column_indices)?;
+            &fallback
+        };
         let rows = pk_bytes
             .iter()
             .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
