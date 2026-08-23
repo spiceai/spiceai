@@ -778,17 +778,14 @@ pub(crate) const S3_PARAMETERS: [ParameterSpec; S3_PARAMS_LEN] = [
         .description("Comma-separated list of Availability Zone IDs for S3 Express One Zone storage (e.g., 'usw2-az1' or 'usw2-az1,usw2-az2'). When specified without 'cayenne_file_path', auto-generates bucket name from app and dataset name, and creates the bucket if needed. For multi-zone redundancy, specify multiple zones. Data is written to all zones with ACID guarantees - writes succeed only if all zones succeed. Reads are served from the primary (first) zone with fallback to replicas."),
 ];
 
-/// Returns true if the path is an S3 Express One Zone path.
-///
-/// S3 Express One Zone buckets have the naming convention: `{base-name}--{zone-id}--x-s3`
-/// Example: `s3://mybucket--usw2-az1--x-s3/prefix/`
-#[must_use]
-pub fn is_s3_express_path(path: &str) -> bool {
-    path.starts_with("s3://") && path.contains("--x-s3")
-}
+pub use runtime_object_store::is_s3_express_path;
 
 /// Validates that the path is either a local path or an S3 Express One Zone path.
 /// Standard S3 paths are not supported.
+/// # Errors
+///
+/// Returns [`Error::StandardS3NotSupported`] for a standard `s3://` path: only S3 Express
+/// One Zone buckets and local paths are supported.
 pub fn validate_file_path(path: &str) -> Result<()> {
     if path.starts_with("s3://") && !is_s3_express_path(path) {
         return Err(Error::StandardS3NotSupported {
@@ -833,6 +830,10 @@ pub fn is_multi_zone_s3_express(source: &dyn AccelerationSource) -> bool {
 /// Parses the `cayenne_s3_zone_ids` parameter as a comma-separated list of zone IDs.
 /// Normalizes entries (trim + lowercase) and deduplicates, preserving first-seen order.
 /// Returns an empty vector if the parameter is not set.
+/// # Errors
+///
+/// Returns [`Error::InvalidConfiguration`] when `cayenne_s3_zone_ids` is empty or names a
+/// zone the engine cannot use.
 pub fn get_s3_zone_ids(source: &dyn AccelerationSource) -> Result<Vec<String>> {
     source
         .acceleration()
@@ -892,6 +893,10 @@ pub fn extract_zone_id_from_bucket(bucket_name: &str) -> Option<&str> {
 /// - Lowercase only
 /// - Only alphanumeric and hyphens allowed
 /// - Max 63 characters total (we leave room for the suffix)
+/// # Errors
+///
+/// Returns [`Error::InvalidBucketName`] when the derived name cannot satisfy S3 Express
+/// bucket naming — the app and dataset names feed into it, so either can make it invalid.
 pub fn generate_bucket_name(app_name: &str, dataset_name: &str, zone_id: &str) -> Result<String> {
     // Sanitize names for S3 bucket naming requirements
     fn sanitize(s: &str) -> String {
@@ -969,6 +974,10 @@ pub fn generate_bucket_name(app_name: &str, dataset_name: &str, zone_id: &str) -
 ///
 /// Returns `Ok(true)` if a new bucket was created, `Ok(false)` if the bucket already existed.
 /// Returns `Err` if the bucket creation or verification fails.
+/// # Errors
+///
+/// Returns an error when the bucket cannot be created or its existence cannot be
+/// established — a missing or unauthorized credential, or an S3 API failure.
 pub async fn create_s3_express_bucket_if_needed(
     bucket_name: &str,
     zone_id: &str,
@@ -1184,6 +1193,10 @@ pub async fn create_s3_express_bucket_if_needed(
 /// - `timeout`: Client timeout (defaults to 120s if None)
 /// - `unsigned_payload`: Whether to skip payload signing (defaults to true if None)
 #[expect(clippy::too_many_arguments)]
+/// # Errors
+///
+/// Returns an error when the credentials or the endpoint cannot be resolved into a
+/// usable object store.
 pub async fn build_s3_object_store_for_validation(
     bucket_name: &str,
     zone_id: &str,
@@ -1281,6 +1294,10 @@ pub async fn build_s3_object_store_for_validation(
     clippy::type_complexity,
     reason = "Return type represents distinct S3 configuration fields"
 )]
+/// # Errors
+///
+/// Returns [`Error::InvalidS3Url`] when `data_path` is not a parseable `s3://` URL, and
+/// an invalid-configuration error when it names no bucket.
 pub fn get_s3_bucket_info(
     source: &dyn AccelerationSource,
     data_path: &str,
@@ -1478,6 +1495,10 @@ async fn resolve_s3_params_with_prefix(
 /// Unlike [`build_s3_object_store`] (warm tier, S3 Express One Zone only), this
 /// targets general S3 endpoints: path-style requests by default, no
 /// zone/Express options. Returns `None` when `location` is not `s3://`.
+/// # Errors
+///
+/// Returns [`Error::InvalidS3Url`] when `location` does not parse, or a store-construction
+/// error when the credentials or region cannot be resolved.
 pub async fn build_datalake_object_store(
     source: &dyn AccelerationSource,
     location: &str,
@@ -1608,6 +1629,10 @@ pub async fn build_datalake_object_store(
 /// background promotion), then best-effort DELETE it (failure only warns —
 /// `DeleteObject` is deliberately optional so minimal-permission deployments
 /// work; a leftover probe marker is harmless).
+/// # Errors
+///
+/// Returns an error when the probe write, read or delete fails — which is what proves the
+/// credentials actually carry the access the engine needs, rather than merely existing.
 pub async fn validate_datalake_store_access(
     config: &cayenne::metadata::ObjectStoreConfig,
     dataset_name: &str,
@@ -1771,6 +1796,10 @@ async fn build_single_s3_store_for_path(
 /// Build an S3 object store for S3 Express One Zone storage.
 ///
 /// Returns `None` if the path is not an S3 path, or an error if S3 configuration is invalid.
+/// # Errors
+///
+/// Returns an error when the path is not a supported S3 Express location, or when the
+/// credentials and endpoint cannot be resolved into a store.
 pub async fn build_s3_object_store(
     source: &dyn AccelerationSource,
     data_path: String,
@@ -1962,24 +1991,6 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
-    }
-
-    #[test]
-    fn test_is_s3_express_path() {
-        // Valid S3 Express One Zone paths
-        assert!(is_s3_express_path("s3://mybucket--usw2-az1--x-s3/prefix/"));
-        assert!(is_s3_express_path("s3://data-bucket--use1-az4--x-s3/"));
-        assert!(is_s3_express_path(
-            "s3://my-bucket-name--euw1-az2--x-s3/some/nested/path/"
-        ));
-
-        // Standard S3 paths (not Express)
-        assert!(!is_s3_express_path("s3://mybucket/prefix/"));
-        assert!(!is_s3_express_path("s3://mybucket-with-dashes/prefix/"));
-        assert!(!is_s3_express_path("s3://mybucket--partial/prefix/"));
-
-        // Non-S3 paths
-        assert!(!is_s3_express_path("/local/path/"));
     }
 
     #[test]
