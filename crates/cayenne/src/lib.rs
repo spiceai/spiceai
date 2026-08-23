@@ -93,8 +93,9 @@ pub use catalog_provider::{
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
-    CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
+    CdcDurability, DataFile, DeleteFile, DeleteWriteBackMarkers, InlinedData, InlinedDataStats,
+    InlinedDelete, ObjectStoreConfig, PartitionMetadata, PendingWriteBackMarker, StorageClass,
+    TableMetadata, TableStatistics, WriteBackOp,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]

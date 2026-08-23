@@ -66,6 +66,7 @@ use super::pk_index::{
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
+use crate::metadata::PendingWriteBackMarker;
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
@@ -6820,14 +6821,15 @@ impl CayenneTableProvider {
             .downcast_ref::<crate::CayenneCatalog>()
     }
 
-    /// List up to `limit` undelivered write-back markers (oldest commit first)
-    /// as `(pk_bytes, sequence_number)`. The `pk_bytes` are opaque `OwnedRow`
-    /// encodings — feed them back to [`Self::decode_pk_keys`] /
+    /// List up to `limit` undelivered write-back markers (oldest commit first).
+    /// Each marker carries the key's `OwnedRow` encoding, the sequence of the
+    /// commit that dirtied it, and that commit's [`WriteBackOp`] — feed the
+    /// `pk_bytes` back to [`Self::decode_pk_keys`] and the markers to
     /// [`Self::clear_dirty_keys`].
     ///
     /// # Errors
     /// Propagates the underlying metastore error.
-    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<(Vec<u8>, i64)>> {
+    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<PendingWriteBackMarker>> {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(Vec::new());
         };
@@ -6841,12 +6843,12 @@ impl CayenneTableProvider {
     ///
     /// # Errors
     /// Propagates the underlying metastore error.
-    pub async fn clear_dirty_keys(&self, keys: &[(Vec<u8>, i64)]) -> Result<()> {
+    pub async fn clear_dirty_keys(&self, markers: &[PendingWriteBackMarker]) -> Result<()> {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(());
         };
         catalog
-            .clear_pending_write_back(self.table_id(), keys)
+            .clear_pending_write_back(self.table_id(), markers)
             .await?;
         Ok(())
     }
@@ -6898,6 +6900,67 @@ impl CayenneTableProvider {
             table: self.table_name().to_string(),
             message: format!("failed to decode write-back marker primary keys: {e}"),
         })
+    }
+
+    /// Encode deleted primary keys as durable write-back marker `pk_bytes`.
+    ///
+    /// Markers store the `RowConverter` `OwnedRow` encoding, so the delete path's
+    /// own key representations have to be brought to it: `row_keys` already are
+    /// that encoding and pass through, while `int64_pks` are raw key values (the
+    /// `Int64Pk` strategy never builds a converter) and are encoded here through
+    /// the same converter the write path uses. Mixing the two representations in
+    /// one marker set would make a delete marker unmatchable against the upsert
+    /// marker for the same key.
+    fn encode_write_back_delete_markers(
+        &self,
+        int64_pks: &[i64],
+        row_keys: &[Box<[u8]>],
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut encoded: Vec<Vec<u8>> = row_keys.iter().map(|key| key.to_vec()).collect();
+        if !int64_pks.is_empty() {
+            let converter = self.build_pk_converter(&self.pk_column_indices)?;
+            let column: ArrayRef = Arc::new(arrow::array::Int64Array::from(int64_pks.to_vec()));
+            let rows = converter
+                .convert_columns(std::slice::from_ref(&column))
+                .map_err(|e| Error::Internal {
+                    table: self.table_name().to_string(),
+                    message: format!("failed to encode write-back delete marker keys: {e}"),
+                })?;
+            encoded.extend(rows.iter().map(|row| row.as_ref().to_vec()));
+        }
+        Ok(encoded)
+    }
+
+    /// Build the durable write-back delete markers for one committed delete, or
+    /// `None` when this table does not deliver deletes to a federated source.
+    ///
+    /// `source` gates the marking: only a user `DELETE` states that the row
+    /// should no longer exist at the source. A CDC-applied delete is the source
+    /// telling us it already deleted the row — marking it would echo the delete
+    /// straight back — and a retention prune only evicts rows from the
+    /// accelerator, so marking it would destroy source rows the retention policy
+    /// never claimed.
+    pub(crate) fn write_back_delete_markers(
+        &self,
+        source: DeletionRequestSource,
+        int64_pks: &[i64],
+        row_keys: &[Box<[u8]>],
+        sequence_number: Option<i64>,
+    ) -> Result<Option<crate::metadata::DeleteWriteBackMarkers>> {
+        if !self.durable_write_back || !source.marks_write_back_deletes() {
+            return Ok(None);
+        }
+        let Some(sequence_number) = sequence_number else {
+            return Ok(None);
+        };
+        let pk_bytes = self.encode_write_back_delete_markers(int64_pks, row_keys)?;
+        if pk_bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::metadata::DeleteWriteBackMarkers {
+            pk_bytes,
+            sequence_number,
+        }))
     }
 
     /// The primary-key column names in key order (for the delivery adapter).
@@ -26812,6 +26875,12 @@ impl CayenneTableProvider {
                 let keys = self.extract_primary_keys_from_batch(&filtered_batch)?;
                 let deleted_pk_i64: HashSet<i64> = keys.int64_pk.into_iter().collect();
                 let deleted_row_keys: HashSet<Box<[u8]>> = keys.row_keys.into_iter().collect();
+                // Retain the keys for durable write-back marking; the rewrite
+                // below only reports how many rows it removed.
+                rewrite.deleted_int64_pks.extend(deleted_pk_i64.iter().copied());
+                rewrite
+                    .deleted_row_keys
+                    .extend(deleted_row_keys.iter().cloned());
                 let (filtered_batch, removed_rows) = self
                     .filter_inlined_batch_for_pk_deletions(
                         visible_batch,
@@ -29815,16 +29884,8 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_deletion_vectors(&filters).await;
         }
 
-        let file_sink = self
-            .build_deletion_vector_sink(&filters, None, DeletionRequestSource::User)
-            .await?;
-        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
-            Arc::new(InlineAwareDeletionSink {
-                table: self.clone_for_write(),
-                file_sink,
-                filters,
-            }),
-        ))))
+        self.delete_from_with_source(filters, DeletionRequestSource::User)
+            .await
     }
 
     async fn update(
@@ -29952,15 +30013,33 @@ fn active_transaction(
     }
 }
 
+/// What asked for a delete. Governs both whether the caller needs a verified
+/// "rows affected" count and whether the delete is a statement that the row
+/// should also stop existing at the federated source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletionRequestSource {
+pub(crate) enum DeletionRequestSource {
+    /// A user `DELETE` statement.
     User,
+    /// The CDC apply loop replaying a delete that already happened at the source.
     Cdc,
+    /// A retention policy evicting rows from the accelerator.
+    Retention,
 }
 
 impl DeletionRequestSource {
     fn requires_exact_count(self) -> bool {
         matches!(self, Self::User)
+    }
+
+    /// Whether a delete from this source should be delivered to the federated
+    /// source as a delete. Only a user `DELETE` says the row should stop
+    /// existing; CDC is replaying a delete the source already performed, and
+    /// retention is evicting from the cache, not from the system of record.
+    fn marks_write_back_deletes(self) -> bool {
+        match self {
+            Self::User => true,
+            Self::Cdc | Self::Retention => false,
+        }
     }
 }
 
@@ -30103,6 +30182,48 @@ impl CayenneTableProvider {
         Ok(tables)
     }
 
+    /// Plan a delete whose originator is known.
+    ///
+    /// [`TableProvider::delete_from`] cannot tell a user `DELETE` from a
+    /// retention prune — both arrive through the same trait method — so callers
+    /// that are not a user statement must declare themselves here. The source
+    /// decides whether the delete is delivered to the federated source as a
+    /// delete (see [`Self::write_back_delete_markers`]) as well as whether the
+    /// caller needs a verified row count.
+    pub(crate) async fn delete_from_with_source(
+        &self,
+        filters: Vec<Expr>,
+        source: DeletionRequestSource,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let file_sink = self
+            .build_deletion_vector_sink(&filters, None, source)
+            .await?;
+        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
+            Arc::new(InlineAwareDeletionSink {
+                table: self.clone_for_write(),
+                file_sink,
+                filters,
+                source,
+            }),
+        ))))
+    }
+
+    /// Plan a retention delete: rows are evicted from the accelerator only.
+    ///
+    /// A retention policy bounds what the *cache* holds; it makes no claim about
+    /// the federated source, so these deletes never become write-back deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deletion sink cannot be built.
+    pub async fn delete_for_retention(
+        &self,
+        filters: Vec<Expr>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.delete_from_with_source(filters, DeletionRequestSource::Retention)
+            .await
+    }
+
     /// Build the [`CayenneDeletionSink`] behind the deletion-vector delete paths.
     ///
     /// User-visible deletes require a verified deleted-row count because the SQL
@@ -30183,6 +30304,7 @@ impl CayenneTableProvider {
             table: self.clone_for_write(),
             file_sink,
             filters: filters.to_vec(),
+            source: DeletionRequestSource::Cdc,
         };
         let deleted = sink
             .delete_from(Arc::new(datafusion_execution::TaskContext::default()))

@@ -403,6 +403,7 @@ impl PreparedTxnCommit {
                         self.table.table_id(),
                         &dirty_pk_bytes,
                         self.publish.snapshot_sequence,
+                        crate::WriteBackOp::Upsert,
                     )
                     .await?;
             }

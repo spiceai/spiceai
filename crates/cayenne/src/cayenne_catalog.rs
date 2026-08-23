@@ -18,9 +18,10 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeleteWriteBackMarkers, DeletionType, InlinedData,
+    InlinedDataStats, InlinedDelete, PartitionMetadata, PendingWriteBackMarker,
+    PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    WriteBackOp,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -1016,24 +1017,37 @@ impl CayenneCatalog {
     ///
     /// `dirty_pk_bytes` are the `RowConverter` `OwnedRow` encodings of the full
     /// primary keys (bit-identical to the keyset/footprint `pk_digest` input).
+    ///
+    /// `op` records which operation dirtied these keys. It travels WITH the
+    /// sequence: a re-mark that wins the `MAX` also replaces the op, and one that
+    /// loses leaves both alone, so the stored op always describes the
+    /// highest-sequence commit for that key. Without that coupling a delete
+    /// marker could keep an older commit's `upsert` op and be delivered as a
+    /// resurrection of the row it deleted.
     pub(crate) async fn mark_dirty_keys_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
         table_id: &str,
         dirty_pk_bytes: &[Vec<u8>],
         sequence_number: i64,
+        op: WriteBackOp,
     ) -> CatalogResult<()> {
         use std::fmt::Write as _;
         const MAX_PARAMS: usize = 32_000;
-        const PARAMS_PER_ROW: usize = 3;
+        const PARAMS_PER_ROW: usize = 4;
         const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
 
         for chunk in dirty_pk_bytes.chunks(MAX_ROWS_PER_CHUNK) {
             const PREFIX: &str = "INSERT INTO cayenne_pending_write_back \
-                 (table_id, pk_bytes, sequence_number) VALUES ";
+                 (table_id, pk_bytes, sequence_number, op) VALUES ";
+            // `op` follows the winning sequence (see the doc comment). Both
+            // assignments read the pre-UPDATE `sequence_number`, so the CASE
+            // decides against the stored value, not the one just written.
             const SUFFIX: &str = " ON CONFLICT(table_id, pk_bytes) DO UPDATE SET \
+                 op = CASE WHEN excluded.sequence_number >= cayenne_pending_write_back.sequence_number \
+                      THEN excluded.op ELSE cayenne_pending_write_back.op END, \
                  sequence_number = MAX(cayenne_pending_write_back.sequence_number, excluded.sequence_number)";
-            let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + chunk.len() * 20);
+            let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + chunk.len() * 24);
             sql.push_str(PREFIX);
             let mut params = Vec::with_capacity(chunk.len() * PARAMS_PER_ROW);
             for (i, pk_bytes) in chunk.iter().enumerate() {
@@ -1041,10 +1055,18 @@ impl CayenneCatalog {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
+                let _ = write!(
+                    sql,
+                    "(?{}, ?{}, ?{}, ?{})",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3
+                );
                 params.push(insert_record_table_id_value(table_id));
                 params.push(MetastoreValue::Blob(pk_bytes.clone()));
                 params.push(MetastoreValue::Integer(sequence_number));
+                params.push(MetastoreValue::Integer(op.as_i64()));
             }
             sql.push_str(SUFFIX);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
@@ -1053,23 +1075,29 @@ impl CayenneCatalog {
     }
 
     /// List up to `limit` undelivered write-back markers for `table_id`, oldest
-    /// commit sequence first. Returns `(pk_bytes, sequence_number)` pairs.
+    /// commit sequence first.
     pub(crate) async fn list_pending_write_back(
         &self,
         table_id: &str,
         limit: usize,
-    ) -> CatalogResult<Vec<(Vec<u8>, i64)>> {
+    ) -> CatalogResult<Vec<PendingWriteBackMarker>> {
         self.metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT pk_bytes, sequence_number FROM cayenne_pending_write_back \
+                    sql: "SELECT pk_bytes, sequence_number, op FROM cayenne_pending_write_back \
                           WHERE table_id = ?1 ORDER BY sequence_number ASC LIMIT ?2",
                     params: vec![
                         insert_record_table_id_value(table_id),
                         MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
                     ],
                 },
-                |row| Ok((row.get_blob(0)?, row.get_i64(1)?)),
+                |row| {
+                    Ok(PendingWriteBackMarker {
+                        pk_bytes: row.get_blob(0)?,
+                        sequence_number: row.get_i64(1)?,
+                        op: WriteBackOp::from_i64(row.get_i64(2)?),
+                    })
+                },
             )
             .await
     }
@@ -1082,21 +1110,21 @@ impl CayenneCatalog {
     pub(crate) async fn clear_pending_write_back(
         &self,
         table_id: &str,
-        keys: &[(Vec<u8>, i64)],
+        markers: &[PendingWriteBackMarker],
     ) -> CatalogResult<()> {
-        if keys.is_empty() {
+        if markers.is_empty() {
             return Ok(());
         }
         let txn = self.metastore.begin_transaction().await?;
         let table_id_value = insert_record_table_id_value(table_id);
-        for (pk_bytes, claimed_seq) in keys {
+        for marker in markers {
             txn.execute(ExecuteParams {
                 sql: "DELETE FROM cayenne_pending_write_back \
                       WHERE table_id = ?1 AND pk_bytes = ?2 AND sequence_number <= ?3",
                 params: vec![
                     table_id_value.clone(),
-                    MetastoreValue::Blob(pk_bytes.clone()),
-                    MetastoreValue::Integer(*claimed_seq),
+                    MetastoreValue::Blob(marker.pk_bytes.clone()),
+                    MetastoreValue::Integer(marker.sequence_number),
                 ],
             })
             .await?;
@@ -2557,6 +2585,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
+        write_back_markers: Option<DeleteWriteBackMarkers>,
     ) -> CatalogResult<()> {
         const MAX_PARAMS: usize = 32_000;
         const PARAMS_PER_DELETE_FILE: usize = 10;
@@ -2580,7 +2609,7 @@ impl MetadataCatalog for CayenneCatalog {
                 });
             }
         }
-        let txn = self.begin_transaction().await?;
+        let mut txn = self.begin_transaction().await?;
         for chunk in delete_files.chunks(MAX_PARAMS / PARAMS_PER_DELETE_FILE) {
             let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
             txn.execute(ExecuteParams { sql: &sql, params }).await?;
@@ -2613,6 +2642,21 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Text(inlined_id.clone()),
                 ],
             })
+            .await?;
+        }
+        // Durable write-back delete markers, in the SAME transaction as the
+        // delete they describe: either both land or neither does, so delivery
+        // can never miss a committed delete or announce one that rolled back.
+        if let Some(markers) = write_back_markers
+            && !markers.pk_bytes.is_empty()
+        {
+            self.mark_dirty_keys_in_txn(
+                txn.as_mut(),
+                table_id,
+                &markers.pk_bytes,
+                markers.sequence_number,
+                WriteBackOp::Delete,
+            )
             .await?;
         }
         txn.commit().await
@@ -6651,6 +6695,7 @@ mod tests {
                     created_at: String::new(),
                 }],
                 Vec::new(),
+                None,
             )
             .await
             .expect_err("missing inline rewrite target must abort the transaction");

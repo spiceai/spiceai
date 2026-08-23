@@ -24,23 +24,39 @@ limitations under the License.
 //! 1. **List** a batch of the oldest markers (`list_dirty_keys`) — a plain
 //!    read, NOT an atomic reservation; concurrency safety comes from the
 //!    compare-and-clear in step 4, not from claiming these markers here.
+//!    Each marker carries the [`WriteBackOp`] of the commit that dirtied it.
 //! 2. **Read** those keys' *current* committed values from the accelerator
 //!    (a fenced point scan), AFTER the list.
-//! 3. **Deliver** to the source idempotently. Partition keys by delete-only
-//!    vs upsert, processes separately. If the source cannot do a native upsert
-//!    (it answers `Replace` with `NotImplemented`), delivery falls back to the
-//!    older delete-then-insert emulation over all claimed keys - a temporary path
-//!    that reopens the #11915 window, kept only until every durable-write-back
-//!    source supports native upsert.
+//! 3. **Deliver** to the source idempotently, from the marked intent:
+//!    - a key the read returned is upserted with that value;
+//!    - a key the read did not return, marked [`WriteBackOp::Delete`], is
+//!      deleted at the source;
+//!    - a key the read did not return, marked [`WriteBackOp::Upsert`], is not
+//!      delivered at all (see [`classify_delivery`]).
+//!
+//!    If the source cannot do a native upsert (it answers `Replace` with
+//!    `NotImplemented`), delivery falls back to a delete-then-insert emulation
+//!    over the keys being upserted — a temporary path that reopens the #11915
+//!    window, kept only until every durable-write-back source supports native
+//!    upsert.
 //! 4. **Compare-and-clear** the markers whose stored sequence is still at or
 //!    below the sequence listed in step 1 — a newer commit that bumped a marker
 //!    during delivery leaves it in place, so the stale delivery never clears a
 //!    fresh mark.
 //!
 //! Delivery failure never blocks accelerator commits; the dirty set simply
-//! grows until the next successful pass. Marking happens only in the
-//! commit-publish transaction (never in the CDC apply path), so an echo of our
-//! own write cannot spawn a fresh delivery.
+//! grows until the next successful pass. Marking happens only in a commit
+//! transaction (never in the CDC apply path), so an echo of our own write cannot
+//! spawn a fresh delivery.
+//!
+//! # Absence is not a delete
+//!
+//! Delivery acts on the operation each marker records, never on whether the
+//! accelerator still holds the key. A key can be missing for reasons that are
+//! not a deletion — a retention policy pruned it, or the read could not see it —
+//! and turning any of those into a source `DELETE` destroys rows nobody deleted.
+//! A committed `DELETE` marks its keys explicitly, which is what makes the
+//! source delete safe to issue.
 //!
 //! # Known limitation — mixed writers
 //!
@@ -57,7 +73,7 @@ use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
-use cayenne::CayenneTableProvider;
+use cayenne::{CayenneTableProvider, PendingWriteBackMarker, WriteBackOp};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
@@ -163,7 +179,10 @@ impl WriteBackWorker {
             return Ok(0);
         }
 
-        let pk_bytes: Vec<Vec<u8>> = claimed.iter().map(|(bytes, _)| bytes.clone()).collect();
+        let pk_bytes: Vec<Vec<u8>> = claimed
+            .iter()
+            .map(|marker| marker.pk_bytes.clone())
+            .collect();
         let pk_arrays = self.provider.decode_pk_keys(&pk_bytes).map_err(to_df_err)?;
         let Some(pk_values) = pk_arrays.into_iter().next() else {
             return Ok(0);
@@ -188,18 +207,26 @@ impl WriteBackWorker {
             .await?;
         let session_state = ctx.state();
 
-        // Split the claimed keys by whether the post-claim read still returned
-        // them. Present and absent key sets are disjoint, so the upsert and the
-        // delete below touch disjoint source rows.
+        // Decide what to deliver for each claimed key from the marked operation
+        // and whether the post-claim read still returned it.
         let pk_col = self.pk_columns[0].as_str();
-        let absent = absent_claimed_keys(pk_col, &pk_values, &current)?;
+        let plan = classify_delivery(pk_col, &claimed, &pk_values, &current)?;
         let has_present = current.iter().any(|batch| batch.num_rows() > 0);
+
+        if !plan.undelivered.is_empty() {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                keys = plan.undelivered.len(),
+                "Dataset '{}': {} committed row(s) are no longer in the accelerator and were not written back, so the source may still hold their previous values. Nothing was deleted at the source: a row can go missing without having been deleted (a retention policy removed it, or the read could not see it), and only a committed DELETE authorizes deleting it at the source. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
+                self.dataset_name,
+                plan.undelivered.len(),
+            );
+        }
 
         let federated_provider = self.federated.table_provider().await;
 
-        // Attempt a Upsert. If federated source does not support it `DataFusionError::NotImplemented`
-        // Fallback to delete and append.
-        let mut fallback_delivered = false;
+        // Attempt an upsert. If the federated source does not support it
+        // (`DataFusionError::NotImplemented`) fall back to delete-then-insert.
         if has_present {
             match execute_insert(
                 Arc::clone(&federated_provider),
@@ -218,9 +245,14 @@ impl WriteBackWorker {
                         error = %e,
                         "durable write-back: source does not support InsertOp::Replace; falling back to delete-then-insert delivery"
                     );
+                    // Delete only the keys about to be re-inserted. A blanket
+                    // delete over every claimed key would also remove the keys
+                    // this pass deliberately left alone.
+                    let present_filter =
+                        col(pk_col).in_list(plan.present.iter().cloned().map(lit).collect(), false);
                     let _ = datafusion::physical_plan::collect(
                         federated_provider
-                            .delete_from(&session_state, vec![filter])
+                            .delete_from(&session_state, vec![present_filter])
                             .await?,
                         session_state.task_ctx(),
                     )
@@ -234,27 +266,29 @@ impl WriteBackWorker {
                         None,
                     )
                     .await?;
-                    // The blanket delete above already removed the absent keys, so
-                    // skip the absent-only delete below.
-                    fallback_delivered = true;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        // Absent keys → delete. Genuinely gone from the accelerator (the read did
-        // not return them), so this delete is correct rather than a blanket first
-        // step. Skipped when the fallback above already deleted every claimed key.
-        if !fallback_delivered && !absent.is_empty() {
-            let absent_filter = col(pk_col).in_list(absent.into_iter().map(lit).collect(), false);
+        // Keys a committed DELETE removed. `classify_delivery` puts a key in
+        // exactly one of these sets, so this delete cannot undo the upsert above.
+        if !plan.deleted.is_empty() {
+            let delete_filter =
+                col(pk_col).in_list(plan.deleted.into_iter().map(lit).collect(), false);
             let delete_plan = federated_provider
-                .delete_from(&session_state, vec![absent_filter])
+                .delete_from(&session_state, vec![delete_filter])
                 .await?;
             let _ =
                 datafusion::physical_plan::collect(delete_plan, session_state.task_ctx()).await?;
         }
 
-        // Ack: clear only markers still at/below the claimed sequence.
+        // Ack: clear only markers still at/below the claimed sequence. Keys that
+        // were not delivered are cleared too — their marker describes a commit
+        // that has been superseded, and keeping it would grow the dirty set
+        // without bound while re-warning every pass. A commit that re-dirtied the
+        // key during this pass bumped its sequence above what was claimed, so its
+        // marker survives the clear and is delivered next pass.
         self.provider
             .clear_dirty_keys(&claimed)
             .await
@@ -272,18 +306,47 @@ fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
     Ok(col(pk_col).in_list(list, false))
 }
 
-/// The claimed primary keys that the post-claim accelerator read did NOT return
-/// — the keys that are genuinely gone and must be deleted from the source.
+/// What one delivery pass should do with each claimed key.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct DeliveryPlan {
+    /// Keys the post-claim read returned; delivered as an upsert of that value.
+    pub(crate) present: Vec<ScalarValue>,
+    /// Keys a committed `DELETE` removed; delivered as a source delete.
+    pub(crate) deleted: Vec<ScalarValue>,
+    /// Keys the read did not return that no committed `DELETE` marked. Nothing
+    /// is delivered for these — see the module's "Absence is not a delete".
+    pub(crate) undelivered: Vec<ScalarValue>,
+}
+
+/// Decide what to deliver for each claimed key.
 ///
-/// `claimed_pks` are all the keys listed this pass; `current` holds the rows the
-/// read returned for the keys still present. Absent = claimed − present, so the
-/// caller can upsert `current` and delete only the absent keys, never issuing a
-/// delete for a key that still exists (the spurious delete #11915 depended on).
-fn absent_claimed_keys(
+/// A key the read returned is upserted with its current value, whatever its
+/// marker says: the read is the authority on the value, and a delete marker
+/// whose key is present again means a later commit re-created it (that commit
+/// bumped the marker, so this pass's clear leaves it for the next one).
+///
+/// A key the read did not return is deleted at the source **only** when its
+/// marker records a [`WriteBackOp::Delete`]. Absence on its own proves nothing:
+/// a retention prune or a read that could not see the row looks identical to a
+/// deletion, and deleting on that evidence destroys rows nobody deleted — which
+/// is why this returns them as `undelivered` rather than as deletes.
+///
+/// `claimed` and `claimed_pks` are parallel: `claimed_pks[i]` is the decoded key
+/// of `claimed[i]`.
+pub(crate) fn classify_delivery(
     pk_col: &str,
+    claimed: &[PendingWriteBackMarker],
     claimed_pks: &ArrayRef,
     current: &[RecordBatch],
-) -> DataFusionResult<Vec<ScalarValue>> {
+) -> DataFusionResult<DeliveryPlan> {
+    if claimed.len() != claimed_pks.len() {
+        return Err(DataFusionError::Execution(format!(
+            "durable write-back: {} claimed markers do not line up with {} decoded keys",
+            claimed.len(),
+            claimed_pks.len()
+        )));
+    }
+
     let mut present: HashSet<ScalarValue> = HashSet::new();
     for batch in current {
         let Some(column) = batch.column_by_name(pk_col) else {
@@ -296,14 +359,19 @@ fn absent_claimed_keys(
         }
     }
 
-    let mut absent: Vec<ScalarValue> = Vec::new();
-    for row in 0..claimed_pks.len() {
-        let key = ScalarValue::try_from_array(claimed_pks.as_ref(), row)?;
-        if !present.contains(&key) {
-            absent.push(key);
+    let mut plan = DeliveryPlan::default();
+    for (index, marker) in claimed.iter().enumerate() {
+        let key = ScalarValue::try_from_array(claimed_pks.as_ref(), index)?;
+        if present.contains(&key) {
+            plan.present.push(key);
+        } else {
+            match marker.op {
+                WriteBackOp::Delete => plan.deleted.push(key),
+                WriteBackOp::Upsert => plan.undelivered.push(key),
+            }
         }
     }
-    Ok(absent)
+    Ok(plan)
 }
 
 #[expect(
@@ -312,4 +380,162 @@ fn absent_claimed_keys(
 )]
 fn to_df_err(e: cayenne::provider::Error) -> DataFusionError {
     DataFusionError::Execution(format!("durable write-back: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeliveryPlan, classify_delivery};
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use cayenne::{PendingWriteBackMarker, WriteBackOp};
+    use datafusion::scalar::ScalarValue;
+    use std::sync::Arc;
+
+    const PK_COL: &str = "id";
+
+    fn marker(pk: i64, op: WriteBackOp) -> PendingWriteBackMarker {
+        PendingWriteBackMarker {
+            // The classifier reads the op and relies on the caller's decoded key
+            // array for identity, so the exact encoding here is immaterial.
+            pk_bytes: pk.to_be_bytes().to_vec(),
+            sequence_number: pk,
+            op,
+        }
+    }
+
+    fn keys(pks: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(pks.to_vec()))
+    }
+
+    /// The rows an accelerator read returned for the keys still present.
+    fn read_returning(pks: &[i64]) -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![Field::new(PK_COL, DataType::Int64, false)]));
+        vec![
+            RecordBatch::try_new(schema, vec![keys(pks)]).expect("valid single-column key batch"),
+        ]
+    }
+
+    fn scalars(pks: &[i64]) -> Vec<ScalarValue> {
+        pks.iter().map(|pk| ScalarValue::Int64(Some(*pk))).collect()
+    }
+
+    /// The regression this whole change exists for: a key that is simply gone
+    /// from the accelerator — a retention prune, a read that could not see it —
+    /// carries an upsert marker, and must NEVER be deleted at the source.
+    #[test]
+    fn an_absent_key_without_a_delete_marker_is_never_deleted_at_the_source() {
+        let claimed = vec![marker(1, WriteBackOp::Upsert)];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
+            .expect("classification succeeds");
+
+        assert_eq!(
+            plan,
+            DeliveryPlan {
+                present: vec![],
+                deleted: vec![],
+                undelivered: scalars(&[1]),
+            },
+            "an absent upsert-marked key must be reported as undelivered, never deleted"
+        );
+    }
+
+    #[test]
+    fn an_absent_key_with_a_delete_marker_is_deleted_at_the_source() {
+        let claimed = vec![marker(1, WriteBackOp::Delete)];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
+            .expect("classification succeeds");
+
+        assert_eq!(plan.deleted, scalars(&[1]));
+        assert!(plan.present.is_empty() && plan.undelivered.is_empty());
+    }
+
+    /// A delete marker whose key the read returned means a later commit
+    /// re-created the row; delivering the delete would erase that newer write.
+    #[test]
+    fn a_present_key_is_upserted_even_when_its_marker_says_delete() {
+        let claimed = vec![marker(1, WriteBackOp::Delete)];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
+            .expect("classification succeeds");
+
+        assert_eq!(plan.present, scalars(&[1]));
+        assert!(
+            plan.deleted.is_empty(),
+            "a key the accelerator still holds must not be deleted at the source"
+        );
+    }
+
+    #[test]
+    fn a_present_key_with_an_upsert_marker_is_upserted() {
+        let claimed = vec![marker(1, WriteBackOp::Upsert)];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
+            .expect("classification succeeds");
+
+        assert_eq!(plan.present, scalars(&[1]));
+        assert!(plan.deleted.is_empty() && plan.undelivered.is_empty());
+    }
+
+    /// One pass mixes all three outcomes; the upsert and delete sets must stay
+    /// disjoint so the two deliveries cannot fight over a key.
+    #[test]
+    fn a_mixed_batch_splits_into_disjoint_upserts_and_deletes() {
+        let claimed = vec![
+            marker(1, WriteBackOp::Upsert), // present
+            marker(2, WriteBackOp::Delete), // absent → delete
+            marker(3, WriteBackOp::Upsert), // absent → undelivered
+            marker(4, WriteBackOp::Delete), // present → upsert (re-created)
+        ];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2, 3, 4]), &read_returning(&[1, 4]))
+            .expect("classification succeeds");
+
+        assert_eq!(plan.present, scalars(&[1, 4]));
+        assert_eq!(plan.deleted, scalars(&[2]));
+        assert_eq!(plan.undelivered, scalars(&[3]));
+        for key in &plan.deleted {
+            assert!(
+                !plan.present.contains(key),
+                "the delete and upsert key sets must be disjoint"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_read_with_no_delete_markers_delivers_nothing() {
+        let claimed = vec![marker(1, WriteBackOp::Upsert), marker(2, WriteBackOp::Upsert)];
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[])
+            .expect("classification succeeds");
+
+        assert!(
+            plan.present.is_empty() && plan.deleted.is_empty(),
+            "a read that returned nothing must not be read as 'every key was deleted'"
+        );
+        assert_eq!(plan.undelivered, scalars(&[1, 2]));
+    }
+
+    #[test]
+    fn markers_and_decoded_keys_that_do_not_line_up_are_rejected() {
+        let claimed = vec![marker(1, WriteBackOp::Delete)];
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &read_returning(&[]))
+            .expect_err("a length mismatch must not be classified");
+
+        assert!(
+            err.to_string().contains("do not line up"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_read_missing_the_primary_key_column_is_an_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![keys(&[1])]).expect("valid batch");
+        let claimed = vec![marker(1, WriteBackOp::Upsert)];
+
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch])
+            .expect_err("a read without the key column must not be classified");
+
+        assert!(
+            err.to_string().contains("missing from the accelerator read"),
+            "unexpected error: {err}"
+        );
+    }
 }

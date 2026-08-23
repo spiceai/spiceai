@@ -371,6 +371,14 @@ pub(crate) struct InlinedDataRewrite {
     pub(crate) updated_data: Vec<InlinedData>,
     pub(crate) deleted_inlined_ids: Vec<String>,
     pub(crate) removed_rows: usize,
+    /// The primary keys this rewrite deleted from the inline tier. Carried out
+    /// so durable write-back can mark them: the inline tier is a separate tier
+    /// from the files the deletion-vector sink reports, and a delete that only
+    /// touched inline rows would otherwise leave the source untouched.
+    pub(crate) deleted_int64_pks: Vec<i64>,
+    /// As `deleted_int64_pks`, for `RowConverter`-keyed tables. Already the
+    /// `OwnedRow` encoding a marker stores.
+    pub(crate) deleted_row_keys: Vec<Box<[u8]>>,
 }
 
 impl InlinedDataRewrite {
@@ -384,6 +392,10 @@ pub(crate) struct InlineAwareDeletionSink {
     pub(crate) table: CayenneTableProvider,
     pub(crate) file_sink: CayenneDeletionSink,
     pub(crate) filters: Vec<Expr>,
+    /// What asked for this delete. Only a user `DELETE` marks its keys for
+    /// durable write-back delivery — see
+    /// [`CayenneTableProvider::write_back_delete_markers`].
+    pub(crate) source: super::table::DeletionRequestSource,
 }
 
 /// `true` when the delete targets every row — an empty filter list, or every
@@ -546,6 +558,50 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
     }
 }
 
+impl InlineAwareDeletionSink {
+    /// Collect this delete's keys from both tiers and encode them as durable
+    /// write-back delete markers, or `None` when the table does not deliver
+    /// deletes to a federated source (or this delete's source must not mark).
+    ///
+    /// The file tier reports keys in its strategy's own representation while the
+    /// inline tier reports them separately; both feed one marker set so a delete
+    /// spanning tiers produces one marker per key.
+    async fn write_back_delete_markers(
+        &self,
+        prepared_file_delete: Option<&super::delete::PreparedDeletionPublish>,
+        inline_rewrite: &InlinedDataRewrite,
+    ) -> std::result::Result<
+        Option<crate::metadata::DeleteWriteBackMarkers>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        use super::delete::PreparedDeletedKeys;
+
+        let mut int64_pks = inline_rewrite.deleted_int64_pks.clone();
+        let mut row_keys = inline_rewrite.deleted_row_keys.clone();
+        let mut sequence_number = None;
+        if let Some(prepared) = prepared_file_delete {
+            match prepared.deleted_keys() {
+                PreparedDeletedKeys::Int64(pks) => int64_pks.extend(pks.iter().copied()),
+                PreparedDeletedKeys::RowKeys(keys) => row_keys.extend(keys.iter().cloned()),
+            }
+            sequence_number = prepared.delete_sequence();
+        }
+        // An inline-only delete writes no deletion-vector file and so reserves no
+        // delete sequence; fall back to the table's current high-water mark, which
+        // is at or above every committed write to these keys.
+        let sequence_number = match sequence_number {
+            Some(sequence) => Some(sequence),
+            None if !int64_pks.is_empty() || !row_keys.is_empty() => {
+                Some(self.table.sequence_high_water().await)
+            }
+            None => None,
+        };
+        self.table
+            .write_back_delete_markers(self.source, &int64_pks, &row_keys, sequence_number)
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
 #[async_trait]
 impl DeletionSink for InlineAwareDeletionSink {
     async fn delete_from(
@@ -568,6 +624,11 @@ impl DeletionSink for InlineAwareDeletionSink {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
+            // Durable write-back delete markers for every key this delete removed,
+            // across both tiers, written in the commit transaction below.
+            let write_back_markers = self
+                .write_back_delete_markers(prepared_file_delete.as_ref(), &inline_rewrite)
+                .await?;
             if let Err(error) = self
                 .table
                 .metadata_catalog()
@@ -576,6 +637,7 @@ impl DeletionSink for InlineAwareDeletionSink {
                     self.table.table_id(),
                     inline_rewrite.updated_data.clone(),
                     inline_rewrite.deleted_inlined_ids.clone(),
+                    write_back_markers,
                 )
                 .await
             {

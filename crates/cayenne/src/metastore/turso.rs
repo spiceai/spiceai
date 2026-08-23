@@ -379,6 +379,7 @@ impl TursoMetastore {
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            op INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (table_id, pk_bytes)
         )
     ";
@@ -768,6 +769,19 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_cold_tier_file ADD COLUMN pk_bloom_blob BLOB",
+                (),
+            )
+            .await;
+
+        // Which operation dirtied a write-back marker (see
+        // PENDING_WRITE_BACK_TABLE_DDL). The DEFAULT 0 the ALTER applies to
+        // legacy rows is correct rather than merely safe: before this column only
+        // upsert commits marked keys. Forward- and downgrade-safe (an older
+        // binary ignores the extra column). Appended last to match CREATE TABLE
+        // and EXPECTED_TABLES column order.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_pending_write_back ADD COLUMN op INTEGER NOT NULL DEFAULT 0",
                 (),
             )
             .await;

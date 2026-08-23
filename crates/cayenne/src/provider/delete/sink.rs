@@ -161,9 +161,39 @@ enum PreparedDeletionCache {
     },
 }
 
+/// The primary keys a prepared delete tombstones, in whichever representation
+/// the table's deletion strategy uses.
+pub(crate) enum PreparedDeletedKeys<'a> {
+    /// Raw key values, for the `Int64Pk` strategy. NOT the `RowConverter`
+    /// encoding: a caller that needs marker `pk_bytes` must re-encode them.
+    Int64(&'a HashSet<i64>),
+    /// `RowConverter` `OwnedRow` encodings, for the `RowConverterBased` strategy.
+    RowKeys(&'a HashSet<Box<[u8]>>),
+}
+
 impl PreparedDeletionPublish {
     pub(crate) fn delete_files(&self) -> &[DeleteFile] {
         &self.delete_files
+    }
+
+    /// The primary keys this delete tombstones on the file tier.
+    ///
+    /// Durable write-back records these as delete markers so delivery removes
+    /// exactly the keys a committed `DELETE` removed.
+    pub(crate) fn deleted_keys(&self) -> PreparedDeletedKeys<'_> {
+        match &self.publish {
+            PreparedDeletionCache::Int64 { pks, .. } => PreparedDeletedKeys::Int64(pks),
+            PreparedDeletionCache::RowKeys { keys, .. } => PreparedDeletedKeys::RowKeys(keys),
+        }
+    }
+
+    /// The sequence this delete's tombstones were committed at, which orders its
+    /// write-back markers against any upsert marker for the same key.
+    pub(crate) fn delete_sequence(&self) -> Option<i64> {
+        match &self.publish {
+            PreparedDeletionCache::Int64 { sequence, .. }
+            | PreparedDeletionCache::RowKeys { sequence, .. } => *sequence,
+        }
     }
 
     pub(crate) fn deleted_count(&self) -> u64 {

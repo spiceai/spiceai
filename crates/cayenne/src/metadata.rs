@@ -176,6 +176,72 @@ pub struct DataFile {
     pub sequence_number: i64,
 }
 
+/// Which operation dirtied a durable federated write-back marker.
+///
+/// Delivery reconciles a marked key to the federated source by acting on this
+/// recorded intent. A key a committed `DELETE` removed is marked
+/// [`WriteBackOp::Delete`] and delivered as a source delete; every other marker
+/// is an [`WriteBackOp::Upsert`] of the key's current committed value. Delivery
+/// never infers a delete from a key being absent in the accelerator, because
+/// absence has causes other than deletion — a retention prune, or a read that
+/// could not see the row — and turning those into source deletes destroys rows
+/// nobody deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBackOp {
+    /// The key's current committed value must be upserted at the source.
+    Upsert,
+    /// The key was deleted; the source row must be deleted.
+    Delete,
+}
+
+impl WriteBackOp {
+    /// The stored `op` encoding (see the `cayenne_pending_write_back` DDL).
+    #[must_use]
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::Upsert => 0,
+            Self::Delete => 1,
+        }
+    }
+
+    /// Decode a stored `op`. Anything other than the delete encoding reads as
+    /// [`WriteBackOp::Upsert`] — the safe direction, and what a legacy row means
+    /// (it predates the column, so it can only have come from an upsert commit).
+    /// An unrecognized value must never become a delete at the source.
+    #[must_use]
+    pub fn from_i64(value: i64) -> Self {
+        if value == Self::Delete.as_i64() {
+            Self::Delete
+        } else {
+            Self::Upsert
+        }
+    }
+}
+
+/// One undelivered durable write-back marker: a primary key a committed write
+/// applied to the accelerator but has not yet reconciled to the federated source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWriteBackMarker {
+    /// `RowConverter` `OwnedRow` encoding of the full primary key.
+    pub pk_bytes: Vec<u8>,
+    /// Table commit sequence of the commit that last dirtied this key.
+    pub sequence_number: i64,
+    /// The operation that commit performed on the key.
+    pub op: WriteBackOp,
+}
+
+/// Durable write-back delete markers to record in the SAME metastore transaction
+/// as the delete that produced them, so a crash cannot leave the accelerator
+/// holding a delete the source will never be told about.
+#[derive(Debug, Clone)]
+pub struct DeleteWriteBackMarkers {
+    /// `RowConverter` `OwnedRow` encodings of the deleted primary keys.
+    pub pk_bytes: Vec<Vec<u8>>,
+    /// The delete's commit sequence, which orders these markers against any
+    /// upsert marker for the same key.
+    pub sequence_number: i64,
+}
+
 /// The type of deletion vector: position-based or key-based.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DeletionType {
