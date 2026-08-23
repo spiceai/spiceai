@@ -498,7 +498,11 @@ async fn accumulate(
     for s in 0..inputs {
         let base = if supersede { 0 } else { (s * rows) as i64 };
         let written = write_snapshot(&fixture, (shape.batch)(base, rows)).await;
-        assert_eq!(written as usize, rows, "{} snapshot {s} row count", shape.name);
+        assert_eq!(
+            written as usize, rows,
+            "{} snapshot {s} row count",
+            shape.name
+        );
     }
     // Quiesce post-write bookkeeping BEFORE timing. Each insert queues stats
     // persistence and a listing refresh, which bump the snapshot generation; the
@@ -531,7 +535,10 @@ fn timed_pass(runtime: &tokio::runtime::Runtime, fixture: &Fixture, label: &str)
             .provider
             .compact_protected_snapshots_subset(usize::MAX),
     );
-    assert!(merged.is_ok(), "{label}: pass must not error, got {merged:?}");
+    assert!(
+        merged.is_ok(),
+        "{label}: pass must not error, got {merged:?}"
+    );
     if merged.as_ref().is_ok_and(|merged| !merged) {
         // Loud: a declined pass times the DECLINE path, so its cell must be
         // excluded from any fit rather than averaged in with real merges. Which
@@ -576,8 +583,8 @@ fn bench_maintenance_cost(c: &mut Criterion) {
             // not the throughput denominator: that is on-disk `.vortex` bytes, the
             // unit `cayenne_compaction_merged_bytes` reports, so bench and production
             // MB/s are the same quantity.
-            let arrow_mib = (shape.batch)(0, rows).get_array_memory_size() as f64
-                / (1024.0 * 1024.0);
+            let arrow_mib =
+                (shape.batch)(0, rows).get_array_memory_size() as f64 / (1024.0 * 1024.0);
             eprintln!(
                 "{} ({} cols): {rows} rows = {arrow_mib:.4} MiB Arrow/snapshot",
                 shape.name, shape.columns,
@@ -731,7 +738,11 @@ fn bench_maintenance_cost(c: &mut Criterion) {
             Arc::clone(&env),
         ))));
         for coalesced in [true, false] {
-            let arm = if coalesced { "coalesced" } else { "partitioned" };
+            let arm = if coalesced {
+                "coalesced"
+            } else {
+                "partitioned"
+            };
             group.bench_function(format!("{}/{rows}rows/{arm}", shape.name), |b| {
                 b.iter_batched(
                     || {

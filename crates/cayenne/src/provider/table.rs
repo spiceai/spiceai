@@ -6994,8 +6994,12 @@ impl CayenneTableProvider {
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
-        let shard_count =
-            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes, write_class);
+        let shard_count = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            write_class,
+        );
         // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
         // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
         // Acquire permits for that clamped count so a `cayenne_write_concurrency`
@@ -7465,11 +7469,11 @@ impl CayenneTableProvider {
         // `compaction::maintenance_encode_shards`. Checked before the sort-column
         // and volume branches so the arm under test is unambiguous in the
         // write-shape counter.
-        if matches!(write_class, super::delta_encoding::WriteClass::Maintenance) {
-            if let Some(shards) = super::compaction::maintenance_encode_shards() {
-                self.record_write_shape("maintenance_pinned", shards);
-                return shards;
-            }
+        if matches!(write_class, super::delta_encoding::WriteClass::Maintenance)
+            && let Some(shards) = super::compaction::maintenance_encode_shards()
+        {
+            self.record_write_shape("maintenance_pinned", shards);
+            return shards;
         }
         // A sorted write must go through ONE writer, or the global order is
         // scattered across shard files and each file's zone maps span the whole
@@ -19390,10 +19394,6 @@ impl CayenneTableProvider {
     /// non-overlapping runs; a per-file rewrite maps one input file to output
     /// file(s) covering a SUBSET of that input's own key range, so non-overlap is
     /// preserved by construction rather than re-established by a single writer.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one rewrite shape's inputs; the alternative is a struct used at exactly one call site"
-    )]
     async fn bake_rewrite_per_file(
         &self,
         state: &datafusion::execution::session_state::SessionState,
@@ -19419,8 +19419,8 @@ impl CayenneTableProvider {
         }
 
         let bake_merge_write_start = Instant::now();
-        let outcome = match self.weak_self.get().and_then(std::sync::Weak::upgrade) {
-            Some(provider) => {
+        let outcome =
+            if let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) {
                 self.bake_rewrite_per_file_spawned(
                     &provider,
                     state,
@@ -19431,8 +19431,7 @@ impl CayenneTableProvider {
                     concurrency,
                 )
                 .await
-            }
-            None => {
+            } else {
                 // No `weak_self` — a provider never `Arc`-wrapped, i.e. the unit-test
                 // path. Rewrite the units inline: correct and identical in output,
                 // just not parallel.
@@ -19450,8 +19449,7 @@ impl CayenneTableProvider {
                     );
                 }
                 Ok(total)
-            }
-        };
+            };
         record_cayenne_write_phase(
             self.table_metadata.table_name.as_str(),
             "bake_merge_write",
@@ -39088,8 +39086,21 @@ mod tests {
         // requested writer count for parallel encode (no key clustering).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
-        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                None,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            4
+        );
+        let format = provider.write_shard_format(
+            4,
+            tsb,
+            None,
+            crate::provider::delta_encoding::WriteClass::Delta,
+        );
         let write_shard = format
             .write_shard()
             .expect("unsorted multi-writer config should enable write sharding");
@@ -39120,20 +39131,54 @@ mod tests {
         // count is capped at `snapshot_write_concurrency` = DEFAULT_WRITE_CONCURRENCY
         // (4) clamped to session_target_partitions (8) ⇒ 4.
         // A small exact delta (< one unit) stays a single file.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib), crate::provider::delta_encoding::WriteClass::Delta), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(2 * mib),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            1
+        );
         // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16
         // unit-shards, capped to the write-concurrency ceiling (4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib), crate::provider::delta_encoding::WriteClass::Delta), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(256 * mib),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            4
+        );
         // Mid-size flush: 48 MiB / 16 MiB = 3 shards (under the cap ⇒ unit-driven).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib), crate::provider::delta_encoding::WriteClass::Delta), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(48 * mib),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            3
+        );
         // A tiny configured target (≤ 16 MiB) keeps the old whole-file unit.
         let small_tsb = 8 * 1024 * 1024usize;
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(7 * mib), crate::provider::delta_encoding::WriteClass::Delta),
+            provider.snapshot_shard_count(
+                8,
+                small_tsb,
+                Some(7 * mib),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
             1
         );
         assert_eq!(
-            provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), crate::provider::delta_encoding::WriteClass::Delta),
+            provider.snapshot_shard_count(
+                8,
+                small_tsb,
+                Some(17 * mib),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
             2
         );
     }
@@ -39158,8 +39203,21 @@ mod tests {
         // output file is PK-clustered (tight per-file zone maps).
         // `estimated_bytes = None` ⇒ unknown size ⇒ full fan-out (prior behavior).
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
-        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                None,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            4
+        );
+        let format = provider.write_shard_format(
+            4,
+            tsb,
+            None,
+            crate::provider::delta_encoding::WriteClass::Delta,
+        );
         let write_shard = format
             .write_shard()
             .expect("keyed multi-writer config should enable write sharding");
@@ -39190,7 +39248,12 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
+        let format = provider.write_shard_format(
+            4,
+            tsb,
+            None,
+            crate::provider::delta_encoding::WriteClass::Delta,
+        );
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -39219,7 +39282,12 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let format = provider.write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta);
+        let format = provider.write_shard_format(
+            4,
+            tsb,
+            None,
+            crate::provider::delta_encoding::WriteClass::Delta,
+        );
         let write_shard = format
             .write_shard()
             .expect("multi-writer config should enable write sharding");
@@ -39255,10 +39323,23 @@ mod tests {
         // target-partition count. `estimated_bytes = None` ⇒ full fan-out, so
         // the override (2) is honored unclamped by size.
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 2);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                None,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            2
+        );
         assert_eq!(
             provider
-                .write_shard_format(4, tsb, None, crate::provider::delta_encoding::WriteClass::Delta)
+                .write_shard_format(
+                    4,
+                    tsb,
+                    None,
+                    crate::provider::delta_encoding::WriteClass::Delta
+                )
                 .write_shard()
                 .expect("override should enable write sharding")
                 .write_concurrency,
@@ -39283,10 +39364,23 @@ mod tests {
         // regardless of the size estimate, so pass a large `estimated_bytes`.
         let tsb = provider.context.target_file_size_bytes();
         let huge = Some(tsb as u64 * 64);
-        assert_eq!(provider.snapshot_shard_count(4, tsb, huge, crate::provider::delta_encoding::WriteClass::Delta), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                huge,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            1
+        );
         assert!(
             provider
-                .write_shard_format(4, tsb, huge, crate::provider::delta_encoding::WriteClass::Delta)
+                .write_shard_format(
+                    4,
+                    tsb,
+                    huge,
+                    crate::provider::delta_encoding::WriteClass::Delta
+                )
                 .write_shard()
                 .is_none(),
             "sorted writes fall back to the unsharded base format"
@@ -39313,13 +39407,23 @@ mod tests {
         // A few KiB — far below one 256 MiB target file.
         let small = Some(4 * 1024);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, small, crate::provider::delta_encoding::WriteClass::Delta),
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                small,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
             1,
             "a sub-target-file write must stay a single shard"
         );
         assert!(
             provider
-                .write_shard_format(4, tsb, small, crate::provider::delta_encoding::WriteClass::Delta)
+                .write_shard_format(
+                    4,
+                    tsb,
+                    small,
+                    crate::provider::delta_encoding::WriteClass::Delta
+                )
                 .write_shard()
                 .is_none(),
             "single-shard writes use the unsharded base format (no WriteShardConfig)"
@@ -39345,11 +39449,21 @@ mod tests {
         // clamp to 4.
         let large = Some(tsb as u64 * 100);
         assert_eq!(
-            provider.snapshot_shard_count(4, tsb, large, crate::provider::delta_encoding::WriteClass::Delta),
+            provider.snapshot_shard_count(
+                4,
+                tsb,
+                large,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
             4,
             "a write much larger than write_concurrency target files clamps to write_concurrency"
         );
-        let format = provider.write_shard_format(4, tsb, large, crate::provider::delta_encoding::WriteClass::Delta);
+        let format = provider.write_shard_format(
+            4,
+            tsb,
+            large,
+            crate::provider::delta_encoding::WriteClass::Delta,
+        );
         assert_eq!(
             format
                 .write_shard()
@@ -39382,19 +39496,56 @@ mod tests {
         let unit = (target / 16).clamp((16 * 1024 * 1024u64).min(target), target);
 
         // < 1 unit ⇒ 1 shard (need to *fill* a unit to earn a second).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1), crate::provider::delta_encoding::WriteClass::Delta), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit - 1),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            1
+        );
         // Exactly 1 unit ⇒ 1 shard.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit), crate::provider::delta_encoding::WriteClass::Delta), 1);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            1
+        );
         // 3 units' worth ⇒ 3 shards (below the concurrency cap of 4).
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3), crate::provider::delta_encoding::WriteClass::Delta), 3);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit * 3),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            3
+        );
         // 3.9 units' worth still floors to 3 shards.
         assert_eq!(
-            provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10), crate::provider::delta_encoding::WriteClass::Delta),
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit * 3 + unit * 9 / 10),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
             3
         );
         // 12 units' worth, but with no per-table override the default
         // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12), crate::provider::delta_encoding::WriteClass::Delta), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                8,
+                tsb,
+                Some(unit * 12),
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            4
+        );
     }
 
     #[tokio::test]
@@ -39416,10 +39567,23 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(6, tsb, None, crate::provider::delta_encoding::WriteClass::Delta), 4);
+        assert_eq!(
+            provider.snapshot_shard_count(
+                6,
+                tsb,
+                None,
+                crate::provider::delta_encoding::WriteClass::Delta
+            ),
+            4
+        );
         assert_eq!(
             provider
-                .write_shard_format(6, tsb, None, crate::provider::delta_encoding::WriteClass::Delta)
+                .write_shard_format(
+                    6,
+                    tsb,
+                    None,
+                    crate::provider::delta_encoding::WriteClass::Delta
+                )
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
@@ -40899,7 +41063,12 @@ mod tests {
             install_int64_deletes(&provider, &[(0, 15)]);
 
             let before_ids: Vec<String> = {
-                let mut v: Vec<String> = provider.protected_snapshots.load().keys().cloned().collect();
+                let mut v: Vec<String> = provider
+                    .protected_snapshots
+                    .load()
+                    .keys()
+                    .cloned()
+                    .collect();
                 v.sort();
                 v
             };
@@ -40991,17 +41160,16 @@ mod tests {
                 .bake_seq_prefix_protected_snapshots_with_shape(per_file)
                 .await
                 .expect("bake should not error");
-            assert!(baked, "{label}: the older prefix must bake (>= 2 snapshots)");
+            assert!(
+                baked,
+                "{label}: the older prefix must bake (>= 2 snapshots)"
+            );
 
             let rows = collect_id_value_pairs(&ctx, &provider, label).await;
             let tombstones = int64_tombstones(&provider);
             let mut surviving: Vec<(i64, i64)> = DELETES
                 .iter()
-                .filter_map(|(key, _)| {
-                    tombstones
-                        .get(*key)
-                        .map(|t| (*key, t.delete_sequence))
-                })
+                .filter_map(|(key, _)| tombstones.get(*key).map(|t| (*key, t.delete_sequence)))
                 .collect();
             surviving.sort_unstable();
             observed.push((label, rows, surviving, tombstones.delete_len()));

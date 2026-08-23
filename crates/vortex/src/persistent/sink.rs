@@ -699,8 +699,7 @@ fn start_file_writer(
     //
     // Deeper costs memory: at most `depth` `RecordBatch`es are resident per active
     // writer, on top of what the compressor holds.
-    let (sender, receiver) =
-        futures::channel::mpsc::channel::<RecordBatch>(sink_channel_depth());
+    let (sender, receiver) = futures::channel::mpsc::channel::<RecordBatch>(sink_channel_depth());
     let session = session.clone();
     let path_for_task = path.clone();
 
