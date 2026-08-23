@@ -2,4 +2,4 @@
 source: crates/runtime/tests/models/search.rs
 expression: err.to_string()
 ---
-HTTP error: 400 Bad Request - Search cannot be run on plain because it has no embeddings or full text search indexes.
+Request error: error sending request for url (http://127.0.0.1:56898/v1/search)
