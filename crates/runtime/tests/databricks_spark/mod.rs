@@ -32,8 +32,8 @@ use spicepod::{component::catalog::Catalog, param::Params};
 /// drift apart, the suites still compile while the connector rejects every Spark Connect
 /// dataset with `InvalidMode`, and only a run with live Databricks credentials would notice.
 ///
-/// This check needs none: it asserts the mode is advertised, and naming a
-/// `connector-databricks/spark`-only variant turns the drift into a compile error.
+/// This check needs none: it asserts the mode is advertised, and the guard below turns the
+/// drift into a compile error.
 #[test]
 fn databricks_advertises_the_spark_connect_mode_it_implements() {
     let advertises_spark_connect = connector_databricks::factory()
@@ -47,15 +47,16 @@ fn databricks_advertises_the_spark_connect_mode_it_implements() {
         advertises_spark_connect,
         "the databricks connector must advertise `spark_connect` among its `mode` values"
     );
-
-    // Compiles only while `connector-databricks/spark` is enabled alongside `runtime/spark`.
-    let _implemented: fn(connector_databricks::Error) -> bool = |err| {
-        matches!(
-            err,
-            connector_databricks::Error::UnableToConstructDatabricksSpark { .. }
-        )
-    };
 }
+
+/// Compiles only while `connector-databricks/spark` is enabled alongside `runtime/spark`:
+/// `UnableToConstructDatabricksSpark` exists only under that feature.
+const _: fn(connector_databricks::Error) -> bool = |err| {
+    matches!(
+        err,
+        connector_databricks::Error::UnableToConstructDatabricksSpark { .. }
+    )
+};
 
 fn make_catalog(path: &str, name: &str) -> Catalog {
     let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());
