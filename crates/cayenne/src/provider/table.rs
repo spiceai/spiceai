@@ -8452,6 +8452,42 @@ impl CayenneTableProvider {
         true
     }
 
+    /// Rows the source is expected to hold, from extended schema inference — known
+    /// BEFORE any data is loaded, and today used only to report bootstrap progress.
+    fn inferred_source_rows(&self) -> Option<usize> {
+        data_components::inferred_schema::InferredSchema::from_metadata(
+            self.table_schema().metadata(),
+        )
+        .row_count
+        .and_then(|rows| usize::try_from(rows).ok())
+    }
+
+    /// Whether an exact keyset for this table provably cannot fit its byte budget,
+    /// so the index should be built as a bloom from the start rather than grown to
+    /// the budget and converted.
+    ///
+    /// At SF1000 five tables each grow an exact keyset to its budget during LOAD and
+    /// then degrade — measured at ~11.9 GiB of keyset across the five and 2.5 minutes
+    /// of the load window, all of it discarded. The cardinality that makes the
+    /// outcome inevitable is already in hand before the first row arrives.
+    ///
+    /// Deliberately conservative in one direction. The estimate ignores the key's own
+    /// heap bytes, so it UNDERSTATES the true entry size and only answers `true` when
+    /// even that lower bound busts the budget — a table near the line still takes the
+    /// exact path and degrades if it must. An absent or zero inference, or a table
+    /// that needs exactness, keeps the current behaviour.
+    fn exact_keyset_provably_too_large(&self, budget_bytes: usize) -> bool {
+        if !self.upsert_bloom_eligible() {
+            return false;
+        }
+        let Some(rows) = self.inferred_source_rows().filter(|rows| *rows > 0) else {
+            return false;
+        };
+        // Lower bound on one entry: the map key, the value, and the slot overhead.
+        // The retained key's bytes are extra, hence a bound rather than an estimate.
+        rows.saturating_mul(super::pk_index::min_pk_keyset_entry_bytes()) > budget_bytes
+    }
+
     /// Whether to preserve a bloomed sharded PK index across a relocation-only
     /// invalidation (a mem-tier/inline checkpoint moving rows between locations, or a
     /// compaction rewriting files) instead of dropping it.
@@ -8842,11 +8878,26 @@ impl CayenneTableProvider {
         *self.pk_keyset_cache.lock() = Some(CachedPkIndex::Exact(CachedPkKeyset::with_capacity(0)));
         let shards = self.mem_tier_shard_count();
         if shards > 1 {
-            let keysets: Vec<CachedPkKeyset> = (0..shards)
-                .map(|_| CachedPkKeyset::with_capacity(0))
-                .collect();
-            *self.sharded_pk_keyset_cache.lock() =
-                Some(ShardedPkIndex::Exact(keysets.into_boxed_slice()));
+            let budget = self.effective_sharded_keyset_budget();
+            let index = if self.exact_keyset_provably_too_large(budget) {
+                // Skip the exact phase entirely: this table cannot fit, so growing a
+                // keyset to the budget only to convert it is pure waste — and it is
+                // paid during LOAD, where it competes with the bootstrap it delays.
+                ShardedPkIndex::blooms_for(
+                    shards,
+                    self.inferred_source_rows().unwrap_or(0),
+                    budget / shards.max(1),
+                )
+            } else {
+                ShardedPkIndex::Exact(
+                    (0..shards)
+                        .map(|_| CachedPkKeyset::with_capacity(0))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
+            };
+            self.sample_sharded_index_shape(&index);
+            *self.sharded_pk_keyset_cache.lock() = Some(index);
         }
         // A fresh empty exact keyset has no stale stamps to distrust.
         self.pk_keyset_occ_degraded.store(false, Ordering::Release);

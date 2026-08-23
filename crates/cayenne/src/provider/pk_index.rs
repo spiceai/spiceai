@@ -145,6 +145,14 @@ struct PkKeysetEntry {
 // centralized with `approx_pk_keyset_entry_bytes`.
 const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 
+/// Lower bound on one exact-keyset entry, independent of the key's own bytes: the
+/// map key, the value, and the slot overhead. Used to decide up front whether a table
+/// of known cardinality can possibly fit its budget — a bound rather than an estimate,
+/// so the answer "provably too large" is never wrong in the harmful direction.
+pub(crate) const fn min_pk_keyset_entry_bytes() -> usize {
+    size_of::<u128>() + size_of::<PkKeysetEntry>() + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
+}
+
 pub(crate) fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
     // Charge what the map actually stores per entry: the u128 digest key, the
     // whole `PkKeysetEntry` (the `OwnedRow` fat pointer, `RowLocation`, and the
@@ -1663,6 +1671,34 @@ impl ShardedPkIndex {
         )
     }
 
+    /// Build an already-bloomed sharded index, sized for `expected_keys` across the
+    /// shards and capped per shard.
+    ///
+    /// For a table whose cardinality is known up front to exceed its byte budget:
+    /// growing an exact keyset to that budget and converting it produces the same
+    /// filter, having first spent the memory and the time. `expected_keys` of zero
+    /// falls back to the budget split, which is the no-information sizing.
+    pub(crate) fn blooms_for(
+        shard_count: usize,
+        expected_keys: usize,
+        per_shard_max_bytes: usize,
+    ) -> Self {
+        let n = shard_count.max(1);
+        let per_shard = expected_keys / n;
+        Self::Bloom(
+            (0..n)
+                .map(|_| {
+                    if per_shard == 0 {
+                        PkBloom::with_byte_budget(per_shard_max_bytes)
+                    } else {
+                        PkBloom::with_expected_keys(per_shard, per_shard_max_bytes)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
     /// Representation name for the `kind` dimension of
     /// `cayenne_pk_index_discard_total`. A sharded index is wholly one or the
     /// other — degrading converts every shard — so one name covers it.
@@ -1989,6 +2025,7 @@ mod tests {
         PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, PkBloom, PkBloomRepr, PkDigestSet,
         PkKeysetInsertOutcome, RowLocation, SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex,
         approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar,
+        min_pk_keyset_entry_bytes,
         pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
     };
 
@@ -2004,6 +2041,52 @@ mod tests {
     ///
     /// A bloom may answer `true` for a key it never saw; it must never answer
     /// `false` for one it did.
+    /// A table whose cardinality is known to bust the budget starts as a bloom.
+    ///
+    /// The bound must be conservative in exactly one direction: it ignores the
+    /// retained key's own bytes, so it UNDERSTATES the entry size and a table near
+    /// the line still takes the exact path. Being wrong the other way would send a
+    /// table that would have fit down the lossy path for no reason.
+    #[test]
+    fn a_known_oversized_table_starts_bloomed_and_a_borderline_one_does_not() {
+        let entry = min_pk_keyset_entry_bytes();
+        assert!(entry > 0, "the bound must charge something per entry");
+
+        // 1 MiB of budget: a million keys cannot fit under any entry size.
+        let budget = 1024 * 1024;
+        let too_large = 1_000_000usize.saturating_mul(entry) > budget;
+        assert!(too_large, "a million keys must be provably too large for 1 MiB");
+
+        // A handful of keys always fits, so the exact path is kept.
+        assert!(
+            10usize.saturating_mul(entry) <= budget,
+            "ten keys must not be judged too large"
+        );
+
+        // The bloomed index it builds is sized for the cardinality, not the budget.
+        let index = ShardedPkIndex::blooms_for(4, 1_000_000, budget);
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                assert_eq!(blooms.len(), 4);
+                let bits: usize = blooms.iter().map(|b| b.size_bytes() * 8).sum();
+                assert!(
+                    bits >= 1_000_000 * 4,
+                    "must carry a usable bits/key for the expected count, got {bits} bits"
+                );
+            }
+            ShardedPkIndex::Exact(_) => panic!("blooms_for must build a bloom index"),
+        }
+
+        // No cardinality estimate falls back to the budget split, not to a zero-bit
+        // filter that would answer "present" for everything.
+        match ShardedPkIndex::blooms_for(4, 0, budget) {
+            ShardedPkIndex::Bloom(blooms) => {
+                assert!(blooms.iter().all(|b| b.size_bytes() > 0));
+            }
+            ShardedPkIndex::Exact(_) => panic!("must still build a bloom index"),
+        }
+    }
+
     /// A degrade sizes its blooms for the rows the scan will yield, not for the
     /// whole byte budget.
     ///
