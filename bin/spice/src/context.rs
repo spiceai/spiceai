@@ -799,8 +799,10 @@ impl RuntimeContext {
 /// `spice install` and `spice upgrade` only ever write to `$HOME/.spice/bin`,
 /// but a `spiced` beside the CLI, on `PATH`, or pinned outranks it — so an
 /// upgrade can report success while every later `spice run` keeps starting the
-/// old binary. Silence there is the worst outcome: the user has done the thing
-/// that was supposed to fix their problem.
+/// old binary. The same silence hides the other two ways the install fails to
+/// take effect: resolution erroring, and the written file failing the runnable
+/// check so that nothing resolves at all. Silence on any of them is the worst
+/// outcome: the user has done the thing that was supposed to fix their problem.
 pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
     if let Some(warning) = install_shadow_warning(&ctx.spiced_path(), &ctx.resolve_spiced()) {
         tracing::warn!("{warning}");
@@ -818,9 +820,11 @@ fn install_shadow_warning(
     resolved: &Result<Option<ResolvedSpiced>>,
 ) -> Option<String> {
     match resolved {
-        // Nothing outranks the managed install and nothing else exists, so the
-        // file just written is the file that will run.
-        Ok(None) => None,
+        // The managed install is itself a rung, so nothing resolving means that
+        // install failed the runnable check — absent, not a file, or without an
+        // execute bit — and no other rung supplies a runtime either. The caller
+        // has already reported success, so this is the only account of it.
+        Ok(None) => Some(unusable_install_warning(installed)),
         // Compared by path rather than by source: the question here is whether
         // the managed install is the file that will run, which is not the same
         // question as whether the source is worth announcing at launch.
@@ -862,6 +866,23 @@ fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> Stri
     let source = resolved.source.describe();
     format!(
         "The managed runtime is at '{installed}', but 'spice run' will start '{selected}' ({source}) instead, so installing or upgrading the managed one has no effect. Remove that binary, or set `SPICED_PATH` to '{installed}' to pin the managed install. See: https://spiceai.org/docs/cli"
+    )
+}
+
+/// The wording of [`warn_if_install_is_shadowed`]'s nothing-resolved arm.
+///
+/// Reached only when the managed install itself fails the runnable check:
+/// [`resolve_spiced`] answers with that install whenever it is runnable, so a
+/// `None` here says the file the caller just reported cannot be started and no
+/// other rung holds one either. `spice run` treats it as the signal to install,
+/// which is why the consequence is a repeat download rather than an error.
+///
+/// Carries a remedy of its own, unlike [`unselectable_install_warning`]: there
+/// is no nested error here to name one.
+fn unusable_install_warning(installed: &Path) -> String {
+    let installed = installed.display();
+    format!(
+        "The managed runtime at '{installed}' cannot be started — the path is missing, is not a file, or is not executable — so the next 'spice run' will install the runtime again rather than use this one. Re-run 'spice install --force', or restore execute permission on '{installed}'. See: https://spiceai.org/docs/cli"
     )
 }
 
@@ -1581,24 +1602,31 @@ mod tests {
         assert!(PathBuf::from(&home).is_dir(), "{home}");
     }
 
-    /// The runtime the CLI ships beside, on `PATH`, or in the managed install
-    /// directory: whichever of them exists, the context must find one.
+    /// A real runtime written into a context's own bin dir must satisfy the
+    /// production runnable predicate and win the managed rung.
     ///
-    /// Deliberately asserts *that* a runtime resolves rather than which rung
-    /// supplied it — the host running this suite has a `PATH` and a
-    /// `current_exe` of its own, and pinning the rung here would make the test
-    /// a statement about the developer's machine. The ordering is tested
-    /// against [`resolve_spiced`] directly, where every rung is injected.
+    /// The ladder is injected rather than read off the host — going through
+    /// [`RuntimeContext::resolve_spiced`] would consult the process-wide
+    /// `SPICED_PATH`, `PATH` and `current_exe`, so a developer or runner with a
+    /// pin of their own would decide the outcome, and a pin naming nothing
+    /// runnable would fail the test over an install that is perfectly valid.
+    /// What stays uninjected is [`is_runnable_binary`] itself: the point here is
+    /// that the file the fixture wrote passes the predicate production uses.
     #[test]
     fn a_context_with_an_install_in_its_own_bin_dir_finds_a_runtime() {
         let (ctx, _temp) = create_test_context_with_runtime();
-        assert!(
-            ctx.resolve_spiced()
-                .expect("no SPICED_PATH is set")
-                .is_some(),
-            "an install in this context's own bin dir must resolve"
-        );
+        let managed = ctx.spiced_path();
         assert!(ctx.is_managed_runtime_installed());
+
+        let found = expect_resolved(ladder_with(
+            &[],
+            None,
+            None,
+            managed.to_str().expect("the test install path is UTF-8"),
+            &is_runnable_binary,
+        ));
+        assert_eq!(found.path, managed);
+        assert_eq!(found.source, SpicedSource::ManagedInstall);
     }
 
     /// Build a [`SpicedLookup`] over an invented host: `present` is the set of
@@ -2232,13 +2260,41 @@ mod tests {
         );
     }
 
-    /// No candidate at all means the install just written is the only runtime
-    /// there is, so there is nothing to warn about.
+    /// No candidate at all is not "the install is the only runtime there is":
+    /// the managed install is a rung, so nothing resolving means that file
+    /// failed the runnable check. The caller has already reported success.
     #[test]
-    fn nothing_resolved_is_not_a_shadowed_install() {
+    fn nothing_resolved_means_the_managed_install_cannot_be_started() {
+        let installed = PathBuf::from("/home/me/.spice/bin/spiced");
         assert_eq!(
-            install_shadow_warning(Path::new("/home/me/.spice/bin/spiced"), &Ok(None)),
-            None
+            install_shadow_warning(&installed, &Ok(None)),
+            Some(unusable_install_warning(&installed)),
+            "an install nothing can start must be reported, not returned from silently"
+        );
+    }
+
+    /// The line is the only warning a user gets that `spice install` wrote a
+    /// file no `spice run` can start — so it has to name that file, say what
+    /// happens next, and give a way out.
+    #[test]
+    fn the_unusable_install_warning_names_the_install_and_a_way_out() {
+        let warning = unusable_install_warning(Path::new("/home/me/.spice/bin/spiced"));
+
+        assert!(
+            warning.contains("/home/me/.spice/bin/spiced"),
+            "the warning must name the install it is about: {warning}"
+        );
+        assert!(
+            warning.contains("install the runtime again"),
+            "the warning must state the consequence, not just the failure: {warning}"
+        );
+        assert!(
+            warning.contains("spice install --force"),
+            "the warning must give a way out: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs"),
+            "the warning must link the docs: {warning}"
         );
     }
 
