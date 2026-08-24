@@ -181,7 +181,7 @@ pub struct DataFile {
 /// Delivery reconciles a marked key to the federated source by acting on this
 /// recorded intent. A key a committed `DELETE` removed is marked
 /// [`WriteBackOp::Delete`] and delivered as a source delete; every other marker
-/// is an [`WriteBackOp::Upsert`] of the key's current committed value. Delivery
+/// is a [`WriteBackOp::Upsert`] of the key's current committed value. Delivery
 /// never infers a delete from a key being absent in the accelerator, because
 /// absence has causes other than deletion — a retention prune, or a read that
 /// could not see the row — and turning those into source deletes destroys rows

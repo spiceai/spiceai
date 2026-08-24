@@ -32,7 +32,10 @@ limitations under the License.
 //!    - a key the read did not return, marked [`WriteBackOp::Delete`], is
 //!      deleted at the source;
 //!    - a key the read did not return, marked [`WriteBackOp::Upsert`], is not
-//!      delivered at all (see [`classify_delivery`]).
+//!      delivered at all (see [`classify_delivery`]);
+//!    - a key the read DID return, marked [`WriteBackOp::Delete`], is deferred
+//!      to the next pass with its marker intact, because a commit publishes its
+//!      marker before the delete is scan-visible (see [`classify_delivery`]).
 //!
 //!    If the source cannot do a native upsert (it answers `Replace` with
 //!    `NotImplemented`), delivery falls back to a delete-then-insert emulation
@@ -71,7 +74,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::record_batch::RecordBatch;
 use cayenne::{CayenneTableProvider, PendingWriteBackMarker, WriteBackOp};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -211,7 +214,19 @@ impl WriteBackWorker {
         // and whether the post-claim read still returned it.
         let pk_col = self.pk_columns[0].as_str();
         let plan = classify_delivery(pk_col, &claimed, &pk_values, &current)?;
+        // The read returns the deferred keys' rows too; they must not be
+        // upserted, so drop them before anything is delivered.
+        let current = retain_deliverable_rows(pk_col, &current, &plan.deferred)?;
         let has_present = current.iter().any(|batch| batch.num_rows() > 0);
+
+        if !plan.deferred.is_empty() {
+            tracing::debug!(
+                dataset = %self.dataset_name,
+                keys = plan.deferred.len(),
+                "durable write-back: {} key(s) marked deleted are still readable in the accelerator; leaving their markers for the next pass rather than guessing between a re-created row and a delete that is committed but not yet visible",
+                plan.deferred.len(),
+            );
+        }
 
         if !plan.undelivered.is_empty() {
             tracing::warn!(
@@ -288,12 +303,14 @@ impl WriteBackWorker {
         // that has been superseded, and keeping it would grow the dirty set
         // without bound while re-warning every pass. A commit that re-dirtied the
         // key during this pass bumped its sequence above what was claimed, so its
-        // marker survives the clear and is delivered next pass.
+        // marker survives the clear and is delivered next pass. Deferred keys are
+        // excluded outright: their delete has not been delivered, so clearing
+        // their marker would lose it (see `classify_delivery`).
         self.provider
-            .clear_dirty_keys(&claimed)
+            .clear_dirty_keys(&plan.clearable)
             .await
             .map_err(to_df_err)?;
-        Ok(claimed.len())
+        Ok(plan.clearable.len())
     }
 }
 
@@ -306,6 +323,39 @@ fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
     Ok(col(pk_col).in_list(list, false))
 }
 
+/// Drop the deferred keys' rows from the accelerator read, so the upsert
+/// delivers only what this pass classified as present. The read is filtered by
+/// primary key alone, so it returns the deferred keys' rows too, and upserting
+/// one would push a row the user deleted back to the source.
+fn retain_deliverable_rows(
+    pk_col: &str,
+    current: &[RecordBatch],
+    deferred: &[ScalarValue],
+) -> DataFusionResult<Vec<RecordBatch>> {
+    if deferred.is_empty() {
+        return Ok(current.to_vec());
+    }
+    let deferred: HashSet<&ScalarValue> = deferred.iter().collect();
+    let mut kept = Vec::with_capacity(current.len());
+    for batch in current {
+        let Some(column) = batch.column_by_name(pk_col) else {
+            return Err(DataFusionError::Execution(format!(
+                "durable write-back: primary-key column '{pk_col}' missing from the accelerator read"
+            )));
+        };
+        let mut mask = Vec::with_capacity(column.len());
+        for row in 0..column.len() {
+            let key = ScalarValue::try_from_array(column.as_ref(), row)?;
+            mask.push(!deferred.contains(&key));
+        }
+        let filtered = arrow::compute::filter_record_batch(batch, &BooleanArray::from(mask))?;
+        if filtered.num_rows() > 0 {
+            kept.push(filtered);
+        }
+    }
+    Ok(kept)
+}
+
 /// What one delivery pass should do with each claimed key.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct DeliveryPlan {
@@ -316,20 +366,44 @@ pub(crate) struct DeliveryPlan {
     /// Keys the read did not return that no committed `DELETE` marked. Nothing
     /// is delivered for these — see the module's "Absence is not a delete".
     pub(crate) undelivered: Vec<ScalarValue>,
+    /// Keys marked deleted that the read still returned. Nothing is delivered
+    /// for these and their markers must NOT be cleared — see
+    /// [`classify_delivery`].
+    pub(crate) deferred: Vec<ScalarValue>,
+    /// The claimed markers this pass may clear once it has delivered: every
+    /// claimed marker except the deferred ones.
+    pub(crate) clearable: Vec<PendingWriteBackMarker>,
 }
 
 /// Decide what to deliver for each claimed key.
 ///
-/// A key the read returned is upserted with its current value, whatever its
-/// marker says: the read is the authority on the value, and a delete marker
-/// whose key is present again means a later commit re-created it (that commit
-/// bumped the marker, so this pass's clear leaves it for the next one).
+/// A key the read returned whose marker records an [`WriteBackOp::Upsert`] is
+/// upserted with that value: the read is the authority on the value.
 ///
 /// A key the read did not return is deleted at the source **only** when its
 /// marker records a [`WriteBackOp::Delete`]. Absence on its own proves nothing:
 /// a retention prune or a read that could not see the row looks identical to a
 /// deletion, and deleting on that evidence destroys rows nobody deleted — which
 /// is why this returns them as `undelivered` rather than as deletes.
+///
+/// A key the read returned whose marker records a [`WriteBackOp::Delete`] is
+/// **deferred**: nothing is delivered and its marker is withheld from the clear,
+/// because the two things that produce this combination are indistinguishable
+/// here and one of them is destructive to guess at.
+///
+/// * A later commit re-created the key. That commit bumped the marker above the
+///   claimed sequence, so the clear would no-op for it anyway and the next pass
+///   delivers the new value — deferring costs one pass of latency.
+/// * The delete is committed but not yet scan-visible. A commit publishes its
+///   marker to the metastore before the caches and the in-memory tier reflect
+///   the delete, and delivery takes no lock against a writer, so a pass landing
+///   in that window reads the deleted row as still present. Upserting it and
+///   clearing the marker would drop the delete permanently: the accelerator
+///   goes on to remove the row while the source keeps it, with no marker left
+///   to reconcile them.
+///
+/// Deferring converges in both cases on the next pass, so it cannot grow the
+/// dirty set without bound.
 ///
 /// `claimed` and `claimed_pks` are parallel: `claimed_pks[i]` is the decoded key
 /// of `claimed[i]`.
@@ -362,14 +436,17 @@ pub(crate) fn classify_delivery(
     let mut plan = DeliveryPlan::default();
     for (index, marker) in claimed.iter().enumerate() {
         let key = ScalarValue::try_from_array(claimed_pks.as_ref(), index)?;
-        if present.contains(&key) {
-            plan.present.push(key);
-        } else {
-            match marker.op {
-                WriteBackOp::Delete => plan.deleted.push(key),
-                WriteBackOp::Upsert => plan.undelivered.push(key),
+        match (present.contains(&key), marker.op) {
+            (true, WriteBackOp::Upsert) => plan.present.push(key),
+            (true, WriteBackOp::Delete) => {
+                plan.deferred.push(key);
+                // Withheld from `clearable`: this marker must survive the pass.
+                continue;
             }
+            (false, WriteBackOp::Delete) => plan.deleted.push(key),
+            (false, WriteBackOp::Upsert) => plan.undelivered.push(key),
         }
+        plan.clearable.push(marker.clone());
     }
     Ok(plan)
 }
@@ -437,6 +514,8 @@ mod tests {
                 present: vec![],
                 deleted: vec![],
                 undelivered: scalars(&[1]),
+                deferred: vec![],
+                clearable: claimed,
             },
             "an absent upsert-marked key must be reported as undelivered, never deleted"
         );
@@ -452,18 +531,59 @@ mod tests {
         assert!(plan.present.is_empty() && plan.undelivered.is_empty());
     }
 
-    /// A delete marker whose key the read returned means a later commit
-    /// re-created the row; delivering the delete would erase that newer write.
+    /// A delete-marked key the read still returned is ambiguous — a later
+    /// commit re-created it, or the delete is committed but not yet
+    /// scan-visible — so the pass delivers nothing and keeps the marker.
+    ///
+    /// Clearing it would lose the delete outright in the second case: the
+    /// accelerator goes on to remove the row while the source keeps it, with no
+    /// marker left to reconcile them.
     #[test]
-    fn a_present_key_is_upserted_even_when_its_marker_says_delete() {
+    fn a_present_key_whose_marker_says_delete_is_deferred_with_its_marker_kept() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
         let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
             .expect("classification succeeds");
 
-        assert_eq!(plan.present, scalars(&[1]));
+        assert_eq!(plan.deferred, scalars(&[1]));
         assert!(
             plan.deleted.is_empty(),
             "a key the accelerator still holds must not be deleted at the source"
+        );
+        assert!(
+            plan.present.is_empty(),
+            "a deleted key must not be upserted back to the source"
+        );
+        assert!(
+            plan.clearable.is_empty(),
+            "the marker must survive the pass so the delete is delivered once it is visible"
+        );
+    }
+
+    /// The deferred key's row is dropped from what the upsert delivers — the
+    /// read is filtered by primary key alone, so it returns that row too.
+    #[test]
+    fn a_deferred_key_is_dropped_from_the_rows_delivered_as_upserts() {
+        let deliverable =
+            super::retain_deliverable_rows(PK_COL, &read_returning(&[1, 2]), &scalars(&[2]))
+                .expect("filtering succeeds");
+
+        let remaining: Vec<i64> = deliverable
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name(PK_COL)
+                    .expect("the key column is present")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("an Int64 key column")
+                    .clone();
+                (0..column.len()).map(move |row| column.value(row))
+            })
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![1],
+            "only the non-deferred key's row may be upserted"
         );
     }
 
@@ -477,15 +597,15 @@ mod tests {
         assert!(plan.deleted.is_empty() && plan.undelivered.is_empty());
     }
 
-    /// One pass mixes all three outcomes; the upsert and delete sets must stay
+    /// One pass mixes every outcome; the upsert and delete sets must stay
     /// disjoint so the two deliveries cannot fight over a key.
     #[test]
     fn a_mixed_batch_splits_into_disjoint_upserts_and_deletes() {
         let claimed = vec![
-            marker(1, WriteBackOp::Upsert), // present
+            marker(1, WriteBackOp::Upsert), // present → upsert
             marker(2, WriteBackOp::Delete), // absent → delete
             marker(3, WriteBackOp::Upsert), // absent → undelivered
-            marker(4, WriteBackOp::Delete), // present → upsert (re-created)
+            marker(4, WriteBackOp::Delete), // present → deferred
         ];
         let plan = classify_delivery(
             PK_COL,
@@ -495,9 +615,19 @@ mod tests {
         )
         .expect("classification succeeds");
 
-        assert_eq!(plan.present, scalars(&[1, 4]));
+        assert_eq!(plan.present, scalars(&[1]));
         assert_eq!(plan.deleted, scalars(&[2]));
         assert_eq!(plan.undelivered, scalars(&[3]));
+        assert_eq!(plan.deferred, scalars(&[4]));
+        assert_eq!(
+            plan.clearable,
+            vec![
+                marker(1, WriteBackOp::Upsert),
+                marker(2, WriteBackOp::Delete),
+                marker(3, WriteBackOp::Upsert),
+            ],
+            "every marker except the deferred one may be cleared"
+        );
         for key in &plan.deleted {
             assert!(
                 !plan.present.contains(key),

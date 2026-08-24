@@ -2743,23 +2743,13 @@ impl CayenneAccelerator {
     }
 }
 
-/// Registration-time validation for datalake (cold) tier table options: the
-/// misconfigurations rejected here would otherwise leave the tier silently
-/// inert (a promoter that early-returns forever) or unsafe (a GC grace of
-/// zero). A no-op when the tier is disabled.
-///
-/// Returns `Err(message)` for configurations that must fail registration and
-/// `Ok(warnings)` for configurations that register but degrade — including a
-/// PK-less table, where the tier stays INACTIVE rather than failing (the
-/// dataset is fully serviceable from the warm tier, so a fleet-wide datalake
-/// location must not block PK-less datasets).
-/// Pure (no I/O, no logging) so each rule stays unit-testable.
 /// Reject configurations under which durable write-back could not deliver a
 /// user `DELETE` to the federated source: delete markers are key-addressed, so
 /// the table must use key-based deletes — position deletes are file-position
 /// scoped and cannot express them. `auto` already resolves to `key` for CDC
 /// tables with a primary key (which durable write-back implies), so only an
 /// explicit `position` conflicts.
+///
 /// Pure (no I/O, no logging) so the rule stays unit-testable.
 fn validate_durable_write_back_table_options(
     table_name: &str,
@@ -2774,6 +2764,17 @@ fn validate_durable_write_back_table_options(
     Ok(())
 }
 
+/// Registration-time validation for datalake (cold) tier table options: the
+/// misconfigurations rejected here would otherwise leave the tier silently
+/// inert (a promoter that early-returns forever) or unsafe (a GC grace of
+/// zero). A no-op when the tier is disabled.
+///
+/// Returns `Err(message)` for configurations that must fail registration and
+/// `Ok(warnings)` for configurations that register but degrade — including a
+/// PK-less table, where the tier stays INACTIVE rather than failing (the
+/// dataset is fully serviceable from the warm tier, so a fleet-wide datalake
+/// location must not block PK-less datasets).
+/// Pure (no I/O, no logging) so each rule stays unit-testable.
 fn validate_datalake_table_options(
     table_name: &str,
     options: &cayenne::metadata::CreateTableOptions,
