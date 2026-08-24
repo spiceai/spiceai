@@ -1,9 +1,0 @@
----
-source: crates/test-framework/src/spicetest/datasets/worker.rs
-description: "Query: clickbench_q5"
----
-+-----------------------------+
-| count(DISTINCT hits.UserID) |
-+-----------------------------+
-| 9908497                     |
-+-----------------------------+

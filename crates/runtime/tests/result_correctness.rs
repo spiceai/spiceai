@@ -37,6 +37,12 @@ limitations under the License.
 // real; fixture values are far inside f64's exact-integer range.
 #![allow(clippy::cast_precision_loss)]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

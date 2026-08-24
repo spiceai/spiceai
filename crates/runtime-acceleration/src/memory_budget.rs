@@ -44,6 +44,7 @@ limitations under the License.
 //! warns when it engages.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, RwLock};
 
 /// Share (%) of the splittable query region handed to the query pool when it is
 /// contested with un-limited `DuckDB` instances; the remainder is split equally
@@ -119,6 +120,49 @@ fn format_duckdb_memory_limit(bytes: u64) -> Option<String> {
 #[must_use]
 pub fn duckdb_total_reservation_bytes() -> u64 {
     DUCKDB_TOTAL_RESERVATION_BYTES.load(Ordering::Relaxed)
+}
+
+/// The operator's `cayenne_footer_cache_mb`, published for the Cayenne engine to read.
+///
+/// Holds the `Option` itself rather than an integer with a reserved "absent" value: the
+/// runtime parameter accepts `max` (and `usize::MAX`) as a real setting, so any sentinel
+/// drawn from the value space collides with a value an operator can actually write. A
+/// lock is affordable because this is read once per engine construction, at startup.
+static CAYENNE_FOOTER_CACHE_MB: RwLock<Option<usize>> = RwLock::new(None);
+
+/// Publishes `runtime.params.cayenne_footer_cache_mb` for the engine.
+///
+/// The engine is built by its registration constructor, which takes no arguments, so a
+/// setting resolved from the Spicepod cannot be passed in — it is published here and read
+/// at construction instead. **Must run before the accelerator engines are registered**,
+/// or the engine is built before the value exists and silently uses its default.
+pub fn publish_cayenne_footer_cache_mb(footer_cache_mb: Option<usize>) {
+    *CAYENNE_FOOTER_CACHE_MB
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = footer_cache_mb;
+}
+
+/// Serializes publishing the setting above with constructing the engines that read it.
+///
+/// The value is process-global because a registration constructor takes no arguments,
+/// while the registry it fills is per-`Runtime`. Two `Runtime`s built concurrently in one
+/// process — embedded hosts, and any test binary that builds more than one — could
+/// otherwise both publish before either constructs, leaving one runtime's engine holding
+/// the other's setting. Holding this across the registration pass makes the pair behave as
+/// if the setting were per-`Runtime`: a constructed engine owns its own copy, so a later
+/// publish cannot reach it.
+#[must_use]
+pub fn engine_construction_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &LOCK
+}
+
+/// The published `cayenne_footer_cache_mb`, or `None` when the operator set none.
+#[must_use]
+pub fn cayenne_footer_cache_mb() -> Option<usize> {
+    *CAYENNE_FOOTER_CACHE_MB
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A deduped-by-instance summary of the `DuckDB` accelerators in an app. Built by a
@@ -356,6 +400,32 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
+
+    /// Every value an operator can write must survive the round trip, including the ends
+    /// of the range. `runtime.params.cayenne_footer_cache_mb` accepts `max` as a real
+    /// setting, so a sentinel taken from the value space would report the largest cache
+    /// an operator can ask for as "nothing was configured", and the engine would quietly
+    /// use its default while the rest of the runtime honoured the request.
+    ///
+    /// Runs single-threaded: the published value is process-global by design, so a
+    /// concurrent sibling would race it.
+    #[test]
+    fn a_published_footer_cache_size_survives_the_round_trip() {
+        use super::{cayenne_footer_cache_mb, publish_cayenne_footer_cache_mb};
+
+        for published in [None, Some(0), Some(1), Some(512), Some(usize::MAX)] {
+            publish_cayenne_footer_cache_mb(published);
+            assert_eq!(
+                cayenne_footer_cache_mb(),
+                published,
+                "publishing {published:?} must read back unchanged"
+            );
+        }
+
+        // Leave nothing published, so an engine constructed later in this process is not
+        // handed this test's last value.
+        publish_cayenne_footer_cache_mb(None);
+    }
 
     /// Bare-metal-equivalent `plan()` where host RAM == cgroup total, so `DuckDB`'s
     /// per-instance default is `total * 80 / 100`.

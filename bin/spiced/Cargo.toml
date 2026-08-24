@@ -109,6 +109,9 @@ util = { path = "../../crates/util"}
 # Vortex ships on non-Windows targets only (matching `runtime`'s gate on
 # Cayenne), so the startup parallelism declaration is gated the same way.
 [target.'cfg(not(windows))'.dependencies]
+# The Cayenne engine is not built on Windows, so it is a target dependency rather
+# than an optional one behind a feature.
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
 
 # Non-default features should be added to `lint-rust` make target.
