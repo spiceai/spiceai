@@ -9,6 +9,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb" }
+# Not built on Windows, so a target dependency rather than an unconditional one.
+accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres" }
+accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
+accelerator-turso = { path = "../../crates/accelerators/accelerator-turso" }
+data-connector-api = { path = "../../crates/data-connector-api" }
 schemars.workspace = true
 serde.workspace = true
 serde_json = "1"
@@ -80,7 +86,11 @@ connector-smb = { path = "../../crates/data-connectors/connector-smb" }
 connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake" }
 connector-spark = { path = "../../crates/data-connectors/connector-spark" }
 
+data-accelerator-api = { path = "../../crates/data-accelerator-api" }
 runtime-parameters = { path = "../../crates/runtime-parameters" }
 
 [lints]
 workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }

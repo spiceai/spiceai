@@ -19,8 +19,8 @@
 //!
 //! | Engine | Crate | Spice accelerator counterpart |
 //! |--------|-------|-------------------------------|
-//! | DuckDB | `duckdb` | `runtime::dataaccelerator::duckdb` |
-//! | SQLite | `rusqlite` | `runtime::dataaccelerator::sqlite` |
+//! | DuckDB | `duckdb` | `accelerator_duckdb` |
+//! | SQLite | `rusqlite` | `accelerator_sqlite` |
 //! | chDB   | `chdb-rust` | (none — ClickHouse-compatible reference only) |
 //!
 //! Correctness matrix:

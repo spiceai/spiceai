@@ -23,11 +23,12 @@ use super::{
         aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
+use crate::dataconnector::ConnectorContext;
 
 use app::App;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 
@@ -208,10 +209,11 @@ impl DataConnectorFactory for S3Factory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
@@ -282,7 +284,7 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let app = params.app();
+            let app = Some(context.app());
             let s3 = S3 {
                 params: params.parameters,
                 app,
@@ -316,6 +318,12 @@ impl ListingTableConnector for S3 {
         Some(ObjectVersionType::Version)
     }
 
+    /// S3 returns a stable `ETag` (and, with versioning enabled, a version ID) on
+    /// `HEAD`, so an unchanged object can be served from cache.
+    fn supports_single_file_version_cache(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -330,7 +338,7 @@ impl ListingTableConnector for S3 {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -368,7 +376,7 @@ impl ListingTableConnector for S3 {
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
@@ -415,7 +423,7 @@ impl ListingTableConnector for S3 {
     }
 }
 
-register_data_connector!("s3", S3Factory);
+data_connector_api::register_data_connector!("s3", S3Factory);
 
 #[cfg(test)]
 mod tests {

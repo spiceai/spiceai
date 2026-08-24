@@ -1966,20 +1966,31 @@ impl RefreshTask {
             "run must contain at least one envelope"
         );
 
+        // Runs before the heartbeat retain below: a signal may ride a zero-row
+        // envelope, which the retain would otherwise strip — and the rebuild
+        // would never happen. See `trim_to_rebuild_signal` for why the prefix
+        // goes with it.
+        let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
+
+        // Read after the trim and before the retain. After, because a readiness
+        // flag from a discarded envelope must not reach `signal_dataset_ready`,
+        // which wakes everything blocked on initial load using a flag describing
+        // a source state the rebuild is about to replace. That narrows, but does
+        // not close, the stale-serving window: on the `history_unavailable` path
+        // the dataset becomes Ready regardless, because `rebuild_from_source` is
+        // the ordinary full refresh and `RefreshTask::run` sets `Ready` (and with
+        // it `initial_load_completed`) on success, before the source has
+        // reconnected at the captured head and confirmed catch-up by lag. Closing
+        // the window needs the rebuild to run without that terminal Ready
+        // transition, tracked in #13028. Before the retain, because it drops
+        // heartbeats whose ready flag IS meant to count.
+        //
         // Split envelopes into (committers, batches, ready_flags) preserving
         // arrival order. Committers will be drained sequentially in the
         // background commit task; per-source semantics (e.g., PG `Standby
         // Status Update` carrying the latest LSN, Kafka per-partition
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
-
-        // Read before the heartbeat retain below, for the same reason `any_ready`
-        // is: the signal rides a zero-row, no-op-committer envelope (see
-        // `cdc::build_history_unavailable_envelope`), so the retain would
-        // otherwise strip it and the rebuild would never happen.
-        let history_unavailable = envelopes
-            .iter()
-            .any(cdc::ChangeEnvelope::history_unavailable);
 
         // Strip zero-row readiness heartbeats from the write/durability path
         // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
@@ -2654,11 +2665,11 @@ impl RefreshTask {
         }
         let target_schema = self.accelerator.schema();
         // The accelerated table holds the engine's own creation-time rewrite by
-        // construction (Cayenne/Vortex stores every timestamp at microsecond precision),
-        // so the comparison has to be made against what the engine would store from this
-        // input. Without it the classifier reads that permanent rewrite as `Incompatible`
-        // drift on every CDC batch, and `on_schema_change: fail` stops replication for a
-        // schema that never changed.
+        // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
+        // comparison has to be made against what the engine would store from this input.
+        // Without it the classifier reads that permanent rewrite as `Incompatible` drift
+        // on every CDC batch, and `on_schema_change: fail` stops replication for a schema
+        // that never changed.
         //
         // The match test is rule-aware rather than rebuilding the schema up front: this
         // runs per upsert sub-batch and almost always matches, and rewriting one
@@ -3939,6 +3950,39 @@ fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
     }
 }
 
+/// Trim a run to start at its [`cdc::ChangeEnvelope::history_unavailable`]
+/// signal, reporting whether it had one.
+///
+/// The rebuild runs before the whole run, so anything the run carries AHEAD of
+/// the signal would be applied on top of a table that was re-read past it —
+/// writing a value the source has already moved on from. Streaming resumes at
+/// the position the source captured when it raised the signal, which is at or
+/// after those envelopes, so nothing replays over the regression and it is
+/// durable.
+///
+/// Discarding them is exact rather than lossy: the signal means the source can
+/// no longer explain what changed, and the re-read observes the source at a
+/// point at or after every envelope that preceded the signal, so the re-read
+/// already reflects them. Their committers are dropped unacked, which only holds
+/// a source position back — the rebuild's own boundary commit carries the new
+/// one.
+///
+/// The LAST signal is the barrier, not the first: one rebuild answers every
+/// signal in the run (the caller performs exactly one), so envelopes between two
+/// signals are subsumed by it just as the leading ones are.
+///
+/// A no-op on every ordinary run, which carries no signal at all.
+fn trim_to_rebuild_signal(envelopes: &mut Vec<cdc::ChangeEnvelope>) -> bool {
+    let Some(signal) = envelopes
+        .iter()
+        .rposition(cdc::ChangeEnvelope::history_unavailable)
+    else {
+        return false;
+    };
+    envelopes.drain(..signal);
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteChangeResult {
     DataWritten,
@@ -4843,19 +4887,24 @@ mod tests {
         .build()
     }
 
-    /// Regression test for #13014, CDC leg. Cayenne stores every timestamp at
-    /// microsecond precision because Vortex has no other option, so a Postgres
-    /// `timestamptz` CDC stream arrives as `Timestamp(ns, "UTC")` against a
-    /// `Timestamp(us, "UTC")` accelerated table forever. `classify` reads that as
-    /// `Incompatible`, so before the engine's own rewrites were consulted here,
-    /// `on_schema_change: fail` rejected the first batch and stopped replication for a
-    /// schema that never changed.
+    /// Regression test for #13014, CDC leg. `DuckDB` stores every timezone-aware
+    /// timestamp at microsecond precision, so a Postgres `timestamptz` CDC stream
+    /// arrives as `Timestamp(ns, "UTC")` against a `Timestamp(us, "UTC")` accelerated
+    /// table forever. `classify` reads that as `Incompatible`, so before the engine's
+    /// own rewrites were consulted here, `on_schema_change: fail` rejected the first
+    /// batch and stopped replication for a schema that never changed.
     #[tokio::test]
     async fn cdc_schema_evolution_accepts_an_engine_required_timestamp_rewrite() {
         use crate::accelerated::refresh_task::RefreshTaskBuilder;
         use crate::federated::FederatedTable;
         use arrow::datatypes::TimeUnit;
         use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+        /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds.
+        /// Spelled out rather than imported because the `DuckDB` accelerator sits
+        /// above this crate.
+        static DUCKDB_LIKE_RULES: arrow_tools::type_rewrite::TypeRewriteRules =
+            &[&arrow_tools::type_rewrite::TimestampTzToMicrosecond];
 
         let stored = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -4901,10 +4950,22 @@ mod tests {
             .build()
         };
 
-        let task = build("cdc_engine_rewrite_accepted", CAYENNE_TYPE_REWRITE_RULES);
+        let task = build("cdc_engine_rewrite_accepted", DUCKDB_LIKE_RULES);
         task.maybe_evolve_schema_for_cdc(&incoming).await.expect(
             "an engine-required rewrite is not a schema change and must not fail the write",
         );
+
+        // The upgrade case for #13018. A Cayenne table created before the engine
+        // preserved timestamp units stores microseconds; Cayenne now creates such a
+        // column as nanoseconds, but this table's stored type does not change. Its
+        // rules must still explain that, or upgrading stops replication on the first
+        // batch of an unchanged Postgres `timestamptz` stream. `classify` cannot save
+        // it: nanosecond is excluded as a widening target because rescaling to ns
+        // overflows i64 past ~2262, so us -> ns is `Incompatible`, not `Widening`.
+        let task = build("cdc_legacy_microsecond_table", CAYENNE_TYPE_REWRITE_RULES);
+        task.maybe_evolve_schema_for_cdc(&incoming)
+            .await
+            .expect("a pre-existing microsecond Cayenne table must keep replicating after upgrade");
 
         // Neuter: with no engine rules the same pair is classified as incompatible and
         // `on_schema_change: fail` rejects it - so the pass above is the rules working,
@@ -7194,6 +7255,65 @@ mod tests {
         let schema = Arc::new(create_test_data_schema());
         cdc::build_heartbeat_envelope(&schema, cdc::now_unix_ms(), is_ready)
             .expect("heartbeat envelope builds")
+    }
+
+    /// A rebuild signal is an ordering barrier, not a jump to the front of the
+    /// run: what the run carries ahead of it is subsumed by the re-read and must
+    /// go with it. See `trim_to_rebuild_signal`.
+    #[test]
+    fn a_run_is_trimmed_to_its_last_rebuild_signal() {
+        let log = Arc::new(CommitLog::default());
+        let schema = Arc::new(create_test_data_schema());
+        let signal =
+            || cdc::build_history_unavailable_envelope(&schema).expect("rebuild signal builds");
+
+        // Stale changes queued behind the signal are dropped; the signal and
+        // everything after it (post-capture changes, which DO replay) survive.
+        let mut run = vec![
+            make_tracked_envelope(1, Arc::clone(&log), false),
+            // Ready, and discarded: `apply_envelope_run` reads `any_ready` from
+            // the TRIMMED run, so this flag must not survive to mark the dataset
+            // Ready the moment the replacement lands — before the source has
+            // reconnected at the captured head and caught up.
+            make_tracked_envelope(2, Arc::clone(&log), true),
+            signal(),
+            make_tracked_envelope(3, Arc::clone(&log), false),
+        ];
+        assert!(trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2, "only the signal and its suffix survive");
+        assert!(run[0].history_unavailable(), "the signal leads the run");
+        assert!(!run[1].history_unavailable());
+        assert!(
+            !run.iter().any(cdc::ChangeEnvelope::is_dataset_ready),
+            "a readiness flag from a discarded envelope must not survive the trim"
+        );
+
+        // Two signals in one coalesced run still get exactly one rebuild, so the
+        // envelopes BETWEEN them are subsumed by it too and must not survive.
+        let mut run = vec![
+            make_tracked_envelope(4, Arc::clone(&log), false),
+            signal(),
+            make_tracked_envelope(5, Arc::clone(&log), false),
+            signal(),
+            make_tracked_envelope(6, Arc::clone(&log), false),
+        ];
+        assert!(trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2, "the run is trimmed to the LAST signal");
+        assert!(run[0].history_unavailable());
+
+        // A signal already at the front loses nothing — the stream-head case
+        // every source takes when it raises the signal at subscribe time.
+        let mut run = vec![signal(), make_tracked_envelope(7, Arc::clone(&log), false)];
+        assert!(trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2);
+
+        // An ordinary run is untouched, and reports no rebuild.
+        let mut run = vec![
+            make_tracked_envelope(8, Arc::clone(&log), false),
+            make_tracked_envelope(9, Arc::clone(&log), false),
+        ];
+        assert!(!trim_to_rebuild_signal(&mut run));
+        assert_eq!(run.len(), 2);
     }
 
     /// A run of pure readiness heartbeats must flip the dataset Ready without

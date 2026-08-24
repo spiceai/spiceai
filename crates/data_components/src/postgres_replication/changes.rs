@@ -1324,8 +1324,8 @@ fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
 /// Public wrapper: parse a Postgres NUMERIC text value to `i128` with the
 /// dataset's scale. Bootstrap reuses this so we only have one numeric parsing
 /// implementation.
-pub(super) fn parse_pg_numeric_public(s: &str, scale: i8) -> Result<i128> {
-    parse_pg_numeric_to_i128(s, 38, scale)
+pub(super) fn parse_pg_numeric_public(s: &str, precision: u8, scale: i8) -> Result<i128> {
+    parse_pg_numeric_to_i128(s, precision, scale)
 }
 
 /// Decode a Postgres binary `numeric` (`send` wire form) into an `i128` scaled
@@ -2738,24 +2738,27 @@ mod tests {
     fn numeric_parser_handles_standard_cases() {
         // Scale 2, value 123.45 → 12345
         assert_eq!(
-            parse_pg_numeric_public("123.45", 2).expect("parse 123.45"),
+            parse_pg_numeric_public("123.45", 38, 2).expect("parse 123.45"),
             12_345i128
         );
         // Negative
         assert_eq!(
-            parse_pg_numeric_public("-7.25", 2).expect("parse -7.25"),
+            parse_pg_numeric_public("-7.25", 38, 2).expect("parse -7.25"),
             -725i128
         );
         // Integer (no decimal point) with scale 2 → padded
-        assert_eq!(parse_pg_numeric_public("7", 2).expect("parse 7"), 700i128);
+        assert_eq!(
+            parse_pg_numeric_public("7", 38, 2).expect("parse 7"),
+            700i128
+        );
         // Explicit "+" sign
         assert_eq!(
-            parse_pg_numeric_public("+1.5", 2).expect("parse +1.5"),
+            parse_pg_numeric_public("+1.5", 38, 2).expect("parse +1.5"),
             150i128
         );
         // Zero
         assert_eq!(
-            parse_pg_numeric_public("0.00", 2).expect("parse 0.00"),
+            parse_pg_numeric_public("0.00", 38, 2).expect("parse 0.00"),
             0i128
         );
     }
@@ -2763,7 +2766,7 @@ mod tests {
     #[test]
     fn numeric_parser_rejects_nan_and_inf() {
         for bad in ["NaN", "Infinity", "-Infinity"] {
-            let err = parse_pg_numeric_public(bad, 2).expect_err(bad);
+            let err = parse_pg_numeric_public(bad, 38, 2).expect_err(bad);
             assert!(err.to_string().contains("not representable"));
         }
     }
@@ -2771,8 +2774,33 @@ mod tests {
     #[test]
     fn numeric_parser_rejects_overscale() {
         // 0.1234 with scale 2 has 4 fractional digits → error, not silent truncation.
-        let err = parse_pg_numeric_public("0.1234", 2).expect_err("should reject");
+        let err = parse_pg_numeric_public("0.1234", 38, 2).expect_err("should reject");
         assert!(err.to_string().contains("scale"));
+    }
+
+    /// The initial snapshot and the WAL stream read the same column, so a value
+    /// one path stores is a value the other must store. The snapshot loader used
+    /// to reach this parser without a precision, which pinned it to 38 and let
+    /// bootstrap admit rows replication rejects — the same source value landing
+    /// differently depending on which path carried it.
+    #[test]
+    fn the_public_numeric_parser_honours_the_declared_precision() {
+        assert_eq!(
+            parse_pg_numeric_public("9.99", 3, 2).expect("9.99 fits Decimal128(3, 2)"),
+            999
+        );
+        parse_pg_numeric_public("10.00", 3, 2).expect_err("10.00 is too wide for Decimal128(3, 2)");
+
+        // Same input, same answer as the routine the WAL path calls directly.
+        assert_eq!(
+            parse_pg_numeric_public("9.99", 3, 2).expect("snapshot path"),
+            parse_pg_numeric_to_i128("9.99", 3, 2).expect("replication path")
+        );
+        assert!(
+            parse_pg_numeric_public("10.00", 3, 2).is_err()
+                == parse_pg_numeric_to_i128("10.00", 3, 2).is_err(),
+            "both paths must agree on rejection"
+        );
     }
 
     #[test]

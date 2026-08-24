@@ -23,10 +23,20 @@ license-file.workspace = true
 description = "Per-dataset blob checkpoint store backed by a SQLite accelerator or the Cayenne metastore (implements runtime-checkpoint-api::BlobCheckpointStore)."
 
 [dependencies]
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+arrow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 datafusion-table-providers = { workspace = true, features = ["sqlite"] }
 rusqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+arrow_tools = { path = "../arrow_tools" }
+arrow.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

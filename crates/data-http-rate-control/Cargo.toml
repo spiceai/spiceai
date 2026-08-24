@@ -10,7 +10,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-data-connector-api = { path = "../data-connector-api" }
+data-connector-types = { path = "../data-connector-types" }
 data_components = { path = "../data_components" }
 fundu = { workspace = true }
 governor.workspace = true

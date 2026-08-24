@@ -17,7 +17,7 @@ limitations under the License.
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::dataset::{Dataset, DatasetSpec, OnSchemaChange};
+use crate::component::dataset::{DatasetSpec, OnSchemaChange};
 use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
 use crate::dataconnector::{ConnectorComponent, kafka::SidecarOffsetCommitHook};
@@ -30,7 +30,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
@@ -79,13 +79,9 @@ pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
     schema_evolution: bool,
-    /// Retained so `read_provider` can resolve the checkpoint store over the dataset's
-    /// accelerator. `None` only in unit tests, which build params without a runtime
-    /// attached.
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
-// Hand-written because the retained `ConnectorContext` handle is not `Debug`.
+// Hand-written because `KafkaConfig` is not `Debug`.
 impl std::fmt::Debug for Debezium {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Debezium")
@@ -219,32 +215,7 @@ impl Debezium {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
             schema_evolution,
-            context: None,
         })
-    }
-
-    /// Attach the runtime context the checkpoint store is resolved through.
-    ///
-    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
-    /// alone, which is how they already construct one.
-    #[must_use]
-    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Resolve the checkpoint store over this dataset's accelerator.
-    async fn checkpoint_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
-        let context = self
-            .context
-            .as_ref()
-            .ok_or_else(|| CheckpointError::Store {
-                source: "no runtime is attached to the Debezium connector".into(),
-            })?;
-        context.debezium_checkpoint_store(dataset).await
     }
 }
 
@@ -325,13 +296,13 @@ impl DataConnectorFactory for DebeziumFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let context = params.context.clone();
-            let debezium = Debezium::new(params.parameters)?.with_context(context);
+            let debezium = Debezium::new(params.parameters)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }
@@ -345,7 +316,7 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
-register_data_connector!("debezium", DebeziumFactory);
+data_connector_api::register_data_connector!("debezium", DebeziumFactory);
 
 #[async_trait]
 impl DataConnector for Debezium {
@@ -359,7 +330,8 @@ impl DataConnector for Debezium {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -386,12 +358,16 @@ impl DataConnector for Debezium {
         let dataset_name = dataset.name.to_string();
 
         let debezium_kafka_sys = if dataset.is_file_accelerated() {
-            Some(self.checkpoint_store(dataset).await.boxed().context(
-                super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            )?)
+            Some(
+                context
+                    .debezium_checkpoint_store(dataset)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            )
         } else {
             tracing::warn!(
                 dataset = %dataset_name,
@@ -598,10 +574,12 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
-        _dataset: &Dataset,
+        _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
@@ -683,7 +661,7 @@ async fn set_metadata_to_accelerator(
 }
 
 async fn get_metadata_from_kafka(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
@@ -842,7 +820,7 @@ async fn get_metadata_from_kafka(
 /// Peek at the most recent message on `topic` using a temporary consumer.
 /// Does not touch the real consumer or its group offsets.
 async fn fetch_latest_change_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -873,7 +851,7 @@ async fn fetch_latest_change_event(
 
 /// Read the first available message.
 async fn fetch_first_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_consumer: &KafkaConsumer,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -920,7 +898,7 @@ async fn fetch_first_event(
 /// `block` (legacy `schema_evolution: true`) keeps today's blind adoption.
 async fn refresh_schema_if_evolved(
     metadata: DebeziumKafkaMetadata,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
@@ -1122,7 +1100,7 @@ async fn refresh_schema_if_evolved(
 
 /// Returns the primary key column names from `acceleration.primary_key`, used as a
 /// fallback when no Kafka messages are available to extract Debezium primary keys from.
-fn primary_keys_from_acceleration(dataset: &Dataset) -> Vec<String> {
+fn primary_keys_from_acceleration(dataset: &DatasetSpec) -> Vec<String> {
     dataset
         .acceleration
         .as_ref()

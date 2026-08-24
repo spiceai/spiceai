@@ -8,7 +8,13 @@ on:
       - release-*
       - release/*
     paths:
+      # The model contracts these tests exercise are no longer all under
+      # `crates/llms/` — a change to a trait in one of the API crates reaches
+      # every provider implementing it.
       - 'crates/llms/**'
+      - 'crates/chat-api/**'
+      - 'crates/embed-api/**'
+      - 'crates/rerank-api/**'
   merge_group:
     branches:
       - trunk

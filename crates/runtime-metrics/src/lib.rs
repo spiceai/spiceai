@@ -39,3 +39,18 @@ pub mod telemetry;
 pub mod tools;
 pub mod views;
 pub mod workers;
+
+/// Publishes every component counter at zero.
+///
+/// A counter that never fires exports no series at all, and an absent series reads
+/// as a broken exporter rather than as zero.
+pub fn publish_component_counters_at_zero() {
+    catalogs::publish_counters_at_zero();
+    components::publish_counters_at_zero();
+    datasets::publish_counters_at_zero();
+    embeddings::publish_counters_at_zero();
+    models::publish_counters_at_zero();
+    rerankers::publish_counters_at_zero();
+    tools::publish_counters_at_zero();
+    views::publish_counters_at_zero();
+}
