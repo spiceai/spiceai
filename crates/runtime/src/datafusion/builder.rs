@@ -1262,7 +1262,7 @@ impl DataFusionBuilder {
             datafusion_ref,
             caching,
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
-            pending_sink_tables: TokioRwLock::new(Vec::new()),
+            pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
             pending_initializations: TokioRwLock::new(HashMap::new()),
