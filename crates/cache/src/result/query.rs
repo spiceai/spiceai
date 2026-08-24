@@ -33,9 +33,7 @@ use futures::task::{Context, Poll};
 use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
-use crate::sizing::{
-    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, schema_size, table_refs_size,
-};
+use crate::sizing::{ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, table_refs_size};
 
 use super::CacheStatus;
 
@@ -85,8 +83,8 @@ impl CachedQueryResult {
         read_started_at: Instant,
     ) -> Self {
         Self {
-            data: CachedData::Raw(Arc::new(super::compact_for_storage(batches))),
-            schema,
+            data: CachedData::Raw(Arc::new(super::prepare_for_storage(batches))),
+            schema: arrow_tools::schema_intern::intern(schema),
             input_tables,
             cached_at,
             read_started_at,
@@ -106,7 +104,7 @@ impl CachedQueryResult {
     ) -> Self {
         Self {
             data: CachedData::Encoded(encoded_data),
-            schema,
+            schema: arrow_tools::schema_intern::intern(schema),
             input_tables,
             cached_at,
             read_started_at,
@@ -136,12 +134,12 @@ impl CachedQueryResult {
             let encoded_data = encoder.encode(&records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
-            CachedData::Raw(Arc::new(super::compact_for_storage(records)))
+            CachedData::Raw(Arc::new(super::prepare_for_storage(records)))
         };
 
         Ok(Self {
             data,
-            schema,
+            schema: arrow_tools::schema_intern::intern(schema),
             input_tables,
             cached_at,
             read_started_at,
@@ -180,12 +178,19 @@ impl CachedQueryResult {
 
     /// The memory this entry holds, as the cache's byte budget sees it.
     ///
-    /// Everything reachable from the entry is counted, not just its array
-    /// bytes: the schema, the input-table set, and a flat allowance for the
+    /// Everything the entry holds *of its own* is counted, not just its array
+    /// bytes: its batches, the input-table set, and a flat allowance for the
     /// store's own per-entry bookkeeping. A 0-row result carries no array bytes
     /// at all, so counting only those made it weigh a flat `size_of::<Self>()`
     /// regardless of how wide its schema was, and the byte budget could never
     /// evict one. See [`crate::sizing`] for the imprecisions this accepts.
+    ///
+    /// The schema is deliberately **not** charged here. It is interned, so one
+    /// allocation is shared by every entry over the same shape and charging it
+    /// per entry would bill a 200-column schema tens of thousands of times over
+    /// for memory that exists once. Those bytes are reported instead by
+    /// [`arrow_tools::schema_intern::SchemaInterner::stats`], which counts each
+    /// distinct schema once.
     #[must_use]
     pub fn memory_size(&self) -> u64 {
         let mut size = std::mem::size_of::<Self>();
@@ -204,7 +209,6 @@ impl CachedQueryResult {
             }
         }
 
-        size += ARC_HEADER_BYTES + schema_size(&self.schema);
         size += ARC_HEADER_BYTES + table_refs_size(&self.input_tables);
         size += ENTRY_OVERHEAD_BYTES;
 
@@ -360,7 +364,6 @@ mod tests {
             + 2 * std::mem::size_of::<RecordBatch>() as u64
             + batch1.get_array_memory_size() as u64
             + batch2.get_array_memory_size() as u64
-            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&schema)) as u64
             + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::table_refs_size(&input_tables))
                 as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
@@ -368,7 +371,7 @@ mod tests {
         assert_eq!(
             cached_result.memory_size(),
             expected_size,
-            "an entry must be billed its batches, its schema, its input tables and the store's per-entry overhead"
+            "an entry must be billed its batches, its input tables and the store's per-entry overhead — but not its interned schema"
         );
         assert!(
             cached_result.memory_size() < 10_000,
@@ -399,8 +402,6 @@ mod tests {
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
             + encoded_data.len() as u64
-            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&cached_result.schema))
-                as u64
             + (crate::sizing::ARC_HEADER_BYTES
                 + crate::sizing::table_refs_size(&cached_result.input_tables)) as u64
             + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
@@ -438,34 +439,120 @@ mod tests {
     #[test]
     fn an_empty_result_is_billed_more_than_its_struct() {
         let narrow = empty_result_of_width(4);
-        let wide = empty_result_of_width(200);
         let struct_only = std::mem::size_of::<CachedQueryResult>() as u64;
 
         assert!(
             narrow.memory_size() > struct_only,
-            "a 0-row entry still holds a schema and an input-table set, got {} vs {struct_only}",
-            narrow.memory_size()
-        );
-        assert!(
-            wide.memory_size() > 10 * narrow.memory_size(),
-            "a 200-column 0-row entry must cost far more than a 4-column one, got {} vs {}",
-            wide.memory_size(),
+            "a 0-row entry still holds an input-table set and the store's overhead, got {} vs {struct_only}",
             narrow.memory_size()
         );
     }
 
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933>.
+    ///
+    /// Every `RecordBatch` carries its own `SchemaRef` and nothing upstream
+    /// shares them — a batch does not even share with the stream that carried
+    /// it — so a stored vector of small batches otherwise re-holds one schema
+    /// per element.
+    #[test]
+    fn stored_batches_share_one_schema_with_their_entry() {
+        // Distinct allocations of equal content, as separately-planned queries
+        // produce; `Schema::new` on fresh fields cannot return a shared `Arc`.
+        let fields = vec![Field::new("id", DataType::Int32, false)];
+        let first = Arc::new(Schema::new(fields.clone()));
+        let second = Arc::new(Schema::new(fields));
+        assert!(!Arc::ptr_eq(&first, &second), "inputs start out distinct");
+
+        let batch_of = |schema: &SchemaRef| {
+            RecordBatch::try_new(
+                Arc::clone(schema),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .expect("batch")
+        };
+
+        let cached_at = Instant::now();
+        let result = CachedQueryResult::new_raw(
+            vec![batch_of(&first), batch_of(&second)],
+            Arc::clone(&first),
+            Arc::new(HashSet::new()),
+            cached_at,
+            cached_at,
+        );
+
+        let CachedData::Raw(batches) = &result.data else {
+            panic!("expected raw batches");
+        };
+        assert_eq!(batches.len(), 2);
+        for (i, batch) in batches.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(batch.schema_ref(), &result.schema),
+                "batch {i} must share the entry's interned schema"
+            );
+            assert_eq!(batch.num_rows(), 3, "interning must not disturb the rows");
+            assert_eq!(batch.num_columns(), 1);
+        }
+    }
+
+    /// Two entries over the same shape must point at one schema. Each is built
+    /// from its own freshly-allocated `Schema`, so pointer equality here can
+    /// only come from interning.
+    #[test]
+    fn entries_over_the_same_shape_share_one_schema() {
+        let first = empty_result_of_width(200);
+        let second = empty_result_of_width(200);
+
+        assert!(
+            Arc::ptr_eq(&first.schema, &second.schema),
+            "entries of the same shape must share one schema allocation"
+        );
+        assert_eq!(
+            first.schema.fields().len(),
+            200,
+            "sharing must not alter the schema"
+        );
+    }
+
+    /// The counterpart to [`entries_over_the_same_shape_share_one_schema`]: a
+    /// shared schema is not a per-entry cost, so widening it must not make the
+    /// entry heavier. Charging it per entry billed a 200-column schema once for
+    /// every entry that merely pointed at it.
+    #[test]
+    fn schema_width_does_not_change_what_an_entry_is_billed() {
+        assert_eq!(
+            empty_result_of_width(4).memory_size(),
+            empty_result_of_width(200).memory_size(),
+            "an interned schema is shared, so its width is not the entry's cost"
+        );
+    }
+
     /// The bound `max_size` is meant to be: N entries of a known weight must not
-    /// fit in a budget smaller than N times that weight. Before the fix a
-    /// 1 MiB budget admitted 12,840 wide 0-row entries — ~500 MiB of real memory.
+    /// fit in a budget smaller than N times that weight. Before
+    /// <https://github.com/spiceai/spiceai/issues/12931> a 1 MiB budget admitted
+    /// 12,840 wide 0-row entries holding ~500 MiB, because a 0-row entry
+    /// weighed a flat 82 bytes however wide it was.
+    ///
+    /// The schema those entries share is no longer charged to any of them, so
+    /// what has to bound the stream now is each entry's own cost. This asserts
+    /// the memory really held — every entry plus the one schema behind them all
+    /// — stays within the budget's order of magnitude.
     #[test]
     fn a_byte_budget_bounds_a_stream_of_empty_results() {
-        let entry_weight = empty_result_of_width(200).memory_size();
+        let entry = empty_result_of_width(200);
+        let entry_weight = entry.memory_size();
         let budget = 1024 * 1024_u64;
 
         let admissible = budget / entry_weight;
         assert!(
-            admissible < 200,
-            "a 1 MiB budget must not admit thousands of wide 0-row entries, it admits {admissible} at {entry_weight} bytes each"
+            admissible < 3_000,
+            "a 1 MiB budget must not admit the pre-fix 12,840 wide 0-row entries, it admits {admissible} at {entry_weight} bytes each"
+        );
+
+        let schema_bytes = arrow_tools::schema_intern::schema_deep_size(&entry.schema) as u64;
+        let really_held = admissible * entry_weight + schema_bytes;
+        assert!(
+            really_held < 2 * budget,
+            "the entries admitted plus the single schema they share must stay near the budget, got {really_held} against {budget}"
         );
     }
 

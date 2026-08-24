@@ -28,12 +28,14 @@ limitations under the License.
 //! imprecisions:
 //!
 //! * An allocation reached through an `Arc` from two entries is charged to
-//!   both. Sharing is not observable from a weigher, and over-charging evicts
-//!   sooner, which is the safe direction for a budget.
+//!   both. Sharing is generally not observable from a weigher, and
+//!   over-charging evicts sooner, which is the safe direction for a budget.
+//!   Schemas are the deliberate exception: they are interned, so one allocation
+//!   backs every entry of the same shape, and charging it per entry would bill
+//!   a wide schema once for every entry that merely points at it.
+//!   [`arrow_tools::schema_intern`] counts those bytes once instead.
 //! * Collection slots are charged as `len`- or `capacity`-times-entry-size,
 //!   which omits a hash table's control bytes and a `Vec`'s spare capacity.
-//!   This matches how `arrow_schema::Field::size` charges its own metadata map,
-//!   so a schema is sized the same way whoever asks.
 //! * [`ENTRY_OVERHEAD_BYTES`] is a flat allowance, not a measurement.
 //!
 //! Exactness is not what `max_size` needs. What it needs — and what the
@@ -41,12 +43,11 @@ limitations under the License.
 //! entry holds*, so that a budget expressed in bytes constrains how many
 //! entries fit under it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::BuildHasher;
 use std::mem::size_of;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
 use datafusion::sql::TableReference;
 
 /// Bytes charged to every cache entry for the store's own per-entry bookkeeping.
@@ -72,25 +73,6 @@ pub(crate) const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 /// already covers.
 pub(crate) const fn arc_heap_size<T>() -> usize {
     ARC_HEADER_BYTES + size_of::<T>()
-}
-
-/// Deep size of an Arrow [`Schema`], including the fields it owns and its
-/// key-value metadata.
-///
-/// `arrow-schema` exposes `Fields::size` and `Field::size` but no `Schema::size`,
-/// so the metadata map is charged here the same way `Field::size` charges its own.
-pub(crate) fn schema_size(schema: &Schema) -> usize {
-    size_of::<Schema>() + schema.fields().size() + string_map_size(&schema.metadata)
-}
-
-/// Deep size of a `HashMap<String, String>`: its slots plus the bytes each
-/// string owns.
-pub(crate) fn string_map_size<S: BuildHasher>(map: &HashMap<String, String, S>) -> usize {
-    map.capacity() * size_of::<(String, String)>()
-        + map
-            .iter()
-            .map(|(key, value)| key.capacity() + value.capacity())
-            .sum::<usize>()
 }
 
 /// The bytes a [`TableReference`]'s name parts own on the heap, excluding the
@@ -145,44 +127,6 @@ pub(crate) fn f32_vectors_heap_size(vectors: &[Vec<f32>]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field};
-
-    #[test]
-    fn a_wider_schema_is_charged_more_than_a_narrow_one() {
-        let narrow = Schema::new(
-            (0..4)
-                .map(|i| Field::new(format!("col_{i}"), DataType::Int64, true))
-                .collect::<Vec<_>>(),
-        );
-        let wide = Schema::new(
-            (0..200)
-                .map(|i| Field::new(format!("col_{i}"), DataType::Int64, true))
-                .collect::<Vec<_>>(),
-        );
-
-        assert!(
-            schema_size(&wide) > 20 * schema_size(&narrow),
-            "a 200-column schema must be charged far more than a 4-column one, got {} vs {}",
-            schema_size(&wide),
-            schema_size(&narrow)
-        );
-    }
-
-    #[test]
-    fn a_schema_is_charged_for_its_metadata() {
-        let bare = Schema::new(vec![Field::new("col", DataType::Int64, true)]);
-        let annotated = bare.clone().with_metadata(HashMap::from([(
-            "spice.origin".to_string(),
-            "x".repeat(4_096),
-        )]));
-
-        assert!(
-            schema_size(&annotated) >= schema_size(&bare) + 4_096,
-            "schema metadata must be charged, got {} vs {}",
-            schema_size(&annotated),
-            schema_size(&bare)
-        );
-    }
 
     #[test]
     fn a_table_reference_is_charged_for_every_name_part() {

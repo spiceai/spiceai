@@ -20,4 +20,5 @@ pub mod metadata_keys;
 pub mod record_batch;
 pub mod schema;
 pub mod schema_evolution;
+pub mod schema_intern;
 pub mod type_rewrite;

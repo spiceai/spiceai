@@ -22,7 +22,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 
 use crate::sizing::{
-    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, schema_size, string_vec_heap_size,
+    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, string_vec_heap_size,
     table_reference_heap_size, table_refs_size,
 };
 use crate::{AsTableRefs, Sizeable};
@@ -37,10 +37,11 @@ pub struct CachedAggregationResult {
 }
 
 impl CachedAggregationResult {
-    /// Batches are compacted on the way in, for the same reason
-    /// [`crate::CachedQueryResult`] compacts its own: a top-k search plan emits
-    /// zero-copy slices, and storing one as it arrives would pin — and, through
-    /// [`Sizeable`] below, bill — the whole scan batch it was carved from.
+    /// Batches are compacted and their schemas interned on the way in, for the
+    /// same reasons [`crate::CachedQueryResult`] does both: a top-k search plan
+    /// emits zero-copy slices, and storing one as it arrives would pin — and,
+    /// through [`Sizeable`] below, bill — the whole scan batch it was carved
+    /// from; and every batch otherwise re-holds its own copy of one schema.
     #[must_use]
     pub fn new(
         records: Vec<RecordBatch>,
@@ -50,16 +51,20 @@ impl CachedAggregationResult {
         schema: SchemaRef,
     ) -> Self {
         Self {
-            records: Arc::new(crate::result::compact_for_storage(records)),
+            records: Arc::new(crate::result::prepare_for_storage(records)),
             primary_keys,
             data_columns,
             matches,
-            schema,
+            schema: arrow_tools::schema_intern::intern(schema),
         }
     }
 
     /// The memory one table's aggregated results hold, excluding the struct
     /// itself — the caller charges that through the map slot holding it.
+    ///
+    /// The schema is interned and shared across every entry over the same
+    /// shape, so it is not a per-entry cost and is reported by the interner
+    /// rather than charged here. See [`crate::result::query::CachedQueryResult::memory_size`].
     fn heap_size(&self) -> usize {
         arc_heap_size::<Vec<RecordBatch>>()
             + self.records.len() * std::mem::size_of::<RecordBatch>()
@@ -76,8 +81,6 @@ impl CachedAggregationResult {
                 .iter()
                 .map(|(key, values)| key.capacity() + string_vec_heap_size(values))
                 .sum::<usize>()
-            + ARC_HEADER_BYTES
-            + schema_size(&self.schema)
     }
 }
 
@@ -222,16 +225,41 @@ mod tests {
         );
     }
 
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933>,
+    /// the search cache's half: a schema shared by every entry over the same
+    /// shape is not a per-entry cost, so widening it must not make the entry
+    /// heavier.
     #[test]
-    fn a_wider_search_result_costs_more() {
+    fn schema_width_does_not_change_what_a_search_entry_is_billed() {
         let narrow = empty_result_over(schema_of_width(4), Vec::new());
         let wide = empty_result_over(schema_of_width(200), Vec::new());
 
-        assert!(
-            wide.get_memory_size() > 10 * narrow.get_memory_size(),
-            "a 200-column search entry must cost far more than a 4-column one, got {} vs {}",
+        assert_eq!(
+            narrow.get_memory_size(),
             wide.get_memory_size(),
-            narrow.get_memory_size()
+            "an interned schema is shared, so its width is not the entry's cost"
+        );
+    }
+
+    #[test]
+    fn search_entries_over_the_same_shape_share_one_schema() {
+        let first = empty_result_over(schema_of_width(200), Vec::new());
+        let second = empty_result_over(schema_of_width(200), Vec::new());
+
+        let schema_of = |result: &CachedSearchResult| {
+            Arc::clone(
+                &result
+                    .results
+                    .values()
+                    .next()
+                    .expect("one aggregated result")
+                    .schema,
+            )
+        };
+
+        assert!(
+            Arc::ptr_eq(&schema_of(&first), &schema_of(&second)),
+            "search entries of the same shape must share one schema allocation"
         );
     }
 

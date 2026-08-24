@@ -103,7 +103,13 @@ pub fn stamp_namespace_column(
     let n = batch.num_rows();
     let mut fields: Vec<Field> = schema.fields().iter().map(|f| (**f).clone()).collect();
     fields.push(Field::new(CACHE_NAMESPACE_COLUMN, DataType::Utf8, false));
-    let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    // Every stamped batch of a dataset builds the same schema here, so this
+    // would otherwise be a fresh allocation per batch retained by the write
+    // buffer and by the accelerator behind it.
+    let new_schema = arrow_tools::schema_intern::intern(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )));
     let ns_array: ArrayRef = Arc::new(StringArray::from(vec![namespace_id; n]));
     let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
     cols.push(ns_array);
@@ -767,6 +773,9 @@ impl CacheRefreshHelper {
         let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // Queue write through batched channel
+        let mut batches = batches;
+        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
+
         let request = CacheWriteRequest {
             batches,
             filters: filters.to_vec(),
@@ -1495,8 +1504,11 @@ impl CacheRefreshHelper {
                         // can do the right thing based on the accelerator's
                         // actual storage schema (extended in real deployments,
                         // unextended in unit-test mocks).
+                        let mut queued_batches = batches.clone();
+                        arrow_tools::schema_intern::intern_batch_schemas(&mut queued_batches);
+
                         let write_request = CacheWriteRequest {
-                            batches: batches.clone(),
+                            batches: queued_batches,
                             filters: filters.to_vec(),
                             is_upsert: is_expired,
                             cache_key,
@@ -2130,6 +2142,76 @@ mod cache_namespace_column_tests {
         assert_eq!(ns_col.len(), 3);
         for i in 0..ns_col.len() {
             assert_eq!(ns_col.value(i), "apikey:abc");
+        }
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933> on
+    /// the `refresh_mode: caching` path.
+    ///
+    /// Stamping builds a fresh schema for every batch it touches, and those
+    /// batches are then held by the unbounded write buffer and by the
+    /// accelerator behind it — so without interning each one retains its own
+    /// copy of an identical schema.
+    #[test]
+    fn stamped_batches_share_one_schema() {
+        use arrow::array::Int32Array;
+
+        let stamp_fresh = |value: i32| {
+            // A fresh `Schema` per batch, as separately-planned scans produce.
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let batch = arrow::array::RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from(vec![value])) as ArrayRef],
+            )
+            .expect("batch");
+            stamp_namespace_column(batch, "public").expect("stamped")
+        };
+
+        let first = stamp_fresh(1);
+        let second = stamp_fresh(2);
+
+        assert!(
+            Arc::ptr_eq(first.schema_ref(), second.schema_ref()),
+            "stamped batches of one dataset must share a single schema allocation"
+        );
+        assert_eq!(first.num_columns(), 2, "interning must not alter the batch");
+        assert_eq!(
+            first.schema().field(1).name(),
+            CACHE_NAMESPACE_COLUMN,
+            "the stamped column survives interning"
+        );
+        assert_eq!(second.num_rows(), 1);
+    }
+
+    /// Batches queued for the accelerator are buffered before they are flushed,
+    /// so each one otherwise holds its own copy of the same schema.
+    #[test]
+    fn queued_cache_write_batches_share_one_schema() {
+        use arrow::array::Int32Array;
+
+        let batch_of = |value: i32| {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            arrow::array::RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from(vec![value])) as ArrayRef],
+            )
+            .expect("batch")
+        };
+
+        let mut batches = vec![batch_of(1), batch_of(2), batch_of(3)];
+        assert!(
+            !Arc::ptr_eq(batches[0].schema_ref(), batches[1].schema_ref()),
+            "the batches start out with distinct schema allocations"
+        );
+
+        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
+
+        for (i, batch) in batches.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(batch.schema_ref(), batches[0].schema_ref()),
+                "queued batch {i} must share one schema allocation"
+            );
+            assert_eq!(batch.num_rows(), 1, "interning must not disturb the rows");
         }
     }
 
