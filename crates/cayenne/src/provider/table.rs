@@ -3076,6 +3076,54 @@ const fn range_split_is_worth_taking(bounds: usize, shards: usize, key_is_compos
     !key_is_composite || bounds + 1 >= shards
 }
 
+/// Statistics describing the merge inputs at the finest granularity the plans
+/// expose, for [`range_bounds_from_histogram`] to read as bands.
+///
+/// Per PARTITION, not per plan. A snapshot written by a range-sharded rewrite
+/// holds several files that each cover a narrow slice of the key domain, but the
+/// snapshot's aggregate statistic spans all of them — so one band per input would
+/// hand the histogram back exactly the outer range it is trying to see past, and
+/// the layout would never compound across merges. Partition statistics keep those
+/// slices apart, and they are the same file metadata Cayenne already holds.
+///
+/// Falls back to one band per input when a partition statistic is unavailable
+/// (a partial set of fine bands would bias the cuts toward the inputs that did
+/// report) or when there are more partitions than the histogram's interval walk
+/// should scan.
+fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistics>> {
+    use datafusion_physical_plan::ExecutionPlanProperties;
+
+    /// The walk is quadratic in the band count, so cap the fine granularity
+    /// rather than let a many-file merge pay for it at plan time.
+    const MAX_BANDS: usize = 2_048;
+
+    let aggregates = || -> Vec<Arc<Statistics>> {
+        plans
+            .iter()
+            .filter_map(|plan| plan.partition_statistics(None).ok())
+            .collect()
+    };
+
+    let partitions: usize = plans
+        .iter()
+        .map(|plan| plan.output_partitioning().partition_count())
+        .sum();
+    if partitions == 0 || partitions > MAX_BANDS {
+        return aggregates();
+    }
+
+    let mut bands = Vec::with_capacity(partitions);
+    for plan in plans {
+        for partition in 0..plan.output_partitioning().partition_count() {
+            let Ok(stats) = plan.partition_statistics(Some(partition)) else {
+                return aggregates();
+            };
+            bands.push(stats);
+        }
+    }
+    bands
+}
+
 /// One merge input's contribution to the key histogram: the key range that input
 /// covers, and how many rows it holds.
 #[derive(Clone, Copy)]
@@ -3089,12 +3137,14 @@ struct KeyBand {
 /// derived from the *distribution* the merge inputs describe rather than from the
 /// single range they span.
 ///
-/// Each input contributes one band — its min/max for the key, and its row count —
-/// and the band is read as a uniform density over that range. Summing the bands
-/// gives a piecewise-uniform estimate of where the rows actually are, and cutting
-/// it at equal cumulative mass puts roughly `rows / shards` on every writer. The
+/// Each statistic contributes one band — its min/max for the key, and its row
+/// count — read as a uniform density over that range, except where min equals max
+/// and the band is a point whose rows all share one key. Summing the bands gives a
+/// piecewise-uniform estimate of where the rows actually are, and cutting it at
+/// equal cumulative mass puts roughly `rows / shards` on every writer. The
 /// statistics are ones the merge already loads, so this costs no extra I/O and no
-/// sampling pass.
+/// sampling pass. See [`merge_input_statistics`] for why the bands are gathered
+/// per partition rather than per input.
 ///
 /// This DEGRADES TO [`range_bounds_from_statistics`] BY CONSTRUCTION, which is why
 /// it is safe to prefer unconditionally: when every band spans the same range —
@@ -3117,34 +3167,45 @@ fn range_bounds_from_histogram(
         return None;
     }
 
-    // The first usable min doubles as the template every cut is rebuilt against,
-    // so the bounds carry the column's own unit / timezone / scale.
+    // EVERY non-empty input must be readable, or the histogram is declined
+    // outright. Skipping one is arithmetically identical to declaring it empty,
+    // which drags every cut toward the inputs that did report — a silent bias
+    // that is worse than not using the histogram at all, because the caller's
+    // merged-range fallback at least weighs the whole merge evenly.
+    //
+    // `Inexact` is accepted deliberately. On this path the child is a Cayenne
+    // Vortex scan whose row counts and min/max come exactly from file metadata;
+    // the deletion filter demotes them to `Inexact` because it removes a subset
+    // it cannot enumerate, and passes `net_deletions = 0` for protected-snapshot
+    // scans (`provider/delete/filter_exec.rs`). So a band's row count is a
+    // pre-deletion upper bound and its range is a superset — both conservative,
+    // and both in the SAME direction across inputs, which the walk cancels
+    // because it normalizes by the total. Demanding `Exact` here would decline on
+    // every merge this function exists to serve.
+    //
+    // The first min doubles as the template every cut is rebuilt against, so the
+    // bounds carry the column's own unit / timezone / scale.
     let mut template: Option<ScalarValue> = None;
     let mut bands: Vec<KeyBand> = Vec::with_capacity(inputs.len());
     for stats in inputs {
-        let Some(column_stats) = stats.column_statistics.get(column) else {
+        let &rows = stats.num_rows.get_value()?;
+        if rows == 0 {
+            // A genuinely empty input contributes no mass and biases nothing.
             continue;
-        };
+        }
+        let column_stats = stats.column_statistics.get(column)?;
         let (Some(min), Some(max)) = (
             column_stats.min_value.get_value(),
             column_stats.max_value.get_value(),
         ) else {
-            continue;
+            return None;
         };
         if !scalars_share_a_domain(min, max) {
-            continue;
+            return None;
         }
-        // An input whose row count is unknown must be skipped rather than counted
-        // as zero: treating it as empty would shift every cut away from the rows
-        // it actually holds, which is worse than not using the histogram at all.
-        let Some(&rows) = stats.num_rows.get_value() else {
-            continue;
-        };
-        let (Some(lo), Some(hi)) = (scalar_to_i128(min), scalar_to_i128(max)) else {
-            continue;
-        };
-        if rows == 0 || hi < lo {
-            continue;
+        let (lo, hi) = (scalar_to_i128(min)?, scalar_to_i128(max)?);
+        if hi < lo {
+            return None;
         }
         if let Some(existing) = template.as_ref() {
             // Mixed domains across inputs would interpolate across two number
@@ -3186,33 +3247,62 @@ fn range_bounds_from_histogram(
         return None;
     }
 
-    let mut intervals: Vec<(i128, i128, f64)> = Vec::with_capacity(edges.len() - 1);
+    // Two kinds of mass, kept separate because they cut differently.
+    //
+    // A band spanning a range spreads its rows uniformly across it, so a cut may
+    // land anywhere inside. A band whose min equals its max is a POINT: every one
+    // of its rows carries the same key, so no cut can divide them and they must
+    // all reach one shard. That case is not hypothetical — an input holding only a
+    // hot upsert key has exactly this shape, and it is the shape this whole
+    // function exists to place correctly, so its rows cannot be dropped.
+    //
+    // Point mass is therefore emitted as a zero-width interval at its own value,
+    // ordered ahead of the span interval that starts there. A cut landing inside
+    // one interpolates over a width of zero and so lands exactly on the key; a
+    // point holding more than a shard's worth of rows drives several cuts onto
+    // that same value, which the duplicate collapse below folds into one — fewer,
+    // wider shards, which is the honest outcome when the rows cannot be split.
+    let mut intervals: Vec<(i128, i128, f64)> = Vec::with_capacity(edges.len() * 2);
     let mut total = 0.0_f64;
-    for pair in edges.windows(2) {
-        let (start, end) = (pair[0], pair[1]);
+    for (index, &edge) in edges.iter().enumerate() {
+        let point_mass: f64 = bands
+            .iter()
+            .filter(|band| band.lo == band.hi && band.lo == edge)
+            .map(|band| band.rows)
+            .sum();
+        if point_mass > 0.0 {
+            total += point_mass;
+            intervals.push((edge, edge, point_mass));
+        }
+
+        let Some(&next) = edges.get(index + 1) else {
+            continue;
+        };
         let mut mass = 0.0_f64;
         for band in &bands {
-            if band.hi < start || band.lo > end {
+            if band.lo == band.hi || band.hi < edge || band.lo > next {
                 continue;
             }
-            let overlap_lo = start.max(band.lo);
-            let overlap_hi = end.min(band.hi);
+            let overlap_lo = edge.max(band.lo);
+            let overlap_hi = next.min(band.hi);
             if overlap_hi <= overlap_lo {
                 continue;
             }
-            // A single-valued band has no width to spread over; treating its span
-            // as one keeps its rows on its own value instead of dividing by zero.
-            let width = (band.hi - band.lo).max(1);
+            // Checked throughout: `Decimal128` admits bands wide enough to
+            // overflow an `i128` difference, and a wrapped width would silently
+            // invert the density. Declining hands the caller its fallback.
+            let overlap = overlap_hi.checked_sub(overlap_lo)?;
+            let width = band.hi.checked_sub(band.lo)?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a ratio of two key-domain offsets; the quotient is what \
                           matters and it is well within f64 precision"
             )]
-            let share = (overlap_hi - overlap_lo) as f64 / width as f64;
+            let share = overlap as f64 / width as f64;
             mass += band.rows * share;
         }
         total += mass;
-        intervals.push((start, end, mass));
+        intervals.push((edge, next, mass));
     }
     if total <= 0.0 {
         return None;
@@ -3243,13 +3333,14 @@ fn range_bounds_from_histogram(
             } else {
                 0.0
             };
+            let span = end.checked_sub(start)?;
             #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 reason = "an offset inside one interval of the key domain, \
                           truncated back to the integer domain the column holds"
             )]
-            let offset = ((end - start) as f64 * fraction) as i128;
+            let offset = (span as f64 * fraction) as i128;
             let cut = start.checked_add(offset)?;
             // Same rule the range interpolation applies: a repeated cut would
             // leave a shard no row can reach, so carry fewer, wider shards
@@ -8067,13 +8158,24 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
+        // The sink builds `ShardSpec::Range` only for a SINGLE key expression
+        // (`vortex::persistent::format`), so a composite key must be narrowed to
+        // the column the bounds actually describe — its leading one — or the
+        // bounds are computed, passed down, and then silently ignored in favour
+        // of hashing. The full key is preserved whenever there are no bounds, so
+        // the hash fallback keeps clustering on everything it always did.
+        let mut shard_key_columns = self.resolved_shard_key_columns();
+        let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
+        if range_bounds.is_some() {
+            shard_key_columns.truncate(1);
+        }
         Some(WriteShardConfig {
             write_concurrency: shard_count,
-            shard_key_columns: self.resolved_shard_key_columns(),
-            // Ascending split points, when the caller could derive them for a
-            // single key column. Their absence is not a failure: the write
-            // hashes the key instead, which is what every write did before
-            // range partitioning existed.
+            shard_key_columns,
+            // Ascending split points, when the caller could derive them for the
+            // key's leading column. Their absence is not a failure: the write
+            // hashes the key instead, which is what every write did before range
+            // partitioning existed.
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
         })
     }
@@ -19127,14 +19229,11 @@ impl CayenneTableProvider {
             plans.push(filtered);
         }
 
-        // Captured before `UnionExec` consumes `plans`: one statistic per input is
-        // a histogram of the key, where the union's merged statistic is only its
-        // outer range. Cutting at equal row mass instead of equal width is what
-        // keeps every encoder fed when the key is skewed.
-        let input_statistics: Vec<Arc<Statistics>> = plans
-            .iter()
-            .filter_map(|plan| plan.partition_statistics(None).ok())
-            .collect();
+        // Captured before `UnionExec` consumes `plans`: the inputs' own statistics
+        // are a histogram of the key, where the union's merged statistic is only
+        // its outer range. Cutting at equal row mass instead of equal width is
+        // what keeps every encoder fed when the key is skewed.
+        let input_statistics = merge_input_statistics(&plans);
 
         let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
             plans.remove(0)
@@ -39077,6 +39176,81 @@ mod tests {
         );
     }
 
+    /// Bounds describe ONE column, and the sink builds `ShardSpec::Range` only for
+    /// a single key expression. A composite key must therefore be narrowed to its
+    /// leading column when bounds are present, or they are computed, passed down
+    /// and then silently dropped in favour of hashing — the feature would look
+    /// wired up and do nothing.
+    #[tokio::test]
+    async fn test_write_shard_format_narrows_a_composite_key_to_carry_range_bounds() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("o_id", DataType::Int64, false),
+            Field::new("line", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_for_sharding(
+            "composite_key_range_write",
+            Arc::clone(&schema),
+            vec![],
+            vec!["o_id".to_string(), "line".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+
+        // No bounds: the whole composite key still clusters the hash, exactly as
+        // it did before range partitioning existed.
+        let hashed = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, None)
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            hashed.shard_key_columns,
+            vec!["o_id".to_string(), "line".to_string()],
+            "hashing keeps every key column"
+        );
+        assert!(hashed.range_bounds.is_none());
+
+        // With bounds: narrowed to the leading column, which is the one the
+        // bounds speak about and the only shape the sink range-partitions.
+        let bounds = vec![
+            ScalarValue::Int64(Some(10)),
+            ScalarValue::Int64(Some(20)),
+            ScalarValue::Int64(Some(30)),
+        ];
+        let ranged = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, Some(&bounds))
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            ranged.shard_key_columns,
+            vec!["o_id".to_string()],
+            "range bounds describe the leading column only, so the key narrows to it"
+        );
+        assert_eq!(
+            ranged.range_bounds.as_deref(),
+            Some(bounds.as_slice()),
+            "the bounds must survive to the sink"
+        );
+
+        // An empty bound list is not a split; it must not narrow the hash key.
+        let empty = provider
+            .write_shard_format(4, tsb, None, EncodeFanOut::Sized, Some(&[]))
+            .write_shard()
+            .expect("composite-key multi-writer config should enable write sharding")
+            .clone();
+        assert_eq!(
+            empty.shard_key_columns,
+            vec!["o_id".to_string(), "line".to_string()],
+            "no usable bounds means hashing, which keeps every key column"
+        );
+        assert!(empty.range_bounds.is_none());
+    }
+
     #[tokio::test]
     async fn test_write_shard_format_configured_shard_key_overrides_primary_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -39352,6 +39526,84 @@ mod tests {
         }
     }
 
+    /// An input holding a single hot key is a point, not a range, and its rows
+    /// must still steer the cuts. Spreading a zero-width band over its own (zero)
+    /// width would drop it entirely — and that shape is exactly the hot-key upsert
+    /// this split exists to place, so dropping it would defeat the change on its
+    /// own headline case.
+    #[test]
+    fn a_single_valued_input_contributes_its_rows_and_earns_its_own_boundary() {
+        // 90% of the rows carry one key; the rest are spread over a wide range.
+        let hot = band_stats(100, 100, 90_000);
+        let spread = band_stats(0, 1_000, 10_000);
+
+        let bounds = range_bounds_from_histogram(&[hot, spread], 0, 4)
+            .expect("a point and a span describe a distribution");
+        assert_bounds_are_sound(&bounds, 4, "point mass");
+        assert!(
+            bounds.contains(&ScalarValue::Int64(Some(100))),
+            "the hot key must earn a boundary of its own, got {bounds:?}"
+        );
+
+        // Every row still lands somewhere, and the rows sharing the hot key all
+        // reach ONE shard — they carry the same key, so no split can divide them.
+        let keys: Vec<i64> = (0_i64..1_000)
+            .chain(std::iter::repeat_n(100, 9_000))
+            .collect();
+        let counts = route_to_shards(&keys, &bounds);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            keys.len(),
+            "every row must land on exactly one shard"
+        );
+        assert!(
+            counts.iter().any(|&count| count >= 9_000),
+            "the 9,000 rows on the hot key cannot be divided, so one shard holds them all: {counts:?}"
+        );
+    }
+
+    /// `Decimal128` admits bands wide enough to overflow an `i128` difference. The
+    /// split must decline and let the caller fall back, never wrap into an
+    /// inverted density or panic under overflow checks.
+    #[test]
+    fn an_unrepresentable_key_span_declines_instead_of_overflowing() {
+        use datafusion_common::stats::Precision;
+
+        fn decimal_stats(min: i128, max: i128, rows: Option<usize>) -> Statistics {
+            let mut column = datafusion_common::ColumnStatistics::new_unknown();
+            column.min_value = Precision::Exact(ScalarValue::Decimal128(Some(min), 38, 0));
+            column.max_value = Precision::Exact(ScalarValue::Decimal128(Some(max), 38, 0));
+            let mut stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "k",
+                DataType::Decimal128(38, 0),
+                false,
+            )]));
+            stats.column_statistics = vec![column];
+            if let Some(rows) = rows {
+                stats.num_rows = Precision::Exact(rows);
+            }
+            stats
+        }
+
+        assert!(
+            range_bounds_from_histogram(
+                &[
+                    Arc::new(decimal_stats(i128::MIN, i128::MAX, Some(1_000))),
+                    Arc::new(decimal_stats(0, 1_000, Some(1_000))),
+                ],
+                0,
+                4,
+            )
+            .is_none(),
+            "a span that cannot be represented declines rather than wrapping"
+        );
+        assert!(
+            range_bounds_from_statistics(&decimal_stats(i128::MIN, i128::MAX, None), 0, 4)
+                .is_none(),
+            "the range interpolation declines the same span"
+        );
+    }
+
     /// A composite key is split on its leading column only when that column still
     /// fills every shard; a single-column key keeps the shipped trade.
     #[test]
@@ -39502,8 +39754,9 @@ mod tests {
             "a column index outside the statistics declines"
         );
 
-        // An input whose row count is unknown is skipped, not counted as empty:
-        // weighting it at zero would pull every cut away from the rows it holds.
+        // An input whose row count is unknown declines the WHOLE histogram rather
+        // than being skipped: skipping is arithmetically identical to calling it
+        // empty, which drags every cut toward the inputs that did report.
         let mut unknown_rows =
             Statistics::new_unknown(&Schema::new(vec![Field::new("k", DataType::Int64, false)]));
         let mut column = datafusion_common::ColumnStatistics::new_unknown();
@@ -39511,9 +39764,52 @@ mod tests {
         column.max_value = Precision::Exact(ScalarValue::Int64(Some(100)));
         unknown_rows.column_statistics = vec![column];
         assert!(
-            range_bounds_from_histogram(&[Arc::new(unknown_rows), band_stats(0, 100, 10)], 0, 4)
-                .is_none(),
-            "one usable band is not a distribution, so decline"
+            range_bounds_from_histogram(
+                &[
+                    Arc::new(unknown_rows),
+                    band_stats(0, 100, 10),
+                    band_stats(100, 200, 10),
+                ],
+                0,
+                4,
+            )
+            .is_none(),
+            "one unreadable input declines the whole histogram, not just itself"
+        );
+
+        // Likewise an input that reports rows but no key range.
+        let mut no_range =
+            Statistics::new_unknown(&Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        no_range.num_rows = Precision::Exact(500);
+        no_range.column_statistics = vec![datafusion_common::ColumnStatistics::new_unknown()];
+        assert!(
+            range_bounds_from_histogram(
+                &[
+                    Arc::new(no_range),
+                    band_stats(0, 100, 10),
+                    band_stats(100, 200, 10),
+                ],
+                0,
+                4,
+            )
+            .is_none(),
+            "a non-empty input with no key range declines the whole histogram"
+        );
+
+        // An input that is genuinely EMPTY biases nothing, so it is passed over
+        // and the remaining inputs still describe a distribution.
+        assert!(
+            range_bounds_from_histogram(
+                &[
+                    band_stats(0, 100, 0),
+                    band_stats(0, 100, 10),
+                    band_stats(100, 200, 10),
+                ],
+                0,
+                4,
+            )
+            .is_some(),
+            "an empty input carries no mass, so it cannot bias the cuts"
         );
     }
 
