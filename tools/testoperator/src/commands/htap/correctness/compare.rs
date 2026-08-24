@@ -189,9 +189,6 @@ pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<
         .collect()
 }
 
-/// Cast both columns to `Float64` for value comparison. Returns `None` if either
-/// cast (or the subsequent downcast) fails — the caller fails safe rather than
-/// silently skipping the column.
 /// Two columns' mantissas rescaled to a common decimal scale, expected then actual.
 type RescaledPair = (Vec<Option<i256>>, Vec<Option<i256>>);
 
@@ -257,6 +254,9 @@ fn decimal_pair_to_i256(e_col: &dyn Array, a_col: &dyn Array) -> ExactDecimals {
     }
 }
 
+/// Cast both columns to `Float64` for value comparison. Returns `None` if either
+/// cast (or the subsequent downcast) fails — the caller fails safe rather than
+/// silently skipping the column.
 fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Array, Float64Array)> {
     let e = arrow::compute::cast(e_col, &DataType::Float64).ok()?;
     let a = arrow::compute::cast(a_col, &DataType::Float64).ok()?;
@@ -696,6 +696,52 @@ mod tests {
         assert!(
             delta.exceeded,
             "a difference f64 cannot see must still be caught"
+        );
+    }
+
+    /// A decimal pair that cannot be brought to a common scale must FAIL the
+    /// column, not fall through to `f64`.
+    ///
+    /// Covers the `Unrepresentable` arm and the `safe: false` cast together, which
+    /// nothing else does: the wide-decimal test above uses equal scales, so no
+    /// rescale happens and the arm is never reached. Here a 76-digit mantissa at
+    /// scale 0 is asked to widen to scale 2, which needs 78 digits and overflows
+    /// `Decimal256`. With `safe: true` the cast would null the value instead of
+    /// erroring, and a null reads as "skip this row" — a silent pass.
+    #[test]
+    fn decimals_too_wide_to_bring_to_a_common_scale_fail_the_column() {
+        // 10^75, i.e. 76 significant digits: multiplying by 100 to reach scale 2
+        // exceeds what Decimal256 can hold.
+        let huge = (0..75).fold(i256::from_i128(1), |acc, _| acc * i256::from_i128(10));
+        let expected = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![huge])
+                    .with_precision_and_scale(76, 0)
+                    .expect("scale 0"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_wide",
+            Arc::new(
+                Decimal256Array::from(vec![huge])
+                    .with_precision_and_scale(76, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "an uncomparable decimal pair must fail rather than be guessed at"
+        );
+        assert!(
+            delta
+                .worst
+                .as_deref()
+                .is_some_and(|w| w.contains("common scale")),
+            "the diagnostic must say why it could not be compared, got {:?}",
+            delta.worst
         );
     }
 
