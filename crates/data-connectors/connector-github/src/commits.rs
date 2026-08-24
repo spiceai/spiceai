@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use runtime::dataconnector::ConnectorComponent;
+use data_connector_api::ConnectorComponent;
 use runtime_datafusion::error::find_datafusion_root;
 
 use super::{

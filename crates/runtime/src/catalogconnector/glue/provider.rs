@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
 use crate::{
@@ -180,8 +181,11 @@ impl GlueCatalogProvider {
                     parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
                 }
 
-                let connector =
-                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
+                let connector = GlueDataConnector::new(
+                    parameters,
+                    Some(Arc::clone(&self.app)),
+                    self.parameters.io_runtime.clone(),
+                );
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
@@ -196,11 +200,14 @@ impl GlueCatalogProvider {
                     .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
                     })?;
-                let table_provider = connector.read_provider(&dataset).await.boxed().context(
-                    CreatingDatasetSnafu {
+                let context = RuntimeConnectorContext::for_dataset(&dataset);
+                let table_provider = connector
+                    .read_provider(&context, &dataset)
+                    .await
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                    },
-                )?;
+                    })?;
                 tables.insert(table.name, table_provider);
             }
         }

@@ -26,20 +26,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
     SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::parameters::ConnectorContext;
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -63,15 +63,15 @@ const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
 
 /// Resolve the applied-LSN watermark store over the dataset's own accelerator.
 ///
-/// `None` means nothing durable can record a position — no runtime attached, or no
-/// usable accelerator connection. The caller treats that as "never loaded", which is
-/// correct: an acceleration that cannot persist a watermark cannot have persisted rows
-/// for one to describe.
+/// `None` means nothing durable can record a position — there is no usable accelerator
+/// connection. The caller treats that as "never loaded", which is correct: an
+/// acceleration that cannot persist a watermark cannot have persisted rows for one to
+/// describe.
 async fn resolve_watermark_store(
-    context: Option<&Arc<dyn ConnectorContext>>,
-    dataset: &Dataset,
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
 ) -> Option<Arc<dyn BlobCheckpointStore>> {
-    context?
+    context
         .blob_checkpoint_store(dataset, WATERMARK_TABLE)
         .await
 }
@@ -166,12 +166,16 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
     }
 }
 
-pub fn build_changes_stream(
+/// `async` so the watermark store is resolved here, before the stream is built: the
+/// generator then holds only the resolved store, which owns a connection pool and no
+/// runtime and so cannot pin the runtime for as long as the stream lives.
+pub async fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
-    context: Option<Arc<dyn ConnectorContext>>,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
     federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -202,6 +206,9 @@ pub fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -211,10 +218,25 @@ pub fn build_changes_stream(
         );
     }
 
-    // Resolving the watermark store needs to await, so it happens inside the
-    // stream below; clone the dataset handle it needs (cheap — `Dataset` is an
-    // `Arc`-bound wrapper over its spec).
-    let dataset_for_watermark = dataset.clone();
+    // Where this dataset's applied-LSN watermark lives. An ephemeral acceleration
+    // gets the no-op store: it boots empty and re-snapshots every start, so a
+    // recorded position would describe rows the restart already threw away, and
+    // resuming on it would skip everything before it.
+    //
+    // A durable acceleration with no reachable store also records nothing, which
+    // reads as "never loaded" — correct, since an acceleration that cannot persist a
+    // watermark cannot have persisted the rows one would describe.
+    let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+        Arc::new(NoopAppliedLsnStore)
+    } else {
+        match resolve_watermark_store(context, dataset).await {
+            Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                blobs,
+                identity: source_identity(&params_for_stream, &schema_name, &table_name),
+            }),
+            None => Arc::new(NoopAppliedLsnStore),
+        }
+    };
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -241,8 +263,8 @@ pub fn build_changes_stream(
         .unwrap_or_default();
     let engine_supports_upsert = !matches!(
         engine,
-        runtime::component::dataset::acceleration::Engine::Arrow
-            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+        runtime_component::dataset::acceleration::Engine::Arrow
+            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
@@ -253,7 +275,7 @@ pub fn build_changes_stream(
         a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
                 a.on_conflict.get(pk),
-                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
@@ -264,17 +286,17 @@ pub fn build_changes_stream(
     // mid-stream (the runtime apply loop still enforces the per-policy
     // evolution set). `OnSchemaChange` is `Copy`, so capture it by value.
     let schema_evolution_policy = match dataset.on_schema_change {
-        runtime::component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
-        runtime::component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
-        runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
+        runtime_component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
+        runtime_component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
+        runtime_component::dataset::OnSchemaChange::AppendNewColumns => {
             SchemaEvolutionPolicy::AppendNewColumns
         }
         // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
         // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
         // incompatible changes mid-stream. The accelerated table is recreated only on a
         // `refresh_mode: full` registration, not from the replication stream.
-        runtime::component::dataset::OnSchemaChange::SyncAllColumns
-        | runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
+        runtime_component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime_component::dataset::OnSchemaChange::DropAndRecreate => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
     };
@@ -344,31 +366,6 @@ pub fn build_changes_stream(
             };
             Err(StreamError::External(msg))?;
         }
-
-        // Where this dataset's applied-LSN watermark lives. An ephemeral
-        // acceleration gets the no-op store: it boots empty and re-snapshots
-        // every start, so a recorded position would describe rows the restart
-        // already threw away, and resuming on it would skip everything before it.
-        //
-        // A durable acceleration with no reachable store also records nothing,
-        // which reads as "never loaded" — correct, since an acceleration that
-        // cannot persist a watermark cannot have persisted the rows one would
-        // describe.
-        let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
-            Arc::new(NoopAppliedLsnStore)
-        } else {
-            match resolve_watermark_store(context.as_ref(), &dataset_for_watermark).await {
-                Some(blobs) => Arc::new(SidecarAppliedLsnStore {
-                    blobs,
-                    identity: source_identity(&params_for_stream, &schema_name, &table_name),
-                }),
-                None => Arc::new(NoopAppliedLsnStore),
-            }
-        };
-
-        // See the note in the MySQL connector: the store is what the stream needs, and
-        // the context has served its purpose once the store is resolved.
-        drop(context);
 
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
@@ -831,9 +828,9 @@ impl MetricsProvider for PostgresMetricsProvider {
 /// accelerators must re-snapshot on every start — WAL replay from the slot's
 /// checkpoint can never reconstruct an accelerator that booted empty.
 fn accelerator_is_ephemeral(
-    acceleration: &runtime::component::dataset::acceleration::Acceleration,
+    acceleration: &runtime_component::dataset::acceleration::Acceleration,
 ) -> bool {
-    use runtime::component::dataset::acceleration::{Engine, Mode};
+    use runtime_component::dataset::acceleration::{Engine, Mode};
     // Matched exhaustively (no `_` arm) so a newly added engine has to make an
     // explicit durability claim here: defaulting a non-persistent engine to
     // "persistent" silently skips its resume snapshot and leaves the accelerator
@@ -942,6 +939,7 @@ fn replication_params_from_connector_params(
         // Derived from the dataset's accelerator, which this function does not
         // see; `build_changes_stream` sets it right after.
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -1246,7 +1244,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     /// than in production.
     #[test]
     fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
-        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+        use runtime_component::dataset::acceleration::{Acceleration, Engine, Mode};
 
         let ephemeral = |engine: Engine, mode: Mode| {
             accelerator_is_ephemeral(&Acceleration {

@@ -30,9 +30,15 @@ limitations under the License.
 //!
 //! # Lifetime
 //!
-//! Values live in memory behind an `RwLock` and are replaced wholesale on each
-//! deployment, so a redeploy swaps the set atomically without re-registering the
-//! store or leaving a half-updated view visible to a concurrent lookup.
+//! Values live in memory behind an `RwLock` and every write swaps the whole set
+//! at once, so a delivery is visible to a concurrent lookup either entirely or
+//! not at all, without re-registering the store.
+//!
+//! A deployment does not replace the set wholesale — see
+//! [`CloudDeliveredSecretStore::install_new`]: a component resolves its secrets
+//! as it loads, so what a running process can change is what nothing has
+//! resolved yet. The set is replaced wholesale by the start that reads the local
+//! cache, which is where a rotation lands.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -49,6 +55,19 @@ use crate::{AnyErrorResult, SecretStore};
 /// Reachable as `${ cloud:KEY }` for diagnosis, but the path that matters is the
 /// unqualified `${ secrets:KEY }` walk, which reaches it last.
 pub const CLOUD_DELIVERED_STORE: &str = "cloud";
+
+/// What a delivery changed, and what it could not.
+///
+/// Both lists are names, sorted; a delivered value never appears here.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeliveryUpdate {
+    /// Names this store did not hold and now resolves.
+    pub installed: Vec<String>,
+    /// Names whose delivered value is not the one in effect — rotated, or
+    /// withdrawn by a delivery that no longer carries them. They keep resolving
+    /// to the value the components that hold it resolved.
+    pub pending: Vec<String>,
+}
 
 /// Secrets delivered with a deployment, held in memory.
 #[derive(Default)]
@@ -81,6 +100,51 @@ impl CloudDeliveredSecretStore {
     #[must_use]
     pub fn holds(&self, values: &BTreeMap<String, Zeroizing<Vec<u8>>>) -> bool {
         **self.values.read() == *values
+    }
+
+    /// Install the delivered values this store does not hold yet, and report
+    /// the ones it holds that the delivery does not agree with.
+    ///
+    /// A name the store has never held resolves to nothing today, so installing
+    /// it cannot change what any component already resolved — the components a
+    /// deployment adds can use it as they load. A name it does hold is the
+    /// opposite: a component resolves `${ secrets:… }` once, while it loads, so
+    /// a rotated or withdrawn value only reaches the components holding the old
+    /// one by loading them again. Installing it would leave the components
+    /// loaded before a deployment authenticating with one value and the ones
+    /// loaded after it with another, so the value in effect is kept and the name
+    /// is reported instead.
+    ///
+    /// Names only, never values, so the answer is safe to log and to report.
+    pub fn install_new(&self, delivered: &BTreeMap<String, Zeroizing<Vec<u8>>>) -> DeliveryUpdate {
+        // Held for the whole read-modify-write: a concurrent replace between
+        // the read and the write would be lost.
+        let mut values = self.values.write();
+
+        let mut update = DeliveryUpdate::default();
+        let mut merged = (**values).clone();
+        for (name, value) in delivered {
+            match merged.get(name) {
+                Some(held) if held == value => {}
+                Some(_) => update.pending.push(name.clone()),
+                None => {
+                    merged.insert(name.clone(), value.clone());
+                    update.installed.push(name.clone());
+                }
+            }
+        }
+        // A name the delivery drops is still resolving here, and a component
+        // that resolved it keeps running on it: withdrawing it takes a start.
+        update.pending.extend(
+            merged
+                .keys()
+                .filter(|name| !delivered.contains_key(*name))
+                .cloned(),
+        );
+        update.pending.sort();
+
+        *values = Arc::new(merged);
+        update
     }
 
     /// The delivered secret names, sorted. Safe to log and to report in status;
@@ -179,6 +243,65 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
         assert!(store.get_secret("a").await.expect("lookup").is_none());
+    }
+
+    /// A name nothing has resolved here can be installed while the process
+    /// runs; one that is already resolving cannot, because the components
+    /// holding it only re-resolve when they load again.
+    #[tokio::test]
+    async fn install_new_adds_what_is_unknown_and_keeps_what_is_in_use() {
+        let store = CloudDeliveredSecretStore::new();
+        store.replace(values(&[("held", b"1")]));
+
+        let update = store.install_new(&values(&[("held", b"2"), ("added", b"3")]));
+        assert_eq!(update.installed, vec!["added"]);
+        assert_eq!(update.pending, vec!["held"]);
+        assert_eq!(
+            store
+                .get_secret("held")
+                .await
+                .expect("lookup")
+                .expect("present")
+                .expose_secret(),
+            "1",
+            "the value the loaded components resolved stays in effect"
+        );
+        assert_eq!(
+            store
+                .get_secret("added")
+                .await
+                .expect("lookup")
+                .expect("present")
+                .expose_secret(),
+            "3",
+            "a value nothing has resolved yet is usable straight away"
+        );
+    }
+
+    /// Withdrawing a secret is a change to what a loaded component resolved,
+    /// exactly like rotating one, so it waits the same way.
+    #[test]
+    fn install_new_reports_a_withdrawn_secret_and_keeps_resolving_it() {
+        let store = CloudDeliveredSecretStore::new();
+        store.replace(values(&[("dropped", b"1"), ("kept", b"2")]));
+
+        let update = store.install_new(&values(&[("kept", b"2")]));
+        assert!(update.installed.is_empty());
+        assert_eq!(update.pending, vec!["dropped"]);
+        assert_eq!(store.names(), vec!["dropped", "kept"]);
+    }
+
+    /// A redelivery of the values in effect changes nothing and reports
+    /// nothing — that is what tells a deployment worth applying from a repeat.
+    #[test]
+    fn install_new_is_a_no_op_for_the_values_already_held() {
+        let store = CloudDeliveredSecretStore::new();
+        let delivered = values(&[("a", b"1"), ("b", b"2")]);
+        store.replace(delivered.clone());
+
+        let update = store.install_new(&delivered);
+        assert_eq!(update, DeliveryUpdate::default());
+        assert!(store.holds(&delivered));
     }
 
     #[tokio::test]

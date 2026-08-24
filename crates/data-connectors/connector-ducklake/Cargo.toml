@@ -7,13 +7,14 @@ license-file.workspace = true
 description = "DuckLake data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "extensions-full"] }
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-datafusion = { path = "../../runtime-datafusion" }
 runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
@@ -22,6 +23,9 @@ tracing.workspace = true
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true
