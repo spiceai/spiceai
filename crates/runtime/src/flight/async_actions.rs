@@ -32,9 +32,9 @@ use tonic::Status;
 
 use crate::datafusion::job_executor_context_extension::get_job_executor;
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use crate::http::v1::{current_principal_requires_read_only, queries::SubmitQueryRequest};
+use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::{JobErrorCode, JobState, JobStatus};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, RequestContext, current_principal_requires_read_only};
 
 /// Action types for async query operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

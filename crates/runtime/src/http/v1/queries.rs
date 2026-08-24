@@ -323,7 +323,7 @@ pub(crate) async fn submit(
     Extension(rt): Extension<Arc<Runtime>>,
     Json(request): Json<SubmitQueryRequest>,
 ) -> Response {
-    let read_only = super::current_principal_requires_read_only().await;
+    let read_only = runtime_request_context::current_principal_requires_read_only().await;
 
     let executor = match get_executor(&rt) {
         Ok(e) => e,

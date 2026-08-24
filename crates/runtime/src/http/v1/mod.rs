@@ -76,8 +76,9 @@ use snafu::ResultExt;
 
 use futures::{StreamExt, TryStreamExt};
 
-use runtime_auth::AuthPrincipalRef;
-use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
+use runtime_request_context::{
+    AsyncMarker, CacheNamespace, RequestContext, current_principal_requires_read_only,
+};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
@@ -99,19 +100,6 @@ pub enum Format {
 
     /// CSV format
     Csv,
-}
-
-pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
-    principal
-        .groups()
-        .iter()
-        .any(|group| *group == "write" || *group == "read_write")
-}
-
-pub(crate) async fn current_principal_requires_read_only() -> bool {
-    let context = RequestContext::current(AsyncMarker::new().await);
-    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
-        .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
 pub(crate) async fn require_write_access() -> Option<Response> {

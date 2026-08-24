@@ -22,7 +22,7 @@ use futures::{Stream, StreamExt};
 use http::HeaderMap;
 use opentelemetry::KeyValue;
 use regex::Regex;
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext, principal_has_write_access};
 use sha2::{Digest, Sha256};
 use spicepod::component::runtime::UserAgentCollection;
 use std::sync::atomic::Ordering;
@@ -497,6 +497,18 @@ impl RequestContext {
     pub fn query_timeout(&self) -> Option<std::time::Duration> {
         self.query_timeout
     }
+}
+
+/// Whether the current request must run in read-only mode.
+///
+/// `true` when the request carries an authenticated principal that lacks write
+/// access. An unauthenticated request returns `false` — a deployment with no
+/// `runtime.auth` configured is not forced read-only, and surfaces that require
+/// authentication reject anonymous callers upstream instead.
+pub async fn current_principal_requires_read_only() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
 impl AuthRequestContext for RequestContext {
