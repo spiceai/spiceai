@@ -23,6 +23,7 @@ pub mod catalogs;
 pub mod component_type;
 pub mod datasets;
 pub mod models;
+pub mod queries;
 pub mod status;
 pub mod workers;
 
@@ -30,5 +31,6 @@ pub use catalogs::CatalogInfo;
 pub use component_type::ComponentType;
 pub use datasets::DatasetInfo;
 pub use models::{ModelInfo, ModelListResponse, ModelMetadata};
+pub use queries::SubmitQueryRequest;
 pub use status::{ComponentError, ComponentErrorCategory, ComponentErrorType, ComponentStatus};
 pub use workers::{WorkerInfo, WorkerListResponse};

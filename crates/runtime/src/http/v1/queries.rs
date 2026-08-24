@@ -41,6 +41,7 @@ use crate::Runtime;
 use crate::config::ClusterRole;
 use crate::datafusion::query::write_to_json_value;
 use crate::jobs::{JobErrorCode, JobExecutor, JobState, JobStatus};
+use runtime_api_types::v1::queries::SubmitQueryRequest;
 
 /// Check if cluster mode with scheduler role is enabled.
 /// Returns 503 error response if not in scheduler cluster mode.
@@ -79,25 +80,6 @@ fn get_executor(rt: &Arc<Runtime>) -> Result<Arc<JobExecutor>, Response> {
         )
             .into_response()
     })
-}
-
-/// Request body for submitting a new query.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct SubmitQueryRequest {
-    /// The SQL statement to execute.
-    pub sql: String,
-    /// Optional query parameters (bind variables).
-    #[serde(default)]
-    pub parameters: Option<serde_json::Value>,
-    /// Optional timeout for async jobs.
-    /// Jobs running for longer than this will automatically timeout and fail.
-    #[serde(default)]
-    pub timeout_seconds: Option<u64>,
-    /// Optional maximum size of results for async jobs.
-    /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
-    #[serde(default)]
-    pub maximum_size: Option<u64>,
 }
 
 /// Response for query submission.

@@ -30,8 +30,8 @@ use object_store::{
 use snafu::prelude::*;
 use uuid::Uuid;
 
-use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
+use runtime_api_types::v1::queries::SubmitQueryRequest;
 
 use super::error::{
     DeserializeChunkSnafu, DeserializeStateSnafu, ObjectStoreDeleteSnafu, ObjectStoreListSnafu,
@@ -759,7 +759,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use object_store::memory::InMemory;
 
-    use crate::http::v1::queries::SubmitQueryRequest;
+    use runtime_api_types::v1::queries::SubmitQueryRequest;
 
     fn test_owner() -> String {
         crate::jobs::PUBLIC_JOB_OWNER.to_string()
