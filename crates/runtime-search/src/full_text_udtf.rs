@@ -415,9 +415,12 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
         };
 
         // `expected_generation` is likewise a runtime-only named argument, set
-        // alongside `global_stats` by a distributed search.
+        // alongside `global_stats` by a distributed search. It is rendered as a
+        // bare SQL integer literal (`expected_generation => 7`), which the SQL
+        // parser produces as `Int64`, not `UInt64`, so both variants are accepted.
         let expected_generation = match named.get(TEXT_SEARCH_EXPECTED_GENERATION_ARG) {
             Some(Expr::Literal(ScalarValue::UInt64(Some(g)), _)) => Some(*g),
+            Some(Expr::Literal(ScalarValue::Int64(Some(g)), _)) => u64::try_from(*g).ok(),
             _ => None,
         };
 
@@ -895,5 +898,23 @@ mod tests {
         let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
             .expect("Named include_score should parse");
         assert_eq!(parsed.include_score, Some(false));
+    }
+
+    #[test]
+    fn parse_args_named_expected_generation_accepts_int64_and_uint64() {
+        // A distributed search renders `expected_generation => 7` as a bare SQL
+        // integer literal, which the SQL parser produces as `Int64`, not
+        // `UInt64`. Both must parse to the same value, or the generation-drift
+        // check it feeds silently becomes a no-op for every real query.
+        for scalar in [ScalarValue::Int64(Some(7)), ScalarValue::UInt64(Some(7))] {
+            let exprs = vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+                named_arg("expected_generation", scalar.clone()),
+            ];
+            let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
+                .unwrap_or_else(|e| panic!("expected_generation as {scalar:?} should parse: {e}"));
+            assert_eq!(parsed.expected_generation, Some(7));
+        }
     }
 }

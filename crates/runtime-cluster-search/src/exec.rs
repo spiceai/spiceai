@@ -655,12 +655,14 @@ impl ExecutionPlan for DistributedSearchExec {
 #[cfg(test)]
 mod test {
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
+    use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
-        DistributedSearchParams, Hash, Hasher, build_generation_sql, build_scored_sql,
-        extract_generation, sql_quote,
+        DistributedSearchParams, build_generation_sql, build_scored_sql, extract_generation,
+        sql_quote,
     };
 
     fn score_and_id_schema() -> Schema {

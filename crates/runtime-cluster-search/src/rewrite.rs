@@ -43,7 +43,7 @@ use std::{fmt::Write as _, sync::Arc};
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema, SchemaRef},
     common::{
-        DFSchema, Result,
+        Column, DFSchema, Result,
         tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
     },
     config::ConfigOptions,
@@ -64,13 +64,13 @@ use datafusion::{
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use flight_client::cookie::CookieStore;
 use runtime_cluster::ExecutorRegistry;
-use search::SEARCH_SCORE_COLUMN_NAME;
 use search::generation::text_search::GlobalBm25Stats;
 use search::generation::text_search::bm25_stats::{
     STATS_DOC_FREQ_COLUMN, STATS_TERM_COLUMN, STATS_TOTAL_NUM_DOCS_COLUMN,
     STATS_TOTAL_NUM_TOKENS_COLUMN,
 };
 use search::provider::{SearchQueryProvider, UdtfSource};
+use search::{SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME};
 
 use crate::exec::{DistributedExecutor, DistributedSearchParams};
 use crate::node::DistributedSearchNode;
@@ -162,7 +162,14 @@ impl DistributedSearchRewrite {
         }
 
         let base_ref = TableReference::parse_str(&table);
-        let executors = self.registry.resolve_search_executors(&base_ref);
+        let executors = self
+            .registry
+            .resolve_search_executors(&base_ref)
+            .map_err(|err| {
+                DataFusionError::Plan(format!(
+                    "Cannot plan distributed text_search over '{base_ref}': {err}"
+                ))
+            })?;
         if executors.is_empty() {
             // No live executor covers the table's partitions; produce no rows
             // rather than silently scoring against an empty scheduler index.
@@ -312,6 +319,30 @@ impl AnalyzerRule for DistributedSearchRewrite {
                     None => Ok(Transformed::no(plan)),
                 };
             }
+            // Same shape, but through a `SubqueryAlias` — the common
+            // `FROM text_search(...) AS t WHERE t.col = ...` form. The alias
+            // node's own output schema (and hence the filter's column
+            // qualifiers) name the alias, not the underlying scan, so the
+            // predicate is unqualified before it is split/pushed and the
+            // rewritten plan is re-wrapped in the same alias so anything above
+            // it keeps resolving against it unchanged.
+            if let LogicalPlan::Filter(filter) = &plan
+                && let LogicalPlan::SubqueryAlias(subquery_alias) = filter.input.as_ref()
+                && let LogicalPlan::TableScan(scan) = subquery_alias.input.as_ref()
+            {
+                let unqualified_predicate =
+                    unqualify_column_refs(&filter.predicate, &subquery_alias.alias)?;
+                return match self.rewrite_scan(scan, Some(&unqualified_predicate))? {
+                    Some(rewritten) => {
+                        let inner = rewrap_remaining_filter(rewritten)?;
+                        let aliased = LogicalPlanBuilder::new(inner)
+                            .alias(subquery_alias.alias.clone())?
+                            .build()?;
+                        Ok(Transformed::new(aliased, true, TreeNodeRecursion::Jump))
+                    }
+                    None => Ok(Transformed::no(plan)),
+                };
+            }
             let LogicalPlan::TableScan(scan) = &plan else {
                 return Ok(Transformed::no(plan));
             };
@@ -352,27 +383,64 @@ fn rewrap_remaining_filter(rewritten: RewrittenScan) -> Result<LogicalPlan> {
     }
 }
 
+/// Rewrite every column reference qualified with `alias` to be unqualified.
+///
+/// A filter directly above a `SubqueryAlias` (e.g. `FROM text_search(...) AS t
+/// WHERE t.category = 'x'`) has its column references qualified with `t`, but
+/// the underlying scan's schema — and the executor-side SQL this predicate is
+/// eventually pushed into — has no such alias. A column qualified with a
+/// different (or no) relation is left untouched; `split_pushable_filter` then
+/// naturally treats it as an unknown column and keeps it in the remainder.
+fn unqualify_column_refs(predicate: &Expr, alias: &TableReference) -> Result<Expr> {
+    predicate
+        .clone()
+        .transform(|expr| {
+            if let Expr::Column(c) = &expr
+                && c.relation.as_ref() == Some(alias)
+            {
+                return Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                    &c.name,
+                ))));
+            }
+            Ok(Transformed::no(expr))
+        })
+        .data()
+}
+
 /// Split `predicate` into the conjuncts that reference only `schema`'s columns
 /// (and can be unparsed to SQL) — safe to push into an executor's scored query —
 /// and everything else, re-combined into a single remaining predicate.
+///
+/// A conjunct on [`SEARCH_MATCH_COLUMN_NAME`] is never pushed, even though
+/// `_match` is a real field of `schema`: it is synthesized by the non-distributed
+/// provider *after* candidate selection
+/// (`SearchQueryProvider::supports_filters_pushdown` marks it unsupported for
+/// exactly this reason), so sending it to an executor's pre-candidate-selection
+/// `WHERE` would change which rows are scored, not just filter the final result.
 fn split_pushable_filter(predicate: &Expr, schema: &SchemaRef) -> (Option<String>, Option<Expr>) {
     let unparser = Unparser::new(&PostgreSqlDialect {});
     let mut pushed_sql: Vec<String> = Vec::new();
     let mut remaining: Vec<Expr> = Vec::new();
 
     for conjunct in split_conjunction_owned(predicate.clone()) {
-        let references_known_columns = conjunct
-            .column_refs()
+        let column_refs = conjunct.column_refs();
+        let references_known_columns = column_refs
             .iter()
             .all(|c| schema.column_with_name(c.name()).is_some());
+        let references_match_column = column_refs
+            .iter()
+            .any(|c| c.name() == SEARCH_MATCH_COLUMN_NAME);
 
-        if references_known_columns && let Ok(ast) = unparser.expr_to_sql(&conjunct) {
+        if references_known_columns
+            && !references_match_column
+            && let Ok(ast) = unparser.expr_to_sql(&conjunct)
+        {
             pushed_sql.push(ast.to_string());
             continue;
         }
-        // Not pushable (references an unknown column, or cannot be rendered
-        // as SQL); leave it for the caller to apply above the merge instead
-        // of dropping it.
+        // Not pushable (references an unknown column, references `_match`, or
+        // cannot be rendered as SQL); leave it for the caller to apply above
+        // the merge instead of dropping it.
         remaining.push(conjunct);
     }
 
@@ -477,5 +545,84 @@ mod tests {
         ]));
         let merged = merge_schema_with_score(&schema);
         assert_eq!(merged.fields().len(), 2);
+    }
+
+    fn category_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(SEARCH_MATCH_COLUMN_NAME, DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn unqualify_column_refs_strips_matching_alias() {
+        // `FROM text_search(...) AS t WHERE t.category = 'x'` qualifies the
+        // filter's column with the alias `t`; the executor-side scored query has
+        // no such alias, so it must be stripped before pushing.
+        let alias = TableReference::bare("t");
+        let predicate = Expr::Column(Column::new(Some(alias.clone()), "category"))
+            .eq(datafusion::logical_expr::lit("x"));
+        let unqualified = unqualify_column_refs(&predicate, &alias).expect("should not fail");
+        assert_eq!(
+            unqualified,
+            col("category").eq(datafusion::logical_expr::lit("x"))
+        );
+    }
+
+    #[test]
+    fn unqualify_column_refs_leaves_other_relations_untouched() {
+        // A column qualified with a different relation (or already unqualified)
+        // is left as-is; `split_pushable_filter` will then correctly treat it as
+        // an unknown column rather than mis-pushing it.
+        let alias = TableReference::bare("t");
+        let other = Expr::Column(Column::new(Some(TableReference::bare("other")), "category"));
+        let predicate = other.clone().eq(datafusion::logical_expr::lit("x"));
+        let unchanged = unqualify_column_refs(&predicate, &alias).expect("should not fail");
+        assert_eq!(unchanged, predicate);
+    }
+
+    #[test]
+    fn split_pushable_filter_pushes_known_column_predicate() {
+        let predicate = col("category").eq(datafusion::logical_expr::lit("x"));
+        let (pushed, remaining) = split_pushable_filter(&predicate, &category_schema());
+        assert_eq!(pushed.as_deref(), Some("(\"category\" = 'x')"));
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn split_pushable_filter_keeps_match_column_predicate_above_the_merge() {
+        // `_match` is a real field of the merged schema, but it is synthesized by
+        // the non-distributed provider *after* candidate selection, so pushing it
+        // into an executor's pre-candidate-selection `WHERE` would change which
+        // rows get scored, not just filter the final result. See
+        // `SearchQueryProvider::supports_filters_pushdown`.
+        let predicate = col(SEARCH_MATCH_COLUMN_NAME).like(datafusion::logical_expr::lit("%dog%"));
+        let (pushed, remaining) = split_pushable_filter(&predicate, &category_schema());
+        assert!(pushed.is_none(), "`_match` predicate must not be pushed");
+        assert_eq!(remaining, Some(predicate));
+    }
+
+    #[test]
+    fn split_pushable_filter_splits_mixed_conjunction() {
+        // A `category = 'x' AND _match LIKE '%dog%'` conjunction must push only
+        // the `category` half and leave `_match` above the merge.
+        let predicate = col("category")
+            .eq(datafusion::logical_expr::lit("x"))
+            .and(col(SEARCH_MATCH_COLUMN_NAME).like(datafusion::logical_expr::lit("%dog%")));
+        let (pushed, remaining) = split_pushable_filter(&predicate, &category_schema());
+        assert_eq!(pushed.as_deref(), Some("(\"category\" = 'x')"));
+        assert_eq!(
+            remaining,
+            Some(col(SEARCH_MATCH_COLUMN_NAME).like(datafusion::logical_expr::lit("%dog%")))
+        );
+    }
+
+    #[test]
+    fn split_pushable_filter_keeps_unknown_column_predicate() {
+        let predicate = col("not_in_schema").eq(datafusion::logical_expr::lit(1i64));
+        let (pushed, remaining) = split_pushable_filter(&predicate, &category_schema());
+        assert!(pushed.is_none());
+        assert_eq!(remaining, Some(predicate));
     }
 }

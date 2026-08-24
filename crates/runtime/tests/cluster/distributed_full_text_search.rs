@@ -47,7 +47,7 @@ limitations under the License.
 //!       mode: memory          # arrow (default engine)
 //!       refresh_mode: full
 //!       partition_by:
-//!         - bucket(4, id)
+//!         - "CASE WHEN id = 3 THEN 0 ELSE 1 END"
 //!     columns:
 //!       - name: body
 //!         full_text_search:
@@ -83,11 +83,23 @@ use crate::{
 use super::harness::ClusterHarness;
 
 /// 12 rows. The rare term `peregrine` appears in exactly three documents, with a
-/// strictly-decreasing term frequency (3x, 2x, 1x) across three equal-length
-/// (7-word) documents, so BM25 imposes a strict, deterministic order on the
+/// strictly-decreasing term frequency (3x, 2x, 1x) across three similar-length
+/// documents, so a correctly-merged global BM25 imposes a strict order on the
 /// three hits: id 3 > id 7 > id 11. The common term `data` appears in many docs
 /// and is only present to give the collection realistic document-frequency
 /// statistics (so BM25 has something to normalise against).
+///
+/// `id = 3` (the highest term frequency, so the strongest global-stats hit) is
+/// deliberately isolated onto a single-row partition (see
+/// `make_fts_partitioned_dataset`), so its *local* document frequency and
+/// collection size are the most extreme in the dataset. Scoring it against
+/// local-only statistics (`N = 1`, `df = 1`) collapses its idf far below the
+/// correctly-merged global idf, while `id = 7` and `id = 11` share the other,
+/// 11-row partition and get an inflated local idf (`N = 11`, `df = 2`) instead
+/// of the smaller global one. A per-partition-only (unmerged) implementation
+/// therefore produces `id 7 > id 11 > id 3` — the opposite order at both ends
+/// from the correct `3 > 7 > 11` — so this fixture actually exercises global
+/// statistics merging rather than coincidentally matching it.
 const FTS_DOCS_CSV: &str = r"id,body
 1,the system stores rows of data in tables
 2,queries read data from many tables quickly
@@ -127,8 +139,11 @@ const EXPECTED_RARE_TERM_IDS: [i64; 3] = [3, 7, 11];
 ///
 /// 1. Build a single-node accelerated copy of the data with FTS on `body` and
 ///    capture the id ordering `text_search('peregrine')` produces.
-/// 2. Stand up a scheduler + 2 executors accelerating the *same* data with
-///    `bucket(4, id)` partitioning, so the rows scatter across executors.
+/// 2. Stand up a scheduler + 2 executors accelerating the *same* data,
+///    deterministically partitioned so `id = 3` is alone on one partition and
+///    every other row (including `id = 7` and `id = 11`) is on the other —
+///    guaranteeing the two executors each own a disjoint, non-empty slice of
+///    the matching rows rather than merely being likely to.
 /// 3. Run the identical `text_search` query through the scheduler and assert the
 ///    returned ids and their order equal the single-node baseline.
 #[tokio::test(flavor = "multi_thread")]
@@ -169,7 +184,7 @@ async fn distributed_full_text_search_matches_single_node_ordering() -> Result<(
 
             // --- Distributed cluster ---------------------------------------
             let app = AppBuilder::new("test_distributed_fts")
-                .with_dataset(make_fts_partitioned_dataset(&source, "fts_docs", 4, "id"))
+                .with_dataset(make_fts_partitioned_dataset(&source, "fts_docs"))
                 .with_runtime(SpicepodRuntime {
                     scheduler: Some(make_named_scheduler_config(
                         "distributed_full_text_search_matches_single_node_ordering",
@@ -187,17 +202,24 @@ async fn distributed_full_text_search_matches_single_node_ordering() -> Result<(
             harness.wait_for_executors(Duration::from_secs(30)).await?;
             wait_for_row_count(&harness, "fts_docs", 12, Duration::from_mins(1)).await?;
 
-            // The three matching rows should be spread across partitions/executors
-            // (this is what exercises cross-partition BM25 merging). `bucket()` is a
-            // hash, so exact placement is not predictable; the ownership counts below
-            // are informational, not asserted, because a row-level placement assertion
-            // is not exposed by the harness.
+            // The dataset's 2 partitions must land on 2 distinct executors — not
+            // merely be likely to, per the deterministic `id = 3` vs. everything-else
+            // split in `make_fts_partitioned_dataset` — or the "distributed" query
+            // below would silently exercise only one executor's local (uncontested)
+            // Tantivy index and never touch the cross-executor BM25 merge this test
+            // exists to pin.
             let owner_counts = harness.partition_owner_counts("fts_docs");
-            tracing::info!("fts_docs partition ownership: {owner_counts:?}");
-            // TODO(distributed-fts): if flakiness shows the three `peregrine` docs
-            // sometimes land in a single partition (defeating the cross-partition
-            // check), switch to a column-value `partition_by` that pins each matching
-            // id to a distinct partition, or add more matching ids to force a spread.
+            assert_eq!(
+                owner_counts.len(),
+                2,
+                "expected fts_docs' 2 partitions to be split across 2 distinct \
+                 executors, got: {owner_counts:?}"
+            );
+            assert!(
+                owner_counts.values().all(|&count| count == 1),
+                "expected each executor to own exactly 1 partition (no partition \
+                 co-location), got: {owner_counts:?}"
+            );
 
             // Wait until the distributed FTS index is queryable for all three hits,
             // not merely until the rows are counted — index build can lag row load.
@@ -389,13 +411,13 @@ fn body_fts_column() -> Column {
     .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id"))
 }
 
-/// Memory-accelerated dataset with `bucket()` partitioning and FTS on `body`.
-fn make_fts_partitioned_dataset(
-    source_path: &str,
-    name: &str,
-    num_buckets: i64,
-    partition_column: &str,
-) -> Dataset {
+/// Memory-accelerated dataset with FTS on `body`, deterministically split into
+/// 2 partitions: `id = 3` alone, and every other row (including `id = 7` and
+/// `id = 11`) together. A hash-based `bucket()` split would only make a
+/// cross-executor placement of the matching rows *likely*; this pins it, and
+/// pins which side `id = 3` lands on (see the divergence this is designed to
+/// produce in the `FTS_DOCS_CSV` doc comment).
+fn make_fts_partitioned_dataset(source_path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(source_path, name);
     dataset.columns = vec![
         Column {
@@ -411,7 +433,7 @@ fn make_fts_partitioned_dataset(
         refresh_mode: Some(RefreshMode::Full),
         partition_by: vec![PartitionedBy {
             name: "expr0".to_string(),
-            expression: format!("bucket({num_buckets}, {partition_column})"),
+            expression: "CASE WHEN id = 3 THEN 0 ELSE 1 END".to_string(),
         }],
         ..Acceleration::default()
     });
@@ -466,12 +488,11 @@ fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
         partition_assignment_interval: "1s".to_string(),
         max_partition_assignments_per_interval:
             spicepod::component::runtime::default_max_partition_assignments_per_interval(),
-        // `bucket(4, id)` yields 5 partitions. Cap at 3 per executor so the two
-        // executors split them (3 + 2) rather than one greedily owning all 5 —
-        // forcing the query to merge BM25 results across executors, which is the
-        // behaviour under test. (Mirrors `distributed_acceleration.rs`'s
-        // multi-executor test, which uses the same cap for the same reason.)
-        max_partitions_per_executor: 3,
+        // The dataset has exactly 2 partitions (see `make_fts_partitioned_dataset`).
+        // Cap at 1 per executor so the 2 executors are each forced to take one,
+        // rather than one greedily owning both — forcing the query to merge BM25
+        // results across executors, which is the behaviour under test.
+        max_partitions_per_executor: 1,
         partition_discovery_timeout:
             spicepod::component::runtime::default_partition_discovery_timeout(),
     }
