@@ -799,12 +799,33 @@ pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
     };
     let installed = ctx.spiced_path();
     // Compared by path rather than by source: the question here is whether the
-    // file just written is the file that will run, which is not the same
-    // question as whether the source is worth announcing at launch.
-    if resolved.path == installed {
+    // managed install is the file that will run, which is not the same question
+    // as whether the source is worth announcing at launch.
+    //
+    // Canonicalized first, because a symlink on `PATH` pointing at the managed
+    // install is a normal way to expose it. Those two paths differ lexically
+    // while naming one file, and warning there would tell a user their install
+    // has no effect when it is the very file about to run. Canonicalization
+    // needs the filesystem and can fail (a path that has since been removed);
+    // the lexical comparison is the fallback, which is what this always was.
+    if same_file(&resolved.path, &installed) {
         return;
     }
     tracing::warn!("{}", shadowed_install_warning(&installed, &resolved));
+}
+
+/// Whether two paths name the same file.
+///
+/// Resolves symlinks, so a `PATH` entry pointing at the managed install is
+/// recognized as that install rather than as something shadowing it. Falls back
+/// to a lexical comparison when either path cannot be canonicalized — a path
+/// that no longer exists cannot be the file that is about to run, so the
+/// fallback answering "different" is the safe direction.
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// The wording of [`warn_if_install_is_shadowed`].
@@ -1060,7 +1081,19 @@ fn resolve_spiced(
     if let Some(dir) = lookup.current_exe.as_deref().and_then(Path::parent) {
         let sibling = dir.join(SPICED_FILENAME);
         if (lookup.is_binary)(&sibling) {
-            return Ok(Some(ResolvedSpiced::at(sibling, SpicedSource::Sibling)?));
+            // An ordinary install puts `spice` and `spiced` in the same managed
+            // directory, so the sibling *is* the managed install. Reporting it
+            // as `Sibling` would make [`SpicedSource::is_expected_default`]
+            // false for the commonest layout there is, and `spice run` would
+            // announce its runtime on every single run — the announcement means
+            // "this is not the runtime you installed", so it has to stay rare
+            // enough to be worth reading.
+            let source = if sibling == managed_install {
+                SpicedSource::ManagedInstall
+            } else {
+                SpicedSource::Sibling
+            };
+            return Ok(Some(ResolvedSpiced::at(sibling, source)?));
         }
     }
 
@@ -1831,6 +1864,61 @@ mod tests {
             );
         }
         assert!(SpicedSource::ManagedInstall.is_expected_default());
+    }
+
+    /// The ordinary install puts `spice` and `spiced` in the same managed
+    /// directory, so the sibling rung finds the managed install itself. It has
+    /// to be reported as such: `is_expected_default` is what keeps `spice run`
+    /// from announcing its runtime, and announcing on the commonest layout there
+    /// is would train everyone to ignore the line that exists to say "this is
+    /// not the runtime you installed".
+    #[test]
+    fn the_sibling_that_is_the_managed_install_is_reported_as_managed() {
+        let managed = "/home/me/.spice/bin/spiced";
+        let is_binary = |candidate: &Path| candidate == Path::new(managed);
+        let found = ladder_with(
+            &[],
+            Some("/home/me/.spice/bin/spice"),
+            None,
+            managed,
+            &is_binary,
+        )
+        .expect("the ladder must not error")
+        .expect("the managed install resolves");
+
+        assert_eq!(found.path, PathBuf::from(managed));
+        assert_eq!(
+            found.source,
+            SpicedSource::ManagedInstall,
+            "the sibling and the managed install are one file here"
+        );
+        assert!(
+            found.source.is_expected_default(),
+            "the ordinary layout must not be announced on every run"
+        );
+    }
+
+    /// A sibling that is *not* the managed install stays `Sibling` — that is the
+    /// case the rung was added for, and the one worth announcing.
+    #[test]
+    fn a_sibling_outside_the_managed_dir_is_still_reported_as_a_sibling() {
+        let sibling = "/usr/local/bin/spiced";
+        let is_binary = |candidate: &Path| candidate == Path::new(sibling);
+        let found = ladder_with(
+            &[],
+            Some("/usr/local/bin/spice"),
+            None,
+            "/home/me/.spice/bin/spiced",
+            &is_binary,
+        )
+        .expect("the ladder must not error")
+        .expect("the sibling resolves");
+
+        assert_eq!(found.source, SpicedSource::Sibling);
+        assert!(
+            !found.source.is_expected_default(),
+            "a runtime from outside the managed install must be announced"
+        );
     }
 
     /// A candidate that cannot be anchored is refused, not passed on. Returning
