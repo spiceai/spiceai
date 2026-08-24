@@ -1103,7 +1103,7 @@ mod tests {
         );
 
         assert_eq!(
-            cache.engine,
+            cache.engine(),
             CacheEngine::Moka,
             "Pingora engine should degrade to Moka when the feature is not compiled in"
         );
