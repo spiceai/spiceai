@@ -25,9 +25,17 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
-/// Get a Command for the spice binary
+/// Get a Command for the spice binary.
+///
+/// `SPICED_PATH` is cleared. The CLI resolves the runtime from it and reports a
+/// pin that names nothing runnable as an error, so a developer or CI runner
+/// with one exported would otherwise make every assertion below a property of
+/// the host rather than of the CLI. A test that wants a pin sets one on the
+/// returned command.
 fn spice_cmd() -> Command {
-    cargo_bin_cmd!("spice")
+    let mut cmd = cargo_bin_cmd!("spice");
+    cmd.env_remove("SPICED_PATH");
+    cmd
 }
 
 // ============================================================================
@@ -44,6 +52,25 @@ mod version {
             .assert()
             .success()
             .stdout(predicate::str::contains("CLI version:"));
+    }
+
+    /// The pin survives the fixture's `env_remove`, and a pin that names
+    /// nothing runnable is reported instead of being silently ignored.
+    #[test]
+    fn a_pinned_runtime_that_is_not_runnable_is_reported_by_version() {
+        let dir = TempDir::new().expect("create tempdir");
+        let pin = dir.path().join("spiced");
+        fs::write(&pin, "not a runtime").expect("write the pin");
+
+        let mut cmd = spice_cmd();
+        cmd.env("SPICED_PATH", &pin)
+            .arg("version")
+            .assert()
+            .failure()
+            .stdout(predicate::str::contains("CLI version:"))
+            .stdout(predicate::str::contains("SPICED_PATH"))
+            .stdout(predicate::str::contains(pin.display().to_string()))
+            .stdout(predicate::str::contains("https://spiceai.org/docs/cli"));
     }
 
     #[test]
