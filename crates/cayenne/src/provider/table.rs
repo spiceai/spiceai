@@ -60,8 +60,8 @@ use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence, PendingPkKeys, PkBloom,
     PkDigestSet, PkExistenceRef, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest,
-    pk_digest_bytes, serialize_pk_bloom_sidecar, shard_of_pk,
+    approx_captured_file_bytes, deserialize_pk_bloom_sidecar, pk_digest, pk_digest_bytes,
+    serialize_pk_bloom_sidecar, shard_of_pk,
 };
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
@@ -120,8 +120,8 @@ use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, 
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_lex_ordering, create_physical_expr};
-use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::collect;
@@ -8665,7 +8665,8 @@ impl CayenneTableProvider {
     /// sites, and publish the load so a run shows the filter saturating.
     fn sample_sharded_index_shape(&self, index: &ShardedPkIndex) {
         let is_bloom = matches!(index, ShardedPkIndex::Bloom(_));
-        self.sharded_index_is_bloom.store(is_bloom, Ordering::Release);
+        self.sharded_index_is_bloom
+            .store(is_bloom, Ordering::Release);
         let load = index.bloom_load_milli();
         self.sharded_bloom_load_milli
             .store(load.unwrap_or(u64::MAX), Ordering::Release);
@@ -8735,7 +8736,12 @@ impl CayenneTableProvider {
     /// `None` only when the index may be cached, which the callers have already
     /// ruled out — the fallback name records that impossible case rather than
     /// silently attributing it to one of the real reasons.
-    fn track_pk_index_discard(&self, path: &'static str, kind: &'static str, reason: Option<&'static str>) {
+    fn track_pk_index_discard(
+        &self,
+        path: &'static str,
+        kind: &'static str,
+        reason: Option<&'static str>,
+    ) {
         telemetry::cayenne::track_pk_index_discard(&[
             telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
             telemetry::KeyValue::new("path", path),
@@ -10142,7 +10148,9 @@ impl CayenneTableProvider {
             Some(max_bytes) if self.exact_keyset_provably_too_large(max_bytes) => {
                 BoundedShardedPkIndexBuilder::bloomed(shards, expected_keys, max_bytes)
             }
-            _ => BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys),
+            _ => {
+                BoundedShardedPkIndexBuilder::new(shards, budget).with_expected_keys(expected_keys)
+            }
         };
         let mut row_id_base: i64 = 0;
 
@@ -10218,11 +10226,9 @@ impl CayenneTableProvider {
             )
             .await?
             {
-                let snapshot_stream =
-                    Self::prefetch_batches(datafusion_physical_plan::execute_stream(
-                        snapshot_plan,
-                        Arc::clone(&task_ctx),
-                    )?);
+                let snapshot_stream = Self::prefetch_batches(
+                    datafusion_physical_plan::execute_stream(snapshot_plan, Arc::clone(&task_ctx))?,
+                );
                 Self::process_stream_into_keyset(
                     snapshot_stream,
                     &self.pk_deletion_strategy,
@@ -10283,11 +10289,10 @@ impl CayenneTableProvider {
             )
             .await?
             {
-                let cold_stream =
-                    Self::prefetch_batches(datafusion_physical_plan::execute_stream(
-                        cold_plan,
-                        Arc::clone(&task_ctx),
-                    )?);
+                let cold_stream = Self::prefetch_batches(datafusion_physical_plan::execute_stream(
+                    cold_plan,
+                    Arc::clone(&task_ctx),
+                )?);
                 Self::process_stream_into_keyset(
                     cold_stream,
                     &self.pk_deletion_strategy,
@@ -10947,7 +10952,10 @@ impl CayenneTableProvider {
                 }
 
                 // Enforce non-null primary key values
-                if pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx)) {
+                if pk_nulls
+                    .as_ref()
+                    .is_some_and(|nulls| nulls.is_null(row_idx))
+                {
                     return Err(Error::DataValidation {
                         table: table_name.to_string(),
                         message: format!(
@@ -11569,7 +11577,10 @@ impl CayenneTableProvider {
         };
 
         for (row_idx, key) in row_pk_keys.into_iter().enumerate() {
-            if pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx)) {
+            if pk_nulls
+                .as_ref()
+                .is_some_and(|nulls| nulls.is_null(row_idx))
+            {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Primary key values must be non-null".to_string(),
@@ -11854,7 +11865,9 @@ impl CayenneTableProvider {
         // so this keeps the set at one allocation on the CDC apply hot path.
         let mut miss_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         for row_idx in 0..batch.num_rows() {
-            let null_pk = pk_nulls.as_ref().is_some_and(|nulls| nulls.is_null(row_idx));
+            let null_pk = pk_nulls
+                .as_ref()
+                .is_some_and(|nulls| nulls.is_null(row_idx));
             // Probe on the borrowed row bytes. Every probe below reads `&[u8]`, so
             // the owning `Box<[u8]>` is only taken on the branch that keeps it —
             // a HIT-heavy batch (the steady-state upsert shape) then allocates
@@ -34371,7 +34384,11 @@ mod tests {
 
         // Unset ceiling disables preserving entirely, whatever the signals say.
         assert!(!CayenneTableProvider::should_preserve_bloom(
-            0, 1_000_000, 10_000, None, Some(5)
+            0,
+            1_000_000,
+            10_000,
+            None,
+            Some(5)
         ));
 
         // A stale count with no key count is no evidence: refuse.

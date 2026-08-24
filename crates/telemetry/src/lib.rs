@@ -1322,8 +1322,15 @@ pub mod cayenne {
     /// design point; a filter drifting well below it is saturating, and until now
     /// nothing exported either number — the sizing could only be inferred from a
     /// one-off WARN at degrade time plus an outside row count.
-    pub fn track_pk_bloom_load(load_milli_bits_per_key: u64, inserted_keys: u64, dimensions: &[KeyValue]) {
-        #[expect(clippy::cast_precision_loss, reason = "a load ratio needs no more than f64 precision")]
+    pub fn track_pk_bloom_load(
+        load_milli_bits_per_key: u64,
+        inserted_keys: u64,
+        dimensions: &[KeyValue],
+    ) {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a load ratio needs no more than f64 precision"
+        )]
         let bits_per_key = load_milli_bits_per_key as f64 / 1000.0;
         PK_BLOOM_BITS_PER_KEY
             .get_or_init(|| {
@@ -1339,7 +1346,9 @@ pub mod cayenne {
             .get_or_init(|| {
                 operational_meter()
                     .u64_gauge("cayenne_pk_bloom_inserted_keys")
-                    .with_description("Keys inserted into a bloomed PK existence index across all of its shards.")
+                    .with_description(
+                        "Keys inserted into a bloomed PK existence index across all of its shards.",
+                    )
                     .build()
             })
             .record(inserted_keys, dimensions);

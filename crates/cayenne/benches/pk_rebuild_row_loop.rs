@@ -45,7 +45,11 @@ limitations under the License.
 //!
 //! Throwaway: this exists to rank the four changes, not to guard them.
 
-#![allow(clippy::expect_used, clippy::cast_possible_truncation, reason = "bench")]
+#![allow(
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    reason = "bench"
+)]
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -106,11 +110,9 @@ fn null_per_row(cols: &[ArrayRef], rows: usize) -> usize {
 /// Proposed: combine validity once per batch, then one bit test per row — and skip
 /// the row loop entirely when no column carries nulls.
 fn null_union(cols: &[ArrayRef], rows: usize) -> usize {
-    let combined = cols
-        .iter()
-        .fold(None, |acc: Option<NullBuffer>, c| {
-            NullBuffer::union(acc.as_ref(), c.nulls())
-        });
+    let combined = cols.iter().fold(None, |acc: Option<NullBuffer>, c| {
+        NullBuffer::union(acc.as_ref(), c.nulls())
+    });
     match combined {
         None => 0,
         Some(nb) if nb.null_count() == 0 => 0,

@@ -70,12 +70,12 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::row_converter::{RowConverter, SortField};
-use hash_index::hash_key_128;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::StreamExt;
+use hash_index::hash_key_128;
 
 /// Minimal Cayenne fixture. Deliberately NOT the `vs_duckdb_helpers` one: that
 /// module links the `duckdb` crate, which this bench has no use for.
@@ -129,8 +129,8 @@ mod fixture {
     pub async fn insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
         let ctx = SessionContext::new();
         let schema = Arc::clone(batch.schema_ref());
-        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
-            .expect("memory exec");
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("memory exec");
         let plan = table
             .insert_into(&ctx.state(), input, InsertOp::Append)
             .await
@@ -280,8 +280,8 @@ fn drain(
             let deleted = deleted.clone();
             handles.push(tokio::spawn(async move {
                 let mut stream = stream;
-                let mut conv = (stage != Stage::ScanOnly && stage != Stage::HashColumnOnly)
-                    .then(converter);
+                let mut conv =
+                    (stage != Stage::ScanOnly && stage != Stage::HashColumnOnly).then(converter);
                 let mut filter = Filter::with_expected_keys(ROWS / n.max(1));
                 let mut seen = 0usize;
                 while let Some(batch) = stream.next().await {
@@ -383,7 +383,9 @@ fn bench(c: &mut Criterion) {
         &HashMap::new(),
         true,
     );
-    eprintln!("fixture rows: serial drain saw {observed}, partitioned drain saw {observed_parallel}");
+    eprintln!(
+        "fixture rows: serial drain saw {observed}, partitioned drain saw {observed_parallel}"
+    );
     assert_eq!(
         observed, ROWS,
         "the fixture must hold exactly the rows the throughput is declared against"
@@ -411,8 +413,18 @@ fn bench(c: &mut Criterion) {
         ("stage/plus_encode", Stage::Encode, &pk_cols, false),
         ("stage/plus_digest", Stage::Digest, &pk_cols, false),
         ("stage/plus_insert", Stage::Insert, &pk_cols, false),
-        ("stage/plus_deletion_probe", Stage::DeletionProbe, &pk_cols, false),
-        ("alt/hash_column_only", Stage::HashColumnOnly, &vec![2], false),
+        (
+            "stage/plus_deletion_probe",
+            Stage::DeletionProbe,
+            &pk_cols,
+            false,
+        ),
+        (
+            "alt/hash_column_only",
+            Stage::HashColumnOnly,
+            &vec![2],
+            false,
+        ),
         // B2: is the gap the SERIAL CONSUMER downstream of the coalesce? The scan
         // itself is already partitioned; `serial` drains one coalesced stream, the
         // way `execute_stream` does today, while `partitioned` does the per-key work

@@ -1677,7 +1677,9 @@ impl BoundedShardedPkIndexBuilder {
             (Some(blooms), Some(max_bytes)) => {
                 Self::bloomed(blooms.len(), self.expected_keys, max_bytes)
             }
-            _ => Self::new(self.shards.len(), self.max_bytes).with_expected_keys(self.expected_keys),
+            _ => {
+                Self::new(self.shards.len(), self.max_bytes).with_expected_keys(self.expected_keys)
+            }
         }
     }
 
@@ -2240,8 +2242,7 @@ mod tests {
         PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, PkBloom, PkBloomRepr, PkDigestSet,
         PkKeysetInsertOutcome, RowLocation, SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex,
         approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar,
-        min_pk_keyset_entry_bytes,
-        pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
+        min_pk_keyset_entry_bytes, pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
     };
 
     /// Degrading after a mid-batch stop must not lose the rest of the batch.
@@ -2270,7 +2271,10 @@ mod tests {
         // 1 MiB of budget: a million keys cannot fit under any entry size.
         let budget = 1024 * 1024;
         let too_large = 1_000_000usize.saturating_mul(entry) > budget;
-        assert!(too_large, "a million keys must be provably too large for 1 MiB");
+        assert!(
+            too_large,
+            "a million keys must be provably too large for 1 MiB"
+        );
 
         // A handful of keys always fits, so the exact path is kept.
         assert!(
@@ -2321,7 +2325,10 @@ mod tests {
         assert!(first.union_with(&second), "same-shape filters must union");
 
         for i in 0..KEYS as u64 {
-            assert!(first.maybe_contains(&key(i)), "key {i} was lost by the union");
+            assert!(
+                first.maybe_contains(&key(i)),
+                "key {i} was lost by the union"
+            );
         }
         // Not just a superset: the union must have set the SAME bits, so it cannot
         // answer positive where the one-pass filter answers negative either.
@@ -2341,7 +2348,10 @@ mod tests {
         let mut small = PkBloom::with_expected_keys(100, 1 << 20);
         let large = PkBloom::with_expected_keys(1_000_000, 1 << 20);
         assert!(!small.is_same_shape_as(&large));
-        assert!(!small.union_with(&large), "a mismatched union must be refused");
+        assert!(
+            !small.union_with(&large),
+            "a mismatched union must be refused"
+        );
     }
 
     /// The parallel rebuild's merge must reproduce the serial drain exactly, and must
@@ -2364,7 +2374,10 @@ mod tests {
             for i in (worker..KEYS as u64).step_by(WORKERS) {
                 shard.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
             }
-            assert!(merged.merge_bloomed(&shard), "identically built shards merge");
+            assert!(
+                merged.merge_bloomed(&shard),
+                "identically built shards merge"
+            );
         }
 
         let (ShardedPkIndex::Bloom(serial), ShardedPkIndex::Bloom(merged)) =
@@ -2386,11 +2399,13 @@ mod tests {
         // differently shaped one would drop keys: both must be refused.
         let mut bloomed = BoundedShardedPkIndexBuilder::bloomed(4, Some(KEYS), BUDGET);
         assert!(!bloomed.merge_bloomed(&BoundedShardedPkIndexBuilder::new(4, None)));
-        assert!(!bloomed.merge_bloomed(&BoundedShardedPkIndexBuilder::bloomed(
-            8,
-            Some(KEYS),
-            BUDGET
-        )));
+        assert!(
+            !bloomed.merge_bloomed(&BoundedShardedPkIndexBuilder::bloomed(
+                8,
+                Some(KEYS),
+                BUDGET
+            ))
+        );
     }
 
     /// The running byte total the budget check reads must equal a fresh sum of the
@@ -2423,7 +2438,8 @@ mod tests {
     fn reserving_for_the_expected_keys_changes_capacity_not_contents() {
         const KEYS: usize = 5_000;
         let build = |expected: Option<usize>| {
-            let mut builder = BoundedShardedPkIndexBuilder::new(4, None).with_expected_keys(expected);
+            let mut builder =
+                BoundedShardedPkIndexBuilder::new(4, None).with_expected_keys(expected);
             for i in 0..KEYS as u64 {
                 builder.insert(owned_key(&key(i)), RowLocation::FileUnlocated);
             }

@@ -56,6 +56,15 @@ limitations under the License.
 //! the steady-state upsert shape. The budget row is flat at ~43 us across all three
 //! shard counts, which is what O(1) looks like.
 //!
+//! `borrowed_boolbuilder` answers "why not `BooleanArray::builder`": its
+//! `append_value` also pokes a `NullBufferBuilder` on every row, which this mask
+//! never needs. It measures +2.4% on the all-HIT and half-HIT shapes and +0.9% on
+//! all-MISS -- small, but consistent, non-overlapping, and largest exactly where
+//! the mask is the biggest share of the loop. `BooleanBufferBuilder` also lets the
+//! predicate be built as `BooleanArray::new(buffer, None)`, which states at the
+//! construction site that a filter predicate cannot be null, rather than leaving
+//! it a property of nobody having called `append_null`.
+//!
 //! Throwaway: this exists to rank the changes, not to guard them.
 
 #![allow(
@@ -181,6 +190,28 @@ fn split_borrowed_bits(rows_enc: &Rows, rows: usize, bloom: &Bloom) -> (usize, u
 }
 
 /// Today: sum every shard's byte count on every insert.
+/// `BooleanBuilder` (`BooleanArray::builder`) instead of `BooleanBufferBuilder`:
+/// the same bit-packed values buffer, plus a `NullBufferBuilder` that
+/// `append_value` pokes on every row even when no null is ever appended.
+fn split_borrowed_boolean_builder(rows_enc: &Rows, rows: usize, bloom: &Bloom) -> (usize, usize) {
+    let mut incoming: HashMap<u128, OwnedRow> = HashMap::with_capacity(rows);
+    let mut miss_mask = BooleanArray::builder(rows);
+    for i in 0..rows {
+        let key = rows_enc.row(i);
+        let key_bytes = key.as_ref();
+        let digest = hash_key_128(key_bytes);
+        let is_miss = !bloom.maybe_contains(key_bytes, i) && !incoming.contains_key(&digest);
+        if is_miss {
+            incoming.insert(digest, key.owned());
+        }
+        miss_mask.append_value(is_miss);
+    }
+    let miss_pred = miss_mask.finish();
+    let hit_pred = arrow::compute::not(&miss_pred).expect("negate");
+    black_box((&miss_pred, &hit_pred));
+    (miss_pred.true_count(), incoming.len())
+}
+
 fn budget_scan(rows_enc: &Rows, rows: usize, shards: usize) -> usize {
     let mut bytes = vec![0usize; shards];
     let mut degrades = 0;
@@ -234,6 +265,9 @@ fn bench(c: &mut Criterion) {
         });
         g.bench_function(format!("split/borrowed_bits_{label}"), |b| {
             b.iter(|| black_box(split_borrowed_bits(&encoded, ROWS, &bloom)));
+        });
+        g.bench_function(format!("split/borrowed_boolbuilder_{label}"), |b| {
+            b.iter(|| black_box(split_borrowed_boolean_builder(&encoded, ROWS, &bloom)));
         });
     }
 
