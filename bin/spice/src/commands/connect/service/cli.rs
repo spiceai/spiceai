@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The `spice connect service` command group.
+//! The `spice cloud service` command group.
 //!
 //! `service` is the canonical spelling everywhere — help, completions, errors,
 //! portal copy, documentation. `svc` is a hidden clap alias for interactive
 //! typing only; it is deliberately absent from generated help and from every
 //! message this CLI prints, so it never becomes a second public spelling.
 //!
-//! Every action resolves its target from the instance directory (`--dir`, or
-//! the current directory) and that directory's manifest. There is no way to
+//! Every action resolves its target from the current instance directory and
+//! that directory's manifest. There is no way to
 //! name a systemd unit or a launchd label, because a lifecycle command aimed at
 //! a service belonging to another instance is worse than one that refuses.
 
@@ -30,21 +30,11 @@ use std::path::Path;
 
 use clap::{Args, Subcommand};
 
-use super::super::status::{self, ConnectStatus};
 use super::{ServiceBackend, ServiceManifest, backend};
 use crate::context::RuntimeContext;
 use crate::error::{Error, Result};
-use crate::output::OutputFormat;
 
-/// Default number of log lines printed before following.
-const DEFAULT_LOG_LINES: u32 = 100;
-
-/// Ceiling on the initial log line count. A request for more history than a
-/// supervisor keeps is a mistake worth naming rather than a request to page
-/// through everything on the host.
-const MAX_LOG_LINES: u32 = 100_000;
-
-/// The concise help printed by `spice connect service` with no action.
+/// The concise help printed by `spice cloud service` with no action.
 ///
 /// Hand-written rather than clap's generated help so the group's summary line
 /// stays one screen. [`tests::the_no_action_help_lists_every_action`] pins it
@@ -52,19 +42,16 @@ const MAX_LOG_LINES: u32 = 100_000;
 const SERVICE_HELP: &str = "\
 Manage the persistent Spice Cloud Connect service for this instance directory.
 
-  spice connect service install      Install and start the service.
-  spice connect service uninstall    Stop and remove it, keeping the Cloud identity.
-  spice connect service start        Start an installed, stopped service.
-  spice connect service stop         Stop a running service, leaving it installed.
-  spice connect service restart      Restart it through the supervisor and wait.
-  spice connect service status       Report its state, persistence, and paths.
-  spice connect service logs         Print its output (-n <lines>, -f to follow).
+  spice cloud service install      Install and start the service.
+  spice cloud service uninstall    Stop and remove it, keeping the Cloud identity.
+  spice cloud service start        Start an installed, stopped service.
+  spice cloud service stop         Stop a running service, leaving it installed.
+  spice cloud service restart      Restart it through the supervisor and wait.
 
-Use --dir <path> to act on an instance rooted at another directory.
 Docs: https://spiceai.org/docs";
 
-/// Arguments for `spice connect service`.
-#[derive(Args, Debug)]
+/// Arguments for `spice cloud service`.
+#[derive(Args, Debug, Clone)]
 pub struct ServiceArgs {
     /// The action to perform. With none, concise help is printed and nothing
     /// is done.
@@ -73,7 +60,7 @@ pub struct ServiceArgs {
 }
 
 /// The service lifecycle actions.
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
     /// Install and start the service for this instance directory.
     ///
@@ -84,7 +71,7 @@ pub enum ServiceCommand {
 
     /// Stop and remove this directory's service, keeping the Cloud identity.
     ///
-    /// `spice connect remove` remains the command that releases the identity.
+    /// `spice cloud unlink` remains the command that releases the identity.
     Uninstall,
 
     /// Start an installed, stopped service. Succeeds if it is already running.
@@ -98,12 +85,6 @@ pub enum ServiceCommand {
     /// Never asks a running `spiced` to exit itself, and never signals a
     /// foreground runtime.
     Restart,
-
-    /// Report this directory's service state, boot persistence, and paths.
-    Status(ServiceStatusArgs),
-
-    /// Print this service's output.
-    Logs(LogsArgs),
 }
 
 impl ServiceCommand {
@@ -115,45 +96,11 @@ impl ServiceCommand {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Restart => "restart",
-            Self::Status(_) => "status",
-            Self::Logs(_) => "logs",
         }
     }
 }
 
-/// Arguments for `spice connect service status`.
-#[derive(Args, Debug)]
-pub struct ServiceStatusArgs {
-    /// Output format. `json` writes the same service object that
-    /// `spice connect status --output json` nests, and writes nothing else to
-    /// stdout.
-    #[arg(long, short = 'o', value_enum, default_value_t = OutputFormat::Table)]
-    pub output: OutputFormat,
-}
-
-/// Arguments for `spice connect service logs`.
-#[derive(Args, Debug)]
-pub struct LogsArgs {
-    /// Lines of existing history to print first. `0` with `--follow` prints
-    /// only new output.
-    #[arg(
-        long = "number",
-        short = 'n',
-        value_name = "LINES",
-        default_value_t = DEFAULT_LOG_LINES,
-        value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_LOG_LINES)),
-    )]
-    pub number: u32,
-
-    /// Keep printing new output until interrupted.
-    ///
-    /// Spelled `-f, --follow` to match `docker logs` and `kubectl logs`.
-    /// `--tail` is intentionally not accepted.
-    #[arg(long, short = 'f')]
-    pub follow: bool,
-}
-
-/// Execute `spice connect service <action>`.
+/// Execute `spice cloud service <action>`.
 ///
 /// # Errors
 ///
@@ -165,28 +112,22 @@ pub async fn execute(
     args: ServiceArgs,
     instance_dir: &Path,
     config_dir: &Path,
-    endpoint: &str,
 ) -> Result<()> {
     let Some(command) = args.command else {
         println!("{SERVICE_HELP}");
         return Ok(());
     };
-    if !matches!(&command, ServiceCommand::Status(_)) {
-        ensure_service_lifecycle_supported()?;
-    }
+    ensure_service_lifecycle_supported()?;
 
     let backend = backend();
     let action = command.as_str();
-    let mutation_lock = match &command {
-        ServiceCommand::Status(_) | ServiceCommand::Logs(_) => None,
-        _ => Some(
-            runtime_cloud_connect::MutationLock::acquire(config_dir, action)
-                .await
-                .map_err(|source| Error::CloudConnectIo {
-                    message: format!("acquire Cloud Connect state for service {action}: {source}"),
-                })?,
-        ),
-    };
+    let mutation_lock = Some(
+        runtime_cloud_connect::MutationLock::acquire(config_dir, action)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!("acquire Cloud Connect state for service {action}: {source}"),
+            })?,
+    );
     let locked_dirs = if let Some(lock) = mutation_lock.as_ref() {
         let service_config_dir = tokio::fs::canonicalize(config_dir)
             .await
@@ -202,23 +143,34 @@ pub async fn execute(
                     "validate locked Cloud Connect state for service {action}: {source}"
                 ),
             })?;
-        let state_config_dir =
+        let identity_config_dir =
             lock.descriptor_relative_config_dir()
                 .map_err(|source| Error::CloudConnectIo {
                     message: format!(
                         "pin locked Cloud Connect state for service {action}: {source}"
                     ),
                 })?;
-        Some((service_config_dir, state_config_dir))
+        Some((service_config_dir, identity_config_dir))
     } else {
         None
     };
-    let (service_config_dir, state_config_dir) = locked_dirs.as_ref().map_or(
+    let (service_config_dir, identity_config_dir) = locked_dirs.as_ref().map_or(
         (config_dir, config_dir),
-        |(service_config_dir, state_config_dir)| {
-            (service_config_dir.as_path(), state_config_dir.as_path())
+        |(service_config_dir, identity_config_dir)| {
+            (service_config_dir.as_path(), identity_config_dir.as_path())
         },
     );
+    // Manifest state resolves through the descriptor the lock retains, not
+    // through a name (see `PinnedConfigDir`).
+    //
+    // `identity_config_dir` above is still a pathname on a platform without
+    // Linux's descriptor-rooted traversal, so identity validation and the
+    // manifest can resolve to different directories in one install. Closing
+    // that needs descriptor-relative reads through the whole state layer: #13291.
+    let state_config_dir = match mutation_lock.as_ref() {
+        Some(lock) => super::PinnedConfigDir::for_lock(service_config_dir, lock)?,
+        None => super::PinnedConfigDir::unlocked(config_dir),
+    };
     match command {
         ServiceCommand::Install => {
             install(
@@ -226,24 +178,20 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
+                identity_config_dir,
                 state_config_dir,
             )
             .await
         }
         ServiceCommand::Uninstall => {
-            uninstall(backend, instance_dir, service_config_dir, state_config_dir)
-        }
-        ServiceCommand::Status(args) => {
-            let status = ConnectStatus::collect(instance_dir, service_config_dir, endpoint).await;
-            status::render_service(&status, args.output)?;
-            degraded_error(&status)
+            uninstall(backend, instance_dir, service_config_dir, &state_config_dir)
         }
         ServiceCommand::Start => {
             let manifest = require_installed(
                 backend,
                 instance_dir,
                 service_config_dir,
-                state_config_dir,
+                &state_config_dir,
                 action,
             )?;
             with_recovery_detail(backend, &manifest, backend.start(&manifest))
@@ -252,7 +200,7 @@ pub async fn execute(
             backend,
             instance_dir,
             service_config_dir,
-            state_config_dir,
+            &state_config_dir,
             action,
         )? {
             Some(manifest) => with_recovery_detail(backend, &manifest, backend.stop(&manifest)),
@@ -263,36 +211,72 @@ pub async fn execute(
                 backend,
                 instance_dir,
                 service_config_dir,
-                state_config_dir,
+                &state_config_dir,
                 action,
             )?;
             with_recovery_detail(backend, &manifest, backend.restart(&manifest))
         }
-        ServiceCommand::Logs(args) => {
-            match resolve_or_report(
-                backend,
-                instance_dir,
-                service_config_dir,
-                state_config_dir,
-                action,
-            )? {
-                Some(manifest) => {
-                    let request = super::LogRequest {
-                        number: args.number,
-                        follow: args.follow,
-                    };
-                    with_recovery_detail(backend, &manifest, backend.logs(&manifest, request))
-                }
-                None => Ok(()),
-            }
-        }
     }
+}
+
+/// Print logs from the installed local service, returning whether a service
+/// was present for this directory.
+///
+/// # Errors
+///
+/// Returns an error when service state or its configured log source cannot be
+/// read.
+pub(crate) fn print_local_logs(
+    instance_dir: &Path,
+    config_dir: &Path,
+    number: u32,
+    follow: bool,
+) -> Result<bool> {
+    let backend = backend();
+    let state = super::PinnedConfigDir::unlocked(config_dir);
+    let Some(manifest) = super::resolve_with_state(backend, instance_dir, &state, config_dir)?
+    else {
+        return Ok(false);
+    };
+    let request = super::LogRequest {
+        number,
+        follow,
+        capture: false,
+    };
+    with_recovery_detail(backend, &manifest, backend.logs(&manifest, request))?;
+    Ok(true)
+}
+
+/// Read bounded logs from the installed local service, returning `None` when
+/// this directory has no service.
+///
+/// # Errors
+///
+/// Returns an error when service state or its configured log source cannot be
+/// read.
+pub(crate) fn read_local_logs(
+    instance_dir: &Path,
+    config_dir: &Path,
+    number: u32,
+) -> Result<Option<Vec<String>>> {
+    let backend = backend();
+    let state = super::PinnedConfigDir::unlocked(config_dir);
+    let Some(manifest) = super::resolve_with_state(backend, instance_dir, &state, config_dir)?
+    else {
+        return Ok(None);
+    };
+    let request = super::LogRequest {
+        number,
+        follow: false,
+        capture: true,
+    };
+    with_recovery_detail(backend, &manifest, backend.logs(&manifest, request))
 }
 
 /// Refuse a lifecycle action on a host with no supervisor this release drives.
 ///
-/// `status` is deliberately exempt: it has to render something on every host,
-/// and it already reports `not_installed` there.
+/// Status and logs are exposed by their Cloud commands and do not pass through
+/// this lifecycle-only boundary.
 #[cfg_attr(
     any(target_os = "linux", target_os = "macos"),
     expect(
@@ -309,7 +293,7 @@ fn ensure_service_lifecycle_supported() -> Result<()> {
     {
         Err(Error::InvalidArgument {
             message: format!(
-                "`spice connect service` supports Linux with systemd and macOS with launchd (this host is {}). Run `spiced` from the enrolled directory under your own supervisor instead. See: https://spiceai.org/docs",
+                "`spice cloud service` supports Linux with systemd and macOS with launchd (this host is {}). Run `spiced` from the enrolled directory under your own supervisor instead. See: https://spiceai.org/docs",
                 std::env::consts::OS
             ),
         })
@@ -322,16 +306,17 @@ async fn install(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    identity_config_dir: &Path,
+    state_config_dir: super::PinnedConfigDir,
 ) -> Result<()> {
-    let identity = validate_service_identity(state_config_dir).await?;
+    let identity = validate_service_identity(identity_config_dir).await?;
 
     // Resolved, not derived from `$HOME`: `sudo` rewrites `HOME` to `/root`, and
     // the runtime the operator installed is normally under their own home.
     let spiced_path = ctx.resolve_spiced_path().ok_or_else(|| Error::InvalidArgument {
         message: format!(
             "Failed to install the Spice Cloud Connect service: no Spice runtime was found at {}. \
-             Install it with `spice install` and re-run `spice connect service install`. \
+             Install it with `spice install` and re-run `spice cloud service install`. \
              See: https://spiceai.org/docs",
             ctx.spiced_path().display()
         ),
@@ -357,13 +342,12 @@ async fn install(
     // install waits for the runtime to settle.
     let install_instance_dir = instance_dir.to_path_buf();
     let install_service_config_dir = service_config_dir.to_path_buf();
-    let install_state_config_dir = state_config_dir.to_path_buf();
     let manifest = tokio::task::spawn_blocking(move || {
         super::install_with_state(
             super::backend(),
             &install_instance_dir,
             &install_service_config_dir,
-            &install_state_config_dir,
+            &state_config_dir,
             &spiced_path,
             &runtime_version,
             &health_url,
@@ -394,10 +378,10 @@ async fn install(
     }
     println!();
     println!("Manage it with:");
-    println!("  spice connect status");
-    println!("  spice connect service restart");
-    println!("  spice connect service logs -f");
-    println!("  spice connect service uninstall");
+    println!("  spice cloud status");
+    println!("  spice cloud service restart");
+    println!("  spice cloud logs -f");
+    println!("  spice cloud service uninstall");
     Ok(())
 }
 
@@ -439,7 +423,7 @@ fn uninstall(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
 ) -> Result<()> {
     let Some(manifest) =
         super::uninstall_with_state(backend, instance_dir, state_config_dir, service_config_dir)?
@@ -455,8 +439,8 @@ fn uninstall(
     println!("Removed the Spice Cloud Connect service {}.", manifest.name);
     println!(
         "The Cloud identity, project attachment, delivered secrets, and instance files were \
-         retained — `spice connect service install` resumes the same enrollment, and \
-         `spice connect` starts the instance in the foreground. `spice connect remove` is the \
+         retained — `spice cloud service install` resumes the same enrollment, and \
+         `spice run` starts the instance in the foreground. `spice cloud unlink` is the \
          command that releases the Cloud identity."
     );
     Ok(())
@@ -471,7 +455,7 @@ fn require_installed(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
     action: &str,
 ) -> Result<ServiceManifest> {
     super::resolve_with_state(backend, instance_dir, state_config_dir, service_config_dir)?
@@ -479,7 +463,7 @@ fn require_installed(
             message: format!(
                 "Failed to {action} the Spice Cloud Connect service for {}: no supervisor-managed \
              service is installed for this directory. Install one with \
-             `spice connect service install`. A `spiced` running in the foreground is not \
+             `spice cloud service install`. A `spiced` running in the foreground is not \
              supervisor-managed and is left alone. See: https://spiceai.org/docs",
                 instance_dir.display()
             ),
@@ -496,7 +480,7 @@ fn resolve_or_report(
     backend: &dyn ServiceBackend,
     instance_dir: &Path,
     service_config_dir: &Path,
-    state_config_dir: &Path,
+    state_config_dir: &super::PinnedConfigDir,
     action: &str,
 ) -> Result<Option<ServiceManifest>> {
     let resolved =
@@ -518,11 +502,11 @@ fn resolve_or_report(
 /// a failure, on stderr so a `--output json` run stays parseable, and ahead of
 /// the diagnosis the process exits with. An interruption is not a failure —
 /// the viewer stopped and the service is unchanged — so it gets none.
-fn with_recovery_detail(
+fn with_recovery_detail<T>(
     backend: &dyn ServiceBackend,
     manifest: &ServiceManifest,
-    result: Result<()>,
-) -> Result<()> {
+    result: Result<T>,
+) -> Result<T> {
     if matches!(result, Err(ref err) if !matches!(err, Error::Interrupted)) {
         let hints = backend.recovery_hints(manifest);
         if !hints.is_empty() {
@@ -538,17 +522,6 @@ fn with_recovery_detail(
     result
 }
 
-/// Turn a degraded snapshot into the non-zero exit automation needs.
-///
-/// The report is already on stdout by the time this runs: the diagnosis travels
-/// as the process's error on stderr, so a `--output json` run stays parseable.
-fn degraded_error(status: &ConnectStatus) -> Result<()> {
-    match status.service_degradation() {
-        Some(message) => Err(Error::ServiceUnavailable { message }),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,17 +530,9 @@ mod tests {
     fn the_no_action_help_lists_every_action() {
         // The help is hand-written, so it has to be pinned against the real
         // set of actions or it will silently go stale.
-        for action in [
-            "install",
-            "uninstall",
-            "start",
-            "stop",
-            "restart",
-            "status",
-            "logs",
-        ] {
+        for action in ["install", "uninstall", "start", "stop", "restart"] {
             assert!(
-                SERVICE_HELP.contains(&format!("spice connect service {action}")),
+                SERVICE_HELP.contains(&format!("spice cloud service {action}")),
                 "the no-action help must name `{action}`"
             );
         }
@@ -582,20 +547,5 @@ mod tests {
         assert_eq!(ServiceCommand::Start.as_str(), "start");
         assert_eq!(ServiceCommand::Stop.as_str(), "stop");
         assert_eq!(ServiceCommand::Restart.as_str(), "restart");
-        assert_eq!(
-            ServiceCommand::Status(ServiceStatusArgs {
-                output: OutputFormat::Table
-            })
-            .as_str(),
-            "status"
-        );
-        assert_eq!(
-            ServiceCommand::Logs(LogsArgs {
-                number: DEFAULT_LOG_LINES,
-                follow: false
-            })
-            .as_str(),
-            "logs"
-        );
     }
 }

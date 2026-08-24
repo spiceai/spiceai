@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The resumable `spice connect` enrollment and project transaction.
+//! The resumable `spice cloud link` enrollment and project transaction.
 
 use std::cell::Cell;
 use std::io::IsTerminal as _;
@@ -25,8 +25,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use dialoguer::Password;
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, Password, Select};
 use runtime_cloud_connect::enroll::{
     EnrollNowOutcome, EnrollmentAuthority, InstanceFacts, RetryPolicy, SessionToken,
 };
@@ -35,19 +35,14 @@ use runtime_cloud_connect::identity::{AppAttachment, Identity, IdentityStore};
 use runtime_cloud_connect::{CloudConnectConfig, EnrollmentTransactionLock};
 use zeroize::Zeroizing;
 
-use crate::commands::cloud::{CloudClient, org as cloud_org};
-use crate::commands::login::connect_org::{
-    OrgResolution, resolve_connect_organization_with_client,
-};
-use crate::commands::login::session::{CredentialStore, LoginContinuation, login_inline};
+use crate::commands::cloud::org as cloud_org;
 use crate::context::RuntimeContext;
 use crate::error::{CloudErrorCode, Error, Result};
 
-use super::naming::{collision_suggestion, initial_suggestion, validate_project_name};
 use super::project::{ProjectAttachment, ProjectClient, ProjectMutation};
 use super::state::{ConnectOperation, IdentityFacts, OrganizationBinding, ProjectOperation};
 
-pub(super) struct ConnectRequest {
+pub(crate) struct ConnectRequest {
     pub org: Option<String>,
     pub project: Option<String>,
     pub token: Option<EnrollmentKey>,
@@ -105,18 +100,9 @@ impl TransactionEndpoint {
 const PROJECT_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 const PROJECT_MAX_ATTEMPTS: u32 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthChoice {
-    Login,
-    EnrollmentKey,
-}
-
 trait Prompter {
     fn interactive(&self) -> bool;
-    async fn choose_auth(&mut self) -> Result<Option<AuthChoice>>;
     async fn read_enrollment_key(&mut self, portal_url: &str) -> Result<Option<Zeroizing<String>>>;
-    async fn confirm_project_assignment(&mut self) -> Result<Option<bool>>;
-    async fn project_name(&mut self, suggestion: &str) -> Result<Option<String>>;
 }
 
 struct TerminalPrompter {
@@ -134,32 +120,6 @@ impl TerminalPrompter {
 impl Prompter for TerminalPrompter {
     fn interactive(&self) -> bool {
         self.interactive
-    }
-
-    async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
-        let result = tokio::task::spawn_blocking(|| {
-            Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Connect this directory to Spice Cloud")
-                .items([
-                    "Log in to Spice Cloud (recommended)",
-                    "Use an enrollment key",
-                ])
-                .default(0)
-                .interact_opt()
-        })
-        .await
-        .map_err(|source| Error::CloudConnectIo {
-            message: format!("authentication-choice task panicked: {source}"),
-        })?;
-        map_optional_prompt(result, "authentication choice").map(|choice| {
-            choice.map(|index| {
-                if index == 0 {
-                    AuthChoice::Login
-                } else {
-                    AuthChoice::EnrollmentKey
-                }
-            })
-        })
     }
 
     async fn read_enrollment_key(&mut self, portal_url: &str) -> Result<Option<Zeroizing<String>>> {
@@ -182,36 +142,6 @@ impl Prompter for TerminalPrompter {
             message: format!("enrollment-key prompt task panicked: {source}"),
         })?;
         map_required_prompt(result, "enrollment key").map(|value| value.map(Zeroizing::new))
-    }
-
-    async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
-        let result = tokio::task::spawn_blocking(|| {
-            Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt("Create a project for this instance now?")
-                .default(false)
-                .interact_opt()
-        })
-        .await
-        .map_err(|source| Error::CloudConnectIo {
-            message: format!("project confirmation task panicked: {source}"),
-        })?;
-        map_optional_prompt(result, "project confirmation")
-    }
-
-    async fn project_name(&mut self, suggestion: &str) -> Result<Option<String>> {
-        let suggestion = suggestion.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            Input::<String>::with_theme(&ColorfulTheme::default())
-                .with_prompt("Project name")
-                .default(suggestion)
-                .allow_empty(false)
-                .interact_text()
-        })
-        .await
-        .map_err(|source| Error::CloudConnectIo {
-            message: format!("project-name prompt task panicked: {source}"),
-        })?;
-        map_required_prompt(result, "project name")
     }
 }
 
@@ -240,7 +170,6 @@ fn map_required_prompt<T>(result: dialoguer::Result<T>, what: &str) -> Result<Op
 
 struct LoginCredential {
     token: SessionToken,
-    credential_org: Option<String>,
 }
 
 struct FlowTelemetry {
@@ -286,19 +215,18 @@ impl Drop for FlowTelemetry {
             auth_path = self.auth_path.get(),
             completion = self.completion.get(),
             failure_stage = self.failure_stage.get(),
-            "Spice Connect flow completed"
+            "Spice Cloud link flow completed"
         );
     }
 }
 
-pub(super) async fn execute(
+pub(crate) async fn execute(
     ctx: &RuntimeContext,
     mut request: ConnectRequest,
 ) -> Result<Option<PathBuf>> {
-    // Resolve the instance directory once, before the transaction, and pass
-    // that same stable path through to the foreground launcher. A caller may
-    // spell `--dir` through a symlink, but retargeting it after enrollment must
-    // never start spiced in a different directory.
+    // Resolve the instance directory once before the transaction. A caller may
+    // spell it through a symlink, but retargeting that symlink after enrollment
+    // must never redirect later state writes.
     let directory = canonical_instance_directory(request.dir.as_deref()).await?;
     request.dir = Some(directory.clone());
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -386,7 +314,7 @@ async fn execute_with_inner<P: Prompter>(
         runtime_cloud_connect::RuntimeLock::acquire(&config_dir).map_err(|source| {
             Error::CloudConnectIo {
                 message: format!(
-                    "{source} Stop the running instance before using `spice connect`."
+                    "{source} Stop the running instance before using `spice cloud link`."
                 ),
             }
         })?;
@@ -410,7 +338,6 @@ async fn execute_with_inner<P: Prompter>(
         telemetry.auth("existing");
         return existing_identity_flow(
             &request,
-            prompter,
             ExistingIdentityContext {
                 config_dir: &config_dir,
                 directory: &directory,
@@ -528,7 +455,6 @@ async fn execute_with_inner<P: Prompter>(
                     resumed_operation,
                 },
                 &request,
-                prompter,
                 &telemetry,
             )
             .await;
@@ -560,104 +486,23 @@ async fn execute_with_inner<P: Prompter>(
     }
 
     telemetry.stage("authentication");
-    let login = match if resolved_endpoint.permits_credentials() {
+    let Some(login) = (if resolved_endpoint.permits_credentials() {
         stored_user_login(&endpoint, request.org.as_deref()).await?
     } else {
         None
-    } {
-        Some(login) => login,
-        None if !prompter.interactive() => {
-            if !resolved_endpoint.permits_credentials() {
-                return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
-            }
-            return Err(invalid_usage(
-                "non-interactive Cloud Connect requires either a login with --org <org> --project <name>, or --token <enrollment-key>.",
-            ));
+    }) else {
+        if !resolved_endpoint.permits_credentials() {
+            return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
         }
-        None => match prompter.choose_auth().await? {
-            Some(AuthChoice::Login) => {
-                if !resolved_endpoint.permits_credentials() {
-                    return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
-                }
-                match login_inline(CredentialStore::EnvFile).await? {
-                    LoginContinuation::Authenticated(session) => LoginCredential {
-                        token: SessionToken::new(session.access_token().to_string()),
-                        credential_org: Some(session.org_name().to_string()),
-                    },
-                    LoginContinuation::Cancelled => {
-                        telemetry.complete("cancelled");
-                        return Ok(());
-                    }
-                }
-            }
-            Some(AuthChoice::EnrollmentKey) => {
-                if !resolved_endpoint.permits_credentials() {
-                    return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
-                }
-                telemetry.auth("token");
-                let Some(raw) = prompter.read_enrollment_key(&connect_portal_url()).await? else {
-                    telemetry.complete("cancelled");
-                    return Ok(());
-                };
-                let key =
-                    EnrollmentKey::parse(raw.as_str()).map_err(|source| Error::InvalidUsage {
-                        message: source.to_string(),
-                    })?;
-                return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
-                    .await;
-            }
-            None => {
-                telemetry.complete("cancelled");
-                return Ok(());
-            }
-        },
+        return Err(org_credential_missing(
+            request.org.as_deref().unwrap_or("the target organization"),
+        ));
     };
     telemetry.auth("login");
 
-    let management = CloudClient::with_token_for_org_at(
-        login.token.expose_secret().to_string(),
-        None,
-        &endpoint,
-    )?;
-    telemetry.stage("organization_selection");
-    let selected = match resolve_connect_organization_with_client(
-        &management,
-        request.org.as_deref(),
-        login.credential_org.as_deref(),
-        prompter.interactive(),
-    )
-    .await
-    {
-        Ok(OrgResolution::Selected(org)) => org,
-        Ok(OrgResolution::Cancelled) => {
-            telemetry.complete("cancelled");
-            return Ok(());
-        }
-        Err(error)
-            if request.org.is_none()
-                && prompter.interactive()
-                && error.cloud_code() == Some(CloudErrorCode::Forbidden) =>
-        {
-            eprintln!("{error}");
-            eprintln!(
-                "An owner or admin can supply an enrollment key instead; that path enrolls this instance without creating a project."
-            );
-            if !resolved_endpoint.permits_credentials() {
-                return Err(legacy_endpoint_requires_explicit_authority(&endpoint));
-            }
-            telemetry.auth("token");
-            let Some(raw) = prompter.read_enrollment_key(&connect_portal_url()).await? else {
-                telemetry.complete("cancelled");
-                return Ok(());
-            };
-            let key = EnrollmentKey::parse(raw.as_str()).map_err(|source| Error::InvalidUsage {
-                message: source.to_string(),
-            })?;
-            return enroll_with_key(key_enrollment(request.org.clone(), None), key, &telemetry)
-                .await;
-        }
-        Err(error) => return Err(error),
-    };
+    let selected = request.org.clone().ok_or_else(|| {
+        invalid_usage("Cloud linking requires an explicit organization and project.")
+    })?;
 
     enroll_with_login(
         LoginEnrollment {
@@ -666,12 +511,11 @@ async fn execute_with_inner<P: Prompter>(
             directory: &directory,
             endpoint: &resolved_endpoint,
             region,
-            organization: selected.name,
+            organization: selected,
             login,
             resumed_operation: None,
         },
         &request,
-        prompter,
         &telemetry,
     )
     .await
@@ -739,7 +583,7 @@ fn resumable_authority(
             // The public CLI is interactive-only: a rerun resumes the durable
             // operation and asks for the missing project choice. The explicit
             // force command is the only local-abandon path.
-            let finish = "re-run `spice connect` interactively to finish it, or run `spice connect remove --force --yes` to abandon it explicitly";
+            let finish = "re-run `spice cloud link` interactively to finish it, or run `spice cloud unlink` to abandon it explicitly";
             if request.token.is_some() {
                 return Err(pending_operation_conflict(
                     &format!("was authorized by a login to organization {organization}"),
@@ -838,11 +682,10 @@ struct LoginEnrollment<'a> {
     resumed_operation: Option<String>,
 }
 
-/// Enroll under a login session, then attach a project when one is named.
-async fn enroll_with_login<P: Prompter>(
+/// Enroll under a login session, then attach the explicitly selected project.
+async fn enroll_with_login(
     context: LoginEnrollment<'_>,
     request: &ConnectRequest,
-    prompter: &mut P,
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     telemetry.stage("enrollment");
@@ -868,15 +711,10 @@ async fn enroll_with_login<P: Prompter>(
     }
 
     telemetry.stage("project_assignment");
-    let project =
-        project_name_after_enrollment(request.project.as_deref(), context.directory, prompter)
-            .await?;
-    let Some(project) = project else {
-        print_unattached(&enrolled.identity, enrolled.recovery_url.as_deref());
-        telemetry.complete("cancelled");
-        return Ok(());
-    };
-    let assignment = assign_project(
+    let project = request.project.clone().ok_or_else(|| {
+        invalid_usage("`spice cloud link` requires an existing project selected by name.")
+    })?;
+    assign_project(
         ProjectAssignmentContext {
             endpoint: &context.endpoint.value,
             config_dir: context.config_dir,
@@ -885,15 +723,12 @@ async fn enroll_with_login<P: Prompter>(
             organization: &context.organization,
             identity: &enrolled.identity,
             recovery_url: enrolled.recovery_url.as_deref(),
+            rollback_enrollment_on_refusal: !enrolled.already_enrolled,
         },
         project,
-        prompter,
     )
     .await?;
-    telemetry.complete(match assignment {
-        ProjectAssignment::Attached => "attached",
-        ProjectAssignment::Cancelled => "cancelled",
-    });
+    telemetry.complete("attached");
     Ok(())
 }
 
@@ -927,9 +762,6 @@ fn stored_resume_credential(organization: &str) -> Option<LoginCredential> {
         .or_else(cloud_org::default_token)
         .map(|token| LoginCredential {
             token: SessionToken::new(token),
-            // Which organization a default credential belongs to is exactly
-            // what this path declines to ask, so it is not claimed here.
-            credential_org: None,
         })
 }
 
@@ -942,10 +774,9 @@ fn stored_resume_credential(organization: &str) -> Option<LoginCredential> {
 /// retarget the pending operation. Spice Cloud re-validates the owner/admin role
 /// before the enrollment commits, as it does for the run that published the
 /// draft.
-async fn resume_pending_login<P: Prompter>(
+async fn resume_pending_login(
     context: PendingLogin<'_>,
     request: &ConnectRequest,
-    prompter: &mut P,
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
     let endpoint = context.endpoint.value.as_str();
@@ -958,21 +789,8 @@ async fn resume_pending_login<P: Prompter>(
         context.organization
     );
     telemetry.stage("authentication");
-    let login = match stored_resume_credential(&context.organization) {
-        Some(login) => login,
-        None if !prompter.interactive() => {
-            return Err(org_credential_missing(&context.organization));
-        }
-        None => match login_inline(CredentialStore::EnvFile).await? {
-            LoginContinuation::Authenticated(session) => LoginCredential {
-                token: SessionToken::new(session.access_token().to_string()),
-                credential_org: Some(session.org_name().to_string()),
-            },
-            LoginContinuation::Cancelled => {
-                telemetry.complete("cancelled");
-                return Ok(());
-            }
-        },
+    let Some(login) = stored_resume_credential(&context.organization) else {
+        return Err(org_credential_missing(&context.organization));
     };
     telemetry.auth("login");
 
@@ -988,7 +806,6 @@ async fn resume_pending_login<P: Prompter>(
             resumed_operation: context.resumed_operation,
         },
         request,
-        prompter,
         telemetry,
     )
     .await
@@ -1005,9 +822,8 @@ struct ExistingIdentityContext<'a> {
     pending_project: Option<ProjectOperation>,
 }
 
-async fn existing_identity_flow<P: Prompter>(
+async fn existing_identity_flow(
     request: &ConnectRequest,
-    prompter: &mut P,
     context: ExistingIdentityContext<'_>,
     telemetry: &FlowTelemetry,
 ) -> Result<()> {
@@ -1034,18 +850,15 @@ async fn existing_identity_flow<P: Prompter>(
     } = context;
 
     if identity.is_expired() {
-        // The host clock is not the authority on whether this credential may
-        // renew. Hand the retained runtime locks back to the launcher and let
-        // spiced present the existing key to the control plane, which supports
-        // renewal of an expired leaf within its server-side grace period.
-        // Project mutation remains deferred until a later connect observes the
-        // renewed identity, so this path cannot attach using a credential whose
-        // renewal the control plane has not accepted.
-        println!(
-            "The local clock places this instance identity outside its validity period. Starting the runtime so Spice Cloud can decide whether to renew it; run `spice connect` again after renewal to make project changes."
-        );
+        // Only the runtime owns identity renewal. Linking never starts it, so
+        // refuse before any project mutation and let the operator renew
+        // explicitly.
         telemetry.complete("renewal_required");
-        return Ok(());
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            "The enrolled instance identity is outside its validity period, so the project link was not changed.",
+            "Run `spice run` so Spice Cloud can renew the identity, stop the runtime, then retry `spice cloud link`.",
+        ));
     }
 
     if identity.app_id.is_some() {
@@ -1095,7 +908,7 @@ async fn existing_identity_flow<P: Prompter>(
         && !asserted.eq_ignore_ascii_case(fixed_org)
     {
         return Err(invalid_usage(format!(
-            "this instance is enrolled in organization {fixed_org}, not {asserted}. Run `spice connect remove --force --yes` before enrolling it into another organization."
+            "this instance is enrolled in organization {fixed_org}, not {asserted}. Run `spice cloud unlink` before enrolling it into another organization."
         )));
     }
 
@@ -1109,31 +922,22 @@ async fn existing_identity_flow<P: Prompter>(
             });
         }
         if let Some(asserted) = request.project.as_deref()
-            && asserted != pending.request.name
+            && asserted != pending.project_name
         {
             return Err(invalid_usage(format!(
                 "project attachment for {} is already pending; retry that exact project name.",
-                pending.request.name
+                pending.project_name
             )));
         }
     }
 
     let explicit_project = pending_project
         .as_ref()
-        .map(|operation| operation.request.name.as_str())
+        .map(|operation| operation.project_name.as_str())
         .or(request.project.as_deref());
-    if !prompter.interactive() {
-        if explicit_project.is_none() {
-            print_unattached(&identity, identity.new_project_url.as_deref());
-            telemetry.complete("unattached");
-            return Ok(());
-        }
-        if request.org.is_none() && pending_project.is_none() {
-            return Err(invalid_usage(
-                "non-interactive project setup requires both --org <org> and --project <name>.",
-            ));
-        }
-    }
+    let project = explicit_project.ok_or_else(|| {
+        invalid_usage("`spice cloud link` requires an existing project selected by name.")
+    })?;
 
     if persist_endpoint_file {
         persist_endpoint(config_dir, endpoint).await?;
@@ -1143,51 +947,15 @@ async fn existing_identity_flow<P: Prompter>(
     if !permits_stored_credentials {
         return Err(legacy_endpoint_requires_explicit_authority(endpoint));
     }
-    let mut login = stored_user_login(endpoint, Some(fixed_org)).await?;
-    if login.is_none() && prompter.interactive() {
-        login = match login_inline(CredentialStore::EnvFile).await? {
-            LoginContinuation::Authenticated(session) => Some(LoginCredential {
-                token: SessionToken::new(session.access_token().to_string()),
-                credential_org: Some(session.org_name().to_string()),
-            }),
-            LoginContinuation::Cancelled => {
-                print_unattached(&identity, identity.new_project_url.as_deref());
-                telemetry.complete("cancelled");
-                return Ok(());
-            }
-        };
-    }
+    let login = stored_user_login(endpoint, Some(fixed_org)).await?;
     let Some(login) = login else {
         return Err(org_credential_missing(fixed_org));
     };
-    if let Some(credential_org) = login.credential_org.as_deref()
-        && !credential_org.eq_ignore_ascii_case(fixed_org)
-    {
-        return Err(org_credential_wrong_org(fixed_org, credential_org));
-    }
     let token = login.token;
     telemetry.auth("login");
-    if explicit_project.is_none() {
-        let confirmed = prompter.confirm_project_assignment().await?;
-        if confirmed != Some(true) {
-            print_unattached(&identity, identity.new_project_url.as_deref());
-            telemetry.complete(if confirmed.is_none() {
-                "cancelled"
-            } else {
-                "unattached"
-            });
-            return Ok(());
-        }
-    }
 
     telemetry.stage("project_assignment");
-    let project = project_name_after_enrollment(explicit_project, directory, prompter).await?;
-    let Some(project) = project else {
-        print_unattached(&identity, identity.new_project_url.as_deref());
-        telemetry.complete("cancelled");
-        return Ok(());
-    };
-    let assignment = assign_project(
+    assign_project(
         ProjectAssignmentContext {
             endpoint,
             config_dir,
@@ -1196,15 +964,12 @@ async fn existing_identity_flow<P: Prompter>(
             organization: fixed_org,
             identity: &identity,
             recovery_url: None,
+            rollback_enrollment_on_refusal: false,
         },
-        project,
-        prompter,
+        project.to_string(),
     )
     .await?;
-    telemetry.complete(match assignment {
-        ProjectAssignment::Attached => "attached",
-        ProjectAssignment::Cancelled => "cancelled",
-    });
+    telemetry.complete("attached");
     Ok(())
 }
 
@@ -1212,47 +977,19 @@ async fn stored_user_login(
     endpoint: &str,
     org_hint: Option<&str>,
 ) -> Result<Option<LoginCredential>> {
-    if let Some(org) = org_hint
-        && let Some(token) = cloud_org::token_for_org(org)
-    {
-        return Ok(Some(LoginCredential {
-            token: SessionToken::new(token),
-            credential_org: Some(org.to_string()),
-        }));
-    }
-    let token = cloud_org::default_token();
-    let Some(token) = token else {
-        return Ok(None);
-    };
-    let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-    let Some(context) = client.optional_user_auth_context().await? else {
-        // Service-account credentials have no user auth context. Their
-        // organization is fixed by the issuer and remains server-authorized.
-        return Ok(Some(LoginCredential {
-            token: SessionToken::new(token),
-            credential_org: None,
-        }));
-    };
-    if let Some(org) = org_hint
-        && !context.org_name.eq_ignore_ascii_case(org)
-    {
-        return Err(org_credential_wrong_org(org, &context.org_name));
-    }
-    Ok(Some(LoginCredential {
-        token: SessionToken::new(token),
-        credential_org: (!context.org_name.is_empty()).then_some(context.org_name),
-    }))
-}
-
-fn org_credential_wrong_org(requested: &str, actual: &str) -> Error {
-    Error::cloud_with_hint(
-        CloudErrorCode::OrgCredentialMissing,
-        format!(
-            "No Spice Cloud credential is stored for organization '{requested}'; your selected credential belongs to '{actual}'."
-        ),
-        format!(
-            "Authenticate for it with 'spice cloud login pat --org {requested}' (or 'spice cloud login api --org {requested}' for automation)."
-        ),
+    // Share the preflight's candidates and policy rather than restating them:
+    // `spice cloud link` chooses a credential before this transaction runs, and
+    // a list or a rule that differed would strand a link half-done.
+    let candidates = crate::commands::cloud::client::user_credential_candidates(org_hint);
+    // Share the preflight's policy rather than restating it: `spice cloud link`
+    // chooses a credential before this transaction runs, and a rule that
+    // accepted one here but not there would strand a link half-done.
+    Ok(
+        crate::commands::cloud::client::first_user_credential(&candidates, endpoint, org_hint)
+            .await?
+            .map(|token| LoginCredential {
+                token: SessionToken::new(token),
+            }),
     )
 }
 
@@ -1261,7 +998,7 @@ fn org_credential_missing(org: &str) -> Error {
         CloudErrorCode::OrgCredentialMissing,
         format!("No Spice Cloud credential is stored for organization '{org}'."),
         format!(
-            "Authenticate for it with 'spice cloud login pat --org {org}' (or 'spice cloud login api --org {org}' for automation), or set {}.",
+            "Authenticate for it with 'spice cloud login token --org {org}' (or 'spice cloud login api --org {org}' for automation), or set {}.",
             cloud_org::org_token_var(org)
         ),
     )
@@ -1368,7 +1105,7 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
                 Some(pending) if pending.enrollment_operation_id == resumed => {}
                 Some(_) => {
                     return Err(invalid_usage(
-                        "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice connect` to continue the operation that is pending now, or run `spice connect remove --force --yes` to abandon it explicitly.",
+                        "the pending enrollment for this directory changed while this run was preparing: it now holds a different operation. Nothing was sent. Re-run `spice cloud link` to continue the operation that is pending now, or run `spice cloud unlink` to abandon it explicitly.",
                     ));
                 }
                 None if prepare_dir
@@ -1376,12 +1113,12 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
                     .exists() =>
                 {
                     return Err(invalid_usage(
-                        "this directory finished enrolling while this run was preparing, so the pending operation is gone. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to start the instance.",
+                        "this directory finished enrolling while this run was preparing, so the pending operation is gone. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice cloud link` to start a new link transaction.",
                     ));
                 }
                 None => {
                     return Err(invalid_usage(
-                        "the pending enrollment for this directory was removed while this run was preparing. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice connect` to enroll this directory again.",
+                        "the pending enrollment for this directory was removed while this run was preparing. Nothing was sent, and the enrollment key was not redeemed. Re-run `spice cloud link` to enroll this directory again.",
                     ));
                 }
             }
@@ -1445,40 +1182,6 @@ async fn enroll(attempt: EnrollAttempt<'_>) -> Result<EnrollmentResult> {
     })
 }
 
-async fn project_name_after_enrollment<P: Prompter>(
-    explicit: Option<&str>,
-    directory: &Path,
-    prompter: &mut P,
-) -> Result<Option<String>> {
-    if let Some(name) = explicit {
-        validate_project_name(name)
-            .map_err(|reason| invalid_usage(format!("invalid --project value: {reason}.")))?;
-        return Ok(Some(name.to_string()));
-    }
-    if !prompter.interactive() {
-        return Err(invalid_usage(
-            "non-interactive project setup requires both --org <org> and --project <name>.",
-        ));
-    }
-
-    let suggestion = initial_suggestion(directory);
-    loop {
-        let Some(name) = prompter.project_name(&suggestion).await? else {
-            return Ok(None);
-        };
-        match validate_project_name(&name) {
-            Ok(()) => return Ok(Some(name)),
-            Err(reason) => eprintln!("Project name {reason}."),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectAssignment {
-    Attached,
-    Cancelled,
-}
-
 struct ProjectAssignmentContext<'a> {
     endpoint: &'a str,
     config_dir: &'a Path,
@@ -1487,24 +1190,45 @@ struct ProjectAssignmentContext<'a> {
     organization: &'a str,
     identity: &'a Identity,
     recovery_url: Option<&'a str>,
+    rollback_enrollment_on_refusal: bool,
 }
 
-async fn assign_project<P: Prompter>(
-    context: ProjectAssignmentContext<'_>,
-    first_name: String,
-    prompter: &mut P,
-) -> Result<ProjectAssignment> {
+async fn assign_project(context: ProjectAssignmentContext<'_>, project_name: String) -> Result<()> {
     let client = ProjectClient::new(context.endpoint).map_err(|error| project_error(&error))?;
-    let base = first_name.clone();
-    let mut name = first_name;
-    let mut collision_number = 2_u32;
+    let projects = client
+        .list_attachable(context.token)
+        .await
+        .map_err(|error| project_error(&error))?;
+    let project = projects.into_iter().find(|project| {
+        project.name == project_name && project.org.eq_ignore_ascii_case(context.organization)
+    });
+    let Some(project) = project else {
+        if context.rollback_enrollment_on_refusal {
+            rollback_refused_fresh_enrollment(&context).await?;
+        }
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::ProjectNotFound,
+            format!(
+                "Project '{}/{}' is not attachable to this enrolled instance.",
+                context.organization, project_name
+            ),
+            "Run `spice cloud link` without a project to list every project the server currently allows this instance to attach to.",
+        ));
+    };
+    let location = project
+        .instances
+        .iter()
+        .find(|instance| instance.id == context.identity.identifier)
+        .and_then(|instance| instance.location.as_deref())
+        .or(project.region.as_deref());
     let started = Instant::now();
     let mut retry_attempt = 0_u32;
 
     loop {
-        let operation = prepare_project_operation(&context, &name).await?;
+        let operation =
+            prepare_project_operation(&context, &project.name, project.id, location).await?;
         match client
-            .create(context.token, context.organization, &operation.request)
+            .attach(context.token, context.organization, &operation.request)
             .await
         {
             Ok(attachment) => {
@@ -1515,34 +1239,7 @@ async fn assign_project<P: Prompter>(
                     attachment.organization, attachment.project_name
                 );
                 println!("Monitor: {}", attachment.monitor_url);
-                return Ok(ProjectAssignment::Attached);
-            }
-            Err(error) if error.is_name_conflict() && prompter.interactive() => {
-                delete_project_operation(context.config_dir).await?;
-                eprintln!(
-                    "A project named '{name}' already exists. Choose a new name; the existing project was not linked."
-                );
-                let suggestion = collision_suggestion(&base, collision_number);
-                collision_number = collision_number.saturating_add(1);
-                loop {
-                    let Some(next) = prompter.project_name(&suggestion).await? else {
-                        print_unattached(context.identity, context.recovery_url);
-                        return Ok(ProjectAssignment::Cancelled);
-                    };
-                    match validate_project_name(&next) {
-                        Ok(()) => {
-                            name = next;
-                            break;
-                        }
-                        Err(reason) => eprintln!("Project name {reason}."),
-                    }
-                }
-                retry_attempt = 0;
-            }
-            Err(error) if error.is_name_conflict() => {
-                delete_project_operation(context.config_dir).await?;
-                print_unattached(context.identity, context.recovery_url);
-                return Err(project_error(&error));
+                return Ok(());
             }
             // The control plane knows this instance has an attachment, but
             // does not return enough state in this denial to persist it
@@ -1561,8 +1258,12 @@ async fn assign_project<P: Prompter>(
                 tokio::time::sleep(delay).await;
             }
             Err(error) if !error.is_attachment_ambiguous() => {
+                if context.rollback_enrollment_on_refusal {
+                    rollback_refused_fresh_enrollment(&context).await?;
+                } else {
+                    print_unattached(context.identity, context.recovery_url);
+                }
                 delete_project_operation(context.config_dir).await?;
-                print_unattached(context.identity, context.recovery_url);
                 return Err(project_error(&error));
             }
             Err(error) => return Err(ambiguous_project_error(&error)),
@@ -1573,17 +1274,27 @@ async fn assign_project<P: Prompter>(
 async fn prepare_project_operation(
     context: &ProjectAssignmentContext<'_>,
     project_name: &str,
+    project_id: i64,
+    location: Option<&str>,
 ) -> Result<ProjectOperation> {
     let config_dir = context.config_dir.to_path_buf();
     let directory = context.directory.to_path_buf();
     let endpoint = context.endpoint.to_string();
     let organization = context.organization.to_string();
     let project_name = project_name.to_string();
-    let request = ProjectMutation::signed(context.identity, context.organization, &project_name)
-        .map_err(|error| project_error(&error))?;
+    let request =
+        ProjectMutation::signed(context.identity, context.organization, project_id, location)
+            .map_err(|error| project_error(&error))?;
     tokio::task::spawn_blocking(move || {
-        ProjectOperation::prepare(&config_dir, &directory, &endpoint, &organization, request)
-            .map_err(|error| state_error(&error))
+        ProjectOperation::prepare(
+            &config_dir,
+            &directory,
+            &endpoint,
+            &organization,
+            &project_name,
+            request,
+        )
+        .map_err(|error| state_error(&error))
     })
     .await
     .map_err(|source| Error::CloudConnectIo {
@@ -1600,6 +1311,195 @@ async fn delete_project_operation(config_dir: &Path) -> Result<()> {
     .map_err(|source| Error::CloudConnectIo {
         message: format!("project journal cleanup task panicked: {source}"),
     })?
+}
+
+async fn rollback_refused_fresh_enrollment(context: &ProjectAssignmentContext<'_>) -> Result<()> {
+    match runtime_cloud_connect::release::release(
+        context.endpoint,
+        context.identity,
+        context.token.expose_secret(),
+        None,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(error) if error.is_not_found() => {}
+        Err(error) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "Spice Cloud refused the project attachment and could not roll back the fresh enrollment, so the local identity was kept for retry: {error}"
+                ),
+            });
+        }
+    }
+    let identity_path = context
+        .config_dir
+        .join(runtime_cloud_connect::config::IDENTITY_FILE);
+    IdentityStore::clear_async(&identity_path)
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("clear the rolled-back enrolled identity: {source}"),
+        })
+}
+
+pub(crate) async fn clear_local_state(config_dir: &Path, identity_path: &Path) -> Result<()> {
+    let enrollment_transaction = Arc::new(
+        runtime_cloud_connect::EnrollmentTransactionLock::try_acquire_async(config_dir)
+            .await
+            .map_err(|source| Error::CloudConnectIo {
+                message: format!("acquire the enrollment transaction before unlink: {source}"),
+            })?,
+    );
+    let blocking_config_dir = config_dir.to_path_buf();
+    let identity_path = identity_path.to_path_buf();
+    let transaction = Arc::clone(&enrollment_transaction);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let cache_path =
+            blocking_config_dir.join(runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE);
+        super::state::remove_durable_file(&cache_path).map_err(|source| Error::CloudConnectIo {
+            message: format!("remove the delivered-secrets cache: {source}"),
+        })?;
+        for (label, file) in [
+            (
+                "cloud-managed Spicepod",
+                runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE,
+            ),
+            (
+                "staged cloud-managed Spicepod",
+                "spicepod-cloud-managed.incoming.yml",
+            ),
+            (
+                "cloud-managed Spicepod replacement backup",
+                "spicepod-cloud-managed.bak",
+            ),
+            (
+                "deployment transaction marker",
+                runtime_cloud_connect::config::DEPLOYMENT_TRANSACTION_FILE,
+            ),
+            (
+                "staged deployment transaction marker",
+                runtime_cloud_connect::config::DEPLOYMENT_TRANSACTION_INCOMING_FILE,
+            ),
+            (
+                "staged delivered-secret cache",
+                runtime_cloud_connect::config::INCOMING_SECRET_CACHE_FILE,
+            ),
+            (
+                "previous delivered-secret cache",
+                runtime_cloud_connect::config::PREVIOUS_SECRET_CACHE_FILE,
+            ),
+            (
+                "previous cloud-managed Spicepod",
+                runtime_cloud_connect::config::PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE,
+            ),
+        ] {
+            let path = blocking_config_dir.join(file);
+            super::state::remove_durable_file(&path).map_err(|source| Error::CloudConnectIo {
+                message: format!("remove the {label}: {source}"),
+            })?;
+        }
+        ConnectOperation::delete(&blocking_config_dir).map_err(|source| Error::CloudConnectIo {
+            message: format!("remove the enrollment journal: {source}"),
+        })?;
+        ProjectOperation::delete(&blocking_config_dir).map_err(|source| Error::CloudConnectIo {
+            message: format!("remove the project attachment journal: {source}"),
+        })?;
+        super::state::remove_durable_file(
+            &blocking_config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+        )
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("remove the Cloud endpoint binding: {source}"),
+        })?;
+        remove_local_credential_debris(&blocking_config_dir)?;
+        Ok(())
+    })
+    .await
+    .map_err(|source| Error::CloudConnectIo {
+        message: format!("local Cloud Connect cleanup task panicked: {source}"),
+    })??;
+
+    enrollment_transaction
+        .delete_draft_async()
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("remove the enrollment draft: {source}"),
+        })?;
+    IdentityStore::clear_with_transaction_async(identity_path, transaction)
+        .await
+        .map_err(|source| Error::CloudConnectIo {
+            message: format!("clear the released instance identity: {source}"),
+        })?;
+    Ok(())
+}
+
+/// Remove only the secret-bearing temporary and quarantined file families
+/// created by Cloud Connect writers. The caller holds the local state locks,
+/// so every matching writer artifact is abandoned and removable.
+fn remove_local_credential_debris(config_dir: &Path) -> Result<()> {
+    let draft_path = runtime_cloud_connect::EnrollmentDraft::path_in(config_dir);
+    let identity_path = config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE);
+    let entries = match std::fs::read_dir(config_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::CloudConnectIo {
+                message: format!(
+                    "inspect local Cloud credential artifacts in {}: {source}",
+                    config_dir.display()
+                ),
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::CloudConnectIo {
+            message: format!(
+                "inspect local Cloud credential artifacts in {}: {source}",
+                config_dir.display()
+            ),
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let generated_draft_quarantine = is_generated_draft_quarantine(&name);
+        let generated_draft_temp =
+            runtime_cloud_connect::identity::is_runtime_atomic_write_artifact(&draft_path, &name);
+        let generated_identity_temp =
+            runtime_cloud_connect::identity::is_runtime_atomic_write_artifact(
+                &identity_path,
+                &name,
+            );
+        if generated_draft_quarantine || generated_draft_temp || generated_identity_temp {
+            super::state::remove_durable_file(&entry.path()).map_err(|source| {
+                Error::CloudConnectIo {
+                    message: format!(
+                        "remove local Cloud credential artifact at {}: {source}",
+                        entry.path().display()
+                    ),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Match the exact quarantine spelling emitted by [`super::state`].
+fn is_generated_draft_quarantine(name: &str) -> bool {
+    let Some(parts) = name
+        .strip_prefix("enrollment-draft.quarantine.")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    let mut parts = parts.split('.');
+    let (Some(epoch), Some(pid), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    epoch
+        .parse::<u128>()
+        .is_ok_and(|value| value.to_string() == epoch)
+        && pid
+            .parse::<u32>()
+            .is_ok_and(|value| value.to_string() == pid)
 }
 
 async fn persist_attachment(config_dir: &Path, attachment: &ProjectAttachment) -> Result<()> {
@@ -1648,7 +1548,7 @@ fn validate_existing_identity(path: &Path, identity: &Identity) -> Result<()> {
     if let Some(reason) = identity.reconnect_validation_error() {
         return Err(Error::CloudConnectIo {
             message: format!(
-                "the Cloud Connect identity at {} is unusable ({reason}); run `spice connect remove --force --yes` before enrolling again",
+                "the Cloud Connect identity at {} is unusable ({reason}); run `spice cloud unlink` before enrolling again",
                 path.display()
             ),
         });
@@ -1927,6 +1827,22 @@ fn preflight_request(request: &ConnectRequest) -> Result<()> {
     Ok(())
 }
 
+fn validate_project_name(name: &str) -> std::result::Result<(), &'static str> {
+    if !(4..=38).contains(&name.len()) {
+        return Err("must be between 4 and 38 characters");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("must contain only lowercase letters, digits, and dashes");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err("must start and end with a letter or digit");
+    }
+    Ok(())
+}
+
 fn print_attached(identity: &Identity) {
     let org = identity.org_name.as_deref().unwrap_or("Spice Cloud");
     let project = identity.app_name.as_deref().unwrap_or("attached project");
@@ -1969,75 +1885,6 @@ mod tests {
     };
 
     use super::*;
-
-    struct ScriptedPrompter {
-        interactive: bool,
-        auth: Option<AuthChoice>,
-        key: Option<String>,
-        confirm: Option<bool>,
-        names: std::collections::VecDeque<Option<String>>,
-    }
-
-    impl Prompter for ScriptedPrompter {
-        fn interactive(&self) -> bool {
-            self.interactive
-        }
-
-        async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
-            Ok(self.auth.take())
-        }
-
-        async fn read_enrollment_key(
-            &mut self,
-            _portal_url: &str,
-        ) -> Result<Option<Zeroizing<String>>> {
-            Ok(self.key.take().map(Zeroizing::new))
-        }
-
-        async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
-            Ok(self.confirm.take())
-        }
-
-        async fn project_name(&mut self, _suggestion: &str) -> Result<Option<String>> {
-            Ok(self.names.pop_front().flatten())
-        }
-    }
-
-    #[tokio::test]
-    async fn scripted_auth_choice_has_exact_two_paths() {
-        let mut prompt = ScriptedPrompter {
-            interactive: true,
-            auth: Some(AuthChoice::Login),
-            key: None,
-            confirm: None,
-            names: std::collections::VecDeque::new(),
-        };
-        assert_eq!(
-            prompt.choose_auth().await.expect("choice"),
-            Some(AuthChoice::Login)
-        );
-        prompt.auth = Some(AuthChoice::EnrollmentKey);
-        assert_eq!(
-            prompt.choose_auth().await.expect("choice"),
-            Some(AuthChoice::EnrollmentKey)
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_and_eof_are_clean_prompt_outcomes() {
-        let mut prompt = ScriptedPrompter {
-            interactive: true,
-            auth: None,
-            key: None,
-            confirm: None,
-            names: std::collections::VecDeque::from([None]),
-        };
-        assert_eq!(prompt.choose_auth().await.expect("cancel"), None);
-        assert_eq!(
-            prompt.project_name("steady-spice").await.expect("eof"),
-            None
-        );
-    }
 
     #[test]
     fn terminal_prompt_interrupt_and_eof_map_to_clean_cancellation() {
@@ -2152,24 +1999,12 @@ mod tests {
             self.interactive
         }
 
-        async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
-            panic!("a pending draft must resume its own authority without a chooser");
-        }
-
         async fn read_enrollment_key(
             &mut self,
             _portal_url: &str,
         ) -> Result<Option<Zeroizing<String>>> {
             self.key_prompts += 1;
             Ok(self.key.take().map(Zeroizing::new))
-        }
-
-        async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
-            panic!("a resumed enrollment-key operation never assigns a project");
-        }
-
-        async fn project_name(&mut self, _suggestion: &str) -> Result<Option<String>> {
-            panic!("a resumed enrollment-key operation never assigns a project");
         }
     }
 
@@ -2188,10 +2023,6 @@ mod tests {
     impl Prompter for RacingPrompter {
         fn interactive(&self) -> bool {
             true
-        }
-
-        async fn choose_auth(&mut self) -> Result<Option<AuthChoice>> {
-            panic!("a pending draft must resume its own authority without a chooser");
         }
 
         async fn read_enrollment_key(
@@ -2215,14 +2046,6 @@ mod tests {
                 .expect("publish the replacement draft");
             }
             Ok(self.key.take().map(Zeroizing::new))
-        }
-
-        async fn confirm_project_assignment(&mut self) -> Result<Option<bool>> {
-            panic!("a resumed enrollment-key operation never assigns a project");
-        }
-
-        async fn project_name(&mut self, _suggestion: &str) -> Result<Option<String>> {
-            panic!("a resumed enrollment-key operation never assigns a project");
         }
     }
 
@@ -2431,8 +2254,8 @@ mod tests {
         let rendered = with_key.to_string();
         assert!(
             rendered.contains("--token")
-                && rendered.contains("re-run `spice connect` interactively")
-                && rendered.contains("spice connect remove --force --yes"),
+                && rendered.contains("re-run `spice cloud link` interactively")
+                && rendered.contains("spice cloud unlink"),
             "{rendered}"
         );
         // The advertised command has to work in the mode the operator is in. A
@@ -2440,7 +2263,7 @@ mod tests {
         // on it, while the organization comes from the binding either way — so
         // naming --org instead would fail the caller it was written for.
         assert!(
-            !rendered.contains("spice connect --org"),
+            !rendered.contains("spice cloud link --org"),
             "the remedy must not advertise a command a non-interactive caller cannot finish: {rendered}"
         );
 
@@ -2499,7 +2322,7 @@ mod tests {
         .expect_err("a pending operation must not be replayed to another control plane");
     }
 
-    /// The end-to-end resume: a plain interactive `spice connect` over a pending
+    /// The end-to-end resume: a plain interactive `spice cloud link` over a pending
     /// enrollment-key draft asks for a key exactly once, never opens the
     /// chooser, and leaves the retry-safe state intact when the control plane
     /// cannot be reached.
@@ -2703,8 +2526,8 @@ mod tests {
         .expect_err("a key cannot finish a pending login-mode operation");
         let rendered = error.to_string();
         assert!(
-            rendered.contains("re-run `spice connect` interactively")
-                && rendered.contains("spice connect remove --force --yes"),
+            rendered.contains("re-run `spice cloud link` interactively")
+                && rendered.contains("spice cloud unlink"),
             "the pending operation must answer, naming what finishes and what abandons it: {rendered}"
         );
         assert_eq!(
@@ -2780,6 +2603,67 @@ mod tests {
                 .exists(),
             "a refused resume must enroll nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn unlink_cleanup_removes_cloud_state_and_preserves_operator_backups() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let config_dir = root.path().join(".spice");
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        let artifacts = [
+            runtime_cloud_connect::config::IDENTITY_FILE,
+            "enrollment-draft.json",
+            "enrollment-draft.quarantine.1.2.json",
+            ".enrollment-draft.json.93f1f89a-e2b7-4597-b01d-6e955efb8de8.tmp",
+            ".identity.json.ae2284bb-7147-4a82-8816-37fe41f401d8.tmp",
+            runtime_cloud_connect::secret_cache::SECRET_CACHE_FILE,
+            runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE,
+            "spicepod-cloud-managed.incoming.yml",
+            "spicepod-cloud-managed.bak",
+            runtime_cloud_connect::config::DEPLOYMENT_TRANSACTION_FILE,
+            runtime_cloud_connect::config::DEPLOYMENT_TRANSACTION_INCOMING_FILE,
+            runtime_cloud_connect::config::PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE,
+            runtime_cloud_connect::config::PREVIOUS_SECRET_CACHE_FILE,
+            runtime_cloud_connect::config::INCOMING_SECRET_CACHE_FILE,
+            CloudConnectConfig::ENDPOINT_OVERRIDE_FILE,
+            runtime_cloud_connect::config::CloudConnectConfig::CONNECT_OPERATION_FILE,
+            runtime_cloud_connect::config::CloudConnectConfig::PROJECT_OPERATION_FILE,
+        ]
+        .map(|file| config_dir.join(file));
+        for artifact in &artifacts {
+            std::fs::write(artifact, b"Cloud state").expect("write Cloud artifact");
+        }
+        let operator_owned = [
+            ".identity.json.manual.bak",
+            ".enrollment-draft.json.notes.bak",
+            "enrollment-draft.quarantine.notes.2.json",
+        ]
+        .map(|file| config_dir.join(file));
+        for path in &operator_owned {
+            std::fs::write(path, b"operator backup").expect("write operator backup");
+        }
+
+        clear_local_state(
+            &config_dir,
+            &config_dir.join(runtime_cloud_connect::config::IDENTITY_FILE),
+        )
+        .await
+        .expect("clear Cloud state");
+
+        for artifact in artifacts {
+            assert!(
+                !artifact.exists(),
+                "unlink cleanup must remove {}",
+                artifact.display()
+            );
+        }
+        for path in operator_owned {
+            assert!(
+                path.exists(),
+                "unlink cleanup must preserve {}",
+                path.display()
+            );
+        }
     }
 
     #[test]

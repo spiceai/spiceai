@@ -322,10 +322,118 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionFields, UnionMode};
+    use arrow_tools::type_rewrite::apply_rules;
     use datafusion_table_providers::UnsupportedTypeAction;
 
-    use super::transform_schema_for_vortex;
+    use super::{CAYENNE_CREATION_REWRITE_RULES, transform_schema_for_vortex};
+
+    #[test]
+    fn creation_rewrite_rules_match_vortex_for_all_supported_type_families() {
+        let list_item = Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ));
+        let map_entries = Arc::new(Field::new_struct(
+            "entries",
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Float16, true)),
+            ],
+            false,
+        ));
+        let union_fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Arc::new(Field::new("text", DataType::Utf8, true)),
+                Arc::new(Field::new(
+                    "at",
+                    DataType::Timestamp(TimeUnit::Second, None),
+                    true,
+                )),
+            ],
+        )
+        .expect("valid union fields");
+        let types = vec![
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::List(Arc::clone(&list_item)),
+            DataType::ListView(Arc::clone(&list_item)),
+            DataType::FixedSizeList(Arc::clone(&list_item), 2),
+            DataType::LargeList(Arc::clone(&list_item)),
+            DataType::LargeListView(Arc::clone(&list_item)),
+            DataType::Struct(
+                vec![
+                    Field::new("score", DataType::Float16, true),
+                    Field::new(
+                        "at",
+                        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            DataType::Union(union_fields, UnionMode::Sparse),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float16)),
+            DataType::Decimal32(5, 2),
+            DataType::Decimal64(10, 2),
+            DataType::Decimal128(20, 2),
+            DataType::Decimal256(40, 2),
+            DataType::Map(map_entries, false),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                )),
+            ),
+        ];
+        let schema = Schema::new(
+            types
+                .into_iter()
+                .enumerate()
+                .map(|(index, data_type)| Field::new(format!("column_{index}"), data_type, true))
+                .collect::<Vec<_>>(),
+        );
+
+        let transformed = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect("supported types should transform for Vortex");
+        let creation_rules = apply_rules(&schema, CAYENNE_CREATION_REWRITE_RULES);
+
+        assert_eq!(
+            creation_rules, transformed,
+            "creation rewrite rules must normalize every supported Cayenne type exactly as table creation does"
+        );
+    }
 
     #[test]
     fn float16_converts_to_float32() {

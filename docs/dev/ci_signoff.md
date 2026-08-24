@@ -197,9 +197,18 @@ paths), and the `code_changes` filter in `.github/actions/check-code-changes`
 also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
-what must be gated from what the `lint-rust` recipe reads and from the tracked
-config-file names, rather than from a list someone has to remember, and fails
-when the three drift. Change them together.
+what must be gated from what the `lint-rust` recipe reads, from the tracked
+config-file names, and from every tracked `.rs` file — rather than from a list
+someone has to remember — and fails when the three drift. Change them together.
+
+Deriving from the tracked sources is what catches a whole source *tree* going
+ungated, which the config-file derivation cannot see: top-level `vendor/` holds
+Rust compiled into the workspace through a `[patch.crates-io]` entry, and it
+matched no `code_changes` glob, so a PR confined to it had the merge queue
+report `Rust Lint` and `Build and Test` green having run zero steps
+([#13120](https://github.com/spiceai/spiceai/issues/13120)). The derivation
+itself is pinned by `scripts/test_check_rust_gate_paths.py`, which `lint-rust`
+runs first — a clean tree exercises only the shapes it happens to contain.
 
 ### The unreachable-module guard
 

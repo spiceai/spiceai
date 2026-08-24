@@ -24,11 +24,11 @@ use crate::flight::{
     Error, Service as SpiceFlightService, configure_flight_server_transport,
     is_address_in_use_error, session_auth,
 };
-use crate::tls::flight_incoming::tls_incoming;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
+use runtime_tls::flight_incoming::tls_incoming;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
