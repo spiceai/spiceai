@@ -44,18 +44,32 @@ impl RuntimeServer {
         Self { tools }
     }
 
-    async fn get_tool(&self, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+    /// Resolve `tool_name` to a tool and the canonical name that tool is exposed
+    /// under.
+    ///
+    /// The requested name is not a stable identity for the tool: `decode_tool_name`
+    /// accepts a component's `__` both escaped (`tool_-_name`, what the encoder
+    /// emits) and raw (`tool__name`), so several spellings resolve to the same
+    /// `(catalog, tool)` pair and all of them execute. A caller that records the
+    /// call must label it with the returned canonical name — labelling with the
+    /// requested one splits a single tool's `task_history` rows by whichever
+    /// spelling each caller happened to send.
+    async fn get_tool(&self, tool_name: &str) -> Option<(Arc<dyn SpiceModelTool>, String)> {
         let tools = self.tools.read().await;
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some(tool);
+            return Some((tool, encode_tool_name(&catalog_name, &name)));
         }
         // Fall back to a direct (non-catalog) lookup. This covers top-level
         // tools whose names legitimately contain the `__` catalog separator.
+        // Such a tool is exposed under its own name, so that name is already
+        // canonical and must not be re-encoded.
         match tools.get(tool_name)? {
-            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => Some(Arc::clone(tool)),
+            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
+                Some((Arc::clone(tool), tool_name.to_string()))
+            }
             Tooling::Catalog { .. } => None,
         }
     }
@@ -127,7 +141,7 @@ impl ServerHandler for RuntimeServer {
                 ));
             }
 
-            let Some(tool) = self.get_tool(tool_name.as_ref()).await else {
+            let Some((tool, exposed_name)) = self.get_tool(tool_name.as_ref()).await else {
                 return Err(McpError::method_not_found::<
                     rmcp::model::CallToolRequestMethod,
                 >());
@@ -170,10 +184,12 @@ impl ServerHandler for RuntimeServer {
                     ));
                 }
 
-                let task_name = task_name_for_exposed_tool(tool_name.as_ref());
-                let mcp_server = decode_tool_name(tool_name.as_ref())
-                    .map_or_else(|| tool_name.to_string(), |(server, _)| server);
-                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %tool_name, input = %input);
+                // Labelled from the canonical exposed name `get_tool` resolved,
+                // never the requested spelling — see `get_tool`.
+                let task_name = task_name_for_exposed_tool(&exposed_name);
+                let mcp_server = decode_tool_name(&exposed_name)
+                    .map_or_else(|| exposed_name.clone(), |(server, _)| server);
+                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
                 tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %mcp_server, "labels");
 
                 return match mcp_proxy
@@ -257,4 +273,115 @@ fn to_map(v: Value) -> Map<String, Value> {
         return Map::default();
     };
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::SpiceToolCatalog;
+
+    struct StubTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for StubTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// A catalog holding one tool, looked up by its exact upstream name — the
+    /// same contract `McpToolCatalog::get` has.
+    struct StubCatalog {
+        name: &'static str,
+        tool: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl SpiceToolCatalog for StubCatalog {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            self.name
+        }
+        async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+            vec![Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>]
+        }
+        async fn get(&self, name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+            (name == self.tool).then(|| Arc::new(StubTool(self.tool)) as Arc<dyn SpiceModelTool>)
+        }
+    }
+
+    fn server_with(catalog_name: &'static str, tool_name: &'static str) -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            catalog_name.to_string(),
+            Tooling::Catalog {
+                tools: Arc::new(StubCatalog {
+                    name: catalog_name,
+                    tool: tool_name,
+                }) as Arc<dyn SpiceToolCatalog>,
+                default_catalog_names: vec![],
+            },
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
+    #[tokio::test]
+    async fn aliased_request_spellings_resolve_to_one_exposed_name() {
+        // Part of https://github.com/spiceai/spiceai/issues/13338: the gateway
+        // used to label the task with the requested name, but `decode_tool_name`
+        // accepts a component's `__` both escaped (`tool_-_name`, what the
+        // encoder emits) and raw (`tool__name`). Both spellings reach the same
+        // tool and execute, so labelling from the request would still split one
+        // tool across two `task_history` rows.
+        let server = server_with("srv", "tool__name");
+        let canonical = encode_tool_name("srv", "tool__name");
+        assert_eq!(canonical, "srv__tool_-_name");
+
+        for requested in [canonical.as_str(), "srv__tool__name"] {
+            let (_, exposed) = server
+                .get_tool(requested)
+                .await
+                .unwrap_or_else(|| panic!("{requested} should resolve"));
+            assert_eq!(
+                exposed, canonical,
+                "request {requested} was not canonicalized"
+            );
+            assert_eq!(
+                task_name_for_exposed_tool(&exposed),
+                "tool_use::srv__tool_-_name",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_level_tool_keeps_its_own_name() {
+        // A non-catalog tool is exposed under its own name, even when that name
+        // contains the `__` separator, so re-encoding it would rename the tool.
+        let mut tools = HashMap::new();
+        tools.insert(
+            "top__level".to_string(),
+            Tooling::Tool(Arc::new(StubTool("top__level")) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+
+        let (_, exposed) = server
+            .get_tool("top__level")
+            .await
+            .expect("a top-level tool resolves by its own name");
+        assert_eq!(exposed, "top__level");
+    }
 }
