@@ -305,9 +305,29 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 ///
 /// # Errors
 ///
-/// Returns an `ArrowError` when `target_type` does not describe the layout `data` holds —
-/// validation refuses it rather than reinterpreting the buffers under a type that does not fit.
+/// Returns an `ArrowError` when `target_type` asks for anything beyond a field name or a
+/// nullability flag — a different unit, timezone, signedness, width, precision or scale reads
+/// the same buffers as different values, so it is refused rather than reinterpreted. Also
+/// returns an `ArrowError` when `target_type` does not describe the layout `data` holds.
 pub fn relabel_array_data(
+    data: ArrayData,
+    target_type: &DataType,
+) -> Result<ArrayData, ArrowError> {
+    if data.data_type() == target_type {
+        return Ok(data);
+    }
+
+    // `build` below only validates buffer *shape*, so every same-layout target it accepts would
+    // be rebuilt — `Int32` under a `UInt32` label turns -1 into 4294967295 without an error.
+    // Meaning is checked here instead, once for the whole tree rather than at each level.
+    ensure_relabel_is_metadata_only(data.data_type(), target_type)?;
+
+    relabel_validated_array_data(data, target_type)
+}
+
+/// The rebuild half of [`relabel_array_data`], called once `target_type` is known to differ from
+/// `data`'s type only in field names and nullability flags.
+fn relabel_validated_array_data(
     data: ArrayData,
     target_type: &DataType,
 ) -> Result<ArrayData, ArrowError> {
@@ -336,13 +356,106 @@ pub fn relabel_array_data(
         .child_data()
         .iter()
         .zip(&targets)
-        .map(|(child, target)| relabel_array_data(child.clone(), target))
+        .map(|(child, target)| relabel_validated_array_data(child.clone(), target))
         .collect::<Result<Vec<_>, ArrowError>>()?;
 
     data.into_builder()
         .data_type(target_type.clone())
         .child_data(children)
         .build()
+}
+
+/// Rejects a `target_type` that would change what `source`'s buffers mean.
+///
+/// [`relabel_array_data`] promises to carry values across unchanged, so only the parts of a type
+/// that hold no data may differ: field names, and nullability flags, at every level. Everything
+/// a buffer's interpretation depends on — primitive width and signedness, timestamp/interval/
+/// duration unit, timezone, decimal precision and scale, `FixedSizeList` size, `Union` mode and
+/// type ids, `Dictionary` key type, `Map` `sorted` flag — has to match exactly.
+///
+/// The walk covers the same child-bearing types as [`target_child_types`]. Anything else is
+/// compared whole, so a type this does not know about is refused rather than relabelled: a new
+/// Arrow variant fails closed here instead of being reinterpreted.
+fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Result<(), ArrowError> {
+    match (source, target) {
+        (DataType::List(source_item), DataType::List(target_item))
+        | (DataType::LargeList(source_item), DataType::LargeList(target_item))
+        | (DataType::ListView(source_item), DataType::ListView(target_item))
+        | (DataType::LargeListView(source_item), DataType::LargeListView(target_item)) => {
+            ensure_relabel_is_metadata_only(source_item.data_type(), target_item.data_type())
+        }
+        (
+            DataType::FixedSizeList(source_item, source_len),
+            DataType::FixedSizeList(target_item, target_len),
+        ) if source_len == target_len => {
+            ensure_relabel_is_metadata_only(source_item.data_type(), target_item.data_type())
+        }
+        (
+            DataType::Map(source_entries, source_sorted),
+            DataType::Map(target_entries, target_sorted),
+        ) if source_sorted == target_sorted => {
+            ensure_relabel_is_metadata_only(source_entries.data_type(), target_entries.data_type())
+        }
+        (DataType::Struct(source_fields), DataType::Struct(target_fields))
+            if source_fields.len() == target_fields.len() =>
+        {
+            for (source_field, target_field) in source_fields.iter().zip(target_fields) {
+                ensure_relabel_is_metadata_only(
+                    source_field.data_type(),
+                    target_field.data_type(),
+                )?;
+            }
+            Ok(())
+        }
+        (
+            DataType::Union(source_fields, source_mode),
+            DataType::Union(target_fields, target_mode),
+        ) if source_mode == target_mode && source_fields.len() == target_fields.len() => {
+            for ((source_id, source_field), (target_id, target_field)) in
+                source_fields.iter().zip(target_fields.iter())
+            {
+                if source_id != target_id {
+                    return Err(relabel_changes_meaning(source, target));
+                }
+                ensure_relabel_is_metadata_only(
+                    source_field.data_type(),
+                    target_field.data_type(),
+                )?;
+            }
+            Ok(())
+        }
+        (
+            DataType::RunEndEncoded(source_run_ends, source_values),
+            DataType::RunEndEncoded(target_run_ends, target_values),
+        ) => {
+            // Run ends are a data buffer of their own, so their type is compared like any leaf.
+            ensure_relabel_is_metadata_only(
+                source_run_ends.data_type(),
+                target_run_ends.data_type(),
+            )?;
+            ensure_relabel_is_metadata_only(source_values.data_type(), target_values.data_type())
+        }
+        (
+            DataType::Dictionary(source_key, source_value),
+            DataType::Dictionary(target_key, target_value),
+        ) if source_key == target_key => {
+            ensure_relabel_is_metadata_only(source_value, target_value)
+        }
+        _ if source == target => Ok(()),
+        _ => Err(relabel_changes_meaning(source, target)),
+    }
+}
+
+/// The error [`ensure_relabel_is_metadata_only`] reports, naming the pair that disagrees.
+///
+/// Separate from the shape error `ArrayData::build` raises: the target here fits the buffers, and
+/// the complaint is that it makes them mean something else.
+fn relabel_changes_meaning(source: &DataType, target: &DataType) -> ArrowError {
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel an Arrow array of type {source} as {target}: that changes how the values \
+         are read, not only field names and nullability. Convert the values instead of relabelling \
+         them — see `rewrite_data_type` for the rules that change a type's layout."
+    ))
 }
 
 /// The types `target_type`'s children must carry, in the order [`ArrayData`] holds them.
@@ -371,7 +484,252 @@ fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field, IntervalUnit, Schema, UnionFields, UnionMode};
+    use arrow::array::{Array, Int32Array, ListArray};
+    use arrow::buffer::{Buffer, OffsetBuffer};
+    use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, UnionFields, UnionMode};
+
+    /// A `Map` whose `entries` field is nullable, built the way IPC decode delivers it —
+    /// `MapArray::try_new` refuses this shape outright, which is the defect
+    /// [`MapEntriesNonNullable`] corrects.
+    fn map_with_nullable_entries() -> (ArrayData, DataType) {
+        let entries_fields = Fields::from(vec![
+            Field::new("keys", DataType::Int32, false),
+            Field::new("values", DataType::Int32, true),
+        ]);
+        let entries = ArrayData::builder(DataType::Struct(entries_fields.clone()))
+            .len(2)
+            .add_child_data(Int32Array::from(vec![1, 2]).to_data())
+            .add_child_data(Int32Array::from(vec![10, 20]).to_data())
+            .build()
+            .expect("the entries struct is well formed");
+        let map_type = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entries_fields.clone()),
+                true,
+            )),
+            false,
+        );
+        let map = ArrayData::builder(map_type)
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([0i32, 2]))
+            .add_child_data(entries)
+            .build()
+            .expect("a map with nullable entries decodes even though Arrow forbids it");
+        let target = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entries_fields),
+                false,
+            )),
+            false,
+        );
+        (map, target)
+    }
+
+    #[test]
+    fn relabel_refuses_a_signedness_flip() {
+        let data = Int32Array::from(vec![-1, 2]).to_data();
+        let err = relabel_array_data(data, &DataType::UInt32).expect_err(
+            "relabelling Int32 as UInt32 must be refused: the buffers fit, so it would \
+             republish -1 as 4294967295",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Int32") && message.contains("UInt32"),
+            "the error must name both types, got: {message}"
+        );
+    }
+
+    #[test]
+    fn relabel_refuses_a_timestamp_unit_change() {
+        let data = ArrayData::builder(DataType::Timestamp(TimeUnit::Second, None))
+            .len(1)
+            .add_buffer(Buffer::from_slice_ref([1_i64]))
+            .build()
+            .expect("a one-element second-resolution timestamp is well formed");
+        let err = relabel_array_data(data, &DataType::Timestamp(TimeUnit::Nanosecond, None))
+            .expect_err(
+                "relabelling Second as Nanosecond must be refused: it would reread 1970-01-01 \
+                 00:00:01 as 1970-01-01 00:00:00.000000001",
+            );
+        assert!(
+            err.to_string().contains("Timestamp(ns)"),
+            "the error must name the target unit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relabel_refuses_a_value_change_at_depth() {
+        let values = Int32Array::from(vec![-1, 2]);
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        let target = DataType::List(Arc::new(Field::new("item", DataType::UInt32, true)));
+        let err = relabel_array_data(list.to_data(), &target).expect_err(
+            "a signedness flip on the list item must be refused at depth, not only at the top \
+             level",
+        );
+        assert!(
+            err.to_string().contains("UInt32"),
+            "the error must name the offending child type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relabel_refuses_a_reinterpretation_that_keeps_the_layout() {
+        // Every pair here shares a buffer layout, so `ArrayData::build` accepts all of them; each
+        // one reads those bytes as something else. One arm per part of a type that carries data.
+        let cases = [
+            (DataType::Int32, DataType::Date32),
+            (DataType::Int64, DataType::Float64),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                DataType::Interval(IntervalUnit::YearMonth),
+                DataType::Interval(IntervalUnit::DayTime),
+            ),
+            (
+                DataType::Duration(TimeUnit::Second),
+                DataType::Duration(TimeUnit::Millisecond),
+            ),
+            (DataType::Decimal128(10, 2), DataType::Decimal128(10, 4)),
+        ];
+        for (source, target) in cases {
+            assert!(
+                ensure_relabel_is_metadata_only(&source, &target).is_err(),
+                "{source} must not be relabellable as {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn relabel_refuses_a_nested_shape_change_that_holds_data() {
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let cases = [
+            (
+                DataType::FixedSizeList(Arc::clone(&item), 2),
+                DataType::FixedSizeList(Arc::clone(&item), 3),
+            ),
+            (
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            ),
+            (
+                DataType::Map(Arc::clone(&item), false),
+                DataType::Map(Arc::clone(&item), true),
+            ),
+            (
+                DataType::List(Arc::clone(&item)),
+                DataType::LargeList(Arc::clone(&item)),
+            ),
+            (
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+                DataType::Struct(Fields::from(vec![
+                    Field::new("a", DataType::Int32, true),
+                    Field::new("b", DataType::Int32, true),
+                ])),
+            ),
+            (
+                DataType::Union(
+                    UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, true)])
+                        .expect("one type id for one field"),
+                    UnionMode::Sparse,
+                ),
+                DataType::Union(
+                    UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, true)])
+                        .expect("one type id for one field"),
+                    UnionMode::Dense,
+                ),
+            ),
+            (
+                DataType::Union(
+                    UnionFields::try_new(vec![0_i8], vec![Field::new("a", DataType::Int32, true)])
+                        .expect("one type id for one field"),
+                    UnionMode::Dense,
+                ),
+                DataType::Union(
+                    UnionFields::try_new(vec![1_i8], vec![Field::new("a", DataType::Int32, true)])
+                        .expect("one type id for one field"),
+                    UnionMode::Dense,
+                ),
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int16, false)),
+                    Arc::new(Field::new("values", DataType::Int32, true)),
+                ),
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::new(Field::new("values", DataType::Int32, true)),
+                ),
+            ),
+        ];
+        for (source, target) in cases {
+            assert!(
+                ensure_relabel_is_metadata_only(&source, &target).is_err(),
+                "{source} must not be relabellable as {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn relabel_still_carries_a_map_entries_nullability_correction() {
+        let (map, target) = map_with_nullable_entries();
+        let keys_before = map.child_data()[0].child_data()[0].clone();
+
+        let relabelled = relabel_array_data(map, &target)
+            .expect("flipping the entries nullability flag is metadata-only");
+
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].child_data()[0].buffers(),
+            keys_before.buffers(),
+            "the key buffer must be carried over untouched"
+        );
+    }
+
+    #[test]
+    fn relabel_still_carries_a_field_rename_at_depth() {
+        let values = Int32Array::from(vec![-1, 2]);
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        // A Delta column-mapping projection renames the child and may flip its nullability; both
+        // are metadata, so both must still pass.
+        let target = DataType::List(Arc::new(Field::new("renamed", DataType::Int32, false)));
+
+        let relabelled = relabel_array_data(list.to_data(), &target)
+            .expect("renaming a child field and tightening its nullability is metadata-only");
+
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].buffers(),
+            Int32Array::from(vec![-1, 2]).to_data().buffers(),
+            "the value buffer must be carried over untouched"
+        );
+    }
+
+    #[test]
+    fn relabel_reports_one_line_naming_both_types() {
+        let err = relabel_changes_meaning(&DataType::Int32, &DataType::UInt32).to_string();
+        assert!(
+            !err.contains('\n'),
+            "an error message must stay on one line, got: {err}"
+        );
+        assert!(
+            err.contains("type Int32 as UInt32"),
+            "the message must read as prose naming both types, got: {err}"
+        );
+    }
 
     #[test]
     fn float16_to_float32_top_level_and_nested() {
