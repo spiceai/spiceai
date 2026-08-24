@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use app::AppBuilder;
 
@@ -27,8 +28,13 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
 
-fn make_catalog(path: &str, name: &str) -> Catalog {
-    let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());
+/// Cold Spark Connect clusters can take several minutes to become Ready in CI.
+const LOAD_TIMEOUT: Duration = Duration::from_mins(10);
+const CATALOG_RETRY_DELAY: Duration = Duration::from_secs(10);
+
+fn make_catalog(name: &str) -> Catalog {
+    let mut catalog = Catalog::new("databricks:spiceai_sandbox".to_string(), name.to_string());
+    catalog.include = vec!["tpch.*".to_string()];
     catalog.params = Some(get_params());
     catalog
 }
@@ -62,6 +68,86 @@ fn get_params() -> Params {
     )
 }
 
+async fn catalog_table_count(rt: &Runtime, catalog: &str) -> Result<i64, anyhow::Error> {
+    let result = rt
+        .datafusion()
+        .query_builder(&format!(
+            "SELECT COUNT(*) as cnt FROM information_schema.tables \
+             WHERE table_catalog = '{catalog}'"
+        ))
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    Ok(result
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .map(|a| a.value(0))
+        })
+        .unwrap_or(0))
+}
+
+/// Loads components and retries while the Spark cluster is still Pending.
+///
+/// Unity Catalog registration soft-fails individual Spark Connect table providers when the
+/// cluster is Pending, so `load_components` can finish quickly with an empty catalog. Keep
+/// rebuilding until tables appear or [`LOAD_TIMEOUT`] elapses (same overall wait budget as
+/// `databricks_spark_m2m`).
+async fn load_runtime_waiting_for_catalog(app_name: &str) -> Result<Runtime, anyhow::Error> {
+    let start = Instant::now();
+
+    loop {
+        let remaining = LOAD_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for Spark Connect cluster/catalog to become ready"
+            ));
+        }
+
+        let app = AppBuilder::new(app_name)
+            .with_catalog(make_catalog("db_uc"))
+            .build();
+
+        configure_test_datafusion();
+        let rt = Runtime::builder().with_app(app).build().await;
+        let cloned_rt = Arc::new(rt.clone());
+
+        tokio::select! {
+            // We may need to wait for the cluster to startup and become ready, so wait for up to 10 minutes
+            () = tokio::time::sleep(remaining) => {
+                return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+            }
+            () = cloned_rt.load_components() => {}
+        }
+
+        let table_count = catalog_table_count(&rt, "db_uc").await?;
+        if table_count > 0 {
+            return Ok(rt);
+        }
+
+        tracing::warn!(
+            "Catalog 'db_uc' registered with 0 tables (cluster may still be Pending); retrying in {}s",
+            CATALOG_RETRY_DELAY.as_secs()
+        );
+
+        let retry_wait = CATALOG_RETRY_DELAY.min(LOAD_TIMEOUT.saturating_sub(start.elapsed()));
+        if retry_wait.is_zero() {
+            return Err(anyhow::anyhow!(
+                "Timed out waiting for Spark Connect cluster/catalog to become ready"
+            ));
+        }
+        tokio::time::sleep(retry_wait).await;
+    }
+}
+
 #[tokio::test]
 #[cfg_attr(
     not(feature = "extended_tests"),
@@ -77,35 +163,14 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let app = AppBuilder::new("databricks_spark_connector")
-                .with_catalog(make_catalog(
-                    "catalog-dash-test",
-                    "db_uc",
-                ))
-                .build();
-
-            configure_test_datafusion();
-            let mut rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await;
-
-            let cloned_rt = Arc::new(rt.clone());
-            // Set a timeout for the test
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
+            let mut rt = load_runtime_waiting_for_catalog("databricks_spark_connector").await?;
 
             let queries: QueryTests = vec![(
-                "SELECT * FROM db_uc.default.databricks_demo ORDER BY network, isp LIMIT 10",
+                "SELECT * FROM db_uc.tpch.nation ORDER BY n_nationkey LIMIT 10",
                 "select",
                 Some(Box::new(|result_batches| {
                     for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 7, "num_cols: {}", batch.num_columns());
+                        assert_eq!(batch.num_columns(), 4, "num_cols: {}", batch.num_columns());
                         assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                     }
 
@@ -153,30 +218,17 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let app = AppBuilder::new("databricks_spark_schema_test")
-                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
+            let rt = load_runtime_waiting_for_catalog("databricks_spark_schema_test").await?;
 
             runtime_ready_check(&rt).await;
 
-            // Verify databricks_demo columns appear in information_schema
+            // Verify tpch.nation columns appear in information_schema
             let result = rt
                 .datafusion()
                 .query_builder(
                     "SELECT column_name FROM information_schema.columns \
-                     WHERE table_catalog = 'db_uc' AND table_schema = 'default' \
-                     AND table_name = 'databricks_demo' \
+                     WHERE table_catalog = 'db_uc' AND table_schema = 'tpch' \
+                     AND table_name = 'nation' \
                      ORDER BY ordinal_position",
                 )
                 .build()
@@ -193,8 +245,8 @@ async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
                 .map(datafusion::arrow::array::RecordBatch::num_rows)
                 .sum();
             assert_eq!(
-                total_columns, 7,
-                "Expected 7 columns in databricks_demo schema, got {total_columns}"
+                total_columns, 4,
+                "Expected 4 columns in tpch.nation schema, got {total_columns}"
             );
 
             Ok(())
@@ -216,48 +268,11 @@ async fn databricks_spark_dataset_registration_test() -> Result<(), anyhow::Erro
 
     test_request_context()
         .scope(async {
-            let app = AppBuilder::new("databricks_spark_registration_test")
-                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
-                .build();
-
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(app).build().await;
-            let cloned_rt = Arc::new(rt.clone());
-
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
-                }
-                () = cloned_rt.load_components() => {}
-            }
+            let rt = load_runtime_waiting_for_catalog("databricks_spark_registration_test").await?;
 
             runtime_ready_check(&rt).await;
 
-            // Verify the catalog datasets are registered in information_schema.tables
-            let result = rt
-                .datafusion()
-                .query_builder(
-                    "SELECT COUNT(*) as cnt FROM information_schema.tables \
-                     WHERE table_catalog = 'db_uc'",
-                )
-                .build()
-                .run()
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .data
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let table_count: i64 = result
-                .first()
-                .and_then(|b| {
-                    b.column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int64Array>()
-                        .map(|a| a.value(0))
-                })
-                .unwrap_or(0);
+            let table_count = catalog_table_count(&rt, "db_uc").await?;
             assert!(
                 table_count > 0,
                 "Expected at least one table registered under db_uc catalog, found {table_count}"

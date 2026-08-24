@@ -2,17 +2,17 @@
 source: crates/runtime/tests/databricks_spark/mod.rs
 description: "Databricks (mode: spark_connect) Integration Test Results"
 ---
-+-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+
-| network           | isp                        | organization               | autonomous_system_number | autonomous_system_organization | mobile_country_code | mobile_network_code |
-+-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+
-| 1.0.128.0/17      | TOT Public Company Limited | TOT Public Company Limited |                          |                                |                     |                     |
-| 1.128.0.0/11      | Telstra Internet           | Telstra Internet           | 1221                     | Telstra Pty Ltd                |                     |                     |
-| 100.43.128.0/24   | Firecold_Inc               | Firecold_Inc               |                          |                                |                     |                     |
-| 100.43.129.0/26   | bernice_ulloa              | bernice_ulloa              |                          |                                |                     |                     |
-| 100.43.129.128/28 | dewei_feng                 | dewei_feng                 |                          |                                |                     |                     |
-| 100.43.129.144/28 | radoslav_ja?ar             | radoslav_ja?ar             |                          |                                |                     |                     |
-| 100.43.129.160/28 | jakub_henderson            | jakub_henderson            |                          |                                |                     |                     |
-| 100.43.129.176/28 | elisa_blom                 | elisa_blom                 |                          |                                |                     |                     |
-| 100.43.129.192/29 | gertrude_burnham           | gertrude_burnham           |                          |                                |                     |                     |
-| 100.43.129.200/29 | mariam_lovett              | mariam_lovett              |                          |                                |                     |                     |
-+-------------------+----------------------------+----------------------------+--------------------------+--------------------------------+---------------------+---------------------+
++-------------+-----------+-------------+--------------------------------------------------------------------------------------------------------------------+
+| n_nationkey | n_name    | n_regionkey | n_comment                                                                                                          |
++-------------+-----------+-------------+--------------------------------------------------------------------------------------------------------------------+
+| 0           | ALGERIA   | 0           | furiously regular requests. platelets affix furious                                                                |
+| 1           | ARGENTINA | 1           | instructions wake quickly. final deposits haggle. final, silent theodolites                                        |
+| 2           | BRAZIL    | 1           | asymptotes use fluffily quickly bold instructions. slyly bold dependencies sleep carefully pending accounts        |
+| 3           | CANADA    | 1           | ss deposits wake across the pending foxes. packages after the carefully bold requests integrate caref              |
+| 4           | EGYPT     | 4           | usly ironic, pending foxes. even, special instructions nag. sly, final foxes detect slyly fluffily                 |
+| 5           | ETHIOPIA  | 0           | regular requests sleep carefull                                                                                    |
+| 6           | FRANCE    | 3           | oggedly. regular packages solve across                                                                             |
+| 7           | GERMANY   | 3           | ong the regular requests: blithely silent pinto beans hagg                                                         |
+| 8           | INDIA     | 2           | uriously unusual deposits about the slyly final pinto beans could                                                  |
+| 9           | INDONESIA | 2           | d deposits sleep quickly according to the dogged, regular dolphins. special excuses haggle furiously special reque |
++-------------+-----------+-------------+--------------------------------------------------------------------------------------------------------------------+

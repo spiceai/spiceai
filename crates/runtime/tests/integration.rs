@@ -323,6 +323,8 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                (r"sc://[^;]+", "sc://<SPARK_CONNECT_ENDPOINT>"),
+                (r"x-databricks-cluster-id=[^;]+", "x-databricks-cluster-id=<DATABRICKS_CLUSTER_ID>"),
             ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);

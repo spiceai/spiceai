@@ -47,12 +47,13 @@ fn get_params() -> Params {
             ),
             (
                 "databricks_aws_secret_access_key".to_string(),
-                "${ env:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }".to_string(),
+                "${ env:NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }".to_string(),
             ),
             (
                 "databricks_aws_access_key_id".to_string(),
-                "${ env:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }".to_string(),
+                "${ env:NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }".to_string(),
             ),
+            ("databricks_aws_region".to_string(), "us-west-2".to_string()),
             ("client_timeout".to_string(), "120s".to_string()),
             ("mode".to_string(), "delta_lake".to_string()),
         ]
