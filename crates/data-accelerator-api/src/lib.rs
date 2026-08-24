@@ -28,6 +28,7 @@ limitations under the License.
 //! passed in via below-runtime crates — so an accelerator engine (and the `AcceleratedTable`
 //! machinery) can implement or consume the contract without depending on `runtime`.
 
+use crate::snapshots::CayenneSnapshotValidationError;
 use ::arrow::datatypes::SchemaRef;
 use arrow_tools::type_rewrite::TypeRewriteRules;
 use async_trait::async_trait;
@@ -494,6 +495,56 @@ pub trait DataAccelerator: Send + Sync {
         registry: Arc<AcceleratorEngineRegistry>,
         open_option: OpenOption,
     ) -> Result<Arc<dyn AcceleratorSidecar>, CheckpointError>;
+
+    /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
+    /// configured before any of them exists.
+    ///
+    /// `tuning` is the operator's raw `tuning` parameter, interpreted by the engine
+    /// because it owns the vocabulary; `data_path` and `metastore_path` are the
+    /// directories to probe. A catalog has no schema inference, so the seed comes from
+    /// the host alone — which is precisely why it must come from the engine, and why an
+    /// engine with no adaptive controller returns the default outcome and keeps its
+    /// static values.
+    async fn adaptive_tuning_seeds(
+        &self,
+        _tuning: Option<&str>,
+        _data_path: &str,
+        _metastore_path: &str,
+    ) -> AdaptiveTuningOutcome {
+        AdaptiveTuningOutcome::default()
+    }
+
+    /// How this engine's writes accumulate for `acceleration`, or `None` when the engine
+    /// is not the one that acceleration names.
+    ///
+    /// `unset_refresh_mode` is what an absent `refresh_mode` resolves to for the source's
+    /// connector, which the caller resolves because only it knows the `from:` value (see
+    /// `runtime_acceleration::acceleration::unset_refresh_mode_for_connector`).
+    ///
+    /// Asked of the engine rather than recomputed by the runtime so the budget cannot
+    /// disagree with the tables it is budgeting for: the same classification configures
+    /// the table itself.
+    fn spicepod_write_profile(
+        &self,
+        _acceleration: &spicepod::acceleration::Acceleration,
+        _unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
+    ) -> Option<SpicepodWriteProfile> {
+        None
+    }
+
+    /// The identity of the store this acceleration shares with other datasets, when the
+    /// engine keeps one — Cayenne's resolved metadata directory.
+    ///
+    /// Datasets that resolve to the same key share snapshot state, so they must agree on
+    /// whether snapshots are enabled; [`validate_snapshot_consistency`] checks that
+    /// before any of them loads. The key is the engine's own resolution rule, which is
+    /// why it is asked for here rather than recomputed by the caller.
+    ///
+    /// Defaults to `None`: an engine whose datasets share no store has nothing to agree
+    /// about.
+    fn shared_store_key(&self, _acceleration: &Acceleration) -> Option<String> {
+        None
+    }
 
     /// This engine's contribution to the coordinated memory budget, summarised from the
     /// pod's configuration *before* initialization.
@@ -970,6 +1021,138 @@ pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) 
             .iter()
             .filter_map(|key| acceleration_settings.params.get(*key))
             .any(|value| value.eq_ignore_ascii_case("none"))
+}
+
+/// Starting values for an engine's adaptive-tuning knobs, derived from the host.
+///
+/// The controller anchors its bounds to whatever it starts from, so a seed that ignores
+/// the host leaves it riding the wrong window. Only the engine can derive these — it
+/// probes the storage under its own directories — which is why the caller asks rather
+/// than computing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveTuningSeeds {
+    pub compaction_background_interval_ms: u64,
+    pub compaction_trigger_files: usize,
+    /// The inline-flush caps are `i64` because that is what the engine derives and what
+    /// its config takes; converting here would only invite a lossy round trip.
+    pub inline_flush_max_rows: i64,
+    pub inline_flush_max_segments: i64,
+    pub inline_flush_max_bytes: i64,
+    pub write_concurrency: usize,
+}
+
+/// The outcome of asking an engine to seed adaptive tuning.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdaptiveTuningOutcome {
+    /// The operator's `tuning` value was not one the engine recognizes. Reported rather
+    /// than corrected so the caller can warn once and carry on with the default.
+    pub tuning_value_invalid: bool,
+    /// `None` when the operator did not ask for adaptive tuning, in which case the engine
+    /// keeps its static defaults.
+    pub seeds: Option<AdaptiveTuningSeeds>,
+}
+
+/// How an engine's writes accumulate for one acceleration, classified from the Spicepod
+/// *before* initialization.
+///
+/// The runtime sizes thread pools and carves memory from the pod's declared
+/// accelerations, which means classifying each one before any component exists. The
+/// classification is the engine's own — it decides what a given `refresh_mode` does to
+/// its files — while enumerating the component kinds that declare an acceleration is the
+/// runtime's. This type is the boundary between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpicepodWriteProfile {
+    /// Writes arrive continuously and land in an in-memory tier first, so the table
+    /// demands host memory beyond its files.
+    pub uses_cdc_tier: bool,
+    /// Files accumulate across writes, so a background compactor has something to
+    /// consolidate. A whole-table replace discards what the previous refresh wrote and
+    /// therefore does not.
+    pub needs_compaction: bool,
+    /// Small writes are inlined rather than written straight through, which needs a write
+    /// buffer sized per table.
+    pub inlines_small_writes: bool,
+}
+
+/// Rejects a pod whose datasets share an engine's store but disagree about snapshots.
+///
+/// An engine that keeps a shared store (Cayenne's `SQLite` metadata catalog) puts every
+/// dataset in one metadata directory, and enabling snapshots means that catalog joins the
+/// snapshot archive. A pod where some datasets in one directory snapshot and others do not
+/// cannot be restored consistently, so it is refused up front rather than at restore time.
+///
+/// Engine-agnostic: it groups by whatever [`DataAccelerator::shared_store_key`] returns,
+/// and an engine that returns `None` — or is simply not linked into this build — takes part
+/// in no group and so can never fail this check.
+///
+/// # Errors
+///
+/// Returns [`CayenneSnapshotValidationError::InconsistentSnapshotSettings`] naming the
+/// directory and both sides of the disagreement.
+pub fn validate_snapshot_consistency(
+    sources: &[Arc<dyn AccelerationSource>],
+) -> Result<(), CayenneSnapshotValidationError> {
+    let mut store_groups: HashMap<String, Vec<(String, bool)>> = HashMap::new();
+
+    for source in sources {
+        let Some(acceleration) = source.acceleration() else {
+            continue;
+        };
+        let Some(engine) = accelerator_for_engine(acceleration.engine) else {
+            continue;
+        };
+        let Some(store_key) = engine.shared_store_key(acceleration) else {
+            continue;
+        };
+
+        let snapshots_enabled = !matches!(
+            acceleration.snapshot_behavior,
+            runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+        );
+        store_groups
+            .entry(store_key)
+            .or_default()
+            .push((source.name().to_string(), snapshots_enabled));
+    }
+
+    for (metadata_dir, datasets) in store_groups {
+        if datasets.len() <= 1 {
+            continue;
+        }
+
+        let enabled: Vec<&str> = datasets
+            .iter()
+            .filter_map(|(name, enabled)| if *enabled { Some(name.as_str()) } else { None })
+            .collect();
+        let disabled: Vec<&str> = datasets
+            .iter()
+            .filter_map(|(name, enabled)| if *enabled { None } else { Some(name.as_str()) })
+            .collect();
+
+        if !enabled.is_empty() && !disabled.is_empty() {
+            return Err(
+                CayenneSnapshotValidationError::InconsistentSnapshotSettings {
+                    metadata_dir,
+                    enabled_datasets: enabled.join(", "),
+                    disabled_datasets: disabled.join(", "),
+                },
+            );
+        }
+
+        // Several datasets sharing the store with snapshots all enabled is supported:
+        // each snapshot ships a per-dataset metastore slice, so they cannot clobber one
+        // another on extract.
+    }
+
+    Ok(())
+}
+
+/// The registered accelerator for `engine`, or `None` when this build links none.
+fn accelerator_for_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
+    DATA_ACCELERATOR_REGISTRATIONS
+        .iter()
+        .find(|registration| registration.engine == engine)
+        .map(|registration| (registration.constructor)())
 }
 
 #[cfg(test)]

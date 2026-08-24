@@ -22,7 +22,6 @@ pub mod session;
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
-use crate::manifest;
 use clap::{Args, Subcommand};
 use spice_cloud_client::redirect::same_origin_redirect_policy;
 
@@ -491,112 +490,6 @@ fn generate_auth_code() -> String {
             CHARSET[idx] as char
         })
         .collect()
-}
-
-/// Read org and app name from spicepod.yaml or spicepod.yml if it exists.
-fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
-    let Some(spicepod_path) = manifest::existing_spicepod_path(std::path::Path::new(".")) else {
-        return (None, None);
-    };
-
-    let Ok(contents) = std::fs::read_to_string(spicepod_path) else {
-        return (None, None);
-    };
-
-    let Ok(yaml) = yaml::from_str::<yaml::Value>(&contents) else {
-        return (None, None);
-    };
-
-    let org_name = yaml
-        .get("metadata")
-        .and_then(|m| m.get("org"))
-        .and_then(|o| o.as_str())
-        .map(String::from);
-
-    let app_name = yaml.get("name").and_then(|n| n.as_str()).map(String::from);
-
-    (org_name, app_name)
-}
-
-/// Auth context from Spice.ai API.
-pub(crate) struct SpiceAuthContext {
-    username: String,
-    email: String,
-    org_name: String,
-    app_name: Option<String>,
-    app_api_key: Option<String>,
-}
-
-/// Redacts the app API key: the context rides inside login outcomes and
-/// sessions whose `Debug` output can reach logs and assertion messages.
-impl std::fmt::Debug for SpiceAuthContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiceAuthContext")
-            .field("username", &self.username)
-            .field("email", &self.email)
-            .field("org_name", &self.org_name)
-            .field("app_name", &self.app_name)
-            .field(
-                "app_api_key",
-                &self.app_api_key.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
-/// Get auth context from Spice.ai API.
-async fn get_spice_auth_context(
-    base_url: &str,
-    access_token: &str,
-    org_name: Option<&str>,
-    app_name: Option<&str>,
-) -> Result<SpiceAuthContext> {
-    let mut url = format!("{base_url}/api/spice-cli/auth");
-
-    let mut params = Vec::new();
-    if let Some(org) = org_name {
-        params.push(format!("org_name={}", urlencoding::encode(org)));
-    }
-    if let Some(app) = app_name {
-        params.push(format!("app_name={}", urlencoding::encode(app)));
-    }
-    if !params.is_empty() {
-        url = format!("{url}?{}", params.join("&"));
-    }
-
-    let client = credentialed_client()?;
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .send()
-        .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: format!("Failed to get auth context: {e}"),
-        })?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(crate::error::Error::InvalidResponse {
-            message: format!("Auth context request failed: {text}"),
-        });
-    }
-
-    // Parse the response - API returns nested org/app objects
-    let body: serde_json::Value =
-        response
-            .json()
-            .await
-            .map_err(|e| crate::error::Error::InvalidResponse {
-                message: format!("Failed to parse auth context: {e}"),
-            })?;
-
-    Ok(SpiceAuthContext {
-        username: body["username"].as_str().unwrap_or_default().to_string(),
-        email: body["email"].as_str().unwrap_or_default().to_string(),
-        org_name: body["org"]["name"].as_str().unwrap_or_default().to_string(),
-        app_name: body["app"]["name"].as_str().map(String::from),
-        app_api_key: body["app"]["api_key"].as_str().map(String::from),
-    })
 }
 
 #[cfg(test)]

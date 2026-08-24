@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
+use crate::snapshot::ResultsSnapshotPredicate;
 use crate::spiced::SpicedInstance;
 
 #[cfg(feature = "file_append")]
@@ -42,7 +43,7 @@ pub struct SpiceTest<S: TestState> {
     use_progress_bars: bool,
     api_key: Option<String>,
     explain_plan_snapshot: bool,
-    results_snapshot_predicate: Option<fn(&str) -> bool>,
+    results_snapshot_predicate: Option<ResultsSnapshotPredicate>,
     validate_row_count: bool,
 
     state: S,
@@ -86,8 +87,11 @@ impl<S: TestNotStarted> SpiceTest<S> {
         self
     }
 
+    /// The predicate is called with (scenario name, query name) and decides
+    /// whether that query's results are asserted exactly, with float columns
+    /// rounded, or not snapshotted at all.
     #[must_use]
-    pub fn with_results_snapshot(mut self, predicate: fn(&str) -> bool) -> Self {
+    pub fn with_results_snapshot(mut self, predicate: ResultsSnapshotPredicate) -> Self {
         self.results_snapshot_predicate = Some(predicate);
         self
     }
