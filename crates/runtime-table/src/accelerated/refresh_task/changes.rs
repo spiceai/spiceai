@@ -2766,7 +2766,7 @@ impl RefreshTask {
                     emit_schema_evolution_event(&dataset, "partitioned_unsupported", &change, true);
                     return Err(crate::accelerated::Error::FailedToWriteData {
                         source: DataFusionError::Execution(format!(
-                            "widening schema change detected on the CDC stream for {dataset} ({change}), \
+                            "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
                              but a partitioned Cayenne acceleration cannot evolve its schema and a restart will not apply it either. \
                              The change was refused rather than applied lossily, so the source keeps its position. \
                              Remove `partition_by` from the acceleration to allow evolution, or drop and recreate the dataset against the new source schema. \
