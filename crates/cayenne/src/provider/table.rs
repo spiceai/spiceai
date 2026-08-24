@@ -4273,7 +4273,7 @@ impl CayenneTableProvider {
         let paths = std::mem::take(&mut *retired_cache_paths.lock());
         context
             .file_format()
-            .invalidate_cached_paths(context.runtime_env(), paths)
+            .invalidate_cached_paths(context.runtime_env(), &task_table, paths)
             .await;
         cleanup_result
             .map_err(|source| Error::TaskPanicked {
@@ -4713,7 +4713,7 @@ impl CayenneTableProvider {
                 // the same scan-ref gate above excludes a later cache reinsert.
                 let paths = std::mem::take(&mut *retired_cache_paths.lock());
                 file_format
-                    .invalidate_cached_paths(&runtime_env, paths)
+                    .invalidate_cached_paths(&runtime_env, &table_id, paths)
                     .await;
                 match removed {
                     Ok(Ok(true)) => {
@@ -4893,7 +4893,11 @@ impl CayenneTableProvider {
     pub(crate) async fn invalidate_retired_paths(&self, paths: HashSet<ObjectStorePath>) {
         self.context
             .file_format()
-            .invalidate_cached_paths(self.context.runtime_env(), paths)
+            .invalidate_cached_paths(
+                self.context.runtime_env(),
+                &self.table_metadata.table_id,
+                paths,
+            )
             .await;
     }
 

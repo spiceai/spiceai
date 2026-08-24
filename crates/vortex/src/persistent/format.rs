@@ -495,11 +495,19 @@ impl VortexFormat {
     ///
     /// Callers pass the paths of objects a retirement has confirmed absent.
     /// Neither cache has a TTL or any invalidation of its own — an entry leaves
-    /// only when another `put` pushes it out under capacity pressure — and a
-    /// caller whose paths are immutable never writes one again, so an artifact
-    /// whose file has been retired can never be looked up while still holding a
-    /// share of a budget every other table draws on. Retirement is the only
-    /// thing that hands it back.
+    /// only when another `put` pushes it out under capacity pressure — so an
+    /// artifact whose file has been retired would otherwise keep a share of a
+    /// budget every other table draws on for the life of the process. This call
+    /// is the only thing that hands it back.
+    ///
+    /// The two halves are not equally ordered against reads already in flight.
+    /// The segment half is: `SharedSegmentCache` registers per-path state and
+    /// drains in-flight puts before enumerating keys. The footer half is not —
+    /// `infer_schema` and `infer_stats` miss the cache, `await` the object-store
+    /// read, and only then insert what they read, so a scan that missed before
+    /// this call can insert after it and leave one entry per raced path resident
+    /// for the life of the process. Giving the footer side the same coordination
+    /// is tracked in <https://github.com/spiceai/spiceai/issues/13447>.
     ///
     /// Both caches key on the object-store location, so one path set addresses
     /// both; taking them together is what stops a caller releasing one and
@@ -508,7 +516,12 @@ impl VortexFormat {
     /// because every read site checks
     /// [`CachedFileMetadataEntry::is_valid_for`](datafusion_execution::cache::cache_manager::CachedFileMetadataEntry::is_valid_for)
     /// against the current object.
-    pub async fn invalidate_cached_paths(&self, runtime_env: &RuntimeEnv, paths: HashSet<Path>) {
+    pub async fn invalidate_cached_paths(
+        &self,
+        runtime_env: &RuntimeEnv,
+        table: &str,
+        paths: HashSet<Path>,
+    ) {
         if paths.is_empty() {
             return;
         }
@@ -537,8 +550,7 @@ impl VortexFormat {
         {
             tracing::error!(
                 target: "vortex::footer_cache",
-                %error,
-                "Footer-cache invalidation failed to run; retired footers stay cached until capacity evicts them"
+                "Failed to release the memory cached for the files table '{table}' has just retired, so the runtime keeps holding it until another table's reads push it out. Restart the runtime to reclaim it immediately. Cause: {error}. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
             );
         }
     }
@@ -1357,7 +1369,7 @@ mod tests {
         let mut to_retire = retired.clone();
         to_retire.insert(Path::from("retired/never-opened.vortex"));
         format
-            .invalidate_cached_paths(&runtime_env, to_retire)
+            .invalidate_cached_paths(&runtime_env, "retired", to_retire)
             .await;
         assert!(
             cached("retired").is_empty(),
