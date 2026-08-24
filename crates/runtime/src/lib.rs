@@ -71,9 +71,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use status::ComponentStatus;
-use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -86,7 +86,6 @@ use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub use runtime_table::accelerated;
-pub(crate) mod accelerator_memory_budget;
 pub mod auth;
 pub mod builder;
 pub mod catalogconnector;
@@ -101,7 +100,6 @@ pub(crate) mod drasi;
 pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
 pub use runtime_table::federated;
@@ -116,7 +114,6 @@ mod init;
 pub mod internal_table;
 pub mod jobs;
 mod management;
-pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
@@ -134,7 +131,6 @@ pub mod resource_monitor {
 // layering guard cannot see a path that hides inside a legal crate-level edge.
 pub(crate) use runtime_parameters as parameters;
 
-pub mod podswatcher;
 pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
@@ -150,10 +146,8 @@ mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
-pub mod tls;
 pub mod token_providers;
 pub mod tools;
-pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;
 mod view;
@@ -336,6 +330,16 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column primary key is supported today, but this dataset declares a {pk_columns}-column key ({primary_key}). Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackCompositePrimaryKey {
+        dataset_name: String,
+        connector: String,
+        primary_key: String,
+        pk_columns: usize,
+    },
+
+    #[snafu(display(
         "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
@@ -345,15 +349,14 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[cfg(feature = "postgres-accel")]
+    // The list comes from the accelerator registration slice, so it names the engines
+    // this build actually linked. A hand-written list is wrong for every build that
+    // omits an engine, which is every build that omits an engine crate.
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
-    ))]
-    AcceleratorEngineNotAvailable { name: String },
-
-    #[cfg(not(feature = "postgres-accel"))]
-    #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
+        "The accelerator engine '{name}' is not available in this build. Valid engines are {available}. \
+        Set `acceleration.engine` to one of those, or install a build that includes '{name}'. \
+        For details, visit: https://spiceai.org/docs/components/data-accelerators",
+        available = data_accelerator_api::registered_engine_list()
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -631,7 +634,7 @@ pub struct Runtime {
     prometheus_registry: Option<prometheus::Registry>,
     /// On-demand metrics reader for cluster observability.
     /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
-    metrics_reader: Option<metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
@@ -1226,7 +1229,7 @@ impl Runtime {
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
     #[must_use]
-    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+    pub fn metrics_reader(&self) -> Option<&telemetry::metrics_reader::MetricsReader> {
         self.metrics_reader.as_ref()
     }
 
@@ -1409,7 +1412,7 @@ impl Runtime {
                     Arc::new(move || {
                         metrics_reader_for_collector
                             .as_ref()
-                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .map(telemetry::metrics_reader::MetricsReader::collect_otlp)
                             .unwrap_or_default()
                     });
                 (
@@ -1989,7 +1992,7 @@ impl Runtime {
         }
     }
 
-    // Closes and deallocates all resources (including the static registries)
+    // Closes and deallocates all resources, including this runtime's accelerator engines.
     pub async fn shutdown(&self) {
         if self.status.is_shutdown() {
             return;
@@ -2074,12 +2077,12 @@ impl Runtime {
             }
         }
 
-        dataconnector::unregister_all().await;
-        catalogconnector::unregister_all().await;
+        // `dataconnector`, `catalogconnector`, and `document_parse` hold only
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
-
-        document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics endpoints.

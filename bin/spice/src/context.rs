@@ -352,9 +352,8 @@ impl RuntimeContext {
     ///
     /// The first matching entry wins, exactly as before -- .env.local outranks .env,
     /// and within a file the earlier line wins. A blank value is authoritative but is
-    /// never a credential: `spice login` writes `SPICE_SPICEAI_API_KEY=` for an app
-    /// that has no key, so a blank resolves to `None` rather than falling through to
-    /// an older key in a lower-precedence file.
+    /// never a credential, so it resolves to `None` rather than falling through to an
+    /// older key in a lower-precedence file.
     fn load_api_key_from_env_files(&self) -> Option<String> {
         // Try .env.local first, then .env
         let env_files = [".env.local", ".env"];
@@ -502,9 +501,10 @@ impl RuntimeContext {
     /// [`Self::spiced_path`] — which is derived from `HOME` — points at
     /// `/root/.spice/bin/spiced` under `sudo` and misses the runtime the
     /// invoking user actually installed. That matters because
-    /// `sudo spice connect service install` is the documented way to install the
+    /// `sudo spice cloud service install` is the documented way to install the
     /// service: without the last rung, every such run concludes the runtime is
-    /// missing and downloads the latest *release*.
+    /// missing and downloads the latest *release*, which on a machine tracking
+    /// `trunk` silently pairs a dev CLI with a released runtime.
     ///
     /// Preference order:
     /// 1. `$SPICED_PATH` — an explicit pin, honored ahead of everything.
@@ -524,7 +524,7 @@ impl RuntimeContext {
     /// anyone who can write the one can write the other. Note this reasoning
     /// rests on the directories, *not* on `sudo` sanitizing `PATH`: `secure_path`
     /// is set by stock `sudoers` on most Linux distributions but not on macOS.
-    /// The commands documented to run under `sudo` — `spice connect service
+    /// The commands documented to run under `sudo` — `spice cloud service
     /// install` and `spice connect remove` — do not rely on it either; the
     /// former clears the environment and drops to the service account before it
     /// runs anything it resolved here.
@@ -641,9 +641,8 @@ impl RuntimeContext {
             let tls_cert = if tls_cert.is_absolute() {
                 tls_cert
             } else {
-                // Preserve the CLI caller's path semantics even when a command
-                // such as `spice connect --dir` later changes the child's
-                // working directory before spawn.
+                // Preserve the CLI caller's path semantics even when a caller
+                // selects a different child working directory before spawn.
                 std::env::current_dir()
                     .context(RuntimeExecutionSnafu)?
                     .join(tls_cert)
@@ -1085,7 +1084,7 @@ fn sudo_invoker_home() -> Option<PathBuf> {
 /// Absolute paths `getent` ships at, in the order they are tried.
 ///
 /// Resolving it through `PATH` would be a privilege-escalation hole: this runs
-/// under `sudo` on the documented `spice connect service install` path, so a `PATH`
+/// under `sudo` on the documented `spice cloud service install` path, so a `PATH`
 /// entry the invoking user controls would have this process execute their binary
 /// as root. Only these known locations are accepted, and a host with `getent`
 /// somewhere else falls through to reading `/etc/passwd`.
@@ -1453,7 +1452,7 @@ mod tests {
     #[test]
     fn passwd_home_resolves_a_user_macos_keeps_out_of_etc_passwd() {
         // Every ordinary macOS account lives in Directory Services only, so
-        // without the `dscl` step `sudo spice connect service install` cannot find the
+        // without the `dscl` step `sudo spice cloud service install` cannot find the
         // runtime the invoking user installed.
         let Ok(user) = std::env::var("USER") else {
             return;
@@ -1678,7 +1677,7 @@ mod tests {
     }
 
     /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
-    /// home must still be found — otherwise `sudo spice connect service install`
+    /// home must still be found — otherwise `sudo spice cloud service install`
     /// concludes the runtime is missing and downloads a release over the
     /// operator's build. It stays the *last* rung: this context's own install
     /// is the one this user asked for.

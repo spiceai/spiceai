@@ -241,7 +241,7 @@ impl<'a> fmt::MakeWriter<'a> for ServiceLogWriter {
 /// may also be capturing stdout, and a runtime started by hand with the flag
 /// must still print to the terminal it was started from.
 ///
-/// Never coloured. These files are read back by `spice connect service logs`
+/// Never coloured. These files are read back by `spice cloud logs`
 /// and by whatever an operator greps them with, and SGR escapes between the
 /// level and the target defeat a pattern written the way the line reads.
 ///
@@ -359,7 +359,7 @@ pub(crate) async fn init_tracing(
                 "Failed to open the Spice service log directory {}: {e}. A managed service writes \
                  its only log here, so it is not started without one. Check the directory exists \
                  and that this account can write it, then re-run \
-                 `spice connect service install`. See: https://spiceai.org/docs",
+                 `spice cloud service install`. See: https://spiceai.org/docs",
                 service_log_dir
                     .unwrap_or_else(|| std::path::Path::new(""))
                     .display()

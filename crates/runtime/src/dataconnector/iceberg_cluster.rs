@@ -41,7 +41,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 
-use crate::execution_plan::{IcebergScanExec, session_is_distributed};
+use runtime_execution_plans::{IcebergScanExec, session_is_distributed};
 
 /// Wraps an Iceberg `TableProvider` so its scans can cross Ballista node
 /// boundaries. Carries the `DataFusion` [`TableReference`] used to resolve this

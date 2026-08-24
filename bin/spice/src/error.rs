@@ -261,7 +261,7 @@ pub enum Error {
     #[snafu(display("Failed to enroll with Spice Cloud: {message}"))]
     CloudConnectEnroll { message: String },
 
-    /// A `spice connect service` action needs a service that is not installed
+    /// A `spice cloud service` action needs a service that is not installed
     /// for the selected instance directory.
     ///
     /// Distinct from a generic failure because nothing went wrong: the request
@@ -276,7 +276,7 @@ pub enum Error {
     #[snafu(display("{message}"))]
     ServiceUnavailable { message: String },
 
-    /// The viewer was interrupted — `spice connect service logs --follow`
+    /// The viewer was interrupted — `spice cloud logs --follow`
     /// stopped following. The service is unchanged.
     #[snafu(display("Interrupted."))]
     Interrupted,

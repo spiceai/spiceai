@@ -16,12 +16,9 @@ limitations under the License.
 
 //! Starting the runtime in the foreground, from any command that needs to.
 //!
-//! `spice run` is not the only command that ends with a runtime attached to the
-//! terminal — `spice connect` does too, and anything that leaves the user at a
-//! running instance must behave identically: install the runtime if it is
-//! missing, resolve the same endpoint flags, inherit the terminal so the
-//! runtime's own output *is* the command's output, forward the signals that
-//! stop it, and exit with the status the runtime exited with.
+//! `spice run` installs the runtime when it is missing, resolves endpoint
+//! flags, inherits the terminal so the runtime's own output is the command's
+//! output, forwards shutdown signals, and exits with the runtime's status.
 //!
 //! One launcher is what keeps those identical. Re-invoking the `spice run`
 //! subcommand from another command would add a third process to every Ctrl-C
@@ -81,9 +78,9 @@ pub struct RunConfig {
     /// Who reports the Cloud connection once the runtime is serving.
     pub connection_report: ConnectionReport,
     /// The directory the runtime runs in. It resolves the spicepod *and* the
-    /// per-instance `.spice` state, so a caller acting on an instance directory
-    /// (`spice connect --dir`) has to set it rather than assume the CLI was
-    /// invoked from there. `None` inherits this process's working directory.
+    /// per-instance `.spice` state, so a caller acting on another instance
+    /// directory has to set it rather than assume the CLI was invoked there.
+    /// `None` inherits this process's working directory.
     pub working_dir: Option<PathBuf>,
 }
 
@@ -182,7 +179,7 @@ async fn start_runtime_process(
     let mut cmd = tokio::process::Command::from(std_cmd);
 
     // Environment paths are normally resolved relative to the parent's current
-    // directory. Preserve that meaning when `--dir` gives the child a different
+    // directory. Preserve that meaning when a caller gives the child a different
     // working directory; otherwise the runtime can enroll against a different
     // `.spice` directory than the CLI just wrote.
     if let Some(config_dir) = std::env::var_os(SPICE_CONFIG_DIR_ENV) {
@@ -509,10 +506,9 @@ mod tests {
 
         #[tokio::test]
         async fn the_runtime_runs_in_the_configured_working_directory() {
-            // `spice connect --dir` acts on an instance directory, and the
-            // runtime resolves both the spicepod and the `.spice` state from
-            // its working directory — so this is what makes the runtime it
-            // starts the one that directory describes.
+            // The runtime resolves both the spicepod and the `.spice` state
+            // from its working directory, so this is what makes the runtime
+            // it starts the one that directory describes.
             let dir = tempfile::tempdir().expect("create tempdir");
             let instance_dir = dir.path().join("instance");
             std::fs::create_dir_all(&instance_dir).expect("create the instance directory");
@@ -543,7 +539,7 @@ mod tests {
         #[tokio::test]
         async fn a_failing_runtime_reports_its_own_status() {
             // The CLI adopts this as its own exit status, so a script that runs
-            // `spice connect` sees what the runtime reported rather than that
+            // A caller sees what the runtime reported rather than merely that
             // the CLI managed to start it.
             let dir = tempfile::tempdir().expect("create tempdir");
             let ctx = context_with_stub_runtime(&dir.path().join("bin"), "#!/bin/sh\nexit 3\n");

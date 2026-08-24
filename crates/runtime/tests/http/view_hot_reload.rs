@@ -33,7 +33,8 @@ use app::AppBuilder;
 use arrow::array::{Array, RecordBatch};
 use axum::{Router, routing::get};
 use futures::TryStreamExt;
-use runtime::{Runtime, auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
+use podswatcher::PodsWatcher;
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use tokio::net::TcpListener;
 
 use crate::{

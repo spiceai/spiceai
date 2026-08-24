@@ -158,7 +158,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice connect remove --yes` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
+        "The Cloud Connect identity at {} cannot be used: {reason}. Stop spiced, run `spice cloud unlink` from this instance directory, mint a new enrollment key in the Spice Cloud portal, and restart with `spiced --token <enrollment-key>`. See: https://spiceai.org/docs",
         path.display()
     ))]
     IdentityUnusable {

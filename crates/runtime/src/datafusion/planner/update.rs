@@ -40,7 +40,7 @@ pub(super) fn plan_distributed_update(
     dml: &DmlStatement,
     handler: Arc<dyn CatalogDmlHandler>,
 ) -> DFResult<LogicalPlan> {
-    let filters = extract_filters(&dml.input)?;
+    let filters = extract_filters(&dml.input, &dml.table_name.to_string())?;
     let assignments = extract_update_assignments(&dml.input, &dml.table_name)?;
 
     Ok(LogicalPlan::Extension(Extension {

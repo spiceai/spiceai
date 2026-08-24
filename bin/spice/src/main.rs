@@ -132,12 +132,9 @@ struct Cli {
 
     /// Spice.ai Cloud runtime endpoint region used with --cloud.
     ///
-    /// Not declared `requires = "cloud"`, because clap's generic
-    /// missing-required-argument error is the wrong diagnosis on
-    /// `spice connect`: there the flag is a confusion with `--region` (where
-    /// the instance runs) or `--endpoint` (which control plane to enroll
-    /// against), and the command says so itself. The `--cloud` requirement is
-    /// enforced for every other command by [`validate_cloud_region_usage`].
+    /// The `--cloud` requirement is enforced by
+    /// [`validate_cloud_region_usage`] so the CLI can provide a specific
+    /// diagnosis.
     #[arg(long, global = true, value_parser = parse_cloud_region)]
     cloud_region: Option<String>,
 
@@ -347,9 +344,18 @@ fn main() {
 
     // Run the CLI
     let machine = cli.machine;
+    let cloud_service_command = matches!(
+        &cli.command,
+        Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Service(_),
+            ..
+        })
+    );
     if let Err(e) = run_cli(cli) {
         if machine {
             write_machine_error(&e);
+        } else if cloud_service_command {
+            eprintln!("{e}");
         } else {
             tracing::error!("{e}");
         }
@@ -549,14 +555,10 @@ fn normalize_cloud_region_flags(args: impl IntoIterator<Item = OsString>) -> Vec
 
 /// Reject `--cloud-region` on commands that have no cloud to apply it to.
 ///
-/// This is the guard clap used to enforce with `requires = "cloud"`. It moved
-/// here so `spice connect` can diagnose the flag itself: on that command
-/// `--cloud-region` is a confusion with `--region` or `--endpoint`, and
-/// "the following required arguments were not provided: --cloud" points at
-/// none of it. `connect` is therefore exempt here and refuses the flag in
-/// `connect::execute`, with a message naming the two flags that do apply.
+/// This is kept outside clap's `requires = "cloud"` relationship so the CLI
+/// can explain what the region selects and how to correct the invocation.
 fn validate_cloud_region_usage(cli: &Cli) -> Result<()> {
-    if cli.cloud_region.is_none() || cli.cloud || matches!(cli.command, Commands::Connect(_)) {
+    if cli.cloud_region.is_none() || cli.cloud {
         return Ok(());
     }
     Err(spice::error::Error::InvalidArgument {
@@ -676,7 +678,7 @@ fn apply_machine_mode(command: &mut Commands) {
         Commands::Chat(args) => args.output = OutputFormat::Json,
         Commands::Refresh(args) => args.output = OutputFormat::Json,
         Commands::Cloud(args) => apply_machine_cloud_mode(&mut args.command),
-        Commands::Connect(args) => args.apply_machine_mode(),
+        Commands::Login(args) => args.output = login::LoginOutput::Json,
         // `Nsql` is intentionally excluded: it is always an interactive REPL with
         // no one-shot/non-interactive mode, so there is no JSON output format to apply.
         // The remaining commands are lifecycle/manifest-editing commands with no
@@ -687,6 +689,7 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Upgrade(_)
         | Commands::Run(_)
         | Commands::Add(_)
+        | Commands::Connect(_)
         | Commands::Validate(_)
         | Commands::Dataset(_)
         | Commands::Catalog(_)
@@ -703,7 +706,6 @@ fn apply_machine_mode(command: &mut Commands) {
         | Commands::Snapshots(_)
         | Commands::Extension(_)
         | Commands::Metadata(_)
-        | Commands::Login(_)
         | Commands::Cluster(_)
         | Commands::Completions(_)
         | Commands::Feedback(_) => {}
@@ -736,6 +738,10 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
 }
 
 fn apply_machine_cloud_mode(command: &mut cloud::CloudCommands) {
+    if let cloud::CloudCommands::Login(args) = command {
+        args.output = login::LoginOutput::Json;
+        return;
+    }
     if let Some(output) = command.output_mut() {
         *output = OutputFormat::Json;
     }
@@ -863,9 +869,7 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
-        // Connect owns this decision so later structured subcommands do not
-        // duplicate its command parsing here.
-        Commands::Connect(a) => a.produces_json(),
+        Commands::Login(a) => a.output == login::LoginOutput::Json,
         _ => false,
     }
 }
@@ -922,14 +926,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             rt.block_on(add::execute(&ctx, args))?;
         }
         Commands::Connect(mut args) => {
-            // `--cloud-region` on `connect` says which Spice Cloud to enroll
-            // into. Hand it to the command rather than dropping it here, so it
-            // participates in the documented enroll-endpoint precedence
-            // instead of being silently accepted and ignored.
             args.cloud_region.clone_from(&cli.cloud_region);
-            // A foreground runtime this command starts is its output, so the
-            // global verbosity has to reach it the way `spice run -v` does.
-            args.verbosity = cli.verbose;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(connect::execute(&ctx, args))?;
