@@ -497,14 +497,18 @@ fn relabel_changes_extension_type(
     source_value: Option<&str>,
     target_value: Option<&str>,
 ) -> ArrowError {
+    // Field names, the metadata key, and the extension values all come from the schema, so
+    // escape them: an embedded newline would break the one-line contract this error is read
+    // under, and split one log record into two.
     ArrowError::InvalidArgumentError(format!(
-        "Cannot relabel the Arrow field '{}' as '{}': `{key}` differs ({} vs {}), which republishes \
+        "Cannot relabel the Arrow field '{}' as '{}': `{}` differs ({} vs {}), which republishes \
          the same values as a different extension type. Convert the values instead of relabelling \
          them.",
-        source.name(),
-        target.name(),
-        source_value.unwrap_or("unset"),
-        target_value.unwrap_or("unset"),
+        source.name().escape_debug(),
+        target.name().escape_debug(),
+        key.escape_debug(),
+        source_value.unwrap_or("unset").escape_debug(),
+        target_value.unwrap_or("unset").escape_debug(),
     ))
 }
 
@@ -513,10 +517,15 @@ fn relabel_changes_extension_type(
 /// Separate from the shape error `ArrayData::build` raises: the target here fits the buffers, and
 /// the complaint is that it makes them mean something else.
 fn relabel_changes_meaning(source: &DataType, target: &DataType) -> ArrowError {
+    // A rendered `DataType` embeds the names of every field nested under it, and those come
+    // from the schema, so escape the rendering rather than the type: see
+    // `relabel_changes_extension_type` for the same reason.
     ArrowError::InvalidArgumentError(format!(
-        "Cannot relabel an Arrow array of type {source} as {target}: that changes how the values \
+        "Cannot relabel an Arrow array of type {} as {}: that changes how the values \
          are read, not only field names and nullability. Convert the values instead of relabelling \
-         them — see `rewrite_data_type` for the rules that change a type's layout."
+         them — see `rewrite_data_type` for the rules that change a type's layout.",
+        source.to_string().escape_debug(),
+        target.to_string().escape_debug(),
     ))
 }
 
@@ -850,7 +859,7 @@ mod tests {
         // an id names *which column* this is, so a change there is not merely descriptive.
         let (data, target) = list_with_item_metadata("comment", "physical", "logical");
         let relabelled = relabel_array_data(data, &target)
-            .expect("a field id is an annotation, not a claim about what the values mean");
+            .expect("a `comment` is descriptive, not a claim about what the values mean");
         assert_eq!(relabelled.data_type(), &target);
         assert_eq!(
             relabelled.child_data()[0].buffers(),
@@ -869,6 +878,39 @@ mod tests {
         assert!(
             err.contains("type Int32 as UInt32"),
             "the message must read as prose naming both types, got: {err}"
+        );
+    }
+
+    /// Every string these errors interpolate comes from the schema, and a schema is not ours to
+    /// trust: a field name, an extension metadata key, or an extension value may hold a newline.
+    /// The one-line contract has to hold for those too, not only for the leaf types that cannot
+    /// carry one.
+    #[test]
+    fn a_newline_in_a_schema_string_cannot_break_an_error_across_lines() {
+        let hostile = "item\nERROR: fabricated";
+
+        let nested = |name: &str| DataType::List(Arc::new(Field::new(name, DataType::Int32, true)));
+        let err = relabel_changes_meaning(&nested(hostile), &nested("item")).to_string();
+        assert!(
+            !err.contains('\n'),
+            "a nested field name renders inside the type, so it must be escaped, got: {err}"
+        );
+        assert!(
+            err.contains("ERROR: fabricated"),
+            "escaping must keep the name readable rather than dropping it, got: {err}"
+        );
+
+        let err = relabel_changes_extension_type(
+            &Field::new(hostile, DataType::Int32, true),
+            &Field::new("item", DataType::Int32, true),
+            "ARROW:extension:name\nkey",
+            Some("arrow.json\nvalue"),
+            None,
+        )
+        .to_string();
+        assert!(
+            !err.contains('\n'),
+            "the field name, the metadata key and the value are all schema-controlled, got: {err}"
         );
     }
 
