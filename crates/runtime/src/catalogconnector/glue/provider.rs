@@ -513,11 +513,11 @@ impl UnreadableTables {
     /// Spice cannot read, or `None` when it can read all of them.
     ///
     /// One line per database rather than one per table, so a database of ORC
-    /// tables does not bury everything else in the log. It is emitted through a
-    /// [`SpacedTracer`] because `RefreshableCatalogProvider::refresh` rebuilds
-    /// every schema provider on a 60s cycle, and a standing condition re-reported
-    /// every minute for the life of the process is noise; keying on the message
-    /// means a *changed* set of unreadable tables still reports immediately.
+    /// tables does not bury everything else in the log. `RefreshableCatalogProvider::refresh`
+    /// rebuilds every schema provider on a 60s cycle, so this line is spaced by
+    /// [`UnreadableWarnings`] rather than emitted on each one: a standing condition
+    /// re-reported every minute for the life of the process is noise, while a set
+    /// that *changed* — or that went away and came back — is reported at once.
     fn summary(&self, catalog: &str, database: &str) -> Option<String> {
         if self.total == 0 {
             return None;
@@ -532,6 +532,7 @@ impl UnreadableTables {
 
         Some(format!(
             "Catalog '{catalog}': skipping {total} Glue table(s) in database '{database}' that Spice cannot read: {named}{elided}. \
+            They are not registered, so queries against them will not resolve. \
             Spice reads Glue tables stored as {SUPPORTED_INPUT_FORMATS}; run with debug logging for the reason each table was skipped, \
             or name them in the catalog's `exclude` patterns to suppress this warning. \
             For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue"
@@ -944,6 +945,15 @@ mod tests {
         );
         assert!(one.contains("archive"), "{one}");
         assert!(one.contains(SUPPORTED_INPUT_FORMATS), "{one}");
+        assert!(
+            one.contains("queries against them will not resolve"),
+            "this is the only line an operator gets for a table that silently is not there, \
+             so it has to say what they will observe: {one}"
+        );
+        assert!(
+            one.contains("https://docs.spiceai.org/components/catalogs/glue"),
+            "the message must carry the docs link that makes it actionable: {one}"
+        );
         assert!(!one.contains("more"), "nothing was elided: {one}");
 
         let mut many = UnreadableTables::default();
