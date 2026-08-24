@@ -104,9 +104,9 @@ pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 /// [`register_data_accelerator!`] ignores this argument entirely.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcceleratorRuntimeConfig {
-    /// `runtime.params.cayenne_footer_cache_mb`: the size of the process-wide Vortex
-    /// footer-metadata cache. `None` when the operator set none, which is distinct from
-    /// `Some(0)` (no footer cache at all).
+    /// `runtime.params.cayenne_footer_cache_mb`: how much the Cayenne engine may spend on
+    /// its Vortex footer-metadata cache. `None` when the operator set none, which is
+    /// distinct from `Some(0)` — no footer cache at all.
     pub cayenne_footer_cache_mb: Option<usize>,
 }
 

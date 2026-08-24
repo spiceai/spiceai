@@ -1164,6 +1164,12 @@ impl CayenneAccelerator {
         Self::with_footer_cache_mb(config.cayenne_footer_cache_mb)
     }
 
+    /// The footer-cache size this engine was configured with.
+    #[must_use]
+    pub fn footer_cache_mb(&self) -> Option<usize> {
+        self.footer_cache_mb
+    }
+
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
@@ -4776,11 +4782,9 @@ mod tests {
     /// The footer-cache size reaches the engine as a constructor argument, so it belongs
     /// to the `Runtime` that supplied it.
     ///
-    /// This replaces a round-trip test over the process-global channel this seam retired.
-    /// `usize::MAX` is covered because `runtime.params.cayenne_footer_cache_mb` accepts
-    /// `max`: the retired channel reserved that value to mean "nothing was published", so
-    /// the largest cache an operator can ask for silently became the default. Nothing here
-    /// can reserve a value, but the case is the one worth keeping a test on.
+    /// `usize::MAX` is asserted because `runtime.params.cayenne_footer_cache_mb` accepts
+    /// `max`: the largest cache an operator can ask for must arrive as written, and every
+    /// value in the range has to be distinguishable from an absent one.
     #[test]
     fn the_footer_cache_size_comes_from_the_runtime_config() {
         use data_accelerator_api::AcceleratorRuntimeConfig;
@@ -4809,6 +4813,36 @@ mod tests {
         // the engine instance, so there is nothing for a concurrent build to overwrite.
         assert_eq!(configured(Some(64)), Some(64));
         assert_eq!(CayenneAccelerator::new().footer_cache_mb, None);
+    }
+
+    /// The registration the slice carries must be the *configured* form.
+    ///
+    /// Calling `from_runtime_config` directly cannot show this: the simple form of
+    /// `register_data_accelerator!` ignores its argument, so registering through it would
+    /// build the engine with `new()` and drop the operator's setting while every direct
+    /// test stayed green. This goes through the constructor the slice actually holds.
+    #[test]
+    fn the_registered_constructor_forwards_the_runtime_config() {
+        use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
+
+        let registration = DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == Engine::Cayenne)
+            .expect("this crate registers the Cayenne engine");
+
+        let built = (registration.constructor)(&AcceleratorRuntimeConfig {
+            cayenne_footer_cache_mb: Some(321),
+        });
+        let cayenne = built
+            .as_any()
+            .downcast_ref::<CayenneAccelerator>()
+            .expect("the Cayenne registration builds a CayenneAccelerator");
+
+        assert_eq!(
+            cayenne.footer_cache_mb(),
+            Some(321),
+            "the registered constructor must pass the runtime config to the engine"
+        );
     }
 
     /// The write profile is the engine's answer about its *own* acceleration, so an
