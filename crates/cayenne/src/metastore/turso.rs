@@ -776,9 +776,10 @@ impl MetastoreBackend for TursoMetastore {
         // Which operation dirtied a write-back marker (see
         // PENDING_WRITE_BACK_TABLE_DDL). The DEFAULT 0 the ALTER applies to
         // legacy rows is correct rather than merely safe: before this column only
-        // upsert commits marked keys. Forward- and downgrade-safe (an older
-        // binary ignores the extra column). Appended last to match CREATE TABLE
-        // and EXPECTED_TABLES column order.
+        // upsert commits marked keys. Forward-only: a binary predating the column
+        // rejects the migrated table outright, because `validate_existing_schema`
+        // compares the full ordered column list and fails on an extra one.
+        // Appended last to match CREATE TABLE and EXPECTED_TABLES column order.
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_pending_write_back ADD COLUMN op INTEGER NOT NULL DEFAULT 0",
