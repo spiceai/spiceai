@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayData;
 use arrow::error::ArrowError;
+use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 
 /// A rewrite rule applied by [`apply_rules`] to every [`DataType`] node in a schema.
@@ -331,6 +332,8 @@ fn relabel_validated_array_data(
     data: ArrayData,
     target_type: &DataType,
 ) -> Result<ArrayData, ArrowError> {
+    // Redundant for the entry call, which has already compared these, but load-bearing for the
+    // recursion below: a sibling child often already carries its target type.
     if data.data_type() == target_type {
         return Ok(data);
     }
@@ -376,34 +379,34 @@ fn relabel_validated_array_data(
 /// The walk covers the same child-bearing types as [`target_child_types`]. Anything else is
 /// compared whole, so a type this does not know about is refused rather than relabelled: a new
 /// Arrow variant fails closed here instead of being reinterpreted.
+/// `DataType::equals_datatype` is deliberately not used here: it requires nullability to match,
+/// which this guard must allow to differ, and it ignores field metadata, so it would miss a changed
+/// extension type. The two walks look interchangeable and are not.
 fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Result<(), ArrowError> {
     match (source, target) {
         (DataType::List(source_item), DataType::List(target_item))
         | (DataType::LargeList(source_item), DataType::LargeList(target_item))
         | (DataType::ListView(source_item), DataType::ListView(target_item))
         | (DataType::LargeListView(source_item), DataType::LargeListView(target_item)) => {
-            ensure_relabel_is_metadata_only(source_item.data_type(), target_item.data_type())
+            ensure_field_relabel_is_metadata_only(source_item, target_item)
         }
         (
             DataType::FixedSizeList(source_item, source_len),
             DataType::FixedSizeList(target_item, target_len),
         ) if source_len == target_len => {
-            ensure_relabel_is_metadata_only(source_item.data_type(), target_item.data_type())
+            ensure_field_relabel_is_metadata_only(source_item, target_item)
         }
         (
             DataType::Map(source_entries, source_sorted),
             DataType::Map(target_entries, target_sorted),
         ) if source_sorted == target_sorted => {
-            ensure_relabel_is_metadata_only(source_entries.data_type(), target_entries.data_type())
+            ensure_field_relabel_is_metadata_only(source_entries, target_entries)
         }
         (DataType::Struct(source_fields), DataType::Struct(target_fields))
             if source_fields.len() == target_fields.len() =>
         {
             for (source_field, target_field) in source_fields.iter().zip(target_fields) {
-                ensure_relabel_is_metadata_only(
-                    source_field.data_type(),
-                    target_field.data_type(),
-                )?;
+                ensure_field_relabel_is_metadata_only(source_field, target_field)?;
             }
             Ok(())
         }
@@ -417,10 +420,7 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
                 if source_id != target_id {
                     return Err(relabel_changes_meaning(source, target));
                 }
-                ensure_relabel_is_metadata_only(
-                    source_field.data_type(),
-                    target_field.data_type(),
-                )?;
+                ensure_field_relabel_is_metadata_only(source_field, target_field)?;
             }
             Ok(())
         }
@@ -429,11 +429,8 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
             DataType::RunEndEncoded(target_run_ends, target_values),
         ) => {
             // Run ends are a data buffer of their own, so their type is compared like any leaf.
-            ensure_relabel_is_metadata_only(
-                source_run_ends.data_type(),
-                target_run_ends.data_type(),
-            )?;
-            ensure_relabel_is_metadata_only(source_values.data_type(), target_values.data_type())
+            ensure_field_relabel_is_metadata_only(source_run_ends, target_run_ends)?;
+            ensure_field_relabel_is_metadata_only(source_values, target_values)
         }
         (
             DataType::Dictionary(source_key, source_value),
@@ -444,6 +441,64 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
         _ if source == target => Ok(()),
         _ => Err(relabel_changes_meaning(source, target)),
     }
+}
+
+/// Compares one nested field pair: its extension type, then its data type.
+///
+/// A field carries more than the type the walk recurses into. An Arrow **extension type** lives in
+/// field metadata (`ARROW:extension:name`, `ARROW:extension:metadata`) and is precisely a claim
+/// about what identical storage buffers mean — a `Utf8` labelled `arrow.uuid` and a bare `Utf8`
+/// have the same layout and different meaning — so it belongs to the part of a type that holds
+/// data, and the target installs it wholesale when the level is rebuilt.
+///
+/// Only those two keys are compared. Other metadata (a Parquet field id, a comment) annotates a
+/// field without changing how its values are read, and the Delta column-mapping caller relabels
+/// across schemas whose fields differ in exactly that way — rejecting all metadata differences
+/// would refuse a correct relabel to guard something that is not a reinterpretation.
+fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Result<(), ArrowError> {
+    let extension_parts = [
+        (
+            EXTENSION_TYPE_NAME_KEY,
+            source.extension_type_name(),
+            target.extension_type_name(),
+        ),
+        (
+            EXTENSION_TYPE_METADATA_KEY,
+            source.extension_type_metadata(),
+            target.extension_type_metadata(),
+        ),
+    ];
+    for (key, source_value, target_value) in extension_parts {
+        if source_value != target_value {
+            return Err(relabel_changes_extension_type(
+                source,
+                target,
+                key,
+                source_value,
+                target_value,
+            ));
+        }
+    }
+    ensure_relabel_is_metadata_only(source.data_type(), target.data_type())
+}
+
+/// The error [`ensure_field_relabel_is_metadata_only`] reports for an extension-type change.
+fn relabel_changes_extension_type(
+    source: &Field,
+    target: &Field,
+    key: &str,
+    source_value: Option<&str>,
+    target_value: Option<&str>,
+) -> ArrowError {
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel the Arrow field '{}' as '{}': `{key}` differs ({} vs {}), which republishes \
+         the same values as a different extension type. Convert the values instead of relabelling \
+         them.",
+        source.name(),
+        target.name(),
+        source_value.unwrap_or("unset"),
+        target_value.unwrap_or("unset"),
+    ))
 }
 
 /// The error [`ensure_relabel_is_metadata_only`] reports, naming the pair that disagrees.
@@ -710,6 +765,84 @@ mod tests {
         let relabelled = relabel_array_data(list.to_data(), &target)
             .expect("renaming a child field and tightening its nullability is metadata-only");
 
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].buffers(),
+            Int32Array::from(vec![-1, 2]).to_data().buffers(),
+            "the value buffer must be carried over untouched"
+        );
+    }
+
+    /// A `List<Int32>` whose item field carries `metadata`, plus a target that differs from it only
+    /// in that metadata.
+    fn list_with_item_metadata(
+        key: &str,
+        source_value: &str,
+        target_value: &str,
+    ) -> (ArrayData, DataType) {
+        let item = |value: &str| {
+            Arc::new(
+                Field::new("item", DataType::Int32, true)
+                    .with_metadata([(key.to_owned(), value.to_owned())].into()),
+            )
+        };
+        let list = ListArray::new(
+            item(source_value),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Int32Array::from(vec![-1, 2])),
+            None,
+        );
+        (list.to_data(), DataType::List(item(target_value)))
+    }
+
+    #[test]
+    fn relabel_refuses_an_extension_type_change_at_depth() {
+        // An extension type is a claim about what identical buffers mean, so swapping it is the
+        // same class of reinterpretation as a signedness flip — and it lives in field metadata,
+        // which the type walk alone never sees.
+        for key in [EXTENSION_TYPE_NAME_KEY, EXTENSION_TYPE_METADATA_KEY] {
+            let (data, target) = list_with_item_metadata(key, "one", "another");
+            let err = relabel_array_data(data, &target).expect_err(
+                "changing a nested field's extension type must be refused: the buffers are \
+                 unchanged but the values now mean something else",
+            );
+            assert!(
+                err.to_string().contains(key) && err.to_string().contains("item"),
+                "the error must name the key and the field, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn relabel_refuses_adding_an_extension_type_to_a_bare_field() {
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Int32Array::from(vec![-1, 2])),
+            None,
+        );
+        let target = DataType::List(Arc::new(
+            Field::new("item", DataType::Int32, true).with_metadata(
+                [(EXTENSION_TYPE_NAME_KEY.to_owned(), "arrow.uuid".to_owned())].into(),
+            ),
+        ));
+        let err = relabel_array_data(list.to_data(), &target)
+            .expect_err("promoting a bare field to an extension type must be refused");
+        assert!(
+            err.to_string().contains("unset"),
+            "the error must say the source had no extension type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relabel_still_carries_a_change_to_metadata_that_is_not_an_extension_type() {
+        // The Delta column-mapping caller relabels between schemas whose fields differ in
+        // annotations like a Parquet field id. That is not a reinterpretation, so it must pass —
+        // this is the arm that keeps the extension-type guard from over-rejecting.
+        let (data, target) = list_with_item_metadata("PARQUET:field_id", "17", "42");
+        let relabelled = relabel_array_data(data, &target)
+            .expect("a field id is an annotation, not a claim about what the values mean");
         assert_eq!(relabelled.data_type(), &target);
         assert_eq!(
             relabelled.child_data()[0].buffers(),
