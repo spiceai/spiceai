@@ -20,7 +20,7 @@ limitations under the License.
 //! This module explicitly references all connector modules to ensure they are linked into the
 //! binary and their `linkme` distributed slice registrations are included.
 
-use data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS;
+use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
 use data_connector_api::DATA_CONNECTOR_REGISTRATIONS;
 use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
@@ -153,7 +153,7 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .map(|reg| {
-            let accelerator = (reg.constructor)(&Default::default());
+            let accelerator = (reg.constructor)(&AcceleratorRuntimeConfig::default());
             ConnectorSchema {
                 // Use Display trait to get the string representation
                 name: reg.engine.to_string(),
