@@ -23,10 +23,22 @@ license-file.workspace = true
 description = "Per-dataset blob checkpoint store backed by a DuckDB accelerator (implements runtime-checkpoint-api::BlobCheckpointStore)."
 
 [dependencies]
+runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+arrow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+duckdb.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+arrow.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

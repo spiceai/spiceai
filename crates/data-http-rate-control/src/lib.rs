@@ -33,7 +33,7 @@ use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use data_components::rate_limit::{HttpRateLimiter, HttpRateLimiterMetrics};
-use data_connector_api::{ConnectorComponent, DataConnectorError, DataConnectorResult};
+use data_connector_types::{ConnectorComponent, DataConnectorError, DataConnectorResult};
 use governor::Quota;
 use object_store::ObjectStore;
 use opentelemetry::KeyValue;

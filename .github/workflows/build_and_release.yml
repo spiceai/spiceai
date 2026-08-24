@@ -2,8 +2,16 @@ name: build_and_release
 
 on:
   push:
+    # Release branches build for the same reason trunk does: the `build` job uploads
+    # each commit's spiced to MinIO, and that upload is the only source the daily
+    # `testoperator dispatch` has for a branch's binary. Without it the dispatch
+    # walks back ten commits, finds nothing, and the branch silently loses its
+    # benchmark coverage. `setup-matrix` already recognizes release branches; only
+    # the trigger was missing. Releasing stays tag-gated — the `publish` job runs
+    # for `refs/tags/v*` alone.
     branches:
       - trunk
+      - release/**
     tags:
       - v*
     paths-ignore:

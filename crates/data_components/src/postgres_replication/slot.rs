@@ -25,7 +25,9 @@ use tokio_postgres::NoTls;
 
 use super::{
     MissingPrimaryKeySnafu, Result, SetupConnectSnafu, SetupExecSnafu, SourceTableNotFoundSnafu,
-    TlsConfigSnafu, UnsupportedReplicaIdentitySnafu, config::ReplicationParams,
+    TlsConfigSnafu, UnsupportedReplicaIdentitySnafu,
+    config::ReplicationParams,
+    retention::{self, SlotRemoval, SlotRetentionPosture},
 };
 
 /// Info about a slot after `setup_slot_and_publication` returns.
@@ -42,6 +44,14 @@ pub struct SlotInfo {
     /// absence — the initial snapshot still captures their values, but
     /// replicated changes apply them as NULL.
     pub generated_columns: Vec<String>,
+    /// What the source server will do on its own about this slot, read during
+    /// setup.
+    ///
+    /// Carried on the outcome so the shutdown message can state what removes the
+    /// slot without opening a connection to ask. A durable slot is not dropped at
+    /// shutdown, so there is no connection to the source on that path at all, and
+    /// shutdown must never wait on the source to produce a log line.
+    pub retention_posture: SlotRetentionPosture,
 }
 
 pub type SlotSetupOutcome = SlotInfo;
@@ -95,9 +105,17 @@ pub struct SharedMemberSetup {
     /// has subscribed yet — the caller holds the ack floor for the ones that
     /// have not, so their changes are not acked away before they join.
     pub publication_tables: Vec<(String, String)>,
-    /// The earliest LSN this slot can still stream from — see
-    /// [`read_slot_restart_lsn`] — read *after* the slot is ensured, so a slot
-    /// just created reports its own creation point rather than `None`.
+    /// The earliest LSN this slot still *retains* — see [`read_slot_restart_lsn`]
+    /// — read *after* the slot is ensured, so a slot just created reports its own
+    /// creation point rather than `None`.
+    ///
+    /// This is **not** the earliest LSN the slot can be streamed from, and must not
+    /// be used as one: Postgres forwards a `START_REPLICATION` position below the
+    /// slot's `confirmed_flush_lsn` up to it (`CreateDecodingContext`), so an
+    /// acknowledged change can never be re-streamed even while its WAL is retained
+    /// here. Anything deciding whether a position is still reachable wants the later
+    /// of this and `confirmed_flush_lsn`; using retention alone reads an unfillable
+    /// gap as resumable and skips it silently (#11289).
     ///
     /// `None` only when the slot does not exist, which cannot normally follow
     /// `ensure_slot`; it is carried as an `Option` so a slot dropped underneath
@@ -324,6 +342,10 @@ async fn ensure_slot(
     client: &tokio_postgres::Client,
     params: &ReplicationParams,
 ) -> Result<SlotInfo> {
+    // Read once, before anything branches, so every outcome below carries it and
+    // the slot-creation message can name what will remove the slot it creates.
+    let retention_posture = retention::read_posture(client).await?;
+
     // A slot the server has invalidated still looks present to every check
     // below, so retire it first and let the rest of this function create its
     // replacement.
@@ -353,6 +375,7 @@ async fn ensure_slot(
                     consistent_lsn: advanced_lsn,
                     snapshot_name: None,
                     generated_columns: Vec::new(),
+                    retention_posture,
                     // The old history is gone, so this slot carries none for any
                     // member -- the same contract as a slot created this process.
                     created_fresh: true,
@@ -371,6 +394,7 @@ async fn ensure_slot(
                 consistent_lsn: confirmed_flush_lsn,
                 snapshot_name: None,
                 generated_columns: Vec::new(),
+                retention_posture,
                 created_fresh: false,
             });
         }
@@ -388,6 +412,7 @@ async fn ensure_slot(
                 consistent_lsn: 0,
                 snapshot_name: None,
                 generated_columns: Vec::new(),
+                retention_posture,
                 created_fresh: true,
             });
         }
@@ -418,6 +443,7 @@ async fn ensure_slot(
                 // A raced slot with no durable checkpoint yet still needs
                 // a bootstrap (same reasoning as the Some(0) path above).
                 generated_columns: Vec::new(),
+                retention_posture,
                 created_fresh: confirmed == 0,
             });
         }
@@ -431,6 +457,14 @@ async fn ensure_slot(
         snapshot = %snapshot_name,
         "Created new replication slot"
     );
+    // What it costs and what removes it, stated once here and again at shutdown.
+    tracing::info!(
+        "{}",
+        retention::slot_lifetime_message(
+            &params.slot_name,
+            SlotRemoval::resolve(params.slot_is_disposable(), retention_posture),
+        )
+    );
 
     Ok(SlotInfo {
         slot_name: params.slot_name.clone(),
@@ -438,8 +472,168 @@ async fn ensure_slot(
         consistent_lsn,
         snapshot_name: Some(snapshot_name),
         generated_columns: Vec::new(),
+        retention_posture,
         created_fresh: true,
     })
+}
+
+/// Replace a slot the replication stream has been refused, and return the LSN its
+/// replacement starts at.
+///
+/// Called only after `START_REPLICATION` has *observed* the refusal (see
+/// `resilience::is_slot_unusable`), which is what licenses the unconditional drop
+/// here. [`drop_slot_if_invalidated`] cannot be reused for this: it acts on
+/// `wal_status = 'lost'`, and a slot can be refused while the catalog still reads
+/// otherwise — the two views are updated by different code paths, and a slot the
+/// stream will not accept has to go regardless of how the catalog describes it.
+/// The drop also tolerates the slot already being gone, which is the case when an
+/// operator dropped it themselves.
+///
+/// The publication is deliberately untouched. Its membership is what the tables'
+/// datasets subscribed with, it survives the slot, and recreating it would
+/// re-derive state the caller already holds.
+///
+/// The replacement carries no history: its `restart_lsn` is the current WAL
+/// position, so every acceleration on the slot has a watermark the slot cannot
+/// reach and must be rebuilt from the source. The caller is responsible for that
+/// — this function only replaces the slot.
+pub async fn replace_unusable_slot(params: &ReplicationParams) -> Result<u64> {
+    super::resilience::retry_async(
+        "postgres_replication::replace_unusable_slot",
+        super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
+        is_transient_setup_error,
+        || async {
+            let (client, conn_task) = connect_setup(params).await?;
+            let outcome = replace_slot(&client, params).await;
+            drop(client);
+            let _ = conn_task.await;
+            outcome
+        },
+    )
+    .await
+}
+
+async fn replace_slot(client: &tokio_postgres::Client, params: &ReplicationParams) -> Result<u64> {
+    // Read before dropping. The catalog is the only thing that distinguishes the
+    // two ways a slot stops working, they call for different fixes, and after the
+    // drop the evidence is gone.
+    let refused = describe_refused_slot(client, &params.slot_name).await;
+
+    match client
+        .execute("SELECT pg_drop_replication_slot($1)", &[&params.slot_name])
+        .await
+    {
+        Ok(_) => {}
+        // Already gone — the server, or an operator, got there first. That is
+        // the state this was trying to reach.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == SQLSTATE_UNDEFINED_OBJECT) => {}
+        Err(e) => return Err(e).context(SetupExecSnafu),
+    }
+
+    let (consistent_lsn, _snapshot_name) = create_logical_slot(client, &params.slot_name).await?;
+    // The replacement is a new slot with its own WAL cost, so it gets the same
+    // lifetime line a slot created during setup does. Without it, the one slot an
+    // operator never sees costed is the one that appeared without them asking.
+    match retention::read_posture(client).await {
+        Ok(posture) => tracing::info!(
+            "{}",
+            retention::slot_lifetime_message(
+                &params.slot_name,
+                SlotRemoval::resolve(params.slot_is_disposable(), posture),
+            )
+        ),
+        // Recovery must not fail for want of a log line.
+        Err(e) => tracing::warn!(
+            slot = %params.slot_name,
+            "could not read the source's slot-retention settings, so this replacement slot's WAL cost and removal policy are not stated: {e}"
+        ),
+    }
+    let (cause, advice) = refused.explain();
+    tracing::warn!(
+        slot = %params.slot_name,
+        consistent_lsn = %format_lsn(consistent_lsn),
+        "Replication slot `{}` could no longer supply changes, so it has been replaced ({cause}). Every acceleration on it is rebuilt from the source rather than resumed, because the changes since the position each one recorded as applied are no longer retained anywhere. {advice}",
+        params.slot_name,
+    );
+    Ok(consistent_lsn)
+}
+
+/// What the catalog said about a slot the replication stream refused, which is
+/// what the replacement log explains itself with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefusedSlot {
+    /// Still in the catalog, so the server invalidated it. `wal_status` names the
+    /// cause where the server reports one (`PostgreSQL` 13+).
+    Present { wal_status: Option<String> },
+    /// Not in the catalog at all: dropped out from under the stream, by an
+    /// operator or by a failover to a server that never had it.
+    Absent,
+    /// The catalog could not be read. Distinct from both, because naming a cause
+    /// that was never observed is worse than admitting to not knowing.
+    Unknown,
+}
+
+impl RefusedSlot {
+    /// The cause clause and the advice clause of the replacement message.
+    fn explain(&self) -> (String, &'static str) {
+        /// What to do about a server that stopped retaining enough WAL. Shared by
+        /// both invalidation shapes, since the remedy does not depend on which
+        /// `wal_status` the server happens to report.
+        const RETENTION_ADVICE: &str = "Raise max_slot_wal_keep_size on the source, or reduce replication lag, to avoid this; on PostgreSQL 18+ an invalidation by idle_replication_slot_timeout means instead that Spice was down for longer than that timeout.";
+        match self {
+            Self::Present {
+                wal_status: Some(status),
+            } => (
+                format!("PostgreSQL invalidated it: wal_status={status}"),
+                RETENTION_ADVICE,
+            ),
+            Self::Present { wal_status: None } => (
+                "the server refused to stream from it, and reports no wal_status for it"
+                    .to_string(),
+                RETENTION_ADVICE,
+            ),
+            Self::Absent => (
+                "it no longer exists, so it was dropped while Spice was streaming from it"
+                    .to_string(),
+                "Spice creates its own slots and reuses them across restarts, so dropping one by hand costs a full re-read of every table on it; an idle slot is safe to leave in place, and Spice releases it itself when the acceleration it feeds does not survive a restart.",
+            ),
+            // Neither cause was observed, so neither remedy may be prescribed:
+            // raising WAL retention does nothing for a slot someone dropped, and
+            // pointing at a manual drop misdirects an operator whose server ran out
+            // of retention. Name both, and what tells them apart.
+            Self::Unknown => (
+                "the server refused to stream from it, and its catalog entry could not be read"
+                    .to_string(),
+                "Either PostgreSQL invalidated it (raise max_slot_wal_keep_size on the source, or reduce replication lag) or it was dropped while Spice was streaming from it; `SELECT slot_name, wal_status FROM pg_replication_slots` would have said which.",
+            ),
+        }
+    }
+}
+
+/// Classify a slot the stream refused, for [`RefusedSlot::explain`].
+///
+/// Never fails: this only produces a log line, and a diagnostic that could abort
+/// the recovery it is describing would be worse than a vaguer one.
+async fn describe_refused_slot(client: &tokio_postgres::Client, slot_name: &str) -> RefusedSlot {
+    match client
+        .query_opt(
+            "SELECT wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+    {
+        Ok(Some(row)) => RefusedSlot::Present {
+            wal_status: row.get::<_, Option<String>>(0),
+        },
+        Ok(None) => RefusedSlot::Absent,
+        // Includes a server too old for `wal_status` (`PostgreSQL` 13+), where the
+        // query fails on the column rather than the row. That still leaves the
+        // slot's presence unread, so it reports the same way as any other failure
+        // rather than guessing at one.
+        Err(_) => RefusedSlot::Unknown,
+    }
 }
 
 /// SQLSTATE `55006` (`object_in_use`) — the slot is still held by an active
@@ -1129,6 +1323,45 @@ fn quote_ident(ident: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slot dropped by an operator and one the server invalidated need different
+    /// fixes, so the line that explains the replacement must not describe one as the
+    /// other — and must not name a cause it never observed.
+    #[test]
+    fn the_replacement_names_the_cause_it_actually_observed() {
+        let (cause, advice) = RefusedSlot::Present {
+            wal_status: Some("lost".to_string()),
+        }
+        .explain();
+        assert!(cause.contains("wal_status=lost"), "{cause}");
+        assert!(advice.contains("max_slot_wal_keep_size"), "{advice}");
+
+        let (cause, advice) = RefusedSlot::Absent.explain();
+        assert!(cause.contains("no longer exists"), "{cause}");
+        assert!(
+            !cause.contains("invalidated"),
+            "a slot someone dropped was not invalidated by the server: {cause}"
+        );
+        assert!(
+            !advice.contains("max_slot_wal_keep_size"),
+            "raising WAL retention does not address a slot that was dropped: {advice}"
+        );
+
+        // Neither shape may be asserted when the catalog could not be read — and that
+        // applies to the *advice* as much as the cause, since each remedy implies a
+        // cause and misdirects when it is the wrong one.
+        let (cause, advice) = RefusedSlot::Unknown.explain();
+        assert!(advice.contains("Either"), "{advice}");
+        assert!(advice.contains("max_slot_wal_keep_size"), "{advice}");
+        assert!(advice.contains("dropped"), "{advice}");
+        assert!(cause.contains("could not be read"), "{cause}");
+        assert!(!cause.contains("no longer exists"), "{cause}");
+        assert!(!cause.contains("wal_status="), "{cause}");
+
+        // A server too old to report `wal_status` still gets a usable line.
+        let (cause, _) = RefusedSlot::Present { wal_status: None }.explain();
+        assert!(cause.contains("no wal_status"), "{cause}");
+    }
 
     /// The advance target is bound as `pg_lsn`, so it must round-trip through
     /// the exact textual form Postgres accepts.

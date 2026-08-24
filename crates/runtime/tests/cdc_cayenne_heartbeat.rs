@@ -35,6 +35,12 @@ limitations under the License.
 #![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};

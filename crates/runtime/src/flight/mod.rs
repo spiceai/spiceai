@@ -24,7 +24,6 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
-use crate::tls::TlsConfig;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -53,6 +52,7 @@ use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use std::future::Future;
 use std::num::NonZeroU32;
@@ -121,6 +121,12 @@ impl Service {
     }
 }
 
+/// The handler each RPC delegates to records its own `flight_requests` /
+/// `flight_request_duration_ms` sample, so the sample carries a `command` label
+/// and, where the response is a stream, spans the drain rather than the setup.
+/// Starting a timer here as well would double every sample, so don't.
+/// `list_flights` and `poll_flight_info` are the exceptions — they are
+/// unimplemented, have no handler to delegate to, and record here.
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
@@ -135,7 +141,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        let _start = track_flight_request("do_handshake", None).await;
         let response = handshake::handle(
             request.metadata(),
             self.basic_auth.as_ref(),
@@ -173,7 +178,6 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let _start = track_flight_request("get_schema", None).await;
         get_schema::handle(request).await
     }
 
@@ -181,7 +185,6 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let _start = track_flight_request("do_get", None).await;
         let response = Box::pin(do_get::handle(request)).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -190,7 +193,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        let _start = track_flight_request("do_put", None).await;
         let response = do_put::handle(request).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -199,7 +201,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        let _start = track_flight_request("do_exchange", None).await;
         let response = do_exchange::handle(self, request).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -208,7 +209,6 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        let _start = track_flight_request("do_action", None).await;
         let response = Box::pin(actions::do_action(request)).await?;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -217,7 +217,6 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let _start = track_flight_request("list_actions", None).await;
         let response = actions::list().await;
         Ok(Self::wrap_response_stream_with_scope(response).await)
     }
@@ -949,7 +948,7 @@ pub async fn start(
         // bind doesn't show up as a phantom "Flight listening" line.
         tracing::info!("Spice Runtime Flight listening on {bind_address}");
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-        let incoming = crate::tls::flight_incoming::tls_incoming(
+        let incoming = runtime_tls::flight_incoming::tls_incoming(
             listener,
             Arc::clone(&tls_config.flight_server_config),
         );
