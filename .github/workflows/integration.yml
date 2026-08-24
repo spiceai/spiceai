@@ -143,13 +143,19 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         # One `cargo nextest archive` invocation, and effectively the whole job. Bounding the
         # step rather than only the job is what names the step that hung, instead of leaving
-        # a wedge attributed to the job as a whole. 150 minutes sits clear of the 81-117
-        # minutes the last eighteen successful `push` and `merge_group` runs took while this
-        # step still made seven invocations; the single invocation that replaced them
-        # resolves the dependency graph once rather than seven times, so it cannot exceed
-        # that basis. The bound stays a ceiling rather than a target either way, because the
-        # spread tracks how contended the shared runner pool is, and one tight enough to
-        # fail a legitimate build would be worse than the slow build it replaced.
+        # a wedge attributed to the job as a whole.
+        #
+        # 150 minutes is set from a historical reference rather than a measurement of the
+        # step as it stands: 81-117 minutes across the last eighteen successful `push` and
+        # `merge_group` runs from when this step still made seven `nextest archive`
+        # invocations. Consolidating those to one removes the six redundant dependency
+        # resolutions, so the reference is conservative for the ordinary case — but it is
+        # not a ceiling, because a cold compiler cache, a contended shared runner pool, or
+        # more test targets can each push a single invocation past it. That is why the bound
+        # sits clear of the range rather than near it: one tight enough to fail a legitimate
+        # build would be worse than the slow build it replaced. Post-consolidation
+        # measurements should replace this reference once there are eighteen of them
+        # (#13429).
         timeout-minutes: 150
         env:
           CARGO_INCREMENTAL: 0
