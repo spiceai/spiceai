@@ -996,10 +996,25 @@ fn grants_execute(_metadata: &std::fs::Metadata) -> bool {
 /// this function exists to prevent — and silently, since the candidate has
 /// already passed its runnable check by then.
 fn anchor_to_current_dir(path: PathBuf) -> Result<PathBuf> {
+    // The closure only pins the lifetime `std::path::absolute`'s generic
+    // parameter leaves open; it is still that function doing the work.
+    anchor_with(path, |candidate: &Path| std::path::absolute(candidate))
+}
+
+/// [`anchor_to_current_dir`] with the resolver injected, so the failure arm is
+/// reachable in a test.
+///
+/// `std::path::absolute` only fails when the working directory cannot be read,
+/// which a test cannot arrange without changing the directory of the whole
+/// process — shared with every other test in the binary.
+fn anchor_with(
+    path: PathBuf,
+    absolute: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path);
     }
-    std::path::absolute(&path).context(SpicedPathNotAnchorableSnafu {
+    absolute(&path).context(SpicedPathNotAnchorableSnafu {
         path: path.display().to_string(),
     })
 }
@@ -1818,34 +1833,48 @@ mod tests {
         assert!(SpicedSource::ManagedInstall.is_expected_default());
     }
 
-    /// An absolute candidate needs no working directory to anchor against, so
-    /// it resolves unchanged.
+    /// A candidate that cannot be anchored is refused, not passed on. Returning
+    /// it unanchored is what let `Command::new` re-resolve a bare name through
+    /// `PATH` and start a different binary than the one just validated, and by
+    /// this point the candidate has already passed its runnable check — so the
+    /// substitution would be silent.
+    ///
+    /// The resolver is injected because the real one only fails when the working
+    /// directory cannot be read, which cannot be arranged for one test without
+    /// moving the whole process.
     #[test]
-    fn an_absolute_candidate_anchors_to_itself() {
-        let anchored = anchor_to_current_dir(PathBuf::from("/opt/spice/bin/spiced"))
-            .expect("an absolute path needs no working directory");
-        assert_eq!(anchored, PathBuf::from("/opt/spice/bin/spiced"));
+    fn a_candidate_that_cannot_be_anchored_is_refused() {
+        let unreadable_cwd = |_: &Path| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "working directory is gone",
+            ))
+        };
+        let error = anchor_with(PathBuf::from("spiced"), unreadable_cwd)
+            .expect_err("an unanchorable candidate must not resolve");
+        let message = error.to_string();
+        assert!(
+            message.contains("spiced"),
+            "the error must name the candidate: {message}"
+        );
+        assert!(
+            message.contains("absolute path"),
+            "the error must give a way out: {message}"
+        );
     }
 
-    /// A relative candidate is resolved against the directory it was validated
-    /// in. `Command::new` would otherwise re-interpret it against the child's
-    /// `--dir`, and a bare name with no separator is not a path to it at all —
-    /// it is a fresh `PATH` lookup, so the file that ran need not be the file
-    /// that was checked.
+    /// An absolute candidate has nothing to anchor against, so it never consults
+    /// the working directory — and so cannot fail when that directory is
+    /// unreadable. Injecting a resolver that would fail is what proves the
+    /// short-circuit is real rather than incidental.
     #[test]
-    fn a_relative_candidate_is_anchored_to_an_absolute_path() {
-        let anchored = anchor_to_current_dir(PathBuf::from("spiced"))
-            .expect("the test process has a working directory");
-        assert!(
-            anchored.is_absolute(),
-            "a relative candidate must not survive resolution as a bare name: {}",
-            anchored.display()
-        );
-        assert!(
-            anchored.ends_with("spiced"),
-            "anchoring must not change which file is named: {}",
-            anchored.display()
-        );
+    fn an_absolute_candidate_never_consults_the_working_directory() {
+        let must_not_be_called = |_: &Path| {
+            panic!("an absolute candidate must not be resolved against the working directory")
+        };
+        let anchored = anchor_with(PathBuf::from("/opt/spice/bin/spiced"), must_not_be_called)
+            .expect("an absolute path anchors to itself");
+        assert_eq!(anchored, PathBuf::from("/opt/spice/bin/spiced"));
     }
 
     /// A file without an execute bit is a half-written download, not a runtime.
