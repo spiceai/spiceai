@@ -56,14 +56,27 @@ limitations under the License.
 //! the steady-state upsert shape. The budget row is flat at ~43 us across all three
 //! shard counts, which is what O(1) looks like.
 //!
-//! `borrowed_boolbuilder` answers "why not `BooleanArray::builder`": its
-//! `append_value` also pokes a `NullBufferBuilder` on every row, which this mask
-//! never needs. It measures +2.4% on the all-HIT and half-HIT shapes and +0.9% on
-//! all-MISS -- small, but consistent, non-overlapping, and largest exactly where
-//! the mask is the biggest share of the loop. `BooleanBufferBuilder` also lets the
-//! predicate be built as `BooleanArray::new(buffer, None)`, which states at the
-//! construction site that a filter predicate cannot be null, rather than leaving
-//! it a property of nobody having called `append_null`.
+//! ## Mask strategy, isolated (issue #13408)
+//!
+//! `borrowed_vecbool` / `borrowed_boolbuilder` / `borrowed_bits` differ ONLY in how
+//! the mask is built, so they answer "what did the mask alone cost" -- which
+//! `owned_vec` cannot, since it also changes the per-row `.owned()`.
+//!
+//! | mask | all-HIT | half-HIT | all-MISS |
+//! |---|---|---|---|
+//! | `Vec<bool>` + clone + second `Vec` | 66.34 us | 161.23 us | 241.05 us |
+//! | `BooleanArray::builder()` | 53.35 us | 155.21 us | 232.29 us |
+//! | `BooleanBufferBuilder` | 52.18 us | 152.32 us | 231.73 us |
+//!
+//! Dropping `Vec<bool>` is worth ~1.27x on the all-HIT shape and ~1.05x elsewhere
+//! -- NOT the 3.41x the shipped change measured, which is mostly the allocation.
+//!
+//! `BooleanBuilder::append_value` also pokes a `NullBufferBuilder` on every row,
+//! which a filter predicate never needs: +2.4% on all-HIT and half-HIT, +0.9% on
+//! all-MISS, consistent and non-overlapping. `BooleanBufferBuilder` additionally
+//! lets the predicate be built as `BooleanArray::new(buffer, None)`, stating at the
+//! construction site that it cannot be null rather than leaving that a property of
+//! nobody having called `append_null`.
 //!
 //! Throwaway: this exists to rank the changes, not to guard them.
 
@@ -190,6 +203,33 @@ fn split_borrowed_bits(rows_enc: &Rows, rows: usize, bloom: &Bloom) -> (usize, u
 }
 
 /// Today: sum every shard's byte count on every insert.
+/// The `Vec<bool>` mask, with borrowed keys so ONLY the mask differs from
+/// `split_borrowed_bits`.
+///
+/// `split_owned_vec` conflates the mask with the per-row `.owned()`, so it cannot
+/// answer "what did the mask alone cost". This can: a byte per row, cloned for the
+/// predicate, and a second `Vec<bool>` for the complement, each converted by
+/// `BooleanArray::from` (which re-packs bytes into bits).
+fn split_borrowed_vec_bool(rows_enc: &Rows, rows: usize, bloom: &Bloom) -> (usize, usize) {
+    let mut incoming: HashMap<u128, OwnedRow> = HashMap::with_capacity(rows);
+    let mut miss_mask = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let key = rows_enc.row(i);
+        let key_bytes = key.as_ref();
+        let digest = hash_key_128(key_bytes);
+        let is_miss = !bloom.maybe_contains(key_bytes, i) && !incoming.contains_key(&digest);
+        if is_miss {
+            incoming.insert(digest, key.owned());
+        }
+        miss_mask.push(is_miss);
+    }
+    let miss_pred = BooleanArray::from(miss_mask.clone());
+    let hit_mask: Vec<bool> = miss_mask.iter().map(|m| !*m).collect();
+    let hit_pred = BooleanArray::from(hit_mask);
+    black_box((&miss_pred, &hit_pred));
+    (miss_pred.true_count(), incoming.len())
+}
+
 /// `BooleanBuilder` (`BooleanArray::builder`) instead of `BooleanBufferBuilder`:
 /// the same bit-packed values buffer, plus a `NullBufferBuilder` that
 /// `append_value` pokes on every row even when no null is ever appended.
@@ -262,6 +302,9 @@ fn bench(c: &mut Criterion) {
         let bloom = Bloom::new(ROWS, hit_every);
         g.bench_function(format!("split/owned_vec_{label}"), |b| {
             b.iter(|| black_box(split_owned_vec(&encoded, ROWS, &bloom)));
+        });
+        g.bench_function(format!("split/borrowed_vecbool_{label}"), |b| {
+            b.iter(|| black_box(split_borrowed_vec_bool(&encoded, ROWS, &bloom)));
         });
         g.bench_function(format!("split/borrowed_bits_{label}"), |b| {
             b.iter(|| black_box(split_borrowed_bits(&encoded, ROWS, &bloom)));
