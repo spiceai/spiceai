@@ -1254,8 +1254,11 @@ fn resolve_spiced(
 /// executes the selected binary as the account holding that service's data
 /// and credentials, chosen from a `PATH` the invoker controls.
 ///
+/// Identity here is a [`PosixIdentity`], so a `sudo` that moves only the group
+/// counts.
+///
 /// Two shapes are deliberately not transitions. A `sudo` that stays on one
-/// account — `sudo -u alice` run by alice, or a plain login, which sets no
+/// identity — `sudo -u alice` run by alice, or a plain login, which sets no
 /// `SUDO_USER` at all — is reading its own `PATH`. And [`sudo_invoker_name`]
 /// excludes a *root* invoker, so `sudo -u spice-svc` run by root leaves the
 /// rung open: the `PATH` inherited is then root's own, and one root controls
@@ -1263,37 +1266,74 @@ fn resolve_spiced(
 #[cfg(unix)]
 fn running_for_another_user() -> bool {
     is_elevation(
-        nix::unistd::Uid::effective().as_raw(),
+        PosixIdentity {
+            user: nix::unistd::Uid::effective().as_raw(),
+            group: nix::unistd::Gid::effective().as_raw(),
+        },
         sudo_invoker_name().is_some(),
-        sudo_invoker_uid(),
+        sudo_invoker_identity(),
     )
 }
 
-/// [`running_for_another_user`] over the three facts it reads, so each arm is
-/// assertable: a test cannot change this process's effective uid, and the
+/// [`running_for_another_user`] over the facts it reads, so each arm is
+/// assertable: a test cannot change this process's effective ids, and the
 /// `SUDO_*` variables are shared with every other test in the binary.
 ///
-/// Fails closed on the identity comparison: an invoker whose uid cannot be
-/// read counts as a different identity, because the alternative is leaving the
-/// rung open on the strength of a fact we do not have.
+/// Fails closed: an invoker whose identity cannot be read counts as a
+/// different one, because the alternative is leaving the rung open on the
+/// strength of a fact we do not have.
 #[cfg(unix)]
-fn is_elevation(effective_uid: u32, invoked_via_sudo: bool, sudo_invoker_uid: Option<u32>) -> bool {
-    invoked_via_sudo && sudo_invoker_uid != Some(effective_uid)
+fn is_elevation(
+    effective: PosixIdentity,
+    invoked_via_sudo: bool,
+    sudo_invoker: Option<PosixIdentity>,
+) -> bool {
+    invoked_via_sudo && sudo_invoker != Some(effective)
 }
 
-/// The uid of the user who invoked `sudo`, or `None` when this process was not
-/// invoked through it or `sudo` did not say.
+/// The pair that decides whether two identities are the same one.
+///
+/// Both halves matter, because `sudo` can move either without the other and
+/// each alone reaches data the invoker cannot otherwise read:
+/// `sudo -u alice -g privileged spice run`, run by alice, keeps her uid
+/// throughout — so a user-only comparison sees no transition, while the
+/// process it starts holds a group she does not otherwise have and runs a
+/// binary chosen from her own `PATH`.
+///
+/// Requiring both also means a `sudo` under a non-default group — one the
+/// invoker reached with `newgrp`, so `SUDO_GID` names it rather than their
+/// login group — resolves through the managed install rather than `PATH`.
+/// That is the safe direction to be wrong in.
 #[cfg(unix)]
-fn sudo_invoker_uid() -> Option<u32> {
-    sudo_invoker_uid_in(std::env::var("SUDO_UID").ok())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PosixIdentity {
+    user: u32,
+    group: u32,
 }
 
-/// [`sudo_invoker_uid`] over the variable rather than the environment, so the
-/// parse is assertable — `SUDO_UID` is shared with every other test in this
-/// binary.
+/// The identity the user who invoked `sudo` held, or `None` when this process
+/// was not invoked through it or `sudo` did not say — which includes saying
+/// only half of it.
 #[cfg(unix)]
-fn sudo_invoker_uid_in(sudo_uid: Option<String>) -> Option<u32> {
-    sudo_uid?.trim().parse().ok()
+fn sudo_invoker_identity() -> Option<PosixIdentity> {
+    sudo_invoker_identity_in(
+        std::env::var("SUDO_UID").ok(),
+        std::env::var("SUDO_GID").ok(),
+    )
+}
+
+/// [`sudo_invoker_identity`] over the variables rather than the environment,
+/// so the parse is assertable — `SUDO_UID` and `SUDO_GID` are shared with
+/// every other test in this binary.
+///
+/// Either id failing to parse yields no identity at all rather than a partial
+/// one, which is what makes [`is_elevation`] fail closed on it.
+#[cfg(unix)]
+fn sudo_invoker_identity_in(user: Option<String>, group: Option<String>) -> Option<PosixIdentity> {
+    Some(PosixIdentity {
+        user: user?.trim().parse().ok()?,
+        group: group?.trim().parse().ok()?,
+    })
 }
 
 /// The user who invoked `sudo`, or `None` when this process was not invoked
@@ -2046,6 +2086,21 @@ mod tests {
         assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
     }
 
+    /// The three accounts the elevation arms are written against: root, the
+    /// human who invokes `sudo`, and the service account they act for.
+    #[cfg(unix)]
+    const ROOT_IDENTITY: PosixIdentity = PosixIdentity { user: 0, group: 0 };
+    #[cfg(unix)]
+    const OPERATOR_IDENTITY: PosixIdentity = PosixIdentity {
+        user: 1000,
+        group: 1000,
+    };
+    #[cfg(unix)]
+    const SERVICE_IDENTITY: PosixIdentity = PosixIdentity {
+        user: 999,
+        group: 999,
+    };
+
     /// Every arm of the identity comparison, including the transition that
     /// reaches no root at all: `sudo -u spice-svc` gains no privilege the
     /// invoker lacks in general, but it does run the selected binary as an
@@ -2053,30 +2108,44 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn elevation_is_acting_for_a_different_user() {
-        const ROOT: u32 = 0;
-        const OPERATOR: u32 = 1000;
-        const SERVICE: u32 = 999;
-
         assert!(
-            is_elevation(ROOT, true, Some(OPERATOR)),
+            is_elevation(ROOT_IDENTITY, true, Some(OPERATOR_IDENTITY)),
             "`sudo spice` would read the operator's PATH as root"
         );
         assert!(
-            is_elevation(SERVICE, true, Some(OPERATOR)),
+            is_elevation(SERVICE_IDENTITY, true, Some(OPERATOR_IDENTITY)),
             "`sudo -u spice-svc` reaches an account the operator is not"
         );
         assert!(
-            is_elevation(SERVICE, true, None),
-            "an invoker whose uid cannot be read is no proof of one account"
+            is_elevation(SERVICE_IDENTITY, true, None),
+            "an invoker whose identity cannot be read is no proof of one account"
         );
 
         assert!(
-            !is_elevation(ROOT, false, None),
+            !is_elevation(ROOT_IDENTITY, false, None),
             "no invoker at all means this process is reading its own PATH"
         );
         assert!(
-            !is_elevation(OPERATOR, true, Some(OPERATOR)),
-            "`sudo -u operator` run by operator stays on one account"
+            !is_elevation(OPERATOR_IDENTITY, true, Some(OPERATOR_IDENTITY)),
+            "`sudo -u operator` run by operator stays on one identity"
+        );
+    }
+
+    /// A group is an identity too. `sudo -u alice -g privileged`, run by alice,
+    /// never changes uid — so a rule that compares only users reads it as no
+    /// transition, while the process it starts holds a group alice does not
+    /// otherwise have and runs a binary chosen from alice's own `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn elevation_is_a_group_transition_even_when_the_user_is_unchanged() {
+        let with_privileged_group = PosixIdentity {
+            group: 27,
+            ..OPERATOR_IDENTITY
+        };
+
+        assert!(
+            is_elevation(with_privileged_group, true, Some(OPERATOR_IDENTITY)),
+            "`sudo -g privileged` grants a group the invoker's PATH must not steer"
         );
     }
 
@@ -2117,29 +2186,53 @@ mod tests {
         );
     }
 
-    /// What `SUDO_UID` has to look like to name a uid at all. A value that does
-    /// not parse leaves the comparison in [`is_elevation`] without its second
-    /// identity, which is why that arm closes the rung rather than opening it.
+    /// What `SUDO_UID` and `SUDO_GID` have to look like to name an identity at
+    /// all. Either one failing to parse leaves [`is_elevation`] without the
+    /// invoker's identity, which is why that arm closes the rung rather than
+    /// opening it.
     #[cfg(unix)]
     #[test]
-    fn sudo_uid_names_an_invoker_only_when_it_parses() {
-        assert_eq!(sudo_invoker_uid_in(Some("1000".to_string())), Some(1000));
+    fn sudo_ids_name_an_invoker_only_when_they_both_parse() {
+        let identity = |uid: Option<&str>, gid: Option<&str>| {
+            sudo_invoker_identity_in(uid.map(ToString::to_string), gid.map(ToString::to_string))
+        };
+
         assert_eq!(
-            sudo_invoker_uid_in(Some(" 1000\n".to_string())),
-            Some(1000),
-            "the variable is read as sudo leaves it"
+            identity(Some("1000"), Some("20")),
+            Some(PosixIdentity {
+                user: 1000,
+                group: 20
+            })
+        );
+        assert_eq!(
+            identity(Some(" 1000\n"), Some(" 20\n")),
+            Some(PosixIdentity {
+                user: 1000,
+                group: 20
+            }),
+            "the variables are read as sudo leaves them"
         );
 
-        assert_eq!(sudo_invoker_uid_in(None), None, "not invoked through sudo");
+        assert_eq!(identity(None, None), None, "not invoked through sudo");
         assert_eq!(
-            sudo_invoker_uid_in(Some("operator".to_string())),
+            identity(Some("1000"), None),
+            None,
+            "half an identity is no identity"
+        );
+        assert_eq!(
+            identity(None, Some("20")),
+            None,
+            "half an identity is no identity, either way round"
+        );
+        assert_eq!(
+            identity(Some("operator"), Some("20")),
             None,
             "a name is not a uid"
         );
         assert_eq!(
-            sudo_invoker_uid_in(Some("-1".to_string())),
+            identity(Some("1000"), Some("-1")),
             None,
-            "a uid is unsigned"
+            "an id is unsigned"
         );
     }
 
