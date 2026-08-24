@@ -64,7 +64,10 @@ impl CachedAggregationResult {
     ///
     /// The schema is interned and shared across every entry over the same
     /// shape, so it is not a per-entry cost and is reported by the interner
-    /// rather than charged here. See [`crate::result::query::CachedQueryResult::memory_size`].
+    /// rather than charged here. A schema unique to one entry is likewise not
+    /// charged — deliberately; see
+    /// [`crate::result::query::CachedQueryResult::memory_size`] for why that
+    /// tradeoff was taken and what reports the residual.
     fn heap_size(&self) -> usize {
         arc_heap_size::<Vec<RecordBatch>>()
             + self.records.len() * std::mem::size_of::<RecordBatch>()

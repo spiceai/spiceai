@@ -30,10 +30,15 @@ limitations under the License.
 //! * An allocation reached through an `Arc` from two entries is charged to
 //!   both. Sharing is generally not observable from a weigher, and
 //!   over-charging evicts sooner, which is the safe direction for a budget.
-//!   Schemas are the deliberate exception: they are interned, so one allocation
-//!   backs every entry of the same shape, and charging it per entry would bill
-//!   a wide schema once for every entry that merely points at it.
-//!   [`arrow_tools::schema_intern`] counts those bytes once instead.
+//!   Schemas are the deliberate exception, in the other direction: they are
+//!   interned, so one allocation backs every entry of the same shape, and
+//!   charging it per entry would bill a wide schema once for every entry that
+//!   merely points at it. A schema unique to a single entry is not charged
+//!   either — the same deliberate choice, accepting that such a workload can
+//!   exceed `max_size` by the size of its schemas.
+//!   [`arrow_tools::schema_intern`] counts those bytes once and publishes them,
+//!   so the residual is reported rather than enforced. See
+//!   [`crate::result::query::CachedQueryResult::memory_size`].
 //! * Collection slots are charged as `len`- or `capacity`-times-entry-size,
 //!   which omits a hash table's control bytes and a `Vec`'s spare capacity.
 //! * [`ENTRY_OVERHEAD_BYTES`] is a flat allowance, not a measurement.

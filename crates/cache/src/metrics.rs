@@ -68,12 +68,11 @@ impl EvictionReason {
 /// memory is reported instead: once per distinct schema, rather than once per
 /// entry holding it.
 ///
-/// Registering them as *observable* gauges also gives the pool its only
-/// periodic reader. Interning sweeps the shard it touches, which is enough
-/// while a shard sees traffic, but a shard that goes quiet after a burst would
-/// otherwise hold its dead rows and their capacity indefinitely. Collection
-/// calls `stats()`, which sweeps, so the pool shrinks on the collection
-/// interval rather than waiting for traffic that may never come.
+/// The callbacks only read: `stats()` does not sweep, so collecting these
+/// gauges never changes what the pool holds. Reclamation is driven separately
+/// by the runtime's cache-maintenance loop, which runs whether or not metrics
+/// are enabled — tying it to collection would have made the pool's memory
+/// depend on `--metrics`, which is off by default.
 pub struct SchemaInternerMetrics {
     _rows: ObservableGauge<u64>,
     _schema_bytes: ObservableGauge<u64>,
@@ -82,8 +81,6 @@ pub struct SchemaInternerMetrics {
 
 static SCHEMA_INTERNER_METRICS: LazyLock<SchemaInternerMetrics> = LazyLock::new(|| {
     let meter = global::meter("schema_interner");
-    // `stats()` sweeps, so it is called once per collection and the three
-    // gauges observe that one snapshot rather than sweeping three times.
     SchemaInternerMetrics {
         _rows: meter
             .u64_observable_gauge("schema_interner_schemas")

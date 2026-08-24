@@ -1077,23 +1077,38 @@ impl Runtime {
 
     /// Periodically drives moka housekeeping so invalidation predicates and
     /// expired entries are reclaimed even on caches with no `get`/`insert`
-    /// traffic. Returns immediately when no cache is configured; otherwise loops
-    /// until the task is cancelled at shutdown.
+    /// traffic, and reclaims the shared Arrow schema pool. Loops until the task
+    /// is cancelled at shutdown.
     pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
         let caching = self.datafusion().caching();
-        if caching.results.is_none()
-            && caching.plans.is_none()
-            && caching.search.is_none()
-            && caching.embeddings.is_none()
-        {
-            return Ok(());
-        }
+        let has_cache = caching.results.is_some()
+            || caching.plans.is_some()
+            || caching.search.is_some()
+            || caching.embeddings.is_some();
 
         let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            caching.run_pending_maintenance().await;
+
+            // Swept whether or not a SQL cache is configured, and independently
+            // of whether metrics are enabled. The pool only reclaims a shard
+            // that interning happens to touch, so a shard that goes quiet after
+            // a burst — a cache invalidation, a retired Cayenne inline view —
+            // would otherwise hold its dead rows and their capacity for the
+            // process lifetime. Cayenne's inline-data cache interns too, so the
+            // pool holds memory even with every SQL cache switched off.
+            //
+            // On a blocking thread: it takes each shard's lock and may
+            // reallocate the shards it shrinks, which is unbounded by anything
+            // this task controls.
+            if let Err(e) = tokio::task::spawn_blocking(arrow_tools::schema_intern::sweep).await {
+                tracing::debug!("Schema pool maintenance did not complete: {e}");
+            }
+
+            if has_cache {
+                caching.run_pending_maintenance().await;
+            }
         }
     }
 

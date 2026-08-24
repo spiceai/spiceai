@@ -186,11 +186,27 @@ impl CachedQueryResult {
     /// evict one. See [`crate::sizing`] for the imprecisions this accepts.
     ///
     /// The schema is deliberately **not** charged here. It is interned, so one
-    /// allocation is shared by every entry over the same shape and charging it
+    /// allocation is shared by every entry over the same shape, and charging it
     /// per entry would bill a 200-column schema tens of thousands of times over
-    /// for memory that exists once. Those bytes are reported instead by
-    /// [`arrow_tools::schema_intern::SchemaInterner::stats`], which counts each
-    /// distinct schema once.
+    /// for memory that exists once.
+    ///
+    /// This holds even when a schema is **unique to one entry** — that case is
+    /// intentional, not an oversight. Such an entry does hold an allocation no
+    /// weigher charges, so a workload of unboundedly many distinct output
+    /// shapes can exceed `max_size` by the size of its schemas. The considered
+    /// alternative was charging `schema_size / Arc::strong_count` at insert,
+    /// which self-corrects because it degrades to the full charge exactly when
+    /// deduplication fails. It was rejected: making every entry's weight depend
+    /// on how many others happen to share its shape at that instant means an
+    /// entry's charge varies with unrelated traffic, and the common case — one
+    /// shape behind many entries — is precisely where per-entry billing was
+    /// wrong to begin with.
+    ///
+    /// What keeps that residual case from being silent is reporting rather than
+    /// admission: [`arrow_tools::schema_intern::SchemaInterner::stats`] counts
+    /// each distinct schema once and is published as
+    /// `schema_interner_schema_bytes`, so a pool growing without bound is
+    /// visible even though it does not trigger eviction.
     #[must_use]
     pub fn memory_size(&self) -> u64 {
         let mut size = std::mem::size_of::<Self>();
