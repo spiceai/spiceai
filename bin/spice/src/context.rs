@@ -511,8 +511,9 @@ impl RuntimeContext {
     /// 1. `$SPICED_PATH` — an explicit pin, honored ahead of everything.
     /// 2. `spiced` beside the running `spice`, via `current_exe()` — the
     ///    binary the user actually invoked, and its build partner.
-    /// 3. `spiced` on `PATH` — skipped while root is acting for another user
-    ///    (a plain root login is not: it is reading its own `PATH`).
+    /// 3. `spiced` on `PATH` — skipped while `sudo` is acting for an account
+    ///    other than the invoker's (a plain login is not: it is reading its
+    ///    own `PATH`).
     /// 4. `$HOME/.spice/bin/spiced` — the managed install, and a genuine root
     ///    login's own install.
     /// 5. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
@@ -520,16 +521,16 @@ impl RuntimeContext {
     ///
     /// Under `sudo`, every rung names a binary the invoking user already chose
     /// or installed, which is the trust rung 5 has always extended: a runtime
-    /// in the invoker's own home has been executed as root since that rung was
-    /// added.
+    /// in the invoker's own home has been executed as the elevated account
+    /// since that rung was added.
     ///
     /// Rung 3 is the exception, and it closes while elevated. The line the other
     /// rungs stay on is that the invoker performed a deliberate act naming the
     /// binary: rung 1 is an explicit pin, and `sudo` strips `SPICED_PATH` under
     /// the default `env_reset`, so reaching it under elevation takes `sudo -E`,
     /// a `sudoers` entry, or `sudo SPICED_PATH=… spice`; rung 2 is not
-    /// environment at all but the directory of the binary root is already
-    /// executing, so a writable one means the compromise preceded resolution.
+    /// environment at all but the directory of the binary already executing,
+    /// so a writable one means the compromise preceded resolution.
     /// `PATH` is the one rung `sudo` carries through with no act by anyone, and
     /// `spice run` and `spice version` execute what resolves here without
     /// dropping privileges or clearing the environment. Nothing about `sudo`
@@ -912,6 +913,29 @@ fn unselectable_install_warning(installed: &Path, cause: &Error) -> String {
     )
 }
 
+/// The wording a command uses when the ladder selected nothing at all.
+///
+/// Lives here, with the ladder, because every word of it is a claim about the
+/// rungs: it names no rung it cannot vouch for. [`resolve_spiced`] skips the
+/// `PATH` rung whenever `sudo` is acting for another account — the ordinary way
+/// `spice cloud service install` is invoked — so a message enumerating `PATH`
+/// would send an operator hunting through a list that was never searched.
+/// `SPICED_PATH` is the one selector that applies either way, so that is the
+/// remedy named beside `spice install`.
+///
+/// `action` is the caller's own failure, in the `Failed to {action}` form the
+/// CLI's errors use.
+pub(crate) fn runtime_not_selected_message(action: &str, managed_install: &Path) -> String {
+    format!(
+        "Failed to {action}: no Spice runtime could be selected, so there is nothing to run. \
+         Install one with `spice install`, which writes to {}, or set `SPICED_PATH` to the \
+         runtime to use — `PATH` is not searched while `sudo` is acting for another account, \
+         because it belongs to the invoking user rather than to that account. \
+         See: https://spiceai.org/docs",
+        managed_install.display()
+    )
+}
+
 /// Read a runtime's version by running it.
 ///
 /// Public so a caller that has already resolved does not walk the ladder a
@@ -1033,10 +1057,12 @@ struct SpicedLookup<'a> {
     /// [`is_runnable_binary`].
     is_binary: &'a dyn Fn(&Path) -> bool,
     /// Whether this process is acting for another user — see
-    /// [`running_for_another_user`]. Closes the `PATH` rung, and moves
-    /// with [`Self::sudo_invoker_home`]: both are decided by
-    /// [`sudo_invoker_name`], so the rung that closes and the rung that answers
-    /// in its place cannot disagree.
+    /// [`running_for_another_user`]. Closes the `PATH` rung, and whenever it
+    /// does, [`Self::sudo_invoker_home`] is there to answer: closing requires
+    /// an invoker that [`sudo_invoker_name`] named, which is the same fact rung
+    /// 5 looks up. The converse does not hold — `sudo -u alice` run by alice
+    /// names an invoker without being a transition — so an open rung says
+    /// nothing about rung 5.
     elevated: bool,
 }
 
@@ -1228,14 +1254,17 @@ fn resolve_spiced(
 /// executes the selected binary as the account holding that service's data
 /// and credentials, chosen from a `PATH` the invoker controls.
 ///
-/// A `sudo` that stays on one account is not a transition: `sudo -u alice` run
-/// by alice reads alice's own `PATH`, as does a plain login, which sets no
-/// `SUDO_USER` at all.
+/// Two shapes are deliberately not transitions. A `sudo` that stays on one
+/// account — `sudo -u alice` run by alice, or a plain login, which sets no
+/// `SUDO_USER` at all — is reading its own `PATH`. And [`sudo_invoker_name`]
+/// excludes a *root* invoker, so `sudo -u spice-svc` run by root leaves the
+/// rung open: the `PATH` inherited is then root's own, and one root controls
+/// buys an attacker nothing they would not already have.
 #[cfg(unix)]
 fn running_for_another_user() -> bool {
     is_elevation(
         nix::unistd::Uid::effective().as_raw(),
-        sudo_invoker_name().as_deref(),
+        sudo_invoker_name().is_some(),
         sudo_invoker_uid(),
     )
 }
@@ -1248,12 +1277,8 @@ fn running_for_another_user() -> bool {
 /// read counts as a different identity, because the alternative is leaving the
 /// rung open on the strength of a fact we do not have.
 #[cfg(unix)]
-fn is_elevation(
-    effective_uid: u32,
-    sudo_invoker: Option<&str>,
-    sudo_invoker_uid: Option<u32>,
-) -> bool {
-    sudo_invoker.is_some() && sudo_invoker_uid != Some(effective_uid)
+fn is_elevation(effective_uid: u32, invoked_via_sudo: bool, sudo_invoker_uid: Option<u32>) -> bool {
+    invoked_via_sudo && sudo_invoker_uid != Some(effective_uid)
 }
 
 /// The uid of the user who invoked `sudo`, or `None` when this process was not
@@ -1755,8 +1780,8 @@ mod tests {
         )
     }
 
-    /// [`ladder`] over a process that is root acting for another user, which is
-    /// the only condition that closes the `PATH` rung.
+    /// [`ladder`] over a process acting for an account other than the one whose
+    /// `PATH` it inherited, which is the condition that closes the `PATH` rung.
     fn elevated_ladder(
         env: &[(&str, &str)],
         current_exe: Option<&str>,
@@ -2033,25 +2058,62 @@ mod tests {
         const SERVICE: u32 = 999;
 
         assert!(
-            is_elevation(ROOT, Some("operator"), Some(OPERATOR)),
+            is_elevation(ROOT, true, Some(OPERATOR)),
             "`sudo spice` would read the operator's PATH as root"
         );
         assert!(
-            is_elevation(SERVICE, Some("operator"), Some(OPERATOR)),
+            is_elevation(SERVICE, true, Some(OPERATOR)),
             "`sudo -u spice-svc` reaches an account the operator is not"
         );
         assert!(
-            is_elevation(SERVICE, Some("operator"), None),
+            is_elevation(SERVICE, true, None),
             "an invoker whose uid cannot be read is no proof of one account"
         );
 
         assert!(
-            !is_elevation(ROOT, None, None),
-            "root with no invoker is reading its own PATH"
+            !is_elevation(ROOT, false, None),
+            "no invoker at all means this process is reading its own PATH"
         );
         assert!(
-            !is_elevation(OPERATOR, Some("operator"), Some(OPERATOR)),
+            !is_elevation(OPERATOR, true, Some(OPERATOR)),
             "`sudo -u operator` run by operator stays on one account"
+        );
+    }
+
+    /// The ladder's "nothing resolved" wording. `PATH` is the load-bearing
+    /// half: rung 3 closes whenever `sudo` is acting for another account, so
+    /// the message has to say `PATH` went unsearched rather than list it among
+    /// the places a runtime was looked for and not found.
+    #[test]
+    fn the_unselected_runtime_message_does_not_claim_path_was_searched() {
+        let message = runtime_not_selected_message(
+            "install the Spice Cloud Connect service",
+            Path::new("/home/ada/.spice/bin/spiced"),
+        );
+
+        assert!(
+            message.contains("`PATH` is not searched"),
+            "the message must say `PATH` was not searched: {message}"
+        );
+        assert!(
+            !message.contains("on `PATH`"),
+            "the message must not report `PATH` as somewhere it searched: {message}"
+        );
+        assert!(
+            message.contains("Failed to install the Spice Cloud Connect service"),
+            "the message must name the caller's own failure: {message}"
+        );
+        assert!(
+            message.contains("/home/ada/.spice/bin/spiced"),
+            "the message must name where `spice install` writes: {message}"
+        );
+        assert!(
+            message.contains("SPICED_PATH"),
+            "the message must name the selector that survives elevation: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs"),
+            "the message must link the docs: {message}"
         );
     }
 

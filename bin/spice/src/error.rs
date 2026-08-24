@@ -104,7 +104,7 @@ pub enum Error {
 
     /// `SPICED_PATH` names something that cannot be run as the runtime
     #[snafu(display(
-        "Failed to locate the Spice runtime: `SPICED_PATH` is set to '{path}', which is not an executable file. Point `SPICED_PATH` at a 'spiced' binary (and check it is executable: 'chmod +x {path}'), or unset it to use the runtime beside the CLI, on 'PATH', or from 'spice install'. See: https://spiceai.org/docs/cli"
+        "Failed to locate the Spice runtime: `SPICED_PATH` is set to '{path}', which is not an executable file. Point `SPICED_PATH` at a 'spiced' binary (and check it is executable: 'chmod +x {path}'), or unset it to fall back to the usual runtime selection ('spice install' writes the managed one). See: https://spiceai.org/docs/cli"
     ))]
     SpicedPathOverrideNotRunnable { path: String },
 

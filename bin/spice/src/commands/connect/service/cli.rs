@@ -300,27 +300,6 @@ fn ensure_service_lifecycle_supported() -> Result<()> {
     }
 }
 
-/// The error printed when no runtime could be selected to install the service
-/// against.
-///
-/// Names no resolution rung it cannot vouch for. `resolve_spiced` skips the
-/// `PATH` rung when root is acting for another user, which is the ordinary way
-/// this installer is invoked, so a message enumerating `PATH` would send an
-/// operator hunting through a list that was never searched. `SPICED_PATH` is
-/// the one selector that applies in both modes, so that is the remedy named
-/// beside `spice install`.
-fn runtime_not_selected_message(managed_install: &Path) -> String {
-    format!(
-        "Failed to install the Spice Cloud Connect service: no Spice runtime could be selected, \
-         so there is nothing for the service to run. \
-         Install one with `spice install`, which writes to {}, or set `SPICED_PATH` to the \
-         runtime to use — under `sudo`, `PATH` is not searched, because it belongs to the \
-         invoking user rather than to the service. \
-         See: https://spiceai.org/docs",
-        managed_install.display()
-    )
-}
-
 /// Install and report what was installed.
 async fn install(
     ctx: &RuntimeContext,
@@ -337,7 +316,10 @@ async fn install(
     let spiced_path = ctx
         .resolve_spiced()?
         .ok_or_else(|| Error::InvalidArgument {
-            message: runtime_not_selected_message(&ctx.spiced_path()),
+            message: crate::context::runtime_not_selected_message(
+                "install the Spice Cloud Connect service",
+                &ctx.spiced_path(),
+            ),
         })?
         .path;
     // Propagated, not defaulted: the manifest records the version installed, so
@@ -557,36 +539,6 @@ mod tests {
         }
         // `svc` is a typing alias, never documented copy.
         assert!(!SERVICE_HELP.contains("svc"), "{SERVICE_HELP}");
-    }
-
-    #[test]
-    fn the_unselected_runtime_error_does_not_claim_path_was_searched() {
-        let message = runtime_not_selected_message(Path::new("/home/ada/.spice/bin/spiced"));
-
-        // `resolve_spiced` skips the `PATH` rung whenever root is acting for
-        // another user, which is how this installer is normally invoked. The
-        // message has to say so rather than list `PATH` among the places a
-        // runtime was looked for and not found.
-        assert!(
-            message.contains("`PATH` is not searched"),
-            "the message must say `PATH` was not searched: {message}"
-        );
-        assert!(
-            !message.contains("on `PATH`"),
-            "the message must not report `PATH` as somewhere it searched: {message}"
-        );
-        assert!(
-            message.contains("/home/ada/.spice/bin/spiced"),
-            "the message must name where `spice install` writes: {message}"
-        );
-        assert!(
-            message.contains("SPICED_PATH"),
-            "the message must name the selector that works under `sudo`: {message}"
-        );
-        assert!(
-            message.contains("https://spiceai.org/docs"),
-            "the message must link the docs: {message}"
-        );
     }
 
     #[test]
