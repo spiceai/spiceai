@@ -557,11 +557,9 @@ mod tests {
 
         // Guard the premise: if the two casts ever agree, this test would pass for
         // the wrong reason and stop covering the bug.
-        let (e_f64, a_f64) = cast_pair_to_f64(
-            expected.column(0).as_ref(),
-            actual.column(0).as_ref(),
-        )
-        .expect("both cast to f64");
+        let (e_f64, a_f64) =
+            cast_pair_to_f64(expected.column(0).as_ref(), actual.column(0).as_ref())
+                .expect("both cast to f64");
         #[expect(
             clippy::float_cmp,
             reason = "bit-exact f64 inequality IS the premise being guarded"
@@ -679,11 +677,9 @@ mod tests {
 
         // Guard the premise: if `f64` could tell these apart, the test would pass
         // without exercising the exact path at all.
-        let (e_f64, a_f64) = cast_pair_to_f64(
-            expected.column(0).as_ref(),
-            actual.column(0).as_ref(),
-        )
-        .expect("both cast to f64");
+        let (e_f64, a_f64) =
+            cast_pair_to_f64(expected.column(0).as_ref(), actual.column(0).as_ref())
+                .expect("both cast to f64");
         #[expect(
             clippy::float_cmp,
             reason = "bit-exact f64 equality IS the collision being guarded"
