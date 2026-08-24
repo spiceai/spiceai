@@ -161,7 +161,14 @@ impl GlueCatalogProvider {
         })
     }
 
-    async fn create_schema_provider(&self, database: String) -> Result<Arc<dyn SchemaProvider>> {
+    /// Builds the schema provider for one database, and reports the summary of
+    /// the tables it holds that Spice cannot read. The summary is returned
+    /// rather than logged here so that `refresh` can decide it against the rest
+    /// of the catalog, once the whole snapshot is known to have succeeded.
+    async fn create_schema_provider(
+        &self,
+        database: String,
+    ) -> Result<(Arc<dyn SchemaProvider>, Option<String>)> {
         let mut tables_builder = self.client.get_tables().database_name(&database);
 
         if let Some(catalog_id) = &self.catalog_id {
@@ -226,16 +233,12 @@ impl GlueCatalogProvider {
             }
         }
 
-        if let Some(summary) = unreadable.summary(&self.catalog_name, &database)
-            && self.unreadable_warnings.is_due(&database, &summary)
-        {
-            tracing::warn!("{summary}");
-        }
+        let summary = unreadable.summary(&self.catalog_name, &database);
 
         let tables = RwLock::new(tables);
         let schema_provider = GlueSchemaProvider { tables };
 
-        Ok(Arc::new(schema_provider))
+        Ok((Arc::new(schema_provider), summary))
     }
 
     async fn validate_parameters(parameters: &mut ConnectorParams) -> Result<()> {
@@ -283,6 +286,7 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
         let mut paginator = databases_builder.into_paginator().send();
 
         let mut databases = HashMap::new();
+        let mut unreadable = HashMap::new();
 
         while let Some(maybe_get_databases_output) = paginator.next().await {
             let get_databases_output = maybe_get_databases_output.context(GetDatabasesSnafu)?;
@@ -300,24 +304,29 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
                     continue;
                 }
 
-                let schema_provider = self.create_schema_provider(db.name().to_string()).await?;
+                let (schema_provider, summary) =
+                    self.create_schema_provider(db.name().to_string()).await?;
 
+                if let Some(summary) = summary {
+                    unreadable.insert(db.name.clone(), summary);
+                }
                 databases.insert(db.name, schema_provider);
             }
         }
-        let mut dbs = match self.databases.write() {
-            Ok(dbs) => dbs,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        {
+            let mut dbs = match self.databases.write() {
+                Ok(dbs) => dbs,
+                Err(poisoned) => poisoned.into_inner(),
+            };
 
-        *dbs = databases;
+            *dbs = databases;
+        }
 
-        // The live database set is now exactly `dbs`, so drop the warning state
-        // of any database this refresh no longer lists — otherwise a catalog
-        // whose databases come and go accumulates entries for names that are
-        // gone, which is the unbounded growth this map is keyed to avoid.
-        self.unreadable_warnings
-            .retain_databases(|database| dbs.contains_key(database));
+        // Only now that the whole snapshot succeeded is `unreadable` the
+        // complete picture, so this is where the warning state may move.
+        for summary in self.unreadable_warnings.reconcile(&unreadable) {
+            tracing::warn!("{summary}");
+        }
 
         Ok(())
     }
@@ -399,9 +408,9 @@ fn is_readable(database: &str, table: &Table, unreadable: &mut UnreadableTables)
 /// When each database's standing "cannot read these tables" warning was last
 /// emitted, and what it said.
 ///
-/// Keyed on the database rather than on the message, so the map is bounded by the
-/// databases this catalog holds — every one of which is already resident in
-/// [`GlueCatalogProvider::databases`], and `refresh` prunes this map to match.
+/// Keyed on the database rather than on the message, so the map holds at most
+/// one entry per database the catalog listed on its last successful refresh —
+/// every one of which is already resident in [`GlueCatalogProvider::databases`].
 /// Keying on the message instead (as a [`util::tracers::SpacedTracer`] does)
 /// would retain one entry for every distinct unreadable-table set the process
 /// ever saw, which grows without bound in a catalog whose tables churn. Storing
@@ -413,45 +422,50 @@ struct UnreadableWarnings {
 }
 
 impl UnreadableWarnings {
-    /// Whether this database's summary is due to be logged: immediately when it
-    /// differs from the one last reported for that database, and otherwise once
-    /// per [`UNREADABLE_WARNING_INTERVAL`]. Records the decision, so a caller
-    /// that asks twice for the same summary is told yes at most once.
-    fn is_due(&self, database: &str, summary: &str) -> bool {
-        self.is_due_at(database, summary, Instant::now())
+    /// Moves the warning state to `summaries` — one refresh's complete set of
+    /// per-database unreadable-table summaries — and returns the summaries that
+    /// are due to be logged.
+    fn reconcile(&self, summaries: &HashMap<DatabaseName, String>) -> Vec<String> {
+        self.reconcile_at(summaries, Instant::now())
     }
 
-    /// [`Self::is_due`] with the clock supplied, so the interval is testable
+    /// [`Self::reconcile`] with the clock supplied, so the interval is testable
     /// without sleeping through it.
-    fn is_due_at(&self, database: &str, summary: &str, now: Instant) -> bool {
+    ///
+    /// Call this only for a refresh that completed: a refresh that gave up
+    /// part-way has no complete `summaries`, and applying a partial one would
+    /// both discard the state of databases it never reached and leave entries
+    /// for databases the catalog does not end up holding.
+    fn reconcile_at(&self, summaries: &HashMap<DatabaseName, String>, now: Instant) -> Vec<String> {
         let mut last = match self.last.lock() {
             Ok(last) => last,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match last.get_mut(database) {
-            Some((last_summary, last_logged))
-                if last_summary == summary
-                    && now.duration_since(*last_logged) < UNREADABLE_WARNING_INTERVAL =>
-            {
-                false
-            }
-            Some(entry) => {
-                *entry = (summary.to_string(), now);
-                true
-            }
-            None => {
-                last.insert(database.to_string(), (summary.to_string(), now));
-                true
-            }
-        }
-    }
 
-    /// Drops the state of every database the predicate rejects.
-    fn retain_databases(&self, live: impl Fn(&str) -> bool) {
-        match self.last.lock() {
-            Ok(mut last) => last.retain(|database, _| live(database)),
-            Err(poisoned) => poisoned.into_inner().retain(|database, _| live(database)),
+        // A database this refresh did not report a summary for either has no
+        // unreadable table any more or is no longer in the catalog. Keeping its
+        // entry would grow the map as databases come and go, and would suppress
+        // the warning if the very same tables became unreadable again inside the
+        // interval — the recurrence is news, however recently it was last said.
+        last.retain(|database, _| summaries.contains_key(database));
+
+        let mut due = Vec::new();
+        for (database, summary) in summaries {
+            match last.get_mut(database) {
+                Some((last_summary, last_logged))
+                    if last_summary == summary
+                        && now.duration_since(*last_logged) < UNREADABLE_WARNING_INTERVAL => {}
+                Some(entry) => {
+                    *entry = (summary.clone(), now);
+                    due.push(summary.clone());
+                }
+                None => {
+                    last.insert(database.clone(), (summary.clone(), now));
+                    due.push(summary.clone());
+                }
+            }
         }
+        due
     }
 
     /// How many databases this holds state for. The bound the message-keyed
@@ -699,6 +713,26 @@ mod tests {
     const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
     const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 
+    /// One refresh's per-database summaries, for [`UnreadableWarnings`].
+    fn refresh_of(summaries: &[(&str, &str)]) -> HashMap<DatabaseName, String> {
+        summaries
+            .iter()
+            .map(|(database, summary)| ((*database).to_string(), (*summary).to_string()))
+            .collect()
+    }
+
+    /// Sorted, because the summaries come back in the iteration order of a
+    /// [`HashMap`].
+    fn reconcile(
+        warnings: &UnreadableWarnings,
+        summaries: &[(&str, &str)],
+        now: Instant,
+    ) -> Vec<String> {
+        let mut due = warnings.reconcile_at(&refresh_of(summaries), now);
+        due.sort();
+        due
+    }
+
     /// A changed unreadable set must be reported at once, an unchanged one must
     /// wait out the interval, and neither may cost a map entry — the state is
     /// keyed on the database, so a database that churns through many distinct
@@ -708,19 +742,30 @@ mod tests {
         let warnings = UnreadableWarnings::default();
         let start = Instant::now();
 
-        assert!(
-            warnings.is_due_at("sales", "3 tables", start),
+        assert_eq!(
+            reconcile(&warnings, &[("sales", "3 tables")], start),
+            ["3 tables"],
             "the first summary for a database must be reported"
         );
         assert!(
-            !warnings.is_due_at("sales", "3 tables", start + Duration::from_secs(60)),
+            reconcile(
+                &warnings,
+                &[("sales", "3 tables")],
+                start + Duration::from_secs(60)
+            )
+            .is_empty(),
             "the same summary inside the interval must stay suppressed"
         );
 
         // A different set is news, whatever the interval says.
         for (elapsed, summary) in [(61, "4 tables"), (62, "5 tables"), (63, "6 tables")] {
-            assert!(
-                warnings.is_due_at("sales", summary, start + Duration::from_secs(elapsed)),
+            assert_eq!(
+                reconcile(
+                    &warnings,
+                    &[("sales", summary)],
+                    start + Duration::from_secs(elapsed)
+                ),
+                [summary],
                 "a changed summary must be reported immediately: {summary}"
             );
         }
@@ -730,9 +775,15 @@ mod tests {
             "four distinct summaries for one database must cost one entry, not four"
         );
 
-        assert!(
-            warnings.is_due_at("orders", "3 tables", start + Duration::from_secs(64)),
-            "a summary another database has never reported must be reported"
+        assert_eq!(
+            reconcile(
+                &warnings,
+                &[("sales", "6 tables"), ("orders", "3 tables")],
+                start + Duration::from_secs(64)
+            ),
+            ["3 tables"],
+            "a summary another database has never reported must be reported, and \
+             `sales` is unchanged inside its interval"
         );
         assert_eq!(
             warnings.tracked_databases(),
@@ -741,15 +792,60 @@ mod tests {
         );
 
         // A database the catalog no longer lists must not keep its entry.
-        warnings.retain_databases(|database| database == "sales");
+        assert!(
+            reconcile(
+                &warnings,
+                &[("sales", "6 tables")],
+                start + Duration::from_secs(65)
+            )
+            .is_empty(),
+            "dropping `orders` must not disturb what `sales` reports"
+        );
         assert_eq!(
             warnings.tracked_databases(),
             1,
             "a database dropped from the catalog must not keep its warning state"
         );
-        assert!(
-            warnings.is_due_at("orders", "3 tables", start + Duration::from_secs(65)),
+        assert_eq!(
+            reconcile(
+                &warnings,
+                &[("sales", "6 tables"), ("orders", "3 tables")],
+                start + Duration::from_secs(66)
+            ),
+            ["3 tables"],
             "a database re-listed after being dropped starts over, so it reports again"
+        );
+    }
+
+    /// A database whose tables all become readable again clears its state, so a
+    /// recurrence of the very same set is reported rather than suppressed as a
+    /// repeat. The recurrence is news: the tables went away and came back.
+    #[test]
+    fn an_unreadable_set_that_recovers_and_recurs_is_reported_again() {
+        let warnings = UnreadableWarnings::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            reconcile(&warnings, &[("sales", "3 tables")], start),
+            ["3 tables"]
+        );
+
+        // Every table readable again: no summary for `sales` at all.
+        assert!(reconcile(&warnings, &[], start + Duration::from_secs(60)).is_empty());
+        assert_eq!(
+            warnings.tracked_databases(),
+            0,
+            "a database with nothing unreadable must not keep its warning state"
+        );
+
+        assert_eq!(
+            reconcile(
+                &warnings,
+                &[("sales", "3 tables")],
+                start + Duration::from_secs(120)
+            ),
+            ["3 tables"],
+            "the same set becoming unreadable again is a new event, not a repeat of the old one"
         );
     }
 
@@ -760,17 +856,26 @@ mod tests {
         let warnings = UnreadableWarnings::default();
         let start = Instant::now();
 
-        assert!(warnings.is_due_at("sales", "3 tables", start));
-        assert!(
-            !warnings.is_due_at(
-                "sales",
-                "3 tables",
-                start + UNREADABLE_WARNING_INTERVAL - Duration::from_secs(1)
-            ),
-            "one second short of the interval must stay suppressed"
+        assert_eq!(
+            reconcile(&warnings, &[("sales", "3 tables")], start),
+            ["3 tables"]
         );
         assert!(
-            warnings.is_due_at("sales", "3 tables", start + UNREADABLE_WARNING_INTERVAL),
+            reconcile(
+                &warnings,
+                &[("sales", "3 tables")],
+                start + UNREADABLE_WARNING_INTERVAL - Duration::from_secs(1)
+            )
+            .is_empty(),
+            "one second short of the interval must stay suppressed"
+        );
+        assert_eq!(
+            reconcile(
+                &warnings,
+                &[("sales", "3 tables")],
+                start + UNREADABLE_WARNING_INTERVAL
+            ),
+            ["3 tables"],
             "the interval must expire, or a standing condition is reported once and never again"
         );
     }
