@@ -43,10 +43,8 @@ use datafusion::{
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use util::tracers::SpacedTracer;
-use util::warn_spaced;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// How long the standing "cannot read these tables" warning is suppressed for
 /// after it is emitted. Sized well above the 60s catalog refresh so a condition
@@ -105,9 +103,7 @@ pub struct GlueCatalogProvider {
     catalog_name: String,
     catalog_id: Option<String>,
     databases: RwLock<HashMap<DatabaseName, Arc<dyn SchemaProvider>>>,
-    /// Spaces the standing "cannot read these tables" warning, which every
-    /// refresh would otherwise re-emit for as long as the tables exist.
-    unreadable_tracer: SpacedTracer,
+    unreadable_warnings: UnreadableWarnings,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -161,7 +157,7 @@ impl GlueCatalogProvider {
             catalog_name: catalog.name.clone(),
             catalog_id: catalog.catalog_id.clone(),
             parameters,
-            unreadable_tracer: SpacedTracer::new(UNREADABLE_WARNING_INTERVAL),
+            unreadable_warnings: UnreadableWarnings::default(),
         })
     }
 
@@ -230,8 +226,10 @@ impl GlueCatalogProvider {
             }
         }
 
-        if let Some(summary) = unreadable.summary(&self.catalog_name, &database) {
-            warn_spaced!(&self.unreadable_tracer, "{}", summary.as_str());
+        if let Some(summary) = unreadable.summary(&self.catalog_name, &database)
+            && self.unreadable_warnings.is_due(&database, &summary)
+        {
+            tracing::warn!("{summary}");
         }
 
         let tables = RwLock::new(tables);
@@ -314,6 +312,13 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
 
         *dbs = databases;
 
+        // The live database set is now exactly `dbs`, so drop the warning state
+        // of any database this refresh no longer lists — otherwise a catalog
+        // whose databases come and go accumulates entries for names that are
+        // gone, which is the unbounded growth this map is keyed to avoid.
+        self.unreadable_warnings
+            .retain_databases(|database| dbs.contains_key(database));
+
         Ok(())
     }
 }
@@ -376,13 +381,86 @@ fn is_readable(database: &str, table: &Table, unreadable: &mut UnreadableTables)
     match InputFormat::try_from(table) {
         Ok(_) => true,
         Err(err) => {
+            // Both the table name and the error's text carry Glue-controlled
+            // strings, so escape them: an embedded newline would split one log
+            // record into two.
             tracing::debug!(
                 database,
-                table = table.name(),
-                "Skipping Glue table Spice cannot read: {err}"
+                table = %table.name().escape_debug(),
+                "Skipping Glue table Spice cannot read: {}",
+                err.to_string().escape_debug()
             );
             unreadable.record(table.name());
             false
+        }
+    }
+}
+
+/// When each database's standing "cannot read these tables" warning was last
+/// emitted, and what it said.
+///
+/// Keyed on the database rather than on the message, so the map is bounded by the
+/// databases this catalog holds — every one of which is already resident in
+/// [`GlueCatalogProvider::databases`], and `refresh` prunes this map to match.
+/// Keying on the message instead (as a [`util::tracers::SpacedTracer`] does)
+/// would retain one entry for every distinct unreadable-table set the process
+/// ever saw, which grows without bound in a catalog whose tables churn. Storing
+/// the summary alongside the instant is what keeps a *changed* set reporting
+/// immediately rather than waiting out the interval.
+#[derive(Default)]
+struct UnreadableWarnings {
+    last: Mutex<HashMap<DatabaseName, (String, Instant)>>,
+}
+
+impl UnreadableWarnings {
+    /// Whether this database's summary is due to be logged: immediately when it
+    /// differs from the one last reported for that database, and otherwise once
+    /// per [`UNREADABLE_WARNING_INTERVAL`]. Records the decision, so a caller
+    /// that asks twice for the same summary is told yes at most once.
+    fn is_due(&self, database: &str, summary: &str) -> bool {
+        self.is_due_at(database, summary, Instant::now())
+    }
+
+    /// [`Self::is_due`] with the clock supplied, so the interval is testable
+    /// without sleeping through it.
+    fn is_due_at(&self, database: &str, summary: &str, now: Instant) -> bool {
+        let mut last = match self.last.lock() {
+            Ok(last) => last,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match last.get_mut(database) {
+            Some((last_summary, last_logged))
+                if last_summary == summary
+                    && now.duration_since(*last_logged) < UNREADABLE_WARNING_INTERVAL =>
+            {
+                false
+            }
+            Some(entry) => {
+                *entry = (summary.to_string(), now);
+                true
+            }
+            None => {
+                last.insert(database.to_string(), (summary.to_string(), now));
+                true
+            }
+        }
+    }
+
+    /// Drops the state of every database the predicate rejects.
+    fn retain_databases(&self, live: impl Fn(&str) -> bool) {
+        match self.last.lock() {
+            Ok(mut last) => last.retain(|database, _| live(database)),
+            Err(poisoned) => poisoned.into_inner().retain(|database, _| live(database)),
+        }
+    }
+
+    /// How many databases this holds state for. The bound the message-keyed
+    /// alternative did not have.
+    #[cfg(test)]
+    fn tracked_databases(&self) -> usize {
+        match self.last.lock() {
+            Ok(last) => last.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
         }
     }
 }
@@ -621,10 +699,85 @@ mod tests {
     const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
     const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 
-    /// Regression test for #13102: `InputFormat::try_from(t).is_ok()` discarded a
-    /// structured error that already named the table and the format, so a table
-    /// Spice cannot read was absent from the catalog with nothing logged at all.
-    /// Every rejecting shape must now be recorded by name.
+    /// A changed unreadable set must be reported at once, an unchanged one must
+    /// wait out the interval, and neither may cost a map entry — the state is
+    /// keyed on the database, so a database that churns through many distinct
+    /// summaries holds exactly one.
+    #[test]
+    fn a_changed_unreadable_set_reports_at_once_without_growing_the_state() {
+        let warnings = UnreadableWarnings::default();
+        let start = Instant::now();
+
+        assert!(
+            warnings.is_due_at("sales", "3 tables", start),
+            "the first summary for a database must be reported"
+        );
+        assert!(
+            !warnings.is_due_at("sales", "3 tables", start + Duration::from_secs(60)),
+            "the same summary inside the interval must stay suppressed"
+        );
+
+        // A different set is news, whatever the interval says.
+        for (elapsed, summary) in [(61, "4 tables"), (62, "5 tables"), (63, "6 tables")] {
+            assert!(
+                warnings.is_due_at("sales", summary, start + Duration::from_secs(elapsed)),
+                "a changed summary must be reported immediately: {summary}"
+            );
+        }
+        assert_eq!(
+            warnings.tracked_databases(),
+            1,
+            "four distinct summaries for one database must cost one entry, not four"
+        );
+
+        assert!(
+            warnings.is_due_at("orders", "3 tables", start + Duration::from_secs(64)),
+            "a summary another database has never reported must be reported"
+        );
+        assert_eq!(
+            warnings.tracked_databases(),
+            2,
+            "state is per database, so a second database adds exactly one entry"
+        );
+
+        // A database the catalog no longer lists must not keep its entry.
+        warnings.retain_databases(|database| database == "sales");
+        assert_eq!(
+            warnings.tracked_databases(),
+            1,
+            "a database dropped from the catalog must not keep its warning state"
+        );
+        assert!(
+            warnings.is_due_at("orders", "3 tables", start + Duration::from_secs(65)),
+            "a database re-listed after being dropped starts over, so it reports again"
+        );
+    }
+
+    /// The interval is what stops a standing condition being re-reported every
+    /// 60s refresh, so it has to actually expire.
+    #[test]
+    fn an_unchanged_unreadable_set_reports_again_once_the_interval_expires() {
+        let warnings = UnreadableWarnings::default();
+        let start = Instant::now();
+
+        assert!(warnings.is_due_at("sales", "3 tables", start));
+        assert!(
+            !warnings.is_due_at(
+                "sales",
+                "3 tables",
+                start + UNREADABLE_WARNING_INTERVAL - Duration::from_secs(1)
+            ),
+            "one second short of the interval must stay suppressed"
+        );
+        assert!(
+            warnings.is_due_at("sales", "3 tables", start + UNREADABLE_WARNING_INTERVAL),
+            "the interval must expire, or a standing condition is reported once and never again"
+        );
+    }
+
+    /// Regression test for #13102: every shape `InputFormat::try_from` refuses
+    /// must be recorded by name, so a table Spice cannot read is never absent
+    /// from the catalog with nothing logged about it.
     #[test]
     fn a_table_glue_cannot_read_is_recorded_rather_than_dropped_silently() {
         let mut unreadable = UnreadableTables::default();
