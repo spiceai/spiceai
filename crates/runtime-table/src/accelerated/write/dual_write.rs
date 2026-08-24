@@ -503,6 +503,22 @@ async fn join_partitioned_staged_tasks(
     })
 }
 
+/// Whether this accelerator reconciles its own committed writes to the
+/// federated source through durable write-back markers.
+///
+/// When it does, the delivery worker is the **single owner** of that delivery:
+/// the legacy fire-and-forget forwards must stand down, or the same mutation
+/// reaches the source through two unordered paths. This is the same predicate
+/// that decides whether the worker is spawned at all, so the two decisions
+/// cannot disagree about who owns delivery.
+#[must_use]
+pub fn accelerator_owns_write_back_delivery(accelerator: &Arc<dyn TableProvider>) -> bool {
+    extract_cayenne_write_target(accelerator).is_some_and(|target| match target {
+        CayenneWriteTarget::Staged(provider) => provider.is_durable_write_back(),
+        CayenneWriteTarget::Partitioned(_) => false,
+    })
+}
+
 pub fn extract_cayenne_write_target(
     table_provider: &Arc<dyn TableProvider>,
 ) -> Option<CayenneWriteTarget> {
@@ -709,7 +725,7 @@ fn cayenne_target_as_provider(target: &CayenneWriteTarget) -> Arc<dyn TableProvi
 
 #[cfg(test)]
 mod tests {
-    use super::{DualWriteDeletionSink, DualWriteUpdateSink};
+    use super::{DualWriteDeletionSink, DualWriteUpdateSink, accelerator_owns_write_back_delivery};
     use arrow::array::UInt64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -725,6 +741,24 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
     use std::sync::Arc;
+
+    /// The safety-critical direction: an accelerator that does NOT deliver its
+    /// own writes must keep its fire-and-forget forward, since that forward is
+    /// the only thing that reaches the source for it. Answering `true` here
+    /// would silently stop delivering its writes altogether.
+    #[test]
+    fn an_accelerator_without_durable_write_back_does_not_own_delivery() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mem_table: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("mem table should be created"),
+        );
+
+        assert!(
+            !accelerator_owns_write_back_delivery(&mem_table),
+            "only a durable-write-back Cayenne accelerator owns its own delivery"
+        );
+    }
 
     fn count_exec(n: u64) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new(

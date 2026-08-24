@@ -1366,15 +1366,9 @@ impl AcceleratedTable {
     #[must_use]
     pub fn is_durable_write_back(&self) -> bool {
         matches!(self.write_mode, WriteMode::WriteBack)
-            && crate::accelerated::write::dual_write::extract_cayenne_write_target(
+            && crate::accelerated::write::dual_write::accelerator_owns_write_back_delivery(
                 &self.accelerator,
             )
-            .is_some_and(|target| match target {
-                crate::accelerated::write::CayenneWriteTarget::Staged(provider) => {
-                    provider.is_durable_write_back()
-                }
-                crate::accelerated::write::CayenneWriteTarget::Partitioned(_) => false,
-            })
     }
 
     #[must_use]

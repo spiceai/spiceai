@@ -240,6 +240,8 @@ pub(crate) async fn delete_write_back(
             )
         })?
         .clone();
+    let markers_own_delivery =
+        super::dual_write::accelerator_owns_write_back_delivery(&accelerator);
     let accelerator_plan = accelerator.delete_from(state, filters.clone()).await?;
     Ok(Arc::new(DeletionExec::new(Arc::new(
         WriteBackDeletionSink {
@@ -247,6 +249,7 @@ pub(crate) async fn delete_write_back(
             federated,
             filters,
             session_state,
+            markers_own_delivery,
         },
     ))))
 }
@@ -256,6 +259,10 @@ struct WriteBackDeletionSink {
     federated: Arc<FederatedTable>,
     filters: Vec<Expr>,
     session_state: SessionState,
+    /// The accelerator records this delete as a durable write-back marker, so
+    /// the delivery worker owns reconciling it to the source and the forward
+    /// below must stand down.
+    markers_own_delivery: bool,
 }
 
 #[async_trait]
@@ -275,6 +282,18 @@ impl DeletionSink for WriteBackDeletionSink {
 
         // Inside a transaction, the delivery worker reconciles the change to the source.
         if request_in_transaction(&context) {
+            return Ok(count);
+        }
+
+        // A durable-write-back table recorded this delete's keys as markers in
+        // the same metastore transaction as the delete, and the delivery worker
+        // reconciles them. Forwarding here as well would deliver one mutation
+        // through two unordered paths: besides the duplicate DML, a forward that
+        // lands late can delete a row a later marker-based upsert had already
+        // re-created at the source — after that upsert's marker was cleared, so
+        // nothing is left to reconcile it back. The marker path is also the
+        // durable one; this forward is lost outright if the process dies.
+        if self.markers_own_delivery {
             return Ok(count);
         }
 
@@ -746,6 +765,7 @@ mod tests {
             federated,
             filters: vec![],
             session_state: session_state.clone(),
+            markers_own_delivery: false,
         };
 
         let count = sink
@@ -766,6 +786,7 @@ mod tests {
             federated,
             filters: vec![],
             session_state: session_state.clone(),
+            markers_own_delivery: false,
         };
 
         let err = sink
@@ -835,6 +856,7 @@ mod tests {
             federated,
             filters: vec![],
             session_state: session_state.clone(),
+            markers_own_delivery: false,
         };
 
         let count = sink
@@ -864,6 +886,7 @@ mod tests {
             federated,
             filters: vec![],
             session_state,
+            markers_own_delivery: false,
         };
 
         let count = sink
@@ -875,6 +898,38 @@ mod tests {
         assert!(
             !forwarded.load(std::sync::atomic::Ordering::SeqCst),
             "federated forward must be skipped inside a transaction"
+        );
+    }
+
+    /// A durable-write-back table records the delete as a marker and its
+    /// delivery worker reconciles it, so this forward must stand down even
+    /// outside a transaction. Running both would deliver one mutation through
+    /// two unordered paths, and a forward that lands late can remove a row a
+    /// later marker-based upsert had already re-created at the source.
+    #[tokio::test]
+    async fn write_back_deletion_skips_forward_when_markers_own_delivery() {
+        let session_state = SessionContext::new().state();
+        let forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let federated = Arc::new(FederatedTable::Immediate(SignalingTableProvider::new_arc(
+            Arc::clone(&forwarded),
+        )));
+        let sink = WriteBackDeletionSink {
+            accelerator_plan: count_exec(7),
+            federated,
+            filters: vec![],
+            session_state: session_state.clone(),
+            markers_own_delivery: true,
+        };
+
+        let count = sink
+            .delete_from(session_state.task_ctx())
+            .await
+            .expect("deletion should succeed");
+        assert_eq!(count, 7);
+        drain_spawned_tasks().await;
+        assert!(
+            !forwarded.load(std::sync::atomic::Ordering::SeqCst),
+            "the delivery worker owns this delete; the forward must not also run"
         );
     }
 
