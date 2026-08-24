@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, DeleteWriteBackMarkers, DeletionType, InlinedData,
-    InlinedDataStats, InlinedDelete, PartitionMetadata, PendingWriteBackMarker,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeleteWriteBackMarkers, DeletionType,
+    InlinedData, InlinedDataStats, InlinedDelete, PartitionMetadata, PendingWriteBackMarker,
     PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
     WriteBackOp,
 };

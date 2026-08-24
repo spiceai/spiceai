@@ -410,10 +410,12 @@ mod tests {
 
     /// The rows an accelerator read returned for the keys still present.
     fn read_returning(pks: &[i64]) -> Vec<RecordBatch> {
-        let schema = Arc::new(Schema::new(vec![Field::new(PK_COL, DataType::Int64, false)]));
-        vec![
-            RecordBatch::try_new(schema, vec![keys(pks)]).expect("valid single-column key batch"),
-        ]
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            PK_COL,
+            DataType::Int64,
+            false,
+        )]));
+        vec![RecordBatch::try_new(schema, vec![keys(pks)]).expect("valid single-column key batch")]
     }
 
     fn scalars(pks: &[i64]) -> Vec<ScalarValue> {
@@ -485,8 +487,13 @@ mod tests {
             marker(3, WriteBackOp::Upsert), // absent → undelivered
             marker(4, WriteBackOp::Delete), // present → upsert (re-created)
         ];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2, 3, 4]), &read_returning(&[1, 4]))
-            .expect("classification succeeds");
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1, 2, 3, 4]),
+            &read_returning(&[1, 4]),
+        )
+        .expect("classification succeeds");
 
         assert_eq!(plan.present, scalars(&[1, 4]));
         assert_eq!(plan.deleted, scalars(&[2]));
@@ -501,7 +508,10 @@ mod tests {
 
     #[test]
     fn an_empty_read_with_no_delete_markers_delivers_nothing() {
-        let claimed = vec![marker(1, WriteBackOp::Upsert), marker(2, WriteBackOp::Upsert)];
+        let claimed = vec![
+            marker(1, WriteBackOp::Upsert),
+            marker(2, WriteBackOp::Upsert),
+        ];
         let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[])
             .expect("classification succeeds");
 
@@ -526,7 +536,11 @@ mod tests {
 
     #[test]
     fn a_read_missing_the_primary_key_column_is_an_error() {
-        let schema = Arc::new(Schema::new(vec![Field::new("other", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int64,
+            false,
+        )]));
         let batch = RecordBatch::try_new(schema, vec![keys(&[1])]).expect("valid batch");
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
 
@@ -534,7 +548,8 @@ mod tests {
             .expect_err("a read without the key column must not be classified");
 
         assert!(
-            err.to_string().contains("missing from the accelerator read"),
+            err.to_string()
+                .contains("missing from the accelerator read"),
             "unexpected error: {err}"
         );
     }
