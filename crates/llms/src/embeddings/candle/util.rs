@@ -48,13 +48,8 @@ pub(crate) fn load_tokenizer(model_root: &Path) -> Result<Tokenizer> {
     let mut tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
-    // Some Sentence-Transformers tokenizers (e.g. all-MiniLM-L6-v2) bake a fixed-length padding
-    // and truncation into tokenizer.json. The TEI `Tokenization` built in `load_tokenization` owns
-    // padding, the attention mask, and the max sequence length, and its mean-pool must never see
-    // padding tokens. A baked-in fixed padding pads every input to that width and the padding then
-    // leaks into attention and pooling, so for short inputs the padding dominates the pooled vector
-    // and ranking collapses to near-random. Clear both here so TEI is the single source of truth,
-    // matching upstream text-embeddings-inference. Regression test for #13415.
+    // Some Sentence-Transformers tokenizers bake a fixed-length padding and truncation into `tokenizer.json`.
+    // Clear both here so TEI is the single source of truth, matching upstream text-embeddings-inference.
     tokenizer.with_padding(None);
     tokenizer
         .with_truncation(None)
