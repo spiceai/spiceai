@@ -189,7 +189,10 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     match args.output {
         OutputFormat::Table => {
             if !args.cli_only {
-                println!("Runtime version: {}", describe_runtime_version(&runtime));
+                println!(
+                    "Runtime version: {}",
+                    describe_runtime_version(runtime.as_ref())
+                );
                 // Where the runtime came from belongs beside its version: this
                 // is where people look when the CLI and the runtime disagree,
                 // and the answer is usually that they are from different
@@ -230,7 +233,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
 /// difference between "there is no runtime" and "there is one and it would not
 /// say" decides whether a user goes looking for an install or for a broken
 /// binary, and the path printed beneath contradicts the first answer.
-fn describe_runtime_version(runtime: &Option<crate::Result<String>>) -> String {
+fn describe_runtime_version(runtime: Option<&crate::Result<String>>) -> String {
     match runtime {
         None => "not installed".to_string(),
         Some(Ok(version)) => version.clone(),
@@ -252,7 +255,7 @@ mod tests {
         let unprobeable = Some(Err(crate::error::Error::RuntimeVersion {
             message: "exec format error".to_string(),
         }));
-        let described = describe_runtime_version(&unprobeable);
+        let described = describe_runtime_version(unprobeable.as_ref());
         assert_ne!(
             described, "not installed",
             "a located runtime must not be described as missing"
@@ -262,9 +265,9 @@ mod tests {
             "the description must say what actually failed: {described}"
         );
 
-        assert_eq!(describe_runtime_version(&None), "not installed");
+        assert_eq!(describe_runtime_version(None), "not installed");
         assert_eq!(
-            describe_runtime_version(&Some(Ok("v2.1.5".to_string()))),
+            describe_runtime_version(Some(&Ok("v2.1.5".to_string()))),
             "v2.1.5"
         );
     }
