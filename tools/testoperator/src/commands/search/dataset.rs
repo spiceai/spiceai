@@ -43,6 +43,19 @@ const TOUCHE2020_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
     "mteb/touche2020",
     &["corpus/corpus/0000.parquet", "corpus/corpus/0001.parquet"],
 );
+const MSMARCO_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard_sharded(
+    "mteb/msmarco",
+    &[
+        "corpus/corpus/0000.parquet",
+        "corpus/corpus/0001.parquet",
+        "corpus/corpus/0002.parquet",
+        "corpus/corpus/0003.parquet",
+        "corpus/corpus/0004.parquet",
+        "corpus/corpus/0005.parquet",
+        "corpus/corpus/0006.parquet",
+    ],
+);
+const STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY: MtebRepo = MtebRepo::standard("mteb/stackoverflow-qa");
 
 /// The search dataset to run against. Each built-in variant owns its own MTEB data preparation,
 /// while `Custom` tests a customer-supplied spicepod as-is. Search-config construction,
@@ -70,6 +83,8 @@ pub(crate) enum BuiltinDataset {
     ScifactRetrieval,
     NfcorpusRetrieval,
     Touche2020Retrieval,
+    MsmarcoRetrieval,
+    StackoverflowQaRetrieval,
 }
 
 impl From<Option<SearchDatasetArg>> for SearchDataset {
@@ -93,6 +108,8 @@ impl From<SearchDatasetArg> for BuiltinDataset {
             SearchDatasetArg::ScifactRetrieval => BuiltinDataset::ScifactRetrieval,
             SearchDatasetArg::NfcorpusRetrieval => BuiltinDataset::NfcorpusRetrieval,
             SearchDatasetArg::Touche2020Retrieval => BuiltinDataset::Touche2020Retrieval,
+            SearchDatasetArg::MsmarcoRetrieval => BuiltinDataset::MsmarcoRetrieval,
+            SearchDatasetArg::StackoverflowQaRetrieval => BuiltinDataset::StackoverflowQaRetrieval,
         }
     }
 }
@@ -109,6 +126,8 @@ impl BuiltinDataset {
             BuiltinDataset::ScifactRetrieval => &SCIFACT_RETRIEVAL_REPOSITORY,
             BuiltinDataset::NfcorpusRetrieval => &NFCORPUS_RETRIEVAL_REPOSITORY,
             BuiltinDataset::Touche2020Retrieval => &TOUCHE2020_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::MsmarcoRetrieval => &MSMARCO_RETRIEVAL_REPOSITORY,
+            BuiltinDataset::StackoverflowQaRetrieval => &STACKOVERFLOW_QA_RETRIEVAL_REPOSITORY,
         }
     }
 
@@ -123,6 +142,8 @@ impl BuiltinDataset {
             BuiltinDataset::ScifactRetrieval => "scifact_retrieval",
             BuiltinDataset::NfcorpusRetrieval => "nfcorpus_retrieval",
             BuiltinDataset::Touche2020Retrieval => "touche2020_retrieval",
+            BuiltinDataset::MsmarcoRetrieval => "msmarco_retrieval",
+            BuiltinDataset::StackoverflowQaRetrieval => "stackoverflow_qa_retrieval",
         }
     }
 }

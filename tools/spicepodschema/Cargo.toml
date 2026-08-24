@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 accelerator-duckdb = { path = "../../crates/accelerators/accelerator-duckdb" }
+# Not built on Windows, so a target dependency rather than an unconditional one.
 accelerator-postgres = { path = "../../crates/accelerators/accelerator-postgres" }
 accelerator-sqlite = { path = "../../crates/accelerators/accelerator-sqlite" }
 accelerator-turso = { path = "../../crates/accelerators/accelerator-turso" }
@@ -90,3 +91,6 @@ runtime-parameters = { path = "../../crates/runtime-parameters" }
 
 [lints]
 workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }

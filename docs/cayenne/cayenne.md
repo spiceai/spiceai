@@ -113,7 +113,7 @@ Omitting `mode` on a Cayenne dataset therefore selects fully in-RAM Cayenne. Set
   this mode (no object store is built).
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
-`crates/runtime/src/dataaccelerator/cayenne/mod.rs` (`apply_memory_mode_overrides`,
+`crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,
 partition reject), `VortexConfig.memory_mode`,
 `CayenneTableProvider::is_memory_resident_mode`, and the mem-tier write path in
 `provider/sink.rs` / `provider/mutation_writer.rs`.
