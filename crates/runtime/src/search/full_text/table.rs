@@ -60,9 +60,9 @@ pub(crate) fn dataset_attaches_stream(
 /// Builds (but does not register) a [`FullTextDatabaseIndex`] over `inner_table_provider`.
 ///
 /// `store_fields_override` replaces the store-fields set derived from the columns' vector
-/// metadata: the compound warm-tier caller passes `Some(&[])` so the index's query schema is
-/// exactly `[primary key…, _score]` (matching the Elasticsearch secondary tier); the
-/// plain full-text caller passes `None` to keep the metadata-derived set.
+/// metadata and search fields: the compound warm-tier caller passes `Some(&[])` so the
+/// index's query schema is exactly `[primary key…, _score]` (matching the Elasticsearch
+/// secondary tier); the plain full-text caller passes `None` to keep the derived set.
 ///
 /// Expects at least one [`Column`] to have a full text search column configured.
 pub(crate) fn build_full_text_database_index(
@@ -118,17 +118,21 @@ pub(crate) fn build_full_text_database_index(
         derived_store_fields = columns
             .iter()
             .filter_map(|c| {
-                // Both metadata kinds are only about vector-search's own metadata filter;
-                // either one still means the column should be projectable and, per its
-                // tantivy type, filterable through the FTS index too.
-                c.as_vector_metadata()?;
+                // A vector-metadata column is projectable/filterable through the FTS index
+                // by design. A plain full-text search column is included too: storing its
+                // text in the index lets a `text_search()` query be answered straight from
+                // the index, without a hydration join back to the base table for every
+                // query (see #13410).
+                if c.as_vector_metadata().is_none() && !search_fields.contains(&c.name) {
+                    return None;
+                }
                 let (_, field) = schema.column_with_name(&c.name)?;
                 if !FullTextDatabaseIndex::is_field_type_supported(field.data_type()) {
                     // e.g. `Date32`/`Date64`/`Timestamp`: a valid `Filterable` metadata type for
                     // other index backends (Elasticsearch), but not yet representable in the
                     // local FTS schema. Skip it here rather than fail index construction.
                     tracing::warn!(
-                        "Column {} on table {} has vector-search metadata but its type ({}) is not supported by the full text search index; it will not be filterable there",
+                        "Column {} on table {} is configured to be stored in the full text search index, but its type ({}) is not supported there; it will not be filterable or answerable from the index",
                         c.name,
                         tbl,
                         field.data_type()
@@ -599,6 +603,45 @@ mod tests {
         assert!(
             !field_names.iter().any(|f| f == "body"),
             "an empty store_fields set must not expose the searched content column: {field_names:?}"
+        );
+    }
+
+    /// Regression test for #13410: without an override, the searched column's text must be
+    /// stored in the index, so a plain `text_search()` query can be answered from the index
+    /// alone instead of joining back to the base table for every query.
+    #[tokio::test]
+    async fn default_store_fields_expose_the_searched_column() {
+        use search::index::SearchIndex;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let table =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
+                as Arc<dyn TableProvider>;
+        let columns = vec![
+            Column::new("body")
+                .with_full_text_search(FullTextSearchConfig::enabled().with_row_id("id")),
+        ];
+        let table_ref = datafusion::sql::TableReference::parse_str("docs");
+
+        let index = build_full_text_database_index(table, &columns, &table_ref, None, false)
+            .expect("index builds");
+
+        let plan = index
+            .query_table_provider("hello")
+            .expect("query plan builds");
+        let field_names: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        assert!(
+            field_names.iter().any(|f| f == "body"),
+            "the searched column must be exposed by the index so its text is answerable without a hydration join: {field_names:?}"
         );
     }
 }
