@@ -541,7 +541,7 @@ impl RuntimeContext {
     /// states it as an allowlist because `getent` lives in one of two places. A
     /// runtime legitimately lives anywhere, so an allowlist would strand
     /// ordinary users; the rung is skipped only while
-    /// [`running_as_root_for_another_user`] holds, and rungs 4 and 5 answer
+    /// [`running_for_another_user`] holds, and rungs 4 and 5 answer
     /// instead.
     ///
     /// Returns `Ok(None)` when no candidate exists — the signal to install.
@@ -1032,8 +1032,8 @@ struct SpicedLookup<'a> {
     /// Whether a candidate path names a runtime binary — see
     /// [`is_runnable_binary`].
     is_binary: &'a dyn Fn(&Path) -> bool,
-    /// Whether this process is root acting for another user — see
-    /// [`running_as_root_for_another_user`]. Closes the `PATH` rung, and moves
+    /// Whether this process is acting for another user — see
+    /// [`running_for_another_user`]. Closes the `PATH` rung, and moves
     /// with [`Self::sudo_invoker_home`]: both are decided by
     /// [`sudo_invoker_name`], so the rung that closes and the rung that answers
     /// in its place cannot disagree.
@@ -1123,7 +1123,7 @@ impl SpicedLookup<'static> {
             current_exe: std::env::current_exe().ok(),
             sudo_invoker_home: &sudo_invoker_home,
             is_binary: &is_runnable_binary,
-            elevated: running_as_root_for_another_user(),
+            elevated: running_for_another_user(),
         }
     }
 }
@@ -1214,40 +1214,71 @@ fn resolve_spiced(
     Ok(None)
 }
 
-/// Whether this process is root running on behalf of somebody else.
+/// Whether this process is acting for somebody other than the user whose
+/// `PATH` it inherited.
 ///
 /// `PATH` is then the invoking user's while the process it would steer is
-/// root's — the exact condition [`GETENT_PATHS`] refuses to resolve `getent`
-/// under, and the runtime is the larger prize: `spice run` and `spice version`
-/// execute what the ladder selects with `Command::new`, dropping neither
-/// privileges nor the environment.
+/// somebody else's — the exact condition [`GETENT_PATHS`] refuses to resolve
+/// `getent` under, and the runtime is the larger prize: `spice run` and
+/// `spice version` execute what the ladder selects with `Command::new`,
+/// dropping neither privileges nor the environment.
 ///
-/// `sudo -u root` sets `SUDO_USER=root`, which is root invoking `sudo` on its
-/// own behalf, and a plain root login sets no `SUDO_USER` at all — in both the
-/// `PATH` being read is already root's own, so neither is elevation.
+/// The transition that matters is any change of identity, not only one to
+/// root. `sudo -u spice-svc spice run` never becomes root, yet it still
+/// executes the selected binary as the account holding that service's data
+/// and credentials, chosen from a `PATH` the invoker controls.
+///
+/// A `sudo` that stays on one account is not a transition: `sudo -u alice` run
+/// by alice reads alice's own `PATH`, as does a plain login, which sets no
+/// `SUDO_USER` at all.
 #[cfg(unix)]
-fn running_as_root_for_another_user() -> bool {
+fn running_for_another_user() -> bool {
     is_elevation(
-        nix::unistd::Uid::effective().is_root(),
+        nix::unistd::Uid::effective().as_raw(),
         sudo_invoker_name().as_deref(),
+        sudo_invoker_uid(),
     )
 }
 
-/// [`running_as_root_for_another_user`] over the two facts it reads, so each
-/// arm is assertable: a test cannot change this process's effective uid, and
-/// `SUDO_USER` is shared with every other test in the binary.
+/// [`running_for_another_user`] over the three facts it reads, so each arm is
+/// assertable: a test cannot change this process's effective uid, and the
+/// `SUDO_*` variables are shared with every other test in the binary.
+///
+/// Fails closed on the identity comparison: an invoker whose uid cannot be
+/// read counts as a different identity, because the alternative is leaving the
+/// rung open on the strength of a fact we do not have.
 #[cfg(unix)]
-fn is_elevation(euid_is_root: bool, sudo_invoker: Option<&str>) -> bool {
-    euid_is_root && sudo_invoker.is_some()
+fn is_elevation(
+    effective_uid: u32,
+    sudo_invoker: Option<&str>,
+    sudo_invoker_uid: Option<u32>,
+) -> bool {
+    sudo_invoker.is_some() && sudo_invoker_uid != Some(effective_uid)
+}
+
+/// The uid of the user who invoked `sudo`, or `None` when this process was not
+/// invoked through it or `sudo` did not say.
+#[cfg(unix)]
+fn sudo_invoker_uid() -> Option<u32> {
+    sudo_invoker_uid_in(std::env::var("SUDO_UID").ok())
+}
+
+/// [`sudo_invoker_uid`] over the variable rather than the environment, so the
+/// parse is assertable — `SUDO_UID` is shared with every other test in this
+/// binary.
+#[cfg(unix)]
+fn sudo_invoker_uid_in(sudo_uid: Option<String>) -> Option<u32> {
+    sudo_uid?.trim().parse().ok()
 }
 
 /// The user who invoked `sudo`, or `None` when this process was not invoked
 /// through it.
 ///
 /// The one place the invoker's identity is decided, because two rungs move
-/// together on it: rung 3 closes when there *is* an invoker, and rung 5 is what
-/// answers instead. Were they to disagree, an elevated user whose only runtime
-/// sits on `PATH` would be told to install a runtime they already have.
+/// together on it: rung 3 closes when the invoker is a different account than
+/// the one being acted for, and rung 5 is what answers instead. Were they to
+/// disagree, an elevated user whose only runtime sits on `PATH` would be told
+/// to install a runtime they already have.
 ///
 /// `sudo -u root` sets `SUDO_USER=root`, which is root invoking `sudo` on its
 /// own behalf: the `$HOME` rung has already looked where that would point, and
@@ -1267,7 +1298,7 @@ fn sudo_invoker_in(sudo_user: Option<String>) -> Option<String> {
 
 /// Windows has no `sudo` to inherit a `PATH` across, so the rung stays open.
 #[cfg(not(unix))]
-fn running_as_root_for_another_user() -> bool {
+fn running_for_another_user() -> bool {
     false
 }
 
@@ -1990,21 +2021,63 @@ mod tests {
         assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
     }
 
-    /// Both facts are load-bearing, and each is wrong on its own: a process with
-    /// no invoker reads its own `PATH`, and an unprivileged `sudo -u somebody`
-    /// gains no root to escalate to.
+    /// Every arm of the identity comparison, including the transition that
+    /// reaches no root at all: `sudo -u spice-svc` gains no privilege the
+    /// invoker lacks in general, but it does run the selected binary as an
+    /// account the invoker is not, out of a `PATH` the invoker controls.
     #[cfg(unix)]
     #[test]
-    fn elevation_is_root_acting_for_another_user() {
-        assert!(is_elevation(true, Some("operator")));
+    fn elevation_is_acting_for_a_different_user() {
+        const ROOT: u32 = 0;
+        const OPERATOR: u32 = 1000;
+        const SERVICE: u32 = 999;
 
         assert!(
-            !is_elevation(true, None),
+            is_elevation(ROOT, Some("operator"), Some(OPERATOR)),
+            "`sudo spice` would read the operator's PATH as root"
+        );
+        assert!(
+            is_elevation(SERVICE, Some("operator"), Some(OPERATOR)),
+            "`sudo -u spice-svc` reaches an account the operator is not"
+        );
+        assert!(
+            is_elevation(SERVICE, Some("operator"), None),
+            "an invoker whose uid cannot be read is no proof of one account"
+        );
+
+        assert!(
+            !is_elevation(ROOT, None, None),
             "root with no invoker is reading its own PATH"
         );
         assert!(
-            !is_elevation(false, Some("operator")),
-            "without root there is nothing to escalate to"
+            !is_elevation(OPERATOR, Some("operator"), Some(OPERATOR)),
+            "`sudo -u operator` run by operator stays on one account"
+        );
+    }
+
+    /// What `SUDO_UID` has to look like to name a uid at all. A value that does
+    /// not parse leaves the comparison in [`is_elevation`] without its second
+    /// identity, which is why that arm closes the rung rather than opening it.
+    #[cfg(unix)]
+    #[test]
+    fn sudo_uid_names_an_invoker_only_when_it_parses() {
+        assert_eq!(sudo_invoker_uid_in(Some("1000".to_string())), Some(1000));
+        assert_eq!(
+            sudo_invoker_uid_in(Some(" 1000\n".to_string())),
+            Some(1000),
+            "the variable is read as sudo leaves it"
+        );
+
+        assert_eq!(sudo_invoker_uid_in(None), None, "not invoked through sudo");
+        assert_eq!(
+            sudo_invoker_uid_in(Some("operator".to_string())),
+            None,
+            "a name is not a uid"
+        );
+        assert_eq!(
+            sudo_invoker_uid_in(Some("-1".to_string())),
+            None,
+            "a uid is unsigned"
         );
     }
 
