@@ -141,13 +141,15 @@ jobs:
       # Build the test binaries without running tests
       - name: Build integration test archives
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        # Seven `cargo nextest archive` invocations, and effectively the whole job. Bounding
-        # the step rather than only the job cuts a wedged build while the `if: always()`
-        # steps after it still run, and names the step that hung. 117 minutes is the
-        # slowest of the last eighteen successful `push` and `merge_group` runs (81-117);
-        # the bound sits clear of that rather than near it, because the spread tracks how
-        # contended the shared runner pool is, and a bound tight enough to fail a
-        # legitimate build would be worse than the slow build it replaced.
+        # One `cargo nextest archive` invocation, and effectively the whole job. Bounding the
+        # step rather than only the job is what names the step that hung, instead of leaving
+        # a wedge attributed to the job as a whole. 150 minutes sits clear of the 81-117
+        # minutes the last eighteen successful `push` and `merge_group` runs took while this
+        # step still made seven invocations; the single invocation that replaced them
+        # resolves the dependency graph once rather than seven times, so it cannot exceed
+        # that basis. The bound stays a ceiling rather than a target either way, because the
+        # spread tracks how contended the shared runner pool is, and one tight enough to
+        # fail a legitimate build would be worse than the slow build it replaced.
         timeout-minutes: 150
         env:
           CARGO_INCREMENTAL: 0
@@ -342,7 +344,12 @@ jobs:
         # 13.4 - nearly a factor of eight, because these tests wait on external services
         # (Databricks, Oracle Cloud, S3) whose latency is not ours. The bound is set well
         # above the worst case rather than close to it for that reason, and below the job's
-        # so the snapshot upload steps after it still run.
+        # so a wedge here is attributed to this step rather than to the job.
+        #
+        # The snapshot steps after it are deliberately not reached when this one fails: their
+        # conditions carry no status function, so GitHub applies `success()` and a partial
+        # snapshot set never reaches `upload-integration-snapshots` to become an update
+        # branch. A timeout is a failure by that measure, which is the behaviour we want.
         timeout-minutes: 40
         env:
           AWS_EC2_METADATA_DISABLED: true
