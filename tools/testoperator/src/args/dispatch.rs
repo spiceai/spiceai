@@ -963,6 +963,53 @@ tests:
     }
 
     #[test]
+    fn test_msmarco_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: msmarco_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::MsmarcoRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["benchmark_dataset"], "msmarco_retrieval");
+    }
+
+    #[test]
+    fn test_stackoverflow_qa_search_section_deserialization() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/stackoverflow_qa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: stackoverflow_qa_retrieval
+    ready_wait: 1800
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.search[0].benchmark_dataset,
+            Some(SearchDatasetArg::StackoverflowQaRetrieval)
+        ));
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(
+            serialized["benchmark_dataset"],
+            "stackoverflow_qa_retrieval"
+        );
+    }
+
+    #[test]
     fn test_custom_search_section_omits_benchmark_dataset() {
         // A custom run leaves `benchmark_dataset` unset. It must deserialize to `None` and, so the
         // dispatch workflow input stays absent (letting the workflow default to a custom run), it
