@@ -6409,6 +6409,7 @@ dependencies = [
  "num_cpus",
  "object_store 0.13.2",
  "opendal 0.55.0",
+ "opentelemetry",
  "oracle",
  "parking_lot",
  "parquet",
