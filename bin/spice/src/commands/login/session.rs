@@ -19,16 +19,11 @@ limitations under the License.
 
 use crate::error::Result;
 
-use super::SpiceAuthContext;
-
 /// How the browser authorization ended: with a token, or with the user
 /// refusing it.
 pub(crate) enum BrowserLoginOutcome {
     /// The user authorized the login.
-    Granted {
-        access_token: String,
-        context: SpiceAuthContext,
-    },
+    Granted { access_token: String },
     /// The user refused the authorization in the browser.
     Declined,
 }
@@ -37,10 +32,9 @@ pub(crate) enum BrowserLoginOutcome {
 impl std::fmt::Debug for BrowserLoginOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Granted { context, .. } => f
+            Self::Granted { .. } => f
                 .debug_struct("Granted")
                 .field("access_token", &"<redacted>")
-                .field("context", context)
                 .finish(),
             Self::Declined => f.write_str("Declined"),
         }
@@ -90,12 +84,19 @@ impl BrowserLogin {
         });
     }
 
-    /// Wait for the browser authorization, then fetch who it authenticated.
+    /// Wait for the browser authorization and return the granted token.
+    ///
+    /// Resolving *who* the token belongs to is the caller's job, and is
+    /// optional: a token Spice Cloud has granted authenticates the management
+    /// API whether or not the identity endpoint can describe its owner, and
+    /// the `spice cloud login` save path already degrades to a token-only
+    /// success when that lookup fails. Failing here instead would discard a
+    /// working credential the user just approved.
     ///
     /// # Errors
     ///
     /// Returns an error if the exchange fails in a way waiting cannot clear,
-    /// if the wait times out, or if the auth context cannot be fetched.
+    /// or if the wait times out.
     pub(crate) async fn authenticate(&self) -> Result<BrowserLoginOutcome> {
         self.authenticate_within(super::LOGIN_POLL_TIMEOUT, super::LOGIN_POLL_INTERVAL)
             .await
@@ -124,22 +125,7 @@ impl BrowserLogin {
             super::AccessTokenPoll::Denied => return Ok(BrowserLoginOutcome::Declined),
         };
 
-        // The spicepod manifest in the working directory may name a preferred
-        // org/app for the auth context to resolve against.
-        let (org_name, app_name) = super::read_spicepod_metadata();
-
-        let context = super::get_spice_auth_context(
-            &self.base_url,
-            &access_token,
-            org_name.as_deref(),
-            app_name.as_deref(),
-        )
-        .await?;
-
-        Ok(BrowserLoginOutcome::Granted {
-            access_token,
-            context,
-        })
+        Ok(BrowserLoginOutcome::Granted { access_token })
     }
 }
 
@@ -155,18 +141,11 @@ mod tests {
     fn browser_outcome_debug_redacts_the_token() {
         let outcome = BrowserLoginOutcome::Granted {
             access_token: "tok_super_secret".to_string(),
-            context: SpiceAuthContext {
-                username: "jane".to_string(),
-                email: "jane@example.com".to_string(),
-                org_name: "acme".to_string(),
-                app_name: None,
-                app_api_key: Some("key_super_secret".to_string()),
-            },
         };
 
         let rendered = format!("{outcome:?}");
         assert!(
-            !rendered.contains("tok_super_secret") && !rendered.contains("key_super_secret"),
+            !rendered.contains("tok_super_secret"),
             "a live credential leaked into Debug output: {rendered}"
         );
     }
@@ -187,49 +166,25 @@ mod tests {
             .await;
     }
 
-    /// The full mock-server flow: the exchange grants a token, the auth
-    /// context answers who it belongs to, and the outcome carries both.
+    /// The full mock-server flow: the exchange grants a token, and that token
+    /// is the whole outcome.
     #[tokio::test]
-    async fn a_granted_authorization_yields_the_token_and_identity() {
+    async fn a_granted_authorization_yields_the_token() {
         let server = wiremock::MockServer::start().await;
         mount_exchange(
             &server,
             serde_json::json!({ "access_token": "tok_live_123" }),
         )
         .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/api/spice-cli/auth"))
-            .and(wiremock::matchers::header(
-                "Authorization",
-                "Bearer tok_live_123",
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "username": "jane",
-                    "email": "jane@example.com",
-                    "org": { "name": "acme" },
-                    "app": { "name": "retail-analytics", "api_key": "key_123" },
-                })),
-            )
-            .mount(&server)
-            .await;
 
         let outcome = flow_against(&server)
             .await
             .expect("a granted flow should succeed");
 
-        let BrowserLoginOutcome::Granted {
-            access_token,
-            context,
-        } = outcome
-        else {
+        let BrowserLoginOutcome::Granted { access_token } = outcome else {
             panic!("expected a granted outcome");
         };
         assert_eq!(access_token, "tok_live_123");
-        assert_eq!(context.username, "jane");
-        assert_eq!(context.org_name, "acme");
-        assert_eq!(context.app_name.as_deref(), Some("retail-analytics"));
-        assert_eq!(context.app_api_key.as_deref(), Some("key_123"));
     }
 
     /// A refusal in the browser is a decided outcome rather than a retryable
@@ -245,24 +200,27 @@ mod tests {
         assert!(matches!(outcome, BrowserLoginOutcome::Declined));
     }
 
-    /// The token is only as good as the identity behind it: a granted exchange
-    /// whose auth context cannot be fetched is a failed login.
+    /// A token the user approved survives an identity endpoint that cannot
+    /// describe it. The flow asks the exchange and nothing else, so a broken
+    /// `/api/spice-cli/auth` — which answers this way for real accounts —
+    /// cannot discard the credential before it is ever stored.
     #[tokio::test]
-    async fn a_failed_auth_context_fails_the_flow() {
+    async fn a_broken_identity_endpoint_does_not_discard_the_token() {
         let server = wiremock::MockServer::start().await;
         mount_exchange(&server, serde_json::json!({ "access_token": "tok_live" })).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/spice-cli/auth"))
-            .respond_with(wiremock::ResponseTemplate::new(500))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_json(serde_json::json!({})))
             .mount(&server)
             .await;
 
-        let err = flow_against(&server)
+        let outcome = flow_against(&server)
             .await
-            .expect_err("an unfetchable auth context should fail the login");
-        assert!(
-            err.to_string().contains("Auth context request failed"),
-            "unexpected error: {err}"
-        );
+            .expect("an unfetchable identity must not fail the login");
+
+        let BrowserLoginOutcome::Granted { access_token } = outcome else {
+            panic!("expected a granted outcome");
+        };
+        assert_eq!(access_token, "tok_live");
     }
 }

@@ -1,9 +1,0 @@
----
-source: crates/test-framework/src/spicetest/datasets/worker.rs
-description: "Query: clickbench_q6"
----
-+-----------------------------------+
-| count(DISTINCT hits.SearchPhrase) |
-+-----------------------------------+
-| 243208                            |
-+-----------------------------------+

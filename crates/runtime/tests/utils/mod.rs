@@ -22,6 +22,8 @@ limitations under the License.
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism; this is where the
 // binaries that share these helpers get it.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
 #[cfg(feature = "duckdb")]
 use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]

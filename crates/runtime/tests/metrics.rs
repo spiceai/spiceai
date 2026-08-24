@@ -30,6 +30,12 @@ limitations under the License.
 
 #![recursion_limit = "256"]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+
 // Accelerator engines are their own crates and self-register through a linkme slice. A
 // dev-dependency alone does not put an entry in a test binary — the linker drops the
 // unreferenced static — and every integration binary links separately, so each one that

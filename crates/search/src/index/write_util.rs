@@ -238,6 +238,12 @@ pub async fn embed_column(
         }
     }
 
+    // Every row was null or empty; skip the embed call (some providers reject an
+    // empty input array) and return a None per row.
+    if column.is_empty() {
+        return Ok(vec![None; rb.num_rows()]);
+    }
+
     let embedded_data = model
         .embed(EmbeddingInput::StringArray(column))
         .await

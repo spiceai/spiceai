@@ -20,6 +20,8 @@ limitations under the License.
 // unreferenced static — and every integration binary links separately, so each one that
 // exercises an engine needs its own reference. `integration.rs`'s
 // `accelerator_crates_register_their_engines` guards the mechanism.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
 #[cfg(feature = "duckdb")]
 use accelerator_duckdb as _;
 #[cfg(feature = "postgres-accel")]

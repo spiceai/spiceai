@@ -19,6 +19,66 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-cayenne"
+version = "2.2.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-credential-bridge",
+ "aws-sdk-s3",
+ "byte-unit",
+ "bytes",
+ "cayenne",
+ "cpu-budget",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-table-providers",
+ "fundu",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "linkme",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-sqlite",
+ "runtime-checkpoint-turso",
+ "runtime-datafusion",
+ "runtime-object-store",
+ "runtime-parameters",
+ "runtime-resources",
+ "runtime-secrets",
+ "runtime-table",
+ "runtime-table-partition",
+ "rusqlite",
+ "search",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "turso-shared",
+ "url",
+ "util",
+ "uuid 1.23.2",
+ "vortex-datafusion",
+]
+
+[[package]]
 name = "accelerator-duckdb"
 version = "2.2.0-unstable"
 dependencies = [
@@ -4259,7 +4319,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6200,6 +6260,7 @@ dependencies = [
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "spicepod",
  "sysinfo 0.38.4",
  "tokio",
  "tracing",
@@ -7240,7 +7301,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=f2dad23247908d284a226cbb294ef7c3c08b16f1#f2dad23247908d284a226cbb294ef7c3c08b16f1"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=beeecde18a72d2b6cad9d75aa44279398f084bce#beeecde18a72d2b6cad9d75aa44279398f084bce"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -9151,8 +9212,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -10320,7 +10381,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -10334,8 +10395,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10391,8 +10452,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-glue"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10406,8 +10467,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10430,8 +10491,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-datafusion"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10446,8 +10507,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-storage-opendal"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10465,8 +10526,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg_test_utils"
-version = "0.10.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=c86f2f7ae9b37a8a795cc4c25574df436aa1d392#c86f2f7ae9b37a8a795cc4c25574df436aa1d392"
+version = "0.10.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=351d1bc7b6ac9a835397e248e9c687f305e947d1#351d1bc7b6ac9a835397e248e9c687f305e947d1"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -17111,6 +17172,7 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
@@ -19863,6 +19925,7 @@ dependencies = [
 name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
@@ -19994,6 +20057,7 @@ dependencies = [
 name = "spicepodschema"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
@@ -24355,7 +24419,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
