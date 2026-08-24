@@ -427,7 +427,10 @@ mod tests {
         ]));
 
         assert!(
-            !Arc::ptr_eq(&interner.intern(Arc::clone(&plain)), &interner.intern(Arc::clone(&tagged))),
+            !Arc::ptr_eq(
+                &interner.intern(Arc::clone(&plain)),
+                &interner.intern(Arc::clone(&tagged))
+            ),
             "field-level metadata distinguishes two schemas"
         );
     }
@@ -505,7 +508,10 @@ mod tests {
         }
 
         let stats = interner.stats();
-        assert_eq!(stats.rows, 0, "dead rows must not accumulate, got {stats:?}");
+        assert_eq!(
+            stats.rows, 0,
+            "dead rows must not accumulate, got {stats:?}"
+        );
         assert_eq!(stats.schema_bytes, 0);
     }
 
