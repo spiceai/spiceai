@@ -34,7 +34,7 @@ limitations under the License.
 //! money sums are ~1e9–1e13). This bound is documented here so a future,
 //! enormous scale factor doesn't silently lose integer exactness unnoticed.
 
-use arrow::array::{Array, Float64Array, RecordBatch};
+use arrow::array::{Array, Decimal128Array, Float64Array, RecordBatch};
 use arrow::datatypes::DataType;
 
 /// Relative tolerance for floating-point columns (0.1%). Comfortably above the
@@ -185,6 +185,46 @@ pub fn approximate_columns(expected: &RecordBatch, actual: &RecordBatch) -> Vec<
 /// Cast both columns to `Float64` for value comparison. Returns `None` if either
 /// cast (or the subsequent downcast) fails — the caller fails safe rather than
 /// silently skipping the column.
+/// Two columns' mantissas rescaled to a common decimal scale, expected then actual.
+type RescaledPair = (Vec<Option<i128>>, Vec<Option<i128>>);
+
+/// Both columns' values as `i128` mantissas brought to a common scale, or `None`
+/// when either side is not an exact decimal or the rescale would overflow.
+///
+/// Exists because comparing two decimals THROUGH `f64` cannot be made reliable:
+/// Arrow casts a decimal to `f64` by dividing the mantissa by `10^scale` in
+/// floating point, and neither the divisor nor the quotient is generally
+/// representable. Two sides holding the same decimal but declaring different
+/// scales — a `NUMERIC` the source reports at its own scale against the scale
+/// Spice declares — therefore land on `f64` values that differ in the last
+/// place. Comparing the mantissas instead is exact by construction, so the
+/// zero-tolerance the fingerprint gate wants for `SUM`/`MIN`/`MAX` over money
+/// stops being a bet on the cast happening to round the same way twice.
+fn decimal_pair_to_i128(e_col: &dyn Array, a_col: &dyn Array) -> Option<RescaledPair> {
+    let (e_scale, a_scale) = (
+        decimal_scale(e_col.data_type())?,
+        decimal_scale(a_col.data_type())?,
+    );
+    // Rescale both sides UP to the wider scale: scaling down would discard the
+    // digits that a genuine divergence might live in.
+    let common = e_scale.max(a_scale);
+    let widen = |col: &dyn Array, scale: i8| -> Option<Vec<Option<i128>>> {
+        let decimal = arrow::compute::cast(col, &DataType::Decimal128(38, scale)).ok()?;
+        let decimal = decimal.as_any().downcast_ref::<Decimal128Array>()?;
+        let steps = u32::try_from(common.checked_sub(scale)?).ok()?;
+        let factor = 10_i128.checked_pow(steps)?;
+        (0..decimal.len())
+            .map(|r| {
+                if decimal.is_null(r) {
+                    return Some(None);
+                }
+                decimal.value(r).checked_mul(factor).map(Some)
+            })
+            .collect()
+    };
+    Some((widen(e_col, e_scale)?, widen(a_col, a_scale)?))
+}
+
 fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Array, Float64Array)> {
     let e = arrow::compute::cast(e_col, &DataType::Float64).ok()?;
     let a = arrow::compute::cast(a_col, &DataType::Float64).ok()?;
@@ -241,6 +281,14 @@ pub fn numeric_delta(
         // If it somehow doesn't, fail safe: in the fingerprint gate this is the
         // *only* comparator, so silently skipping the column could let a real
         // numeric divergence pass.
+        // Exact decimals are decided on their mantissas, never on the `f64` cast
+        // below (see `decimal_pair_to_i128`). The cast is still taken, because the
+        // reported `rel %` and `max_rel_delta` are computed from it -- only the
+        // pass/fail decision moves.
+        let exact_decimals = (!float_col)
+            .then(|| decimal_pair_to_i128(e_col, a_col))
+            .flatten();
+
         let Some((e_arr, a_arr)) = cast_pair_to_f64(e_col, a_col) else {
             out.exceeded = true;
             if out.worst.is_none() {
@@ -269,10 +317,13 @@ pub fn numeric_delta(
                 out.max_rel_delta = rel;
             }
 
-            let cell_exceeded = if float_col {
-                rel > FLOAT_REL_TOLERANCE
-            } else {
-                diff > 0.0
+            let cell_exceeded = match (&exact_decimals, float_col) {
+                // Same mantissa at a common scale is the same number, whatever the
+                // two `f64` casts made of it.
+                (Some((e_dec, a_dec)), _) => e_dec.get(r).copied().flatten()
+                    != a_dec.get(r).copied().flatten(),
+                (None, true) => rel > FLOAT_REL_TOLERANCE,
+                (None, false) => diff > 0.0,
             };
             if cell_exceeded {
                 out.exceeded = true;
@@ -417,6 +468,107 @@ mod tests {
                 Decimal128Array::from(raw).with_data_type(DataType::Decimal128(precision, scale)),
             ) as ArrayRef,
         )
+    }
+
+    /// Two decimals holding the SAME number at different scales must compare
+    /// equal, even though casting each to `f64` does not produce the same value.
+    ///
+    /// Regression: the fingerprint gate compared exact columns via `f64` and
+    /// demanded bit equality, so a `NUMERIC` the source reported at one scale and
+    /// Spice at another failed with a `rel 0.000000%` delta -- the comparator
+    /// printing evidence that the difference was its own cast. It broke SF1000
+    /// `postgres-cayenne` for days, and only passed when every aggregate in the
+    /// fingerprint happened to round identically on both sides.
+    #[test]
+    fn the_same_decimal_at_two_scales_is_not_a_divergence() {
+        // 9290582224.69 at scale 20 against the same number at money scale. Scale 20
+        // is where Arrow's decimal-to-f64 cast starts to disagree with itself: both
+        // the mantissa and the 10^20 divisor stop being exactly representable, so the
+        // quotient is no longer correctly rounded. It reproduces the SF1000 gate's
+        // `sum_d_ytd` rejection to the digit -- 9290582224.689999 against
+        // 9290582224.69. Lower scales (2 through 18) divide exactly and agree, which
+        // is why this failed intermittently rather than always.
+        let expected = batch_of(
+            "sum_d_ytd",
+            Arc::new(
+                // The money-scale mantissa, restated at scale 20.
+                Decimal128Array::from(vec![929_058_222_469_i128 * 10_i128.pow(18)])
+                    .with_precision_and_scale(38, 20)
+                    .expect("scale 20"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_d_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![929_058_222_469_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        // Guard the premise: if the two casts ever agree, this test would pass for
+        // the wrong reason and stop covering the bug.
+        let (e_f64, a_f64) = cast_pair_to_f64(
+            expected.column(0).as_ref(),
+            actual.column(0).as_ref(),
+        )
+        .expect("both cast to f64");
+        #[expect(
+            clippy::float_cmp,
+            reason = "bit-exact f64 inequality IS the premise being guarded"
+        )]
+        {
+            assert_ne!(
+                e_f64.value(0),
+                a_f64.value(0),
+                "premise: the f64 casts must disagree, or this test proves nothing"
+            );
+        }
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            !delta.exceeded,
+            "the same number at two scales must not diverge, got {:?}",
+            delta.worst
+        );
+    }
+
+    /// The exact path must stay exact: a decimal difference of one unit in the
+    /// last place is a REAL divergence and must still fail, or the fix above
+    /// would have bought a passing gate by blinding it.
+    #[test]
+    fn a_one_ulp_decimal_difference_still_diverges() {
+        let expected = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_000_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_001_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "a genuine one-cent difference must still be caught"
+        );
+    }
+
+    fn batch_of(name: &str, col: ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            col.data_type().clone(),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![col]).expect("batch")
     }
 
     #[test]
