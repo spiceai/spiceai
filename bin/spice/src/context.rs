@@ -889,7 +889,9 @@ impl SpicedSource {
 /// A located `spiced` binary and where it was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSpiced {
-    /// Path to the binary, anchored by [`anchor_to_current_dir`].
+    /// Path to the binary, anchored against the working directory in effect when
+    /// it was resolved, so a caller that changes directory before spawning still
+    /// launches the binary that was found.
     pub path: PathBuf,
     /// Which rung of the ladder supplied it.
     pub source: SpicedSource,
