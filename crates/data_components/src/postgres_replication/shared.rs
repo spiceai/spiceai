@@ -2338,16 +2338,37 @@ async fn attach_member(
     let watermark = match applied_lsn_store.load().await {
         Ok(watermark) => watermark,
         Err(e) => {
-            // Reading it failed, so we cannot prove the gap is fillable. Treat it
-            // the same as a position belonging to another source — unusable — so
-            // the acceleration is rebuilt: a needless rebuild costs a re-read,
-            // while a wrong resume silently keeps rows the source has deleted.
+            // Reading it failed, so we cannot prove the gap is fillable — the
+            // acceleration is rebuilt: a needless rebuild costs a re-read, while a
+            // wrong resume silently keeps rows the source has deleted.
             tracing::warn!(
                 dataset = %dataset_name,
                 "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
             );
-            super::RecordedPosition::ForeignSource
+            super::RecordedPosition::Unusable(super::UnusableReason::Unreadable)
         }
+    };
+    // A recorded position ahead of the source's current WAL position cannot
+    // belong to this server's history — the source was restored or rewound since
+    // it was recorded (see `recorded_position_is_ahead_of_source`). Downgrade it
+    // BEFORE classification and seating: resuming on it would keep pre-restore
+    // rows, and seating it as the replay floor would silently suppress every
+    // legitimate post-restore change at or below it.
+    let watermark = if super::recorded_position_is_ahead_of_source(
+        &watermark,
+        setup.current_wal_lsn,
+    ) {
+        if let super::RecordedPosition::At(recorded) = &watermark {
+            tracing::warn!(
+                dataset = %dataset_name,
+                recorded_lsn = recorded.lsn,
+                current_wal_lsn = setup.current_wal_lsn,
+                "Dataset '{dataset_name}' recorded its acceleration as applied up to a position ahead of the source's current WAL position, which means the source was restored or rewound (for example from a backup or point-in-time recovery) after the position was recorded, so the acceleration will be rebuilt from the source rather than resumed — resuming would keep pre-restore rows and skip post-restore changes. See: https://spiceai.org/docs/components/data-connectors/postgres"
+            );
+        }
+        super::RecordedPosition::Unusable(super::UnusableReason::RewoundSource)
+    } else {
+        watermark
     };
     // Absence of a watermark is evidence of a gap only when the acceleration
     // could be holding rows this process did not load AND a position could have
@@ -2428,7 +2449,7 @@ async fn attach_member(
         !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
     );
 
-    // Why the rebuild, in the terms the operator can act on. The four causes are
+    // Why the rebuild, in the terms the operator can act on. The causes are
     // genuinely different situations, and the acknowledged-past one is the easiest to
     // mistake for a retention problem: the WAL is still on disk, but a slot cannot
     // re-stream what it has already acknowledged.
@@ -2436,8 +2457,14 @@ async fn attach_member(
         super::RecordedPosition::Absent => {
             "it has no recorded position, so any rows it already holds cannot be shown to be current"
         }
-        super::RecordedPosition::ForeignSource => {
+        super::RecordedPosition::Unusable(super::UnusableReason::ForeignSource) => {
             "the position it recorded belongs to a different source, so it does not describe these rows"
+        }
+        super::RecordedPosition::Unusable(super::UnusableReason::Unreadable) => {
+            "the position it recorded could not be read, so any rows it already holds cannot be shown to be current"
+        }
+        super::RecordedPosition::Unusable(super::UnusableReason::RewoundSource) => {
+            "the position it recorded as applied is ahead of the source's current WAL position, so the source was restored or rewound after it was recorded and its contents do not describe the source's current history"
         }
         super::RecordedPosition::At(watermark)
             if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
@@ -4532,6 +4559,9 @@ mod tests {
     ) -> slot::SharedMemberSetup {
         slot::SharedMemberSetup {
             slot_restart_lsn: Some(0),
+            // Far ahead of every LSN these tests use, so no test watermark ever
+            // reads as a rewound source (see `recorded_position_is_ahead_of_source`).
+            current_wal_lsn: u64::MAX,
             slot: slot::SlotInfo {
                 slot_name: "slot".to_string(),
                 publication_name: "pub".to_string(),

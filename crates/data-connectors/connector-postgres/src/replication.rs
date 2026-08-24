@@ -32,7 +32,8 @@ use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotM
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, XactStatus, XidRegistry, config, start_replication_stream,
+    SchemaEvolutionPolicy, UnusableReason, XactStatus, XidRegistry, config,
+    start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
@@ -143,7 +144,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
                 streaming_from = %self.identity,
                 "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
             );
-            return Ok(RecordedPosition::ForeignSource);
+            return Ok(RecordedPosition::Unusable(UnusableReason::ForeignSource));
         }
         Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
     }
