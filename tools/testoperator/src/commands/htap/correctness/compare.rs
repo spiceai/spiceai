@@ -30,7 +30,7 @@ limitations under the License.
 //!
 //! Two decimal cells are decided on their **mantissas**, rescaled to a common
 //! scale — never on a `f64` cast, which is not a reliable equality test for them
-//! (see `decimal_pair_to_i128`). Everything else is compared after casting to
+//! (see `decimal_pair_to_i256`). Everything else is compared after casting to
 //! `f64`: exact for integers whose magnitude stays below 2^53 (~9.0e15), which
 //! holds for every CH-benCH aggregate at the scale factors we run (the largest
 //! row counts are ~1e9–1e13). That bound is documented here so a future,
