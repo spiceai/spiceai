@@ -842,13 +842,14 @@ pub struct CreateProjectArgs {
     /// Project name
     pub name: String,
 
-    /// Deployment region (e.g. us-east-1-prod-aws-data)
+    /// Deployment region for a Spice-managed project (e.g. us-east-1-prod-aws-data)
     #[arg(long, value_parser = parse_create_project_region)]
-    pub region: String,
+    pub region: Option<String>,
 
-    /// Project kind (set or cluster)
-    #[arg(long, value_parser = clap::value_parser!(ProjectKind), default_value = "set")]
-    pub kind: ProjectKind,
+    /// Project kind (set or cluster) for a Spice-managed project. Omit to create a
+    /// Cloud Connect project that your own runtime serves
+    #[arg(long, value_parser = clap::value_parser!(ProjectKind))]
+    pub kind: Option<ProjectKind>,
 
     /// Project description
     #[arg(long)]
@@ -1215,7 +1216,15 @@ async fn execute_status(
     // — is reported: rendering it as "no instances are running" would make the
     // diagnosis command lie about the thing it exists to diagnose.
     let never_deployed = latest.is_none();
+    // Real health-read failures only. A data-plane refusal to inspect a
+    // runtime hosted outside Spice Cloud deliberately never lands here (see
+    // `classify_health_failures`): this value feeds the degradation exit
+    // contract, and a healthy Cloud Connect or BYOC project must exit 0.
     let mut runtime_error: Option<String> = None;
+    // The server's stated reason when the data plane declined to inspect the
+    // runtime (HTTP 501), for the sections that would otherwise be missing
+    // with no explanation.
+    let mut health_refusal: Option<String> = None;
 
     let (instances, datasets) =
         match project_runtime_context(ctx, &client, &target, args.instance.as_deref()).await {
@@ -1233,13 +1242,11 @@ async fn execute_status(
                 )
                 .await;
 
-                for failure in [instances.as_ref().err(), datasets.as_ref().err()] {
-                    if let Some(err) = failure
-                        && runtime_error.is_none()
-                    {
-                        runtime_error = Some(err.to_string());
-                    }
-                }
+                (runtime_error, health_refusal) = classify_health_failures(
+                    [instances.as_ref().err(), datasets.as_ref().err()]
+                        .into_iter()
+                        .flatten(),
+                );
 
                 (
                     instances
@@ -1273,6 +1280,12 @@ async fn execute_status(
             "datasets_total": datasets.len(),
             "datasets_unhealthy": unhealthy,
             "runtime_error": &runtime_error,
+            // Why `instances` can be empty with no `runtime_error`: the data
+            // plane does not inspect a runtime hosted outside Spice Cloud (a
+            // Cloud Connect instance, a BYOC cluster), so its health is absent
+            // by design rather than unknown. Carries the server's stated
+            // reason verbatim.
+            "health_not_reported": &health_refusal,
             "link": {
                 "connection": local.connection,
                 "service": local.service,
@@ -1317,6 +1330,15 @@ async fn execute_status(
     if instances.is_empty() {
         if runtime_error.is_some() {
             println!("Instances: unknown.");
+        } else if let Some(reason) = &health_refusal {
+            // The CLI names the friendly Cloud Connect shape itself; for any
+            // other kind the server's reason says where the runtime actually
+            // is, so a new kind never gets mislabeled by an old binary.
+            if project.kind.as_deref() == Some("standalone") {
+                println!("{}", self_hosted_instances_note(&target));
+            } else {
+                println!("{}", instances_not_inspected_note(&target, reason));
+            }
         } else {
             println!("No instances are running.");
         }
@@ -1366,6 +1388,15 @@ async fn execute_status(
             println!();
             println!("  Logs: spice cloud logs --project {target} --level error");
         }
+    } else if let Some(reason) = &health_refusal
+        && !instances.is_empty()
+    {
+        // The instances table rendered, so the refusal came from the dataset
+        // read alone; without this line the section is silently missing and
+        // reads as "no datasets". When the instances section is also absent,
+        // its note already explains the whole health read.
+        println!();
+        println!("{}", dataset_health_not_reported_note(&target, reason));
     }
 
     println!();
@@ -1949,7 +1980,7 @@ async fn verify_login_org(
     // Do not compare a user's default org with the requested org: doing so
     // rejects valid member access before the membership endpoint can decide.
     let _ = token_org;
-    client.get_auth_context_for_org(requested).await?;
+    client::confirm_org_access(client, requested).await?;
     Ok(Some(requested.to_string()))
 }
 
@@ -2377,18 +2408,29 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
-        Err(err) if client::is_unauthorized_auth_context_error(&err) => {
-            // The auth-context endpoint requires a user token (subscription
-            // or PAT). Service-account tokens (OAuth client credentials) are
-            // valid for API calls but do not have a user identity.
-            if client.list_projects().await.is_ok() {
-                return Err(Error::cloud_with_hint(
-                    CloudErrorCode::Forbidden,
-                    "User identity is not available for this authentication method. The current credential is a valid service-account token and can be used for API calls, but has no user identity.",
-                    "Run 'spice cloud login subscription' or 'spice cloud login token' to obtain a user token.",
-                ));
-            }
-            return Err(err);
+        // Spice Cloud returned no user identity. That happens for a
+        // service-account token (OAuth client credentials), which authenticates
+        // API calls but has no user behind it, and when the endpoint has no
+        // user record to return at all. Neither says the credential is
+        // unusable, so neither should reach the user as a raw failure.
+        Err(err) if client::is_absent_user_identity_error(&err) => {
+            // Whether other commands work is a separate question, and the
+            // answer only widens the guidance — it never withholds it, or a
+            // second failure here would put the unusable original message back
+            // in front of the user.
+            let usable = client.list_projects().await.is_ok();
+            let detail = if usable {
+                "The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command."
+            } else {
+                "Whether the credential works for anything else is unknown: listing this organization's projects did not succeed either, which a missing role or scope would also explain."
+            };
+            return Err(Error::cloud_with_hint(
+                CloudErrorCode::Forbidden,
+                format!(
+                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. {detail}"
+                ),
+                "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
+            ));
         }
         Err(err) => return Err(err),
     };
@@ -2774,22 +2816,7 @@ async fn user_token_for_cloud_connect(
     action: &str,
     command: &str,
 ) -> Result<String> {
-    let mut candidates = Vec::new();
-    for token in [
-        requested_org.and_then(org::token_for_org),
-        org::default_token(),
-        org::active_org()
-            .ok()
-            .flatten()
-            .and_then(|org| org::token_for_org(&org)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if !candidates.contains(&token) {
-            candidates.push(token);
-        }
-    }
+    let candidates = client::user_credential_candidates(requested_org);
     if candidates.is_empty() {
         return Err(Error::cloud_with_hint(
             CloudErrorCode::NotAuthenticated,
@@ -2798,14 +2825,8 @@ async fn user_token_for_cloud_connect(
         ));
     }
 
-    for token in candidates {
-        let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
-        if client.optional_user_auth_context().await?.is_none() {
-            continue;
-        }
-        if let Some(org) = requested_org {
-            client.get_auth_context_for_org(org).await?;
-        }
+    if let Some(token) = client::first_user_credential(&candidates, endpoint, requested_org).await?
+    {
         return Ok(token);
     }
 
@@ -3107,7 +3128,6 @@ fn release_endpoint<'a>(
 async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result<()> {
     let active_org = resolve_org(flag_org)?;
     let client = CloudClient::connect(active_org.as_deref()).await?;
-    let context = client.optional_user_auth_context().await?;
     let mut projects = client.list_projects().await?;
 
     if projects.is_empty() {
@@ -3122,22 +3142,25 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         return Ok(());
     }
 
-    // Label with the org the *credential* reports, never the one that was
-    // requested. Stamping the requested org onto a listing the server actually
-    // produced for another org would assert an attribution the CLI has not
-    // verified — and `--output json` would carry it into scripts.
-    let context_org = context
-        .as_ref()
-        .map(|c| c.org_name.as_str())
-        .filter(|org| !org.is_empty())
-        .or(active_org.as_deref())
-        .unwrap_or("");
+    // Spice Cloud scoped this listing to the org the client asked for, so that
+    // org is what these projects belong to. Only when nothing named one does
+    // the credential's own org apply, and it is worth a round trip only then.
+    let credential_org = if active_org.is_some() {
+        None
+    } else {
+        client
+            .optional_user_auth_context()
+            .await?
+            .map(|context| context.org_name)
+    };
+    let listing_org =
+        client::resolve_listing_org(active_org.as_deref(), credential_org.as_deref()).unwrap_or("");
     // The Spice Cloud `/v1/apps` endpoint does not populate `org` per project, so
-    // backfill it from the auth-context org — the same fallback the table
-    // rendering applies via `display_project_name`. Without this, `--output json`
-    // emitted `"org": ""` while the table showed `<org>/<name>`, breaking
-    // format parity and machine-readable scripting (see #11041).
-    backfill_project_orgs(&mut projects, context_org);
+    // backfill it from the listing's org — the same fallback the table rendering
+    // applies via `display_project_name`. Without this, `--output json` emitted
+    // `"org": ""` while the table showed `<org>/<name>`, breaking format parity
+    // and machine-readable scripting (see #11041).
+    backfill_project_orgs(&mut projects, listing_org);
 
     if args.output == OutputFormat::Json {
         return write_json(&projects);
@@ -3151,7 +3174,7 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
         "CREATED",
     ]);
     for project in &projects {
-        let display_name = display_project_name(project, context_org);
+        let display_name = display_project_name(project, listing_org);
         table.add_row(vec![
             display_name,
             project.description.clone().unwrap_or_default(),
@@ -3171,29 +3194,29 @@ async fn execute_projects(args: &ProjectsArgs, flag_org: Option<&str>) -> Result
     Ok(())
 }
 
-/// Backfill each project's empty `org` from the auth-context org so machine-readable
-/// (`--output json`) output matches the human-readable table, which already
-/// applies this fallback when rendering via [`display_project_name`]. The Spice
-/// Cloud `/v1/apps` endpoint does not populate `org` on each project, so the auth
-/// context is the only source of truth for the user's org. A no-op when
-/// `context_org` is empty (nothing to fall back to) or the project already carries
-/// an org.
-fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], context_org: &str) {
-    if context_org.is_empty() {
+/// Backfill each project's empty `org` from the org whose listing it arrived in,
+/// so machine-readable (`--output json`) output matches the human-readable table,
+/// which already applies this fallback when rendering via [`display_project_name`].
+/// The Spice Cloud `/v1/apps` endpoint does not populate `org` on each project, so
+/// the org the listing was requested for is the only evidence of which org these
+/// projects belong to. A no-op when `listing_org` is empty (nothing to fall back
+/// to) or the project already carries an org.
+fn backfill_project_orgs(projects: &mut [spice_cloud_client::types::Project], listing_org: &str) {
+    if listing_org.is_empty() {
         return;
     }
     for project in projects.iter_mut() {
         if project.org.is_empty() {
-            project.org = context_org.to_string();
+            project.org = listing_org.to_string();
         }
     }
 }
 
-/// Format a project's display name as `org/name`, falling back to the auth
-/// context org when the project payload does not include one.
-fn display_project_name(project: &spice_cloud_client::types::Project, context_org: &str) -> String {
+/// Format a project's display name as `org/name`, falling back to the org whose
+/// listing it arrived in when the project payload does not include one.
+fn display_project_name(project: &spice_cloud_client::types::Project, listing_org: &str) -> String {
     let org = if project.org.is_empty() {
-        context_org
+        listing_org
     } else {
         project.org.as_str()
     };
@@ -3709,7 +3732,7 @@ fn render_cloud_logs(logs: spice_cloud_client::types::LogsResponse) {
 }
 
 async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>) -> Result<()> {
-    let create_region = validate_create_project_args(args)?;
+    let placement = resolve_create_project_placement(args)?;
 
     let client = connect(flag_org).await?;
     let spicepod_content = if let Some(path) = args.spicepod.as_deref() {
@@ -3721,19 +3744,16 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
     let app = client
         .create_project(
             &args.name,
-            &create_region,
-            args.kind,
             args.description.as_deref(),
             &args.visibility,
-            args.replicas,
-            args.cpu,
-            args.memory,
-            args.storage_size_gb,
-            args.executor_replicas,
-            args.executor_cpu,
-            args.executor_memory,
+            placement,
         )
         .await?;
+
+    // Which kind of project this is, is Spice Cloud's answer and not the
+    // request's, so it is read off the create response. Held here because the
+    // optional spicepod/channel update below replaces `app`.
+    let created_kind = app.kind.clone();
 
     // The create response may omit `org`, so fall back to the org this
     // command acted on — the same org the new app was created in.
@@ -3746,7 +3766,7 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
         app.name.clone(),
     );
 
-    let app = if spicepod_content.is_some() || args.channel.is_some() {
+    let mut app = if spicepod_content.is_some() || args.channel.is_some() {
         match client
             .update_project(
                 &created,
@@ -3779,10 +3799,21 @@ async fn execute_project_create(args: &CreateProjectArgs, flag_org: Option<&str>
         app
     };
 
+    // The kind is resolved once, at create, so an update response that omits it
+    // is not a project whose kind changed: the create's answer fills the gap
+    // rather than being overruled by its absence. Both output paths read the
+    // same field afterwards, so neither can report a kind the other does not.
+    if app.kind.is_none() {
+        app.kind = created_kind;
+    }
+
     if args.output == OutputFormat::Json {
         return write_json(&app);
     }
-    println!("\x1b[32m✓ Created app {created}\x1b[0m");
+    match app.kind.as_deref() {
+        Some(kind) => println!("\x1b[32m✓ Created {kind} app {created}\x1b[0m"),
+        None => println!("\x1b[32m✓ Created app {created}\x1b[0m"),
+    }
     if let Ok(api_keys) = client.get_api_keys(&created).await
         && let Some(api_key) = api_keys.api_key
     {
@@ -3821,10 +3852,88 @@ async fn execute_create_deployment(
     Ok(())
 }
 
-fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
-    let region = normalize_create_project_region(&args.region)?;
+/// Flags that configure a hosted runtime, and so have no meaning on a project
+/// Spice Cloud does not run.
+///
+/// This is the set Spice Cloud itself calls hosted runtime configuration and
+/// refuses on a Cloud Connect project — sizing and version selection alike.
+/// `--channel` reaches the control plane through the update that follows the
+/// create rather than through the create itself, so refusing it here is what
+/// keeps that update from being sent at all: were it allowed through, the create
+/// would succeed and the update would fail, and the CLI would roll the create
+/// back by deleting the project it had just made.
+fn hosted_runtime_flags(args: &CreateProjectArgs) -> Vec<&'static str> {
+    [
+        ("--replicas", args.replicas.is_some()),
+        ("--cpu", args.cpu.is_some()),
+        ("--memory", args.memory.is_some()),
+        ("--storage-size-gb", args.storage_size_gb.is_some()),
+        ("--executor-replicas", args.executor_replicas.is_some()),
+        ("--executor-cpu", args.executor_cpu.is_some()),
+        ("--executor-memory", args.executor_memory.is_some()),
+        ("--channel", args.channel.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, given)| given.then_some(flag))
+    .collect()
+}
 
-    if args.kind == ProjectKind::Cluster {
+/// Decide which project `spice cloud project create` was asked for.
+///
+/// `--kind` is the discriminator, because naming a kind is naming a hosted
+/// topology: a Cloud Connect project has no hosted runtime, so there is no
+/// third kind value that could stand for one. Naming a kind therefore requires
+/// a region and admits the runtime configuration that region provisions;
+/// omitting it asks for a Cloud Connect project and admits neither.
+///
+/// Placement flags are refused rather than dropped. A region silently ignored
+/// looks like a working region selection until someone checks where the
+/// project actually runs, and a Cloud Connect project's region is not the
+/// caller's to state in the first place — it follows from the stamp the
+/// attached instance's control stream terminates on.
+fn resolve_create_project_placement(
+    args: &CreateProjectArgs,
+) -> Result<client::CreateProjectPlacement> {
+    let Some(kind) = args.kind else {
+        if let Some(region) = args.region.as_deref() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "--region {region} does not apply to project '{name}': without --kind this creates a Cloud Connect project, whose region is not chosen here — it follows from the stamp the attached instance's control stream terminates on. Pass --kind set (or --kind cluster) alongside --region to create a Spice-managed project in that region instead. See: https://spiceai.org/docs/spice-cloud",
+                    name = args.name,
+                ),
+            });
+        }
+
+        let unsupported = hosted_runtime_flags(args);
+        if !unsupported.is_empty() {
+            return Err(crate::error::Error::InvalidArgument {
+                message: format!(
+                    "{flags} {do_not} apply to project '{name}': without --kind this creates a Cloud Connect project, which Spice Cloud does not run — your own runtime serves it, and you choose its size and version. Drop {them}, or pass --kind set to create a Spice-managed project that has a hosted runtime to configure. See: https://spiceai.org/docs/spice-cloud",
+                    flags = unsupported.join(", "),
+                    do_not = if unsupported.len() == 1 {
+                        "does not"
+                    } else {
+                        "do not"
+                    },
+                    them = if unsupported.len() == 1 { "it" } else { "them" },
+                    name = args.name,
+                ),
+            });
+        }
+
+        return Ok(client::CreateProjectPlacement::Standalone);
+    };
+
+    let Some(region) = args.region.as_deref() else {
+        return Err(crate::error::Error::InvalidArgument {
+            message: format!(
+                "--kind {kind} creates a Spice-managed project, which needs a region: pass --region <region>, and run 'spice cloud regions' to list them. Omit --kind to create a Cloud Connect project that your own runtime serves, which has no region to choose. See: https://spiceai.org/docs/spice-cloud"
+            ),
+        });
+    };
+    let region = normalize_create_project_region(region)?;
+
+    if kind == ProjectKind::Cluster {
         if args.replicas != Some(1) {
             return Err(crate::error::Error::InvalidArgument {
                 message: "Cluster apps require --replicas 1".to_string(),
@@ -3852,7 +3961,19 @@ fn validate_create_project_args(args: &CreateProjectArgs) -> Result<String> {
         }
     }
 
-    Ok(region)
+    Ok(client::CreateProjectPlacement::Managed(
+        client::ManagedProjectPlacement {
+            region,
+            kind,
+            replicas: args.replicas,
+            cpu: args.cpu,
+            memory: args.memory,
+            storage_size_gb: args.storage_size_gb,
+            executor_replicas: args.executor_replicas,
+            executor_cpu: args.executor_cpu,
+            executor_memory: args.executor_memory,
+        },
+    ))
 }
 
 async fn execute_project_get(args: &GetProjectArgs, flag_org: Option<&str>) -> Result<()> {
@@ -4444,22 +4565,25 @@ async fn project_runtime_context(
 ) -> Result<RuntimeContext> {
     let project = client.get_project(target).await?;
 
-    let region = project.region.clone().ok_or_else(|| {
+    let region = project.data_plane_region().ok_or_else(|| {
         Error::cloud_with_hint(
             CloudErrorCode::NotFound,
             format!(
                 "Project {target} does not report a region, so its instance endpoint is unknown."
             ),
-            format!("Check it with 'spice cloud status --project {target}'."),
+            format!(
+                "A Cloud Connect project reports its region once an instance is linked and \
+                 connected: link this directory to {target} and start it with 'spice run'. \
+                 See: https://spiceai.org/docs/spice-cloud"
+            ),
         )
     })?;
-    let region =
-        spice_cloud_client::endpoints::normalize_data_region(&region).ok_or_else(|| {
-            Error::cloud(
-                CloudErrorCode::InvalidRequest,
-                format!("Project {target} reports an unrecognized region '{region}'."),
-            )
-        })?;
+    let region = spice_cloud_client::endpoints::normalize_data_region(region).ok_or_else(|| {
+        Error::cloud(
+            CloudErrorCode::InvalidRequest,
+            format!("Project {target} reports an unrecognized region '{region}'."),
+        )
+    })?;
 
     // Prefer the key the management API reports for this project; fall back to
     // a key stored for the same org only if the API withholds one. Never reach
@@ -4493,6 +4617,83 @@ async fn project_runtime_context(
     }
 
     Ok(runtime_ctx)
+}
+
+/// The server's stated reason when the data plane declines to inspect the
+/// project's runtime, rather than failing to reach it.
+///
+/// Spice Cloud relays deployments and secrets to a runtime hosted outside the
+/// platform — a Cloud Connect standalone instance, a BYOC cluster — but
+/// answers HTTP 501 when asked to inspect it, with a reason naming where that
+/// runtime actually is. The reason travels to the user verbatim: the server
+/// knows the deployment kind, and this binary may predate kinds the server
+/// has since learned.
+fn health_refusal_reason(error: &Error) -> Option<&str> {
+    match error {
+        Error::RuntimeHttp { status: 501, body } => Some(body.as_str()),
+        _ => None,
+    }
+}
+
+/// Fold the health-read outcomes into what status reports: the first real
+/// failure, and the server's reason when it declined to inspect the runtime.
+///
+/// A refusal is the project's expected shape, not a failure — it never
+/// reaches the error slot, which feeds the degradation exit contract, so a
+/// healthy Cloud Connect or BYOC project exits 0. Real failures still land
+/// there even when a refusal accompanies them: the two report unrelated
+/// facts. A refusal with no reason text gets a generic one, so the sections
+/// it explains never render an empty clause.
+fn classify_health_failures<'a>(
+    failures: impl IntoIterator<Item = &'a Error>,
+) -> (Option<String>, Option<String>) {
+    let mut first_failure = None;
+    let mut refusal = None;
+    for error in failures {
+        if let Some(reason) = health_refusal_reason(error) {
+            if refusal.is_none() {
+                let reason = if reason.is_empty() {
+                    "the runtime is hosted outside Spice Cloud, which cannot reach it to \
+                     inspect it"
+                } else {
+                    reason
+                };
+                refusal = Some(reason.to_string());
+            }
+        } else if first_failure.is_none() {
+            first_failure = Some(error.to_string());
+        }
+    }
+    (first_failure, refusal)
+}
+
+/// The status line for a project whose instances Spice Cloud cannot inspect.
+///
+/// This line is the only explanation the user gets for an absent health
+/// section on a healthy Cloud Connect project, so it must say where the
+/// health can actually be read.
+fn self_hosted_instances_note(target: &ProjectTarget) -> String {
+    format!(
+        "Instances: self-hosted — Spice Cloud does not inspect the runtime serving project \
+         {target}. Check it with 'spice status' on the machine that runs it."
+    )
+}
+
+/// The status line when Spice Cloud declines to inspect the runtime and the
+/// CLI cannot name the deployment kind — the server's reason says where the
+/// runtime actually is.
+fn instances_not_inspected_note(target: &ProjectTarget, reason: &str) -> String {
+    format!(
+        "Instances: not inspected — Spice Cloud cannot inspect the runtime serving project \
+         {target}: {reason}"
+    )
+}
+
+/// Explains an absent dataset-health section when the instances table
+/// rendered but the dataset read was declined — without it the section is
+/// silently missing and reads as "this project has no datasets".
+fn dataset_health_not_reported_note(target: &ProjectTarget, reason: &str) -> String {
+    format!("Dataset health is not reported for project {target}: {reason}")
 }
 
 /// Name what a report describes: one pinned instance, or the project as a whole.
@@ -4613,6 +4814,99 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn only_a_501_carries_a_health_refusal_reason() {
+        // The data plane answers 501 when asked to inspect a runtime hosted
+        // outside Spice Cloud, and its body names where that runtime is —
+        // Cloud Connect and BYOC each get their own wording. Every other
+        // failure is a real one and must keep rendering as a degradation, or
+        // status would hide genuine outages.
+        let refused = Error::RuntimeHttp {
+            status: 501,
+            body: "this endpoint is not available for an app deployed to your own cluster"
+                .to_string(),
+        };
+        assert_eq!(
+            health_refusal_reason(&refused),
+            Some("this endpoint is not available for an app deployed to your own cluster")
+        );
+
+        let failed = Error::RuntimeHttp {
+            status: 500,
+            body: String::new(),
+        };
+        assert_eq!(health_refusal_reason(&failed), None);
+    }
+
+    #[test]
+    fn a_refusal_never_reaches_the_error_slot() {
+        let refused = Error::RuntimeHttp {
+            status: 501,
+            body: "not available for a self-hosted runtime".to_string(),
+        };
+        let failed = Error::RuntimeHttp {
+            status: 500,
+            body: "boom".to_string(),
+        };
+
+        // Refusal alone: nothing degrades, so status exits 0; the note built
+        // from the reason is the explanation the user gets instead.
+        let (error, refusal) = classify_health_failures([&refused]);
+        assert_eq!(error, None);
+        assert_eq!(
+            refusal.as_deref(),
+            Some("not available for a self-hosted runtime")
+        );
+
+        // A real failure alongside the refusal must still degrade the command.
+        let (error, refusal) = classify_health_failures([&refused, &failed]);
+        assert!(error.is_some(), "a real failure must not be masked");
+        assert!(refusal.is_some());
+
+        // Real failures only: reported, with no refusal note.
+        let (error, refusal) = classify_health_failures([&failed]);
+        assert!(error.is_some());
+        assert_eq!(refusal, None);
+
+        // A refusal with no reason text still explains itself.
+        let bare = Error::RuntimeHttp {
+            status: 501,
+            body: String::new(),
+        };
+        let (_, refusal) = classify_health_failures([&bare]);
+        let reason = refusal.expect("a bare refusal must still carry a reason");
+        assert!(!reason.is_empty(), "the fallback reason must not be empty");
+    }
+
+    #[test]
+    fn refusal_notes_name_the_project_and_carry_the_servers_reason() {
+        let target = ProjectTarget::new(Some("spicehq".to_string()), "team-app");
+        let reason = "its runtime is reachable only from that cluster";
+
+        let instances = instances_not_inspected_note(&target, reason);
+        assert!(
+            instances.contains("spicehq/team-app"),
+            "note was: {instances}"
+        );
+        assert!(instances.contains(reason), "note was: {instances}");
+
+        let datasets = dataset_health_not_reported_note(&target, reason);
+        assert!(
+            datasets.contains("spicehq/team-app"),
+            "note was: {datasets}"
+        );
+        assert!(datasets.contains(reason), "note was: {datasets}");
+    }
+
+    #[test]
+    fn self_hosted_note_names_the_project_and_where_health_lives() {
+        let target = ProjectTarget::new(Some("spicehq".to_string()), "team-app");
+        let note = self_hosted_instances_note(&target);
+        assert!(note.contains("spicehq/team-app"), "note was: {note}");
+        assert!(note.contains("'spice status'"), "note was: {note}");
+        assert!(note.contains("machine that runs it"), "note was: {note}");
+    }
+
+    #[test]
     fn metrics_table_row_matches_header_count() {
         // Regression for #9989: row was emitting one more cell than the header
         // had columns, so the `disk_write_operations` value rendered without a
@@ -4707,7 +5001,7 @@ mod tests {
     fn is_cloud_unauthorized_error_matches_a_rejected_credential() {
         let err = Error::cloud(CloudErrorCode::TokenExpired, "Unauthorized: token expired");
 
-        assert!(client::is_unauthorized_auth_context_error(&err));
+        assert!(client::is_absent_user_identity_error(&err));
     }
 
     #[test]
@@ -4716,7 +5010,7 @@ mod tests {
         // not allowed — that must not be mistaken for a missing user identity.
         let err = Error::cloud(CloudErrorCode::Forbidden, "Forbidden: missing scope");
 
-        assert!(!client::is_unauthorized_auth_context_error(&err));
+        assert!(!client::is_absent_user_identity_error(&err));
     }
 
     #[test]
@@ -4802,8 +5096,8 @@ mod tests {
     fn create_project_args(kind: ProjectKind, replicas: Option<i32>) -> CreateProjectArgs {
         CreateProjectArgs {
             name: "app".to_string(),
-            region: "us-east-1-prod-aws-data".to_string(),
-            kind,
+            region: Some("us-east-1-prod-aws-data".to_string()),
+            kind: Some(kind),
             description: None,
             visibility: "private".to_string(),
             replicas,
@@ -4827,10 +5121,20 @@ mod tests {
         args
     }
 
+    /// A `spice cloud project create <name>` with no placement flags at all —
+    /// the invocation that asks Spice Cloud for a Cloud Connect project.
+    fn standalone_project_args() -> CreateProjectArgs {
+        let mut args = create_project_args(ProjectKind::Set, None);
+        args.kind = None;
+        args.region = None;
+        args
+    }
+
     #[test]
     fn create_cluster_requires_explicit_single_replica() {
-        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, None))
-            .expect_err("cluster without replicas should fail");
+        let err =
+            resolve_create_project_placement(&create_project_args(ProjectKind::Cluster, None))
+                .expect_err("cluster without replicas should fail");
 
         assert_eq!(
             err.to_string(),
@@ -4840,8 +5144,9 @@ mod tests {
 
     #[test]
     fn create_cluster_requires_executor_configuration() {
-        let err = validate_create_project_args(&create_project_args(ProjectKind::Cluster, Some(1)))
-            .expect_err("cluster without executor configuration should fail");
+        let err =
+            resolve_create_project_placement(&create_project_args(ProjectKind::Cluster, Some(1)))
+                .expect_err("cluster without executor configuration should fail");
 
         assert_eq!(
             err.to_string(),
@@ -4851,18 +5156,112 @@ mod tests {
 
     #[test]
     fn create_cluster_accepts_one_replica() {
-        validate_create_project_args(&cluster_app_args(Some(1)))
+        let placement = resolve_create_project_placement(&cluster_app_args(Some(1)))
             .expect("cluster with one scheduler replica should pass");
+
+        let client::CreateProjectPlacement::Managed(managed) = placement else {
+            panic!("a named kind creates a Spice-managed project");
+        };
+        assert_eq!(managed.region, "us-east-1-prod-aws-data");
+        assert_eq!(managed.kind, ProjectKind::Cluster);
     }
 
     #[test]
     fn create_project_rejects_invalid_region_syntax() {
         let mut args = create_project_args(ProjectKind::Set, None);
-        args.region = "bad_region".to_string();
+        args.region = Some("bad_region".to_string());
 
-        let err = validate_create_project_args(&args).expect_err("invalid region should fail");
+        let err = resolve_create_project_placement(&args).expect_err("invalid region should fail");
 
         assert!(err.to_string().contains("Invalid region 'bad_region'"));
+    }
+
+    #[test]
+    fn create_project_without_kind_asks_for_a_cloud_connect_project() {
+        let placement = resolve_create_project_placement(&standalone_project_args())
+            .expect("no kind and no placement flags should be accepted");
+
+        assert!(matches!(
+            placement,
+            client::CreateProjectPlacement::Standalone
+        ));
+    }
+
+    #[test]
+    fn create_project_rejects_region_without_kind() {
+        let mut args = standalone_project_args();
+        args.region = Some("us-east-1-prod-aws-data".to_string());
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("a region without a kind should fail rather than be dropped");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --region us-east-1-prod-aws-data does not apply to project 'app': without --kind this creates a Cloud Connect project, whose region is not chosen here — it follows from the stamp the attached instance's control stream terminates on. Pass --kind set (or --kind cluster) alongside --region to create a Spice-managed project in that region instead. See: https://spiceai.org/docs/spice-cloud"
+        );
+    }
+
+    #[test]
+    fn create_project_rejects_hosted_runtime_flags_without_kind() {
+        let mut args = standalone_project_args();
+        args.replicas = Some(3);
+        args.executor_cpu = Some(8);
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("hosted runtime configuration without a kind should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --replicas, --executor-cpu do not apply to project 'app': without --kind this creates a Cloud Connect project, which Spice Cloud does not run — your own runtime serves it, and you choose its size and version. Drop them, or pass --kind set to create a Spice-managed project that has a hosted runtime to configure. See: https://spiceai.org/docs/spice-cloud"
+        );
+    }
+
+    /// `--channel` is applied by an update that runs after the create, so
+    /// letting it through would create the project and then delete it again when
+    /// Spice Cloud refused the update. It has to be refused before the create.
+    #[test]
+    fn create_project_rejects_channel_without_kind() {
+        let mut args = standalone_project_args();
+        args.channel = Some(UpdateChannel::Nightly);
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("an update channel without a kind should fail");
+
+        assert!(
+            err.to_string()
+                .starts_with("Invalid argument: --channel does not apply to project 'app':"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn create_project_rejects_a_single_hosted_runtime_flag_in_the_singular() {
+        let mut args = standalone_project_args();
+        args.memory = Some(bytes::NumBytes::from_bytes(1024));
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("hosted runtime configuration without a kind should fail");
+
+        assert!(
+            err.to_string()
+                .starts_with("Invalid argument: --memory does not apply to project 'app':"),
+            "unexpected message: {err}"
+        );
+        assert!(err.to_string().contains("Drop it, or pass --kind set"));
+    }
+
+    #[test]
+    fn create_project_requires_a_region_with_kind() {
+        let mut args = create_project_args(ProjectKind::Set, None);
+        args.region = None;
+
+        let err = resolve_create_project_placement(&args)
+            .expect_err("a named kind without a region should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: --kind set creates a Spice-managed project, which needs a region: pass --region <region>, and run 'spice cloud regions' to list them. Omit --kind to create a Cloud Connect project that your own runtime serves, which has no region to choose. See: https://spiceai.org/docs/spice-cloud"
+        );
     }
 
     #[test]
@@ -4883,6 +5282,7 @@ mod tests {
             id: 1,
             name: name.to_string(),
             org: org.to_string(),
+            kind: None,
             description: None,
             visibility: None,
             created_at: None,
@@ -4902,7 +5302,7 @@ mod tests {
     }
 
     #[test]
-    fn display_project_name_falls_back_to_context_org_when_project_org_is_empty() {
+    fn display_project_name_falls_back_to_the_listing_org_when_project_org_is_empty() {
         let project = test_project("", "dashboard");
         assert_eq!(
             display_project_name(&project, "analytics"),
@@ -4917,7 +5317,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_project_orgs_fills_empty_org_from_context() {
+    fn backfill_project_orgs_fills_empty_org_from_the_listing_org() {
         let mut projects = vec![
             test_project("", "ltd-mint"),
             test_project("", "zippy-cayenne"),
@@ -4939,10 +5339,31 @@ mod tests {
     }
 
     #[test]
-    fn backfill_project_orgs_noop_when_context_empty() {
+    fn backfill_project_orgs_noop_when_the_listing_org_is_empty() {
         let mut projects = vec![test_project("", "ltd-mint")];
         backfill_project_orgs(&mut projects, "");
         assert_eq!(projects[0].org, "");
+    }
+
+    #[test]
+    fn a_listing_requested_for_an_org_is_labelled_with_that_org() {
+        // Regression for the cross-org mis-attribution this replaced: Spice
+        // Cloud scopes the listing to the requested org but returns no `org` on
+        // any row, so preferring the credential's org labelled another
+        // organization's projects — table and `--output json` alike — with the
+        // caller's own, and a name copied from that listing addressed either
+        // nothing or a same-named project in the wrong org.
+        let listing_org = client::resolve_listing_org(Some("spiceai"), Some("lukekim"))
+            .expect("a requested org is a listing org");
+        let mut projects = vec![test_project("", "docs")];
+
+        backfill_project_orgs(&mut projects, listing_org);
+
+        assert_eq!(projects[0].org, "spiceai");
+        assert_eq!(
+            display_project_name(&projects[0], listing_org),
+            "spiceai/docs"
+        );
     }
 
     // ========================================================================

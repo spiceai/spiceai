@@ -89,7 +89,10 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [HTTP](https://github.com/spiceai/cookbook/blob/trunk/http/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
+     - [ ] [MySQL CDC](https://github.com/spiceai/cookbook/blob/trunk/mysql/cdc/README.md)
+     - [ ] [MySQL Aurora CDC](https://github.com/spiceai/cookbook/blob/trunk/mysql/rds-aurora-cdc/README.md)
      - [ ] [PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/connector/README.md)
+     - [ ] [PostgreSQL CDC](https://github.com/spiceai/cookbook/blob/trunk/postgres/cdc/README.md)
      - [ ] [S3](https://github.com/spiceai/cookbook/blob/trunk/s3/README.md)
      - [ ] [SharePoint](https://github.com/spiceai/cookbook/blob/trunk/sharepoint/README.md)
      - [ ] [Snowflake](https://github.com/spiceai/cookbook/blob/trunk/snowflake/README.md)
@@ -190,6 +193,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Dual Dataset Registration](https://github.com/spiceai/cookbook/blob/trunk/acceleration/dual-dataset-registration/README.md)
      - [ ] [Docker Deployment](https://github.com/spiceai/cookbook/blob/trunk/docker/README.md)
      - [ ] [Localpod](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
+     - [ ] [Cloud Connect Dev](https://github.com/spiceai/cookbook/blob/trunk/cloud-connect-dev/README.md)
 
 ## Focus Areas
 
