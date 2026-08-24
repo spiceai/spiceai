@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::mcp::task_name::task_name_for_exposed_tool;
 use crate::tooling::Tooling;
 
 use rmcp::{
@@ -169,7 +170,7 @@ impl ServerHandler for RuntimeServer {
                     ));
                 }
 
-                let task_name = format!("tool_use::{tool_name}");
+                let task_name = task_name_for_exposed_tool(tool_name.as_ref());
                 let mcp_server = decode_tool_name(tool_name.as_ref())
                     .map_or_else(|| tool_name.to_string(), |(server, _)| server);
                 let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %tool_name, input = %input);
