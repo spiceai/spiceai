@@ -29,16 +29,17 @@ use data_components::snowflake::{
     quote_snowflake_table_path,
 };
 use data_components::{Read, ReadWrite};
-use datafusion::datasource::TableProvider;
-use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
-use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
-use runtime::datafusion::udf::deny_spice_specific_functions;
-use runtime::parameters::ParameterSpec;
+use datafusion::datasource::TableProvider;
+use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::ParameterSpec;
+use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -146,10 +147,11 @@ impl DataConnectorFactory for SnowflakeFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync,
@@ -243,7 +245,7 @@ impl From<ReadProviderError> for DataConnectorError {
     }
 }
 
-fn snowflake_table_path(dataset: &Dataset) -> DataConnectorResult<String> {
+fn snowflake_table_path(dataset: &DatasetSpec) -> DataConnectorResult<String> {
     quote_snowflake_table_path(dataset.path()).map_err(|source| {
         DataConnectorError::InvalidConfiguration {
             dataconnector: CONNECTOR_NAME.to_string(),
@@ -265,7 +267,8 @@ impl DataConnector for Snowflake {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let path = snowflake_table_path(dataset)?;
 
@@ -279,7 +282,8 @@ impl DataConnector for Snowflake {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = match snowflake_table_path(dataset) {
             Ok(path) => path,
@@ -483,10 +487,10 @@ mod tests {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_snowflake as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_snowflake_connector,
     SNOWFLAKE_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

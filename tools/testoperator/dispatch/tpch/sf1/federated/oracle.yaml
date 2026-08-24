@@ -4,5 +4,4 @@ tests:
     query_set: tpch
     query_overrides: oracle
     runner_type: spiceai-dev-runners
-    # https://github.com/spiceai/spiceai/issues/6450
-    validate_results: false
+    validate_results: true

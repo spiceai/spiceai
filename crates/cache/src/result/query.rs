@@ -55,6 +55,15 @@ pub struct CachedQueryResult {
     pub input_tables: Arc<HashSet<TableReference>>,
     /// Timestamp when the result was cached.
     cached_at: Instant,
+    /// When the query that produced this result began reading.
+    ///
+    /// Serving this entry is only sound while none of [`Self::input_tables`]
+    /// has been invalidated since this instant, which is what
+    /// [`crate::QueryResultsCacheProvider::get_raw_key`] checks on every hit.
+    /// It is deliberately *not* [`Self::cached_at`]: an invalidation landing
+    /// between the read and the store must also disqualify the entry, and
+    /// `cached_at` is after both.
+    pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
 }
@@ -70,12 +79,14 @@ impl CachedQueryResult {
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
     ) -> Self {
         Self {
-            data: CachedData::Raw(Arc::new(batches)),
+            data: CachedData::Raw(Arc::new(super::compact_for_storage(batches))),
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder: None,
         }
     }
@@ -87,6 +98,7 @@ impl CachedQueryResult {
         schema: Arc<Schema>,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Self {
         Self {
@@ -94,6 +106,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder,
         }
     }
@@ -112,6 +125,7 @@ impl CachedQueryResult {
         schema: SchemaRef,
         input_tables: Arc<HashSet<TableReference>>,
         cached_at: Instant,
+        read_started_at: Instant,
         encoder: Option<Arc<dyn Encoder>>,
     ) -> Result<Self, crate::encoding::Error> {
         // Only store encoded data if an encoder is provided
@@ -119,7 +133,7 @@ impl CachedQueryResult {
             let encoded_data = encoder.encode(&records).await?;
             CachedData::Encoded(Bytes::from(encoded_data))
         } else {
-            CachedData::Raw(Arc::new(records))
+            CachedData::Raw(Arc::new(super::compact_for_storage(records)))
         };
 
         Ok(Self {
@@ -127,6 +141,7 @@ impl CachedQueryResult {
             schema,
             input_tables,
             cached_at,
+            read_started_at,
             encoder,
         })
     }
@@ -319,8 +334,13 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new_raw(batches, Arc::clone(&schema), input_tables, cached_at);
+        let cached_result = CachedQueryResult::new_raw(
+            batches,
+            Arc::clone(&schema),
+            input_tables,
+            cached_at,
+            cached_at,
+        );
 
         // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
@@ -358,8 +378,14 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new(encoded_data.clone(), schema, input_tables, cached_at, None);
+        let cached_result = CachedQueryResult::new(
+            encoded_data.clone(),
+            schema,
+            input_tables,
+            cached_at,
+            cached_at,
+            None,
+        );
 
         let expected_size =
             std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
@@ -378,7 +404,8 @@ mod tests {
         let input_tables = Arc::new(HashSet::new());
         let cached_at = Instant::now();
 
-        let cached_result = CachedQueryResult::new_raw(batches, schema, input_tables, cached_at);
+        let cached_result =
+            CachedQueryResult::new_raw(batches, schema, input_tables, cached_at, cached_at);
 
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
         let actual_size = cached_result.memory_size();
@@ -405,6 +432,7 @@ mod tests {
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
             Instant::now(),
+            Instant::now(),
         );
 
         let memory_size = cached_result.memory_size();
@@ -414,6 +442,80 @@ mod tests {
         assert_eq!(
             sizeable_size as u64, memory_size,
             "Sizeable trait should delegate to memory_size()"
+        );
+    }
+
+    use crate::utils::tests::wide_string_batch;
+
+    fn only_payload(batch: &RecordBatch) -> String {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload is a StringArray")
+            .value(0)
+            .to_string()
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12921>.
+    /// An entry built from a slice must not hold — or be billed — the batch the
+    /// slice was carved out of.
+    #[test]
+    fn a_sliced_entry_is_billed_its_own_rows_new_raw() {
+        let scan_batch = wide_string_batch(2_000);
+        let sliced = scan_batch.slice(1_000, 1);
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::new_raw(
+            vec![sliced.clone()],
+            sliced.schema(),
+            Arc::new(HashSet::new()),
+            cached_at,
+            cached_at,
+        );
+
+        assert!(
+            cached_result.memory_size() * 100 < scan_batch.get_array_memory_size() as u64,
+            "a one-row entry sliced from a 2000-row batch should be billed a small fraction of it, got {} of {}",
+            cached_result.memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+    }
+
+    /// The same store path, exercised through `from_batches` — what background
+    /// revalidation uses — and asserting the row itself survives compaction.
+    #[tokio::test]
+    async fn a_sliced_entry_is_billed_its_own_rows_from_batches() {
+        let scan_batch = wide_string_batch(2_000);
+        let sliced = scan_batch.slice(1_000, 1);
+        let expected_payload = only_payload(&sliced);
+        let cached_at = Instant::now();
+
+        let cached_result = CachedQueryResult::from_batches(
+            vec![sliced.clone()],
+            sliced.schema(),
+            Arc::new(HashSet::new()),
+            cached_at,
+            cached_at,
+            None,
+        )
+        .await
+        .expect("should create cached result");
+
+        assert!(
+            cached_result.memory_size() * 100 < scan_batch.get_array_memory_size() as u64,
+            "a one-row entry should be billed a small fraction of its parent, got {} of {}",
+            cached_result.memory_size(),
+            scan_batch.get_array_memory_size()
+        );
+
+        let records = cached_result.records().await.expect("should decode");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].num_rows(), 1);
+        assert_eq!(
+            only_payload(&records[0]),
+            expected_payload,
+            "compacting the entry must not change the row it holds"
         );
     }
 
@@ -431,6 +533,7 @@ mod tests {
             Vec::new(),
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
+            Instant::now(),
             Instant::now(),
         );
 
@@ -455,6 +558,7 @@ mod tests {
             Vec::new(),
             Arc::clone(&schema),
             Arc::new(HashSet::new()),
+            Instant::now(),
             Instant::now(),
             None,
         )

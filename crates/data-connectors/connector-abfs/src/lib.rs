@@ -14,21 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::Runtime;
-use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{
+use app::App;
+use data_connector_api::ConnectorContext;
+use data_connector_api::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType, build_fragments,
+    object_store_timeout_message,
 };
-use runtime::dataconnector::parameters::{
+use data_connector_api::parameters::{
     Validator,
     azure::{
         AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator, AzureSasTokenNormalizer,
     },
 };
-use runtime::dataconnector::{
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
+use runtime_component::dataset::DatasetSpec;
+use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -41,10 +44,12 @@ use url::Url;
 
 static PREFIX: &str = "abfs";
 
+const ABFS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/abfs";
+
 static VALIDATORS: LazyLock<
     Vec<
         Box<
-            dyn Validator<Error = runtime::dataconnector::parameters::azure::Error>
+            dyn Validator<Error = data_connector_api::parameters::azure::Error>
                 + Send
                 + Sync
                 + 'static,
@@ -93,7 +98,7 @@ pub enum Error {
 
 pub struct AzureBlobFS {
     params: Parameters,
-    runtime: Option<Runtime>,
+    app: Option<Arc<App>>,
     tokio_io_runtime: Handle,
 }
 
@@ -209,10 +214,11 @@ impl DataConnectorFactory for AzureBlobFSFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = data_connector_api::NewDataConnectorResult> + Send + 'a>> {
         // Validate versioning parameter early
         if let Some(versioning) = params.parameters.get("versioning").expose().ok()
             && !matches!(versioning, "enabled" | "disabled")
@@ -231,10 +237,10 @@ impl DataConnectorFactory for AzureBlobFSFactory {
                 validator.validate(&mut params).await?;
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = Some(context.app());
             let azure = AzureBlobFS {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(azure) as Arc<dyn DataConnector>)
@@ -279,7 +285,7 @@ impl ListingTableConnector for AzureBlobFS {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -287,7 +293,7 @@ impl ListingTableConnector for AzureBlobFS {
         let mut azure_url =
             Url::parse(url)
                 .boxed()
-                .context(runtime::dataconnector::InvalidConfigurationSnafu {
+                .context(data_connector_api::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -329,17 +335,34 @@ impl ListingTableConnector for AzureBlobFS {
         Ok(azure_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
+                // A timeout arrives in the same `Generic` variant as an authentication failure, so
+                // it is classified first: the auth checks below key off which credentials are
+                // configured, not off what failed, and would report a network timeout as a bad
+                // secret.
+                if let Some(message) = object_store_timeout_message(
+                    source.as_ref(),
+                    "Azure",
+                    self.params.get("client_timeout").expose().ok(),
+                    ABFS_DOCS,
+                ) {
+                    return DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: message.into(),
+                    };
+                }
+
                 // Try to provide more specific error messages based on auth method
                 let has_msi = self.params.get("msi_endpoint").expose().ok().is_some();
                 let has_use_cli = self
@@ -401,12 +424,164 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     AzureBlobFSFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_abfs as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_abfs_connector,
     ABFS_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,
     AzureBlobFSFactory
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::AppBuilder;
+    use object_store::client::{HttpError, HttpErrorKind};
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::Dataset;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime_secrets::Secrets;
+    use tokio::sync::RwLock;
+
+    fn create_test_connector(params: Parameters) -> AzureBlobFS {
+        AzureBlobFS {
+            params,
+            app: None,
+            tokio_io_runtime: Handle::current(),
+        }
+    }
+
+    /// Component parameters must be passed `abfs_`-prefixed and runtime parameters unprefixed —
+    /// `Parameters::try_new` silently drops a key on the wrong side of that rule, which would
+    /// leave a credential unset and quietly turn the tests below into no-ops.
+    async fn create_test_parameters(params: Vec<(String, secrecy::SecretString)>) -> Parameters {
+        Parameters::try_new(
+            "abfs_test",
+            params,
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid ABFS test parameters")
+    }
+
+    async fn create_test_dataset() -> Dataset {
+        DatasetBuilder::try_new("abfs://container/path/".to_string(), "test")
+            .expect("dataset builder should be created")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
+            .build()
+            .expect("dataset should be built")
+    }
+
+    /// `object_store` flattens a transport failure into `Error::Generic`, keeping the
+    /// classification only as a typed `HttpError` in the source chain.
+    fn generic_error(kind: HttpErrorKind) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "MicrosoftAzure",
+            source: Box::new(HttpError::new(
+                kind,
+                std::io::Error::other("upstream transport failure"),
+            )),
+        }
+    }
+
+    /// A timed-out request arrives in the same `Generic` variant an authentication failure does,
+    /// so classifying it by which credential is configured reports a working `client_id` as
+    /// broken and never names the parameter that resolves it (#12793).
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_as_a_client_credentials_failure() {
+        let params = create_test_parameters(vec![(
+            "abfs_client_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("client_timeout"),
+            "a timeout should point at client_timeout, got: {message}"
+        );
+        assert!(
+            !message.contains("authentication failed"),
+            "a timeout must not be reported as an authentication failure, got: {message}"
+        );
+    }
+
+    /// The same holds for the SAS and managed-identity branches: every credential the connector
+    /// keys off must lose to the timeout check, not just the first one.
+    #[tokio::test]
+    async fn a_timeout_is_not_reported_against_any_configured_credential() {
+        for credential in ["abfs_sas_string", "abfs_msi_endpoint"] {
+            let params =
+                create_test_parameters(vec![(credential.to_string(), "value".to_string().into())])
+                    .await;
+            let connector = create_test_connector(params);
+            let dataset = create_test_dataset().await;
+
+            let message = connector
+                .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+                .to_string();
+
+            assert!(
+                message.contains("client_timeout") && !message.contains("authentication failed"),
+                "a timeout with {credential} configured must not be blamed on it, got: {message}"
+            );
+        }
+    }
+
+    /// The timeout check must not swallow the classification it runs ahead of: a `Generic` error
+    /// that is *not* a timeout is still reported against the configured credential.
+    #[tokio::test]
+    async fn a_non_timeout_error_still_reports_the_configured_auth_method() {
+        let params = create_test_parameters(vec![(
+            "abfs_client_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Decode))
+            .to_string();
+
+        assert!(
+            message.contains("client credentials authentication failed"),
+            "a non-timeout error should keep its auth classification, got: {message}"
+        );
+        assert!(
+            !message.contains("client_timeout"),
+            "a non-timeout error must not be reported as a timeout, got: {message}"
+        );
+    }
+
+    /// The message names the number to raise, not just the parameter.
+    #[tokio::test]
+    async fn a_timeout_surfaces_the_configured_client_timeout() {
+        let params = create_test_parameters(vec![(
+            "client_timeout".to_string(),
+            "120s".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset = create_test_dataset().await;
+
+        let message = connector
+            .handle_object_store_error(&dataset, generic_error(HttpErrorKind::Timeout))
+            .to_string();
+
+        assert!(
+            message.contains("120s"),
+            "the configured client_timeout should be surfaced, got: {message}"
+        );
+    }
+}

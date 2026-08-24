@@ -16,11 +16,15 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
-    component::{catalog::Catalog, dataset::builder::DatasetBuilder},
+    component::{
+        catalog::{Catalog, table_selector},
+        dataset::builder::DatasetBuilder,
+    },
     dataconnector::parameters::ConnectorParams,
 };
 use app::App;
@@ -30,11 +34,11 @@ use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::get_databases::GetDatabasesError;
 use aws_sdk_glue::operation::get_tables::GetTablesError;
 use data_components::RefreshableCatalogProvider;
+use data_components::catalog_filter::TableSelector;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
     common::Result as DFResult,
 };
-use globset::GlobSet;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -85,8 +89,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
     client: Client,
-    include: Option<GlobSet>,
-    orig_include: Vec<String>,
+    selector: TableSelector,
     runtime: Arc<Runtime>,
     app: Arc<App>,
     parameters: ConnectorParams,
@@ -138,8 +141,7 @@ impl GlueCatalogProvider {
 
         Ok(Self {
             client,
-            include: catalog.include.clone(),
-            orig_include: catalog.orig_include.clone(),
+            selector: table_selector(catalog),
             runtime,
             app,
             databases,
@@ -169,7 +171,7 @@ impl GlueCatalogProvider {
                 .into_iter()
                 .filter(|t| {
                     InputFormat::try_from(t).is_ok()
-                        && is_included(self.include.as_ref(), &database, t.name())
+                        && is_selected(&self.selector, &database, t.name())
                 })
                 .collect::<Vec<_>>();
 
@@ -179,8 +181,11 @@ impl GlueCatalogProvider {
                     parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
                 }
 
-                let connector =
-                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
+                let connector = GlueDataConnector::new(
+                    parameters,
+                    Some(Arc::clone(&self.app)),
+                    self.parameters.io_runtime.clone(),
+                );
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
@@ -195,11 +200,14 @@ impl GlueCatalogProvider {
                     .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
                     })?;
-                let table_provider = connector.read_provider(&dataset).await.boxed().context(
-                    CreatingDatasetSnafu {
+                let context = RuntimeConnectorContext::for_dataset(&dataset);
+                let table_provider = connector
+                    .read_provider(&context, &dataset)
+                    .await
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                    },
-                )?;
+                    })?;
                 tables.insert(table.name, table_provider);
             }
         }
@@ -259,7 +267,15 @@ impl RefreshableCatalogProvider for GlueCatalogProvider {
         while let Some(maybe_get_databases_output) = paginator.next().await {
             let get_databases_output = maybe_get_databases_output.context(GetDatabasesSnafu)?;
             for db in get_databases_output.database_list {
-                if !database_might_match(&db.name, &self.orig_include) {
+                // A database no `include` pattern can reach cannot contribute a
+                // table, so skip its `GetTables` pagination entirely; every
+                // database that survives is still filtered table by table.
+                //
+                // Skipping the database also drops it from `schema_names`, so
+                // pruning narrows this catalog's namespace — unlike the
+                // `PostgreSQL` connector, which registers a pruned schema empty
+                // and keeps the namespace fixed.
+                if !self.selector.may_select_within(&db.name) {
                     tracing::debug!("skipping database {}", &db.name);
                     continue;
                 }
@@ -310,25 +326,18 @@ impl SchemaProvider for GlueSchemaProvider {
     }
 }
 
-fn database_might_match(database: &str, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        return true;
-    }
-
-    patterns.iter().any(|pattern| {
-        pattern == database
-            || pattern.starts_with(&format!("{database}."))
-            || pattern.starts_with("*.")
-            || pattern == "*.*"
-    })
-}
-
-fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) -> bool {
+/// Whether the catalog registers `{database}.{table}`, logging which half of
+/// the configuration withheld it when it does not.
+///
+/// [`TableSelector::selects_table`] answers the same question without the
+/// diagnostic; the log is the reason this wrapper exists, and it matches what
+/// the `adbc` and `PostgreSQL` connectors do at their own call sites. Taking
+/// the already-joined name also keeps it to one `format!` per table, which
+/// `selects_table` would double.
+fn is_selected(selector: &TableSelector, database: &str, table: &str) -> bool {
     let database_with_table = format!("{database}.{table}");
-    if let Some(include) = include
-        && !include.is_match(&database_with_table)
-    {
-        tracing::debug!("skipping table {database_with_table}");
+    if let Some(reason) = selector.rejection_reason(&database_with_table) {
+        tracing::debug!("skipping table {database_with_table} ({reason})");
         return false;
     }
     true
@@ -337,70 +346,135 @@ fn is_included(include: Option<&globset::GlobSet>, database: &str, table: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use globset::{Glob, GlobSetBuilder};
+    use crate::component::catalog::CatalogBuilder;
+    use spicepod::component::catalog as spicepod_catalog;
 
-    #[test]
-    fn database_might_match_exact_match() {
-        let patterns = vec!["mydb".to_string()];
-        assert!(database_might_match("mydb", &patterns));
+    /// A selector built the way the runtime builds one: from a spicepod
+    /// catalog's `include:`/`exclude:`, through `CatalogBuilder`'s real
+    /// `compile_globset`. Hand-populating a `CatalogSpec` instead would skip the
+    /// compile step the user's patterns actually travel.
+    fn selector(include: &[&str], exclude: &[&str]) -> TableSelector {
+        let catalog = spicepod_catalog::Catalog {
+            from: "glue".to_string(),
+            name: "glue".to_string(),
+            description: None,
+            metadata: HashMap::default(),
+            access: spicepod::component::access::AccessMode::default(),
+            include: include.iter().map(|p| (*p).to_string()).collect(),
+            exclude: exclude.iter().map(|p| (*p).to_string()).collect(),
+            params: None,
+            dataset_params: None,
+            depends_on: Vec::default(),
+            metrics: None,
+            acceleration: None,
+        };
+
+        table_selector(
+            &CatalogBuilder::try_from(catalog)
+                .expect("a catalog with valid glob patterns should build")
+                .into_spec(),
+        )
     }
 
+    /// The bug this change fixes (#12634): the connector compiled `exclude` and
+    /// then consulted only `include`, so a table the user asked to keep out was
+    /// registered anyway. Asserted against both predicates the connector
+    /// applies, over the four shapes `exclude` is written in.
     #[test]
-    fn database_might_match_prefix_match() {
-        let patterns = vec!["mydb.table1".to_string()];
-        assert!(database_might_match("mydb", &patterns));
+    fn a_catalogs_exclude_reaches_the_tables_glue_registers() {
+        // Excluded out of an included set.
+        let s = selector(&["public.*"], &["public.audit_log"]);
+        assert!(is_selected(&s, "public", "orders"));
+        assert!(
+            !is_selected(&s, "public", "audit_log"),
+            "a table matched by `exclude` must not be registered"
+        );
+
+        // `exclude` wins over an `include` naming the same table.
+        let s = selector(&["public.audit_log"], &["public.audit_log"]);
+        assert!(!is_selected(&s, "public", "audit_log"));
+
+        // `exclude` with no `include` -- the shape that reads most obviously as
+        // "keep this table out", and was ignored entirely.
+        let s = selector(&[], &["private.*"]);
+        assert!(is_selected(&s, "public", "orders"));
+        assert!(!is_selected(&s, "private", "orders"));
+        assert!(!is_selected(&s, "private", "secrets"));
+        // The database is still interrogated: the prune reads `include` only,
+        // and proving an `exclude` covers every table a database can hold is a
+        // far stronger claim than it can make.
+        assert!(s.may_select_within("private"));
+
+        // A non-matching `exclude` leaves the table present, and does not widen
+        // `include` to admit the name it excludes.
+        let s = selector(&["public.*"], &["private.audit_log"]);
+        assert!(is_selected(&s, "public", "audit_log"));
+        assert!(!is_selected(&s, "reporting", "orders"));
+        assert!(s.may_select_within("public"));
+        assert!(!s.may_select_within("private"));
     }
 
+    /// Pattern shapes the database prune must not reject, each naming a
+    /// database whose tables the per-table filter accepts. Regression test for
+    /// #12630.
     #[test]
-    fn database_might_match_wildcard_prefix() {
-        let patterns = vec!["*.table1".to_string()];
-        assert!(database_might_match("mydb", &patterns));
+    fn database_prune_keeps_partial_wildcard_and_class_shapes() {
+        for (pattern, database) in [
+            ("sales_*.orders", "sales_east"),
+            ("sales_*.*", "sales_east"),
+            ("*", "public"),
+            ("{public,sales}.*", "public"),
+            ("[ps]ublic.*", "public"),
+            ("?ublic.orders", "public"),
+        ] {
+            assert!(
+                selector(&[pattern], &[]).may_select_within(database),
+                "pattern {pattern} must not skip database {database}"
+            );
+        }
     }
 
+    /// The invariant tying this file's two predicates together: the prune
+    /// decides which databases are interrogated and the per-table filter decides
+    /// which tables survive. A table `is_selected` accepts must live in a
+    /// database the prune kept -- otherwise it is silently absent from the
+    /// catalog, and nothing reports it.
+    ///
+    /// `exclude` is deliberately not a dimension here. It cannot turn
+    /// `is_selected` from `false` to `true` and it is not read by the prune at
+    /// all, so every exclude set is implied by the empty one -- adding them
+    /// would multiply the assertion count by shapes that cannot fail.
     #[test]
-    fn database_might_match_wildcard_all() {
-        let patterns = vec!["*.*".to_string()];
-        assert!(database_might_match("mydb", &patterns));
-    }
+    fn a_database_holding_a_selected_table_is_never_skipped() {
+        let includes = [
+            "public.orders",
+            "public.*",
+            "*.orders",
+            "*",
+            "*.*",
+            "sales_*.orders",
+            "sales_*.*",
+            "{public,sales}.*",
+            "[ps]ublic.*",
+            "?ublic.orders",
+            "public.ord*",
+            "otherdb.*",
+        ];
+        let databases = ["public", "sales", "sales_east", "salesx", "otherdb", "p"];
+        let tables = ["orders", "line_item", "o"];
 
-    #[test]
-    fn database_might_match_no_match() {
-        let patterns = vec!["otherdb".to_string(), "otherdb.table1".to_string()];
-        assert!(!database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn database_might_match_empty_patterns() {
-        let patterns: Vec<String> = vec![];
-        assert!(database_might_match("mydb", &patterns));
-    }
-
-    #[test]
-    fn is_included_no_globset() {
-        assert!(is_included(None, "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_matching_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("mydb.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(is_included(Some(&globset), "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_non_matching_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("otherdb.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(!is_included(Some(&globset), "mydb", "table1"));
-    }
-
-    #[test]
-    fn is_included_wildcard_glob() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("*.table1").expect("builder add"));
-        let globset = builder.build().expect("builder build");
-        assert!(is_included(Some(&globset), "mydb", "table1"));
+        for include in includes {
+            let selector = selector(&[include], &[]);
+            for database in databases {
+                let kept = selector.may_select_within(database);
+                for table in tables {
+                    assert!(
+                        !is_selected(&selector, database, table) || kept,
+                        "include {include} selects {database}.{table} \
+                         but skipped database {database}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -6,6 +6,14 @@ image:
   tag: latest-models # 2.2.0-unstable
 replicaCount: 1
 
+# Update strategy for the Deployment (used when stateful.enabled is false).
+# strategy:
+#   type: Recreate
+
+# Update strategy for the StatefulSet (used when stateful.enabled is true).
+# updateStrategy:
+#   type: RollingUpdate
+
 service:
   # type can be null, ClusterIP, NodePort, or LoadBalancer
   type: null

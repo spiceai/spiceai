@@ -37,20 +37,21 @@ use tei_core::{
     TextEmbeddingsError,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
-    tokenization::{EncodingInput, Tokenization},
+    tokenization::EncodingInput,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
-use super::util::{
-    download_hf_artifacts, inputs_from_openai, load_config, load_tokenizer,
-    max_seq_length_from_st_config, pool_from_str, position_offset,
-};
+use super::util::{download_hf_artifacts, inputs_from_openai, load_tokenization, pool_from_str};
 
 #[derive(Debug)]
 pub struct TeiEmbed {
     pub infer: Infer,
     pub model_size: i32,     // Used for `size` method.
     pub tok: Arc<Tokenizer>, // Used for `chunker` method.
+
+    // When `Some`, inputs longer than the model's maximum sequence length are
+    // truncated in that direction instead of failing the embedding call.
+    truncation: Option<TruncationDirection>,
 
     // Shared embeddings cache
     cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
@@ -66,6 +67,7 @@ impl TeiEmbed {
         tokenizer_path: &Path,
         pooling_overwrite: Option<String>,
         max_seq_length_overwrite: Option<usize>,
+        truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
         let model_filename = model_path
             .file_name()
@@ -106,7 +108,13 @@ impl TeiEmbed {
             Self::DEFAULT_POOLING_OPERATOR
         };
 
-        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite).await
+        Self::from_dir(
+            &model_root,
+            Some(pool),
+            max_seq_length_overwrite,
+            truncation,
+        )
+        .await
     }
 
     pub async fn from_hf(
@@ -115,6 +123,7 @@ impl TeiEmbed {
         hf_token: Option<&str>,
         pooling_overwrite: Option<&str>,
         max_seq_length_overwrite: Option<usize>,
+        truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
         // Only error if user-provided value is incorrect.
         let pool = pooling_overwrite
@@ -130,7 +139,7 @@ impl TeiEmbed {
             .transpose()?
             .flatten();
         let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
-        Self::from_dir(&model_root, pool, max_seq_length_overwrite).await
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite, truncation).await
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
@@ -138,36 +147,9 @@ impl TeiEmbed {
         root: &Path,
         pooling_overwrite: Option<Pool>,
         max_seq_length_overwrite: Option<usize>,
+        truncation: Option<TruncationDirection>,
     ) -> Result<Self> {
-        let tokenizer = load_tokenizer(root)?;
-        let config = load_config(root)?;
-
-        // Load [`Tokenization`]
-        let position_offset = position_offset(&config);
-
-        let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
-            max_seq_length
-        } else {
-            // Some models will have `sentence_*_config.json` file defining a specific `max_seq_length`.
-            match max_seq_length_from_st_config(root) {
-                Ok(max_seq_length_opt) => {
-                    max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load max_seq_length from ST config: {e}");
-                    config.max_position_embeddings - position_offset
-                }
-            }
-        };
-
-        let token = Tokenization::new(
-            1,
-            tokenizer.clone(),
-            max_input_length,
-            position_offset,
-            None,
-            None,
-        );
+        let (tokenizer, config, token) = load_tokenization(root, max_seq_length_overwrite)?;
 
         // Load [`Backend`]
         // TODO: add pooling parameter from https://github.com/spiceai/spiceai/pull/3174
@@ -207,6 +189,7 @@ impl TeiEmbed {
             infer,
             model_size: config.hidden_size,
             tok: Arc::new(tokenizer),
+            truncation,
             cache: None,
             cache_model_id: None,
         })
@@ -234,6 +217,10 @@ impl TeiEmbed {
         let batch_size = inputs.len();
         tracing::trace!("Embedding {batch_size} batches");
 
+        // `embed_pooled` wants `truncate: bool` and `truncation_direction` as separate
+        // arguments; the direction is meaningless when not truncating, so default it.
+        let truncate = self.truncation.is_some();
+        let truncation_direction = self.truncation.unwrap_or_default();
         let mut futures = Vec::with_capacity(batch_size);
         for input in inputs {
             let local_infer = self.infer.clone();
@@ -242,8 +229,8 @@ impl TeiEmbed {
                 local_infer
                     .embed_pooled(
                         input,
-                        false, // Don't automatically truncate, error.
-                        TruncationDirection::Right,
+                        truncate,
+                        truncation_direction,
                         None,
                         true,
                         None,

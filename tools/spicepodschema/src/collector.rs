@@ -20,12 +20,11 @@ limitations under the License.
 //! This module explicitly references all connector modules to ensure they are linked into the
 //! binary and their `linkme` distributed slice registrations are included.
 
-use runtime::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS;
-use runtime::dataconnector::DATA_CONNECTOR_REGISTRATIONS;
-use runtime::model::params::{
-    anthropic, azure, bedrock, databricks, file, google, huggingface, openai, spiceai, xai,
-};
+use data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS;
+use data_connector_api::DATA_CONNECTOR_REGISTRATIONS;
+use runtime::model::params::get_params_spec;
 use runtime_parameters::ParameterSpec;
+use spicepod::component::model::ModelSource;
 
 // Force linkage of all data connector modules by referencing their factory types.
 // Without these references, the linker may not include the modules and their
@@ -69,19 +68,14 @@ use runtime::dataconnector::s3 as _;
 use runtime::dataconnector::spiceai as _;
 
 // Force linkage of all data accelerator modules
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+use accelerator_duckdb as _;
+use accelerator_postgres as _;
+use accelerator_sqlite as _;
+use accelerator_turso as _;
 #[expect(unused_imports)]
 use runtime::dataaccelerator::arrow as _;
-#[cfg(not(windows))]
-#[expect(unused_imports)]
-use runtime::dataaccelerator::cayenne as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::duckdb as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::postgres as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::sqlite as _;
-#[expect(unused_imports)]
-use runtime::dataaccelerator::turso as _;
 
 /// Schema information for a connector or accelerator.
 #[derive(Debug, Clone)]
@@ -209,61 +203,62 @@ pub fn collect_catalog_connectors() -> Vec<CatalogConnectorSchema> {
 
 /// Collects schema information from all model sources.
 ///
-/// Model sources define their parameters in `crates/runtime/src/model/params/`.
-/// This function enumerates them directly to avoid adding schema-generation-only
-/// code to the runtime.
+/// Model sources define their parameters as `#[derive(TypedParams)]` structs in
+/// `crates/runtime/src/model/params/`; `get_params_spec` regenerates the
+/// `ParameterSpec` list from each struct, keeping the struct the single source
+/// of truth for both runtime deserialization and schema.
 #[must_use]
 pub fn collect_model_sources() -> Vec<ModelSourceSchema> {
     vec![
         ModelSourceSchema {
             name: "openai",
             prefix: "openai",
-            parameters: openai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::OpenAi),
         },
         ModelSourceSchema {
             name: "azure",
             prefix: "azure",
-            parameters: azure::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Azure),
         },
         ModelSourceSchema {
             name: "file",
             prefix: "file",
-            parameters: file::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::File),
         },
         ModelSourceSchema {
             name: "databricks",
             prefix: "databricks",
-            parameters: databricks::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Databricks),
         },
         ModelSourceSchema {
             name: "huggingface",
             prefix: "huggingface",
-            parameters: huggingface::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::HuggingFace),
         },
         ModelSourceSchema {
             name: "anthropic",
             prefix: "anthropic",
-            parameters: anthropic::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Anthropic),
         },
         ModelSourceSchema {
             name: "xai",
             prefix: "xai",
-            parameters: xai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Xai),
         },
         ModelSourceSchema {
             name: "bedrock",
             prefix: "bedrock",
-            parameters: bedrock::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Bedrock),
         },
         ModelSourceSchema {
             name: "google",
             prefix: "google",
-            parameters: google::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::Google),
         },
         ModelSourceSchema {
             name: "spiceai",
             prefix: "spiceai",
-            parameters: spiceai::PARAMETERS,
+            parameters: get_params_spec(&ModelSource::SpiceAI),
         },
     ]
 }

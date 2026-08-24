@@ -13,6 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+// The runtime's async call graph nests deeply enough that computing the layout of a test's
+// top-level future exceeds rustc's default 128-deep query limit. Matches the `recursion_limit`
+// the `runtime` crate itself and the sibling integration test crates set.
+#![recursion_limit = "256"]
+
 use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -22,10 +28,49 @@ use std::sync::Arc;
 
 #[cfg(feature = "postgres-accel")]
 use crate::utils::TEST_REQUEST_CONTEXT;
+
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
+
+// The force-links these tests depend on live in `utils`, which every binary sharing
+// these helpers includes; the guard below is what proves they are working.
+/// An engine reaches the registry only if its crate is linked into this binary, which a
+/// Cargo dependency does not guarantee — the linker drops the unreferenced slice static.
+/// Asserted here rather than left to the first accelerated test of each engine, which
+/// needs a live database and so cannot tell a missing registration apart from a missing
+/// server. Extend this with each engine that moves into its own crate.
+#[test]
+fn accelerator_crates_register_their_engines() {
+    let engines = data_accelerator_api::registered_engine_names();
+    #[cfg(feature = "postgres-accel")]
+    assert!(
+        engines.iter().any(|engine| engine == "postgres"),
+        "the postgres accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "sqlite")]
+    assert!(
+        engines.iter().any(|engine| engine == "sqlite"),
+        "the sqlite accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "turso")]
+    assert!(
+        engines.iter().any(|engine| engine == "turso"),
+        "the turso accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(feature = "duckdb")]
+    assert!(
+        engines.iter().any(|engine| engine == "duckdb"),
+        "the duckdb accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    #[cfg(not(windows))]
+    assert!(
+        engines.iter().any(|engine| engine == "cayenne"),
+        "the cayenne accelerator is not registered in this test binary; linked engines: {engines:?}"
+    );
+    let _ = &engines;
+}
 
 mod abfs;
 mod acceleration;
@@ -33,6 +78,7 @@ mod acceleration;
 mod adbc;
 mod cache;
 mod catalog;
+#[cfg(not(windows))]
 mod cayenne;
 #[cfg(not(windows))]
 mod cayenne_catalog_ddl;
@@ -106,6 +152,8 @@ mod mysql;
 mod odbc;
 #[cfg(feature = "oracle")]
 mod oracle;
+#[cfg(not(windows))]
+mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;

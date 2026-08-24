@@ -40,8 +40,8 @@ use futures::future::try_join_all;
 use itertools::Itertools;
 use llms::embeddings::Embed;
 use parking_lot::RwLock;
-use runtime_datafusion_index::Index;
 use snafu::{ResultExt, Snafu, ensure};
+use spice_table::{Index, WriteWindow};
 
 use crate::index::{
     SearchIndex, VectorIndex, embedding_col,
@@ -337,6 +337,47 @@ impl Index for MemoryVectorIndex {
 
         self.store.write().delete_by_keys(&key_strings)
     }
+
+    /// Entries live in this index's own store, not in the accelerated table row, so a
+    /// replacing write has to clear them: it removes a row by not re-sending it, which
+    /// neither [`Index::compute_index`] nor [`Index::delete_by_keys`] can observe.
+    ///
+    /// The clear is staged rather than applied. The store is process-local, so the whole
+    /// window can be built alongside the current contents and swapped in at
+    /// [`Index::on_write_complete`] — a query during the refresh reads the previous
+    /// contents, never a half-rebuilt index, and a refresh that fails leaves them in place.
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        let mut store = self.store.write();
+        match window {
+            WriteWindow::ReplaceAll => store.begin_replace_window(),
+            // An append has to land in the rows readers already see. A replace window whose
+            // terminators never ran leaves the store staging, so without this the append would
+            // be staged too and the `on_write_complete` that follows it would publish that
+            // staged set as the whole index — dropping every row the abandoned window had
+            // not re-sent. Discarding is a no-op in the usual case of no window open.
+            WriteWindow::Append => store.abandon_replace_window(),
+        }
+        Ok(())
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        self.store.write().commit_replace_window();
+        Ok(())
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        self.store.write().abandon_replace_window();
+        Ok(())
+    }
+
+    // `write_start_failure_is_fatal` / `write_complete_failure_is_fatal` are deliberately left
+    // at their `false` default even though the tantivy index overrides both for its own staged
+    // window. All three callbacks above are infallible — the store is a lock away, with no I/O —
+    // so there is no failure of this index's for either flag to classify. Returning `true`
+    // anyway would not be inert: `CompoundVectorIndex` ORs the flags across its halves, so it
+    // would promote the *other* half's best-effort failure (an Elasticsearch `refresh_interval`
+    // override that could not be applied, a `_forcemerge` that failed) into one that fails the
+    // whole write.
 }
 
 #[async_trait]
@@ -445,5 +486,308 @@ impl VectorIndex for MemoryVectorIndex {
             None,
         )?
         .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use datafusion_expr::{Volatility, create_udf};
+    use llms::embeddings::EmbeddingInput;
+
+    const DIM: i32 = 3;
+
+    /// Deterministic, model-free embedder: maps a string to a vector derived from its bytes.
+    #[derive(Debug)]
+    struct ByteEmbed;
+
+    fn byte_vector(text: &str) -> Vec<f32> {
+        let dim = usize::try_from(DIM).expect("DIM is positive");
+        let mut vector = vec![0.0_f32; dim];
+        for (i, b) in text.bytes().enumerate() {
+            vector[i % dim] += f32::from(b) / 255.0;
+        }
+        vector
+    }
+
+    #[async_trait]
+    impl Embed for ByteEmbed {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![byte_vector(&s)]),
+                EmbeddingInput::StringArray(v) => Ok(v.iter().map(|s| byte_vector(s)).collect()),
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn size(&self) -> i32 {
+            DIM
+        }
+    }
+
+    /// These tests never execute a query plan, so the query-time `embed(text, model)` UDF is
+    /// only needed to construct the index.
+    fn embed_udf() -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            "embed",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::List(Arc::new(Field::new_list_field(DataType::Float32, true))),
+            Volatility::Volatile,
+            Arc::new(|_args| {
+                Err(DataFusionError::Execution(
+                    "the memory index tests do not execute query plans".to_string(),
+                ))
+            }),
+        ))
+    }
+
+    fn memory_index() -> MemoryVectorIndex {
+        MemoryVectorIndex::try_new(
+            "content".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::none(),
+            Arc::new(ByteEmbed),
+            embed_udf(),
+            "model_name".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("valid memory index")
+    }
+
+    /// One row per id, with `content` derived from the id so each row embeds distinctly.
+    fn batch(ids: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+        let contents: Vec<String> = ids.iter().map(|id| format!("row {id}")).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(contents)),
+            ],
+        )
+        .expect("valid test batch")
+    }
+
+    /// The ids a query would find in the index, in ascending order.
+    fn indexed_ids(index: &MemoryVectorIndex) -> Vec<i64> {
+        let mut ids: Vec<i64> = index
+            .store
+            .read()
+            .batches()
+            .iter()
+            .flat_map(|b| {
+                let (idx, _) = b
+                    .schema()
+                    .column_with_name("id")
+                    .expect("the stored schema carries the primary key");
+                b.column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn write_window(index: &MemoryVectorIndex, window: WriteWindow, ids: &[i64]) {
+        index
+            .on_write_start(window)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(ids)])
+            .await
+            .expect("the rows are indexed");
+        index
+            .on_write_complete()
+            .await
+            .expect("the write window closes");
+    }
+
+    /// The regression test. A `refresh_mode: full` refresh removes a row by not re-sending
+    /// it — it announces no deletion — so before this fix the index kept a vector for row 2
+    /// and searches went on returning it after `SELECT` had stopped.
+    #[tokio::test]
+    async fn a_full_refresh_drops_entries_for_rows_it_did_not_resend() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+        assert_eq!(indexed_ids(&index), vec![1, 2, 3]);
+
+        write_window(&index, WriteWindow::ReplaceAll, &[1, 3]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 3],
+            "a replacing write reproduces the whole table, so a row it does not carry is a \
+             row the source dropped"
+        );
+    }
+
+    /// The clear is staged, not applied: the window is built alongside the current contents
+    /// so a search during the refresh is served the previous rows rather than a partially
+    /// rebuilt index.
+    #[tokio::test]
+    async fn rows_stay_readable_while_a_full_refresh_rebuilds_them() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[4])])
+            .await
+            .expect("the rows are indexed");
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 2, 3],
+            "an uncommitted refresh must not be visible, in whole or in part"
+        );
+
+        index
+            .on_write_complete()
+            .await
+            .expect("the write window closes");
+        assert_eq!(indexed_ids(&index), vec![4]);
+    }
+
+    /// A refresh that fails partway leaves the index exactly as it was, rather than serving
+    /// whatever fraction of the new contents had arrived.
+    #[tokio::test]
+    async fn a_failed_full_refresh_leaves_the_previous_rows_in_place() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[9])])
+            .await
+            .expect("the rows are indexed");
+        index
+            .on_write_failed()
+            .await
+            .expect("the write window is abandoned");
+
+        assert_eq!(indexed_ids(&index), vec![1, 2, 3]);
+    }
+
+    /// An append adds to what the index holds. Clearing on this window would drop every row
+    /// the append did not happen to carry — the failure the `WriteWindow` distinction exists
+    /// to avoid, and the one a CDC change batch would hit.
+    #[tokio::test]
+    async fn an_append_keeps_the_rows_it_does_not_resend() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2]).await;
+
+        write_window(&index, WriteWindow::Append, &[3]).await;
+
+        assert_eq!(indexed_ids(&index), vec![1, 2, 3]);
+    }
+
+    /// A write that never opened a window at all — the CDC path, which the sink lifecycle
+    /// does not wrap — keeps writing straight into the readable rows.
+    #[tokio::test]
+    async fn a_write_outside_any_window_lands_in_the_readable_rows() {
+        let index = memory_index();
+        index
+            .compute_index(vec![batch(&[1, 2])])
+            .await
+            .expect("the rows are indexed");
+
+        assert_eq!(indexed_ids(&index), vec![1, 2]);
+    }
+
+    /// A refresh abandoned without either terminator running — a cancelled refresh, a
+    /// restart — must not have its rows swept into the next one's commit.
+    #[tokio::test]
+    async fn an_abandoned_window_does_not_leak_into_the_next_one() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[7])])
+            .await
+            .expect("the rows are indexed");
+
+        // No `on_write_complete` / `on_write_failed`; the next refresh simply starts.
+        write_window(&index, WriteWindow::ReplaceAll, &[2]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![2],
+            "row 7 belonged to a refresh that never completed"
+        );
+    }
+
+    /// The same abandoned window, followed by an append rather than another refresh. The
+    /// append has to land in the rows readers see: staged into the window the cancelled
+    /// refresh left open, its `on_write_complete` would publish that staged set as the
+    /// entire index and drop every row the abandoned refresh had not re-sent.
+    #[tokio::test]
+    async fn an_abandoned_window_does_not_capture_the_next_append() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[7])])
+            .await
+            .expect("the rows are indexed");
+
+        // No `on_write_complete` / `on_write_failed`; an append simply follows.
+        write_window(&index, WriteWindow::Append, &[3]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 2, 3],
+            "row 7 belonged to a refresh that never completed, and an append must not \
+             replace the rows it did not carry"
+        );
+    }
+
+    /// A delete arriving inside a replace window acts on the rows being staged, so the
+    /// deleted row does not reappear when the window is published.
+    #[tokio::test]
+    async fn a_delete_inside_a_replace_window_applies_to_the_staged_rows() {
+        let index = memory_index();
+        write_window(&index, WriteWindow::Append, &[1, 2]).await;
+
+        index
+            .on_write_start(WriteWindow::ReplaceAll)
+            .await
+            .expect("the write window opens");
+        index
+            .compute_index(vec![batch(&[1, 2, 3])])
+            .await
+            .expect("the rows are indexed");
+        index
+            .delete_by_keys(batch(&[2]))
+            .await
+            .expect("the delete applies");
+        index
+            .on_write_complete()
+            .await
+            .expect("the write window closes");
+
+        assert_eq!(indexed_ids(&index), vec![1, 3]);
     }
 }

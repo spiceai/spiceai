@@ -23,14 +23,15 @@ use super::{
         aws::{AuthValidator, RegionValidator, S3EndpointValidator},
     },
 };
+use crate::dataconnector::ConnectorContext;
+
+use app::App;
 
 use crate::{
-    Runtime,
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 
-use object_store::client::{HttpError, HttpErrorKind};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -104,21 +105,21 @@ pub enum Error {
 
 pub struct S3 {
     pub(crate) params: Parameters,
-    pub(crate) runtime: Option<Runtime>,
+    pub(crate) app: Option<Arc<App>>,
     pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl S3 {
-    /// Creates a new `S3` connector with the given parameters, runtime, and I/O runtime handle.
+    /// Creates a new `S3` connector with the given parameters, app, and I/O runtime handle.
     #[must_use]
     pub fn new(
         params: Parameters,
-        runtime: Option<Runtime>,
+        app: Option<Arc<App>>,
         tokio_io_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             params,
-            runtime,
+            app,
             tokio_io_runtime,
         }
     }
@@ -208,10 +209,11 @@ impl DataConnectorFactory for S3Factory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
             && endpoint.ends_with('/')
         {
@@ -282,10 +284,10 @@ impl DataConnectorFactory for S3Factory {
                 }
             }
 
-            let runtime = params.runtime().map(Arc::unwrap_or_clone);
+            let app = Some(context.app());
             let s3 = S3 {
                 params: params.parameters,
-                runtime,
+                app,
                 tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
@@ -316,6 +318,12 @@ impl ListingTableConnector for S3 {
         Some(ObjectVersionType::Version)
     }
 
+    /// S3 returns a stable `ETag` (and, with versioning enabled, a version ID) on
+    /// `HEAD`, so an unchanged object can be served from cache.
+    fn supports_single_file_version_cache(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -330,7 +338,7 @@ impl ListingTableConnector for S3 {
 
     fn get_object_store_url(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         url: Option<&str>,
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
@@ -362,40 +370,30 @@ impl ListingTableConnector for S3 {
         Ok(s3_url)
     }
 
-    fn get_runtime(&self) -> Option<Runtime> {
-        self.runtime.clone()
+    fn get_app(&self) -> Option<Arc<App>> {
+        self.app.clone()
     }
 
     fn handle_object_store_error(
         &self,
-        dataset: &Dataset,
+        dataset: &DatasetSpec,
         error: object_store::Error,
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
-                // object_store 0.13 preserves the transport classification
-                // (reqwest/hyper/IO timeouts) as a typed `HttpError` in the source
-                // chain. Surface timeouts with an actionable message instead of the
-                // opaque "error decoding response body" that body-read timeouts
-                // otherwise produce when many datasets are loaded concurrently.
-                if object_store_http_error_kind(source.as_ref()) == Some(HttpErrorKind::Timeout) {
-                    let client_timeout = self
-                        .params
-                        .get("client_timeout")
-                        .expose()
-                        .ok()
-                        .unwrap_or("30s (default)");
+                // A timeout arrives in the same `Generic` variant as an authentication failure,
+                // so it is classified first — otherwise the `auth` check below attributes it to
+                // the configured credentials.
+                if let Some(message) = listing::object_store_timeout_message(
+                    source.as_ref(),
+                    "S3",
+                    self.params.get("client_timeout").expose().ok(),
+                    S3_DOCS,
+                ) {
                     return DataConnectorError::UnableToConnectInternal {
                         dataconnector: format!("{self}"),
                         connector_component: ConnectorComponent::from(dataset),
-                        source: format!(
-                            "S3 request timed out (client_timeout: {client_timeout}). This often \
-                             happens when many datasets are loaded concurrently and saturate the \
-                             network or I/O. Consider increasing the `client_timeout` parameter or \
-                             reducing the number of concurrent dataset loads. See {S3_DOCS}#params \
-                             for details."
-                        )
-                        .into(),
+                        source: message.into(),
                     };
                 }
 
@@ -425,25 +423,7 @@ impl ListingTableConnector for S3 {
     }
 }
 
-/// Walks an `object_store` error's source chain for the typed `HttpError`.
-/// `object_store` 0.13 classifies `reqwest`/`hyper`/I/O timeouts into
-/// `HttpErrorKind::Timeout` before flattening the error into
-/// `object_store::Error::Generic`, so we can detect timeouts via a typed downcast
-/// rather than matching on the error message.
-fn object_store_http_error_kind(
-    source: &(dyn std::error::Error + 'static),
-) -> Option<HttpErrorKind> {
-    let mut next = Some(source);
-    while let Some(err) = next {
-        if let Some(http_error) = err.downcast_ref::<HttpError>() {
-            return Some(http_error.kind());
-        }
-        next = err.source();
-    }
-    None
-}
-
-register_data_connector!("s3", S3Factory);
+data_connector_api::register_data_connector!("s3", S3Factory);
 
 #[cfg(test)]
 mod tests {
@@ -453,13 +433,14 @@ mod tests {
         component::dataset::{Dataset, builder::DatasetBuilder},
     };
     use app::AppBuilder;
+    use object_store::client::{HttpError, HttpErrorKind};
     use runtime_secrets::Secrets;
     use tokio::sync::RwLock;
 
     fn create_test_connector(params: Parameters) -> S3 {
         S3 {
             params,
-            runtime: None,
+            app: None,
             tokio_io_runtime: tokio::runtime::Handle::current(),
         }
     }

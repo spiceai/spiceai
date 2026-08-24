@@ -166,12 +166,12 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
 /// unchanged. The same `task_history` exclusion as the console layer is
 /// applied so span-only records don't pollute the log tail.
 fn cloud_connect_log_capture_layer<S>(
-    cloud_connect_flag: bool,
+    cloud_connect_configured: bool,
 ) -> Option<Box<dyn Layer<S> + Send + Sync>>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    if !crate::cloud_connect::is_configured(cloud_connect_flag) {
+    if !cloud_connect_configured {
         return None;
     }
     let ring = crate::log_capture::install(crate::log_capture::DEFAULT_CAPACITY);
@@ -186,8 +186,98 @@ where
     )
 }
 
+/// The bounded, rotating log files a supervised runtime writes, shared between
+/// every `fmt` layer that writes to them.
+///
+/// One handle behind a mutex rather than one per call: rotation renames the
+/// live file, and two writers rotating independently would each keep their own
+/// idea of which file they are appending to.
+#[derive(Clone)]
+struct ServiceLogWriter(Arc<std::sync::Mutex<runtime_cloud_connect::service_log::RotatingLog>>);
+
+impl ServiceLogWriter {
+    /// Open the log files for a service started with `--service-log-dir`.
+    fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self(Arc::new(std::sync::Mutex::new(
+            runtime_cloud_connect::service_log::RotatingLog::open(dir)?,
+        ))))
+    }
+}
+
+impl std::io::Write for ServiceLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // A poisoned mutex means another thread panicked mid-record. The
+        // remedy is still to write this one: losing the log of a process that
+        // is failing is losing the account of why.
+        let mut log = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut log = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log.flush()
+    }
+}
+
+impl<'a> fmt::MakeWriter<'a> for ServiceLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Build the layer that writes the console log to a supervised instance's own
+/// bounded files, or `None` when this runtime was not started with
+/// `--service-log-dir`.
+///
+/// Added *alongside* the terminal layer rather than replacing it: a supervisor
+/// may also be capturing stdout, and a runtime started by hand with the flag
+/// must still print to the terminal it was started from.
+///
+/// Never coloured. These files are read back by `spice cloud logs`
+/// and by whatever an operator greps them with, and SGR escapes between the
+/// level and the target defeat a pattern written the way the line reads.
+///
+/// # Errors
+///
+/// Returns an error when the directory or its live file cannot be opened. This
+/// fails startup on purpose: these files are the only log a managed service
+/// has, and a service that came up with nowhere to write them would be
+/// diagnosed by nothing.
+fn service_log_layer<S>(
+    dir: Option<&std::path::Path>,
+) -> std::io::Result<Option<Box<dyn Layer<S> + Send + Sync>>>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let writer = ServiceLogWriter::open(dir)?;
+    Ok(Some(
+        fmt::layer()
+            .with_ansi(false)
+            .with_writer(writer)
+            .with_filter(filter::filter_fn(|metadata| {
+                metadata.target() != "task_history"
+            }))
+            .boxed(),
+    ))
+}
+
 /// The layer that writes the human-readable log to `writer`, `spiced`'s stdout
 /// in production.
+///
+/// A query's trace id arrives as a field of an entered span, which the default
+/// event format renders ahead of the target — see
+/// `runtime::task_history::correlation`. Nothing here does that work.
 ///
 /// `ansi` decides whether each line carries SGR escapes. It is a parameter
 /// rather than a literal because the answer depends on where the writer points:
@@ -237,7 +327,8 @@ pub(crate) async fn init_tracing(
     config: Option<&TracingConfig>,
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
-    cloud_connect_flag: bool,
+    cloud_connect_configured: bool,
+    service_log_dir: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -263,7 +354,18 @@ pub(crate) async fn init_tracing(
         .with(task_history_layer)
         .with(progress_layer())
         .with(console_layer(ansi, std::io::stdout))
-        .with(cloud_connect_log_capture_layer(cloud_connect_flag));
+        .with(service_log_layer(service_log_dir).map_err(|e| {
+            format!(
+                "Failed to open the Spice service log directory {}: {e}. A managed service writes \
+                 its only log here, so it is not started without one. Check the directory exists \
+                 and that this account can write it, then re-run \
+                 `spice cloud service install`. See: https://spiceai.org/docs",
+                service_log_dir
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .display()
+            )
+        })?)
+        .with(cloud_connect_log_capture_layer(cloud_connect_configured));
 
     tracing::subscriber::set_global_default(subscriber)?;
     // Routes `log` records — which most of the dependency graph, DataFusion
@@ -610,7 +712,7 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(
-                target: "runtime::accelerated_table::refresh_task",
+                target: "runtime::accelerated::refresh_task",
                 "Failed to load data for dataset taxi_trips"
             );
             tracing::info!(target: "task_history", "sql_query");
@@ -637,6 +739,57 @@ mod tests {
         assert!(
             !plain.contains("sql_query"),
             "task_history records belong to the task-history table, not the console, got: {plain}"
+        );
+    }
+
+    /// The point of the whole exercise: a query's records name the id that
+    /// finds them — including records from a crate that knows nothing about
+    /// task history — while a record outside any query claims no id.
+    #[test]
+    fn console_layer_names_the_trace_id_of_the_task_in_scope() {
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let probe = ProbeWriter::default();
+        let subscriber = tracing_subscriber::registry().with(console_layer(false, probe.clone()));
+
+        let request_context = runtime_request_context::RequestContext::builder(
+            runtime_request_context::Protocol::Http,
+        )
+        .with_client_trace_id(Some(std::sync::Arc::from(trace_id)))
+        .build();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let trace = runtime::task_history::correlation::begin_task_trace(
+                &tracing::Span::none(),
+                &request_context,
+            );
+            trace.in_scope(|| {
+                tracing::warn!(target: "data_components", "connection reset by peer");
+            });
+            tracing::warn!(target: "runtime", "loaded dataset taxi_trips");
+        });
+
+        let logged = probe.contents();
+        let named = format!(
+            "{}{{trace_id={trace_id}}}",
+            runtime::task_history::correlation::TRACE_SPAN_NAME
+        );
+
+        let inside = logged
+            .lines()
+            .find(|line| line.contains("connection reset"))
+            .expect("a record from another crate must reach the console");
+        assert!(
+            inside.contains(&named),
+            "a query-derived record must name the query's trace id, got: {inside}"
+        );
+
+        let outside = logged
+            .lines()
+            .find(|line| line.contains("taxi_trips"))
+            .expect("a record outside any task must reach the console");
+        assert!(
+            !outside.contains("trace_id"),
+            "a record emitted outside a task has no id to claim, got: {outside}"
         );
     }
 

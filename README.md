@@ -309,6 +309,61 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch` | Elasticsearch with kNN                                               | Alpha  |
 
+## Change Forwarding to Drasi (Alpha)
+
+> **Alpha** — Drasi support is in preview and should not be used in production.
+
+Configured as `.drasi` on a dataset accelerated with `refresh_mode: changes`. Publishes the dataset's change-data-capture stream to a [Drasi](https://drasi.io) source, so Drasi continuous queries react to the same changes Spice applies to the local accelerator. One row becomes one graph node: the primary key derives the element id, the source table name becomes the node label, and the row's columns become node properties.
+
+Forwarding runs before the change is acknowledged to the source, so delivery is at-least-once — a change is replayed rather than lost if Drasi is unreachable.
+
+```yaml
+datasets:
+  - from: postgres:public.orders
+    name: orders
+    acceleration:
+      enabled: true
+      engine: cayenne
+      refresh_mode: changes
+    drasi:
+      source_id: spice-cdc
+      delivery: queued          # or `acknowledged` (default)
+      params:
+        drasi_http_endpoint: http://localhost:9000
+```
+
+| Transport | Description                                                                    | Status |
+| --------- | ------------------------------------------------------------------------------ | ------ |
+| `http`    | Batched POST to a Drasi Server HTTP source                                     | Alpha  |
+| `redis`   | CloudEvents envelopes on the Redis stream a Drasi platform source consumes      | Alpha  |
+
+`delivery` selects when a change counts as handed off, which is the throughput/durability trade:
+
+| `delivery` | Replication | On failure |
+| ---------- | ----------- | ---------- |
+| `acknowledged` (default) | Advances only once Drasi has the change, so nothing is lost — a stall or crash replays it. A slow or unreachable Drasi slows or stops replication. | `on_delivery_error`: `block` (default) retries indefinitely; `skip` gives up after a bounded budget and continues; `fail` stops the stream. |
+| `queued` | Never waits for Drasi — the change is queued locally and the replication position acknowledged immediately, with delivery retried in the background. `on_delivery_error` does not apply. | A failure that could clear is written to a durable dead-letter store under `.spice/data/drasi` and retried until it lands, surviving a restart. One that never clears is counted and discarded, so it cannot block later changes. |
+
+Use `queued` when Drasi is a downstream consumer whose availability should not pace replication; keep `acknowledged` when no change may be missed.
+
+Under `queued`, the replication log is no longer what replays a failure — the dead-letter store is. Because an insert or update is a full-state replace keyed by element id, redelivery must not be overtaken by newer changes for the same row, so the store is stop-the-line: once anything is pending, later changes queue behind it and delivery resumes only once it drains. Drasi's view of a dataset advances in order or not at all. The store is capped (1024 batches per component); past that the oldest is discarded and counted, since the newest state for a row is the state worth keeping.
+
+`forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
+
+Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
+
+```yaml
+runtime:
+  drasi:
+    source_id: spice-runtime
+    params:
+      drasi_http_endpoint: http://localhost:9000
+    tables:
+      - name: task_history
+```
+
+Runtime tables are always queued — they have no replication position to hold, so there is nothing for blocking to protect. Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
+
 ## Supported Catalogs
 
 Catalog Connectors connect to external catalog providers and make their tables available for federated SQL query in Spice. The schema hierarchy of the external catalog is preserved.
@@ -321,7 +376,7 @@ Catalog Connectors connect to external catalog providers and make their tables a
 | `iceberg`       | Apache Iceberg          | Beta   | Parquet                      |
 | `ducklake`      | DuckLake                | Beta   | Parquet                      |
 | `glue`          | AWS Glue                | Alpha  | CSV, Parquet, Iceberg        |
-| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Alpha | PostgreSQL Wire Protocol |
+| `pg`            | PostgreSQL (with native WAL CDC catalog acceleration) | Beta | PostgreSQL Wire Protocol |
 
 ## Supported Secret Stores
 

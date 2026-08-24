@@ -36,8 +36,10 @@ limitations under the License.
 //!
 //! Coverage is env-scalable for CI without code changes (see `env_scale`):
 //! `CAYENNE_PROPTEST_SCALE` multiplies the seed count of every config, and
-//! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both default
-//! to 1 (a fast local run).
+//! `CAYENNE_PROPTEST_OPS_SCALE` multiplies the per-seed op count. Both accept
+//! fractional values (e.g. `0.25` for a lighter per-PR pass) and default to 1
+//! (the current fast local run). Scaling never drops a config below 1 seed/op,
+//! so every config still runs on every PR — only its depth changes.
 //!
 //! All configs currently converge — the convergence/resurrection defects this
 //! harness surfaced are fixed (see the PR description for the linked fixes). If
@@ -986,20 +988,45 @@ async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
 //   * `CAYENNE_PROPTEST_OPS_SCALE` — multiplies the per-seed OP count (longer
 //     sequences = deeper histories; costlier in the concurrent configs because
 //     each op carries a small real-time sleep, so scale this more gently).
-// Both default to 1 and accept any positive integer; a missing/zero/unparseable
-// value is treated as 1.
-fn env_scale(var: &str) -> u64 {
+// Both default to 1 and accept any positive number, including fractions below 1
+// (e.g. `0.25` for a lighter per-PR pass); a missing/non-positive/unparseable
+// value is treated as 1. The scaled result is always rounded up to at least 1,
+// so no config's seed/op count can be scaled away to 0 — every config still
+// runs, just shallower.
+fn env_scale(var: &str) -> f64 {
     std::env::var(var)
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(1)
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&v| v > 0.0)
+        .unwrap_or(1.0)
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "base seed counts are small (<1_000); exact in f64"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
 fn scaled_seeds(base: u64) -> u64 {
-    base * env_scale("CAYENNE_PROPTEST_SCALE")
+    ((base as f64) * env_scale("CAYENNE_PROPTEST_SCALE"))
+        .round()
+        .max(1.0) as u64
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "base op counts are small (<1_000); exact in f64"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "env_scale() is always positive and the result is floored at 1.0 before casting"
+)]
 fn scaled_ops(base: usize) -> usize {
-    base * usize::try_from(env_scale("CAYENNE_PROPTEST_OPS_SCALE")).expect("scale fits usize")
+    ((base as f64) * env_scale("CAYENNE_PROPTEST_OPS_SCALE"))
+        .round()
+        .max(1.0) as usize
 }
 
 // ============================================================================
@@ -1204,6 +1231,43 @@ fn concurrent_cold() -> Workload {
         cold: true,
     }
 }
+
+// --- Harness ---
+
+/// The workloads below plan deeply enough that some need more stack than the
+/// 2 MiB std gives a thread, so `test_with_backends!` runs every body on a
+/// `common::TEST_STACK_SIZE` thread. Assert that headroom directly: it is a
+/// property of the harness, not of any one workload, and without a test of its
+/// own a harness change that dropped it would surface as an unrelated
+/// workload's process aborting on whichever backend happens to plan deepest.
+///
+/// Touches 4 MiB — twice the std default, a quarter of what the harness
+/// reserves — so it overflows without the harness and clears it with room to
+/// spare.
+async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
+    /// 64 KiB per frame, kept out of the caller's frame by `inline(never)` and
+    /// out of the optimizer's reach by `black_box`.
+    #[inline(never)]
+    fn descend(frames: u32) {
+        // Consuming stack is the whole assertion, so the lint's advice to move
+        // this to the heap would leave the test measuring nothing. The size is
+        // deliberate, and it is bounded: 64 KiB × 64 frames against the 16 MiB
+        // `common::TEST_STACK_SIZE` the harness reserves.
+        #[expect(
+            clippy::large_stack_arrays,
+            reason = "the frame must live on the stack for this to test stack headroom"
+        )]
+        let mut frame = [0u8; 64 * 1024];
+        std::hint::black_box(&mut frame);
+        if frames > 0 {
+            descend(frames - 1);
+        }
+    }
+
+    descend(63);
+    Ok(())
+}
+test_with_backends!(prop_harness_stack_headroom_impl);
 
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {

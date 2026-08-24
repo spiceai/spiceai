@@ -40,7 +40,7 @@ use datafusion::{
     },
 };
 use futures::{TryFutureExt, TryStreamExt};
-use runtime::component::dataset::Dataset;
+use runtime_component::dataset::DatasetSpec;
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -60,8 +60,8 @@ impl WorkflowsTableProvider {
         client: GithubRestClient,
         owner: &str,
         repo: &str,
-        dataset: &Dataset,
-    ) -> runtime::dataconnector::DataConnectorResult<Self> {
+        dataset: &DatasetSpec,
+    ) -> data_connector_api::DataConnectorResult<Self> {
         let fields = vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),

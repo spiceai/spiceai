@@ -32,13 +32,18 @@ limitations under the License.
 //!   initialized before any `${ store:KEY }` resolution is possible, so that
 //!   would be a chicken-and-egg cycle. Only the bootstrap `env` store is
 //!   available at this point.
-//! - [`non_empty`] / [`non_empty_secret`] / [`non_empty_path`] normalize blank
-//!   values to `None`, used by the stores' `into_config` conversions.
+//! - `non_empty` / `non_empty_secret` / `non_empty_path` normalize blank
+//!   values to `None`, used by the stores' `into_config` conversions. Each is
+//!   compiled only for the store features that call it, so a build without
+//!   those stores does not carry them as dead code.
 
 use std::collections::HashMap;
+#[cfg(feature = "hashicorp_vault")]
 use std::path::PathBuf;
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
+use secrecy::SecretString;
 use snafu::prelude::*;
 
 use crate::SecretStore;
@@ -50,6 +55,7 @@ use crate::lexer::SecretReplacementMatcher;
 /// a whitespace-only value from a templated config) as *absent* — otherwise an
 /// empty string would slip past validation and surface later as an opaque SDK
 /// error instead of a clean "missing parameter".
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
 #[must_use]
 pub(crate) fn non_empty(value: Option<String>) -> Option<String> {
     let trimmed = value.map(|v| v.trim().to_string())?;
@@ -62,6 +68,7 @@ pub(crate) fn non_empty(value: Option<String>) -> Option<String> {
 
 /// [`non_empty`] for secret values: trims and drops blanks without leaving the
 /// trimmed bytes in a non-zeroizing intermediate `String`.
+#[cfg(any(feature = "azure-keyvault", feature = "hashicorp_vault"))]
 #[must_use]
 pub(crate) fn non_empty_secret(value: Option<SecretString>) -> Option<SecretString> {
     let value = value?;
@@ -74,6 +81,7 @@ pub(crate) fn non_empty_secret(value: Option<SecretString>) -> Option<SecretStri
 }
 
 /// [`non_empty`] for filesystem-path values.
+#[cfg(feature = "hashicorp_vault")]
 #[must_use]
 pub(crate) fn non_empty_path(value: Option<PathBuf>) -> Option<PathBuf> {
     let value = value?;

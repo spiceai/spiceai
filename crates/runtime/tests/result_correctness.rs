@@ -26,6 +26,7 @@ limitations under the License.
 //! Standalone DuckDB↔SQLite agreement (no Spice) lives under
 //! `result_correctness_standalone_engines_test`.
 
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
@@ -35,6 +36,12 @@ limitations under the License.
 // SQLite INTEGER widened into a Float64 column when the inferred column kind is
 // real; fixture values are far inside f64's exact-integer range.
 #![allow(clippy::cast_precision_loss)]
+
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -237,10 +244,10 @@ mod sqlite_accel {
     use super::{
         compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
     };
+    use accelerator_sqlite::SqliteAccelerator;
     use arrow::array::RecordBatch;
+    use data_accelerator_api::DataAccelerator;
     use datafusion::datasource::TableProvider;
-    use runtime::dataaccelerator::DataAccelerator;
-    use runtime::dataaccelerator::sqlite::SqliteAccelerator;
     use rusqlite::Connection;
     use std::sync::Arc;
 
@@ -483,11 +490,11 @@ mod duckdb_accel {
     use super::{
         compare, create_cmd, insert_batch, make_dim, make_fact, micro_queries, spice_query,
     };
+    use accelerator_duckdb::DuckDBAccelerator;
     use arrow::array::RecordBatch;
+    use data_accelerator_api::DataAccelerator;
     use datafusion::datasource::TableProvider;
     use duckdb::Connection;
-    use runtime::dataaccelerator::DataAccelerator;
-    use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
     use std::sync::Arc;
 
     fn load_standalone_duckdb(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {

@@ -10,9 +10,12 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+data-connector-api = { path = "../data-connector-api" }
+data-accelerator-api = { path = "../data-accelerator-api" }
 datafusion.workspace = true
 reqwest.workspace = true
 runtime = { path = "../runtime" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true

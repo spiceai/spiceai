@@ -42,7 +42,7 @@ pub enum ParseCloudEnumError {
     ))]
     InvalidUpdateChannel { input: String },
     #[snafu(display("invalid kind '{input}'. Expected one of: set, cluster"))]
-    InvalidAppKind { input: String },
+    InvalidProjectKind { input: String },
 }
 
 impl std::fmt::Display for UpdateChannel {
@@ -72,17 +72,17 @@ impl std::str::FromStr for UpdateChannel {
     }
 }
 
-/// App kind — determines whether the app is a `SpicepodSet` or `SpicepodCluster`.
+/// Project kind — determines whether the project is a `SpicepodSet` or `SpicepodCluster`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum AppKind {
+pub enum ProjectKind {
     /// Standard scheduler-only deployment.
     Set,
     /// Distributed deployment with separate scheduler and executor pods.
     Cluster,
 }
 
-impl std::fmt::Display for AppKind {
+impl std::fmt::Display for ProjectKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Set => write!(f, "set"),
@@ -91,14 +91,14 @@ impl std::fmt::Display for AppKind {
     }
 }
 
-impl std::str::FromStr for AppKind {
+impl std::str::FromStr for ProjectKind {
     type Err = ParseCloudEnumError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "set" | "spicepodset" => Ok(Self::Set),
             "cluster" | "spicepodcluster" => Ok(Self::Cluster),
-            _ => Err(ParseCloudEnumError::InvalidAppKind {
+            _ => Err(ParseCloudEnumError::InvalidProjectKind {
                 input: s.to_string(),
             }),
         }
@@ -106,25 +106,70 @@ impl std::str::FromStr for AppKind {
 }
 
 // ============================================================================
-// Apps
+// Organizations
+// ============================================================================
+
+/// An organization the authenticated identity can act on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Org {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub name: String,
+    #[serde(default, alias = "displayName", alias = "display_name")]
+    pub display_name: Option<String>,
+    /// Membership role (`owner`, `admin`, `member`, ...) when the API reports one.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Wire format for org listings. The endpoint may return either a bare array or
+/// an `{"orgs": [...]}` envelope, so accept both.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OrgsResponse {
+    Wrapped { orgs: Vec<Org> },
+    Bare(Vec<Org>),
+}
+
+impl OrgsResponse {
+    #[must_use]
+    pub fn into_orgs(self) -> Vec<Org> {
+        match self {
+            Self::Wrapped { orgs } | Self::Bare(orgs) => orgs,
+        }
+    }
+}
+
+// ============================================================================
+// Projects
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct App {
+pub struct Project {
     pub id: i64,
     pub name: String,
     #[serde(default)]
     pub org: String,
+    /// Which kind of project this is (`managed`, `standalone`, ...), as Spice
+    /// Cloud resolved it.
+    ///
+    /// Carried verbatim rather than parsed into a closed set: the kind is the
+    /// server's to decide, the set of kinds grows without a new CLI, and a
+    /// binary already in the field must still be able to read a project whose
+    /// kind it has never heard of. Absent when the control plane predates the
+    /// field.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub description: Option<String>,
     pub visibility: Option<String>,
     pub created_at: Option<String>,
     pub region: Option<String>,
     pub production_branch: Option<String>,
     #[serde(default)]
-    pub config: Option<AppConfig>,
+    pub config: Option<ProjectConfig>,
 }
 
-impl App {
+impl Project {
     #[must_use]
     pub fn full_name(&self) -> String {
         if self.org.is_empty() {
@@ -133,33 +178,66 @@ impl App {
             format!("{}/{}", self.org, self.name)
         }
     }
+
+    /// The region whose data plane serves this project's instances.
+    ///
+    /// Spice Cloud reports a Spice-managed project's region at the top level
+    /// of the project record. A Cloud Connect project has no region of its
+    /// own at creation — it follows from where the attached instance
+    /// connects, and Spice Cloud records it only on the project config — so
+    /// consult both. `None` means no instance can be reached yet.
+    #[must_use]
+    pub fn data_plane_region(&self) -> Option<&str> {
+        self.region.as_deref().or_else(|| {
+            self.config
+                .as_ref()
+                .and_then(|config| config.region.as_deref())
+        })
+    }
 }
 
+/// Wire format for a project listing.
+///
+/// Spice Cloud renamed apps to projects and serves both spellings: the
+/// canonical `/v1/projects` answers with a `projects` envelope, while the
+/// preserved `/v1/apps` alias keeps its original `apps` envelope. Accept
+/// either so the CLI reads the same on both paths and across the rename.
 #[derive(Debug, Deserialize)]
-pub struct AppsResponse {
-    pub apps: Vec<App>,
+#[serde(untagged)]
+pub enum ProjectsResponse {
+    Projects { projects: Vec<Project> },
+    Apps { apps: Vec<Project> },
+}
+
+impl ProjectsResponse {
+    #[must_use]
+    pub fn into_projects(self) -> Vec<Project> {
+        match self {
+            Self::Projects { projects } | Self::Apps { apps: projects } => projects,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppExecutor {
+pub struct ProjectExecutor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppConfig {
+pub struct ProjectConfig {
     pub spicepod: Option<serde_json::Value>,
     pub registry: Option<String>,
     pub image: Option<String>,
     pub image_tag: Option<String>,
     pub update_channel: Option<String>,
     pub replicas: Option<i32>,
-    pub resources: Option<AppResources>,
-    pub executor: Option<AppExecutor>,
+    pub resources: Option<ProjectResources>,
+    pub executor: Option<ProjectExecutor>,
     pub region: Option<String>,
     pub node_group: Option<String>,
     pub storage_size_gb: Option<f64>,
@@ -168,14 +246,14 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResources {
-    pub limits: AppResourceLimits,
+pub struct ProjectResources {
+    pub limits: ProjectResourceLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests: Option<AppResourceRequests>,
+    pub requests: Option<ProjectResourceRequests>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResourceLimits {
+pub struct ProjectResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
     /// Omitted when the caller leaves memory unspecified; Cloud API treats the missing field as
@@ -187,7 +265,7 @@ pub struct AppResourceLimits {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppResourceRequests {
+pub struct ProjectResourceRequests {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,7 +273,7 @@ pub struct AppResourceRequests {
 }
 
 #[derive(Debug, Serialize)]
-pub struct CreateAppRequest {
+pub struct CreateProjectRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -213,15 +291,15 @@ pub struct CreateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor: Option<AppExecutor>,
+    pub executor: Option<ProjectExecutor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]
-pub struct UpdateAppRequest {
+pub struct UpdateProjectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,9 +315,9 @@ pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spicepod: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resources: Option<AppResources>,
+    pub resources: Option<ProjectResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub executor: Option<AppExecutor>,
+    pub executor: Option<ProjectExecutor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_size_gb: Option<f64>,
 }
@@ -401,46 +479,6 @@ pub struct RegenerateApiKeyRequest {
 }
 
 // ============================================================================
-// Standalone instance adoption codes
-// ============================================================================
-
-/// Request body for `POST /v1/instance-adoption-codes`, the management-API
-/// mint a logged-in `spice connect` uses instead of making the customer copy a
-/// code out of the portal.
-#[derive(Debug, Default, Serialize)]
-pub struct MintAdoptionCodeRequest {
-    /// Display label for the adoption-codes screen — who minted this and why.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// Lifetime in seconds. Omitted to take the endpoint's short default,
-    /// which is what a mint-and-redeem-immediately caller wants: a code that
-    /// outlives its own enroll is a live org credential nobody is holding.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_seconds: Option<u32>,
-    /// The org the caller believes it is minting into. An **assertion, not a
-    /// selection** — the org always comes from the token, and a mismatch is a
-    /// not-found. Without it, a token bound to org A plus `--org B` would mint
-    /// quietly into A.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org: Option<String>,
-}
-
-/// Response from `POST /v1/instance-adoption-codes`. The plaintext code is
-/// returned exactly once, at mint.
-#[derive(Debug, Deserialize)]
-pub struct MintAdoptionCodeResponse {
-    /// The plaintext adoption code. Never logged, never written to disk.
-    pub code: String,
-    /// The org the code is scoped to, as the cloud resolved it from the token.
-    #[serde(default)]
-    pub org: Option<String>,
-    /// RFC 3339 expiry, for an error message that can say how long the code
-    /// was good for.
-    #[serde(default)]
-    pub expires_at: Option<String>,
-}
-
-// ============================================================================
 // Metrics
 // ============================================================================
 
@@ -580,15 +618,18 @@ mod tests {
     #[test]
     fn app_kind_parse_error_is_typed() {
         let error = "worker"
-            .parse::<AppKind>()
+            .parse::<ProjectKind>()
             .expect_err("invalid app kind should fail");
 
-        assert!(matches!(error, ParseCloudEnumError::InvalidAppKind { .. }));
+        assert!(matches!(
+            error,
+            ParseCloudEnumError::InvalidProjectKind { .. }
+        ));
     }
 
     #[test]
     fn resource_limits_omit_unspecified_memory() {
-        let limits = AppResourceLimits {
+        let limits = ProjectResourceLimits {
             cpu: Some("2".to_string()),
             memory: None,
             ephemeral_storage: None,
@@ -599,8 +640,81 @@ mod tests {
     }
 
     #[test]
+    fn project_listings_parse_on_both_sides_of_the_rename() {
+        // Spice Cloud serves `/v1/projects` with a `projects` envelope and
+        // keeps `/v1/apps` with its original `apps` envelope for existing
+        // clients. The CLI must read the same from either, so switching paths
+        // later is a one-line change and never a parse failure in the field.
+        let projects: ProjectsResponse =
+            serde_json::from_str(r#"{"projects":[{"id":1,"name":"team-app","org":"spicehq"}]}"#)
+                .expect("projects envelope should deserialize");
+        assert_eq!(projects.into_projects()[0].name, "team-app");
+
+        let apps: ProjectsResponse =
+            serde_json::from_str(r#"{"apps":[{"id":1,"name":"team-app","org":"spicehq"}]}"#)
+                .expect("legacy apps envelope should deserialize");
+        assert_eq!(apps.into_projects()[0].name, "team-app");
+    }
+
+    #[test]
+    fn data_plane_region_consults_the_project_record_then_the_config() {
+        fn project(region: Option<&str>, config_region: Option<&str>) -> Project {
+            Project {
+                id: 1,
+                name: "team-app".to_string(),
+                org: "spicehq".to_string(),
+                kind: None,
+                description: None,
+                visibility: None,
+                created_at: None,
+                region: region.map(str::to_string),
+                production_branch: None,
+                config: config_region.map(|region| ProjectConfig {
+                    region: Some(region.to_string()),
+                    ..ProjectConfig::default()
+                }),
+            }
+        }
+
+        // A Spice-managed project reports its region on the project record.
+        assert_eq!(
+            project(Some("us-east-1-prod-aws-data"), Some("us-west-2")).data_plane_region(),
+            Some("us-east-1-prod-aws-data")
+        );
+        // A Cloud Connect project reports it only on the project config, once
+        // an instance is attached; commands that reach the data plane must
+        // resolve this shape too, or every health/logs/datasets read fails.
+        assert_eq!(
+            project(None, Some("us-west-2")).data_plane_region(),
+            Some("us-west-2")
+        );
+        // Neither set: there is no data-plane endpoint to derive.
+        assert_eq!(project(None, None).data_plane_region(), None);
+    }
+
+    #[test]
+    fn orgs_response_accepts_wrapped_and_bare_payloads() {
+        let wrapped: OrgsResponse = serde_json::from_str(
+            r#"{"orgs":[{"id":1,"name":"spicehq","displayName":"Spice HQ","role":"owner"}]}"#,
+        )
+        .expect("wrapped org listing should deserialize");
+        let orgs = wrapped.into_orgs();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "spicehq");
+        assert_eq!(orgs[0].display_name.as_deref(), Some("Spice HQ"));
+        assert_eq!(orgs[0].role.as_deref(), Some("owner"));
+
+        let bare: OrgsResponse = serde_json::from_str(r#"[{"name":"lukekim"}]"#)
+            .expect("bare org listing should deserialize");
+        let orgs = bare.into_orgs();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "lukekim");
+        assert!(orgs[0].id.is_none());
+    }
+
+    #[test]
     fn app_config_preserves_unknown_update_channel() {
-        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+        let config = serde_json::from_value::<ProjectConfig>(serde_json::json!({
             "update_channel": "next"
         }))
         .expect("unknown update channels should deserialize");

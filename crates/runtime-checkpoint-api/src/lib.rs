@@ -34,27 +34,44 @@ limitations under the License.
 //!
 //! | shape (this crate) | store trait | used by |
 //! |---|---|---|
-//! | [`BlobCheckpoint`] — one opaque `String` | [`BlobCheckpointStore`] | `DynamoDB` (and any connector that serializes its whole state) |
-//! | `KafkaOffsetRow { dataset, topic, partition, offset }` *(planned)* | `KafkaOffsetStore` — per-partition upsert with `offset = GREATEST(new, old)` | `Kafka`, `Debezium` |
-//! | `MySqlBinlogCheckpoint { file, pos, … }` *(planned)* | … | `MySQL` |
-//! | `MongoCheckpoint { resume_token, cluster_time_ts, … }` *(planned)* | … | `MongoDB` |
+//! | [`BlobCheckpoint`] — one opaque `String` | [`BlobCheckpointStore`] | `DynamoDB`, the `PostgreSQL` replication watermark (and any connector that serializes its whole state) |
+//! | [`kafka::KafkaCheckpoint`] + [`kafka::KafkaOffset`] rows | [`kafka::KafkaCheckpointStore`] — per-partition upsert resolving to `GREATEST(new, old)` | `Kafka` |
+//! | [`debezium::DebeziumCheckpoint`] + [`kafka::KafkaOffset`] rows | [`debezium::DebeziumCheckpointStore`] | `Debezium` (its events arrive over Kafka, so the offset rows are shared) |
+//! | [`mysql_binlog::MySqlBinlogCheckpoint`] | [`mysql_binlog::MySqlBinlogStore`] | `MySQL` |
+//! | [`mongodb::MongoCheckpointMetadata`] | [`mongodb::MongoCheckpointStore`] | `MongoDB` |
 //!
 //! The shape structs are **plain data** — this crate names no `rdkafka`, `aws-sdk-*`,
-//! `mysql`, or `mongodb` type — so it takes zero source-library dependencies and needs
-//! no capability features. That keeps each connector's on-disk schema intact (no forced
-//! blob migration) while still letting every store be reached as a small object-safe
-//! `Arc<dyn …Store>`.
+//! `mysql`, `mongodb`, or even Arrow type — so it takes zero source-library
+//! dependencies and needs no capability features. A schema snapshot travels as its
+//! durable JSON encoding (`schema_json`), which callers convert with
+//! `arrow_tools::schema::{schema_to_json, schema_from_json}`. That keeps each
+//! connector's on-disk schema intact (no forced blob migration) while still letting
+//! every store be reached as a small object-safe `Arc<dyn …Store>`.
 //!
-//! Persistence for each shape is implemented **per storage engine** in the sibling
-//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates (one crate per engine so
-//! the stitch binary links only the engines it enables — `feature = crate`); the
-//! `runtime` crate resolves a dataset to its accelerator connection and constructs the
-//! matching store.
+//! # Where each shape is implemented
+//!
+//! Every shape is implemented **per storage engine**, in the sibling
+//! `runtime-checkpoint-{duckdb,sqlite,postgres,turso}` crates — one crate per engine, so
+//! the stitch binary links only the engines it enables. Each of those crates bundles its
+//! stores behind `runtime_acceleration::sidecar::AcceleratorSidecar`, which the engine's
+//! accelerator returns from `DataAccelerator::sidecar`.
+//!
+//! That indirection is what keeps a caller from naming an engine: the runtime resolves a
+//! dataset to its accelerator, asks for the sidecar, and takes the store it wants. It
+//! never learns which engine answered, and — more importantly — never has to depend on
+//! the engine crate to ask.
 
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use snafu::Snafu;
+
+pub mod debezium;
+pub mod kafka;
+pub mod mongodb;
+pub mod mysql_binlog;
+pub mod offsets;
+pub mod retry;
 
 /// A persisted **blob** checkpoint for one dataset: the connector-serialized, opaque
 /// `data` payload plus the store-managed timestamp of its last write (connectors use

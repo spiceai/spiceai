@@ -1,0 +1,97 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::Arc;
+
+use datafusion::catalog::TableProvider;
+use datafusion::sql::TableReference;
+use tokio::sync::RwLock;
+
+use crate::accelerated::AcceleratedTable;
+use crate::accelerated::refresh::Refresher;
+
+#[derive(Clone)]
+pub struct SynchronizedTable {
+    parent_dataset_name: TableReference,
+    child_dataset_name: TableReference,
+    child_accelerator: Arc<dyn TableProvider>,
+    refresher: Arc<Refresher>,
+    /// Reference to parent's synchronized children list (for caching mode registration)
+    parent_synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
+    /// Reference to parent's accelerator (for initializing child from existing data)
+    parent_accelerator: Arc<dyn TableProvider>,
+}
+
+impl std::fmt::Debug for SynchronizedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynchronizedTable")
+            .field("parent_dataset_name", &self.parent_dataset_name)
+            .field("child_dataset_name", &self.child_dataset_name)
+            .field("child_accelerator", &self.child_accelerator)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SynchronizedTable {
+    pub fn from(
+        accelerated_table: &AcceleratedTable,
+        child_accelerator: Arc<dyn TableProvider>,
+        child_dataset_name: TableReference,
+    ) -> Self {
+        Self {
+            parent_dataset_name: accelerated_table.dataset_name.clone(),
+            child_dataset_name,
+            child_accelerator,
+            refresher: accelerated_table.refresher(),
+            parent_synchronized_children: accelerated_table.synchronized_children(),
+            parent_accelerator: accelerated_table.get_accelerator(),
+        }
+    }
+
+    #[must_use]
+    pub fn child_dataset_name(&self) -> TableReference {
+        self.child_dataset_name.clone()
+    }
+
+    #[must_use]
+    pub fn parent_dataset_name(&self) -> TableReference {
+        self.parent_dataset_name.clone()
+    }
+
+    #[must_use]
+    pub fn child_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.child_accelerator)
+    }
+
+    #[must_use]
+    pub fn parent_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.parent_accelerator)
+    }
+
+    #[must_use]
+    pub fn refresher(&self) -> Arc<Refresher> {
+        Arc::clone(&self.refresher)
+    }
+
+    /// Register the child accelerator with the parent for caching mode synchronization.
+    /// This allows the parent to propagate cached data to the child.
+    pub async fn register_child_with_parent(&self) {
+        self.parent_synchronized_children
+            .write()
+            .await
+            .push(Arc::clone(&self.child_accelerator));
+    }
+}

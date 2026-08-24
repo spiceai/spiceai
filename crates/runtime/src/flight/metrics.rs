@@ -33,10 +33,24 @@ pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLoc
     METER
         .f64_histogram("flight_request_duration_ms")
         .with_unit("ms")
+        // The OpenTelemetry default boundaries start at 5ms, so a point-lookup `do_get` would
+        // report a quantile drawn from that first bucket rather than from its own latency.
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
 /// Track a Flight RPC. `command` is a static label for fixed RPC variants.
+///
+/// Record once per RPC, in the handler that knows the command — a second timer
+/// over the same RPC doubles the counter and the histogram. The returned
+/// [`TimeMeasurement`] records on drop: bind it for the span you want measured,
+/// or move it into a [`telemetry::timing::TimedStream`] to span a streamed
+/// response.
+///
+/// Await the call. `let _start = track_flight_request(..)` binds the future, not
+/// the measurement, and a future dropped unpolled records nothing at all —
+/// naming the binding suppresses `unused_must_use`, and
+/// `clippy::let_underscore_future` only fires on the `let _` form.
 pub async fn track_flight_request(
     method: &'static str,
     command: Option<&'static str>,
@@ -60,7 +74,10 @@ pub(crate) async fn track_flight_request_value(
     dimensions.extend(request_context.to_dimensions());
 
     FLIGHT_REQUESTS.add(1, dimensions.as_slice());
-    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions.as_slice())
+    // Moved, not borrowed: `TimeMeasurement::new` takes `impl Into<Vec<KeyValue>>`,
+    // so a slice would deep-clone every label — including the owned `user_agent`
+    // string the request context contributes.
+    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions)
 }
 
 pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {

@@ -87,6 +87,15 @@ fn spicepod_cores_size_the_runtime_pools() {
     // reports for each of them.
     let dedicated = runtime_async::ManagedTokioRuntime::try_new().expect("builds a pool");
     assert_eq!(dedicated.handle().metrics().num_workers(), 1);
+
+    // Installing the budget also declares it to Vortex. Like the budget, the
+    // declaration resolves once per process, so only the test that installs
+    // the budget can assert it.
+    #[cfg(not(windows))]
+    assert_eq!(
+        vortex_utils::parallelism::get_available_parallelism(),
+        Some(2)
+    );
 }
 
 /// `--set-runtime cpu.cores=4` reaches the typed field, so the override surface

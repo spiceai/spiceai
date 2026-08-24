@@ -104,7 +104,7 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// Any Spice-specific function in this list has a real `DuckDB` equivalent and
 /// can therefore be federated (pushed down) to `DuckDB` rather than denied. The
 /// federation deny-list derives its `DuckDB` carve-out from this list (see
-/// `runtime::datafusion::udf::deny_spice_functions_for_duckdb`), so the dialect
+/// [`crate::function_support::deny_spice_functions_for_duckdb`]), so the dialect
 /// and the deny-list stay in sync automatically.
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {

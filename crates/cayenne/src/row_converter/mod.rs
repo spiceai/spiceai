@@ -45,8 +45,8 @@ limitations under the License.
 //! it never re-implements the whole encoder/decoder.
 //!
 //! Only the Arrow types reachable as a Cayenne primary key are supported (all integer/float
-//! primitives, `Boolean`, the byte/string family including views, dates, times, microsecond
-//! timestamps, and decimals). Unsupported types return [`arrow_schema::ArrowError::NotYetImplemented`].
+//! primitives, `Boolean`, the byte/string family including views, dates, times, timestamps at
+//! every unit, and decimals). Unsupported types return [`arrow_schema::ArrowError::NotYetImplemented`].
 
 mod codec;
 mod rows;

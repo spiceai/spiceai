@@ -38,13 +38,13 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
-use runtime_datafusion_index::Index;
+use spice_table::{Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
-use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
@@ -468,10 +468,18 @@ impl Index for ElasticsearchIndex {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))
         });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+        // The refresh-interval override applies to any write window. Clearing the index for
+        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
+        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
+        // or half-populated index to readers for the length of the refresh. It needs an
+        // atomic index-per-refresh alias swap, tracked separately in #12413.
         self.write_maintenance
             .on_write_start(self.client.as_ref(), &self.es_index)
             .await
@@ -720,10 +728,18 @@ impl Index for ElasticsearchTextIndex {
         let futs = batches
             .into_iter()
             .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+        // The refresh-interval override applies to any write window. Clearing the index for
+        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
+        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
+        // or half-populated index to readers for the length of the refresh. It needs an
+        // atomic index-per-refresh alias swap, tracked separately in #12413.
         self.write_maintenance
             .on_write_start(self.client.as_ref(), &self.es_index)
             .await

@@ -40,8 +40,9 @@ use rand::RngExt as _;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::IdentitySource;
+use runtime_tls::TlsConfig;
 use spicepod::{component::dataset::Dataset, param::Params};
 use tempfile::TempDir;
 

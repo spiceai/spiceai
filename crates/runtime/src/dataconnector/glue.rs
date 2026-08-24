@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::ConnectorContext;
+use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
@@ -36,7 +38,7 @@ use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::DatasetSpec,
     parameters::{ParameterSpec, Parameters},
 };
 
@@ -102,21 +104,30 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    /// The loaded app, which the S3 sub-provider needs and a dataset's configuration spec
+    /// does not carry. Held strongly: the app is configuration and references no runtime.
+    app: Option<Arc<App>>,
     tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        params: Parameters,
+        app: Option<Arc<App>>,
+        tokio_io_runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             params,
+            app,
             tokio_io_runtime,
         }
     }
 
     async fn create_table_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.parse_path(false, None).map_err(|e| {
             super::DataConnectorError::InvalidConfiguration {
@@ -193,9 +204,11 @@ impl GlueDataConnector {
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
                 create_s3_provider(
+                    context,
                     input_format,
                     dataset.clone(),
                     self.params.clone(),
+                    self.app.clone(),
                     &table,
                     self.tokio_io_runtime.clone(),
                 )
@@ -250,12 +263,14 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
+            let app = Some(context.app());
+            let glue = GlueDataConnector::new(params.parameters, app, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
         })
     }
@@ -277,18 +292,20 @@ impl DataConnector for GlueDataConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        self.create_table_provider(dataset).await
+        self.create_table_provider(context, dataset).await
     }
 
     #[cfg(feature = "iceberg-write")]
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
-        Some(self.create_table_provider(dataset).await)
+        Some(self.create_table_provider(context, dataset).await)
     }
 }
 
@@ -354,7 +371,7 @@ impl TryFrom<&Table> for InputFormat {
 }
 
 async fn create_iceberg_provider(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     config: &SdkConfig,
     database: String,
     table: &Table,
@@ -478,9 +495,11 @@ async fn create_iceberg_provider(
 }
 
 async fn create_s3_provider(
+    context: &dyn ConnectorContext,
     input_format: InputFormat,
-    mut dataset: Dataset,
+    mut dataset: DatasetSpec,
     mut params: Parameters,
+    app: Option<Arc<App>>,
     table: &Table,
     tokio_io_runtime: tokio::runtime::Handle,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -533,13 +552,13 @@ async fn create_s3_provider(
     params.insert("file_format".into(), input_format.file_format().into());
     let s3 = S3 {
         params,
-        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        app,
         tokio_io_runtime,
     };
 
     dataset.from = from;
 
-    s3.read_provider(&dataset).await
+    s3.read_provider(context, &dataset).await
 }
 
 fn ensure_s3_trailing_slash(s3_location: &str) -> String {

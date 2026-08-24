@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::dataconnector::ConnectorComponent;
-use runtime::datafusion::error::find_datafusion_root;
+use data_connector_api::ConnectorComponent;
+use runtime_datafusion::error::find_datafusion_root;
 
 use super::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
