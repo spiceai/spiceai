@@ -3025,10 +3025,14 @@ fn range_bounds_from_statistics(
     let min = column_stats.min_value.get_value()?;
     let max = column_stats.max_value.get_value()?;
 
-    // Interpolate over the value domain. Only the integer and date families are
-    // covered: they are the CDC key shapes that matter (a monotonic id, a day
-    // bucket), and each divides exactly. Floats and decimals are deliberately
-    // left out rather than approximated into bounds that could collapse.
+    // Interpolate over the value domain. Covered families are the ones backed by a
+    // fixed-width integer whose ordering IS the integer ordering, so a value
+    // interpolated between two of them is one the column can hold: the integers,
+    // `Date32`/`Date64`, `Time32`/`Time64`, the four `Timestamp` units, and
+    // `Decimal128` (whose scale makes it a scaled integer). Floats are excluded --
+    // their ordering is fine, but interpolating through `i128` would collapse a
+    // narrow range to one cut -- as are strings, which the sink compares as
+    // scalars rather than by byte prefix. See `scalar_to_i128`.
     //
     // Both ends must describe the same value domain, or the interpolation would
     // compare across two of them and produce bounds that match neither.
@@ -3111,11 +3115,19 @@ fn merge_input_statistics(plans: &[Arc<dyn ExecutionPlan>]) -> Vec<Arc<Statistic
     /// rather than let a many-file merge pay for it at plan time.
     const MAX_BANDS: usize = 2_048;
 
+    // All-or-nothing, for the same reason the fine path is: a set missing one
+    // plan's rows is not a smaller distribution, it is a WRONG one, and the
+    // histogram cannot tell the difference. Dropping the failures instead would
+    // let two surviving plans look like the whole merge and bias every cut, which
+    // is exactly the partial-input bias the band collection refuses. An empty
+    // vector leaves fewer than two bands, so the histogram declines and the
+    // caller takes its merged-range fallback.
     let aggregates = || -> Vec<Arc<Statistics>> {
         plans
             .iter()
-            .filter_map(|plan| plan.partition_statistics(None).ok())
-            .collect()
+            .map(|plan| plan.partition_statistics(None).ok())
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
     };
 
     let partitions: usize = plans
@@ -39684,6 +39696,63 @@ mod tests {
                 .is_none(),
             "the range interpolation declines the same span"
         );
+    }
+
+    /// The shape the composite gate exists to refuse: a sparse leading column.
+    ///
+    /// `(tenant_id, sequence)` where `tenant_id` takes two values a million apart.
+    /// Splitting on it can reach only two shards however many cuts are produced,
+    /// while hashing the whole key spreads the varying `sequence` across every
+    /// writer. Both ways the inputs can present that column must decline, and the
+    /// bound COUNT is what carries the evidence in each: an equal-width guess over
+    /// the outer range is not admitted at all, and the band walk cannot manufacture
+    /// cuts where no rows are.
+    #[test]
+    fn a_sparse_composite_leading_column_declines_however_its_inputs_are_written() {
+        const SHARDS: usize = 8;
+        const FAR: i64 = 1_000_000;
+
+        // (a) Hash-written inputs: every band reports the whole span, so there is
+        // no occupancy information anywhere in the set. The walk declines on band
+        // width, so the split is not offered histogram evidence at all.
+        let hashed: Vec<Arc<Statistics>> = (0..8).map(|_| band_stats(1, FAR, 10_000)).collect();
+        assert!(
+            range_bounds_from_histogram(&hashed, 0, SHARDS).is_none(),
+            "bands spanning the domain carry no distribution, so they decline"
+        );
+        // Equal-width over that range WOULD produce a full set of cuts — and this
+        // is exactly the trap: the cuts exist, the rows to fill them do not.
+        let equi_width = range_bounds_from_statistics(&hashed[0], 0, SHARDS)
+            .expect("a wide range interpolates a full set of cuts");
+        assert_eq!(equi_width.len(), SHARDS - 1);
+        assert!(
+            !range_split_is_worth_taking(equi_width.len(), SHARDS, true, false),
+            "a full set of cuts over an empty range must not pass the composite gate"
+        );
+
+        // (b) Range-written inputs: each partition holds one tenant, so the bands
+        // are points. They clear the width gate, but the walk can only cut where
+        // mass is, so it yields one bound rather than seven.
+        let clustered = vec![band_stats(1, 1, 50_000), band_stats(FAR, FAR, 50_000)];
+        let bounds = range_bounds_from_histogram(&clustered, 0, SHARDS)
+            .expect("two points still describe where the rows are");
+        assert!(
+            bounds.len() + 1 < SHARDS,
+            "two occupied values cannot fill eight shards, got {bounds:?}"
+        );
+        assert!(
+            !range_split_is_worth_taking(bounds.len(), SHARDS, true, true),
+            "histogram evidence that reaches two shards must still decline"
+        );
+
+        // A single-column key keeps its shipped trade in the same situation:
+        // clustering on the key it was chosen for beats scattering it.
+        assert!(range_split_is_worth_taking(
+            bounds.len(),
+            SHARDS,
+            false,
+            true
+        ));
     }
 
     /// A composite key takes its leading column only on evidence: bounds from the
