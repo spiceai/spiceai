@@ -38,9 +38,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
+use cayenne::CayenneTableProvider;
 use cayenne::metadata::CreateTableOptions;
 use cayenne::row_converter::{RowConverter, SortField};
-use cayenne::CayenneTableProvider;
 
 use datafusion::prelude::SessionContext;
 
