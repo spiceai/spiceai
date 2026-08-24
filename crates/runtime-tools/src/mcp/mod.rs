@@ -17,7 +17,6 @@ limitations under the License.
 pub mod catalog;
 pub mod factory;
 pub mod server;
-mod task_name;
 pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
@@ -54,6 +53,27 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Prefix every tool-use task name carries.
+///
+/// `spice trace` and the task-history exporter both match on this prefix, but
+/// neither can share this constant — `bin/spice` depends on neither this crate
+/// nor `tools` — so each spells it out itself.
+const TOOL_USE_PREFIX: &str = "tool_use::";
+
+/// `runtime.task_history.task` for a call on the tool exposed as `exposed_name`.
+///
+/// A proxied tool is reachable through two entry points — the `/v1/mcp` gateway
+/// and [`McpToolWrapper::call`](tool::McpToolWrapper::call), which a
+/// `POST /v1/tools/{name}` request or a model-driven call enters directly. Both
+/// label the task through this one function, from the name the tool is exposed
+/// under, so one tool cannot be recorded under two spellings: grouping
+/// `runtime.task_history` by `task` would then split it across two rows, and
+/// `spice trace <task>` would show only the half matching the spelling it was
+/// given.
+pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
+    format!("{TOOL_USE_PREFIX}{exposed_name}")
+}
 
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
 const MCP_HEADERS_PARAM: &str = "mcp_headers";

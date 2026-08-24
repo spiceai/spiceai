@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::mcp::task_name::task_name_for_exposed_tool;
+use crate::mcp::task_name_for_exposed_tool;
 use crate::tooling::Tooling;
 
 use rmcp::{
@@ -39,6 +39,15 @@ pub struct RuntimeServer {
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
 }
 
+/// A tool resolved from a request name, with the identity to record it under.
+struct ResolvedTool {
+    tool: Arc<dyn SpiceModelTool>,
+    /// The canonical name the tool is exposed as — see [`RuntimeServer::get_tool`].
+    exposed_name: String,
+    /// The catalog the tool came from, or `None` for a top-level tool.
+    catalog: Option<String>,
+}
+
 impl RuntimeServer {
     pub fn new(tools: Arc<RwLock<HashMap<String, Tooling>>>) -> Self {
         Self { tools }
@@ -54,22 +63,29 @@ impl RuntimeServer {
     /// call must label it with the returned canonical name — labelling with the
     /// requested one splits a single tool's `task_history` rows by whichever
     /// spelling each caller happened to send.
-    async fn get_tool(&self, tool_name: &str) -> Option<(Arc<dyn SpiceModelTool>, String)> {
+    async fn get_tool(&self, tool_name: &str) -> Option<ResolvedTool> {
         let tools = self.tools.read().await;
         if let Some((catalog_name, name)) = decode_tool_name(tool_name)
             && let Some(Tooling::Catalog { tools: catalog, .. }) = tools.get(&catalog_name)
             && let Some(tool) = catalog.get(&name).await
         {
-            return Some((tool, encode_tool_name(&catalog_name, &name)));
+            return Some(ResolvedTool {
+                tool,
+                exposed_name: encode_tool_name(&catalog_name, &name),
+                catalog: Some(catalog_name),
+            });
         }
         // Fall back to a direct (non-catalog) lookup. This covers top-level
         // tools whose names legitimately contain the `__` catalog separator.
         // Such a tool is exposed under its own name, so that name is already
-        // canonical and must not be re-encoded.
+        // canonical and must not be re-encoded — and it belongs to no catalog,
+        // however much its name may look like one qualified by the separator.
         match tools.get(tool_name)? {
-            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => {
-                Some((Arc::clone(tool), tool_name.to_string()))
-            }
+            Tooling::Tool(tool) | Tooling::FunctionTool(tool) => Some(ResolvedTool {
+                tool: Arc::clone(tool),
+                exposed_name: tool_name.to_string(),
+                catalog: None,
+            }),
             Tooling::Catalog { .. } => None,
         }
     }
@@ -141,14 +157,14 @@ impl ServerHandler for RuntimeServer {
                 ));
             }
 
-            let Some((tool, exposed_name)) = self.get_tool(tool_name.as_ref()).await else {
+            let Some(resolved) = self.get_tool(tool_name.as_ref()).await else {
                 return Err(McpError::method_not_found::<
                     rmcp::model::CallToolRequestMethod,
                 >());
             };
 
             // If possible, we pass the call through to the MCP server.
-            if let Some(mcp_proxy) = tool.as_mcp_proxy().await {
+            if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
                 tracing::debug!("{tool_name} uses MCP. Will call directly");
 
                 // Security: Validate arguments JSON depth before proxying
@@ -184,11 +200,11 @@ impl ServerHandler for RuntimeServer {
                     ));
                 }
 
-                // Labelled from the canonical exposed name `get_tool` resolved,
-                // never the requested spelling — see `get_tool`.
-                let task_name = task_name_for_exposed_tool(&exposed_name);
-                let mcp_server = decode_tool_name(&exposed_name)
-                    .map_or_else(|| exposed_name.clone(), |(server, _)| server);
+                // Labelled from the canonical identity `get_tool` resolved, never
+                // the requested spelling — see `get_tool`.
+                let exposed_name = &resolved.exposed_name;
+                let task_name = task_name_for_exposed_tool(exposed_name);
+                let mcp_server = resolved.catalog.as_deref().unwrap_or(exposed_name);
                 let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
                 tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %mcp_server, "labels");
 
@@ -224,7 +240,8 @@ impl ServerHandler for RuntimeServer {
                 ));
             }
 
-            let result = tool
+            let result = resolved
+                .tool
                 .call(args.as_str())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -352,18 +369,21 @@ mod tests {
         assert_eq!(canonical, "srv__tool_-_name");
 
         for requested in [canonical.as_str(), "srv__tool__name"] {
-            let (_, exposed) = server
+            let resolved = server
                 .get_tool(requested)
                 .await
                 .unwrap_or_else(|| panic!("{requested} should resolve"));
             assert_eq!(
-                exposed, canonical,
+                resolved.exposed_name, canonical,
                 "request {requested} was not canonicalized"
             );
             assert_eq!(
-                task_name_for_exposed_tool(&exposed),
+                task_name_for_exposed_tool(&resolved.exposed_name),
                 "tool_use::srv__tool_-_name",
             );
+            // The catalog is reported from the resolve, not re-derived by
+            // decoding the canonical name a second time.
+            assert_eq!(resolved.catalog.as_deref(), Some("srv"));
         }
     }
 
@@ -378,10 +398,13 @@ mod tests {
         );
         let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
 
-        let (_, exposed) = server
+        let resolved = server
             .get_tool("top__level")
             .await
             .expect("a top-level tool resolves by its own name");
-        assert_eq!(exposed, "top__level");
+        assert_eq!(resolved.exposed_name, "top__level");
+        // It belongs to no catalog, however much the `__` in its name looks like
+        // one — so `mcp_server` must not report a phantom `top`.
+        assert_eq!(resolved.catalog, None);
     }
 }

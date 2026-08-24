@@ -31,7 +31,7 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 use tools::SpiceModelTool;
 use tools::naming::encode_tool_name;
 
-use super::{Result, catalog::McpClient, task_name::task_name_for_exposed_tool};
+use super::{Result, catalog::McpClient, task_name_for_exposed_tool};
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<McpClient>>,
@@ -61,12 +61,17 @@ impl McpToolWrapper {
     ///
     /// Both are the name the tool is exposed under. That qualification is
     /// applied *outside* this wrapper — `with_name` in `tooling.rs` /
-    /// `runtime::tools::utils`, whose `RenamedTool` delegates `call` straight
-    /// back here — so [`Self::name`] is still the bare upstream name and the
-    /// exposed name has to be recomputed from its parts. Recording the bare name
-    /// (or, before this, a `server/tool` join) labelled the same tool
-    /// differently from the `/v1/mcp` gateway, which records the resolved
-    /// exposed name.
+    /// `runtime::tools::utils` — so [`Self::name`] is still the bare upstream
+    /// name and the exposed name has to be recomputed from its parts. It cannot
+    /// be read off the caller either: a `POST /v1/tools/{name}` request resolves
+    /// through `Runtime::get_tool`, which hands back the tool un-renamed.
+    ///
+    /// The qualification is recomputed *unconditionally*, which matches the
+    /// exposure layer only because a tool catalog is exempted from it when it is
+    /// a default catalog, and the default catalogs are `memory` and `builtin` —
+    /// never an MCP server. Were an MCP-backed catalog ever made default, this
+    /// would go back to labelling a tool differently from the name it is listed
+    /// under.
     fn task_history_labels(server_name: &str, spec: &Tool) -> (String, String) {
         let exposed_name = encode_tool_name(server_name, &spec.name);
         (task_name_for_exposed_tool(&exposed_name), exposed_name)
@@ -193,8 +198,9 @@ mod tests {
         assert_eq!(task, "tool_use::github__search_code");
         // The gateway labels the task from the exposed name it resolved the
         // request by, so agreeing on that name is what makes the two match.
+        // (Asserting `task == task_name_for_exposed_tool(&exposed)` here would be
+        // a tautology — the value above is what pins it.)
         assert_eq!(exposed, "github__search_code");
-        assert_eq!(task, task_name_for_exposed_tool(&exposed));
     }
 
     #[test]
@@ -212,7 +218,7 @@ mod tests {
         ] {
             let (task, exposed) = McpToolWrapper::task_history_labels(server, &spec(tool));
             let suffix = task
-                .strip_prefix(super::super::task_name::TOOL_USE_PREFIX)
+                .strip_prefix(super::super::TOOL_USE_PREFIX)
                 .expect("a tool-use task name carries the prefix");
             assert_eq!(suffix, exposed, "task suffix must be the exposed name");
             assert_eq!(
