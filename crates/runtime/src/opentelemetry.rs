@@ -173,6 +173,13 @@ impl MetricsService for Service {
             resource_metrics.len()
         );
         for resource_metric in resource_metrics {
+            // Resource attributes (`service.name`, `service.instance.id`, …) identify the
+            // process a data point came from, so they are merged into every data point's own
+            // attributes and become dimension columns of the metric table.
+            let resource_attrs = resource_metric
+                .resource
+                .as_ref()
+                .map_or(&[][..], |resource| resource.attributes.as_slice());
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     let Some(data) = metric.data else {
@@ -206,6 +213,7 @@ impl MetricsService for Service {
                     let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                         metric.name.as_str(),
                         &data,
+                        resource_attrs,
                         existing_schema.as_ref(),
                     );
                     total_data_points += data_points_count;
@@ -269,6 +277,7 @@ impl MetricsService for Service {
                                             match metric_data_to_record_batch(
                                                 metric.name.as_str(),
                                                 &data,
+                                                resource_attrs,
                                                 Some(&evolved),
                                             )
                                             .0
@@ -372,9 +381,13 @@ impl MetricsService for Service {
 /// to the export's total and, on `Err`, to its rejected count — so dropped data points are
 /// reported to the client through `ExportMetricsPartialSuccess.rejected_data_points` instead of
 /// being invisible in a mixed export (#12188).
+///
+/// `resource_attrs` are the resource-level attributes of the export the metric arrived in; they
+/// are merged into every data point's attributes (see `merge_resource_attributes`).
 pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
+    resource_attrs: &[KeyValue],
     existing_schema: Option<&Schema>,
 ) -> (Result<RecordBatch>, u64) {
     let data_points_count = data_point_count(data);
@@ -399,15 +412,24 @@ pub fn metric_data_to_record_batch(
     }
 
     let record_batch = match data {
-        Data::Gauge(gauge) => {
-            number_data_points_to_record_batch(metric, &gauge.data_points, existing_schema)
-        }
-        Data::Sum(sum) => {
-            number_data_points_to_record_batch(metric, &sum.data_points, existing_schema)
-        }
-        Data::Histogram(histogram) => {
-            histogram_data_points_to_record_batch(metric, &histogram.data_points, existing_schema)
-        }
+        Data::Gauge(gauge) => number_data_points_to_record_batch(
+            metric,
+            &gauge.data_points,
+            resource_attrs,
+            existing_schema,
+        ),
+        Data::Sum(sum) => number_data_points_to_record_batch(
+            metric,
+            &sum.data_points,
+            resource_attrs,
+            existing_schema,
+        ),
+        Data::Histogram(histogram) => histogram_data_points_to_record_batch(
+            metric,
+            &histogram.data_points,
+            resource_attrs,
+            existing_schema,
+        ),
         // TODO: Support other metric data types (ExponentialHistogram, Summary)
         Data::ExponentialHistogram(_) | Data::Summary(_) => UnsupportedMetricDataTypeSnafu {
             metric,
@@ -477,9 +499,34 @@ macro_rules! append_value {
     };
 }
 
+/// A data point's attributes with the export's resource attributes merged in.
+///
+/// A key present on both wins for the data point: the point's own attribute is the more specific
+/// description of that measurement, and a resource attribute must never overwrite it.
+fn merge_resource_attributes(
+    resource_attrs: &[KeyValue],
+    data_point_attrs: &[KeyValue],
+) -> Vec<KeyValue> {
+    if resource_attrs.is_empty() {
+        return data_point_attrs.to_vec();
+    }
+    let mut merged: Vec<KeyValue> = resource_attrs
+        .iter()
+        .filter(|resource_attr| {
+            !data_point_attrs
+                .iter()
+                .any(|attr| attr.key == resource_attr.key)
+        })
+        .cloned()
+        .collect();
+    merged.extend(data_point_attrs.iter().cloned());
+    merged
+}
+
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
+    resource_attrs: &[KeyValue],
     existing_schema: Option<&Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
@@ -555,7 +602,10 @@ fn number_data_points_to_record_batch(
         } else {
             return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
         }
-        attributes.push(data_point.attributes.as_slice());
+        attributes.push(merge_resource_attributes(
+            resource_attrs,
+            &data_point.attributes,
+        ));
         time_unix_nano_builder.append_value(data_point.time_unix_nano);
         start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
@@ -587,7 +637,7 @@ fn number_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        attributes.as_slice(),
+        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
         existing_schema,
         NUMBER_VALUE_COLUMN_NAMES,
     );
@@ -625,6 +675,7 @@ fn number_data_points_to_record_batch(
 fn histogram_data_points_to_record_batch(
     metric: &str,
     data_points: &[HistogramDataPoint],
+    resource_attrs: &[KeyValue],
     existing_schema: Option<&Schema>,
 ) -> Result<RecordBatch> {
     if data_points.is_empty() {
@@ -657,7 +708,10 @@ fn histogram_data_points_to_record_batch(
             .append_slice(&data_point.explicit_bounds);
         explicit_bounds_builder.append(true);
 
-        attributes.push(data_point.attributes.as_slice());
+        attributes.push(merge_resource_attributes(
+            resource_attrs,
+            &data_point.attributes,
+        ));
         time_unix_nano_builder.append_value(data_point.time_unix_nano);
         start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
@@ -696,7 +750,7 @@ fn histogram_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        attributes.as_slice(),
+        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
         existing_schema,
         HISTOGRAM_VALUE_COLUMN_NAMES,
     );
@@ -1060,6 +1114,8 @@ mod tests {
     use opentelemetry_proto::tonic::metrics::v1::ScopeMetrics;
     use opentelemetry_proto::tonic::metrics::v1::Summary;
     use opentelemetry_proto::tonic::metrics::v1::SummaryDataPoint;
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use parking_lot::Mutex;
     use runtime_query_engine::query_engine::Error as QueryEngineError;
     use runtime_query_engine::query_engine::QueryRequest;
     use runtime_query_engine::query_engine::Result as QueryEngineResult;
@@ -1145,7 +1201,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, count) = metric_data_to_record_batch("latency", &data, None);
+        let (result, count) = metric_data_to_record_batch("latency", &data, &[], None);
         assert_eq!(count, 2, "both data points should be counted");
         let batch = result.expect("record batch should build");
 
@@ -1207,7 +1263,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, _) = metric_data_to_record_batch("empty_metric", &data, None);
+        let (result, _) = metric_data_to_record_batch("empty_metric", &data, &[], None);
         let batch = result.expect("record batch should build");
 
         let sums = column(&batch, SUM_COLUMN_NAME)
@@ -1270,7 +1326,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, count) = metric_data_to_record_batch("query_duration_ms", &data, None);
+        let (result, count) = metric_data_to_record_batch("query_duration_ms", &data, &[], None);
         assert_eq!(count, 3);
         let batch = result.expect("record batch should build despite late attribute");
 
@@ -1303,7 +1359,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, count) = metric_data_to_record_batch("no_points", &data, None);
+        let (result, count) = metric_data_to_record_batch("no_points", &data, &[], None);
         assert_eq!(count, 0);
         assert!(
             matches!(result, Err(Error::MetricWithNoDataPoints {})),
@@ -1327,7 +1383,7 @@ mod tests {
             )],
             aggregation_temporality: 0,
         });
-        let (first_result, _) = metric_data_to_record_batch("latency", &first, None);
+        let (first_result, _) = metric_data_to_record_batch("latency", &first, &[], None);
         let first_batch = first_result.expect("first batch builds");
         let existing_schema = first_batch.schema();
 
@@ -1345,7 +1401,7 @@ mod tests {
             aggregation_temporality: 0,
         });
         let (second_result, _) =
-            metric_data_to_record_batch("latency", &second, Some(existing_schema.as_ref()));
+            metric_data_to_record_batch("latency", &second, &[], Some(existing_schema.as_ref()));
         let second_batch = second_result.expect("second batch builds");
 
         // `host` column should be carried over from the existing schema and be null here.
@@ -1401,7 +1457,7 @@ mod tests {
                 vec![string_attribute("region", "us")],
             )],
         });
-        let (first_result, _) = metric_data_to_record_batch("svc_requests", &first, None);
+        let (first_result, _) = metric_data_to_record_batch("svc_requests", &first, &[], None);
         let first_schema = first_result.expect("first batch builds").schema();
 
         // Second export introduces `tier`; build against the first schema to get the widened one.
@@ -1415,14 +1471,18 @@ mod tests {
             )],
         });
         let (widened_result, _) =
-            metric_data_to_record_batch("svc_requests", &second, Some(first_schema.as_ref()));
+            metric_data_to_record_batch("svc_requests", &second, &[], Some(first_schema.as_ref()));
         let widened_schema = widened_result.expect("widened batch builds").schema();
         assert!(detect_added_columns(&first_schema, &widened_schema) == vec!["tier".to_string()]);
 
         // Rebuilding the same data against the (evolved) widened schema yields the identical
         // field order — the invariant the OTel pre-flight relies on for the rebuilt batch.
-        let (rebuilt_result, _) =
-            metric_data_to_record_batch("svc_requests", &second, Some(widened_schema.as_ref()));
+        let (rebuilt_result, _) = metric_data_to_record_batch(
+            "svc_requests",
+            &second,
+            &[],
+            Some(widened_schema.as_ref()),
+        );
         let rebuilt_schema = rebuilt_result.expect("rebuilt batch builds").schema();
         let widened_names: Vec<&str> = widened_schema
             .fields()
@@ -1454,7 +1514,7 @@ mod tests {
             data_points: vec![number_data_point(1.0, vec![])],
         });
 
-        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, &[], Some(&existing));
         let batch = result.expect("batch must build despite the non-nullable stored dimension");
 
         let region_field = batch
@@ -1495,7 +1555,7 @@ mod tests {
             )],
         });
 
-        let (result, _) = metric_data_to_record_batch("svc_requests", &data, Some(&existing));
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, &[], Some(&existing));
         let batch = result.expect("batch must build even with an unsupported existing column");
 
         assert!(
@@ -1529,7 +1589,8 @@ mod tests {
             data_points: vec![number_data_point(1.0, vec![])],
         });
 
-        let (result, _) = metric_data_to_record_batch("query_active_count", &data, Some(&existing));
+        let (result, _) =
+            metric_data_to_record_batch("query_active_count", &data, &[], Some(&existing));
         let batch = result.expect("batch must build with the view-typed dimensions materialized");
 
         assert_eq!(
@@ -1581,7 +1642,7 @@ mod tests {
                 ],
             )],
         });
-        let (first_result, _) = metric_data_to_record_batch("svc", &first, None);
+        let (first_result, _) = metric_data_to_record_batch("svc", &first, &[], None);
         let first_schema = first_result.expect("first batch builds").schema();
         assert_eq!(
             field_names(&first_schema),
@@ -1595,7 +1656,8 @@ mod tests {
         );
 
         // Second export, same dimensions: the schema must be identical, not just equivalent.
-        let (second_result, _) = metric_data_to_record_batch("svc", &first, Some(&first_schema));
+        let (second_result, _) =
+            metric_data_to_record_batch("svc", &first, &[], Some(&first_schema));
         let second_batch = second_result.expect("second batch builds");
         assert_eq!(
             field_names(&second_batch.schema()),
@@ -1611,7 +1673,8 @@ mod tests {
         let third = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
             data_points: vec![number_data_point(2.0, vec![string_attribute("host", "b")])],
         });
-        let (third_result, _) = metric_data_to_record_batch("svc", &third, Some(&first_schema));
+        let (third_result, _) =
+            metric_data_to_record_batch("svc", &third, &[], Some(&first_schema));
         let third_batch = third_result.expect("third batch builds");
         assert_eq!(
             field_names(&third_batch.schema()),
@@ -1645,7 +1708,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, _) = metric_data_to_record_batch("latency", &data, None);
+        let (result, _) = metric_data_to_record_batch("latency", &data, &[], None);
         let batch = result.expect("record batch should build");
 
         assert_eq!(
@@ -1673,7 +1736,7 @@ mod tests {
             )],
         });
 
-        let (result, _) = metric_data_to_record_batch("svc", &data, None);
+        let (result, _) = metric_data_to_record_batch("svc", &data, &[], None);
         let batch = result.expect("record batch should build");
 
         assert_eq!(
@@ -1709,7 +1772,7 @@ mod tests {
             )],
             aggregation_temporality: 0,
         });
-        let stored = metric_data_to_record_batch("latency", &histogram, None)
+        let stored = metric_data_to_record_batch("latency", &histogram, &[], None)
             .0
             .expect("histogram batch builds")
             .schema();
@@ -1717,7 +1780,7 @@ mod tests {
         let gauge = Data::Gauge(opentelemetry_proto::tonic::metrics::v1::Gauge {
             data_points: vec![number_data_point(1.0, vec![string_attribute("host", "b")])],
         });
-        let (result, _) = metric_data_to_record_batch("latency", &gauge, Some(&stored));
+        let (result, _) = metric_data_to_record_batch("latency", &gauge, &[], Some(&stored));
         let batch = result.expect("gauge batch builds against the stored histogram schema");
 
         assert_eq!(
@@ -1759,7 +1822,7 @@ mod tests {
         let summary = Data::Summary(Summary {
             data_points: vec![SummaryDataPoint::default(); 3],
         });
-        let (result, count) = metric_data_to_record_batch("gc_pause_seconds", &summary, None);
+        let (result, count) = metric_data_to_record_batch("gc_pause_seconds", &summary, &[], None);
         assert_eq!(count, 3, "a Summary's data points must still be counted");
         let error = result.expect_err("Summary has no batch builder");
         assert!(matches!(error, Error::UnsupportedMetricDataType { .. }));
@@ -1773,7 +1836,7 @@ mod tests {
             data_points: vec![ExponentialHistogramDataPoint::default(); 2],
             aggregation_temporality: 0,
         });
-        let (result, count) = metric_data_to_record_batch("latency", &exponential, None);
+        let (result, count) = metric_data_to_record_batch("latency", &exponential, &[], None);
         assert_eq!(
             count, 2,
             "an ExponentialHistogram's data points must still be counted"
@@ -1843,7 +1906,7 @@ mod tests {
             aggregation_temporality: 0,
         });
 
-        let (result, count) = metric_data_to_record_batch("latency", &data, Some(&existing));
+        let (result, count) = metric_data_to_record_batch("latency", &data, &[], Some(&existing));
         assert_eq!(
             count, 2,
             "the data points this table cannot accept must still be counted as rejected"
@@ -1882,7 +1945,7 @@ mod tests {
             )],
         });
 
-        let (result, _) = metric_data_to_record_batch("svc", &data, Some(&existing));
+        let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
         let batch = result.expect("a well-formed stored schema must still build");
         assert_eq!(
             column(&batch, COUNT_COLUMN_NAME)
@@ -1898,6 +1961,7 @@ mod tests {
     struct WriteRecordingQueryEngine {
         session: Arc<SessionContext>,
         rows_written: AtomicU64,
+        batches_written: Mutex<Vec<RecordBatch>>,
     }
 
     // `QueryEngine` requires `Debug`, and `SessionContext` does not implement it.
@@ -1914,11 +1978,16 @@ mod tests {
             Self {
                 session: Arc::new(SessionContext::new()),
                 rows_written: AtomicU64::new(0),
+                batches_written: Mutex::new(Vec::new()),
             }
         }
 
         fn rows_written(&self) -> u64 {
             self.rows_written.load(Ordering::SeqCst)
+        }
+
+        fn batches_written(&self) -> Vec<RecordBatch> {
+            self.batches_written.lock().clone()
         }
     }
 
@@ -1987,6 +2056,7 @@ mod tests {
         ) -> QueryEngineResult<()> {
             let rows: u64 = data.iter().map(|batch| batch.num_rows() as u64).sum();
             self.rows_written.fetch_add(rows, Ordering::SeqCst);
+            self.batches_written.lock().extend(data);
             Ok(())
         }
     }
@@ -2000,8 +2070,19 @@ mod tests {
     }
 
     fn otlp_request(metrics: Vec<OtlpMetric>) -> ExportMetricsServiceRequest {
+        otlp_request_with_resource(metrics, vec![])
+    }
+
+    fn otlp_request_with_resource(
+        metrics: Vec<OtlpMetric>,
+        resource_attributes: Vec<KeyValue>,
+    ) -> ExportMetricsServiceRequest {
         ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource_attributes,
+                    ..Default::default()
+                }),
                 scope_metrics: vec![ScopeMetrics {
                     metrics,
                     ..Default::default()
@@ -2104,5 +2185,124 @@ mod tests {
             "nothing was rejected, so no partial success is reported"
         );
         assert_eq!(engine.rows_written(), 0);
+    }
+    /// Resource attributes identify the process that produced a measurement, so they must land
+    /// as dimension columns on every data point of the export rather than being dropped.
+    #[test]
+    fn resource_attributes_become_columns_on_number_data_points() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![
+                number_data_point(1.0, vec![string_attribute("region", "us")]),
+                number_data_point(2.0, vec![]),
+            ],
+        });
+        let resource_attrs = vec![
+            string_attribute("service.name", "spiced"),
+            string_attribute("service.instance.id", "instance-a"),
+        ];
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, &resource_attrs, None);
+        let batch = result.expect("record batch should build");
+
+        assert_eq!(
+            column(&batch, "service.name").as_string::<i32>().value(0),
+            "spiced"
+        );
+        assert_eq!(
+            column(&batch, "service.instance.id")
+                .as_string::<i32>()
+                .value(1),
+            "instance-a",
+            "a data point with no attributes of its own still carries the resource attributes"
+        );
+        assert_eq!(
+            column(&batch, "region").as_string::<i32>().value(0),
+            "us",
+            "the data point's own attributes are kept alongside the resource attributes"
+        );
+    }
+
+    #[test]
+    fn resource_attributes_become_columns_on_histogram_data_points() {
+        let data = Data::Histogram(Histogram {
+            data_points: vec![histogram_data_point(
+                1,
+                Some(1.0),
+                Some(1.0),
+                Some(1.0),
+                vec![1],
+                vec![],
+                vec![string_attribute("host", "a")],
+            )],
+            aggregation_temporality: 0,
+        });
+        let resource_attrs = vec![string_attribute("service.instance.id", "instance-a")];
+
+        let (result, _) = metric_data_to_record_batch("latency", &data, &resource_attrs, None);
+        let batch = result.expect("record batch should build");
+
+        assert_eq!(
+            column(&batch, "service.instance.id")
+                .as_string::<i32>()
+                .value(0),
+            "instance-a"
+        );
+        assert_eq!(column(&batch, "host").as_string::<i32>().value(0), "a");
+    }
+
+    /// A data point's own attribute describes that measurement more specifically than the
+    /// resource-level one of the same key, so it must not be overwritten by the merge.
+    #[test]
+    fn data_point_attribute_wins_over_resource_attribute_of_the_same_key() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![number_data_point(
+                1.0,
+                vec![string_attribute("region", "eu")],
+            )],
+        });
+        let resource_attrs = vec![string_attribute("region", "us")];
+
+        let (result, _) = metric_data_to_record_batch("svc_requests", &data, &resource_attrs, None);
+        let batch = result.expect("record batch should build");
+
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == "region")
+                .count(),
+            1,
+            "the colliding key must produce exactly one column"
+        );
+        assert_eq!(column(&batch, "region").as_string::<i32>().value(0), "eu");
+    }
+
+    /// The export handler must thread the resource attributes of each resource metric group into
+    /// the batch it writes; without that, `service.instance.id` never reaches the metric table.
+    #[tokio::test]
+    async fn export_writes_resource_attributes_as_columns() {
+        let engine = Arc::new(WriteRecordingQueryEngine::new());
+        let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
+
+        let request = otlp_request_with_resource(
+            vec![otlp_metric("svc_requests", Some(gauge(1.0)))],
+            vec![string_attribute("service.instance.id", "instance-a")],
+        );
+
+        service
+            .export(Request::new(request))
+            .await
+            .expect("the export must succeed");
+
+        let batches = engine.batches_written();
+        let batch = batches.first().expect("one batch must have been written");
+        assert_eq!(
+            column(batch, "service.instance.id")
+                .as_string::<i32>()
+                .value(0),
+            "instance-a"
+        );
+        assert_eq!(column(batch, "region").as_string::<i32>().value(0), "us");
     }
 }
