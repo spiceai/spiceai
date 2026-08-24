@@ -24,11 +24,11 @@ use crate::flight::{
     Error, Service as SpiceFlightService, configure_flight_server_transport,
     is_address_in_use_error, session_auth,
 };
-use crate::tls::flight_incoming::tls_incoming;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use governor::RateLimiter;
 use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
+use runtime_tls::flight_incoming::tls_incoming;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -248,9 +248,6 @@ pub async fn start_executor_flight_server(
     let session_store = spice_service.session_store();
     let composite_service = CompositeFlightService::new(spice_service);
 
-    // Get app for request context
-    let app = rt.app.read().await.as_ref().map(Arc::clone);
-
     // Wrap the auth in session-awareness to accept session IDs as bearer tokens
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
@@ -268,7 +265,7 @@ pub async fn start_executor_flight_server(
     let rate_limits = &rt.rate_limits;
     let mut server = server
         .layer(
-            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+            RequestContextLayer::new(rt.app(), rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
         .layer(auth_layer)

@@ -92,9 +92,9 @@ const DELETE_CHUNK_ROWS: usize = 512;
 /// remains subject to the mapping gap above.
 ///
 /// Only reads `key_columns` from `keys`, ignoring any other column present — `keys` may be
-/// shaped by [`runtime_datafusion_index::Index::required_columns`] (a superset of the primary
+/// shaped by [`spice_table::Index::required_columns`] (a superset of the primary
 /// key) rather than the primary key alone, since that's what the default
-/// [`runtime_datafusion_index::Index::resolve_delete_keys`] resolves against.
+/// [`spice_table::Index::resolve_delete_keys`] resolves against.
 ///
 /// Issues one `_delete_by_query` request per [`DELETE_CHUNK_ROWS`]-row slice of `keys` rather
 /// than a single request for the whole batch, so a large delete can't build an unbounded
@@ -465,11 +465,20 @@ mod tests {
     /// Records the `_delete_by_query` bodies it is asked to issue and answers each with a
     /// configured response; every other trait method is an error, so a test that reaches one
     /// fails loudly rather than silently passing.
-    #[derive(Debug)]
+    ///
+    /// It also models a document store keyed by `_id`: seed it with [`RecordingClient::with_ids`]
+    /// and an `ids` query (the whole-key delete path) removes exactly those documents, so a test
+    /// can assert the surviving set with [`RecordingClient::present_ids`] instead of the query
+    /// body. The store is empty by default, so the many query-shape tests are unaffected.
+    #[derive(Debug, Default)]
     struct RecordingClient {
         queries: Mutex<Vec<Value>>,
+        ids: Mutex<Vec<String>>,
         /// One response per request, in order; the last one answers every request beyond it, so a
-        /// single-element list answers a whole multi-request delete the same way.
+        /// single-element list answers a whole multi-request delete the same way. Empty — the
+        /// default — means the stub reports exactly what the modeled store removed as fully
+        /// applied, which is what leaves the store-based and query-shape tests indifferent to the
+        /// response body.
         responses: Vec<Value>,
         /// Request ordinals (1-based) answered with a client error instead of a body. The error
         /// carries a status, so it stands for the kind Elasticsearch itself raised — the request
@@ -477,13 +486,14 @@ mod tests {
         erroring: Vec<usize>,
     }
 
-    impl Default for RecordingClient {
-        fn default() -> Self {
-            Self::answering(clean_delete_response(0))
-        }
-    }
-
     impl RecordingClient {
+        fn with_ids(ids: &[&str]) -> Self {
+            Self {
+                ids: Mutex::new(ids.iter().map(|s| (*s).to_string()).collect()),
+                ..Self::default()
+            }
+        }
+
         /// Answers every request with `response` instead of a fully-applied one.
         fn answering(response: Value) -> Self {
             Self::answering_in_turn(vec![response])
@@ -493,9 +503,8 @@ mod tests {
         /// multi-request delete differ from the rest.
         fn answering_in_turn(responses: Vec<Value>) -> Self {
             Self {
-                queries: Mutex::new(Vec::new()),
                 responses,
-                erroring: Vec::new(),
+                ..Self::default()
             }
         }
 
@@ -510,6 +519,16 @@ mod tests {
                 .lock()
                 .expect("queries mutex should not be poisoned")
                 .clone()
+        }
+
+        fn present_ids(&self) -> Vec<String> {
+            let mut ids = self
+                .ids
+                .lock()
+                .expect("ids mutex should not be poisoned")
+                .clone();
+            ids.sort();
+            ids
         }
     }
 
@@ -537,12 +556,32 @@ mod tests {
                     message: format!("request {issued} failed at the index"),
                 });
             }
-            let response = self
-                .responses
-                .get(issued - 1)
-                .or_else(|| self.responses.last())
-                .expect("the stub should be configured with at least one response");
-            Ok(response.clone())
+
+            // Apply an `ids` query to the modeled store so a test can assert the surviving set.
+            let mut deleted = 0;
+            if let Some(values) = query["ids"]["values"].as_array() {
+                let doomed: std::collections::HashSet<&str> =
+                    values.iter().filter_map(Value::as_str).collect();
+                let mut ids = self.ids.lock().expect("ids mutex should not be poisoned");
+                let before = ids.len();
+                ids.retain(|id| !doomed.contains(id.as_str()));
+                deleted = before - ids.len();
+            }
+
+            // A configured response wins, so a test can make the body disagree with what the
+            // store removed — which is the whole point of the response-inspection tests. With
+            // none configured, report that removal as fully applied so `inspect_delete_response`
+            // reads it as clean.
+            Ok(
+                match self
+                    .responses
+                    .get(issued - 1)
+                    .or_else(|| self.responses.last())
+                {
+                    Some(response) => response.clone(),
+                    None => clean_delete_response(deleted as u64),
+                },
+            )
         }
 
         async fn get_mapping(&self, _index: &str) -> EsResult<MappingResponse> {
@@ -831,6 +870,25 @@ mod tests {
             client.queries(),
             vec![json!({"ids": {"values": ["7", "8"]}})]
         );
+    }
+
+    /// End-to-end over the modeled store: a whole-key delete removes exactly the addressed
+    /// documents and leaves the rest, whatever the query body looks like.
+    #[tokio::test]
+    async fn a_whole_key_delete_removes_only_the_addressed_documents() {
+        let client = RecordingClient::with_ids(&["ORDER-1024", "ORDER-1025", "ORDER-1026"]);
+
+        delete_by_keys(
+            &client,
+            "idx",
+            &[pk("id", DataType::Utf8)],
+            &["id".to_string()],
+            &string_key_batch(vec![Some("ORDER-1025")]),
+        )
+        .await
+        .expect("delete should succeed");
+
+        assert_eq!(client.present_ids(), vec!["ORDER-1024", "ORDER-1026"]);
     }
 
     /// An index with no primary key writes documents under generated `_id`s, so there is no id

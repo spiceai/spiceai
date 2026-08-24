@@ -21,9 +21,9 @@ limitations under the License.
 //! [`RowLocation`].
 
 use crate::row_converter::OwnedRow;
-use hash_index::{PrehashedBuildHasher, hash_key_128};
+use hash_index::{PrehashedBuildHasher, hash_key_128, hash_key_bytes};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// Seeded XXH3-128 digest of a primary key's `RowConverter`-encoded bytes — the
 /// key's identity throughout the upsert conflict path.
@@ -415,6 +415,10 @@ pub(crate) fn shard_of_pk(owned_row_bytes: &[u8], n: usize) -> usize {
 /// Number of hash probes for [`PkBloom`]. Seven keeps the false-positive rate
 /// near 1% at the ~10 bits/key fill level; the bloom is sized to the whole byte
 /// budget, so at realistic fills the rate is far lower.
+///
+/// Changing this invalidates every persisted bloom. That is handled, not
+/// forbidden: it moves [`SCATTERED_PROBE_FINGERPRINT`], which is what a reader
+/// checks before trusting a blob's bits.
 const PK_BLOOM_NUM_HASHES: u32 = 7;
 
 /// Seeded FNV-1a-64. Dependency-free and adequate for a Bloom filter; two
@@ -427,6 +431,176 @@ fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
     }
     hash
 }
+
+/// Magic ("CPKF") and version framing every serialized [`PkBloom`]. The magic
+/// occupies the leading 4 bytes, where an unframed (pre-v1) bloom keeps the low
+/// half of `bit_mask` — and a `bit_mask` is always `2^n - 1`, which the magic is
+/// not, so the two shapes are told apart deterministically rather than by the
+/// consistency checks in [`PkBloom::deserialize_from_prefix`] happening to
+/// reject one.
+const PK_BLOOM_FRAME_MAGIC: u32 = 0x4350_4b46;
+/// Version of the framed layout. A reader rejects any other value (→ `None` →
+/// the caller's conservative fallback), so a rollback across a future bump
+/// degrades to extra work, never to wrong answers.
+const PK_BLOOM_FRAME_VERSION_SCATTERED: u32 = 1;
+
+/// Frame version for the split-block layout: a key sets one bit in each of a
+/// 256-bit block's eight `u32` lanes, so a probe touches one cache line and
+/// carries no per-probe branch.
+///
+/// A second VERSION rather than a second magic, because the version is what
+/// tells a reader how to parse the body — words for scattered, blocks for this
+/// — and the fingerprint then says whether the probes that filled it match the
+/// ones this binary would use.
+const PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK: u32 = 2;
+/// Bytes the frame prepends to the bloom body: magic, version, fingerprint.
+const PK_BLOOM_FRAME_HEADER_LEN: usize = 16;
+
+/// Identity of everything that decides WHERE a key's bits land: the hash
+/// function and its seeds, the double-hashing scheme, the probe count
+/// [`PK_BLOOM_NUM_HASHES`], and the bit/word layout [`PkBloom::insert`] uses.
+///
+/// A bloom's bits are only meaningful to a reader that derives probes the same
+/// way. Change any leg and the bits sit where the old function put them while
+/// probes read where the new one looks — uncorrelated, so a key that IS present
+/// can probe as absent. On the cold-tier path that false negative means no
+/// supersede tombstone, and so a duplicate live row.
+///
+/// It is derived rather than declared, so that it cannot be forgotten the way a
+/// hand-bumped version can: it folds [`PK_BLOOM_NUM_HASHES`] together with what
+/// a fixed sample WRITES and what that same sample then READS BACK. That covers
+/// the seeds, the double-hashing scheme, the body of [`pk_bloom_hash`], and both
+/// copies of the bit/word arithmetic — legs no declared constant would catch,
+/// since none of them is a constant.
+///
+/// Reading back is not redundant with the bits. [`PkBloom::insert`] and
+/// [`PkBloom::maybe_contains`] each spell out the mask/word/bit mapping
+/// themselves rather than sharing one helper, so a change to the READ side alone
+/// leaves every written bit — and a write-only fingerprint — exactly where it
+/// was, while breaking the agreement between them. Folding the answers to a
+/// fixed set of present and absent probes is what closes that.
+///
+/// What it does not offer is a proof. The sample is a fixed set of keys, so a
+/// change that happens to leave all of their bits and answers identical — one
+/// conditioned on a key length or byte pattern the sample never takes — goes
+/// unnoticed. The probe count is folded in on its own for that reason, being the
+/// leg likeliest to collide. Nor does the value decompose: a mismatch reports
+/// two `u64`s, not which leg moved.
+/// Fingerprint of the SCATTERED probe function, and of the split-block one.
+///
+/// One per layout, because which probes filled a bloom now depends on which
+/// layout wrote it: a single global would mean a binary that writes split-block
+/// could not validate a scattered blob, and every filter already on disk is
+/// scattered.
+///
+/// Both samples are built through a layout-EXPLICIT constructor, never
+/// [`PkBloom::with_num_bits_pow2`], which follows this process's configured
+/// write version. A fingerprint that moved with an environment variable would
+/// make the same bytes valid in one process and rejected in another.
+static SCATTERED_PROBE_FINGERPRINT: LazyLock<u64> =
+    LazyLock::new(|| probe_fingerprint_of(PkBloom::scattered_with_num_bits_pow2(512)));
+
+static SPLIT_BLOCK_PROBE_FINGERPRINT: LazyLock<u64> =
+    LazyLock::new(|| probe_fingerprint_of(PkBloom::split_block_with_num_bits_pow2(512)));
+
+/// The fingerprint of `sample`'s layout: fill it with fixed keys, then fold the
+/// probe count, the sizing field, every resulting bit, and the answers to a set
+/// of keys that were never inserted.
+///
+/// Keep the scattered arm's folded bytes exactly as they are. Their value is
+/// pinned by [`LEGACY_PK_BLOOM_PROBE_FINGERPRINT`], which every unframed bloom
+/// on disk is validated against — change what goes into the fold and every one
+/// of them stops being readable.
+fn probe_fingerprint_of(mut sample: PkBloom) -> u64 {
+    // Fixed keys spanning empty, short, word-boundary, and long lengths, and
+    // both extremes of the byte range: a leg conditioned on one shape of key is
+    // only caught if the sample takes that shape.
+    const FILLED: [&[u8]; 8] = [
+        b"",
+        b"0",
+        b"\xff\x00",
+        b"\x7f\x80\x01",
+        b"cayenne\x00",
+        b"cayenne-pk-bloom",
+        b"cayenne-pk-bloom-probe-fingerprint-sample-key-0123456789abcdef",
+        &[0xff; 33],
+    ];
+    // Never inserted. Their answers are almost all `false`, and each one is a
+    // separate chance to notice a read side that no longer looks where the write
+    // side put the bits.
+    const ABSENT: [&[u8]; 4] = [b"\x01", b"absent", b"cayenne-pk-bloo", &[0x00; 17]];
+
+    for key in FILLED {
+        sample.insert(key);
+    }
+    let mut folded = Vec::new();
+    match &sample.repr {
+        PkBloomRepr::Scattered { bits, bit_mask } => {
+            // Exactly the bytes the pre-frame fold produced, in that order:
+            // `LEGACY_PK_BLOOM_PROBE_FINGERPRINT` pins this value, and every
+            // unframed bloom on disk is validated against it.
+            folded.extend_from_slice(&PK_BLOOM_NUM_HASHES.to_le_bytes());
+            folded.extend_from_slice(&bit_mask.to_le_bytes());
+            for word in bits {
+                folded.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        PkBloomRepr::SplitBlock { blocks, block_mask } => {
+            // This layout's OWN probe count -- one bit per lane. Folding the
+            // scattered `PK_BLOOM_NUM_HASHES` here would tie the two together,
+            // so retuning the scattered probe count would invalidate every
+            // persisted split-block filter whose probes had not changed.
+            let lanes = u32::try_from(SPLIT_BLOCK_SALT.len()).unwrap_or(0);
+            folded.extend_from_slice(&lanes.to_le_bytes());
+            folded.extend_from_slice(&block_mask.to_le_bytes());
+            for block in blocks {
+                for lane in block {
+                    folded.extend_from_slice(&lane.to_le_bytes());
+                }
+            }
+        }
+    }
+    for key in FILLED.iter().chain(ABSENT.iter()) {
+        folded.push(u8::from(sample.maybe_contains(key)));
+    }
+    // The crate's byte-fingerprint primitive (as used by the WAL checksum and
+    // the file digest), not `pk_bloom_hash` — folding the sample with the same
+    // function that filled it would let a change to that function move the bits
+    // and the fold in step.
+    hash_key_bytes(&[&folded])
+}
+
+/// The frame version and fingerprint this filter serializes as.
+fn frame_of(repr: &PkBloomRepr) -> (u32, u64) {
+    match repr {
+        PkBloomRepr::Scattered { .. } => (
+            PK_BLOOM_FRAME_VERSION_SCATTERED,
+            *SCATTERED_PROBE_FINGERPRINT,
+        ),
+        PkBloomRepr::SplitBlock { .. } => (
+            PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK,
+            *SPLIT_BLOCK_PROBE_FINGERPRINT,
+        ),
+    }
+}
+/// The [`SCATTERED_PROBE_FINGERPRINT`] of the probe function that wrote the
+/// unframed blooms — every bloom persisted before the frame existed.
+///
+/// FROZEN. It names one specific historical probe function, so a change to that
+/// function must NOT be followed by updating this constant: the divergence is
+/// exactly what stops the new reader from trusting bits the old probes placed.
+/// Once the two differ, unframed blobs are rejected (→ exact-scan fallback) and
+/// this constant is inert.
+///
+/// It grandfathers ONE transition — the blooms already on disk — rather than
+/// establishing that old formats are read forever. A future
+/// [`PK_BLOOM_FRAME_VERSION`] bump rejects its predecessor outright, the same
+/// way [`PK_INDEX_SIDECAR_VERSION`] already treats its own. The asymmetry is
+/// deliberate: rejecting a cold-file bloom costs an exact scan of a table's
+/// whole cold tier on every keyset rebuild until those files are re-promoted,
+/// which is worth a one-off compatibility branch in a way rebuilding one
+/// sidecar checkpoint is not.
+const LEGACY_PK_BLOOM_PROBE_FINGERPRINT: u64 = 0x242b_5f72_35cc_ed37;
 
 /// Bounded Bloom filter of live primary keys.
 ///
@@ -443,65 +617,329 @@ fn pk_bloom_hash(bytes: &[u8], seed: u64) -> u64 {
 /// - Only valid for upsert. `DoNothing` needs an exact answer (a false positive
 ///   would wrongly drop a genuinely new row), so those tables keep the exact path.
 pub(crate) struct PkBloom {
-    pub(crate) bits: Vec<u64>,
-    /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
-    pub(crate) bit_mask: u64,
+    repr: PkBloomRepr,
     /// Keys inserted (observability + false-positive-rate estimation).
     pub(crate) inserted_keys: usize,
 }
 
+/// The two on-disk layouts a [`PkBloom`] can hold.
+///
+/// A filter's bits are the output of a specific (hash, probe-derivation, layout)
+/// triple, so these are not interchangeable: bits written by one can only be
+/// probed by the same one. Both are carried because persisted filters outlive a
+/// deployment -- a v2 blob keeps being read by the v2 arm until whatever wrote it
+/// is rewritten.
+enum PkBloomRepr {
+    /// Version 2. Seven probes scattered across the whole bit array, addressed by
+    /// two FNV-1a passes over the key.
+    Scattered {
+        bits: Vec<u64>,
+        /// `num_bits - 1`; `num_bits` is a power of two so indexing masks instead of mods.
+        bit_mask: u64,
+    },
+    /// Version 3. One XXH3 selects a 256-bit block and the key sets exactly one
+    /// bit in each of its eight `u32` lanes, so a probe touches one cache line and
+    /// carries no per-probe branch.
+    SplitBlock {
+        blocks: Vec<[u32; 8]>,
+        /// `num_blocks - 1`; the block count is a power of two.
+        block_mask: u64,
+    },
+}
+
+/// Bits per split-block block: one 256-bit block, eight `u32` lanes.
+const SPLIT_BLOCK_BITS: usize = 256;
+
+/// The Parquet/Impala salts. Eight odd constants with well-spread bit patterns,
+/// so each lane's chosen bit is independent of its neighbours'.
+const SPLIT_BLOCK_SALT: [u32; 8] = [
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
+];
+
 impl PkBloom {
-    /// Allocate a bloom whose bit array fits within `budget_bytes`, using the
-    /// largest power-of-two bit count that does not exceed the budget.
+    /// Allocate a bloom whose bit array fits within `budget_bytes`.
     pub(crate) fn with_byte_budget(budget_bytes: usize) -> Self {
         Self::with_num_bits_pow2(budget_bytes.saturating_mul(8))
     }
 
-    /// Right-size a bloom for `expected_keys` (~10 bits/key, ~1% FPR), never
-    /// exceeding `max_bytes`. Used when persisting a compaction checkpoint so the
-    /// sidecar stays small rather than the full byte budget.
+    /// Right-size a bloom for `expected_keys` at ~10 bits/key, never exceeding
+    /// `max_bytes`.
+    ///
+    /// Version 3 rounds the bit count UP to the next power of two; version 2
+    /// rounds DOWN, which is what it has always done. That round-down is why the
+    /// documented "~1% FPR" was not what the filter delivered: asking for 10
+    /// bits/key and taking the largest power of two below it lands anywhere from
+    /// 5.0 to 10.0 bits/key, and `PK_BLOOM_NUM_HASHES` is tuned for the 10. At
+    /// 100K keys the measured rate is 12.1% rounding down and 0.76% rounding up,
+    /// for the same code and the same request.
+    ///
+    /// Rounding up is safe for existing data even though it changes sizing:
+    /// `bit_mask` is persisted per blob and restored on read, so a filter already
+    /// on disk keeps probing against its own stored size whatever this returns.
     pub(crate) fn with_expected_keys(expected_keys: usize, max_bytes: usize) -> Self {
         let want_bits = expected_keys.saturating_mul(10);
         let cap_bits = max_bytes.saturating_mul(8).max(64);
-        Self::with_num_bits_pow2(want_bits.min(cap_bits))
+        // Round UP, then clamp -- never past the caller's byte ceiling.
+        let rounded = want_bits.checked_next_power_of_two().unwrap_or(want_bits);
+        Self::with_num_bits_pow2(rounded.min(cap_bits))
     }
 
     /// Allocate with the largest power-of-two bit count `<= target_bits` (min 64).
+    ///
+    /// New filters are split-block. The scattered layout remains fully readable
+    /// — every filter already on disk is one — but nothing writes it any more.
+    /// Reverting that decision is a binary rollback rather than a setting, and
+    /// deliberately so: an older binary rejects a split-block frame outright and
+    /// falls back to the exact path, where a runtime switch would leave the
+    /// filters it had already written in place and still being probed.
     pub(crate) fn with_num_bits_pow2(target_bits: usize) -> Self {
+        Self::split_block_with_num_bits_pow2(target_bits)
+    }
+
+    /// The scattered layout at the PRE-FRAME sizing (round down), which is the
+    /// shape every legacy bloom on disk has.
+    #[cfg(test)]
+    fn scattered_with_expected_keys(expected_keys: usize, max_bytes: usize) -> Self {
+        let want_bits = expected_keys.saturating_mul(10);
+        let cap_bits = max_bytes.saturating_mul(8).max(64);
+        Self::scattered_with_num_bits_pow2(want_bits.min(cap_bits))
+    }
+
+    /// The scattered layout, which nothing writes any more.
+    ///
+    /// Retained for the fingerprint sample that validates legacy blooms, and for
+    /// the tests that build the shape those blooms have.
+    fn scattered_with_num_bits_pow2(target_bits: usize) -> Self {
         let num_bits: usize = 1usize << target_bits.max(64).ilog2();
         let words = (num_bits / 64).max(1);
         Self {
-            bits: vec![0u64; words],
-            bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
+            repr: PkBloomRepr::Scattered {
+                bits: vec![0u64; words],
+                bit_mask: u64::try_from(num_bits.saturating_sub(1)).unwrap_or(u64::MAX),
+            },
             inserted_keys: 0,
         }
     }
 
-    /// Serialize as `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)`,
-    /// little-endian.
+    /// The split-block layout, which every new filter uses.
+    fn split_block_with_num_bits_pow2(target_bits: usize) -> Self {
+        let want_blocks = (target_bits / SPLIT_BLOCK_BITS).max(1);
+        let num_blocks = 1usize << want_blocks.ilog2();
+        Self {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; num_blocks],
+                block_mask: u64::try_from(num_blocks.saturating_sub(1)).unwrap_or(0),
+            },
+            inserted_keys: 0,
+        }
+    }
+
+    /// Resident bytes of the bit array, whichever layout backs it.
+    pub(crate) fn size_bytes(&self) -> usize {
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, .. } => bits.len() * 8,
+            PkBloomRepr::SplitBlock { blocks, .. } => blocks.len() * 32,
+        }
+    }
+
+    /// The frame version this filter serializes as.
+    #[cfg(test)]
+    pub(crate) fn frame_version(&self) -> u32 {
+        frame_of(&self.repr).0
+    }
+
+    pub(crate) fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
+        let h1 = pk_bloom_hash(key, 0x517c_c1b7_2722_0a95);
+        // Force odd so successive probes stride across the whole bit space.
+        let h2 = pk_bloom_hash(key, 0x9e37_79b9_7f4a_7c15) | 1;
+        (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
+    }
+
+    /// The block index and the eight per-lane masks for a key, for the
+    /// split-block layout. Fixed length and branch-free so it vectorises.
+    #[inline]
+    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+        // The crate's existing one-shot XXH3-64, the same primitive the WAL
+        // checksum and the frame fingerprint use. One-shot rather than the
+        // streaming `Hasher`: for a 16-byte key the streaming path's setup
+        // costs more than the hash, and more than the two FNV passes it
+        // replaces.
+        let hash = hash_index::hash_key_bytes_oneshot(key);
+        let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
+        // The low half, deliberately: the high half already chose the block, so
+        // the lanes draw on bits the block selection did not consume.
+        let low = u32::try_from(hash & u64::from(u32::MAX)).unwrap_or(0);
+        let mut masks = [0u32; 8];
+        for (mask, salt) in masks.iter_mut().zip(SPLIT_BLOCK_SALT) {
+            // Top five bits of the product pick one of the lane's 32 bits.
+            *mask = 1u32 << (low.wrapping_mul(salt) >> 27);
+        }
+        (block, masks)
+    }
+
+    pub(crate) fn insert(&mut self, key: &[u8]) {
+        match &mut self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                for hash in Self::probe_bits(key) {
+                    let bit = hash & *bit_mask;
+                    let word = usize::try_from(bit >> 6).unwrap_or(0);
+                    bits[word] |= 1u64 << (bit & 63);
+                }
+            }
+            PkBloomRepr::SplitBlock { blocks, block_mask } => {
+                let (index, masks) = Self::split_block_locate(*block_mask, key);
+                let block = &mut blocks[index];
+                for (lane, mask) in block.iter_mut().zip(masks) {
+                    *lane |= mask;
+                }
+            }
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(1);
+    }
+
+    pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                for hash in Self::probe_bits(key) {
+                    let bit = hash & *bit_mask;
+                    let word = usize::try_from(bit >> 6).unwrap_or(0);
+                    if bits[word] & (1u64 << (bit & 63)) == 0 {
+                        return false;
+                    }
+                }
+                true
+            }
+            PkBloomRepr::SplitBlock { blocks, block_mask } => {
+                let (index, masks) = Self::split_block_locate(*block_mask, key);
+                let block = &blocks[index];
+                // Fold every lane rather than exiting on the first miss: the
+                // branch costs more than the remaining ANDs, and the fold is
+                // what vectorises.
+                let mut present = true;
+                for (lane, mask) in block.iter().zip(masks) {
+                    present &= (*lane & mask) == mask;
+                }
+                present
+            }
+        }
+    }
+
+    /// Serialize as `magic(4) | version(4) | probe_fingerprint(8) | body`,
+    /// little-endian, where the body is
+    /// `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)` for the
+    /// scattered layout and
+    /// `block_mask(8) | inserted_keys(8) | num_blocks(8) | blocks(32·B)` for
+    /// split-block.
+    ///
+    /// The header states what a reader needs in order to know it may probe
+    /// these bits at all: which layout wrote them (the version) and which probe
+    /// function placed them (the fingerprint).
     pub(crate) fn serialize_into(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.bit_mask.to_le_bytes());
-        out.extend_from_slice(
-            &u64::try_from(self.inserted_keys)
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        out.extend_from_slice(&u64::try_from(self.bits.len()).unwrap_or(0).to_le_bytes());
-        for word in &self.bits {
-            out.extend_from_slice(&word.to_le_bytes());
+        let (version, fingerprint) = frame_of(&self.repr);
+        out.extend_from_slice(&PK_BLOOM_FRAME_MAGIC.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&fingerprint.to_le_bytes());
+        let inserted = u64::try_from(self.inserted_keys).unwrap_or(u64::MAX);
+        match &self.repr {
+            PkBloomRepr::Scattered { bits, bit_mask } => {
+                out.extend_from_slice(&bit_mask.to_le_bytes());
+                out.extend_from_slice(&inserted.to_le_bytes());
+                out.extend_from_slice(&u64::try_from(bits.len()).unwrap_or(0).to_le_bytes());
+                for word in bits {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+            PkBloomRepr::SplitBlock { blocks, block_mask } => {
+                out.extend_from_slice(&block_mask.to_le_bytes());
+                out.extend_from_slice(&inserted.to_le_bytes());
+                out.extend_from_slice(&u64::try_from(blocks.len()).unwrap_or(0).to_le_bytes());
+                for block in blocks {
+                    for lane in block {
+                        out.extend_from_slice(&lane.to_le_bytes());
+                    }
+                }
+            }
         }
     }
 
     /// Deserialize ONE bloom from the front of `bytes`, returning it and the
     /// number of bytes it consumed — so several blooms can be read back-to-back
-    /// from a sharded sidecar (the bloom is self-describing via its `num_words`).
+    /// from a sharded sidecar (each is self-describing via its count field).
+    ///
+    /// Reads every layout this build knows, whatever it writes: a bloom already
+    /// on disk can only be probed by the layout that filled it, and there is no
+    /// converting one into another — a bloom is lossy, so its members cannot be
+    /// enumerated and re-inserted.
     fn deserialize_from_prefix(bytes: &[u8]) -> Option<(Self, usize)> {
-        let bit_mask = u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?);
-        let inserted_keys = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+        Self::deserialize_from_prefix_probed_by(bytes, *SCATTERED_PROBE_FINGERPRINT)
+    }
+
+    /// [`Self::deserialize_from_prefix`] against an explicit scattered
+    /// fingerprint. Production passes the compiled-in value.
+    ///
+    /// The parameter exists for the UNFRAMED arm, which no serialized-byte
+    /// mutation can reach: an unframed bloom records no fingerprint, so its
+    /// rejection turns on this binary's own value having moved away from
+    /// [`LEGACY_PK_BLOOM_PROBE_FINGERPRINT`] — not on anything in the blob. The
+    /// framed arms need no such seam; a test mutates the recorded fingerprint
+    /// in the bytes and goes through [`Self::from_bytes`].
+    fn deserialize_from_prefix_probed_by(
+        bytes: &[u8],
+        scattered_fingerprint: u64,
+    ) -> Option<(Self, usize)> {
+        let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        if magic != PK_BLOOM_FRAME_MAGIC {
+            // Unframed: persisted before the header existed, so it records
+            // nothing about what filled it. Its bits are probeable only while
+            // this binary still derives scattered probes exactly as that code
+            // did. Always the scattered layout — the frame predates any other.
+            if scattered_fingerprint != LEGACY_PK_BLOOM_PROBE_FINGERPRINT {
+                return None;
+            }
+            return Self::parse_scattered_body(bytes, 0);
+        }
+
+        let version = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+        let written_by = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?);
+        // The version says how to read the body; the fingerprint says whether
+        // the probes that filled it are the ones this binary would use. An
+        // unknown version or a mismatched fingerprint is `None` — the caller's
+        // conservative fallback — never a probe of bits this binary cannot
+        // place.
+        match version {
+            PK_BLOOM_FRAME_VERSION_SCATTERED => {
+                if written_by != scattered_fingerprint {
+                    return None;
+                }
+                Self::parse_scattered_body(bytes, PK_BLOOM_FRAME_HEADER_LEN)
+            }
+            PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK => {
+                if written_by != *SPLIT_BLOCK_PROBE_FINGERPRINT {
+                    return None;
+                }
+                Self::parse_split_block_body(bytes, PK_BLOOM_FRAME_HEADER_LEN)
+            }
+            _ => None,
+        }
+    }
+
+    /// `bit_mask(8) | inserted_keys(8) | num_words(8) | words(8·W)` at
+    /// `header_len`, returning the total bytes consumed including the header.
+    fn parse_scattered_body(bytes: &[u8], header_len: usize) -> Option<(Self, usize)> {
+        let body = bytes.get(header_len..)?;
+        let bit_mask = u64::from_le_bytes(body.get(0..8)?.try_into().ok()?);
+        let inserted_keys = u64::from_le_bytes(body.get(8..16)?.try_into().ok()?);
         let num_words =
-            usize::try_from(u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?)).ok()?;
+            usize::try_from(u64::from_le_bytes(body.get(16..24)?.try_into().ok()?)).ok()?;
         // Reject impossible word counts before allocating.
-        if num_words == 0 || num_words > bytes.len().saturating_sub(24) / 8 {
+        if num_words == 0 || num_words > body.len().saturating_sub(24) / 8 {
             return None;
         }
         // `num_bits` must be a power of two and consistent with `bit_mask`.
@@ -513,48 +951,58 @@ impl PkBloom {
         let mut offset = 24usize;
         for _ in 0..num_words {
             let end = offset.checked_add(8)?;
-            bits.push(u64::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?));
+            bits.push(u64::from_le_bytes(body.get(offset..end)?.try_into().ok()?));
             offset = end;
         }
         Some((
             Self {
-                bits,
-                bit_mask,
+                repr: PkBloomRepr::Scattered { bits, bit_mask },
                 inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
             },
-            offset,
+            header_len + offset,
         ))
     }
 
-    pub(crate) fn probe_bits(key: &[u8]) -> impl Iterator<Item = u64> {
-        let h1 = pk_bloom_hash(key, 0x517c_c1b7_2722_0a95);
-        // Force odd so successive probes stride across the whole bit space.
-        let h2 = pk_bloom_hash(key, 0x9e37_79b9_7f4a_7c15) | 1;
-        (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
-    }
-
-    pub(crate) fn insert(&mut self, key: &[u8]) {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            self.bits[word] |= 1u64 << (bit & 63);
+    /// `block_mask(8) | inserted_keys(8) | num_blocks(8) | blocks(32·B)` at
+    /// `header_len`, returning the total bytes consumed including the header.
+    fn parse_split_block_body(bytes: &[u8], header_len: usize) -> Option<(Self, usize)> {
+        let body = bytes.get(header_len..)?;
+        let block_mask = u64::from_le_bytes(body.get(0..8)?.try_into().ok()?);
+        let inserted_keys = u64::from_le_bytes(body.get(8..16)?.try_into().ok()?);
+        let num_blocks =
+            usize::try_from(u64::from_le_bytes(body.get(16..24)?.try_into().ok()?)).ok()?;
+        // Reject impossible block counts before allocating.
+        if num_blocks == 0 || num_blocks > body.len().saturating_sub(24) / 32 {
+            return None;
         }
-        self.inserted_keys = self.inserted_keys.saturating_add(1);
-    }
-
-    pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
-        for hash in Self::probe_bits(key) {
-            let bit = hash & self.bit_mask;
-            let word = usize::try_from(bit >> 6).unwrap_or(0);
-            if self.bits[word] & (1u64 << (bit & 63)) == 0 {
-                return false;
+        // The block count is a power of two, and `block_mask` selects within it.
+        if !num_blocks.is_power_of_two()
+            || u64::try_from(num_blocks.saturating_sub(1)).ok()? != block_mask
+        {
+            return None;
+        }
+        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut offset = 24usize;
+        for _ in 0..num_blocks {
+            let mut block = [0u32; 8];
+            for lane in &mut block {
+                let end = offset.checked_add(4)?;
+                *lane = u32::from_le_bytes(body.get(offset..end)?.try_into().ok()?);
+                offset = end;
             }
+            blocks.push(block);
         }
-        true
+        Some((
+            Self {
+                repr: PkBloomRepr::SplitBlock { blocks, block_mask },
+                inserted_keys: usize::try_from(inserted_keys).unwrap_or(0),
+            },
+            header_len + offset,
+        ))
     }
 
     /// Serialize this bloom standalone (the [`Self::serialize_into`] frame with
-    /// no sidecar magic/version wrapper) for embedding one bloom per cold-tier
+    /// no sidecar wrapper around it) for embedding one bloom per cold-tier
     /// manifest row (`ColdTierFile::pk_bloom`).
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -563,8 +1011,9 @@ impl PkBloom {
     }
 
     /// Inverse of [`Self::to_bytes`]: parse ONE bloom from `bytes`, ignoring any
-    /// trailing bytes. Returns `None` on a corrupt/short frame so the caller
-    /// falls back to the exact cold scan.
+    /// trailing bytes. Returns `None` on a corrupt/short frame, an unknown
+    /// format version, or bits this binary's probe function did not place, so
+    /// the caller falls back to the exact cold scan.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Self::deserialize_from_prefix(bytes).map(|(bloom, _)| bloom)
     }
@@ -605,7 +1054,7 @@ impl ColdPkExistence {
     pub(crate) fn approx_bytes(&self) -> usize {
         self.blooms
             .iter()
-            .map(|b| b.bits.len().saturating_mul(8))
+            .map(PkBloom::size_bytes)
             .fold(0, usize::saturating_add)
     }
 }
@@ -619,6 +1068,12 @@ const PK_INDEX_SIDECAR_MAGIC: u32 = 0x4350_4b42;
 /// single bloom. A version-1 (single-bloom) sidecar deserializes to `None` →
 /// safe full keyset rebuild (the designed stale-format fallback), so an upgrade
 /// across the bump simply rebuilds the index once.
+///
+/// Framing the blooms themselves did NOT need a bump: each bloom states its own
+/// layout, so a version-2 sidecar full of unframed blooms still reads (no forced
+/// rebuild on upgrade), and a version-2 sidecar full of framed blooms is
+/// rejected deterministically by an older binary — its `num_words` check reads
+/// this bloom's `bit_mask` as a word count, which no frame length can satisfy.
 const PK_INDEX_SIDECAR_VERSION: u32 = 2;
 /// Upper bound on the persisted PK-index blob. Extreme-cardinality tables skip
 /// persistence (and fall back to a runtime rebuild) to bound the metastore and
@@ -676,8 +1131,9 @@ fn deserialize_pk_blooms_sidecar(bytes: &[u8]) -> Option<(Vec<PkBloom>, String)>
     .ok()?;
     let mut rest = bytes.get(count_end..)?;
     // Reject an impossible bloom count before allocating: each bloom is
-    // self-describing and consumes >= 32 bytes (24-byte header + >= one 8-byte
-    // word), so a `count` larger than the remaining bytes can encode means a
+    // self-describing and consumes >= 32 bytes (an unframed bloom's 24-byte body
+    // + >= one 8-byte word; a framed one is 16 bytes larger still), so a `count`
+    // larger than the remaining bytes can encode means a
     // corrupt/truncated sidecar — return None (clean rebuild) rather than risk a
     // huge `with_capacity` allocation. Same guard idiom as `deserialize_from_prefix`.
     if count > rest.len() / 32 {
@@ -727,8 +1183,237 @@ impl CachedPkIndex {
     pub(crate) fn approx_bytes(&self) -> usize {
         match self {
             Self::Exact(keyset) => keyset.approx_bytes,
-            Self::Bloom(bloom) => bloom.bits.len().saturating_mul(8),
+            Self::Bloom(bloom) => bloom.size_bytes(),
         }
+    }
+}
+
+/// One committed key batch held while a PK existence index was checked out of
+/// its cache. Carries the recorded [`RowLocation`] and commit sequence verbatim
+/// so replaying it into the restored index is byte-identical to having recorded
+/// it directly.
+struct PendingPkKeyBatch {
+    keys: PkDigestSet,
+    location: RowLocation,
+    sequence: i64,
+}
+
+/// Divisor applied to a PK cache's byte budget to bound its pending-key log.
+/// The log is transient (it lives only while an index is checked out) and holds
+/// the same per-key payload as the cache, so a quarter keeps the worst case a
+/// fraction of the index it protects.
+const PENDING_PK_KEYS_BUDGET_DIVISOR: usize = 4;
+
+/// Keys committed by other writers while a PK existence index was checked out
+/// of its cache for validation.
+///
+/// A validation stream takes the shared index out of its cache cell and holds it
+/// for the whole lazily-consumed stream, so a writer that commits during that
+/// window finds the cell empty. Recording its keys there is a no-op, and an
+/// existence entry that never lands leaves the index a strict UNDER-approximation
+/// of the live rows — a later upsert probes the restored index, misses, and
+/// classifies the key as new, so it emits no supersede and the table ends up with
+/// two live rows for one primary key. (Over-approximation is the safe direction:
+/// a stale-present entry only costs a redundant tombstone.)
+///
+/// The keys are therefore held here instead, and are both:
+/// - merged into the index when it is restored, so the cache regains every key, and
+/// - probed by the in-flight validation that holds the checked-out index, so a key
+///   committed mid-stream is not read as a new primary key by the writer whose
+///   snapshot predates it.
+///
+/// Bounded by a byte cap. Past it the log stops recording, its snapshot reports
+/// [`PendingPkExistence::is_incomplete`], and the restore discards the index
+/// (forcing an authoritative rebuild) rather than caching one that is silently
+/// missing keys.
+#[derive(Default)]
+pub(crate) struct PendingPkKeys {
+    /// How many indexes are currently checked out over this cache. Distinguishes
+    /// "checked out" from "no cache at all": a cold cache needs no log, because the
+    /// next validation rebuilds the index from the table and sees every committed
+    /// key. Normally 0 or 1 (writers are serialized by the table write lock); see
+    /// [`Self::begin_checkout`] for what a second one means.
+    outstanding: usize,
+    batches: Vec<PendingPkKeyBatch>,
+    approx_bytes: usize,
+    /// The log hit its byte cap and stopped recording, so it no longer holds every
+    /// key committed during the checkout.
+    overflowed: bool,
+    /// The cache was invalidated while the index was checked out, so the index
+    /// describes a table state that has since been superseded (a DELETE, a
+    /// compaction, a recovery) and must not be cached when it comes back.
+    invalidated: bool,
+}
+
+impl PendingPkKeys {
+    /// Byte cap for a log protecting a cache with `cache_budget` bytes.
+    pub(crate) fn budget_from_cache_budget(cache_budget: usize) -> usize {
+        cache_budget / PENDING_PK_KEYS_BUDGET_DIVISOR
+    }
+
+    /// Open a checkout window: keys committed from here until [`Self::end_checkout`]
+    /// are recorded. Any residue from an abandoned checkout is dropped — that index
+    /// was never stored back, so the next validation rebuilds from the table and
+    /// already sees those keys.
+    ///
+    /// Opening a SECOND window while one is outstanding puts two independently-aged
+    /// indexes over one cache: each was read at a different point, so whichever is
+    /// stored last silently reverts the other's keys. Neither is trustworthy, so both
+    /// are marked for discard and the cache goes cold — one rebuild instead of a
+    /// cache that answers "absent" for a live key. Writers are serialized by the
+    /// table write lock, so this is a backstop, not a routine path.
+    pub(crate) fn begin_checkout(&mut self) {
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        } else {
+            self.invalidated = true;
+        }
+        self.batches.clear();
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_add(1);
+    }
+
+    /// Report that the cache was invalidated while an index was checked out, so the
+    /// restore drops that index instead of resurrecting a superseded one. A no-op
+    /// when nothing is checked out — there is then no index in flight, and the flag
+    /// would otherwise leak into the next checkout.
+    pub(crate) fn invalidate(&mut self) {
+        if self.outstanding == 0 {
+            return;
+        }
+        self.invalidated = true;
+        self.batches.clear();
+        self.approx_bytes = 0;
+    }
+
+    /// Hold one committed key batch. A no-op when no index is checked out, or once
+    /// the log has stopped recording. Callers read [`Self::approx_bytes`] around the
+    /// call to account the change.
+    pub(crate) fn record(
+        &mut self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        sequence: i64,
+        max_bytes: usize,
+    ) {
+        if self.outstanding == 0 || self.overflowed || self.invalidated {
+            return;
+        }
+        let batch_bytes = keys
+            .iter()
+            .map(approx_pk_keyset_entry_bytes)
+            .fold(0, usize::saturating_add);
+        if self.approx_bytes.saturating_add(batch_bytes) > max_bytes {
+            // Stop holding keys rather than grow without bound, and release the ones
+            // already held: the index this log protects is now unrecoverable either
+            // way, and `end_checkout` reports that so it is discarded instead of
+            // being stored back missing entries.
+            self.overflowed = true;
+            self.batches.clear();
+            self.approx_bytes = 0;
+            return;
+        }
+        self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
+        self.batches.push(PendingPkKeyBatch {
+            keys: keys.clone(),
+            location: location.clone(),
+            sequence,
+        });
+    }
+
+    /// Close the checkout window and hand back everything committed during it. With
+    /// several windows outstanding every one of them reports a discard, and the flags
+    /// only reset once the last closes.
+    pub(crate) fn end_checkout(&mut self) -> RestoredPkKeys {
+        let restored = RestoredPkKeys {
+            batches: std::mem::take(&mut self.batches),
+            discard_index: self.overflowed || self.invalidated,
+        };
+        self.approx_bytes = 0;
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if self.outstanding == 0 {
+            self.overflowed = false;
+            self.invalidated = false;
+        }
+        restored
+    }
+
+    /// Existence view over the keys held so far, for the validation that holds the
+    /// checked-out index. `None` when nothing was committed during this checkout —
+    /// the overwhelmingly common case, which costs one uncontended lock.
+    pub(crate) fn existence(&self) -> Option<PendingPkExistence> {
+        if self.batches.is_empty() && !self.overflowed {
+            return None;
+        }
+        let capacity = self
+            .batches
+            .iter()
+            .map(|batch| batch.keys.len())
+            .fold(0, usize::saturating_add);
+        let mut locations: HashMap<u128, RowLocation, PrehashedBuildHasher> =
+            HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher);
+        // Later batches win: a key committed twice during the checkout lives where
+        // its most recent commit put it.
+        for batch in &self.batches {
+            for (digest, _) in batch.keys.iter_with_digest() {
+                locations.insert(digest, batch.location.clone());
+            }
+        }
+        Some(PendingPkExistence {
+            locations,
+            incomplete: self.overflowed,
+        })
+    }
+
+    /// Bytes currently held, for memory accounting.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+}
+
+/// Keys committed while an index was checked out, handed to the restore.
+pub(crate) struct RestoredPkKeys {
+    batches: Vec<PendingPkKeyBatch>,
+    discard_index: bool,
+}
+
+impl RestoredPkKeys {
+    /// Whether the index that was checked out must be dropped rather than cached:
+    /// keys committed during the checkout went unheld (the log hit its cap), or the
+    /// cache was invalidated while the index was out. Caching it either way would
+    /// answer "absent" for a live key, which reads as a new primary key.
+    pub(crate) fn index_must_be_discarded(&self) -> bool {
+        self.discard_index
+    }
+
+    /// Replay every held batch, oldest first, so a key committed twice ends on its
+    /// most recent location and sequence.
+    pub(crate) fn batches(&self) -> impl Iterator<Item = (&PkDigestSet, &RowLocation, i64)> {
+        self.batches
+            .iter()
+            .map(|batch| (&batch.keys, &batch.location, batch.sequence))
+    }
+}
+
+/// Snapshot of a [`PendingPkKeys`] log handed to per-batch validation alongside
+/// the checked-out index, so an index miss can still see a concurrent commit.
+pub(crate) struct PendingPkExistence {
+    locations: HashMap<u128, RowLocation, PrehashedBuildHasher>,
+    incomplete: bool,
+}
+
+impl PendingPkExistence {
+    /// Where a key committed during this checkout lives, or `None` if no such key
+    /// was recorded.
+    pub(crate) fn location_by_digest(&self, digest: u128) -> Option<&RowLocation> {
+        self.locations.get(&digest)
+    }
+
+    /// Whether keys committed during this checkout went unrecorded, so a miss here
+    /// does not prove the key is absent from the table.
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 }
 
@@ -935,7 +1620,7 @@ impl ShardedPkIndex {
                 .fold(0, usize::saturating_add),
             Self::Bloom(blooms) => blooms
                 .iter()
-                .map(|b| b.bits.len().saturating_mul(8))
+                .map(PkBloom::size_bytes)
                 .fold(0, usize::saturating_add),
         }
     }
@@ -993,23 +1678,56 @@ impl ShardedPkIndex {
             }
         }
     }
+    /// Insert with the byte budget enforced DURING the loop, returning whether
+    /// the index stayed inside it.
+    ///
+    /// The previous shape inserted every key with `usize::MAX` and left the
+    /// caller to reconcile afterwards, which made the budget a trim rather than
+    /// an admission control: the peak is `batch_keys x entry_bytes` with no
+    /// ceiling, and each entry retains a cloned `OwnedRow` alongside its digest,
+    /// location and sequence. At SF-1000 a heap profile attributed ~14.5 GiB to
+    /// this path against a 256 MiB per-table default — 58x the budget, and the
+    /// budget was doing exactly what it was written to do, just too late.
+    ///
+    /// The tally is re-read every [`BUDGET_RECHECK_KEYS`] keys rather than per
+    /// key: `approx_bytes` is O(shards) over cached per-keyset totals, so it is
+    /// cheap but not free, and a bound that only has to stop unbounded growth
+    /// does not need to be exact. Overshoot is therefore bounded by one chunk
+    /// instead of one batch.
+    ///
+    /// Returning `false` rather than degrading here keeps the policy with the
+    /// caller: an upsert table can fall back to blooms (a false positive is a
+    /// harmless redundant delete) while `DoNothing` needs exactness and must
+    /// drop the index instead.
+    pub(crate) fn record_keys_bounded(
+        &mut self,
+        keys: &PkDigestSet,
+        location: &RowLocation,
+        max_bytes: usize,
+    ) -> bool {
+        /// Keys between budget re-reads. Small enough that a wide batch cannot
+        /// overshoot far, large enough to keep the sum out of the hot loop.
+        const BUDGET_RECHECK_KEYS: usize = 512;
 
-    /// Record `keys` into whichever shard each key routes to
-    /// ([`shard_of_pk`]) — the commit-path analog of
-    /// [`Self::record_keys_in_shard`], for callers whose key set is not
-    /// pre-routed (the inline/file/staging commit paths record a whole
-    /// batch's validated keys at once). Without this, keys committed off the
-    /// mem-tier path exist only in the single-keyset cache and a long-lived
-    /// sharded exact keyset false-negates them into duplicate upserts.
-    /// Existence-only inserts; the caller re-applies the byte budget once
-    /// afterwards (see [`Self::degrade_to_blooms`]).
-    pub(crate) fn record_keys(&mut self, keys: &PkDigestSet, location: &RowLocation) {
         let n = self.shard_count();
         match self {
             Self::Exact(keysets) => {
+                let tally = |keysets: &[CachedPkKeyset]| {
+                    keysets
+                        .iter()
+                        .map(|k| k.approx_bytes)
+                        .fold(0, usize::saturating_add)
+                };
+                if tally(keysets) > max_bytes {
+                    return false;
+                }
+                let mut since_check = 0usize;
                 for (digest, key) in keys.iter_with_digest() {
                     let shard = shard_of_pk(key.as_ref(), n);
                     if let Some(keyset) = keysets.get_mut(shard) {
+                        // Still `usize::MAX` per insert: the per-keyset cap would
+                        // bound one shard, and the budget being enforced here is
+                        // the table-global one across all of them.
                         let _ = keyset.try_insert_with_digest(
                             digest,
                             key,
@@ -1017,8 +1735,49 @@ impl ShardedPkIndex {
                             usize::MAX,
                         );
                     }
+                    since_check = since_check.saturating_add(1);
+                    if since_check >= BUDGET_RECHECK_KEYS {
+                        since_check = 0;
+                        if tally(keysets) > max_bytes {
+                            return false;
+                        }
+                    }
                 }
+                tally(keysets) <= max_bytes
             }
+            // Blooms are allocated at a fixed size, so recording into them
+            // cannot grow the index past its budget.
+            Self::Bloom(blooms) => {
+                for key in keys.iter() {
+                    let shard = shard_of_pk(key.as_ref(), n);
+                    if let Some(bloom) = blooms.get_mut(shard) {
+                        bloom.insert(key.as_ref());
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Record every key of a batch into an already-degraded bloom index.
+    ///
+    /// MUST be called after [`Self::degrade_to_blooms`] when the degrade was
+    /// triggered by [`Self::record_keys_bounded`] returning `false`. That stops
+    /// at the budget, so the keys after the stop were never inserted, and
+    /// `degrade_to_blooms` only converts what the keysets already hold — leaving
+    /// the rest of the batch absent from the bloom.
+    ///
+    /// An absent key is a FALSE NEGATIVE. Under upsert that reads as "this PK is
+    /// new" and writes a duplicate live row, which is the one failure the bloom
+    /// fallback is documented never to cause (a false POSITIVE is merely a
+    /// redundant delete). The single-keyset path has always re-inserted the full
+    /// batch after converting; this is the sharded equivalent.
+    ///
+    /// Cheap and unconditional: blooms are fixed-size, so re-inserting keys
+    /// already present costs a hash and a few bit sets, and no memory.
+    pub(crate) fn record_keys_after_degrade(&mut self, keys: &PkDigestSet) {
+        let n = self.shard_count();
+        match self {
             Self::Bloom(blooms) => {
                 for key in keys.iter() {
                     let shard = shard_of_pk(key.as_ref(), n);
@@ -1027,6 +1786,9 @@ impl ShardedPkIndex {
                     }
                 }
             }
+            // Not degraded, so `record_keys_bounded` admitted the whole batch
+            // and there is nothing to backfill.
+            Self::Exact(_) => {}
         }
     }
 
@@ -1037,10 +1799,31 @@ impl ShardedPkIndex {
     /// unbounded. Safe only under upsert semantics (a bloom false positive
     /// yields a harmless redundant delete) — the caller gates on that.
     pub(crate) fn degrade_to_blooms(&mut self, per_shard_max_bytes: usize) {
+        self.degrade_to_blooms_observed(per_shard_max_bytes, |_, _| {});
+    }
+
+    /// [`Self::degrade_to_blooms`], reporting each shard as it converts.
+    ///
+    /// `observe` receives the shard just converted and the exact bytes still
+    /// held across every keyset. That the figure falls at each step — rather
+    /// than staying at the full exact total until the last shard — is the
+    /// difference between releasing as the conversion goes and releasing at the
+    /// end, and it is not visible in the post-state the two share. Production
+    /// callers pass a no-op.
+    fn degrade_to_blooms_observed(
+        &mut self,
+        per_shard_max_bytes: usize,
+        mut observe: impl FnMut(usize, usize),
+    ) {
         if let Self::Exact(keysets) = self {
-            let blooms: Vec<PkBloom> = keysets
+            let mut exact_bytes_held = keysets
                 .iter()
-                .map(|keyset| {
+                .map(|k| k.approx_bytes)
+                .fold(0, usize::saturating_add);
+            let blooms: Vec<PkBloom> = keysets
+                .iter_mut()
+                .enumerate()
+                .map(|(shard, keyset)| {
                     // Right-size per shard: conversion-time keys with 4× growth
                     // headroom, capped by the per-shard budget split (rationale:
                     // `bloom_from_keyset`).
@@ -1051,6 +1834,14 @@ impl ShardedPkIndex {
                     for key in keyset.rows() {
                         bloom.insert(key.as_ref());
                     }
+                    // Release this shard's exact entries as soon as its bloom
+                    // exists. Building every bloom first and dropping the
+                    // keysets at the end would peak at exact + blooms together,
+                    // which is the worst moment to need extra memory: this
+                    // conversion only runs because the budget was already hit.
+                    exact_bytes_held = exact_bytes_held.saturating_sub(keyset.approx_bytes);
+                    *keyset = CachedPkKeyset::with_capacity(0);
+                    observe(shard, exact_bytes_held);
                     bloom
                 })
                 .collect();
@@ -1071,13 +1862,178 @@ pub(crate) enum PkExistenceRef<'a> {
 mod tests {
     use super::{
         BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkKeyset,
-        ColdPkExistence, PkBloom, PkDigestSet, PkKeysetInsertOutcome, RowLocation, ShardedPkIndex,
-        approx_pk_keyset_entry_bytes, pk_digest, shard_of_pk,
+        ColdPkExistence, LEGACY_PK_BLOOM_PROBE_FINGERPRINT, PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK,
+        PK_INDEX_SIDECAR_MAGIC, PK_INDEX_SIDECAR_VERSION, PkBloom, PkBloomRepr, PkDigestSet,
+        PkKeysetInsertOutcome, RowLocation, SCATTERED_PROBE_FINGERPRINT, ShardedPkIndex,
+        approx_pk_keyset_entry_bytes, deserialize_pk_bloom_sidecar, deserialize_pk_blooms_sidecar,
+        pk_digest, serialize_pk_blooms_sidecar, shard_of_pk,
     };
 
-    /// `record_keys` routes each key to its `shard_of_pk` shard, and
+    /// Degrading after a mid-batch stop must not lose the rest of the batch.
+    ///
+    /// `record_keys_bounded` stops once the budget is reached, so the keys after
+    /// the stop were never inserted. `degrade_to_blooms` only converts what the
+    /// keysets already hold, so those keys would be absent from the bloom — and
+    /// an absent key is a FALSE NEGATIVE, which under upsert reads as "this PK
+    /// is new" and writes a duplicate live row. The single-keyset path has
+    /// always re-inserted the full batch after converting; the sharded path must
+    /// match that contract.
+    ///
+    /// A bloom may answer `true` for a key it never saw; it must never answer
+    /// `false` for one it did.
+    #[test]
+    fn degrading_after_a_mid_batch_stop_still_records_every_key() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(8_000);
+        for i in 0..8_000u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        // Tight enough that the insert stops long before the batch ends.
+        let one_entry = approx_pk_keyset_entry_bytes(&owned_key(&key(0)));
+        let max_bytes = one_entry.saturating_mul(500);
+
+        let within = index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, max_bytes);
+        assert!(
+            !within,
+            "this batch must exceed the budget for the test to mean anything"
+        );
+
+        let per_shard = max_bytes / index.shard_count().max(1);
+        index.degrade_to_blooms(per_shard);
+        index.record_keys_after_degrade(&keys);
+
+        let n = index.shard_count();
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                for k in keys.iter() {
+                    let shard = shard_of_pk(k.as_ref(), n);
+                    assert!(
+                        blooms[shard].maybe_contains(k.as_ref()),
+                        "every key in the batch must survive degradation; a false negative \
+                         here is a duplicate live row under upsert"
+                    );
+                }
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
+        }
+    }
+
+    /// The budget must stop growth DURING the insert, not after it.
+    ///
+    /// The previous shape recorded the whole batch with `usize::MAX` and
+    /// reconciled afterwards, so the peak was `batch_keys x entry_bytes` with no
+    /// ceiling regardless of the configured budget — the mechanism behind ~14.5
+    /// GiB against a 256 MiB default at SF-1000. This asserts the index stops
+    /// near the budget rather than at the end of the batch.
+    #[test]
+    fn a_batch_over_the_budget_stops_inside_it_not_after_it() {
+        let keysets: Vec<CachedPkKeyset> =
+            (0..4).map(|_| CachedPkKeyset::with_capacity(0)).collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        // Far more keys than the budget admits, in one batch.
+        let mut keys = PkDigestSet::with_capacity(20_000);
+        for i in 0..20_000u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        let one_entry = approx_pk_keyset_entry_bytes(&owned_key(&key(0)));
+        // Room for ~1000 entries; the batch is 20x that.
+        let max_bytes = one_entry.saturating_mul(1000);
+
+        let within = index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, max_bytes);
+        assert!(
+            !within,
+            "a batch this far over budget must report over-budget"
+        );
+
+        let held = index.approx_bytes();
+        // Overshoot is bounded by one BUDGET_RECHECK_KEYS chunk (512 entries),
+        // not by the batch. Without the in-loop check this would be all 20,000.
+        let ceiling = max_bytes.saturating_add(one_entry.saturating_mul(512 + 4));
+        assert!(
+            held <= ceiling,
+            "index held {held} bytes, over the {ceiling}-byte chunk-bounded ceiling \
+             (budget {max_bytes}); the budget is being applied after the batch, not during it"
+        );
+    }
+
+    /// Each shard's exact entries are released as its bloom is built, so exact
+    /// and blooms are never both fully resident.
+    ///
+    /// The post-state alone cannot show this — an implementation that built
+    /// every bloom first and dropped the keysets at the end reaches the same
+    /// one. What separates them is the exact bytes still held at each step, so
+    /// the conversion is run through its observation hook: releasing as it goes
+    /// steps the figure down per shard and reaches zero on the last, while
+    /// releasing at the end would report the full exact total until then.
+    #[test]
+    fn degrading_releases_each_shard_as_it_converts() {
+        const SHARDS: usize = 4;
+
+        let keysets: Vec<CachedPkKeyset> = (0..SHARDS)
+            .map(|_| CachedPkKeyset::with_capacity(0))
+            .collect();
+        let mut index = ShardedPkIndex::Exact(keysets.into_boxed_slice());
+
+        let mut keys = PkDigestSet::with_capacity(4096);
+        for i in 0..4096u64 {
+            let k = owned_key(&key(i));
+            keys.insert_with_digest(pk_digest(&k), k);
+        }
+        assert!(index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, usize::MAX));
+        let exact_bytes = index.approx_bytes();
+        assert!(
+            exact_bytes > 0,
+            "the exact index should hold something to release"
+        );
+
+        // (shard converted, exact bytes still held) after each conversion.
+        let mut steps: Vec<(usize, usize)> = Vec::new();
+        index.degrade_to_blooms_observed(64 * 1024, |shard, still_held| {
+            steps.push((shard, still_held));
+        });
+
+        assert_eq!(
+            steps.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(),
+            (0..SHARDS).collect::<Vec<_>>(),
+            "every shard converts, in order"
+        );
+        let mut previously_held = exact_bytes;
+        for (shard, still_held) in &steps {
+            assert!(
+                *still_held < previously_held,
+                "shard {shard} was converted without releasing its exact entries: \
+                 {still_held} bytes still held, unchanged from {previously_held}"
+            );
+            previously_held = *still_held;
+        }
+        assert_eq!(
+            previously_held, 0,
+            "the last conversion must leave no exact entries behind"
+        );
+
+        match &index {
+            ShardedPkIndex::Bloom(blooms) => {
+                assert_eq!(blooms.len(), SHARDS, "every shard converts");
+            }
+            ShardedPkIndex::Exact(_) => panic!("degrade_to_blooms must leave a bloom index"),
+        }
+        assert!(
+            index.approx_bytes() < exact_bytes,
+            "the bloom index must be smaller than the exact one it replaced"
+        );
+    }
+
+    /// `record_keys_bounded` routes each key to its `shard_of_pk` shard, and
     /// `degrade_to_blooms` converts over-budget exact keysets into blooms with
     /// no false negatives — the budget backstop for the maintained index.
+    /// `usize::MAX` here isolates routing from the budget, which has its own
+    /// tests below.
     #[test]
     fn record_keys_routes_and_degrades_to_blooms_without_false_negatives() {
         let keysets: Vec<CachedPkKeyset> =
@@ -1089,7 +2045,7 @@ mod tests {
             let k = owned_key(&key(i));
             keys.insert_with_digest(pk_digest(&k), k);
         }
-        index.record_keys(&keys, &RowLocation::FileUnlocated);
+        assert!(index.record_keys_bounded(&keys, &RowLocation::FileUnlocated, usize::MAX));
         match &index {
             ShardedPkIndex::Exact(keysets) => {
                 let total: usize = keysets.iter().map(CachedPkKeyset::len).sum();
@@ -1232,6 +2188,208 @@ mod tests {
     }
 
     #[test]
+    fn split_block_filter_round_trips_and_has_no_false_negatives() {
+        // Build a v3 filter directly, independent of the env var, so the test
+        // covers the layout rather than the process's write setting.
+        let mut bloom = PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; 4096],
+                block_mask: 4095,
+            },
+            inserted_keys: 0,
+        };
+        let keys: Vec<[u8; 16]> = (0..20_000u128).map(u128::to_le_bytes).collect();
+        for key in &keys {
+            bloom.insert(key);
+        }
+        assert_eq!(bloom.frame_version(), PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK);
+
+        let restored = PkBloom::from_bytes(&bloom.to_bytes()).expect("v3 round-trips");
+        assert_eq!(restored.frame_version(), PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK);
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
+        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+        for key in &keys {
+            assert!(
+                restored.maybe_contains(key),
+                "false negative after round-trip -- a missed conflict writes a duplicate live row"
+            );
+        }
+    }
+
+    /// The property the whole versioning scheme rests on: a v2 reader must reject
+    /// a v3 blob every time, not merely usually. A v2 `bit_mask` is always
+    /// `2^k - 1`, and the v3 magic is not, so the `num_bits == bit_mask + 1` check
+    /// can never accept one.
+    #[test]
+    fn a_v2_reader_deterministically_rejects_a_v3_blob() {
+        let mut bloom = PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; 64],
+                block_mask: 63,
+            },
+            inserted_keys: 0,
+        };
+        for i in 0..500u128 {
+            bloom.insert(&i.to_le_bytes());
+        }
+        let bytes = bloom.to_bytes();
+
+        // Exactly the v2 acceptance test, applied to a v3 frame.
+        let bit_mask = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
+        let num_words = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
+        let num_bits = num_words * 64;
+        assert_ne!(
+            num_bits,
+            bit_mask.wrapping_add(1),
+            "a v3 frame must fail the v2 consistency check"
+        );
+        assert!(
+            !(bit_mask.wrapping_add(1)).is_power_of_two(),
+            "the v3 magic must not look like a v2 bit mask"
+        );
+    }
+
+    /// Both layouts must survive the sharded sidecar, since a table may be
+    /// checkpointed by one binary and reopened by another.
+    #[test]
+    fn a_sidecar_round_trips_either_layout() {
+        for split in [false, true] {
+            let mut bloom = if split {
+                PkBloom {
+                    repr: PkBloomRepr::SplitBlock {
+                        blocks: vec![[0u32; 8]; 128],
+                        block_mask: 127,
+                    },
+                    inserted_keys: 0,
+                }
+            } else {
+                // Explicitly scattered: the general constructor builds
+                // split-block now, so this arm would otherwise test the same
+                // layout twice and cover nothing.
+                PkBloom::scattered_with_num_bits_pow2(1 << 16)
+            };
+            let keys: Vec<[u8; 16]> = (0..2_000u128).map(u128::to_le_bytes).collect();
+            for key in &keys {
+                bloom.insert(key);
+            }
+            let bytes = serialize_pk_blooms_sidecar(std::slice::from_ref(&bloom), "snap-1");
+            let (restored, snapshot) =
+                deserialize_pk_blooms_sidecar(&bytes).expect("sidecar round-trips");
+            assert_eq!(snapshot, "snap-1");
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].frame_version(), bloom.frame_version());
+            for key in &keys {
+                assert!(
+                    restored[0].maybe_contains(key),
+                    "false negative (split={split})"
+                );
+            }
+        }
+    }
+
+    /// `with_expected_keys` must round the bit count UP.
+    ///
+    /// Asserted on the constructor's own output, not on two hand-sized filters:
+    /// a test that only shows "more bits means fewer false positives" stays
+    /// green if the round-up is deleted, which makes it no test of this change.
+    #[test]
+    fn with_expected_keys_rounds_the_bit_count_up() {
+        // 100K keys asks for 1,000,000 bits. Rounding down takes 2^19 and gives
+        // 5.24 bits/key; rounding up takes 2^20 and gives the ~10 the caller
+        // asked for.
+        let filter = PkBloom::with_expected_keys(100_000, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        assert_eq!(
+            filter.size_bytes() * 8,
+            1 << 20,
+            "asked for 10 bits/key and must not receive 5.24"
+        );
+
+        // The ceiling still wins: never round up past what the caller allows.
+        let capped = PkBloom::with_expected_keys(100_000, 64 * 1024);
+        assert!(
+            capped.size_bytes() <= 64 * 1024,
+            "rounding up must not breach max_bytes, got {}",
+            capped.size_bytes()
+        );
+    }
+
+    /// And the accuracy that sizing buys, measured against the round-down the
+    /// pre-frame constructor performed.
+    #[test]
+    fn round_up_sizing_beats_round_down_at_the_same_request() {
+        // Scattered keys, as a hashed composite key is in practice.
+        let mix = |i: u128| i.wrapping_mul(0x9e37_79b9_7f4a_7c15_9e37_79b9_7f4a_7c15);
+        let keys: Vec<[u8; 16]> = (0..100_000u128).map(|i| mix(i).to_le_bytes()).collect();
+        let absent: Vec<[u8; 16]> = (1_000_000..1_100_000u128)
+            .map(|i| mix(i).to_le_bytes())
+            .collect();
+
+        let fpr_at = |bits: usize| {
+            let mut bloom = PkBloom::with_num_bits_pow2(bits);
+            for key in &keys {
+                bloom.insert(key);
+            }
+            #[expect(clippy::cast_precision_loss, reason = "ratio of two small counts")]
+            let rate = absent.iter().filter(|k| bloom.maybe_contains(*k)).count() as f64
+                / absent.len() as f64;
+            rate
+        };
+
+        let want = keys.len() * 10;
+        let rounded_down = fpr_at(want);
+        let rounded_up = fpr_at(want.next_power_of_two());
+        assert!(
+            rounded_up * 5.0 < rounded_down,
+            "rounding up should be far more accurate for the same request: \
+             down={rounded_down:.4} up={rounded_up:.4}"
+        );
+    }
+
+    /// The legacy layout is much less accurate for SEQUENTIAL keys than for
+    /// well-distributed ones, at identical size and load — and a monotonic
+    /// integer primary key, the most ordinary shape a CDC table has, is exactly
+    /// the bad case. This is a large part of what the split-block layout buys.
+    ///
+    /// The cause is the hash. FNV-1a's last operation is a multiply, which
+    /// propagates bits leftward, so its LOW bits are the least diffused — and
+    /// `maybe_contains` indexes with `hash & bit_mask`, i.e. precisely those bits.
+    /// The split-block layout hashes with XXH3 instead and does not have the
+    /// weakness, which this pins as a difference between the two layouts rather
+    /// than an abstract claim about hash quality.
+    #[test]
+    fn sequential_keys_punish_the_scattered_hash_but_not_split_block() {
+        let sequential: Vec<[u8; 16]> = (0..100_000u128).map(u128::to_le_bytes).collect();
+        let absent: Vec<[u8; 16]> = (1_000_000..1_100_000u128).map(u128::to_le_bytes).collect();
+
+        let measure = |mut bloom: PkBloom| {
+            for key in &sequential {
+                bloom.insert(key);
+            }
+            #[expect(clippy::cast_precision_loss, reason = "ratio of two small counts")]
+            let rate = absent.iter().filter(|k| bloom.maybe_contains(*k)).count() as f64
+                / absent.len() as f64;
+            rate
+        };
+
+        let bits = (sequential.len() * 10).next_power_of_two();
+        let v2 = measure(PkBloom::scattered_with_num_bits_pow2(bits));
+        let blocks = bits / super::SPLIT_BLOCK_BITS;
+        let v3 = measure(PkBloom {
+            repr: PkBloomRepr::SplitBlock {
+                blocks: vec![[0u32; 8]; blocks],
+                block_mask: u64::try_from(blocks - 1).expect("fits"),
+            },
+            inserted_keys: 0,
+        });
+
+        assert!(
+            v3 * 4.0 < v2,
+            "the scattered hash should be markedly worse on sequential keys: \
+             scattered={v2:.4} split_block={v3:.4}"
+        );
+    }
+
+    #[test]
     fn pk_bloom_to_from_bytes_round_trips() {
         let mut bloom = PkBloom::with_expected_keys(1000, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
         for n in 0..1000u64 {
@@ -1247,7 +2405,11 @@ mod tests {
                 "restored bloom dropped an inserted key {n}"
             );
         }
-        assert_eq!(restored.bit_mask, bloom.bit_mask, "bit layout preserved");
+        assert_eq!(
+            restored.size_bytes(),
+            bloom.size_bytes(),
+            "bit layout preserved"
+        );
         assert_eq!(restored.inserted_keys, bloom.inserted_keys);
     }
 
@@ -1265,6 +2427,216 @@ mod tests {
         let mut bytes = bloom.to_bytes();
         bytes.truncate(bytes.len() - 8);
         assert!(PkBloom::from_bytes(&bytes).is_none(), "truncated frame");
+    }
+
+    /// The pre-frame serialization: `bit_mask | inserted_keys | num_words |
+    /// words`, with no header. Every bloom persisted before the frame existed
+    /// looks exactly like this, so the tests below build the legacy shape rather
+    /// than asserting against a byte string nothing produces any more.
+    fn unframed_bytes(bloom: &PkBloom) -> Vec<u8> {
+        let PkBloomRepr::Scattered { bits, bit_mask } = &bloom.repr else {
+            panic!("the pre-frame format is scattered only; the frame predates any other layout")
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&bit_mask.to_le_bytes());
+        out.extend_from_slice(
+            &u64::try_from(bloom.inserted_keys)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&u64::try_from(bits.len()).unwrap_or(0).to_le_bytes());
+        for word in bits {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    /// Trunk's pre-frame reader, as an OLD binary would run it: the consistency
+    /// checks alone, with no notion of a magic. Used to prove which shapes such
+    /// a binary accepts and which it turns down — the rollback direction.
+    fn pre_frame_reader_accepts(bytes: &[u8]) -> bool {
+        let Some(bit_mask) = bytes.get(0..8).map(|b| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(b);
+            u64::from_le_bytes(w)
+        }) else {
+            return false;
+        };
+        let Some(num_words) = bytes.get(16..24).map(|b| {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(b);
+            u64::from_le_bytes(w)
+        }) else {
+            return false;
+        };
+        let available = u64::try_from(bytes.len().saturating_sub(24) / 8).unwrap_or(u64::MAX);
+        if num_words == 0 || num_words > available {
+            return false;
+        }
+        let Some(num_bits) = num_words.checked_mul(64) else {
+            return false;
+        };
+        Some(num_bits) == bit_mask.checked_add(1) && num_bits.is_power_of_two()
+    }
+
+    /// A filter in the pre-frame SCATTERED shape, which nothing writes any more
+    /// but every legacy blob on disk has. The tests below are about that shape
+    /// specifically, so they must name it rather than take whatever the current
+    /// writer produces.
+    fn scattered_sample_bloom() -> PkBloom {
+        let mut bloom =
+            PkBloom::scattered_with_expected_keys(100, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        for n in 0..100u64 {
+            bloom.insert(&key(n));
+        }
+        bloom
+    }
+
+    /// A bloom persisted before the frame existed stays readable, so upgrading
+    /// does not force every table through the exact cold scan / keyset rebuild.
+    ///
+    /// If this fails because [`PK_BLOOM_NUM_HASHES`], the hash seeds, or the
+    /// bit layout changed, that is the design working: those blooms are no
+    /// longer probeable and MUST be rejected. Assert the rejection here — do
+    /// NOT update [`LEGACY_PK_BLOOM_PROBE_FINGERPRINT`], which names the
+    /// historical probe function and is frozen.
+    #[test]
+    fn pk_bloom_reads_an_unframed_legacy_blob() {
+        let bloom = scattered_sample_bloom();
+        let legacy = unframed_bytes(&bloom);
+        assert_eq!(
+            *SCATTERED_PROBE_FINGERPRINT, LEGACY_PK_BLOOM_PROBE_FINGERPRINT,
+            "the probe function moved; unframed blooms are no longer probeable — see this test's doc"
+        );
+
+        let restored = PkBloom::from_bytes(&legacy).expect("legacy blob still parses");
+        assert_eq!(restored.size_bytes(), bloom.size_bytes());
+        assert_eq!(restored.inserted_keys, bloom.inserted_keys);
+        for n in 0..100u64 {
+            assert!(
+                restored.maybe_contains(&key(n)),
+                "legacy blob lost inserted key {n}"
+            );
+        }
+    }
+
+    /// The hazard this framing exists for: bits placed by a DIFFERENT probe
+    /// function must not be probed by this one. A live key would probe as
+    /// absent, no supersede tombstone would be recorded, and the row would
+    /// duplicate.
+    #[test]
+    fn pk_bloom_rejects_bits_a_different_probe_function_placed() {
+        let bloom = scattered_sample_bloom();
+
+        // Framed: the writer recorded a fingerprint that is not this binary's.
+        // Through the production reader — the recorded value lives in the bytes,
+        // so the rejection needs no seam.
+        let mut framed = bloom.to_bytes();
+        framed[8..16].copy_from_slice(&SCATTERED_PROBE_FINGERPRINT.wrapping_add(1).to_le_bytes());
+        assert!(
+            PkBloom::from_bytes(&framed).is_none(),
+            "a framed blob written by another probe function must be rejected"
+        );
+        // Unframed: nothing is recorded, so the rejection turns on this binary's
+        // own fingerprint having moved — which only the seam can simulate.
+        assert!(
+            PkBloom::deserialize_from_prefix_probed_by(
+                &unframed_bytes(&bloom),
+                SCATTERED_PROBE_FINGERPRINT.wrapping_add(1)
+            )
+            .is_none(),
+            "an unframed blob must be rejected once the probe function has moved"
+        );
+    }
+
+    #[test]
+    fn pk_bloom_rejects_an_unknown_frame_version() {
+        let mut bytes = scattered_sample_bloom().to_bytes();
+        bytes[4..8].copy_from_slice(&(PK_BLOOM_FRAME_VERSION_SPLIT_BLOCK + 1).to_le_bytes());
+        assert!(
+            PkBloom::from_bytes(&bytes).is_none(),
+            "a future frame version must fall back, not be parsed as this one"
+        );
+    }
+
+    /// The rollback direction: a binary predating the frame rejects a framed
+    /// blob outright rather than probing it, and does so deterministically —
+    /// the magic sits where it reads `bit_mask`, and a `bit_mask` is always
+    /// `2^n - 1`.
+    #[test]
+    fn a_pre_frame_reader_rejects_a_framed_blob() {
+        let bloom = scattered_sample_bloom();
+        let framed = bloom.to_bytes();
+        assert!(
+            pre_frame_reader_accepts(&unframed_bytes(&bloom)),
+            "control: the pre-frame reader accepts the shape it wrote"
+        );
+        assert!(
+            !pre_frame_reader_accepts(&framed),
+            "a pre-frame reader must reject a framed blob"
+        );
+        let leading = u64::from_le_bytes(
+            framed[0..8]
+                .try_into()
+                .expect("frame is longer than 8 bytes"),
+        );
+        assert!(
+            !leading.wrapping_add(1).is_power_of_two(),
+            "the frame's leading word must never look like a bit_mask"
+        );
+    }
+
+    /// A sidecar written before the blooms were framed still loads: the frame
+    /// is per-bloom and self-describing, so the sidecar version did not move
+    /// and no upgrade pays a full keyset rebuild.
+    #[test]
+    fn pk_bloom_sidecar_reads_unframed_blooms() {
+        let bloom = scattered_sample_bloom();
+        let mut legacy_sidecar = Vec::new();
+        legacy_sidecar.extend_from_slice(&PK_INDEX_SIDECAR_MAGIC.to_le_bytes());
+        legacy_sidecar.extend_from_slice(&PK_INDEX_SIDECAR_VERSION.to_le_bytes());
+        legacy_sidecar.extend_from_slice(&8u64.to_le_bytes());
+        legacy_sidecar.extend_from_slice(b"snap-old");
+        legacy_sidecar.extend_from_slice(&1u64.to_le_bytes());
+        legacy_sidecar.extend_from_slice(&unframed_bytes(&bloom));
+
+        let (restored, snapshot) =
+            deserialize_pk_bloom_sidecar(&legacy_sidecar).expect("legacy sidecar still parses");
+        assert_eq!(snapshot, "snap-old");
+        for n in 0..100u64 {
+            assert!(
+                restored.maybe_contains(&key(n)),
+                "legacy sidecar lost inserted key {n}"
+            );
+        }
+    }
+
+    /// Blooms read back-to-back from a sharded sidecar: framing changed each
+    /// bloom's length, so the consumed-bytes accounting has to move with it.
+    #[test]
+    fn pk_bloom_sidecar_reads_framed_blooms_back_to_back() {
+        let mut evens = PkBloom::with_expected_keys(100, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        let mut odds = PkBloom::with_expected_keys(200, COLD_PK_BLOOM_PER_FILE_MAX_BYTES);
+        for n in 0..100u64 {
+            if n % 2 == 0 {
+                evens.insert(&key(n));
+            } else {
+                odds.insert(&key(n));
+            }
+        }
+        let bytes = serialize_pk_blooms_sidecar(&[evens, odds], "snap-sharded");
+
+        let (blooms, snapshot) =
+            deserialize_pk_blooms_sidecar(&bytes).expect("sharded sidecar round-trips");
+        assert_eq!(snapshot, "snap-sharded");
+        assert_eq!(blooms.len(), 2, "both blooms must be read");
+        for n in 0..100u64 {
+            let shard = usize::from(n % 2 != 0);
+            assert!(
+                blooms[shard].maybe_contains(&key(n)),
+                "sharded sidecar lost inserted key {n}"
+            );
+        }
     }
 
     #[test]

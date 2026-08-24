@@ -119,3 +119,8 @@ fn metric_callback_type(metric_callback: &ObserveMetricCallback) -> &'static str
         ObserveMetricCallback::F64(_) => "f64",
     }
 }
+
+/// See [`crate::publish_component_counters_at_zero`].
+pub fn publish_counters_at_zero() {
+    REGISTERED_COUNT.add(0, &[]);
+}

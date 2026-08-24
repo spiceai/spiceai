@@ -21,10 +21,13 @@ use crate::catalogconnector::iceberg::{
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
-    component::{catalog::Catalog, dataset::Dataset},
+    component::{
+        catalog::{Catalog, table_selector},
+        dataset::Dataset,
+    },
     dataconnector::{
         DataConnector, DataConnectorFactory,
-        parameters::{ConnectorParams, ConnectorParamsBuilder},
+        parameters::{ConnectorParams, ConnectorParamsBuilder, RuntimeConnectorContext},
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
     },
     parameters::ExposedParamLookup,
@@ -81,7 +84,7 @@ impl SpiceCloudPlatformCatalog {
             Arc::new(catalog_client),
             namespace_ident,
             read_provider,
-            catalog.include.clone(),
+            table_selector(catalog),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -293,6 +296,7 @@ impl SpiceCloudPlatformCatalog {
                         message: e.to_string(),
                         source: e,
                     })?,
+                &RuntimeConnectorContext::for_dataset(&template_dataset),
             )
             .await
             .map_err(|e| super::Error::UnableToGetCatalogProvider {

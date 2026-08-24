@@ -13,7 +13,7 @@ You may obtain a copy of the License at
 //! transaction.
 //!
 //! These tests validate the building-block contract that
-//! `CayennePartitionedInsertStrategy` (in `runtime/dataaccelerator/cayenne`)
+//! `CayennePartitionedInsertStrategy` (in `accelerator-cayenne`)
 //! relies on:
 //!
 //! - `begin_overwrite` on each partition's `CayenneTableProvider` writes
@@ -167,6 +167,46 @@ async fn snapshot_pointers(setup: &PartitionSetup) -> Vec<String> {
         snapshots.push(meta.current_snapshot_id);
     }
     snapshots
+}
+
+// Regression test for partitioned append refreshes: the deferred target is a
+// durable catalog snapshot identifier, while only the transient writer path is
+// rooted under `_staging/`. Passing the staging path to the catalog makes every
+// partitioned append fail before its atomic pointer update.
+#[tokio::test]
+async fn deferred_append_uses_catalog_valid_target_snapshot_id() {
+    let setup = setup_partitions(1).await;
+    let table = &setup.tables[0];
+    let prepared = table
+        .begin_deferred_snapshot_append(batch_to_stream(make_batch(&[1], &["one"])), 1)
+        .await
+        .expect("prepare deferred append");
+
+    let target_snapshot_id = prepared.target_snapshot_id().to_string();
+    uuid::Uuid::parse_str(&target_snapshot_id)
+        .expect("deferred target snapshot must be a catalog-valid UUID");
+    assert!(
+        !target_snapshot_id.starts_with("_staging/"),
+        "durable target snapshot must not use a staging path"
+    );
+
+    let mut txn = setup
+        .catalog
+        .begin_transaction()
+        .await
+        .expect("begin transaction");
+    setup
+        .catalog
+        .set_current_snapshots_in_txn(
+            &mut *txn,
+            &[(prepared.table_id(), target_snapshot_id.as_str())],
+        )
+        .await
+        .expect("catalog accepts deferred target snapshot");
+    txn.rollback()
+        .await
+        .expect("rollback catalog pointer update");
+    prepared.rollback().await.expect("rollback deferred append");
 }
 
 // ============================================================================

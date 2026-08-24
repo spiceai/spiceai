@@ -1,0 +1,8 @@
+# Frozen output of: git log <last-edit-sha>..origin/trunk --no-merges --format='%h | %an | %s'
+# These are the commits that landed AFTER v2.2.0-rc.1.md was last edited.
+# Captured for the writeReleaseNotes eval. Do not regenerate against live history.
+9f1a2b3 | Jack Eadie | feat(llms): add prompt caching for Anthropic models (#12070)
+8e2b3c4 | Kari Fabri | fix(search): stop rrf() from dropping ties at the top-k boundary (#12073)
+7d3c4d5 | github-actions[bot] | fix(tests): update snapshots after the rrf change (#12074)
+6c4d5e6 | Sergei Grebnov | fix(mongodb): resume from the stored token after a replica set failover (#12077)
+5b5e6f7 | dependabot[bot] | chore(deps): bump tokio from 1.48.0 to 1.48.1 (#12079)

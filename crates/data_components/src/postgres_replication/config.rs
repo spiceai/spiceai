@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use crate::cdc::AccelerationContents;
 use pgwire_replication::{CaCertificate, PgOutputFormat};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -96,7 +97,35 @@ pub struct ReplicationParams {
     /// also set via `pg_replication_initial_snapshot: always` — dropping that
     /// slot would be wrong.
     pub ephemeral_accelerator: bool,
+    /// What the dataset's accelerator held when this stream was built.
+    ///
+    /// Only [`AccelerationContents::Empty`] carries weight, and only over the
+    /// single question of whether a *missing* watermark is evidence of a gap: an
+    /// acceleration holding no rows cannot be hiding a row the source deleted
+    /// while it was away, which is the divergence a rebuild exists to repair.
+    /// Anything else — including a probe that could not answer — leaves the
+    /// rebuild in place.
+    ///
+    /// Even then it only applies when an initial snapshot is going to run, since
+    /// otherwise the rebuild is the only thing that would load the table at all.
+    ///
+    /// Per-dataset, so it is deliberately not part of the shared-slot params
+    /// compatibility check: two datasets legitimately share a slot while one is
+    /// empty and the other is populated.
+    pub acceleration: AccelerationContents,
     pub status_interval: Duration,
+    /// How often an idle member's durably-recorded applied position is carried
+    /// forward to what the slot has acknowledged on its behalf (see
+    /// `shared::flush_idle_watermarks`). Internal, not a user param.
+    ///
+    /// Coarse on purpose. The record only has to be current enough that the *next*
+    /// start does not mistake ordinary idle drift for a gap, and a graceful shutdown
+    /// flushes once more regardless — so this interval governs only how much a
+    /// *crash* can leave behind, where the cost is one rebuild and never a wrong
+    /// resume. Each tick writes at most one small blob per member whose position
+    /// actually moved, into that dataset's own accelerator; a busy member records its
+    /// position through its own commits and costs nothing here.
+    pub watermark_flush_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
     /// falls below this, so a snapshotting or backlog-draining dataset stays
@@ -130,6 +159,17 @@ pub struct ReplicationParams {
     /// still emits text for types lacking a binary send function, so the text
     /// decode path stays live regardless of this setting.
     pub pg_output_format: PgOutputFormat,
+
+    /// How long the shared slot keeps holding its ack floor for a table that is
+    /// in the publication but has no attached member — see
+    /// `shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE` for what the hold is for and
+    /// what letting it lapse costs.
+    ///
+    /// Internal, not a spicepod parameter: the connector always supplies the
+    /// default. It is a field only so a test can shorten it, since the behavior
+    /// that depends on the hold lapsing is otherwise unreachable in under five
+    /// minutes. Read from the params of whichever member opened the slot.
+    pub unclaimed_reservation_grace: Duration,
 }
 
 impl ReplicationParams {
@@ -831,12 +871,16 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             initial_snapshot: true,
             snapshot_on_resume: false,
             ephemeral_accelerator: false,
+            acceleration: AccelerationContents::Unknown,
             status_interval: Duration::from_secs(5),
+            watermark_flush_interval: Duration::from_secs(30),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,
             shared: false,
             member_channel_capacity: 16,
             pg_output_format: PgOutputFormat::Binary,
+            unclaimed_reservation_grace:
+                crate::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
         }
     }
 

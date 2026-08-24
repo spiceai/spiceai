@@ -642,6 +642,104 @@ mod tests {
         sink.write_all(stream, &ctx.task_ctx()).await
     }
 
+    /// Staged writes keep their write-time footer-cache entries: the Vortex
+    /// sink caches each written footer under the path it wrote, and the
+    /// post-move re-key (`rekey_moved_footer_cache_entries`) transfers the
+    /// entry to the published location scans look up. This pins the
+    /// invariant that after an append publishes, no footer-cache entry is
+    /// keyed by a stale (staging / non-current) path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn staged_append_rekeys_write_time_footer_cache_entries() {
+        use datafusion_expr::{col, lit};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig::default();
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "footer_rekey");
+        let options = CreateTableOptions {
+            table_name: "footer_rekey".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(Arc::clone(&context))
+            // Bar the inline path so the append writes real Vortex files.
+            .with_retention_filters(vec![col("id").lt(lit(0_i64))])
+            .create(options)
+            .await
+            .expect("table created");
+
+        let written = append_rows(
+            &provider,
+            &context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![1, 2, 3])],
+        )
+        .await
+        .expect("write");
+        assert_eq!(written, 3);
+
+        let cache = ctx.runtime_env().cache_manager.get_file_metadata_cache();
+        let entries = cache.list_entries();
+        assert!(
+            !entries.is_empty(),
+            "the staged write must leave footer-cache entries"
+        );
+        // The published snapshot may reference files at the path they were
+        // written (no relocation) or move them (staging publish flows); in
+        // both cases the invariant is the same: every cached footer is keyed
+        // by a path that still exists, so no entry is orphaned and scans that
+        // list these locations can hit.
+        for path in entries.keys() {
+            let on_disk = std::path::Path::new("/").join(path.as_ref());
+            assert!(
+                on_disk.exists(),
+                "footer-cache entry '{path}' points at a path that no longer exists"
+            );
+        }
+
+        // Directly exercise the re-key mechanism relocation flows use: the
+        // entry moves to the destination key with its footer intact, and the
+        // stale source key is dropped.
+        let (src_key, src_entry) = {
+            let entries = cache.list_entries();
+            let path = entries.keys().next().expect("an entry").clone();
+            let entry = cache.get(&path).expect("entry");
+            (path, entry)
+        };
+        let dst_key = object_store::path::Path::from(format!("{src_key}.moved"));
+        let dst_meta =
+            vortex_datafusion::synthetic_object_meta(dst_key.clone(), src_entry.meta.size);
+        provider.rekey_moved_footer_cache_entries(vec![(src_key.clone(), Some(dst_meta))]);
+        assert!(
+            cache.get(&src_key).is_none(),
+            "source key must be removed by the re-key"
+        );
+        let moved = cache
+            .get(&dst_key)
+            .expect("entry must exist under the destination key");
+        assert!(
+            Arc::ptr_eq(&moved.file_metadata, &src_entry.file_metadata),
+            "the re-key must carry the same cached footer, not a copy"
+        );
+    }
+
     /// An append that carries no rows must complete as a successful no-op —
     /// including on the upsert + retention-filter shape, where the inline
     /// memtable path is barred and the write goes to a new Vortex snapshot.

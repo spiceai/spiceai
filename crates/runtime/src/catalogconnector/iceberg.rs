@@ -17,7 +17,7 @@ limitations under the License.
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
     Runtime,
-    component::catalog::Catalog,
+    component::catalog::{Catalog, table_selector},
     dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
@@ -53,7 +53,8 @@ fn cluster_table_wrapper(catalog_name: &str) -> CatalogTableWrapper {
     Arc::new(move |schema: &str, table: &str, provider| {
         let table_ref =
             TableReference::full(catalog_name.clone(), schema.to_string(), table.to_string());
-        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)) as Arc<dyn TableProvider>
+        Arc::new(IcebergClusterTableProvider::new(table_ref, provider)).into_table()
+            as Arc<dyn TableProvider>
     })
 }
 use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::StorageFactory};
@@ -186,7 +187,7 @@ impl IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(hadoop_catalog),
             None,
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await
@@ -447,7 +448,7 @@ impl CatalogConnector for IcebergCatalog {
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
-            catalog.include.as_ref(),
+            &table_selector(catalog),
             table_wrapper,
         )
         .await

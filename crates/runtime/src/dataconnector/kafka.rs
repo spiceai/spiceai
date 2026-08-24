@@ -31,35 +31,21 @@ use tonic::async_trait;
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 
-use crate::dataaccelerator::spice_sys::{self, kafka::KafkaSys};
+use runtime_checkpoint_api::debezium::DebeziumCheckpointStore;
 
-#[async_trait]
-pub(crate) trait SidecarOffsetStore: Send + Sync {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
+/// Commits Kafka offsets into the Debezium sidecar after a refresh batch lands.
+pub(crate) struct SidecarOffsetCommitHook {
+    store: Arc<dyn DebeziumCheckpointStore>,
 }
 
-#[async_trait]
-impl SidecarOffsetStore for KafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        KafkaSys::upsert_offsets(self, offsets).await
-    }
-}
-
-pub(crate) struct SidecarOffsetCommitHook<T> {
-    store: Arc<T>,
-}
-
-impl<T> SidecarOffsetCommitHook<T> {
-    pub(crate) fn new(store: Arc<T>) -> Self {
+impl SidecarOffsetCommitHook {
+    pub(crate) fn new(store: Arc<dyn DebeziumCheckpointStore>) -> Self {
         Self { store }
     }
 }
 
 #[async_trait]
-impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
-where
-    T: SidecarOffsetStore,
-{
+impl KafkaOffsetCommitHook for SidecarOffsetCommitHook {
     async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
         self.store
             .upsert_offsets(offsets)

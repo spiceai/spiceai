@@ -1,4 +1,5 @@
 name: testoperator search tests
+run-name: bench - ${{ github.event.inputs.benchmark_dataset }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -20,12 +21,23 @@ on:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
       benchmark_dataset:
-        description: 'Search benchmark dataset to run against'
-        required: true
-        default: 'quora_retrieval'
+        description: 'Built-in MTEB dataset to run against. Select "custom" to test the spicepod as-is.'
+        required: false
+        default: 'custom'
         type: choice
         options:
+          - 'custom'
           - 'quora_retrieval'
+          - 'miracl_en_retrieval'
+          - 'fiqa_retrieval'
+          - 'trec_covid_retrieval'
+          - 'arguana_retrieval'
+          - 'scidocs_retrieval'
+          - 'scifact_retrieval'
+          - 'nfcorpus_retrieval'
+          - 'touche2020_retrieval'
+          - 'msmarco_retrieval'
+          - 'stackoverflow_qa_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false
@@ -92,17 +104,27 @@ jobs:
           echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
-        run: |
-          rm -rf .spice/data
-          testoperator run search \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
-            --concurrency 10 \
-            --benchmark-dataset ${{ github.event.inputs.benchmark_dataset }} \
-            --metrics \
-            -p "${{ github.event.inputs.spicepod_path }}"
         env:
+          BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+        run: |
+          rm -rf .spice/data
+          # A "custom" (or empty) selection tests the spicepod as-is: omit --benchmark-dataset so the
+          # tool runs a custom search rather than downloading an MTEB dataset.
+          dataset_flag=""
+          if [ -n "$BENCHMARK_DATASET" ] && [ "$BENCHMARK_DATASET" != "custom" ]; then
+            dataset_flag="--benchmark-dataset $BENCHMARK_DATASET"
+          fi
+          testoperator run search \
+            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --concurrency 10 \
+            $dataset_flag \
+            --metrics \
+            -p "${{ github.event.inputs.spicepod_path }}"

@@ -8,7 +8,13 @@ on:
       - release-*
       - release/*
     paths:
+      # The model contracts these tests exercise are no longer all under
+      # `crates/llms/` — a change to a trait in one of the API crates reaches
+      # every provider implementing it.
       - 'crates/llms/**'
+      - 'crates/chat-api/**'
+      - 'crates/embed-api/**'
+      - 'crates/rerank-api/**'
   merge_group:
     branches:
       - trunk
@@ -44,6 +50,8 @@ jobs:
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
+    # Evaluates one inline script.
+    timeout-minutes: 15
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -88,6 +96,11 @@ jobs:
   build:
     name: Build Test Binary
     runs-on: spiceai-macos
+    # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
+    # every sample had a warm sccache. Sized against the other macOS workspace
+    # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
+    # build into a red one.
+    timeout-minutes: 300
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
@@ -112,7 +125,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -146,6 +159,8 @@ jobs:
   test:
     runs-on: ${{ matrix.target.runner }}
     needs: [build, setup-matrix]
+    # Slowest observed success in the 2026-07-25..08-08 window: 4 min.
+    timeout-minutes: 90
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       TEST_BINARY_OBJECT_KEY: test_binaries/${{ github.run_id }}/llms_integration_test
@@ -162,7 +177,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

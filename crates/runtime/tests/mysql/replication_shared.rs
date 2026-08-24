@@ -288,6 +288,49 @@ async fn drain_bootstrap(
     Ok(())
 }
 
+/// Drain one member's rebuild head: the single zero-row signal that asks the
+/// consumer to replace the acceleration's contents from the source.
+///
+/// Unlike [`drain_bootstrap`] there are no rows to assert here, and that is the
+/// point — a member whose acceleration already holds rows must not empty it and
+/// stream a fresh snapshot into it, because every query for the length of that
+/// re-read would be answered from an empty, then partially filled, table. The
+/// re-read moves to the consumer's atomic overwrite
+/// (`ChangeEnvelope::history_unavailable`), so the resulting contents are
+/// asserted where that path is covered, not here.
+///
+/// The idle heartbeats a caught-up GTID stream interleaves are zero-row too, so
+/// the signal is found by its flag rather than by position. Any envelope
+/// carrying rows before it is the failure this guards: that is a truncate or a
+/// snapshot batch, i.e. the acceleration being emptied and refilled.
+async fn drain_rebuild(stream: &mut ChangesStream, what: &str) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    loop {
+        let env = next_envelope(stream, &format!("{what} rebuild signal")).await?;
+        anyhow::ensure!(
+            num_rows(&env) == 0,
+            "{what}: the acceleration must be replaced atomically, but rows arrived on the \
+             member's channel before any rebuild signal (ops: {:?})",
+            ops_of(&env)
+        );
+        let is_signal = env.history_unavailable();
+        if is_signal {
+            assert!(
+                !env.is_dataset_ready(),
+                "{what}: the rebuild signal is not ready; readiness is lag-based"
+            );
+        }
+        env.commit().await?;
+        if is_signal {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "{what}: never received a rebuild signal"
+        );
+    }
+}
+
 /// Read the next change on `stream`, asserting it is a single row with `op`/`id`,
 /// then commit it.
 async fn expect_single_change(
@@ -731,19 +774,25 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
 }
 
 /// A purged resume position with `invalid_checkpoint_behavior: restart` must
-/// re-snapshot the member in place instead of fatally erroring — for BOTH the
+/// rebuild the member in place instead of fatally erroring — for BOTH the
 /// file+offset and GTID positioning paths (a purge surfaces as `MySQL` error 1236
 /// in both, and recovery captures the head differently per mode). Regression
 /// test for issue #11968 (restart was a no-op): the running pump's purge handler
 /// now honors `invalid_position_behavior` rather than always broadcasting the
 /// fatal purge error and stopping.
+///
+/// The two modes reach the rebuild by different routes, which is why both are
+/// covered: file mode detects the purge when resolving the start position, so
+/// the signal is the member's stream head; GTID mode resumes and is rejected by
+/// the running pump's `COM_BINLOG_DUMP_GTID`, so the signal is delivered
+/// mid-stream through the member's live channel.
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_group_purged_position_restart_re_snapshots_file() -> Result<(), anyhow::Error> {
+async fn shared_group_purged_position_restart_rebuilds_file() -> Result<(), anyhow::Error> {
     run_purged_position_restart(MYSQL_SHARED_PORT + 6, 210_601, false).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_group_purged_position_restart_re_snapshots_gtid() -> Result<(), anyhow::Error> {
+async fn shared_group_purged_position_restart_rebuilds_gtid() -> Result<(), anyhow::Error> {
     run_purged_position_restart(MYSQL_SHARED_PORT + 7, 210_701, true).await
 }
 
@@ -753,8 +802,8 @@ async fn shared_group_purged_position_restart_re_snapshots_gtid() -> Result<(), 
 /// Structure: subscription 1 bootstraps and persists a resume checkpoint, then
 /// is dropped; we purge that checkpoint's binlogs from the source; subscription
 /// 2 (a distinct `server_id`, so a fully independent source with no teardown
-/// race) resumes from the shared store and must re-snapshot the current state
-/// rather than fatally erroring. A purge surfaces as `MySQL` error 1236 in both
+/// race) resumes from the shared store and must rebuild the acceleration rather
+/// than fatally erroring. A purge surfaces as `MySQL` error 1236 in both
 /// modes — file mode via the resolve-time file check, GTID mode via the running
 /// pump's `COM_BINLOG_DUMP_GTID` rejection (the path issue #11968 fixed).
 async fn run_purged_position_restart(
@@ -810,10 +859,11 @@ async fn run_purged_position_restart(
     exec(&pool, &format!("PURGE BINARY LOGS TO '{current_file}'")).await?;
 
     // Subscription 2: resume from the purged checkpoint. With restart, the
-    // member must re-snapshot the current source state ([1..=5]) — a truncate
-    // barrier, the full snapshot, then the boundary — instead of fataling.
+    // member must hand the consumer an atomic rebuild instead of fataling — and
+    // instead of emptying the acceleration and streaming a fresh snapshot into
+    // it, which every query would observe as an empty, then partial, table.
     let mut stream = subscribe(server_id + 1);
-    drain_bootstrap(&mut stream, "re-snapshot after purge", &[1, 2, 3, 4, 5]).await?;
+    drain_rebuild(&mut stream, "rebuild after purge").await?;
 
     drop(stream);
     pool.disconnect().await?;

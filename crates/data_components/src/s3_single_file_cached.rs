@@ -516,10 +516,14 @@ mod tests {
 
         let mut extra_metadata = std::collections::HashMap::new();
         extra_metadata.insert("schema.key".to_string(), "value".to_string());
-        let wrapped: Arc<dyn TableProvider> = Arc::new(crate::MetadataEnrichedTableProvider::new(
-            Arc::new(cached_table) as Arc<dyn TableProvider>,
-            extra_metadata,
-        ));
+        let inner = Arc::new(cached_table) as Arc<dyn TableProvider>;
+        let wrapped: Arc<dyn TableProvider> = spice_table::SpiceTable::over(
+            Arc::new(crate::MetadataEnrichedTableProvider::new(
+                &inner,
+                extra_metadata,
+            )),
+            inner,
+        );
 
         let result = crate::refresh_skip::should_skip_refresh_for_table_provider(wrapped.as_ref())
             .await
@@ -590,10 +594,14 @@ mod tests {
 
         let mut extra_metadata = std::collections::HashMap::new();
         extra_metadata.insert("schema.key".to_string(), "value".to_string());
-        let wrapped: Arc<dyn TableProvider> = Arc::new(crate::MetadataEnrichedTableProvider::new(
-            Arc::new(cached_table) as Arc<dyn TableProvider>,
-            extra_metadata,
-        ));
+        let inner = Arc::new(cached_table) as Arc<dyn TableProvider>;
+        let wrapped: Arc<dyn TableProvider> = spice_table::SpiceTable::over(
+            Arc::new(crate::MetadataEnrichedTableProvider::new(
+                &inner,
+                extra_metadata,
+            )),
+            inner,
+        );
 
         crate::refresh_skip::reset_refresh_skip_state_for_table_provider(wrapped.as_ref()).await;
 

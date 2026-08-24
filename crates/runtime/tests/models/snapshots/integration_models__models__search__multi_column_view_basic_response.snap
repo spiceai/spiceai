@@ -6,11 +6,14 @@ expression: "normalize_search_response(resp, round_scores)"
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
         "answer": [
           "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
+        ],
+        "question": [
+          "How many multiples of 4 are there between 1 and 30? List them and count the total."
         ]
       },
       "primary_key": {
@@ -18,21 +21,12 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
-        "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
-        ]
-      },
-      "primary_key": {
-        "id": 361
-      }
-    },
-    {
-      "_score": "0.01",
-      "dataset": "qs",
-      "matches": {
+        "answer": [
+          "To find how many groups of 2 are in 14, divide 14 by 2:  \n\\[ 14 \\div 2 = 7 \\]  \nThus, there are $\\boxed{7}$ groups of 2 in 14."
+        ],
         "question": [
           "How many groups of 2 are in 14?"
         ]
@@ -42,11 +36,29 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.01",
+      "_score": "0.03",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "To find how many groups of 5 are in 25, divide 25 by 5:  \n\\[ 25 \\div 5 = 5 \\]  \nSo, there are $\\boxed{5}$ groups of 5 in 25."
+        ],
+        "question": [
+          "How many groups of 5 are in 25?"
+        ]
+      },
+      "primary_key": {
+        "id": 464
+      }
+    },
+    {
+      "_score": "0.02",
       "dataset": "qs",
       "matches": {
         "answer": [
           "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ],
+        "question": [
+          "Which base number, when raised to the fifth power, equals thirty-two?"
         ]
       },
       "primary_key": {

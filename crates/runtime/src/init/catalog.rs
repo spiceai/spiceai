@@ -22,12 +22,13 @@ use crate::{
     catalogconnector::{self, CatalogConnector, get_catalog_provider},
     component::catalog::{Catalog, CatalogBuilder},
     dataconnector::parameters::ConnectorParamsBuilder,
-    status, warn_spaced,
+    status,
 };
 use app::App;
 use futures::future::join_all;
 use runtime_metrics as metrics;
 use snafu::prelude::*;
+use util::warn_spaced;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
@@ -246,7 +247,7 @@ impl Runtime {
         for catalog in &existing_catalogs {
             if !valid_catalogs.iter().any(|c| c.name == catalog.name) {
                 tracing::warn!(
-                    "Failed to deregister catalog '{}'. Removing loaded catalogs is not currently supported.",
+                    "Catalog '{}' was removed from the Spicepod, but a loaded catalog cannot be removed while Spice is running: its tables stay queryable until Spice restarts.",
                     catalog.name
                 );
             }

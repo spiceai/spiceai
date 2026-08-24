@@ -46,12 +46,60 @@ impl CatalogAcceleration {
     pub fn is_durable(&self) -> bool {
         matches!(self.mode, Mode::File | Mode::FileUpdate)
     }
+
+    /// Convert this catalog acceleration into the dataset-level acceleration every
+    /// table it accelerates is configured with: the catalog's engine, storage mode
+    /// and accelerator params, on the one refresh mode catalog acceleration
+    /// supports.
+    ///
+    /// This is a config-shape conversion, not a table enumeration — it names no
+    /// table, connects to nothing, and yields one value per catalog however many
+    /// tables that catalog goes on to accelerate.
+    ///
+    /// It is the single conversion both consumers go through, so the two cannot
+    /// drift: the catalog connector fills in the per-table
+    /// `primary_key`/`on_conflict` on top of it before building each dataset, and
+    /// the runtime builder classifies it for the Cayenne memory budgets — which
+    /// therefore budget for exactly what the catalog's tables are configured with.
+    ///
+    /// Converting is what keeps a single classifier. Answering "does this reach the
+    /// CDC tier / accumulate files?" from `CatalogAcceleration` directly would state
+    /// in a second place what `RefreshWriteProfile` already decides for a dataset,
+    /// and the two would drift the first time that mapping changed. If a third
+    /// component kind ever needs the same analysis, this conversion is the seam to
+    /// replace with a trait both acceleration types implement — the pre-init
+    /// counterpart of `AccelerationSource`, which serves that role after
+    /// initialization.
+    #[must_use]
+    pub fn to_dataset_acceleration(&self) -> spicepod::acceleration::Acceleration {
+        spicepod::acceleration::Acceleration {
+            engine: Some(self.engine.engine_name().to_string()),
+            refresh_mode: Some(match self.refresh_mode {
+                CatalogRefreshMode::Changes => spicepod::acceleration::RefreshMode::Changes,
+            }),
+            // Under a file mode each table lands in its own directory beneath the
+            // configured `cayenne_file_path`, named for the dataset.
+            mode: self.mode.into(),
+            params: (!self.params.is_empty()).then(|| Params::from_string_map(self.params.clone())),
+            ..spicepod::acceleration::Acceleration::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatalogAccelerationEngine {
     #[default]
     Cayenne,
+}
+
+impl CatalogAccelerationEngine {
+    /// The dataset-level `acceleration.engine` name this engine maps to.
+    #[must_use]
+    pub const fn engine_name(self) -> &'static str {
+        match self {
+            Self::Cayenne => "cayenne",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

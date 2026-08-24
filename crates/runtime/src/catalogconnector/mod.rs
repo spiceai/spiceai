@@ -217,6 +217,8 @@ pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
     util::levenshtein::closest_match(name, &registered_catalog_names().await)
 }
 
+// [`CatalogConnectorFactory`] added here should not hold live resources (e.g. cached connection pools).
+// If a factory is ever added that owns a live resource, must reimplement an `unregister_all`.
 pub async fn register_all() {
     let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -348,7 +350,11 @@ pub async fn register_all() {
     );
 }
 
-pub async fn unregister_all() {
+// Test-only: production never clears this registry (see the comment atop
+// `CATALOG_CONNECTOR_FACTORY_REGISTRY`). Callers run under `REGISTRY_TEST_LOCK`
+// so they don't race each other's view of the shared static.
+#[cfg(test)]
+async fn unregister_all() {
     let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
     registry.clear();
 }
@@ -438,6 +444,7 @@ pub async fn get_catalog_provider(
     }
 
     let provider = RefreshingCatalogProvider::new(
+        catalog.name.clone(),
         Arc::clone(&connector)
             .refreshable_catalog_provider(runtime, catalog)
             .await?,

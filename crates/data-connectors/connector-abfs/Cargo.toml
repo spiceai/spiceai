@@ -7,14 +7,21 @@ license-file.workspace = true
 description = "Azure Blob Filesystem (ABFS) data connector for Spice.ai runtime"
 
 [dependencies]
+app = { path = "../../app" }
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 object_store = { workspace = true }
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
+runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 
 [lints]
 workspace = true

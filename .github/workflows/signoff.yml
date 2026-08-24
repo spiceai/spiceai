@@ -8,6 +8,8 @@
 # Same fail-fast order as local sign-off:
 #   0. Skip Rust lint/build/tests when the branch has no Rust-affecting files
 #      vs trunk (.rs, Cargo.toml/lock, rust-toolchain*, .cargo/*)
+#   0b. Refuse a branch whose Makefile has no rule for a target the gate invokes
+#      (a branch based before the target was added would build for hours first)
 #   1. Targeted lint of crates touched by the branch vs trunk (off by default
 #      here — see the run_targeted_prechecks input)
 #   2. Targeted unit tests for those crates (runs only when step 1 does)
@@ -431,7 +433,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@97c3578dcf337786923da33cecd350e7335386b6 # v0.7.0
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -445,6 +447,8 @@ jobs:
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install Protoc
         uses: ./.trusted-ci/actions/install-protoc
@@ -509,13 +513,18 @@ jobs:
       # it. A run that evicted this one re-posts its own `pending` after checkout and
       # setup (~25s), well after this step has run.
       #
-      # `!cancelled()` partitions this against the cancellation handler above, which
-      # would otherwise fight it: on a cancelled run that handler writes `pending` and
-      # this one would immediately rewrite that to `failure`, re-asserting the very
-      # verdict #12424 is about. The split is along the grain of #12343's own design —
-      # `timeout-minutes: 353` exists so budget expiry lands here as a *failed step*
-      # rather than a cancellation, leaving this step the incomplete-run cases and the
-      # handler above the externally-cancelled ones.
+      # `!cancelled()` partitions this against the cancellation handler above, along the
+      # grain of #12343's own design: `timeout-minutes: 353` makes budget expiry land here
+      # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
+      # cases and the handler above the externally-cancelled ones.
+      #
+      # Neither handler writes a verdict, so the two agree on the end state rather than
+      # racing to opposite ones: budget expiry and external cancellation are the same
+      # epistemic state — nothing judged the diff — and `failure` is the one state that
+      # reads as a defect in it instead (#12741). They act on different starting states.
+      # `correct-cancelled` above repairs a `failure`/`error` into `pending`, and leaves
+      # an already-`pending` status untouched; this step restates a `pending` with why
+      # the run ended. A `success` already on the commit is left alone by both.
       - name: Resolve an incomplete sign-off
         if: always() && !cancelled() && steps.sign_off.conclusion != 'success'
         run: |

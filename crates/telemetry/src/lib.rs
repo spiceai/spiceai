@@ -18,6 +18,7 @@ pub use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram};
 use opentelemetry::metrics::{Gauge, UpDownCounter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::OnceLock, time::Duration};
 
 #[cfg(feature = "anonymous_telemetry")]
@@ -25,9 +26,11 @@ pub mod anonymous;
 pub mod exporter;
 pub mod hardware;
 pub mod meter;
+pub mod metrics_reader;
 pub mod noop;
 pub mod reader;
 pub mod timing;
+pub mod tracers;
 
 // As recommended by the OpenTelemetry Semantic Conventions:
 // https://opentelemetry.io/docs/specs/semconv/database/database-metrics/#metric-dbclientresponsereturned_rows
@@ -37,10 +40,12 @@ pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 18] = [
     50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
-// Extended default buckets for duration histogram: 25000.0, 50000.0, 100000.0, 250000.0, 500000.0
-pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
-    0.0, 100.0, 250.0, 500.0, 750.0, 1000.0, 2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0,
-    100_000.0, 250_000.0, 500_000.0,
+// Boundaries for every millisecond-scale duration histogram. The sub-100ms head resolves the band
+// most requests finish in: without it a 0.1ms lookup and a 99ms one share a bucket, and the
+// quantile interpolated inside it tracks the requested percentile rather than any latency.
+pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 24] = [
+    0.0, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 750.0, 1000.0,
+    2500.0, 5000.0, 7500.0, 10000.0, 25000.0, 50000.0, 100_000.0, 250_000.0, 500_000.0,
 ];
 
 // Buckets for byte-sized payload histograms (Cayenne CDC burst / WAL telemetry).
@@ -66,16 +71,59 @@ pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
     8_589_934_592.0,
 ];
 
-// Finer-grained millisecond buckets for sub-second contention timings (metastore
-// writer wait/hold, WAL checkpoint, CDC linger). The shared
-// `DURATION_MS_HISTOGRAM_BUCKETS` jumps straight from 0 to 100ms, which is too
-// coarse for lock/checkpoint latencies that live in the 0.1–50ms band; this set
-// resolves that band while still reaching into the multi-second tail that signals
-// a stall.
+// Finer-grained millisecond buckets for sub-second contention timings (metastore writer
+// wait/hold, WAL checkpoint, CDC linger). Shares its head with `DURATION_MS_HISTOGRAM_BUCKETS`
+// and stops at 30s: a lock or checkpoint wait that long is already a stall.
 pub const CONTENTION_MS_HISTOGRAM_BUCKETS: [f64; 17] = [
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
     10000.0, 30000.0,
 ];
+
+/// Whether the process has finished choosing the `OpenTelemetry` global meter
+/// provider that operator-facing instruments bind to.
+static OPERATOR_METER_PROVIDER_SEALED: AtomicBool = AtomicBool::new(false);
+
+/// Declares that the global meter provider will not be replaced again, so an
+/// instrument built from it may be cached for the life of the process.
+///
+/// `spiced` installs a noop provider at startup and replaces it during
+/// `init_metrics` with the one carrying the operator's Prometheus `/metrics`
+/// and OTLP readers. Call this once the choice is final — after `init_metrics`
+/// when metrics are configured, and also when they are not, so a deployment
+/// that exports nothing still caches (against noop) rather than rebuilding an
+/// instrument on every record.
+pub fn seal_operator_meter_provider() {
+    OPERATOR_METER_PROVIDER_SEALED.store(true, Ordering::Release);
+}
+
+/// Records through a lazily built, cached instrument — except before
+/// [`seal_operator_meter_provider`], where the instrument is built, used and
+/// dropped instead of being cached.
+///
+/// An instrument binds permanently to the provider that was global when it was
+/// built, so caching one built during startup freezes it to the noop provider
+/// and it never reaches `/metrics`. That is not hypothetical: the memory
+/// sampler's first `tokio::time::interval` tick fires immediately, ahead of
+/// the `init_metrics` that installs the real provider, which is what kept
+/// `query_memory_pool_used_bytes` and
+/// `cayenne_compaction_memory_pool_used_bytes` off `/metrics` entirely
+/// (#12667).
+///
+/// Deferring construction to the first record is not enough on its own,
+/// because "the first record" is exactly what a startup-time sampler makes
+/// early. Gating the *cache* rather than the record keeps every early sample
+/// exported through whatever provider is current, and costs a single
+/// [`OnceLock::get`] once the seal is in place — the same steady-state path as
+/// caching unconditionally.
+fn record_via_cached<I>(cell: &OnceLock<I>, build: impl FnOnce() -> I, record: impl FnOnce(&I)) {
+    if let Some(instrument) = cell.get() {
+        record(instrument);
+    } else if OPERATOR_METER_PROVIDER_SEALED.load(Ordering::Acquire) {
+        record(cell.get_or_init(build));
+    } else {
+        record(&build());
+    }
+}
 
 static QUERY_COUNT: OnceLock<Counter<u64>> = OnceLock::new();
 
@@ -307,12 +355,16 @@ static PROCESS_RESIDENT_MEMORY_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 /// the anonymous-telemetry [`meter::METER`], which would never reach an
 /// operator's dashboard. The meter handle is fetched fresh rather than cached,
 /// for the reason `cayenne::operational_meter` documents: caching binds
-/// permanently to whatever provider is global at first access, so the `OnceLock`
-/// holds only the built gauge, whose construction is deferred to the first
-/// record — always after `init_metrics` on this 2s sampling path.
+/// permanently to whatever provider is global at first access.
+///
+/// The built gauge goes through `record_via_cached`, which withholds the
+/// cache until the provider is sealed. Deferring construction to the first
+/// record is not sufficient on its own: the sampler that records this gauge
+/// takes its first sample before `init_metrics` runs.
 pub fn track_process_resident_memory_bytes(bytes: u64, dimensions: &[KeyValue]) {
-    PROCESS_RESIDENT_MEMORY_BYTES
-        .get_or_init(|| {
+    record_via_cached(
+        &PROCESS_RESIDENT_MEMORY_BYTES,
+        || {
             global::meter("process")
                 .u64_gauge("process_resident_memory_bytes")
                 .with_description(
@@ -320,8 +372,9 @@ pub fn track_process_resident_memory_bytes(bytes: u64, dimensions: &[KeyValue]) 
                 )
                 .with_unit("By")
                 .build()
-        })
-        .record(bytes, dimensions);
+        },
+        |gauge| gauge.record(bytes, dimensions),
+    );
 }
 
 static QUERY_SPILLED_ROWS: OnceLock<Counter<u64>> = OnceLock::new();
@@ -444,16 +497,24 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
 /// Registers the CPU-sizing gauges, so a mis-sized deployment is greppable
 /// across a fleet rather than diagnosed pod-by-pod.
 ///
-/// Three quantities, deliberately separate: `spiced_cpu_budget_*` is the value
-/// the runtime *uses*, while `spiced_cpu_limit_millicores` and
-/// `spiced_cpu_request_millicores` are the cgroup *inputs* it was chosen
-/// against. Comparing them is what distinguishes a pod sized for its request
-/// from one sized for its whole node. `source` is `CpuSource::as_str` — the rung
-/// of the detection ladder the budget came from.
+/// `spiced_cpu_budget_*` is the value the runtime *uses*; the rest are the
+/// inputs it was chosen against. Comparing them is what distinguishes a pod
+/// sized for its request from one sized for its whole node. `source` is
+/// `CpuSource::as_str` — the rung of the detection ladder the budget came from,
+/// and the only authority on which input actually won: an exported input may
+/// have been outranked by an explicit setting or by a CPU limit.
 ///
-/// `limit` and `request` are `None` when the cgroup expresses no such value; the
-/// gauge then reports nothing rather than `0`, which would be indistinguishable
-/// from a real zero.
+/// `spiced_cpu_request_millicores` is the pod's own `requests.cpu`, exact, as
+/// declared by whatever wrote the pod spec. The cgroup CPU *share* is
+/// deliberately not exported: every cgroup has one whether or not a request was
+/// expressed — cgroup v2 defaults `cpu.weight: 100`, which inverts to ~2536m in
+/// a plain `docker run` — so a gauge for it would report a request-shaped number
+/// on hosts where nothing requested anything. It stays in the startup log, where
+/// it is read next to the source that was actually used.
+///
+/// Each optional input is `None` when no such value exists; the gauge then
+/// reports nothing rather than `0`, which would be indistinguishable from a real
+/// zero.
 ///
 /// Like [`register_tokio_runtime_metrics`], the binary MUST call this once
 /// AFTER `init_metrics` has installed the Prometheus meter.
@@ -465,7 +526,7 @@ pub fn register_cpu_budget_metrics(
     millicores: u64,
     source: &'static str,
     limit_millicores: Option<u64>,
-    request_millicores: Option<u64>,
+    declared_request_millicores: Option<u64>,
 ) {
     let meter = global::meter("cpu_budget");
 
@@ -494,14 +555,14 @@ pub fn register_cpu_budget_metrics(
             .build();
     }
 
-    if let Some(request) = request_millicores {
+    if let Some(declared) = declared_request_millicores {
         let _ = meter
             .u64_observable_gauge("spiced_cpu_request_millicores")
             .with_description(
-                "CPU request inferred from the cgroup CPU share (Kubernetes requests.cpu). Reported only; never used for sizing.",
+                "The pod's own CPU request (Kubernetes requests.cpu), as declared by the surface that wrote the pod spec. It drives sizing only when nothing outranks it: no CPU limit, and no explicit runtime.cpu.cores (a quantity or all). spiced_cpu_budget_cores{source} reports whether it did, as source=request_burst.",
             )
             .with_unit("{millicpu}")
-            .with_callback(move |obs| obs.observe(request, &[]))
+            .with_callback(move |obs| obs.observe(declared, &[]))
             .build();
     }
 }
@@ -810,6 +871,11 @@ pub mod cayenne {
     /// installed. Fetching it fresh defers binding to each instrument's first record
     /// (inside the `get_or_init` closures below), which on the scan/write paths
     /// always runs after `init_metrics`.
+    ///
+    /// An instrument whose first record can happen at *startup* needs more than
+    /// that, because the deferred build then still lands on the noop provider.
+    /// Those cache through `record_via_cached`, which withholds the cache until
+    /// `seal_operator_meter_provider`.
     fn operational_meter() -> Meter {
         global::meter("cayenne")
     }
@@ -1055,42 +1121,52 @@ pub mod cayenne {
 
     static QUERY_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
-    /// Build-once accessor for the live query-pool usage gauge.
-    fn query_memory_pool_used_bytes() -> &'static Gauge<u64> {
-        QUERY_MEMORY_POOL_USED_BYTES.get_or_init(|| {
-            operational_meter()
-                .u64_gauge("query_memory_pool_used_bytes")
-                .with_description(
-                    "Live bytes reserved in the query memory pool, excluding the in-memory CDC tier's mirror account.",
-                )
-                .with_unit("By")
-                .build()
-        })
+    /// Builds the live query-pool usage gauge against the current global provider.
+    fn build_query_memory_pool_used_bytes() -> Gauge<u64> {
+        operational_meter()
+            .u64_gauge("query_memory_pool_used_bytes")
+            .with_description(
+                "Live bytes reserved in the query memory pool, excluding the in-memory CDC tier's mirror account.",
+            )
+            .with_unit("By")
+            .build()
     }
 
     /// Records live query-pool usage. Sampled by the mem-tier repartition loop,
     /// which already reads the pool on an interval; without this gauge the value
     /// is computed every two seconds and visible nowhere.
+    ///
+    /// That loop takes its first sample before `init_metrics` installs the
+    /// operator's provider, so the gauge is cached through `record_via_cached`
+    /// rather than a bare `get_or_init` — otherwise the cache freezes it to the
+    /// noop provider and it never reaches `/metrics` (#12667).
     pub fn track_query_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
-        query_memory_pool_used_bytes().record(bytes, dimensions);
+        super::record_via_cached(
+            &QUERY_MEMORY_POOL_USED_BYTES,
+            build_query_memory_pool_used_bytes,
+            |gauge| gauge.record(bytes, dimensions),
+        );
     }
 
     static COMPACTION_MEMORY_POOL_USED_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
-    /// Build-once accessor for the live compaction-pool usage gauge.
-    fn compaction_memory_pool_used_bytes() -> &'static Gauge<u64> {
-        COMPACTION_MEMORY_POOL_USED_BYTES.get_or_init(|| {
-            operational_meter()
-                .u64_gauge("cayenne_compaction_memory_pool_used_bytes")
-                .with_description("Live bytes reserved in the dedicated compaction memory pool.")
-                .with_unit("By")
-                .build()
-        })
+    /// Builds the live compaction-pool usage gauge against the current global provider.
+    fn build_compaction_memory_pool_used_bytes() -> Gauge<u64> {
+        operational_meter()
+            .u64_gauge("cayenne_compaction_memory_pool_used_bytes")
+            .with_description("Live bytes reserved in the dedicated compaction memory pool.")
+            .with_unit("By")
+            .build()
     }
 
-    /// Records live compaction-pool usage, sampled alongside the query pool.
+    /// Records live compaction-pool usage, sampled alongside the query pool —
+    /// and cached under the same seal, for the same reason.
     pub fn track_compaction_memory_pool_used_bytes(bytes: u64, dimensions: &[KeyValue]) {
-        compaction_memory_pool_used_bytes().record(bytes, dimensions);
+        super::record_via_cached(
+            &COMPACTION_MEMORY_POOL_USED_BYTES,
+            build_compaction_memory_pool_used_bytes,
+            |gauge| gauge.record(bytes, dimensions),
+        );
     }
 
     static COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
@@ -1908,25 +1984,29 @@ pub mod cayenne {
             .add(pages, &[]);
     }
 
-    // METRIC 3 — inline admission flips. One increment each time a CDC batch that
+    // METRIC 3 — inline admission flips. One increment each time a write that
     // could have updated the inline memtable instead fell back to a Vortex staged
     // write, labeled by `table` and the `reason` it could not inline:
-    // `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap) or
+    // `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap),
     // `blocking_config` (the table's shape — partition column or retention delete
-    // filters — bars inlining outright).
+    // filters — bars inlining outright), or, on the whole-table-replace path,
+    // `ipc_bytes_cap` (the serialized payload exceeded the entry cap even though the
+    // in-memory buffer fit) / `admission_busy` (a sibling partition holds the
+    // context's single inline-admission slot).
 
     static INLINE_FALLBACKS: OnceLock<Counter<u64>> = OnceLock::new();
 
-    /// Counts inline-admission fallbacks: a CDC batch that could not update the inline
+    /// Counts inline-admission fallbacks: a write that could not use the inline
     /// memtable and fell back to a staged Vortex write. `dimensions` should carry
-    /// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config`).
+    /// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config` |
+    /// `ipc_bytes_cap` | `admission_busy`).
     pub fn track_inline_fallback(dimensions: &[KeyValue]) {
         INLINE_FALLBACKS
         .get_or_init(|| {
             operational_meter()
                 .u64_counter("cayenne_inline_fallback_total")
                 .with_description(
-                    "CDC batches that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config).",
+                    "Writes that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config | ipc_bytes_cap | admission_busy).",
                 )
                 .build()
         })
@@ -1973,5 +2053,42 @@ pub mod cayenne {
                 .build()
         })
         .record(bytes, dimensions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
+
+    /// The first boundary above zero is the floor of every quantile drawn from these buckets, and
+    /// requests answered in a fraction of a millisecond are ordinary.
+    ///
+    /// Regression test for #12693.
+    #[test]
+    fn the_duration_buckets_resolve_below_a_millisecond() {
+        let floor = DURATION_MS_HISTOGRAM_BUCKETS
+            .iter()
+            .copied()
+            .find(|&bound| bound > 0.0)
+            .expect("the duration buckets should have a boundary above zero");
+
+        assert!(
+            floor <= 1.0,
+            "the first duration boundary above zero is the floor of every quantile drawn from \
+             these buckets, and {floor}ms is above a millisecond"
+        );
+    }
+
+    #[test]
+    fn histogram_boundaries_are_strictly_increasing() {
+        for (name, bounds) in [
+            ("duration", DURATION_MS_HISTOGRAM_BUCKETS.as_slice()),
+            ("contention", CONTENTION_MS_HISTOGRAM_BUCKETS.as_slice()),
+        ] {
+            assert!(
+                bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "the {name} boundaries must be strictly increasing"
+            );
+        }
     }
 }

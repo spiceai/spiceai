@@ -24,6 +24,7 @@ use serde_json::Value;
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
+use crate::drasi::Drasi as DrasiConfig;
 use crate::fts::FtsStore;
 use crate::metadata::metadata_value_to_string;
 use crate::metric::Metrics;
@@ -231,6 +232,12 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_search: Option<FtsStore>,
 
+    /// Forwards this dataset's change-data-capture stream to a Drasi source, so
+    /// Drasi continuous queries observe the same changes the runtime applies to
+    /// the local accelerator. Requires `acceleration.refresh_mode: changes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drasi: Option<DrasiConfig>,
+
     /// Configures whether the dataset availability monitor is enabled for this dataset.
     /// When enabled, the runtime will periodically check dataset availability
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
@@ -280,6 +287,7 @@ impl Dataset {
             metrics: None,
             vectors: None,
             full_text_search: None,
+            drasi: None,
             check_availability: CheckAvailability::default(),
             check_availability_interval: None,
         }
@@ -371,6 +379,7 @@ impl WithDependsOn<Dataset> for Dataset {
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
             full_text_search: self.full_text_search.clone(),
+            drasi: self.drasi.clone(),
             check_availability: self.check_availability,
             check_availability_interval: self.check_availability_interval.clone(),
         }
@@ -452,6 +461,8 @@ struct DatasetDeserializer {
     vectors: Option<VectorStore>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     full_text_search: Option<FtsStore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drasi: Option<DrasiConfig>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,6 +519,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
             full_text_search: deserializer.full_text_search,
+            drasi: deserializer.drasi,
             check_availability: deserializer.check_availability,
             check_availability_interval: deserializer.check_availability_interval,
         })

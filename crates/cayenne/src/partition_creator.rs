@@ -18,7 +18,7 @@ limitations under the License.
 //! partitioned tables, creating and opening per-partition [`CayenneTableProvider`]s.
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::DFSchema;
@@ -29,7 +29,6 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_table_providers::UnsupportedTypeAction;
-use regex::Regex;
 use runtime_table_partition::Partition;
 use runtime_table_partition::creator::filename::{
     encode_composite_key, encode_key, parse_partition_value, to_hive_partition_dir,
@@ -43,25 +42,17 @@ use crate::{
     TimeRetentionFilterBuilder, metadata,
 };
 
-/// Partition values matching `.*#\d+` (e.g. `"abcdef#123"`) are only supported
-/// on S3 Express One Zone locations, not on local filesystem paths.
-static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r".*#\d+$") {
-        Ok(compiled) => compiled,
-        Err(e) => unreachable!("Unable to compile regexp: {e}"),
-    });
-
 /// Implements [`PartitionCreator`] for Cayenne-backed partitioned tables.
 ///
 /// Creates and opens per-partition [`CayenneTableProvider`]s rooted at
 /// Hive-style subdirectories under `base_path`.
 ///
 /// Two callers construct this: `CREATE TABLE … PARTITIONED BY` in
-/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. They
-/// differ in exactly two ways, and both are opt-in on top of the DDL defaults:
-/// the accelerator shares one background-compaction budget across every
-/// partition ([`Self::with_background_compaction`]), and its tables are targets
-/// for the accelerated dual-write path ([`Self::with_direct_partition_writes`]).
+/// [`crate::ddl::operations`], and the Cayenne accelerator in `runtime`. Both
+/// run their partitions' interval compaction through the process-wide budget
+/// ([`Self::with_background_compaction`]); they differ only in that the
+/// accelerator's tables are targets for the accelerated dual-write path
+/// ([`Self::with_direct_partition_writes`]).
 pub struct CayennePartitionCreator {
     table_name: String,
     base_path: PathBuf,
@@ -118,10 +109,10 @@ impl std::fmt::Debug for CayennePartitionCreator {
 }
 
 impl CayennePartitionCreator {
-    /// Create a partition creator with the `CREATE TABLE … PARTITIONED BY`
-    /// defaults: no shared compaction budget, and not a dual-write target.
-    /// The accelerator opts into both with [`Self::with_background_compaction`]
-    /// and [`Self::with_direct_partition_writes`].
+    /// Create a partition creator that runs no interval compaction and is not a
+    /// dual-write target. Both engines that open Cayenne tables opt into a
+    /// compaction budget with [`Self::with_background_compaction`]; only the
+    /// accelerator opts into [`Self::with_direct_partition_writes`].
     #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
@@ -202,15 +193,14 @@ impl CayennePartitionCreator {
     }
 
     fn partition_table_name(&self, partition_key: &str) -> String {
-        format!(
-            "{}_p{}",
-            self.table_name,
-            encode_identifier_hex(partition_key)
-        )
+        crate::partition_naming::partition_child_table_name(&self.table_name, partition_key)
     }
 
     fn legacy_partition_table_name(&self, partition_values: &[String]) -> String {
-        format!("{}_{}", self.table_name, partition_values.join("_"))
+        crate::partition_naming::legacy_partition_child_table_name(
+            &self.table_name,
+            partition_values,
+        )
     }
 
     fn partition_dir(&self, partition_values: &[ScalarValue]) -> Result<PathBuf, creator::Error> {
@@ -268,21 +258,6 @@ impl PartitionCreator for CayennePartitionCreator {
             .collect::<Result<Vec<_>, _>>()
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
-
-        if self.object_store_config.is_none() {
-            for value in &partition_value_strings {
-                if UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(value) {
-                    return Err(creator::Error::CreatePartition {
-                        source: format!(
-                            "Partition value '{value}' is not supported for local filesystem locations. \
-                             Values matching the pattern '*#<digits>' (e.g., 'abcdef#123') are only \
-                             supported for S3 Express One Zone locations."
-                        )
-                        .into(),
-                    });
-                }
-            }
-        }
 
         tracing::debug!("creating Cayenne partition at {partition_path}");
         tokio::fs::create_dir_all(&partition_dir)
@@ -488,16 +463,6 @@ impl PartitionCreator for CayennePartitionCreator {
     }
 }
 
-fn encode_identifier_hex(value: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        let _ = write!(encoded, "{byte:02X}");
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +546,29 @@ mod tests {
             None,
             Arc::clone(&fixture.runtime_env),
         )
+    }
+
+    /// A table registered in the same metastore as `fixture`'s, rooted outside
+    /// its data directory — the shape an operator gets by accelerating a second
+    /// dataset into one metastore.
+    async fn unrelated_table(fixture: &Fixture, table_name: &str, dir: &str) {
+        fixture
+            .catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&fixture.schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture
+                    .base_path
+                    .with_file_name(dir)
+                    .to_string_lossy()
+                    .to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("the table {table_name} is created: {error}"));
     }
 
     fn bucket(value: &str) -> ScalarValue {
@@ -740,31 +728,208 @@ mod tests {
         );
     }
 
-    /// The pattern gates on a `#` followed only by digits at the end of the
-    /// value; everything else is a legal local partition value.
-    #[test]
-    fn unsupported_local_partition_pattern_matches_only_a_trailing_hash_digits() {
-        for unsupported in ["abcdef#123", "test#1", "some_value#999999", "#0", "a#1"] {
+    /// A partition value is hex-encoded into a single path component before it
+    /// reaches the filesystem, so no character a user can write — a `#`, a path
+    /// separator, a parent-directory reference — can escape or split the
+    /// directory name. This is what makes every value legal on a local
+    /// filesystem, and it is the property to keep if the encoding ever changes.
+    #[tokio::test]
+    async fn a_path_hostile_partition_value_becomes_one_safe_directory_component() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+
+        let hostile = ["abcdef#123", "a/b", "..", "x=y", "with space"];
+        for value in hostile {
+            // The path the creator computes, before the filesystem sees it: a
+            // value that kept a separator would nest below the table directory
+            // rather than sit directly in it, and `read_dir` below could not
+            // tell the difference — it only ever reports the first component.
+            let partition_dir = creator
+                .partition_dir(&[bucket(value)])
+                .unwrap_or_else(|e| panic!("'{value}' must map to a partition directory: {e}"));
+            assert_eq!(
+                partition_dir.parent(),
+                Some(fixture.base_path.as_path()),
+                "'{value}' must name a direct child of the table directory, got {partition_dir:?}"
+            );
+
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .unwrap_or_else(|e| panic!("'{value}' must be a legal partition value: {e}"));
+        }
+
+        let partition_dirs: Vec<String> = std::fs::read_dir(&fixture.base_path)
+            .expect("the table directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("the directory entry is readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .filter(|name| name.starts_with("bucket="))
+            .collect();
+        assert_eq!(
+            partition_dirs.len(),
+            hostile.len(),
+            "one directory per created partition, got {partition_dirs:?}"
+        );
+        for name in &partition_dirs {
+            let encoded = name
+                .strip_prefix("bucket=")
+                .expect("the directory name is Hive-style");
             assert!(
-                UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(unsupported),
-                "'{unsupported}' must be treated as S3 Express One Zone only"
+                encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'),
+                "'{name}' must be a single path-safe component"
             );
         }
-        for supported in [
-            "abcdef",
-            "test_123",
-            "2024-01-01",
-            "partition_value",
-            "123",
-            "abc#def",
-            "test#",
-            "test#abc",
-            "test#123abc",
-        ] {
-            assert!(
-                !UNSUPPORTED_LOCAL_PARTITION_PATTERN.is_match(supported),
-                "'{supported}' must be a legal local filesystem partition value"
-            );
+
+        let mut values: Vec<String> = creator
+            .infer_existing_partitions()
+            .await
+            .expect("partitions are inferred")
+            .iter()
+            .map(|partition| match partition.partition_values.as_slice() {
+                [ScalarValue::Utf8(Some(value))] => value.clone(),
+                other => panic!("expected one Utf8 partition value, got {other:?}"),
+            })
+            .collect();
+        values.sort();
+        let mut expected: Vec<String> = hostile.iter().map(ToString::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            values, expected,
+            "every encoded value must read back exactly as written"
+        );
+    }
+
+    /// Dropping a partitioned table must drop its per-partition child tables
+    /// with it. A surviving child keeps its own stored schema and file manifest,
+    /// so a later recreate of the parent silently reattaches to the old schema
+    /// and to a manifest whose data files were deleted (#12999).
+    #[tokio::test]
+    async fn dropping_the_parent_drops_its_partition_child_tables() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+        for value in ["a", "b"] {
+            creator
+                .create_partition(vec![bucket(value)])
+                .await
+                .unwrap_or_else(|error| panic!("partition {value} is created: {error}"));
         }
+
+        let before = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed before the drop");
+        let children_before = before.iter().filter(|name| name.as_str() != TABLE).count();
+        assert_eq!(
+            children_before, 2,
+            "the fixture must actually register a child table per partition, got {before:?}"
+        );
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops"),
+            "the parent table existed, so the drop reports it was dropped"
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert!(
+            after.is_empty(),
+            "no table may outlive the parent drop, found {after:?}"
+        );
+    }
+
+    /// An unpartitioned table has no `cayenne_partition` rows, so the cascade
+    /// must be a no-op rather than matching a same-prefixed sibling table.
+    #[tokio::test]
+    async fn dropping_a_table_leaves_an_unrelated_same_prefix_table_alone() {
+        let fixture = fixture().await;
+        let sibling = format!("{TABLE}_p0000");
+        unrelated_table(&fixture, &sibling, "sibling").await;
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops")
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert_eq!(
+            after,
+            vec![sibling],
+            "a table that is not a partition of the dropped table must survive"
+        );
+    }
+
+    /// The legacy child-name convention (`{parent}_{values}`) can also spell a
+    /// table an operator accelerated separately into the same metastore —
+    /// partitioning `events` by year spells `events_2024`. Dropping the parent
+    /// must not take that table with it, so a name match only counts when the row
+    /// is rooted at the partition's own directory.
+    #[tokio::test]
+    async fn a_table_colliding_with_the_legacy_partition_name_is_not_dropped() {
+        let fixture = fixture().await;
+        let creator = creator_for(&fixture);
+        creator
+            .create_partition(vec![bucket("a")])
+            .await
+            .expect("partition a is created");
+
+        // Exactly the legacy name this partition would carry, rooted elsewhere.
+        // Derived from the catalog's own partition row rather than spelled by
+        // hand: the recorded values are encoded, so a hand-written name would
+        // collide with nothing and the test would pass without exercising the
+        // guard at all.
+        let partitions = fixture
+            .catalog
+            .get_partitions(&fixture.table_id)
+            .await
+            .expect("the partition is recorded");
+        let [partition] = partitions.as_slice() else {
+            panic!("expected exactly one partition, got {partitions:?}");
+        };
+        let impostor = crate::partition_naming::legacy_partition_child_table_name(
+            TABLE,
+            &partition.partition_values,
+        );
+        unrelated_table(&fixture, &impostor, "unrelated").await;
+
+        assert!(
+            fixture
+                .catalog
+                .drop_table(TABLE)
+                .await
+                .expect("the parent drops")
+        );
+
+        let after = fixture
+            .catalog
+            .list_table_names()
+            .await
+            .expect("table names are listed after the drop");
+        assert_eq!(
+            after,
+            vec![impostor],
+            "the real partition child must go and the name-alike must stay"
+        );
     }
 }

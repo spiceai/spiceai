@@ -23,30 +23,19 @@ limitations under the License.
 //! re-exports the contract so existing `crate::dataaccelerator::…` paths keep resolving.
 
 pub mod arrow;
-#[cfg(not(windows))]
-pub mod cayenne;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 pub mod partitioned_arrow;
-#[cfg(feature = "postgres-accel")]
-pub mod postgres;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
-#[cfg(feature = "turso")]
-pub mod turso;
 
-pub(crate) mod imds;
-pub(crate) mod snapshots;
 pub mod spice_sys;
-pub(crate) mod storage;
+pub use data_accelerator_api::snapshots::CayenneSnapshotValidationError;
+pub(crate) use data_accelerator_api::snapshots::validate_snapshot_paths;
 
-pub(crate) use snapshots::validate_snapshot_paths;
-pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
-
-// The accelerator contract moved to `data-accelerator-api`; re-export for path
-// compatibility. (The `register_data_accelerator!` macro is invoked path-qualified
-// as `data_accelerator_api::register_data_accelerator!` by the engine modules.)
-pub use data_accelerator_api::*;
+// The accelerator contract lives in `data-accelerator-api`; re-exported so
+// `crate::dataaccelerator::…` paths resolve inside this crate. Deliberately
+// `pub(crate)`: a caller outside `runtime` names the contract crate directly, so
+// that reaching the contract does not mean depending on the orchestrator. (The
+// `register_data_accelerator!` macro is invoked path-qualified as
+// `data_accelerator_api::register_data_accelerator!` by the engine modules.)
+pub(crate) use data_accelerator_api::*;
 
 #[cfg(test)]
 mod test {
@@ -60,6 +49,157 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// `DataConnector::resolve_refresh_mode` fills in an unset `refresh_mode`
+    /// (`debezium`/`cdc` → `changes`, `sink` → `disabled`, everything else → `full`) and
+    /// its result is never written back into the `Acceleration`, so both the runtime
+    /// builder and the accelerators have to recover it themselves.
+    ///
+    /// They reach it by different routes: the builder parses the raw Spicepod `from:`
+    /// value before any component exists, while an accelerator asks the initialized
+    /// component for its connector name. Agreeing on every case is what proves a pod
+    /// cannot be budgeted as one shape and configured as another — and it is asserted
+    /// here, with a real `Dataset`, because it is a claim about the pair rather than
+    /// about either side.
+    #[tokio::test]
+    async fn the_two_routes_to_an_unset_refresh_mode_agree() {
+        use crate::component::dataset::acceleration::RefreshMode;
+        use app::AppBuilder;
+
+        let app = Arc::new(AppBuilder::new("connector-unset-refresh-mode").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let both_agree = |from: &str| {
+            let mut dataset =
+                crate::component::dataset::builder::DatasetBuilder::try_new(from.to_string(), "ds")
+                    .expect("dataset builder")
+                    .with_app(Arc::clone(&app))
+                    .with_runtime(Arc::clone(&rt))
+                    .build()
+                    .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                // No `refresh_mode`: the connector decides, and this is what recovers it.
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+
+            // Post-init: through `Dataset::connector_name`, so `DatasetSpec::source()` is
+            // the code under test rather than a hand-rolled parse.
+            let post_init = runtime_acceleration::acceleration_source::resolved_refresh_mode(
+                &dataset,
+                acceleration,
+            );
+            // Pre-init: the builder's parse of the same raw `from:`.
+            let pre_init = crate::builder::connector_unset_refresh_mode(from);
+            assert_eq!(
+                post_init, pre_init,
+                "the accelerator and the runtime builder must resolve `from: {from}` identically"
+            );
+            post_init
+        };
+
+        // `debezium/topic` is the case a `split_once(':')` would miss: `DatasetSpec::source`
+        // treats `/` as a delimiter too, so both routes must agree on it.
+        assert_eq!(both_agree("debezium:my.topic"), RefreshMode::Changes);
+        assert_eq!(both_agree("debezium/topic"), RefreshMode::Changes);
+        assert_eq!(both_agree("cdc:stream"), RefreshMode::Changes);
+        assert_eq!(both_agree("sink"), RefreshMode::Disabled);
+        assert_eq!(both_agree("s3://bucket/path"), RefreshMode::Full);
+        assert_eq!(both_agree("postgres:public.orders"), RefreshMode::Full);
+    }
+
+    /// Pins what `DataAccelerator::spicepod_write_profile` answers, because the memory and
+    /// compaction budgets are computed from it: a wrong mapping would budget a pod as one
+    /// shape while the table is configured as another, and both sides would still look
+    /// internally consistent.
+    ///
+    /// Two things are asserted, and only the second is load-bearing on its own. The
+    /// pre-init and post-init routes agree — but both feed the *same* classifier, differing
+    /// only in how they recover an unset `refresh_mode` (the builder parses the raw `from:`,
+    /// the accelerator asks the initialized component), so that half re-proves the
+    /// resolution agreement rather than the mapping. The absolute expectations below are
+    /// what catch a wrong mapping. That the classification then reaches the table's actual
+    /// configuration is covered engine-side by
+    /// `unset_cdc_refresh_mode_keeps_background_compaction`.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn the_pre_init_and_post_init_write_profiles_agree() {
+        use crate::component::dataset::acceleration::RefreshMode;
+        use app::AppBuilder;
+        use spicepod::acceleration::RefreshMode as SpicepodRefreshMode;
+
+        let app = Arc::new(AppBuilder::new("write-profile-agreement").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let both_agree = |from: &str, refresh_mode: Option<SpicepodRefreshMode>| {
+            // Pre-init: the Spicepod acceleration, classified through the capability the
+            // builder uses.
+            let spicepod_accel = spicepod::acceleration::Acceleration {
+                engine: Some("cayenne".to_string()),
+                mode: spicepod::acceleration::Mode::File,
+                refresh_mode: refresh_mode.clone(),
+                ..Default::default()
+            };
+            let unset = crate::builder::connector_unset_refresh_mode(from);
+            let pre_init = crate::builder::cayenne_write_profile(&spicepod_accel, unset)
+                .expect("the cayenne engine is linked in this test binary");
+
+            // Post-init: the same pod as an initialized dataset, classified by the engine
+            // the way it configures the table.
+            let mut dataset =
+                crate::component::dataset::builder::DatasetBuilder::try_new(from.to_string(), "ds")
+                    .expect("dataset builder")
+                    .with_app(Arc::clone(&app))
+                    .with_runtime(Arc::clone(&rt))
+                    .build()
+                    .expect("build dataset");
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: refresh_mode.map(RefreshMode::from),
+                ..Default::default()
+            });
+            let acceleration = dataset.acceleration.as_ref().expect("acceleration set");
+            let resolved = runtime_acceleration::acceleration_source::resolved_refresh_mode(
+                &dataset,
+                acceleration,
+            );
+            let post_init = accelerator_cayenne::CayenneAccelerator::new()
+                .spicepod_write_profile(&spicepod_accel, resolved)
+                .expect("the cayenne engine classifies its own acceleration");
+
+            assert_eq!(
+                pre_init, post_init,
+                "pre-init and post-init classification of `from: {from}` must agree"
+            );
+            pre_init
+        };
+
+        // An unannotated CDC stream: the connector fills in `changes`, which is the case a
+        // raw-field read would misclassify as a whole-table replace.
+        let cdc = both_agree("debezium:my.topic", None);
+        assert!(
+            cdc.uses_cdc_tier,
+            "an unannotated debezium dataset is a CDC stream"
+        );
+        assert!(
+            cdc.needs_compaction,
+            "a CDC stream accumulates files to consolidate"
+        );
+
+        // A whole-table replace has nothing to consolidate.
+        let full = both_agree("s3://bucket/path", None);
+        assert!(!full.uses_cdc_tier);
+        assert!(!full.needs_compaction);
+
+        // Explicit modes are respected on both sides.
+        let explicit_changes = both_agree("s3://bucket/path", Some(SpicepodRefreshMode::Changes));
+        assert!(explicit_changes.uses_cdc_tier);
+        let _ = both_agree("debezium:my.topic", Some(SpicepodRefreshMode::Full));
+        let _ = both_agree("sink", None);
+    }
 
     #[test]
     fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
@@ -168,7 +308,7 @@ mod test {
     #[cfg(feature = "sqlite")]
     async fn test_file_mode_sqlite_creation_default_path() {
         use crate::builder::RuntimeBuilder;
-        use crate::make_spice_data_directory;
+        use data_accelerator_api::make_spice_data_directory;
         use std::{fs, path::Path};
 
         let spice_data_dir = crate::spice_data_base_path();
@@ -693,7 +833,7 @@ mod accelerator_compat_tests {
             let table = match engine {
                 #[cfg(feature = "sqlite")]
                 Engine::Sqlite => {
-                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                    use accelerator_sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -707,7 +847,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "turso")]
                 Engine::Turso => {
-                    use crate::dataaccelerator::turso::TursoAccelerator;
+                    use accelerator_turso::TursoAccelerator;
                     match TursoAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -721,7 +861,7 @@ mod accelerator_compat_tests {
                 }
                 #[cfg(feature = "duckdb")]
                 Engine::DuckDB => {
-                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                    use accelerator_duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
                         .create_external_table(external_table, None, Vec::new(), None)
                         .await
@@ -749,7 +889,7 @@ mod accelerator_compat_tests {
                 #[cfg(not(windows))]
                 Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
-                    use crate::dataaccelerator::cayenne::CayenneAccelerator;
+                    use accelerator_cayenne::CayenneAccelerator;
 
                     // Clean up any existing .cayenne files and Cayenne metadata
                     // Cayenne only supports appends, so we need a clean state for each test
@@ -1960,7 +2100,7 @@ mod accelerator_compat_tests {
                 let bool_table: Arc<dyn TableProvider> = match engine {
                     #[cfg(feature = "sqlite")]
                     Engine::Sqlite => {
-                        use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                        use accelerator_sqlite::SqliteAccelerator;
                         SqliteAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await
@@ -1968,7 +2108,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "turso")]
                     Engine::Turso => {
-                        use crate::dataaccelerator::turso::TursoAccelerator;
+                        use accelerator_turso::TursoAccelerator;
                         TursoAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await
@@ -1976,7 +2116,7 @@ mod accelerator_compat_tests {
                     }
                     #[cfg(feature = "duckdb")]
                     Engine::DuckDB => {
-                        use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                        use accelerator_duckdb::DuckDBAccelerator;
                         DuckDBAccelerator::new()
                             .create_external_table(external_table, None, Vec::new(), None)
                             .await
@@ -1992,7 +2132,7 @@ mod accelerator_compat_tests {
                     #[cfg(not(windows))]
                     Engine::Cayenne => {
                         use crate::component::dataset::builder::DatasetBuilder;
-                        use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
+                        use accelerator_cayenne::CayenneAccelerator; // Clean up any existing files and metadata
                         if mode == "file" && !location.is_empty() {
                             let test_dir = std::path::Path::new(&location);
                             if test_dir.exists() {
@@ -2190,15 +2330,16 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
             // (when calling scan() directly). Filter pushdown for Vortex only works via
             // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                4
-            };
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 4 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 5",
@@ -2218,12 +2359,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                3
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id < 3",
@@ -2242,12 +2384,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                1
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 1 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} row with id = 5",
@@ -2268,12 +2411,13 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown at the TableProvider level
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
-                10
-            } else {
-                3
-            };
+            // Arrow returns everything: no filter pushdown at the TableProvider
+            // level. Cayenne holds these 10 rows in its inline tier — small
+            // writes inline on this refresh profile — and that tier evaluates the
+            // predicate during the scan, so it returns exactly the matching rows.
+            // Its Vortex path would return all 10; pushdown there only happens via
+            // DataFusion's physical optimizer on a SQL query.
+            let expected_rows = if engine == Engine::Arrow { 10 } else { 3 };
             assert_eq!(
                 total_rows, expected_rows,
                 "{:?}: should have {} rows with id > 3 AND id < 7",

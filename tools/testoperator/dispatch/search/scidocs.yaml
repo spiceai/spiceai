@@ -1,0 +1,33 @@
+tests:
+  search:
+    - spicepod_path: test/spicepods/search/mteb/scidocs/full_text_search-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/scidocs/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/scidocs/hf[all-minilm-l6-v2]-arrow.yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      # CPU-bound all-MiniLM-L6-v2 embedding of the 25,657-doc scidocs corpus averages
+      # ~14 rows/s, so the full load takes ~30 minutes — right at the 1800s edge and
+      # consistently timing out. Give it headroom.
+      ready_wait: 2700
+    - spicepod_path: test/spicepods/search/mteb/scidocs/hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/scidocs/model2vec[potion-multilingual-128M]-duckdb[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/scidocs/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
+    - spicepod_path: test/spicepods/search/mteb/scidocs/model2vec[potion-multilingual-128M]-s3_vectors.yaml
+      runner_type: spiceai-dev-runners
+      benchmark_dataset: scidocs_retrieval
+      ready_wait: 1800
