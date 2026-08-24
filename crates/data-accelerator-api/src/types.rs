@@ -23,7 +23,7 @@ use runtime_acceleration::Engine;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-use super::{DATA_ACCELERATOR_REGISTRATIONS, DataAccelerator};
+use super::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS, DataAccelerator};
 
 // Re-export AccelerationSource from runtime-acceleration so existing paths keep working.
 pub use runtime_acceleration::AccelerationSource;
@@ -67,10 +67,19 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    pub async fn register_all(&self) {
+    /// Builds and registers every engine this build linked, configured for this
+    /// `Runtime`.
+    ///
+    /// `config` is passed to each constructor rather than published somewhere the
+    /// constructors can read, so the settings belong to this registry alone — two
+    /// `Runtime`s built concurrently in one process cannot see each other's.
+    pub async fn register_all(&self, config: &AcceleratorRuntimeConfig) {
         for registration in DATA_ACCELERATOR_REGISTRATIONS {
-            self.register_accelerator_engine(registration.engine, (registration.constructor)())
-                .await;
+            self.register_accelerator_engine(
+                registration.engine,
+                (registration.constructor)(config),
+            )
+            .await;
         }
     }
 

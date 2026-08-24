@@ -153,7 +153,7 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .map(|reg| {
-            let accelerator = (reg.constructor)();
+            let accelerator = (reg.constructor)(&Default::default());
             ConnectorSchema {
                 // Use Display trait to get the string representation
                 name: reg.engine.to_string(),

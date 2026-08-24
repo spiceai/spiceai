@@ -91,14 +91,36 @@ pub fn make_spice_data_directory() -> std::io::Result<()> {
 pub use runtime_acceleration::BootstrapStatus;
 pub use types::{AccelerationSource, AcceleratorEngineRegistry};
 
+/// Runtime-level (not per-dataset) settings an engine needs at construction.
+///
+/// An engine is built by its registration constructor, which the registration slice calls
+/// with no knowledge of the engine's type. Passing the resolved settings *here* is what
+/// keeps them per-`Runtime`: an engine built for one `Runtime` cannot see another's, and
+/// there is no process-global channel to publish them through — nor a window between
+/// publishing and constructing for a concurrent build to interleave in.
+///
+/// Fields are named for the `runtime.params` key they come from. Most engines take
+/// nothing from here, which is why the simple form of
+/// [`register_data_accelerator!`] ignores this argument entirely.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceleratorRuntimeConfig {
+    /// `runtime.params.cayenne_footer_cache_mb`: the size of the process-wide Vortex
+    /// footer-metadata cache. `None` when the operator set none, which is distinct from
+    /// `Some(0)` (no footer cache at all).
+    pub cayenne_footer_cache_mb: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 pub struct AcceleratorRegistration {
     pub engine: Engine,
-    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+    pub constructor: fn(&AcceleratorRuntimeConfig) -> Arc<dyn DataAccelerator>,
 }
 
 impl AcceleratorRegistration {
-    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+    pub const fn new(
+        engine: Engine,
+        constructor: fn(&AcceleratorRuntimeConfig) -> Arc<dyn DataAccelerator>,
+    ) -> Self {
         Self {
             engine,
             constructor,
@@ -158,6 +180,16 @@ fn format_engine_list(names: &[String]) -> String {
 /// register_data_accelerator!(Engine::Foo, FooAccelerator);
 /// ```
 ///
+/// # Example (configured form)
+///
+/// For an engine that takes a runtime-level setting at construction. It must implement
+/// `from_runtime_config(&AcceleratorRuntimeConfig) -> Self`; the simple forms above call
+/// `new()` and ignore the configuration.
+///
+/// ```ignore
+/// register_data_accelerator!(configured: Engine::Foo, FooAccelerator);
+/// ```
+///
 /// # Example (explicit form)
 ///
 /// ```ignore
@@ -174,8 +206,22 @@ fn format_engine_list(names: &[String]) -> String {
 #[macro_export]
 macro_rules! register_data_accelerator {
     ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
-        fn $fn_name() -> ::std::sync::Arc<dyn $crate::DataAccelerator> {
+        fn $fn_name(
+            _config: &$crate::AcceleratorRuntimeConfig,
+        ) -> ::std::sync::Arc<dyn $crate::DataAccelerator> {
             ::std::sync::Arc::new(<$accelerator>::new())
+        }
+
+        #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::AcceleratorRegistration =
+            $crate::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    (configured: $fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
+        fn $fn_name(
+            config: &$crate::AcceleratorRuntimeConfig,
+        ) -> ::std::sync::Arc<dyn $crate::DataAccelerator> {
+            ::std::sync::Arc::new(<$accelerator>::from_runtime_config(config))
         }
 
         #[linkme::distributed_slice($crate::DATA_ACCELERATOR_REGISTRATIONS)]
@@ -186,6 +232,18 @@ macro_rules! register_data_accelerator {
     ($engine:expr, $accelerator:ident) => {
         ::paste::paste! {
             $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
+
+    (configured: $engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                configured:
                 [<__register_data_accelerator_fn_ $accelerator:snake>],
                 [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
                 $engine,
@@ -1152,7 +1210,9 @@ fn accelerator_for_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
     DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .find(|registration| registration.engine == engine)
-        .map(|registration| (registration.constructor)())
+        // Built only to ask it about an acceleration, so the runtime-level settings are
+        // irrelevant: nothing here reads a footer cache.
+        .map(|registration| (registration.constructor)(&AcceleratorRuntimeConfig::default()))
 }
 
 #[cfg(test)]

@@ -1149,15 +1149,19 @@ static CAYENNE_ACCELERATOR_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 impl CayenneAccelerator {
-    /// Builds the engine with the footer-cache size the runtime published.
-    ///
-    /// This is the constructor the registration slice calls, and it takes no arguments,
-    /// which is why the setting arrives through
-    /// [`runtime_acceleration::memory_budget::publish_cayenne_footer_cache_mb`] rather
-    /// than as a parameter.
+    /// Builds the engine with no footer cache configured.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_footer_cache_mb(runtime_acceleration::memory_budget::cayenne_footer_cache_mb())
+        Self::with_footer_cache_mb(None)
+    }
+
+    /// Builds the engine for the `Runtime` whose settings these are.
+    ///
+    /// This is what the registration slice calls, so the footer-cache size arrives as an
+    /// argument and belongs to that one `Runtime`.
+    #[must_use]
+    pub fn from_runtime_config(config: &data_accelerator_api::AcceleratorRuntimeConfig) -> Self {
+        Self::with_footer_cache_mb(config.cayenne_footer_cache_mb)
     }
 
     #[must_use]
@@ -4204,7 +4208,7 @@ fn serialize_partition_child_writes(
     config.write_concurrency = Some(1);
 }
 
-data_accelerator_api::register_data_accelerator!(Engine::Cayenne, CayenneAccelerator);
+data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {
@@ -4767,6 +4771,44 @@ mod tests {
             .collect();
         assert!(dims.contains(&256));
         assert!(dims.contains(&1536));
+    }
+
+    /// The footer-cache size reaches the engine as a constructor argument, so it belongs
+    /// to the `Runtime` that supplied it.
+    ///
+    /// This replaces a round-trip test over the process-global channel this seam retired.
+    /// `usize::MAX` is covered because `runtime.params.cayenne_footer_cache_mb` accepts
+    /// `max`: the retired channel reserved that value to mean "nothing was published", so
+    /// the largest cache an operator can ask for silently became the default. Nothing here
+    /// can reserve a value, but the case is the one worth keeping a test on.
+    #[test]
+    fn the_footer_cache_size_comes_from_the_runtime_config() {
+        use data_accelerator_api::AcceleratorRuntimeConfig;
+
+        let configured = |mb| {
+            CayenneAccelerator::from_runtime_config(&AcceleratorRuntimeConfig {
+                cayenne_footer_cache_mb: mb,
+            })
+            .footer_cache_mb
+        };
+
+        assert_eq!(configured(Some(256)), Some(256));
+        assert_eq!(
+            configured(Some(0)),
+            Some(0),
+            "no footer cache at all is a real setting, distinct from an absent one"
+        );
+        assert_eq!(
+            configured(Some(usize::MAX)),
+            Some(usize::MAX),
+            "`cayenne_footer_cache_mb: max` must reach the engine as the operator wrote it"
+        );
+        assert_eq!(configured(None), None);
+
+        // Two `Runtime`s in one process configure independently: the value travels with
+        // the engine instance, so there is nothing for a concurrent build to overwrite.
+        assert_eq!(configured(Some(64)), Some(64));
+        assert_eq!(CayenneAccelerator::new().footer_cache_mb, None);
     }
 
     /// The write profile is the engine's answer about its *own* acceleration, so an
