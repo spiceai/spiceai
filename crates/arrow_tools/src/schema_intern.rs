@@ -83,7 +83,9 @@ pub struct InternerStats {
     /// keep them alive; reporting them here is what keeps the saving visible
     /// rather than invisible.
     pub schema_bytes: usize,
-    /// The pool's own bookkeeping: its rows and their hash-map slots.
+    /// The pool's own retained allocation: its hash-map slots and bucket
+    /// vectors, measured from capacity rather than from live rows so that
+    /// capacity left behind by a past burst is visible.
     pub self_bytes: usize,
     /// Interned schemas served from an existing row.
     pub hits: u64,
@@ -118,10 +120,6 @@ struct Row {
     schema_size: usize,
 }
 
-/// The pool's own cost for one row: the `Row` itself, the `Weak`'s share of its
-/// bucket `Vec`, and a hash-map slot amortised over the bucket.
-const ROW_SELF_BYTES: usize = size_of::<Row>() + size_of::<u64>() + size_of::<usize>();
-
 #[derive(Default)]
 struct Shard {
     /// Content hash -> candidate rows. A bucket holds more than one row only on
@@ -133,8 +131,19 @@ struct Shard {
     since_sweep: usize,
 }
 
+/// How many times larger than its live contents a collection may be before a
+/// sweep reallocates it.
+///
+/// `retain` removes rows but never gives back the capacity they occupied, so
+/// without this a burst of short-lived query shapes would leave every shard
+/// holding its peak allocation for the process lifetime — which is exactly what
+/// a weakly-held pool promises not to do. Shrinking only past a slack factor
+/// keeps a steady-state workload from reallocating on every sweep.
+const CAPACITY_SLACK: usize = 4;
+
 impl Shard {
-    /// Drops rows whose last holder is gone, and any bucket left empty.
+    /// Drops rows whose last holder is gone, and any bucket left empty, then
+    /// returns the capacity the survivors no longer need.
     fn sweep(&mut self) {
         // Tallied locally so the closure does not alias the fields it updates.
         let (mut rows, mut schema_bytes) = (self.rows, self.schema_bytes);
@@ -148,11 +157,31 @@ impl Shard {
                     false
                 }
             });
+            if candidates.capacity() > candidates.len().saturating_mul(CAPACITY_SLACK) {
+                candidates.shrink_to_fit();
+            }
             !candidates.is_empty()
         });
+        if self.buckets.capacity() > self.buckets.len().saturating_mul(CAPACITY_SLACK) {
+            self.buckets.shrink_to_fit();
+        }
         self.rows = rows;
         self.schema_bytes = schema_bytes;
         self.since_sweep = 0;
+    }
+
+    /// The pool's own retained allocation for this shard: its hash-map slots and
+    /// its bucket vectors.
+    ///
+    /// Measured from capacity rather than from the live-row count, so capacity a
+    /// past burst left behind is visible rather than reported as zero.
+    fn self_bytes(&self) -> usize {
+        self.buckets.capacity() * (size_of::<u64>() + size_of::<Vec<Row>>())
+            + self
+                .buckets
+                .values()
+                .map(|candidates| candidates.capacity() * size_of::<Row>())
+                .sum::<usize>()
     }
 }
 
@@ -297,24 +326,40 @@ impl<S: BuildHasher> SchemaInterner<S> {
         }
     }
 
+    /// Reclaims every shard's tombstones and the capacity they left behind.
+    ///
+    /// Interning sweeps the shard it touches, which is enough while a shard
+    /// keeps seeing traffic — but a shard that goes quiet after a burst would
+    /// otherwise hold its dead rows indefinitely, since nothing else would ever
+    /// look at it. A periodic caller (the metrics reporter) drives this so the
+    /// pool shrinks when its holders disappear rather than when they return.
+    pub fn sweep(&self) {
+        for shard in &self.shards {
+            shard.lock().sweep();
+        }
+    }
+
     /// A snapshot of what the pool holds, excluding tombstones.
+    ///
+    /// Sweeps as it goes: counting live rows means walking them anyway, and it
+    /// keeps the reported figures free of rows whose holders are already gone.
     #[must_use]
     pub fn stats(&self) -> InternerStats {
         let mut rows = 0;
         let mut schema_bytes = 0;
+        let mut self_bytes = 0;
         for shard in &self.shards {
             let mut shard = shard.lock();
-            // Counting live rows means walking them anyway, so reclaim while we
-            // are here and keep the reported figures free of tombstones.
             shard.sweep();
             rows += shard.rows;
             schema_bytes += shard.schema_bytes;
+            self_bytes += shard.self_bytes();
         }
 
         InternerStats {
             rows,
             schema_bytes,
-            self_bytes: rows * ROW_SELF_BYTES,
+            self_bytes,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
@@ -331,6 +376,12 @@ static GLOBAL: LazyLock<SchemaInterner> = LazyLock::new(SchemaInterner::new);
 #[must_use]
 pub fn global() -> &'static SchemaInterner {
     &GLOBAL
+}
+
+/// Reclaims tombstones across the process-wide pool. See
+/// [`SchemaInterner::sweep`].
+pub fn sweep() {
+    GLOBAL.sweep();
 }
 
 /// Interns `schema` in the process-wide pool. See [`SchemaInterner::intern`].
@@ -537,6 +588,78 @@ mod tests {
             "schema metadata must be measured, got {} vs {}",
             schema_deep_size(&annotated),
             schema_deep_size(&bare)
+        );
+    }
+
+    /// `retain` drops rows but keeps the allocation they occupied, so a burst
+    /// of short-lived shapes would otherwise leave every shard holding its peak
+    /// capacity for the process lifetime — and `self_bytes` would report zero
+    /// for it, since nothing live remains to count.
+    #[test]
+    fn a_burst_does_not_leave_its_capacity_behind() {
+        let interner = SchemaInterner::new();
+        for width in 0..512 {
+            drop(interner.intern(schema_of(width)));
+        }
+
+        // Read straight from the shards: `stats()` sweeps, so going through it
+        // here would measure the reclaimed state and never see the peak.
+        let retained = || -> usize {
+            interner
+                .shards
+                .iter()
+                .map(|shard| shard.lock().self_bytes())
+                .sum()
+        };
+        // The bucket map specifically. Dropping empty buckets frees their
+        // vectors on its own, so only this distinguishes giving the map's own
+        // capacity back from merely emptying it.
+        let map_capacity = || -> usize {
+            interner
+                .shards
+                .iter()
+                .map(|shard| shard.lock().buckets.capacity())
+                .sum()
+        };
+
+        let (peak_bytes, peak_capacity) = (retained(), map_capacity());
+        assert!(peak_bytes > 0, "the burst must leave capacity behind");
+        assert!(peak_capacity > 0, "the burst must grow the bucket maps");
+
+        interner.sweep();
+
+        assert_eq!(interner.stats().rows, 0, "every row's holder is gone");
+        assert!(
+            retained() * 2 < peak_bytes,
+            "the pool must give back what the burst left, held {} of a {peak_bytes}-byte peak",
+            retained()
+        );
+        assert!(
+            map_capacity() * 2 < peak_capacity,
+            "the bucket maps must give their capacity back, not just empty themselves: {} of {peak_capacity} slots",
+            map_capacity()
+        );
+    }
+
+    /// Interning only sweeps the shard it touches, so a pool that goes quiet
+    /// after a burst would hold its dead rows until traffic returned. The
+    /// explicit sweep is what the periodic reporter drives.
+    #[test]
+    fn an_explicit_sweep_reclaims_without_further_interning() {
+        let interner = SchemaInterner::new();
+        // Fewer than SWEEP_INTERVAL, so no intern call can have swept.
+        for width in 0..8 {
+            drop(interner.intern(schema_of(width)));
+        }
+
+        interner.sweep();
+
+        // Counted without `stats()`, which sweeps of its own accord and would
+        // mask a `sweep()` that did nothing.
+        let live: usize = interner.shards.iter().map(|shard| shard.lock().rows).sum();
+        assert_eq!(
+            live, 0,
+            "a sweep must reclaim dead rows with no new traffic"
         );
     }
 

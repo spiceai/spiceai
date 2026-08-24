@@ -1300,6 +1300,12 @@ impl Runtime {
         if caching.embeddings.is_some() {
             CachedEmbeddingResult::init();
         }
+
+        // Not gated on a cache being enabled: the schema pool is shared by
+        // everything that retains batches, including Cayenne's inline-data
+        // cache, so it holds — and must report — memory even with every SQL
+        // cache switched off.
+        cache::metrics::init_schema_interner_metrics();
     }
 
     /// Publishes the component counters at zero. Must be called after

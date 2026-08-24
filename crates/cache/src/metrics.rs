@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 
 use opentelemetry::{
     KeyValue, global,
-    metrics::{Counter, Gauge, Meter},
+    metrics::{Counter, Gauge, Meter, ObservableGauge},
 };
 
 use crate::result::{
@@ -58,6 +58,73 @@ impl EvictionReason {
     fn key_value(self) -> KeyValue {
         KeyValue::new("reason", self.as_str())
     }
+}
+
+/// Instruments for the process-wide Arrow schema pool.
+///
+/// Interned schemas are shared by every entry of the same shape, so they are
+/// not charged to any one entry's weight — see
+/// [`crate::result::query::CachedQueryResult::memory_size`]. This is where that
+/// memory is reported instead: once per distinct schema, rather than once per
+/// entry holding it.
+///
+/// Registering them as *observable* gauges also gives the pool its only
+/// periodic reader. Interning sweeps the shard it touches, which is enough
+/// while a shard sees traffic, but a shard that goes quiet after a burst would
+/// otherwise hold its dead rows and their capacity indefinitely. Collection
+/// calls `stats()`, which sweeps, so the pool shrinks on the collection
+/// interval rather than waiting for traffic that may never come.
+pub struct SchemaInternerMetrics {
+    _rows: ObservableGauge<u64>,
+    _schema_bytes: ObservableGauge<u64>,
+    _self_bytes: ObservableGauge<u64>,
+}
+
+static SCHEMA_INTERNER_METRICS: LazyLock<SchemaInternerMetrics> = LazyLock::new(|| {
+    let meter = global::meter("schema_interner");
+    // `stats()` sweeps, so it is called once per collection and the three
+    // gauges observe that one snapshot rather than sweeping three times.
+    SchemaInternerMetrics {
+        _rows: meter
+            .u64_observable_gauge("schema_interner_schemas")
+            .with_description("Distinct Arrow schemas currently shared by the interner.")
+            .with_callback(|observer| {
+                let stats = arrow_tools::schema_intern::global().stats();
+                observer.observe(stats.rows as u64, &[]);
+            })
+            .build(),
+        _schema_bytes: meter
+            .u64_observable_gauge("schema_interner_schema_bytes")
+            .with_description(
+                "Total size of the Arrow schemas the interner shares. Counted once per distinct schema, not once per cache entry holding it.",
+            )
+            .with_unit("By")
+            .with_callback(|observer| {
+                observer.observe(
+                    arrow_tools::schema_intern::global().stats().schema_bytes as u64,
+                    &[],
+                );
+            })
+            .build(),
+        _self_bytes: meter
+            .u64_observable_gauge("schema_interner_overhead_bytes")
+            .with_description("The interner's own bookkeeping: its hash-map slots and bucket vectors.")
+            .with_unit("By")
+            .with_callback(|observer| {
+                observer.observe(
+                    arrow_tools::schema_intern::global().stats().self_bytes as u64,
+                    &[],
+                );
+            })
+            .build(),
+    }
+});
+
+/// Registers the schema-pool gauges. Idempotent.
+///
+/// Must run after the meter provider is installed, like the cache instruments.
+pub fn init_schema_interner_metrics() {
+    LazyLock::force(&SCHEMA_INTERNER_METRICS);
 }
 
 macro_rules! generate_cache_metrics {

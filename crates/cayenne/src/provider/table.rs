@@ -37749,16 +37749,6 @@ mod tests {
         );
     }
 
-    /// DELETE-RECEIVING TABLE — the N>1 split-brain fix. A CDC DELETE absorbed
-    /// into the sharded tier (`write_cdc_delete_keys_in_memory`) must land its
-    /// tombstone in the SAME shard that owns the deleted key's rows, or the
-    /// per-shard merge-on-read filter never sees it and the deleted rows stay
-    /// visible (the `new_order` divergence: Spice retained MORE rows than the
-    /// source). The discriminating case is a key owned by a shard OTHER than
-    /// shard 0 — the old code tombstoned shard 0 unconditionally, so that key's
-    /// rows (in shard 2, say) were never suppressed. Here we delete a key proven
-    /// to be owned by a non-zero shard and assert it is hidden, AND that the
-    /// tombstone is recorded in that owning shard (not shard 0).
     /// Segments are retained for as long as the tier holds them, so a tier of
     /// many small segments would be dominated by schema copies if each batch
     /// carried its own. It does not: the write path normalises every incoming
@@ -37826,6 +37816,16 @@ mod tests {
         }
     }
 
+    /// DELETE-RECEIVING TABLE — the N>1 split-brain fix. A CDC DELETE absorbed
+    /// into the sharded tier (`write_cdc_delete_keys_in_memory`) must land its
+    /// tombstone in the SAME shard that owns the deleted key's rows, or the
+    /// per-shard merge-on-read filter never sees it and the deleted rows stay
+    /// visible (the `new_order` divergence: Spice retained MORE rows than the
+    /// source). The discriminating case is a key owned by a shard OTHER than
+    /// shard 0 — the old code tombstoned shard 0 unconditionally, so that key's
+    /// rows (in shard 2, say) were never suppressed. Here we delete a key proven
+    /// to be owned by a non-zero shard and assert it is hidden, AND that the
+    /// tombstone is recorded in that owning shard (not shard 0).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sharded_cdc_absorbed_delete_routes_tombstone_to_owning_shard() {
         let n = 4_usize;
@@ -44690,16 +44690,6 @@ mod tests {
         );
     }
 
-    /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
-    /// never mutates the metastore inline corpus, so `append_to_mem_tier`
-    /// (exercised here via the memory-mode CDC upsert path; the delete-only
-    /// entry `write_cdc_delete_keys_in_memory` delegates to the same append)
-    /// must leave `inlined_generation` AND `inlined_structural_epoch`
-    /// untouched and the cached view entry reusable — while the appended rows
-    /// are still immediately visible to scans (tier visibility is the
-    /// `ArcSwap` tier swap, not a generation bump). The pre-fix per-append
-    /// structural bump forced every concurrent scan into a full metastore
-    /// rebuild, which sustained CDC could outrun indefinitely (scan
     /// Regression test for <https://github.com/spiceai/spiceai/issues/12933> on
     /// the inline-data cache.
     ///
@@ -44760,6 +44750,16 @@ mod tests {
         );
     }
 
+    /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
+    /// never mutates the metastore inline corpus, so `append_to_mem_tier`
+    /// (exercised here via the memory-mode CDC upsert path; the delete-only
+    /// entry `write_cdc_delete_keys_in_memory` delegates to the same append)
+    /// must leave `inlined_generation` AND `inlined_structural_epoch`
+    /// untouched and the cached view entry reusable — while the appended rows
+    /// are still immediately visible to scans (tier visibility is the
+    /// `ArcSwap` tier swap, not a generation bump). The pre-fix per-append
+    /// structural bump forced every concurrent scan into a full metastore
+    /// rebuild, which sustained CDC could outrun indefinitely (scan
     /// starvation).
     #[tokio::test]
     async fn mem_tier_append_does_not_invalidate_inline_cache() {
