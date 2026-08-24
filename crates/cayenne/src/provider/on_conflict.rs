@@ -559,13 +559,14 @@ impl DeletionSink for PkKeysetInvalidatingDeletionSink {
 }
 
 impl InlineAwareDeletionSink {
-    /// Collect this delete's keys from both tiers and encode them as durable
+    /// Collect this delete's keys from every tier and encode them as durable
     /// write-back delete markers, or `None` when the table does not deliver
     /// deletes to a federated source (or this delete's source must not mark).
     ///
-    /// The file tier reports keys in its strategy's own representation while the
-    /// inline tier reports them separately; both feed one marker set so a delete
-    /// spanning tiers produces one marker per key.
+    /// The file tier reports keys in its strategy's own representation, the
+    /// inline tier reports them separately, and a delete-all additionally
+    /// discards uncheckpointed CDC mem-tier rows wholesale — all feed one marker
+    /// set so a delete spanning tiers produces one marker per key.
     async fn write_back_delete_markers(
         &self,
         prepared_file_delete: Option<&super::delete::PreparedDeletionPublish>,
@@ -576,8 +577,22 @@ impl InlineAwareDeletionSink {
     > {
         use super::delete::PreparedDeletedKeys;
 
+        if !self.table.marks_write_back_deletes(self.source) {
+            return Ok(None);
+        }
+
         let mut int64_pks = inline_rewrite.deleted_int64_pks.clone();
         let mut row_keys = inline_rewrite.deleted_row_keys.clone();
+        // A delete-all also purges every uncheckpointed CDC mem-tier row
+        // (`purge_mem_tier_all`, after the commit below); those rows never pass
+        // through the file or inline paths, so collect their keys here — under
+        // the caller's `write_lock`, so this set is exactly what the purge will
+        // discard — or their deletions never reach the federated source.
+        if is_delete_all(&self.filters) {
+            let mem_tier_keys = self.table.collect_visible_mem_tier_pk_keys()?;
+            int64_pks.extend(mem_tier_keys.int64_pk);
+            row_keys.extend(mem_tier_keys.row_keys);
+        }
         let mut sequence_number = None;
         if let Some(prepared) = prepared_file_delete {
             match prepared.deleted_keys() {
@@ -586,14 +601,21 @@ impl InlineAwareDeletionSink {
             }
             sequence_number = prepared.delete_sequence();
         }
-        // An inline-only delete writes no deletion-vector file and so reserves no
-        // delete sequence; fall back to the table's current high-water mark, which
-        // is at or above every committed write to these keys.
+        // A delete that writes no deletion-vector file reserved no delete
+        // sequence; reserve one now. The sequence must be STRICTLY greater than
+        // any already-claimed marker for these keys: the delivery worker's
+        // compare-and-clear removes markers at `sequence_number <=` the claimed
+        // value, so re-marking at the current high-water mark (which can EQUAL a
+        // claimed marker's sequence) would let an in-flight delivery clear this
+        // delete and the source would keep the row forever.
         let sequence_number = match sequence_number {
             Some(sequence) => Some(sequence),
-            None if !int64_pks.is_empty() || !row_keys.is_empty() => {
-                Some(self.table.sequence_high_water().await)
-            }
+            None if !int64_pks.is_empty() || !row_keys.is_empty() => Some(
+                self.table
+                    .reserve_sequences_local(1)
+                    .await
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?,
+            ),
             None => None,
         };
         self.table
@@ -620,15 +642,20 @@ impl DeletionSink for InlineAwareDeletionSink {
             .as_ref()
             .map_or(0, super::delete::PreparedDeletionPublish::deleted_count);
 
-        if !inline_rewrite.is_empty() || prepared_file_delete.is_some() {
+        // Durable write-back delete markers for every key this delete removes,
+        // across all tiers, written in the commit transaction below. Computed
+        // before the commit gate: a delete-all whose rows live only in the CDC
+        // mem-tier has no file or inline work yet still must commit its markers.
+        let write_back_markers = self
+            .write_back_delete_markers(prepared_file_delete.as_ref(), &inline_rewrite)
+            .await?;
+        if !inline_rewrite.is_empty()
+            || prepared_file_delete.is_some()
+            || write_back_markers.is_some()
+        {
             let delete_files = prepared_file_delete
                 .as_ref()
                 .map_or_else(Vec::new, |prepared| prepared.delete_files().to_vec());
-            // Durable write-back delete markers for every key this delete removed,
-            // across both tiers, written in the commit transaction below.
-            let write_back_markers = self
-                .write_back_delete_markers(prepared_file_delete.as_ref(), &inline_rewrite)
-                .await?;
             if let Err(error) = self
                 .table
                 .metadata_catalog()

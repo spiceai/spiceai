@@ -66,8 +66,8 @@ use super::pk_index::{
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
-use crate::metadata::PendingWriteBackMarker;
 use crate::maintained_aggregate::{MaintainedAggregateRegistry, MaintainedAggregateSpec};
+use crate::metadata::PendingWriteBackMarker;
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
     SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
@@ -6914,18 +6914,30 @@ impl CayenneTableProvider {
                 })?;
             encoded.extend(rows.iter().map(|row| row.as_ref().to_vec()));
         }
+        // A key can arrive from more than one tier of the same delete (a
+        // mem-tier row also has an older file/inline version); one marker per
+        // key is all delivery needs.
+        encoded.sort_unstable();
+        encoded.dedup();
         Ok(encoded)
     }
 
-    /// Build the durable write-back delete markers for one committed delete, or
-    /// `None` when this table does not deliver deletes to a federated source.
+    /// Whether a delete from `source` must record durable write-back delete
+    /// markers on this table.
     ///
-    /// `source` gates the marking: only a user `DELETE` states that the row
-    /// should no longer exist at the source. A CDC-applied delete is the source
-    /// telling us it already deleted the row — marking it would echo the delete
-    /// straight back — and a retention prune only evicts rows from the
-    /// accelerator, so marking it would destroy source rows the retention policy
-    /// never claimed.
+    /// Only a user `DELETE` states that the row should no longer exist at the
+    /// source. A CDC-applied delete is the source telling us it already deleted
+    /// the row — marking it would echo the delete straight back — and a
+    /// retention prune only evicts rows from the accelerator, so marking it
+    /// would destroy source rows the retention policy never claimed.
+    pub(crate) fn marks_write_back_deletes(&self, source: DeletionRequestSource) -> bool {
+        self.durable_write_back && source.marks_write_back_deletes()
+    }
+
+    /// Build the durable write-back delete markers for one committed delete, or
+    /// `None` when this table does not deliver deletes to a federated source
+    /// (or this delete's `source` must not mark — see
+    /// [`Self::marks_write_back_deletes`]).
     pub(crate) fn write_back_delete_markers(
         &self,
         source: DeletionRequestSource,
@@ -6933,7 +6945,7 @@ impl CayenneTableProvider {
         row_keys: &[Box<[u8]>],
         sequence_number: Option<i64>,
     ) -> Result<Option<crate::metadata::DeleteWriteBackMarkers>> {
-        if !self.durable_write_back || !source.marks_write_back_deletes() {
+        if !self.marks_write_back_deletes(source) {
             return Ok(None);
         }
         let Some(sequence_number) = sequence_number else {
@@ -26020,6 +26032,35 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// The primary keys of every row currently visible in the in-memory mem-tier
+    /// (all shards), for durable write-back delete marking: a delete-all discards
+    /// these rows wholesale ([`Self::purge_mem_tier_all`]) without routing them
+    /// through the file or inline delete paths, so their keys must be collected
+    /// here or their deletions never reach the federated source.
+    ///
+    /// The caller MUST hold `write_lock` (as the delete sinks do), so the set
+    /// collected here is exactly the set the subsequent purge discards.
+    pub(crate) fn collect_visible_mem_tier_pk_keys(
+        &self,
+    ) -> datafusion_common::Result<super::on_conflict::ExtractedPrimaryKeys> {
+        let mut keys = super::on_conflict::ExtractedPrimaryKeys::default();
+        if self.mem_tier.is_empty() {
+            return Ok(keys);
+        }
+        for shard in self.mem_tier.shards() {
+            let shard = shard.load_full();
+            if shard.is_empty() || shard.segments.is_empty() {
+                continue;
+            }
+            for batch in self.visible_mem_tier_batches(&shard, None)? {
+                let batch_keys = self.extract_primary_keys_from_batch(&batch)?;
+                keys.int64_pk.extend(batch_keys.int64_pk);
+                keys.row_keys.extend(batch_keys.row_keys);
+            }
+        }
+        Ok(keys)
+    }
+
     /// Discard EVERY in-memory CDC mem-tier row (all shards) for a delete-all
     /// (TRUNCATE / `DELETE … WHERE TRUE`). Returns the count of visible rows
     /// dropped so the caller can fold it into the delete's reported row count.
@@ -26863,7 +26904,9 @@ impl CayenneTableProvider {
                 let deleted_row_keys: HashSet<Box<[u8]>> = keys.row_keys.into_iter().collect();
                 // Retain the keys for durable write-back marking; the rewrite
                 // below only reports how many rows it removed.
-                rewrite.deleted_int64_pks.extend(deleted_pk_i64.iter().copied());
+                rewrite
+                    .deleted_int64_pks
+                    .extend(deleted_pk_i64.iter().copied());
                 rewrite
                     .deleted_row_keys
                     .extend(deleted_row_keys.iter().cloned());
@@ -29844,32 +29887,6 @@ impl TableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        if self.file_based_deletes_preferred(&filters) {
-            // File-based retention operates on listing table files. Materialize
-            // pending inline rows first so retention can reason about file stats.
-            {
-                let _guard = self.write_lock.lock().await;
-                self.checkpoint_inlined_data_if_present_for_delete().await?;
-            }
-
-            tracing::debug!(
-                "Table '{}': using file-based retention delete path",
-                self.table_metadata.table_name,
-            );
-            return self.delete_using_files(&filters);
-        }
-
-        if self.pk_deletion_strategy.is_position_based() {
-            // Position-based deletion vectors target file-local row positions,
-            // so no-PK inline rows must still be materialized before deletion.
-            {
-                let _guard = self.write_lock.lock().await;
-                self.checkpoint_inlined_data_if_present_for_delete().await?;
-            }
-
-            return self.delete_using_deletion_vectors(&filters).await;
-        }
-
         self.delete_from_with_source(filters, DeletionRequestSource::User)
             .await
     }
@@ -30092,14 +30109,11 @@ impl CayenneTableProvider {
     async fn delete_using_deletion_vectors(
         &self,
         filters: &[Expr],
+        source: DeletionRequestSource,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let sink: Arc<dyn DeletionSink> = Arc::new(
-            self.build_deletion_vector_sink(
-                filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
-            .await?,
+            self.build_deletion_vector_sink(filters, Some(Arc::clone(&self.write_lock)), source)
+                .await?,
         );
         Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
             Arc::new(PkKeysetInvalidatingDeletionSink {
@@ -30181,6 +30195,48 @@ impl CayenneTableProvider {
         filters: Vec<Expr>,
         source: DeletionRequestSource,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if self.file_based_deletes_preferred(&filters) && !self.marks_write_back_deletes(source) {
+            // Whole-file deletion removes files by their stats and never
+            // enumerates the keys inside them, so it is only sound for a delete
+            // that need not record write-back delete markers: a user `DELETE`
+            // on a durable-write-back table takes the key-enumerating sink
+            // below instead, or its deletions would never reach the federated
+            // source. Materialize pending inline rows first so the file path
+            // can reason about file stats.
+            {
+                let _guard = self.write_lock.lock().await;
+                self.checkpoint_inlined_data_if_present_for_delete().await?;
+            }
+
+            tracing::debug!(
+                "Table '{}': using file-based retention delete path",
+                self.table_metadata.table_name,
+            );
+            return self.delete_using_files(&filters);
+        }
+
+        if self.pk_deletion_strategy.is_position_based() {
+            // Position deletes address file-local row positions, not keys, so
+            // they cannot express write-back delete markers. Registration
+            // rejects the combination (`validate_durable_write_back_options`);
+            // this guards a table created before that gate existed.
+            if self.marks_write_back_deletes(source) {
+                return Err(datafusion_common::DataFusionError::Plan(format!(
+                    "Failed to delete from dataset {} (cayenne): durable write-back requires key-based deletes, but this table uses position-based deletes. \
+                    Set `cayenne_deletion_mode: key` (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    self.table_metadata.table_name
+                )));
+            }
+            // Position-based deletion vectors target file-local row positions,
+            // so no-PK inline rows must still be materialized before deletion.
+            {
+                let _guard = self.write_lock.lock().await;
+                self.checkpoint_inlined_data_if_present_for_delete().await?;
+            }
+
+            return self.delete_using_deletion_vectors(&filters, source).await;
+        }
+
         let file_sink = self
             .build_deletion_vector_sink(&filters, None, source)
             .await?;

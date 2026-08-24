@@ -2630,6 +2630,17 @@ impl CayenneAccelerator {
                 });
             }
         }
+        // Durable write-back delivers a user DELETE from key-addressed markers,
+        // so it requires key-based deletes. An explicit conflict is an error,
+        // not a silent override.
+        if durable_write_back
+            && let Err(message) =
+                validate_durable_write_back_table_options(table_name, &table_options)
+        {
+            return Err(Error::InvalidConfiguration {
+                detail: message.into(),
+            });
+        }
         // Datalake (cold) tier object store: built from the dedicated
         // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
         let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
@@ -2731,6 +2742,26 @@ impl CayenneAccelerator {
 /// dataset is fully serviceable from the warm tier, so a fleet-wide datalake
 /// location must not block PK-less datasets).
 /// Pure (no I/O, no logging) so each rule stays unit-testable.
+/// Reject configurations under which durable write-back could not deliver a
+/// user `DELETE` to the federated source: delete markers are key-addressed, so
+/// the table must use key-based deletes — position deletes are file-position
+/// scoped and cannot express them. `auto` already resolves to `key` for CDC
+/// tables with a primary key (which durable write-back implies), so only an
+/// explicit `position` conflicts.
+/// Pure (no I/O, no logging) so the rule stays unit-testable.
+fn validate_durable_write_back_table_options(
+    table_name: &str,
+    options: &cayenne::metadata::CreateTableOptions,
+) -> Result<(), String> {
+    if options.vortex_config.deletion_mode == cayenne::metadata::DeletionMode::Position {
+        return Err(format!(
+            "Failed to register dataset {table_name} (cayenne): durable write-back requires key-based deletes, but 'cayenne_deletion_mode: position' is set — a user DELETE could never reach the federated source. \
+            Set 'cayenne_deletion_mode: key' (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_datalake_table_options(
     table_name: &str,
     options: &cayenne::metadata::CreateTableOptions,
@@ -6379,6 +6410,38 @@ mod tests {
             error.contains("cayenne_datalake_gc_interval_ms"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn test_validate_durable_write_back_rejects_explicit_position_deletes() {
+        let config = cayenne::metadata::VortexConfig {
+            deletion_mode: cayenne::metadata::DeletionMode::Position,
+            ..Default::default()
+        };
+        let options = datalake_test_options(vec!["id".to_string()], config);
+        let error = validate_durable_write_back_table_options("dl_t", &options)
+            .expect_err("durable write-back with explicit position deletes must fail registration");
+        assert!(
+            error.contains("cayenne_deletion_mode: position")
+                && error.contains("cayenne_deletion_mode: key"),
+            "the error must name the conflicting setting and the fix: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_durable_write_back_accepts_key_deletes() {
+        for mode in [
+            cayenne::metadata::DeletionMode::Key,
+            cayenne::metadata::DeletionMode::Auto,
+        ] {
+            let config = cayenne::metadata::VortexConfig {
+                deletion_mode: mode,
+                ..Default::default()
+            };
+            let options = datalake_test_options(vec!["id".to_string()], config);
+            validate_durable_write_back_table_options("dl_t", &options)
+                .expect("key and auto deletion modes register with durable write-back");
+        }
     }
 
     #[test]

@@ -178,6 +178,29 @@ impl DatasetMetastoreSlice {
     }
 }
 
+/// Bring a row exported by an older build up to the current column set, or
+/// `None` when the row already has the current shape (or is not a shape this
+/// build knows how to normalize — the caller's length check then rejects it).
+///
+/// `cayenne_pending_write_back` gained a trailing `op` column; a slice exported
+/// before it carries four-column rows. Those markers default to upsert, which
+/// is what they are: before the column existed only upsert commits marked keys
+/// (the same reasoning as the live table's `ALTER … DEFAULT 0` migration —
+/// defaulting them to delete would make the next delivery pass delete live
+/// source rows).
+fn normalize_legacy_slice_row(table_name: &str, row: &SliceRow) -> Option<SliceRow> {
+    const PENDING_WRITE_BACK_PRE_OP_COLUMNS: usize = 4;
+    if table_name == "cayenne_pending_write_back" && row.len() == PENDING_WRITE_BACK_PRE_OP_COLUMNS
+    {
+        let mut normalized = row.clone();
+        normalized.push(SliceValue::Integer(
+            crate::metadata::WriteBackOp::Upsert.as_i64(),
+        ));
+        return Some(normalized);
+    }
+    None
+}
+
 /// Returns the (`path_column_index`, `path_is_relative_column_index`) for tables
 /// that store filesystem paths. Returns `None` for tables without path columns.
 fn path_columns_for_table(table_name: &str) -> Option<(usize, usize)> {
@@ -440,6 +463,8 @@ pub async fn import_dataset(
         );
 
         for row in rows {
+            let normalized = normalize_legacy_slice_row(expected.name, row);
+            let row = normalized.as_ref().unwrap_or(row);
             if row.len() != expected.columns.len() {
                 return Err(CatalogError::Database {
                     message: format!(
@@ -615,6 +640,76 @@ mod tests {
                 "path {path} should be under {anchor_str}"
             );
         }
+    }
+
+    /// A v1 slice exported before `cayenne_pending_write_back` gained its `op`
+    /// column still restores, and its markers read back as upserts — which is
+    /// what they are: before the column existed only upsert commits marked keys,
+    /// so restoring them as deletes would make the next delivery pass delete
+    /// live source rows.
+    #[tokio::test]
+    async fn import_normalizes_pre_op_write_back_marker_rows() {
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        let anchor_a = tmp_a.path();
+        insert_dataset(&ms_a, "trips", anchor_a, &[("p1", "k1", "trips/part-001")]).await;
+
+        let mut slice = export_dataset(ms_a.as_ref(), "trips", anchor_a)
+            .await
+            .expect("export");
+        // Splice in a marker row with the pre-`op` four-column shape, the way an
+        // older build exported it.
+        slice.tables.insert(
+            "cayenne_pending_write_back".to_string(),
+            vec![vec![
+                SliceValue::Blob(
+                    BASE64.encode(crate::metastore::table_id_to_key_bytes("tid-trips")),
+                ),
+                SliceValue::Blob(BASE64.encode([0x0a])),
+                SliceValue::Integer(7),
+                SliceValue::Text("2026-01-01T00:00:00.000Z".to_string()),
+            ]],
+        );
+
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect("a slice with legacy four-column marker rows must import");
+
+        let markers: Vec<(i64, i64)> = ms_b
+            .query(
+                QueryParams {
+                    sql: "SELECT sequence_number, op FROM cayenne_pending_write_back",
+                    params: vec![],
+                },
+                |row| Ok((row.get_i64(0)?, row.get_i64(1)?)),
+            )
+            .await
+            .expect("query markers");
+        assert_eq!(
+            markers,
+            vec![(7, crate::metadata::WriteBackOp::Upsert.as_i64())],
+            "a legacy marker must restore with its sequence and an upsert op"
+        );
+    }
+
+    #[test]
+    fn normalize_legacy_slice_row_leaves_other_shapes_alone() {
+        let current_shape: SliceRow = vec![
+            SliceValue::Blob(String::new()),
+            SliceValue::Blob(String::new()),
+            SliceValue::Integer(1),
+            SliceValue::Text(String::new()),
+            SliceValue::Integer(0),
+        ];
+        assert!(
+            normalize_legacy_slice_row("cayenne_pending_write_back", &current_shape).is_none(),
+            "a five-column row is already current"
+        );
+        let four_columns: SliceRow = current_shape[..4].to_vec();
+        assert!(
+            normalize_legacy_slice_row("cayenne_table", &four_columns).is_none(),
+            "only cayenne_pending_write_back rows are normalized"
+        );
     }
 
     #[tokio::test]

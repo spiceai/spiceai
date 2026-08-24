@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -50,6 +50,9 @@ use datafusion_table_providers::util::{
 test_with_backends!(a_user_delete_marks_its_keys_for_write_back);
 test_with_backends!(a_retention_delete_marks_nothing);
 test_with_backends!(a_delete_on_a_table_without_write_back_marks_nothing);
+test_with_backends!(a_retention_shaped_user_delete_still_marks_its_keys);
+test_with_backends!(consecutive_deletes_mark_with_strictly_increasing_sequences);
+test_with_backends!(a_delete_all_marks_mem_tier_resident_keys);
 
 async fn create_table(
     fixture: &common::TestFixture,
@@ -65,7 +68,7 @@ async fn create_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -105,8 +108,8 @@ async fn seed_rows(
 /// these tests assert what actually landed in the marker table instead of
 /// round-tripping through the provider's decoder.
 fn marker_key_bytes(id: i64) -> Vec<u8> {
-    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)])
-        .expect("primary-key RowConverter");
+    let converter =
+        RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("primary-key RowConverter");
     let column: ArrayRef = Arc::new(Int64Array::from(vec![id]));
     let rows = converter
         .convert_columns(std::slice::from_ref(&column))
@@ -232,6 +235,173 @@ async fn a_delete_on_a_table_without_write_back_marks_nothing(
     assert!(
         marked_keys(&table, &[1, 2, 3]).await.is_empty(),
         "a table without durable write-back must not accumulate markers"
+    );
+
+    Ok(())
+}
+
+/// A user `DELETE` whose predicate happens to have the retention shape
+/// (`retention_col < threshold` on a table with time retention configured) is
+/// still a user delete: it must mark its keys instead of taking the whole-file
+/// delete path, which removes files by their stats without ever enumerating the
+/// keys inside them.
+async fn a_retention_shaped_user_delete_still_marks_its_keys(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::array::TimestampMicrosecondArray;
+    use arrow::datatypes::TimeUnit;
+    use datafusion::scalar::ScalarValue;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let options = CreateTableOptions {
+        table_name: "wb_retention_shaped_delete".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig::default(),
+    };
+    let catalog = Arc::clone(&fixture.catalog);
+    let ctx = SessionContext::new();
+    let table = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .with_durable_write_back(true)
+        .with_time_retention_filter_builder(cayenne::TimeRetentionFilterBuilder::try_new(
+            "event_time",
+            3600,
+            &schema,
+        )?)
+        .create(options)
+        .await?;
+
+    // Every row is older than the threshold below, so the delete removes all of
+    // them.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                1_000_i64, 2_000, 3_000,
+            ])),
+        ],
+    )?;
+    common::insert_batch(&table, batch).await?;
+
+    let threshold = ScalarValue::TimestampMicrosecond(Some(1_000_000_000), None);
+    let plan = table
+        .delete_from(&ctx.state(), vec![col("event_time").lt(lit(threshold))])
+        .await?;
+    datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    let deletes: Vec<i64> = marked_keys(&table, &[1, 2, 3])
+        .await
+        .into_iter()
+        .filter(|(_, op)| *op == WriteBackOp::Delete)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![1, 2, 3],
+        "a retention-shaped user DELETE must mark every key it removed"
+    );
+
+    Ok(())
+}
+
+/// Each delete's markers carry a sequence STRICTLY greater than any earlier
+/// commit's: the delivery worker's compare-and-clear removes markers at
+/// `sequence_number <=` the claimed value, so a delete re-marked at an
+/// already-claimed sequence would be cleared by the in-flight delivery and the
+/// source would keep the row forever.
+async fn consecutive_deletes_mark_with_strictly_increasing_sequences(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, schema) = create_table(&fixture, "wb_delete_sequences", true).await?;
+    seed_rows(&table, &schema, &[1, 2, 3]).await?;
+
+    delete_where_id_in(&table, &[2]).await?;
+    delete_where_id_in(&table, &[3]).await?;
+
+    let sequence_of = |markers: &[cayenne::PendingWriteBackMarker], id: i64| {
+        let key = marker_key_bytes(id);
+        markers
+            .iter()
+            .find(|marker| marker.pk_bytes == key)
+            .map_or_else(
+                || panic!("a delete marker for id {id} must exist"),
+                |marker| marker.sequence_number,
+            )
+    };
+    let markers = table
+        .list_dirty_keys(1024)
+        .await
+        .expect("listing write-back markers succeeds");
+    let first = sequence_of(&markers, 2);
+    let second = sequence_of(&markers, 3);
+    assert!(
+        second > first,
+        "the second delete's marker sequence ({second}) must be strictly greater than the first's ({first})"
+    );
+
+    Ok(())
+}
+
+/// A delete-all discards uncheckpointed rows still resident in the in-memory
+/// mem-tier wholesale, without routing them through the file or inline delete
+/// paths — their keys must still be marked, or those rows survive forever at
+/// the federated source. `memory_mode` keeps every row in the mem-tier, so it
+/// exercises exactly that path.
+async fn a_delete_all_marks_mem_tier_resident_keys(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let options = CreateTableOptions {
+        table_name: "wb_delete_all_mem_tier".to_string(),
+        schema: Arc::clone(&schema),
+        primary_key: vec!["id".to_string()],
+        on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
+        base_path: fixture.data_path.to_string_lossy().to_string(),
+        partition_column: None,
+        vortex_config: cayenne::metadata::VortexConfig {
+            memory_mode: true,
+            ..Default::default()
+        },
+    };
+    let catalog = Arc::clone(&fixture.catalog);
+    let ctx = SessionContext::new();
+    let table = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+        .with_durable_write_back(true)
+        .create(options)
+        .await?;
+    seed_rows(&table, &schema, &[1, 2, 3]).await?;
+
+    let plan = table.delete_from(&ctx.state(), vec![lit(true)]).await?;
+    datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+
+    let deletes: Vec<i64> = marked_keys(&table, &[1, 2, 3])
+        .await
+        .into_iter()
+        .filter(|(_, op)| *op == WriteBackOp::Delete)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![1, 2, 3],
+        "a delete-all must mark every mem-tier-resident key it discarded"
     );
 
     Ok(())
