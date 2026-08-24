@@ -37751,6 +37751,73 @@ mod tests {
     /// rows (in shard 2, say) were never suppressed. Here we delete a key proven
     /// to be owned by a non-zero shard and assert it is hidden, AND that the
     /// tombstone is recorded in that owning shard (not shard 0).
+    /// Segments are retained for as long as the tier holds them, so a tier of
+    /// many small segments would be dominated by schema copies if each batch
+    /// carried its own. It does not: the write path normalises every incoming
+    /// batch onto `table_metadata.schema`, so the whole tier shares that one
+    /// allocation however many applies land in it, and no interning is needed
+    /// here.
+    ///
+    /// This pins that normalisation. If it ever stops, the tier starts holding
+    /// one schema per batch and this fails rather than quietly regressing —
+    /// which is what <https://github.com/spiceai/spiceai/issues/12933> is about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_segments_share_the_tables_one_schema() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table("intern_mem_tier", Arc::clone(&runtime_env), 1).await;
+
+        let table_schema = Arc::clone(&provider.table_metadata.schema);
+        // A fresh, equal allocation per apply, as separately-decoded CDC batches
+        // produce — never the same `Arc` handed in twice.
+        let fresh_schema = || {
+            Arc::new(
+                arrow::datatypes::Schema::new(table_schema.fields().clone())
+                    .with_metadata(table_schema.metadata().clone()),
+            )
+        };
+
+        let first = fresh_schema();
+        let second = fresh_schema();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the two applies must start from distinct schema allocations"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &table_schema),
+            "and neither may be the table's own schema, or normalisation would have nothing to do"
+        );
+
+        apply_upsert_burst(&ctx, &provider, first, &[(1, 10)]).await;
+        apply_upsert_burst(&ctx, &provider, second, &[(2, 20)]).await;
+
+        let tier = provider.mem_tier.shard(0).load();
+        let schemas: Vec<SchemaRef> = tier
+            .segments
+            .iter()
+            .flat_map(|segment| {
+                segment
+                    .batches
+                    .iter()
+                    .map(|batch| Arc::clone(batch.schema_ref()))
+            })
+            .collect();
+
+        assert!(
+            schemas.len() >= 2,
+            "the tier must retain a batch from each apply, got {} across {} segment(s)",
+            schemas.len(),
+            tier.segments.len()
+        );
+        for (i, schema) in schemas.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(schema, &provider.table_metadata.schema),
+                "retained batch {i} must hold the table's one schema allocation, not a copy of it"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sharded_cdc_absorbed_delete_routes_tombstone_to_owning_shard() {
         let n = 4_usize;
