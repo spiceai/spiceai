@@ -60,6 +60,18 @@ mod connection;
 mod replication;
 mod write_back;
 
+/// Per-dataset outstanding-write-back-transaction registries, keyed by dataset
+/// name. See [`Postgres::write_back_registries`] for why each value is its own
+/// single-flight cell.
+type WriteBackRegistries = Arc<
+    tokio::sync::Mutex<
+        HashMap<
+            String,
+            Arc<tokio::sync::OnceCell<Arc<data_components::postgres_replication::XidRegistry>>>,
+        >,
+    >,
+>;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
@@ -83,14 +95,7 @@ pub struct Postgres {
     /// long enough to get-or-insert a dataset's cell, never across the load/GC
     /// I/O that initializes it, so one dataset's slow or unavailable connection
     /// cannot serialize every other dataset's setup behind this connector.
-    write_back_registries: Arc<
-        tokio::sync::Mutex<
-            HashMap<
-                String,
-                Arc<tokio::sync::OnceCell<Arc<data_components::postgres_replication::XidRegistry>>>,
-            >,
-        >,
-    >,
+    write_back_registries: WriteBackRegistries,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -1130,11 +1135,7 @@ async fn build_write_back_deliverer(
     // Version gate: `pg_current_xact_id()` is PG13+, `txid_current()` its
     // PG10–12 equivalent. Read the server version at setup so delivery does
     // not re-decide per pass.
-    let conn = postgres
-        .pool
-        .connect_direct()
-        .await
-        .map_err(|e| setup_error(e))?;
+    let conn = postgres.pool.connect_direct().await.map_err(&setup_error)?;
     let server_version_num: i32 = conn
         .conn
         .query_one("SELECT current_setting('server_version_num')::int4", &[])

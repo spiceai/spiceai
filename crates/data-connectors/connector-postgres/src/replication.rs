@@ -258,7 +258,7 @@ pub(crate) async fn run_write_back_registry_gc(
 /// source would have to sustain ~600k write transactions per second to cross
 /// that between passes. A pass with nothing outstanding skips the server round
 /// trip entirely, so the steady-state cost of the cadence is a map lookup.
-const WRITE_BACK_REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const WRITE_BACK_REGISTRY_RECONCILE_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Spawn the periodic re-run of write-back registry reconciliation for one
 /// dataset.
