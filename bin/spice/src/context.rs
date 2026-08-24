@@ -511,7 +511,7 @@ impl RuntimeContext {
     /// 1. `$SPICED_PATH` — an explicit pin, honored ahead of everything.
     /// 2. `spiced` beside the running `spice`, via `current_exe()` — the
     ///    binary the user actually invoked, and its build partner.
-    /// 3. `spiced` on `PATH`.
+    /// 3. `spiced` on `PATH` — skipped entirely while elevated.
     /// 4. `$HOME/.spice/bin/spiced` — the managed install, and a genuine root
     ///    login's own install.
     /// 5. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
@@ -522,18 +522,18 @@ impl RuntimeContext {
     /// in the invoker's own home has been executed as root since that rung was
     /// added.
     ///
-    /// Rung 3 extends it furthest. What bounds it is that `PATH` is the
-    /// caller's own configuration, that relative entries are refused so the
-    /// working directory cannot become one, and that the rungs below are
-    /// reached only when no entry holds a runtime at all. It does *not* rest on
-    /// `sudo` sanitizing `PATH`: `secure_path` is set by stock `sudoers` on most
-    /// Linux distributions but not on macOS, and `PATH` is searched in order, so
-    /// the directory supplying `spiced` need not be the one that supplied
-    /// `spice`. Narrowing the rung under elevation is tracked in #13316.
-    /// The commands documented to run under `sudo` — `spice cloud service
-    /// install` and `spice connect remove` — do not rely on it either; the
-    /// former clears the environment and drops to the service account before it
-    /// runs anything it resolved here.
+    /// Rung 3 is the exception, and it closes while elevated. `PATH` is the
+    /// caller's own configuration, which is a bound only while the caller and
+    /// the process are the same identity; under `sudo` it is the invoking
+    /// user's `PATH` steering a root process, and `spice run` and
+    /// `spice version` execute what resolves here without dropping privileges.
+    /// Nothing about `sudo` prevents that on its own: `secure_path` is set by
+    /// stock `sudoers` on most Linux distributions but not on macOS, and `PATH`
+    /// is searched in order, so the directory supplying `spiced` need not be the
+    /// one that supplied `spice`. That is the rule [`GETENT_PATHS`] already
+    /// states for a much smaller binary, so the rung is skipped outright when
+    /// [`running_as_root_for_another_user`] holds, and rungs 4 and 5 answer
+    /// instead.
     ///
     /// Returns `Ok(None)` when no candidate exists — the signal to install.
     ///
@@ -1021,6 +1021,9 @@ struct SpicedLookup<'a> {
     /// Whether a candidate path names a runtime binary — see
     /// [`is_runnable_binary`].
     is_binary: &'a dyn Fn(&Path) -> bool,
+    /// Whether this process is root acting for another user — see
+    /// [`running_as_root_for_another_user`]. Closes the `PATH` rung.
+    elevated: bool,
 }
 
 /// Whether `path` names something that can be run as the runtime.
@@ -1106,6 +1109,7 @@ impl SpicedLookup<'static> {
             current_exe: std::env::current_exe().ok(),
             sudo_invoker_home: &sudo_invoker_home,
             is_binary: &is_runnable_binary,
+            elevated: running_as_root_for_another_user(),
         }
     }
 }
@@ -1154,7 +1158,10 @@ fn resolve_spiced(
         }
     }
 
-    if let Some(search_path) = lookup.search_path.as_ref() {
+    // Skipped entirely while elevated: `PATH` then belongs to the invoking user
+    // and the process it would steer is root's. See
+    // [`running_as_root_for_another_user`].
+    if let Some(search_path) = lookup.search_path.as_ref().filter(|_| !lookup.elevated) {
         for dir in std::env::split_paths(search_path) {
             // A relative entry — empty, `.`, `./bin` — resolves against the
             // working directory, and the child is spawned in `--dir` rather
@@ -1192,6 +1199,39 @@ fn resolve_spiced(
     }
 
     Ok(None)
+}
+
+/// Whether this process is root running on behalf of somebody else.
+///
+/// `PATH` is then the invoking user's while the process it would steer is
+/// root's — the exact condition [`GETENT_PATHS`] refuses to resolve `getent`
+/// under, and the runtime is the larger prize: `spice run` and `spice version`
+/// execute what the ladder selects with `Command::new`, dropping neither
+/// privileges nor the environment.
+///
+/// `sudo -u root` sets `SUDO_USER=root`, which is root invoking `sudo` on its
+/// own behalf, and a plain root login sets no `SUDO_USER` at all — in both the
+/// `PATH` being read is already root's own, so neither is elevation.
+#[cfg(unix)]
+fn running_as_root_for_another_user() -> bool {
+    is_elevation(
+        nix::unistd::geteuid().is_root(),
+        std::env::var("SUDO_USER").ok().as_deref(),
+    )
+}
+
+/// [`running_as_root_for_another_user`] over the two facts it reads, so each
+/// arm is assertable: a test cannot change this process's effective uid, and
+/// `SUDO_USER` is shared with every other test in the binary.
+#[cfg(unix)]
+fn is_elevation(euid_is_root: bool, sudo_user: Option<&str>) -> bool {
+    euid_is_root && sudo_user.is_some_and(|user| !user.is_empty() && user != "root")
+}
+
+/// Windows has no `sudo` to inherit a `PATH` across, so the rung stays open.
+#[cfg(not(unix))]
+fn running_as_root_for_another_user() -> bool {
+    false
 }
 
 /// The home directory of the user who invoked `sudo`, or `None` when not
@@ -1647,6 +1687,27 @@ mod tests {
         ladder_with(env, current_exe, sudo_home, managed_install, &is_binary)
     }
 
+    /// [`ladder`] over a process that is root acting for another user, which is
+    /// the only condition that closes the `PATH` rung.
+    fn elevated_ladder(
+        env: &[(&str, &str)],
+        current_exe: Option<&str>,
+        sudo_home: Option<&str>,
+        present: &[&str],
+        managed_install: &str,
+    ) -> Result<Option<ResolvedSpiced>> {
+        let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
+        let is_binary = |path: &Path| present.iter().any(|known| known == path);
+        ladder_elevation(
+            env,
+            current_exe,
+            sudo_home,
+            managed_install,
+            &is_binary,
+            true,
+        )
+    }
+
     /// [`ladder`] with the real filesystem predicate, for the two behaviours
     /// only a real file can express: a directory named `spiced`, and a runtime
     /// with no execute bit.
@@ -1656,6 +1717,26 @@ mod tests {
         sudo_home: Option<&str>,
         managed_install: &str,
         is_binary: &dyn Fn(&Path) -> bool,
+    ) -> Result<Option<ResolvedSpiced>> {
+        ladder_elevation(
+            env,
+            current_exe,
+            sudo_home,
+            managed_install,
+            is_binary,
+            false,
+        )
+    }
+
+    /// [`ladder_with`] with the elevation flag chosen, for the rung that closes
+    /// under `sudo`.
+    fn ladder_elevation(
+        env: &[(&str, &str)],
+        current_exe: Option<&str>,
+        sudo_home: Option<&str>,
+        managed_install: &str,
+        is_binary: &dyn Fn(&Path) -> bool,
+        elevated: bool,
     ) -> Result<Option<ResolvedSpiced>> {
         let env: HashMap<&str, OsString> = env
             .iter()
@@ -1672,6 +1753,7 @@ mod tests {
                 current_exe: current_exe.map(PathBuf::from),
                 sudo_invoker_home: &read_sudo_home,
                 is_binary,
+                elevated,
             },
         )
     }
@@ -1883,6 +1965,86 @@ mod tests {
             PathBuf::from("/home/operator/.spice/bin/spiced")
         );
         assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
+    }
+
+    /// Both facts are load-bearing, and each is wrong on its own: a root login
+    /// reads its own `PATH` (no `SUDO_USER`), `sudo -u root` is root invoking
+    /// `sudo` for itself, and an unprivileged `sudo -u someone-else` gains no
+    /// root to escalate to.
+    #[cfg(unix)]
+    #[test]
+    fn elevation_is_root_acting_for_a_different_user() {
+        assert!(is_elevation(true, Some("operator")));
+
+        assert!(!is_elevation(true, None), "a plain root login is not sudo");
+        assert!(
+            !is_elevation(true, Some("root")),
+            "`sudo -u root` is root acting for itself"
+        );
+        assert!(
+            !is_elevation(true, Some("")),
+            "an empty SUDO_USER names nobody"
+        );
+        assert!(
+            !is_elevation(false, Some("operator")),
+            "without root there is nothing to escalate to"
+        );
+    }
+
+    /// The rung that closes under elevation, and the reason it exists.
+    ///
+    /// `PATH` here is the invoking user's, and the process reading it is root:
+    /// `spice run` and `spice version` execute what resolves without dropping
+    /// privileges, so a `spiced` in any directory that user can write would run
+    /// as root. Root's own install answers instead.
+    #[test]
+    fn an_inherited_path_never_supplies_the_runtime_to_an_elevated_process() {
+        let found = expect_resolved(elevated_ladder(
+            &[("PATH", &search_path(&["/home/operator/bin"]))],
+            None,
+            Some("/home/operator"),
+            &["/home/operator/bin/spiced", "/root/.spice/bin/spiced"],
+            "/root/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/root/.spice/bin/spiced"));
+        assert_eq!(found.source, SpicedSource::ManagedInstall);
+    }
+
+    /// Closing the rung must not strand a host whose only runtime is on `PATH`:
+    /// the elevated process falls through to the rungs below, and reaching the
+    /// invoker's own install is the trust rung 5 has always extended.
+    #[test]
+    fn an_elevated_process_with_only_a_path_runtime_falls_through_to_the_invoker() {
+        let found = expect_resolved(elevated_ladder(
+            &[("PATH", &search_path(&["/home/operator/bin"]))],
+            None,
+            Some("/home/operator"),
+            &[
+                "/home/operator/bin/spiced",
+                "/home/operator/.spice/bin/spiced",
+            ],
+            "/root/.spice/bin/spiced",
+        ));
+        assert_eq!(
+            found.path,
+            PathBuf::from("/home/operator/.spice/bin/spiced")
+        );
+        assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
+    }
+
+    /// The same `PATH` and the same files, unelevated: the rung is open, so
+    /// this pins the narrowing to elevation rather than to the layout.
+    #[test]
+    fn an_unelevated_process_still_takes_the_runtime_from_path() {
+        let found = expect_resolved(ladder(
+            &[("PATH", &search_path(&["/home/operator/bin"]))],
+            None,
+            Some("/home/operator"),
+            &["/home/operator/bin/spiced", "/root/.spice/bin/spiced"],
+            "/root/.spice/bin/spiced",
+        ));
+        assert_eq!(found.path, PathBuf::from("/home/operator/bin/spiced"));
+        assert_eq!(found.source, SpicedSource::OnPath);
     }
 
     /// `Ok(None)` — and not an error — is what tells the launcher to install.
