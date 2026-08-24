@@ -30030,8 +30030,20 @@ pub(crate) enum DeletionRequestSource {
 }
 
 impl DeletionRequestSource {
+    /// Whether the caller needs a verified "rows affected" count, which costs a
+    /// scan on filter shapes that could otherwise persist deletion vectors
+    /// without one.
+    ///
+    /// Only the CDC apply loop discards the count. A user `DELETE` returns it to
+    /// the SQL client, and a retention prune reports it (the runtime logs how
+    /// many rows the policy removed), so both must have it exact — a
+    /// count-skipping path returns a sentinel `0`, which would read as "removed
+    /// nothing" while rows were in fact deleted.
     fn requires_exact_count(self) -> bool {
-        matches!(self, Self::User)
+        match self {
+            Self::User | Self::Retention => true,
+            Self::Cdc => false,
+        }
     }
 
     /// Whether a delete from this source should be delivered to the federated
@@ -31122,6 +31134,33 @@ mod tests {
 
     fn url(s: &str) -> String {
         s.to_string()
+    }
+
+    /// The two things a delete's originator decides are independent, and each
+    /// has a destructive failure mode: a source that wrongly skips marking
+    /// leaves a user's deletion at the federated source, one that wrongly marks
+    /// destroys source rows nobody deleted, and one that wrongly skips the exact
+    /// count reports `0` rows removed while deleting them.
+    #[test]
+    fn each_deletion_source_declares_its_marking_and_counting_needs() {
+        for (source, marks, exact_count) in [
+            (DeletionRequestSource::User, true, true),
+            (DeletionRequestSource::Cdc, false, false),
+            (DeletionRequestSource::Retention, false, true),
+        ] {
+            assert_eq!(
+                source.marks_write_back_deletes(),
+                marks,
+                "{source:?} must{} record write-back delete markers",
+                if marks { "" } else { " not" }
+            );
+            assert_eq!(
+                source.requires_exact_count(),
+                exact_count,
+                "{source:?} must{} receive an exact deleted-row count",
+                if exact_count { "" } else { " not" }
+            );
+        }
     }
 
     /// The per-file row cap must keep a full file's right-sized PK bloom
