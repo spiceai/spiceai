@@ -89,8 +89,13 @@ pub(super) const MIN_VALID_EVENT_POS: u64 = 4;
 /// A floor rather than an assignment: an operator who already raised
 /// `net_write_timeout` past this — the manual workaround for exactly this
 /// symptom — must not have it lowered by connecting a newer runtime, so the
-/// statement takes the greater of their value and this one.
+/// floor is applied only to a session that inherits something lower.
 const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
+
+/// What the operator loses whenever the dump session keeps a `net_write_timeout`
+/// below the floor — carried by the statement that raises it, and by the read
+/// that decides whether to raise it.
+const NET_WRITE_TIMEOUT_NOT_RAISED: &str = "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql";
 
 /// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
 struct PreDumpStatement {
@@ -104,10 +109,17 @@ struct PreDumpStatement {
 
 /// The session setup a dump connection needs, in the order it is issued.
 ///
+/// `inherited_net_write_timeout` is what this connection already carries, as read
+/// by [`inherited_net_write_timeout`], or `None` when the server did not answer
+/// with a value.
+///
 /// Split out from [`open_binlog_stream`] so the statements — in particular
-/// which of them address a *user* variable versus a *system* one — are
-/// assertable without a `MySQL` server.
-fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStatement> {
+/// which of them address a *user* variable versus a *system* one, and which
+/// values they assign — are assertable without a `MySQL` server.
+fn pre_dump_session_statements(
+    checkpoint_interval: Duration,
+    inherited_net_write_timeout: Option<u32>,
+) -> Vec<PreDumpStatement> {
     // Ask the source to send heartbeat events while idle so the stream can
     // detect dead connections and advance its checkpoint. Half the
     // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
@@ -131,18 +143,41 @@ fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStat
     // `net_write_timeout` is a system variable, so it needs the `SESSION`
     // form — the `SET @net_write_timeout` spelling the heartbeats use would
     // define an unrelated user variable and leave the server default in place.
-    // `GREATEST` against the inherited value keeps this a floor in one
-    // statement, with no round-trip to read the current setting first.
-    statements.push(PreDumpStatement {
-        sql: format!(
-            "SET SESSION net_write_timeout = \
-             CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
-        ),
-        rejection_warning: Some(
-            "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
-        ),
-    });
+    // Its value has to be an integer literal: `MySQL` 8.x answers a function
+    // expression there with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the
+    // inherited value, so the floor is resolved against the value read from
+    // this connection rather than by a server-side `GREATEST`.
+    //
+    // Nothing is issued for a session already at or above the floor — there is
+    // nothing to raise — and nothing is issued when the inherited value could
+    // not be read, since assigning the floor blind is what would clamp an
+    // operator's higher setting down. [`open_binlog_stream`] warns in that case.
+    if inherited_net_write_timeout.is_some_and(|inherited| inherited < DUMP_NET_WRITE_TIMEOUT_SECS)
+    {
+        statements.push(PreDumpStatement {
+            sql: format!("SET SESSION net_write_timeout = {DUMP_NET_WRITE_TIMEOUT_SECS}"),
+            rejection_warning: Some(NET_WRITE_TIMEOUT_NOT_RAISED),
+        });
+    }
     statements
+}
+
+/// The `net_write_timeout`, in seconds, this dump connection has inherited, or
+/// `None` when the server did not answer with one.
+///
+/// Read on the connection because the floor cannot be resolved server-side: see
+/// [`pre_dump_session_statements`] for why the assignment has to be a literal.
+/// Typed as `Option<u32>` so a SQL `NULL` answer returns `None` rather than
+/// panicking in `FromRow`.
+async fn inherited_net_write_timeout(conn: &mut Conn) -> Option<u32> {
+    mysql_async::prelude::Queryable::query_first::<Option<u32>, _>(
+        conn,
+        "SELECT @@SESSION.net_write_timeout",
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 pub(super) async fn open_binlog_stream(
@@ -154,10 +189,18 @@ pub(super) async fn open_binlog_stream(
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
+    let inherited_timeout = inherited_net_write_timeout(&mut conn).await;
+    if inherited_timeout.is_none() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            "Could not read the MySQL binlog dump session's net_write_timeout for dataset {dataset_name}, so it was left as the source set it: {NET_WRITE_TIMEOUT_NOT_RAISED}"
+        );
+    }
+
     for PreDumpStatement {
         sql,
         rejection_warning,
-    } in pre_dump_session_statements(params.checkpoint_interval)
+    } in pre_dump_session_statements(params.checkpoint_interval, inherited_timeout)
     {
         if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
             match rejection_warning {
@@ -1032,6 +1075,17 @@ mod tests {
             .map(|statement| statement.sql.as_str())
     }
 
+    /// The value a `SET` statement assigns: everything after its first `=`.
+    ///
+    /// `MySQL` answers an integer system variable assigned a non-integer value
+    /// with `ER_WRONG_TYPE_FOR_VAR` (1232) and keeps the inherited setting, so
+    /// what this returns has to parse as an integer.
+    fn assigned_value(sql: &str) -> &str {
+        sql.split_once('=')
+            .map(|(_, value)| value.trim())
+            .unwrap_or_default()
+    }
+
     /// The warning the statement setting `variable` carries, if it carries one.
     fn statement_rejection_warning(
         statements: &[PreDumpStatement],
@@ -1044,20 +1098,20 @@ mod tests {
     }
 
     #[test]
-    fn the_dump_session_raises_net_write_timeout() {
+    fn the_dump_session_raises_a_lower_net_write_timeout_to_the_floor() {
         // Regression test for #12527: without this the source aborts the shared
         // dump 60s into one dataset's slow apply cycle, and every
         // `refresh_mode: changes` dataset on the connection re-streams from its
         // acked position while already behind.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         let sql = statement_setting(&statements, "net_write_timeout")
-            .expect("the dump session must raise net_write_timeout");
+            .expect("a session below the floor must have net_write_timeout raised");
         assert_eq!(
             sql,
-            format!(
-                "SET SESSION net_write_timeout = \
-                 CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
-            ),
+            format!("SET SESSION net_write_timeout = {DUMP_NET_WRITE_TIMEOUT_SECS}"),
             "net_write_timeout is a SYSTEM variable: the `SET @net_write_timeout` spelling the \
              heartbeats use would define an unrelated user variable and silently leave the \
              server default in place"
@@ -1075,18 +1129,59 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_is_assigned_as_an_integer_literal() {
+        // Regression test for #13307. An integer system variable assigned a
+        // function expression — `GREATEST(...)`, cast or not — is answered with
+        // `ER_WRONG_TYPE_FOR_VAR` (1232): the assignment never takes effect, the
+        // session keeps the server default, and the only trace is the rejection
+        // warning. Every statement the dump session issues has to assign a value
+        // the server will accept.
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("a session below the floor must have net_write_timeout raised");
+        assert_eq!(
+            assigned_value(sql).parse::<u32>().ok(),
+            Some(DUMP_NET_WRITE_TIMEOUT_SECS),
+            "the assigned value must be the floor as an integer literal, not an expression \
+             the server will refuse: {sql}"
+        );
+    }
+
+    #[test]
     fn the_dump_session_never_lowers_an_operators_higher_net_write_timeout() {
         // Raising `net_write_timeout` on the source is the manual workaround for
         // this symptom, so an operator who has already done it must not have it
-        // lowered by connecting a runtime carrying this fix. `GREATEST` against
-        // the session's inherited value makes the statement a floor; a bare
-        // assignment would clamp their setting down to ours.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
-        let sql = statement_setting(&statements, "net_write_timeout")
-            .expect("the dump session must raise net_write_timeout");
-        assert!(
-            sql.contains("GREATEST(@@SESSION.net_write_timeout,"),
-            "the statement must take the greater of the inherited value and ours: {sql}"
+        // lowered by connecting a runtime carrying this fix. The floor is
+        // resolved against the value read from the connection, so a session at
+        // or above it is left alone rather than assigned down to ours.
+        for inherited in [
+            DUMP_NET_WRITE_TIMEOUT_SECS,
+            DUMP_NET_WRITE_TIMEOUT_SECS + 1,
+            DUMP_NET_WRITE_TIMEOUT_SECS * 10,
+        ] {
+            let statements = pre_dump_session_statements(Duration::from_secs(10), Some(inherited));
+            assert_eq!(
+                statement_setting(&statements, "net_write_timeout"),
+                None,
+                "a session inheriting {inherited}s already clears the \
+                 {DUMP_NET_WRITE_TIMEOUT_SECS}s floor, so nothing may be assigned to it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_net_write_timeout_is_left_as_the_source_set_it() {
+        // With no value read there is no way to tell a server default from an
+        // operator's raised setting, and assigning the floor blind would clamp
+        // the latter down. `open_binlog_stream` warns instead.
+        let statements = pre_dump_session_statements(Duration::from_secs(10), None);
+        assert_eq!(
+            statement_setting(&statements, "net_write_timeout"),
+            None,
+            "an unread net_write_timeout must not be assigned a value"
         );
     }
 
@@ -1095,7 +1190,10 @@ mod tests {
         // The heartbeat spellings are tried in pairs and one is always unknown,
         // so those must stay quiet; a rejected net_write_timeout leaves the
         // reconnect cliff in place and is the one the user can act on.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         for statement in &statements {
             assert_eq!(
                 statement.rejection_warning.is_some(),
@@ -1115,8 +1213,12 @@ mod tests {
     #[test]
     fn both_heartbeat_spellings_are_set_as_user_variables_in_nanoseconds() {
         // Half the checkpoint interval, in nanoseconds, on both the pre-8.4 and
-        // 8.4 spellings — unchanged by the net_write_timeout addition.
-        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        // 8.4 spellings — independent of whatever net_write_timeout the
+        // session inherited.
+        let statements = pre_dump_session_statements(
+            Duration::from_secs(10),
+            Some(SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS),
+        );
         for var in ["master_heartbeat_period", "source_heartbeat_period"] {
             assert_eq!(
                 statement_setting(&statements, var),
@@ -1130,7 +1232,7 @@ mod tests {
     fn a_tiny_checkpoint_interval_floors_the_heartbeat_at_500ms() {
         // A sub-second interval would otherwise ask the source to heartbeat
         // continuously.
-        let statements = pre_dump_session_statements(Duration::from_millis(100));
+        let statements = pre_dump_session_statements(Duration::from_millis(100), None);
         assert_eq!(
             statement_setting(&statements, "master_heartbeat_period"),
             Some("SET @master_heartbeat_period = 500000000")
