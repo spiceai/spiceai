@@ -644,6 +644,32 @@ pub struct CdcSchemaEvolution {
     pub constraint_columns: Vec<String>,
 }
 
+/// The apply-time refusal a partitioned Cayenne acceleration gets when the CDC stream
+/// widens under it. Pure so the wording — which is the operator's only account of why
+/// the dataset stopped — is asserted in a test rather than only read in review.
+///
+/// `mode: file_update` is the one configuration a restart does repair, and it is named
+/// rather than detected: `recreates_on_schema_mismatch` is true for it whatever the
+/// engine or the partitioning, so registration drops the acceleration and recreates it
+/// against the new schema instead of asking the engine to evolve in place. Every other
+/// mode re-classifies on restart and refuses again, so pointing all of them at a restart
+/// would send an operator round a loop that cannot terminate.
+// Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
+// otherwise this is dead code on Windows and `-D warnings` fails the build there.
+#[cfg(not(windows))]
+#[must_use]
+fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
+    format!(
+        "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
+         but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
+         rather than applied lossily and the source keeps its position. \
+         Under `mode: file_update`, restart Spice to apply it: the acceleration is dropped and recreated against the new schema. \
+         Under any other mode a restart refuses again — remove `partition_by` from the acceleration to allow evolution, \
+         or drop and recreate the dataset against the new source schema. \
+         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
+}
+
 static CDC_SCHEMA_EVOLUTION: std::sync::LazyLock<
     std::sync::RwLock<HashMap<TableReference, Arc<CdcSchemaEvolution>>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
@@ -2753,7 +2779,13 @@ impl RefreshTask {
                 // repairs the divergence, and for this target it does not: the
                 // accelerator pins the partitioned provider to
                 // `SchemaEvolutionMode::Disabled` when it builds it, so a
-                // restart re-classifies and refuses again (#12999).
+                // restart re-classifies and refuses again (#12999). The one
+                // exception is `mode: file_update`, which never asks the engine
+                // to evolve in place — `recreates_on_schema_mismatch` is true for
+                // it regardless of engine, so registration drops and recreates
+                // the table against the new schema. The refusal message names
+                // that mode rather than the write target, because the mode is
+                // what the operator can read off their own spicepod.
                 #[cfg(not(windows))]
                 if matches!(
                     extract_cayenne_write_target(&self.accelerator),
@@ -2765,12 +2797,8 @@ impl RefreshTask {
                     );
                     emit_schema_evolution_event(&dataset, "partitioned_unsupported", &change, true);
                     return Err(crate::accelerated::Error::FailedToWriteData {
-                        source: DataFusionError::Execution(format!(
-                            "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
-                             but a partitioned Cayenne acceleration cannot evolve its schema and a restart will not apply it either. \
-                             The change was refused rather than applied lossily, so the source keeps its position. \
-                             Remove `partition_by` from the acceleration to allow evolution, or drop and recreate the dataset against the new source schema. \
-                             See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                        source: DataFusionError::Execution(partitioned_widening_refusal(
+                            &dataset, &change,
                         )),
                     });
                 }
@@ -4274,6 +4302,51 @@ mod tests {
             "value".to_string(),
         )]));
         assert!(extracted.is_none(), "no recognized keys must return None");
+    }
+
+    // The refusal stops a CDC dataset dead, so its wording is the operator's only account
+    // of what happened and what to do. Assert the load-bearing parts rather than the shape:
+    // the dataset name (quoted — it is the user's string), the reason, and BOTH recovery
+    // arms. Dropping the `file_update` arm was a real defect: `recreates_on_schema_mismatch`
+    // makes a restart rebuild the table in that mode, and telling those operators a restart
+    // will not help sends them to unnecessary manual recovery.
+    #[cfg(not(windows))]
+    #[test]
+    fn partitioned_widening_refusal_names_both_recovery_arms() {
+        let msg = partitioned_widening_refusal("sales.orders", "column `total` widened i32 -> i64");
+
+        assert!(
+            msg.contains("'sales.orders'"),
+            "the dataset must be named and quoted: {msg}"
+        );
+        assert!(
+            msg.contains("column `total` widened i32 -> i64"),
+            "the refused change must be described: {msg}"
+        );
+        assert!(
+            msg.contains("the source keeps its position"),
+            "the operator has to know the change was not lost: {msg}"
+        );
+        assert!(
+            msg.contains("`mode: file_update`") && msg.contains("restart Spice to apply it"),
+            "restart is the cheapest remedy in `mode: file_update` and must be offered: {msg}"
+        );
+        assert!(
+            msg.contains("Under any other mode a restart refuses again"),
+            "every other mode must be told a restart does not help, or the operator loops: {msg}"
+        );
+        assert!(
+            msg.contains("remove `partition_by`") && msg.contains("drop and recreate the dataset"),
+            "the manual remedies must survive alongside the restart one: {msg}"
+        );
+        assert!(
+            msg.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
+            "user-facing errors carry a docs link: {msg}"
+        );
+        assert!(
+            !msg.contains('\n'),
+            "log/error messages stay on one line: {msg}"
+        );
     }
 
     #[test]
