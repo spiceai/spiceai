@@ -8917,15 +8917,33 @@ impl CayenneTableProvider {
     /// next write re-installs. Both call sites hold the per-table write
     /// lock; the re-check after the awaits is belt-and-braces against a
     /// concurrently populated cache.
-    pub(crate) async fn maybe_install_warm_pk_caches(&self) {
-        if self.table_metadata.on_conflict.is_none() {
-            return;
-        }
+    /// The empty-table decision behind [`Self::maybe_install_warm_pk_caches`],
+    /// separated so every arm can say why it declined.
+    ///
+    /// `Some` means "provably empty, install the caches". `None` means the lazy
+    /// rebuild stands, and the reason is logged rather than swallowed: the two
+    /// outcomes differ by an O(live-rows) scan taken on the CDC apply thread, and
+    /// nothing else in a run distinguishes them.
+    async fn warm_pk_cache_probe(&self) -> Option<()> {
+        let table = self.table_metadata.table_name.as_str();
+        // Not a conflict-validated table: it needs no existence index at all, so
+        // this is not a decline worth reporting.
+        self.table_metadata.on_conflict.as_ref()?;
         if self.pk_warm_probe_done.swap(true, Ordering::AcqRel) {
-            return;
+            // Already probed once for this cache lifetime; the first probe logged.
+            return None;
         }
+        let decline = |reason: &str| {
+            tracing::debug!(
+                target: "cayenne::pk_index",
+                table,
+                reason,
+                "primary-key existence caches not pre-installed; the first conflict-validated batch will rebuild the index by scanning the table"
+            );
+        };
         if !self.pk_caches_absent_and_memory_empty() {
-            return;
+            decline("a primary-key cache is already live, or the in-memory tier holds rows");
+            return None;
         }
         let table_id = &self.table_metadata.table_id;
         // Every snapshot's manifest, not just the current one:
@@ -8934,14 +8952,42 @@ impl CayenneTableProvider {
         // an empty current manifest while holding all its rows.
         match self.catalog.get_all_snapshot_files(table_id).await {
             Ok(files) if files.is_empty() => {}
-            _ => return,
+            Ok(_) => {
+                decline("the table already holds durable rows");
+                return None;
+            }
+            Err(_) => {
+                decline("the snapshot file listing could not be read, so emptiness is unproven");
+                return None;
+            }
         }
         match self.catalog.list_cold_tier_files(table_id).await {
             Ok(files) if files.is_empty() => {}
-            _ => return,
+            Ok(_) => {
+                decline("the datalake tier already holds rows");
+                return None;
+            }
+            Err(_) => {
+                decline("the datalake file listing could not be read, so emptiness is unproven");
+                return None;
+            }
         }
         // Re-check: this future may have suspended across the listings above.
         if !self.pk_caches_absent_and_memory_empty() {
+            decline("a concurrent write populated the table while emptiness was being proven");
+            return None;
+        }
+        Some(())
+    }
+
+    pub(crate) async fn maybe_install_warm_pk_caches(&self) {
+        // Report which arm was taken. Declining is the consequential outcome — the
+        // table then builds no index as it loads, and the first conflict-validated
+        // batch pays the O(live-rows) rebuild instead — but every decline used to be
+        // a bare `return`, so a run gave no way to tell an incremental build from a
+        // full re-scan. `probe` names the arm; the caller reads it back at the one
+        // exit below.
+        if self.warm_pk_cache_probe().await.is_none() {
             return;
         }
 
@@ -8971,10 +9017,15 @@ impl CayenneTableProvider {
         }
         // A fresh empty exact keyset has no stale stamps to distrust.
         self.pk_keyset_occ_degraded.store(false, Ordering::Release);
-        tracing::debug!(
+        // Not `debug!`: this is the arm a run needs to see. Its absence means the
+        // table will rebuild its index by scanning itself on the CDC apply thread,
+        // and at SF1000 that is minutes of the load window -- a difference nothing
+        // else in the log distinguishes.
+        tracing::info!(
+            target: "cayenne::pk_index",
             table = %self.table_metadata.table_name,
             shards,
-            "installed warm empty PK existence caches (empty table probe)"
+            "primary-key existence caches pre-installed for an empty table; the index builds as rows load instead of being rebuilt by a scan"
         );
     }
 
