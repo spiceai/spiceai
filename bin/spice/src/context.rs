@@ -1088,7 +1088,7 @@ fn resolve_spiced(
             // announce its runtime on every single run — the announcement means
             // "this is not the runtime you installed", so it has to stay rare
             // enough to be worth reading.
-            let source = if sibling == managed_install {
+            let source = if same_file(&sibling, managed_install) {
                 SpicedSource::ManagedInstall
             } else {
                 SpicedSource::Sibling
