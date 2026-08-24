@@ -43,7 +43,7 @@ use test_framework::{
 };
 
 use crate::{
-    args::{HtapArgs, SourceType},
+    args::{ExplainPlans, HtapArgs, SourceType},
     commands::bench::prepare_chbench_source,
     health::HealthMonitor,
     probe::{self, Phase},
@@ -263,13 +263,20 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     )
     .await?;
 
-    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+    let mut benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_results_snapshot(|_, _| test_framework::snapshot::SnapshotMode::Skip) // No snapshots for HTAP — results change under OLTP
         .with_progress_bars(!test_args.common.disable_progress_bars)
         // Concurrent OLTP mutations make row counts non-deterministic; 0 rows is expected.
-        .with_validate_row_count(false)
-        .start()?;
+        .with_validate_row_count(false);
+
+    // Plan capture is opt-in (`--explain-plans`); see the flag's own docs for why
+    // it is not always-on the way it is for `run bench`.
+    if args.explain_plans == ExplainPlans::Explain {
+        benchmark_test = benchmark_test.with_explain_plan_snapshot();
+    }
+
+    let benchmark_test = benchmark_test.start()?;
 
     let test = match benchmark_test.wait().await {
         Ok(test) => test,

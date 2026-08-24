@@ -41,7 +41,7 @@ mod schema;
 pub use schema::SchemaTestArgs;
 
 mod htap;
-pub use htap::HtapArgs;
+pub use htap::{ExplainPlans, HtapArgs};
 
 mod streaming;
 pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};

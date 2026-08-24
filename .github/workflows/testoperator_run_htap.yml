@@ -62,6 +62,14 @@ on:
         required: false
         default: false
         type: boolean
+      explain_plans:
+        description: 'Record each analytical query EXPLAIN plan as an insta snapshot. Off by default: accelerator statistics shift under OLTP load, so a plan can legitimately differ between healthy runs. Actual per-operator cardinalities need collect_diagnostics (EXPLAIN ANALYZE), not this.'
+        required: false
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - 'explain'
       skip_analytic_gate:
         description: 'Skip the analytical-query correctness gate (re-runs every CH-benCH query against source + Spice and diffs results) to save time on experiments; the row-count gate still runs. Scheduled runs always leave this false.'
         required: false
@@ -351,6 +359,7 @@ jobs:
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             ${{ github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners' && '--skip-prepare' || '' }} \
             ${{ github.event.inputs.skip_analytic_gate == 'true' && '--skip-analytic-gate' || '' }} \
+            ${{ github.event.inputs.explain_plans != '' && format('--explain-plans {0}', github.event.inputs.explain_plans) || '' }} \
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \

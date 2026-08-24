@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use super::DatasetTestArgs;
 
@@ -71,6 +71,26 @@ pub struct HtapArgs {
     #[arg(long)]
     pub(crate) summary_out: Option<PathBuf>,
 
+    /// Whether to record the `EXPLAIN` plan of every analytical query as an
+    /// insta snapshot (`{spicepod}_{query}_explain_sf{scale_factor}`) - the
+    /// capture `run bench` always performs but an HTAP run does not.
+    ///
+    /// Opt-in rather than always-on for the reason results snapshots are off
+    /// here: the run is under concurrent OLTP load. A plan is far more stable
+    /// than a result set, but it is not guaranteed stable - accelerator
+    /// statistics move as rows land, so a join order can legitimately differ
+    /// between two healthy runs and a committed snapshot would then fail.
+    /// Enable it to capture the plan for a specific investigation (e.g. why one
+    /// query exhausts the query memory pool at a high scale factor), where the
+    /// plan is the artifact and a mismatch is the signal rather than a flake.
+    ///
+    /// This records the plan only. Per-operator *actual* cardinalities and
+    /// timings need `EXPLAIN ANALYZE`, whose output is by construction not
+    /// snapshot-stable; that capture is the sampling probe behind the
+    /// workflow's `collect_diagnostics` input (`scripts/htap-explain-probe.sh`).
+    #[arg(long, value_enum, default_value_t = ExplainPlans::Off)]
+    pub(crate) explain_plans: ExplainPlans,
+
     /// Fail the run if any changes-mode table's apply-phase coverage (instrumented
     /// write-phase time ÷ apply-burst wall time) falls below this fraction (0.0–1.0).
     /// A low ratio means a CDC apply bottleneck hides in un-instrumented code. Default
@@ -113,4 +133,21 @@ fn parse_phase_coverage(value: &str) -> Result<f64, String> {
             "phase coverage must be between 0.0 and 1.0 (inclusive), got {parsed}"
         ))
     }
+}
+
+/// Whether an HTAP run records analytical-query `EXPLAIN` plan snapshots.
+///
+/// An enum rather than a flag so the capture can name a third mode (an
+/// `analyze` variant writing non-snapshot artifacts) without changing the
+/// existing surface.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplainPlans {
+    /// Record no plans (default): keeps the run's query stream to the
+    /// measured queries alone.
+    #[default]
+    #[value(name = "off")]
+    Off,
+    /// Record one `EXPLAIN` snapshot per analytical query.
+    #[value(name = "explain")]
+    Explain,
 }

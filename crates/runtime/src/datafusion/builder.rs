@@ -1836,7 +1836,19 @@ fn runtime_env_with_effective_memory_limit_and_object_store_registry(
         DiskManager::builder()
     };
 
-    let Some(topn) = NonZeroUsize::new(5) else {
+    // How many consumers a `ResourcesExhausted` error names. Reservations are keyed
+    // per consumer, so one operator holds one per partition: a plan at
+    // `target_partitions=64` registers 64 sorters, 64 aggregate streams, and one
+    // scan reservation per table per partition. Reporting 5 of those attributed
+    // 17% of an exhausted pool in practice (19.4 GB of 114.5 GB used) and left the
+    // rest invisible, which is not enough to say what filled it.
+    //
+    // Sized to the default `target_partitions` so a single operator's whole
+    // partition set can appear at once. It costs nothing at steady state:
+    // `TrackConsumersPool` tracks every consumer regardless of this value, and
+    // `report_top` already sorts all of them and only truncates the slice it
+    // formats - and only on the error path.
+    let Some(topn) = NonZeroUsize::new(64) else {
         unreachable!("Memory pool TopN must be greater than 0");
     };
 
@@ -1898,7 +1910,10 @@ fn build_compaction_runtime_env(
         DiskManager::builder()
     };
 
-    let Some(topn) = NonZeroUsize::new(5) else {
+    // Same reasoning as the query pool above: one reservation per consumer per
+    // partition, so 5 cannot attribute an exhausted pool. Compaction runs its own
+    // 64-way partitioning.
+    let Some(topn) = NonZeroUsize::new(64) else {
         unreachable!("Memory pool TopN must be greater than 0");
     };
 
