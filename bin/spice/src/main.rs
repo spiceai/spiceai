@@ -846,7 +846,13 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
 
 /// Returns true if the command will output JSON, so the banner should be suppressed.
 fn is_json_output(cmd: &mut Commands) -> bool {
+    // Explicit for the same reason `apply_machine_mode` is: the two answer for
+    // the same command tree, and a wildcard here lets them disagree silently.
+    // `version` is where that bit: it reports a runtime it cannot resolve, and
+    // a command absent from this list writes that report into the document its
+    // caller is parsing.
     match cmd {
+        Commands::Version(a) => a.output == OutputFormat::Json,
         Commands::Status(a) => a.output == OutputFormat::Json,
         Commands::Datasets(a) => a.output == OutputFormat::Json,
         Commands::Catalogs(a) => a.output == OutputFormat::Json,
@@ -871,7 +877,34 @@ fn is_json_output(cmd: &mut Commands) -> bool {
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),
         Commands::Login(a) => a.output == login::LoginOutput::Json,
-        _ => false,
+        // The commands with no structured output to reserve stdout for; the
+        // same set `apply_machine_mode` has nothing to apply to.
+        Commands::Nsql(_)
+        | Commands::Init(_)
+        | Commands::Install(_)
+        | Commands::Upgrade(_)
+        | Commands::Run(_)
+        | Commands::Add(_)
+        | Commands::Connect(_)
+        | Commands::Validate(_)
+        | Commands::Dataset(_)
+        | Commands::Catalog(_)
+        | Commands::Model(_)
+        | Commands::View(_)
+        | Commands::Embedding(_)
+        | Commands::Reranker(_)
+        | Commands::Tool(_)
+        | Commands::Worker(_)
+        | Commands::Function(_)
+        | Commands::Secret(_)
+        | Commands::Runtime(_)
+        | Commands::Management(_)
+        | Commands::Snapshots(_)
+        | Commands::Extension(_)
+        | Commands::Metadata(_)
+        | Commands::Cluster(_)
+        | Commands::Completions(_)
+        | Commands::Feedback(_) => false,
     }
 }
 
@@ -1816,5 +1849,19 @@ mod tests {
         assert!(is_json(&["spice", "datasets", "--output", "json"]));
         assert!(is_json(&["spice", "pods", "--output", "json"]));
         assert!(is_json(&["spice", "status", "--output", "json"]));
+    }
+
+    /// `version` reserves stdout like any other JSON producer, which is what
+    /// sends a runtime it cannot resolve to stderr rather than into the
+    /// document being parsed.
+    #[test]
+    fn json_version_reserves_stdout() {
+        assert!(is_json(&["spice", "version", "--output", "json"]));
+        assert!(is_json(&["spice", "version", "-o", "json"]));
+
+        assert!(
+            !is_json(&["spice", "version"]),
+            "the table form still writes its report to stdout"
+        );
     }
 }
