@@ -332,7 +332,6 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
 /// Async wrapper around [`link_files_into_tmp_dir`] that runs the synchronous
 /// hard-linking filesystem I/O on a blocking thread, so it never stalls a Tokio
 /// worker thread (and `/health`) during model registration.
-#[expect(clippy::implicit_hasher)]
 pub async fn link_files_into_tmp_dir_blocking(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
     tokio::task::spawn_blocking(move || link_files_into_tmp_dir(files))
         .await
