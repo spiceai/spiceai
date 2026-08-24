@@ -106,6 +106,12 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         && installed_version.contains(&release.tag_name)
     {
         tracing::info!("Spice.ai runtime {} already installed", release.tag_name);
+        // Warned here too, not only after a download. This is the path a user
+        // takes when they are trying to work out why the runtime they installed
+        // is not the one running, so it is the path where being shadowed most
+        // needs saying — and "already installed" on its own reads as agreement
+        // that the install is the one in use.
+        crate::context::warn_if_install_is_shadowed(ctx);
         return Ok(());
     }
 

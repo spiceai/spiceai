@@ -803,6 +803,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
         spice::error::Error::SpicedPathOverrideNotRunnable { .. } => {
             "spiced_path_override_not_runnable"
         }
+        spice::error::Error::SpicedPathNotAnchorable { .. } => "spiced_path_not_anchorable",
         spice::error::Error::WindowsNativeRuntimeUnsupported => {
             "windows_native_runtime_unsupported"
         }

@@ -19,7 +19,8 @@ limitations under the License.
 use crate::error::{
     CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
     RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
-    SpicedPathOverrideNotRunnableSnafu, WindowsNativeRuntimeUnsupportedSnafu,
+    SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu,
+    WindowsNativeRuntimeUnsupportedSnafu,
 };
 use snafu::{OptionExt, ResultExt, ensure};
 use spice_cloud_client::endpoints::data_endpoint as spice_cloud_data_endpoint;
@@ -811,12 +812,16 @@ pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
 /// A function so the text is asserted rather than eyeballed: it is the only
 /// explanation a user gets for an upgrade that appears to succeed and changes
 /// nothing, so it has to keep naming both binaries and what to do about it.
+///
+/// Worded without claiming a write, because the callers that most need it are
+/// the ones that did not perform one — `spice install` reporting the version is
+/// already present, and `spice upgrade` reporting it is already current.
 fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> String {
     let installed = installed.display();
     let selected = resolved.path.display();
     let source = resolved.source.describe();
     format!(
-        "Wrote the runtime to '{installed}', but 'spice run' will start '{selected}' ({source}) instead, so this install will not take effect. Remove that binary, or set `SPICED_PATH` to '{installed}' to pin the one just installed. See: https://spiceai.org/docs/cli"
+        "The managed runtime is at '{installed}', but 'spice run' will start '{selected}' ({source}) instead, so installing or upgrading the managed one has no effect. Remove that binary, or set `SPICED_PATH` to '{installed}' to pin the managed install. See: https://spiceai.org/docs/cli"
     )
 }
 
@@ -900,11 +905,19 @@ pub struct ResolvedSpiced {
 impl ResolvedSpiced {
     /// The one place a [`ResolvedSpiced`] is built, so anchoring covers every
     /// rung rather than the two that happen to need it today.
-    fn at(path: PathBuf, source: SpicedSource) -> Self {
-        Self {
-            path: anchor_to_current_dir(path),
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a relative candidate cannot be anchored, which
+    /// means the working directory could not be read. Anchoring is what makes
+    /// the binary that was validated the binary that runs, so a candidate that
+    /// cannot be anchored is refused rather than handed on — see
+    /// [`anchor_to_current_dir`].
+    fn at(path: PathBuf, source: SpicedSource) -> Result<Self> {
+        Ok(Self {
+            path: anchor_to_current_dir(path)?,
             source,
-        }
+        })
     }
 }
 
@@ -973,11 +986,22 @@ fn grants_execute(_metadata: &std::fs::Metadata) -> bool {
 /// against one directory and executed from another. Worse, a bare name with no
 /// separator is not a path to `Command::new` at all: it is a fresh `PATH`
 /// lookup, so the file that was validated need not be the file that runs.
-/// Anchoring makes the binary that was checked the binary that runs. Best
-/// effort: if the working directory cannot be read the relative path is
-/// returned unchanged, which is no worse than not anchoring at all.
-fn anchor_to_current_dir(path: PathBuf) -> PathBuf {
-    std::path::absolute(&path).unwrap_or(path)
+/// Anchoring makes the binary that was checked the binary that runs.
+///
+/// # Errors
+///
+/// Returns [`Error::SpicedPathNotAnchorable`] when a relative path cannot be
+/// made absolute, which happens when the working directory cannot be read.
+/// Handing the relative path back instead would leave exactly the substitution
+/// this function exists to prevent — and silently, since the candidate has
+/// already passed its runnable check by then.
+fn anchor_to_current_dir(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::path::absolute(&path).context(SpicedPathNotAnchorableSnafu {
+        path: path.display().to_string(),
+    })
 }
 
 impl SpicedLookup<'static> {
@@ -1015,13 +1039,13 @@ fn resolve_spiced(
                 path: pinned.display().to_string(),
             }
         );
-        return Ok(Some(ResolvedSpiced::at(pinned, SpicedSource::Pinned)));
+        return Ok(Some(ResolvedSpiced::at(pinned, SpicedSource::Pinned)?));
     }
 
     if let Some(dir) = lookup.current_exe.as_deref().and_then(Path::parent) {
         let sibling = dir.join(SPICED_FILENAME);
         if (lookup.is_binary)(&sibling) {
-            return Ok(Some(ResolvedSpiced::at(sibling, SpicedSource::Sibling)));
+            return Ok(Some(ResolvedSpiced::at(sibling, SpicedSource::Sibling)?));
         }
     }
 
@@ -1035,7 +1059,7 @@ fn resolve_spiced(
             }
             let candidate = dir.join(SPICED_FILENAME);
             if (lookup.is_binary)(&candidate) {
-                return Ok(Some(ResolvedSpiced::at(candidate, SpicedSource::OnPath)));
+                return Ok(Some(ResolvedSpiced::at(candidate, SpicedSource::OnPath)?));
             }
         }
     }
@@ -1044,7 +1068,7 @@ fn resolve_spiced(
         return Ok(Some(ResolvedSpiced::at(
             managed_install.to_path_buf(),
             SpicedSource::ManagedInstall,
-        )));
+        )?));
     }
 
     if let Some(invoker_home) = (lookup.sudo_invoker_home)() {
@@ -1056,7 +1080,7 @@ fn resolve_spiced(
             return Ok(Some(ResolvedSpiced::at(
                 invoker_install,
                 SpicedSource::SudoInvokerInstall,
-            )));
+            )?));
         }
     }
 
@@ -1339,6 +1363,7 @@ mod tests {
     /// which binary was selected — that is what the ladder tests cover.
     fn test_resolved(ctx: &RuntimeContext) -> ResolvedSpiced {
         ResolvedSpiced::at(ctx.spiced_path(), SpicedSource::ManagedInstall)
+            .expect("an absolute managed path anchors")
     }
 
     /// Write a stand-in `spiced` that [`is_runnable_binary`] will accept.
@@ -1793,9 +1818,44 @@ mod tests {
         assert!(SpicedSource::ManagedInstall.is_expected_default());
     }
 
+    /// An absolute candidate needs no working directory to anchor against, so
+    /// it resolves unchanged.
+    #[test]
+    fn an_absolute_candidate_anchors_to_itself() {
+        let anchored = anchor_to_current_dir(PathBuf::from("/opt/spice/bin/spiced"))
+            .expect("an absolute path needs no working directory");
+        assert_eq!(anchored, PathBuf::from("/opt/spice/bin/spiced"));
+    }
+
+    /// A relative candidate is resolved against the directory it was validated
+    /// in. `Command::new` would otherwise re-interpret it against the child's
+    /// `--dir`, and a bare name with no separator is not a path to it at all —
+    /// it is a fresh `PATH` lookup, so the file that ran need not be the file
+    /// that was checked.
+    #[test]
+    fn a_relative_candidate_is_anchored_to_an_absolute_path() {
+        let anchored = anchor_to_current_dir(PathBuf::from("spiced"))
+            .expect("the test process has a working directory");
+        assert!(
+            anchored.is_absolute(),
+            "a relative candidate must not survive resolution as a bare name: {}",
+            anchored.display()
+        );
+        assert!(
+            anchored.ends_with("spiced"),
+            "anchoring must not change which file is named: {}",
+            anchored.display()
+        );
+    }
+
     /// A file without an execute bit is a half-written download, not a runtime.
     /// It must not win a rung — winning would both shadow a working binary
     /// further down and suppress the auto-install that would repair it.
+    ///
+    /// Unix only, because the premise is: Windows has no execute bit, so
+    /// `grants_execute` accepts every file there and a "broken" candidate is
+    /// indistinguishable from a working one.
+    #[cfg(unix)]
     #[test]
     fn a_non_executable_file_does_not_win_the_ladder() {
         let temp = TempDir::new().expect("create temp dir");
@@ -1868,7 +1928,7 @@ mod tests {
         );
         assert!(
             warning.contains("/home/me/.spice/bin/spiced"),
-            "the warning must name what was written: {warning}"
+            "the warning must name the managed install: {warning}"
         );
         assert!(
             warning.contains("/usr/local/bin/spiced"),
@@ -2209,7 +2269,8 @@ mod tests {
     fn get_run_cmd_runs_the_runtime_it_was_given() {
         let (ctx, _temp) = create_test_context_with_runtime();
         let elsewhere =
-            ResolvedSpiced::at(PathBuf::from("/opt/spice/bin/spiced"), SpicedSource::OnPath);
+            ResolvedSpiced::at(PathBuf::from("/opt/spice/bin/spiced"), SpicedSource::OnPath)
+                .expect("an absolute path anchors");
         let cmd = ctx
             .get_run_cmd(&elsewhere, &[], None)
             .expect("building the command must not re-resolve");

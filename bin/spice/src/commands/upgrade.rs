@@ -174,10 +174,14 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         std::fs::write(&version_file, format!("{target_version}\n")).ok();
 
         tracing::info!("Spice runtime upgraded to {target_version} successfully.");
-        crate::context::warn_if_install_is_shadowed(ctx);
     } else {
         tracing::info!("Runtime is already at {target_version}.");
     }
+    // Outside the branch: what the managed install is shadowed by does not
+    // depend on whether this run had anything to download, and the no-op run is
+    // where the warning matters most — a user checking why their upgrade made no
+    // difference is told the version is current and nothing else.
+    crate::context::warn_if_install_is_shadowed(ctx);
 
     Ok(())
 }

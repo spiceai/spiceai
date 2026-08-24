@@ -108,6 +108,17 @@ pub enum Error {
     ))]
     SpicedPathOverrideNotRunnable { path: String },
 
+    /// A relative runtime path could not be tied to the directory it was
+    /// validated in, so the binary that runs might not be the one that was
+    /// checked.
+    #[snafu(display(
+        "Failed to locate the Spice runtime: '{path}' is a relative path and the current working directory could not be read ({source}), so the runtime that was checked cannot be guaranteed to be the one that runs. Re-run from a directory that exists, or give an absolute path. See: https://spiceai.org/docs/cli"
+    ))]
+    SpicedPathNotAnchorable {
+        path: String,
+        source: std::io::Error,
+    },
+
     /// Native Windows runtime execution is unsupported
     #[snafu(display(
         "Native Windows local runtime install and run are not supported. Open WSL and run the Linux Spice CLI there instead."
