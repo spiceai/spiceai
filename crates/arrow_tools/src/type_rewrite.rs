@@ -300,6 +300,13 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 /// data may differ — field names and nested nullability flags — and children are relabelled
 /// positionally, so `target_type` has to describe the layout `data` already has.
 ///
+/// Positional pairing plus permitted renames has a consequence worth stating: a target whose
+/// same-typed sibling fields are *reordered* is indistinguishable from one that renames each of
+/// them, so it is accepted and each child keeps the values it already had under the other field's
+/// name. Callers must supply a target in the source's field order. This cannot be checked here —
+/// renaming is the Delta column-mapping caller's entire purpose, since its physical field names are
+/// opaque column-mapping ids — so it needs a column identity this function is not given (#13434).
+///
 /// The result shares `data`'s buffers, but the call is not free: each rebuilt level goes back
 /// through [`ArrayData`] validation, which is `O(rows)` in its offsets and `O(bytes)` for a
 /// `Utf8` leaf. Only the levels whose type actually changes are rebuilt.
@@ -837,10 +844,11 @@ mod tests {
 
     #[test]
     fn relabel_still_carries_a_change_to_metadata_that_is_not_an_extension_type() {
-        // The Delta column-mapping caller relabels between schemas whose fields differ in
-        // annotations like a Parquet field id. That is not a reinterpretation, so it must pass —
-        // this is the arm that keeps the extension-type guard from over-rejecting.
-        let (data, target) = list_with_item_metadata("PARQUET:field_id", "17", "42");
+        // The Delta column-mapping caller relabels between schemas whose fields carry different
+        // descriptive metadata. That is not a reinterpretation, so it must pass — this is the arm
+        // that keeps the extension-type guard from over-rejecting. Deliberately not a field id:
+        // an id names *which column* this is, so a change there is not merely descriptive.
+        let (data, target) = list_with_item_metadata("comment", "physical", "logical");
         let relabelled = relabel_array_data(data, &target)
             .expect("a field id is an annotation, not a claim about what the values mean");
         assert_eq!(relabelled.data_type(), &target);
