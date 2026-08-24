@@ -25,23 +25,22 @@ use data_components::{
     kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
 use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::{
+    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
+    UnableToGetReadProviderSnafu,
+    parameters::{ConnectorContext, ConnectorParams},
+};
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
-use runtime::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
-    dataconnector::{
-        ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-        DataConnectorResult, InvalidConfigurationNoSourceSnafu, NewDataConnectorResult,
-        UnableToGetReadProviderSnafu,
-        parameters::{ConnectorContext, ConnectorParams},
-    },
-};
 use runtime_api_types::v1::ComponentType;
 use runtime_checkpoint_api::{
     CheckpointError,
     kafka::{KafkaCheckpoint, KafkaCheckpointStore},
 };
+use runtime_component::dataset::DatasetSpec;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::refresh_sql;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ExposedParamLookup, ParameterSpec, Parameters};
@@ -73,10 +72,6 @@ pub struct Kafka {
     config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
     batching: (usize, Duration),
-    /// Retained so `read_provider` can resolve the offset store over the dataset's
-    /// accelerator. `None` only in unit tests, which build params without a runtime
-    /// attached.
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
 impl Kafka {
@@ -176,32 +171,7 @@ impl Kafka {
             config: kafka_config,
             json_options: get_json_format(&params)?,
             batching: (batch_max_size, batch_max_duration),
-            context: None,
         })
-    }
-
-    /// Attach the runtime context the offset store is resolved through.
-    ///
-    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
-    /// alone, which is how they already construct one.
-    #[must_use]
-    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Resolve the offset store over this dataset's accelerator.
-    async fn offset_store(
-        &self,
-        dataset: &Dataset,
-    ) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
-        let context = self
-            .context
-            .as_ref()
-            .ok_or_else(|| CheckpointError::Store {
-                source: "no runtime is attached to the Kafka connector".into(),
-            })?;
-        context.kafka_checkpoint_store(dataset).await
     }
 }
 
@@ -335,13 +305,13 @@ impl DataConnectorFactory for KafkaFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let context = params.context.clone();
-            let kafka = Kafka::new(params.parameters)?.with_context(context);
+            let kafka = Kafka::new(params.parameters)?;
             Ok(Arc::new(kafka) as Arc<dyn DataConnector>)
         })
     }
@@ -371,7 +341,8 @@ impl DataConnector for Kafka {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -399,12 +370,16 @@ impl DataConnector for Kafka {
             // A dataset whose offsets cannot be persisted is refused rather than run
             // ephemerally: replaying the topic from the beginning into an append
             // accelerator duplicates every row already there.
-            Some(self.offset_store(dataset).await.boxed().context(
-                UnableToGetReadProviderSnafu {
-                    dataconnector: "kafka",
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            )?)
+            Some(
+                context
+                    .kafka_checkpoint_store(dataset)
+                    .await
+                    .boxed()
+                    .context(UnableToGetReadProviderSnafu {
+                        dataconnector: "kafka",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            )
         } else {
             tracing::warn!(
                 dataset = %dataset.name,
@@ -483,7 +458,7 @@ impl DataConnector for Kafka {
 }
 
 async fn init_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
@@ -621,7 +596,7 @@ impl KafkaOffsetCommitHook for SidecarOffsetCommitHook {
 }
 
 async fn bootstrap_new_kafka_consumer(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
@@ -823,10 +798,10 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     KafkaFactory::new_arc()
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_kafka as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_kafka_connector,
     KAFKA_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

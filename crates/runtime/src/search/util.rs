@@ -106,6 +106,7 @@ mod tests {
                 Some(vec!["search_field".to_string()]),
                 None,
                 &[],
+                false,
             )
             .expect("cannot make full text table"),
         )
@@ -191,8 +192,8 @@ mod tests {
             .expect("empty logical plan should build");
         let wrapped: Arc<dyn TableProvider> = Arc::new(VectorScanTableProvider {
             table_provider: Arc::clone(&base),
-            vector_index_list: Arc::new(plan),
             primary_key: vec![],
+            index_list_plans: vec![Arc::new(plan)],
         })
         .into_table();
 

@@ -1,7 +1,10 @@
+# No query_overrides: the `duckdb` set rewrites 16 of the 43 queries to
+# `CAST(col AS TEXT) <> ''` for the DuckDB accelerator, whose unparser cannot emit
+# binary scalar literals. Cayenne reads those columns as strings, so the cast folds
+# away and the arm gains nothing but a deviation from the published ClickBench SQL.
 tests:
   bench:
     spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
     query_set: clickbench
-    query_overrides: duckdb
     runner_type: spiceai-dev-large-runners
     ready_wait: 1800

@@ -14,131 +14,134 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Per-dataset **blob** checkpoint store backed by a `SQLite` accelerator (also
-//! used for the Cayenne metastore, which is a `SQLite` connection).
+//! The `spice_sys_*` sidecar tables as stored by a `SQLite` accelerator.
 //!
-//! Persists one opaque `String` payload keyed by `dataset_name` into a
-//! `(dataset_name PK, checkpoint_data TEXT, created_at, updated_at)` sidecar table
-//! whose name the caller chooses. Implements
-//! [`runtime_checkpoint_api::BlobCheckpointStore`]; the `runtime` crate resolves a
-//! dataset's accelerator connection and constructs it.
+//! One module per checkpoint shape, each implementing the matching
+//! `runtime-checkpoint-api` trait against a [`SqliteConnectionPool`]. The Cayenne
+//! metastore is also a `SQLite` connection, so it reuses every store here.
+//!
+//! [`SqliteSidecar`] binds a pool to a dataset name and hands out those stores; the
+//! `SQLite` accelerator returns one from `DataAccelerator::sidecar`, which is how the
+//! runtime reaches this engine's sidecar tables without naming the engine.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion_table_providers::sql::db_connection_pool::{
-    dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+use datafusion_table_providers::sql::db_connection_pool::sqlitepool::SqliteConnectionPool;
+use runtime_acceleration::{
+    dataset_checkpoint::DatasetCheckpointer,
+    sidecar::{AcceleratorSidecar, unsupported_sidecar},
+    snapshot::SnapshotBehavior,
 };
-use runtime_checkpoint_api::{BlobCheckpoint, BlobCheckpointStore, CheckpointError};
+use runtime_checkpoint_api::{
+    BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+};
 
-/// Blob checkpoint store backed by a `SQLite` accelerator (also used for the Cayenne
-/// metastore, which is a `SQLite` connection).
-pub struct SqliteBlobCheckpointStore {
-    pool: SqliteConnectionPool,
-    dataset_name: String,
-    table_name: &'static str,
+mod blob;
+mod dataset_checkpoint;
+mod debezium;
+mod kafka;
+mod mongodb;
+mod mysql_binlog;
+#[cfg(test)]
+mod test_support;
+
+pub use blob::SqliteBlobCheckpointStore;
+pub use dataset_checkpoint::SqliteDatasetCheckpointer;
+pub use debezium::SqliteDebeziumCheckpointStore;
+pub use kafka::SqliteKafkaCheckpointStore;
+pub use mongodb::SqliteMongoCheckpointStore;
+pub use mysql_binlog::SqliteMySqlBinlogStore;
+
+/// Reports that the pool handed back a connection that is not a `SQLite` one.
+///
+/// Structurally unreachable — a `SqliteConnectionPool` only ever yields a
+/// `SqliteConnection` — but the pool's `connect_sync` is typed as the generic
+/// connection, so the downcast has to be answered.
+pub(crate) fn downcast_failed() -> CheckpointError {
+    CheckpointError::Store {
+        source: "expected a SqliteConnection from the sqlite pool".into(),
+    }
 }
 
-impl SqliteBlobCheckpointStore {
+/// Wraps an engine-level failure as a store failure.
+pub(crate) fn store_error(
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> CheckpointError {
+    CheckpointError::Store {
+        source: source.into(),
+    }
+}
+
+/// One dataset's sidecar tables inside a `SQLite` accelerator.
+pub struct SqliteSidecar {
+    pool: Arc<SqliteConnectionPool>,
+    dataset_name: String,
+}
+
+impl SqliteSidecar {
     #[must_use]
-    pub fn new(pool: SqliteConnectionPool, dataset_name: String, table_name: &'static str) -> Self {
-        Self {
-            pool,
-            dataset_name,
-            table_name,
-        }
+    pub fn new(pool: Arc<SqliteConnectionPool>, dataset_name: String) -> Self {
+        Self { pool, dataset_name }
     }
 }
 
 #[async_trait]
-impl BlobCheckpointStore for SqliteBlobCheckpointStore {
-    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
-        let dataset_name = self.dataset_name.clone();
-        let table = self.table_name;
-
-        let conn_sync = self.pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(CheckpointError::Store {
-                source: "expected a SqliteConnection from the sqlite pool".into(),
-            });
-        };
-
-        conn.conn
-            .call(move |conn: &mut rusqlite::Connection| -> Result<Option<BlobCheckpoint>, rusqlite::Error> {
-                // Ensure the sidecar table exists so a fresh accelerator reads as
-                // "no checkpoint yet" (Ok(None)) rather than a missing-table error.
-                let create_table = format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                        dataset_name TEXT PRIMARY KEY,
-                        checkpoint_data TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )"
-                );
-                conn.execute(&create_table, [])?;
-
-                let query = format!(
-                    "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let mut rows = stmt.query([dataset_name])?;
-
-                if let Some(row) = rows.next()? {
-                    let data: String = row.get(0)?;
-                    let updated_at_epoch: Option<i64> = row.get(1).ok();
-                    let updated_at = updated_at_epoch.and_then(|epoch| {
-                        u64::try_from(epoch).ok().and_then(|e| {
-                            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e))
-                        })
-                    });
-                    Ok(Some(BlobCheckpoint { data, updated_at }))
-                } else {
-                    Ok(None)
-                }
-            })
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })
+impl AcceleratorSidecar for SqliteSidecar {
+    fn blob_checkpoint_store(
+        &self,
+        table_name: &'static str,
+    ) -> Result<Arc<dyn BlobCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(SqliteBlobCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+            table_name,
+        )))
     }
 
-    async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
-        let dataset_name = self.dataset_name.clone();
-        let checkpoint_data = data.to_string();
-        let table = self.table_name;
+    fn kafka_checkpoint_store(&self) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(SqliteKafkaCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        let conn_sync = self.pool.connect_sync();
-        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
-            return Err(CheckpointError::Store {
-                source: "expected a SqliteConnection from the sqlite pool".into(),
-            });
-        };
+    fn debezium_checkpoint_store(
+        &self,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(SqliteDebeziumCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        conn.conn
-            .call(
-                move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
-                    let create_table = format!(
-                        "CREATE TABLE IF NOT EXISTS {table} (
-                            dataset_name TEXT PRIMARY KEY,
-                            checkpoint_data TEXT,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )"
-                    );
-                    conn.execute(&create_table, [])?;
+    fn mysql_binlog_store(&self) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
+        Ok(Arc::new(SqliteMySqlBinlogStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-                    let upsert = format!(
-                        "INSERT INTO {table} (dataset_name, checkpoint_data, updated_at)
-                         VALUES (?1, ?2, CURRENT_TIMESTAMP)
-                         ON CONFLICT (dataset_name) DO UPDATE SET
-                            checkpoint_data = ?2,
-                            updated_at = CURRENT_TIMESTAMP"
-                    );
-                    conn.execute(&upsert, [dataset_name, checkpoint_data])?;
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })
+    fn mongo_checkpoint_store(&self) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(SqliteMongoCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
+
+    async fn dataset_checkpointer(
+        &self,
+        _snapshot_behavior: SnapshotBehavior,
+    ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError> {
+        // `SQLite` has no snapshot support, so the behavior is not consulted.
+        Ok(Arc::new(
+            SqliteDatasetCheckpointer::try_new(Arc::clone(&self.pool), self.dataset_name.clone())
+                .await?,
+        ))
+    }
+
+    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError> {
+        Err(unsupported_sidecar("sqlite", "caching-engine"))
     }
 }

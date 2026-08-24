@@ -191,6 +191,8 @@ runs:
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
         spiceio_endpoint: ${{ inputs.spiceio_endpoint }}
+        minio_access_key: ${{ inputs.minio_access_key }}
+        minio_secret_key: ${{ inputs.minio_secret_key }}
 
     - name: Resolve build paths
       id: resolve-build-paths

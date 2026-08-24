@@ -37,7 +37,7 @@ futures.workspace = true
 linkme.workspace = true
 mongodb.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["mongodb"] }
+runtime-component = { path = "../../runtime-component" }
 runtime-checkpoint-api = { path = "../../runtime-checkpoint-api" }
 runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
@@ -51,6 +51,7 @@ tracing.workspace = true
 default = []
 
 [dev-dependencies]
+runtime = { path = "../../runtime" }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 
 [[bench]]

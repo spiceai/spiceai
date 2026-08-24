@@ -26,9 +26,20 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     if !proto_files.is_empty() {
+        let descriptor_path = PathBuf::from(std::env::var("OUT_DIR").map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("OUT_DIR unset: {err}"),
+            )
+        })?)
+        .join("cloud_connect_descriptor.bin");
         tonic_prost_build::configure()
             .build_server(true)
             .build_client(true)
+            // Emitted for the shared-contract test, which checks the compiled
+            // schema's field numbers/types/presence against the checked-in
+            // fixture the other Cloud Connect implementations verify too.
+            .file_descriptor_set_path(descriptor_path)
             .compile_protos(&proto_files, &[proto_dir])?;
     }
 

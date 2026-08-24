@@ -321,20 +321,29 @@ mod tests {
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
     }
 
+    /// Unparse a plan the way a federated connector would, and demand it
+    /// succeed. See `federated_sql_result` for what these guards are for.
+    fn federated_sql(plan: &LogicalPlan) -> String {
+        federated_sql_result(plan).expect("plan should unparse")
+    }
+
+    /// The seam every guard below unparses through, fallible so a guard can pin
+    /// a refusal as well as a rendering.
+    ///
     /// The upstream fixes these guard live in the `spiceai/datafusion` fork on
     /// `spiceai-54`, so nothing here fails if a later pin bump drops them. The
     /// fork's branch is re-cut per `DataFusion` major and takes its own tests with
     /// it; these stay. Extend them whenever a pin bump carries another unparser
-    /// fix — #13081 tracks the three this bump left unguarded.
+    /// fix — #13081 tracks the three the `edd8861e` → `b5cb7bb3` bump left
+    /// unguarded, and the two below arrived with `b5cb7bb3` → `8e881090`.
     ///
     /// This unparses through the federation executor, which supplies no dialect
     /// here, so the SQL is the default dialect's rather than any one connector's.
     /// The plan shapes, not the spelling, are what these assert.
-    fn federated_sql(plan: &LogicalPlan) -> String {
+    fn federated_sql_result(plan: &LogicalPlan) -> DataFusionResult<String> {
         Unparser::new(test_executor().dialect().as_ref())
             .plan_to_sql(plan)
-            .expect("plan should unparse")
-            .to_string()
+            .map(|statement| statement.to_string())
     }
 
     /// Assert `first` is rendered before `second`, which pins the clause order
@@ -420,5 +429,151 @@ mod tests {
         // The limit has to be taken first, so it is rendered in a scope the
         // filter sits outside of.
         assert_precedes(&federated_sql(&plan), "LIMIT 5", "WHERE");
+    }
+
+    /// Two `Int32` columns, matching the schema the upstream `EXISTS` bound
+    /// cases use so these plans are the same shapes.
+    fn exists_fetch_fields() -> Vec<Field> {
+        vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int32, false),
+        ]
+    }
+
+    fn exists_scan(name: &str) -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan(name, table_source(exists_fetch_fields()), None)
+            .expect("scan should build")
+    }
+
+    /// The same correlation still pushes down when there is no bound to scope,
+    /// so the refusal stays gated on the bound rather than on the correlation's
+    /// shape.
+    ///
+    /// Only sound where the unbounded rendering is correct in its own right. It
+    /// is for a correlation naming several build inputs — every qualifier binds
+    /// to the relation it came from — and it is not for the probe-qualified
+    /// self-join, whose unbounded form loses the correlation to shadowing.
+    fn assert_unbounded_exists_pushdown(plan: &LogicalPlan) {
+        let sql = federated_sql_result(plan)
+            .expect("an unbounded build side has no bound to scope, so it still unparses");
+        assert!(
+            sql.contains("EXISTS") && !sql.contains("LIMIT"),
+            "expected an unbounded EXISTS pushdown, got: {sql}"
+        );
+    }
+
+    /// `LeftSemi Join: t1.c = t2.c AND t1.d = t3.d` over a `t2 INNER JOIN t3`
+    /// build side, bounded only when asked — the correlation names both of the
+    /// build side's inputs.
+    fn a_correlation_naming_two_build_inputs(fetch: Option<usize>) -> LogicalPlan {
+        let build = exists_scan("t2")
+            .join_on(
+                exists_scan("t3").build().expect("build t3"),
+                JoinType::Inner,
+                [col("t2.c").eq(col("t3.c"))],
+            )
+            .expect("join build inputs");
+        // Applied only when asked, so the unbounded plan carries no `Limit` node
+        // at all — the shape a plan with no bound actually has, and the one
+        // upstream's own fixture builds. The unparser reads `limit(0, None)` as
+        // no bound either, so this is fidelity rather than a change of outcome.
+        let build = match fetch {
+            Some(fetch) => build.limit(0, Some(fetch)).expect("limit build side"),
+            None => build,
+        }
+        .build()
+        .expect("build build side");
+
+        exists_scan("t1")
+            .project(vec![col("t1.d")])
+            .expect("project")
+            .join_on(
+                build,
+                JoinType::LeftSemi,
+                [col("t1.c").eq(col("t2.c")), col("t1.d").eq(col("t3.d"))],
+            )
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// `LeftSemi Join: t.c = t.c` where the build side is the same relation as
+    /// the probe, bounded only when asked — the correlation's only qualifier is
+    /// one the probe side also answers to.
+    fn a_correlation_qualified_by_the_probe(fetch: Option<usize>) -> LogicalPlan {
+        let build = LogicalPlanBuilder::scan_with_filters_fetch(
+            "t",
+            table_source(exists_fetch_fields()),
+            None,
+            vec![],
+            fetch,
+        )
+        .expect("scan build side")
+        .build()
+        .expect("build build side");
+
+        exists_scan("t")
+            .project(vec![col("t.d")])
+            .expect("project")
+            .join_on(build, JoinType::LeftSemi, [col("t.c").eq(col("t.c"))])
+            .expect("semi join")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #13277: a row bound on an `EXISTS`-style build side
+    /// has to be moved into a scope of its own, and the scope can carry only one
+    /// relation name. When the correlation names both of the build side's inputs,
+    /// no name keeps every reference bound to the relation it came from.
+    ///
+    /// Leaving the bound beside the correlation is not a safe fallback: that SQL
+    /// binds — `t1` to the outer query, `t2`/`t3` to the subquery's own inputs —
+    /// so the remote engine runs it and answers from rows outside the bound. A
+    /// semi join then reports a match on a row the plan never read. Refusing
+    /// costs the pushdown instead of returning wrong rows.
+    #[test]
+    fn a_bounded_exists_refuses_a_correlation_naming_two_build_inputs() {
+        let err = federated_sql_result(&a_correlation_naming_two_build_inputs(Some(5)))
+            .expect_err("a correlation naming two build-side inputs must be refused");
+        assert!(
+            err.to_string().contains(
+                "not supported when the correlation names more than one of the build side's inputs"
+            ),
+            "expected the refusal to name the unscopable correlation, got: {err}"
+        );
+
+        assert_unbounded_exists_pushdown(&a_correlation_naming_two_build_inputs(None));
+    }
+
+    /// Regression test for #13277: the sibling shape, where the correlation's
+    /// only qualifier is one the probe side also answers to. Naming the scope
+    /// anything else rebinds those references to the probe, turning the
+    /// correlation into a comparison of the outer row with itself.
+    ///
+    /// Both readings are wrong — the subquery's own `FROM` already shadows the
+    /// outer relation, so the correlation is lost whatever the bound does — and
+    /// that unscoped output binds and runs. The `EXISTS` then reduces to "this
+    /// table has a row", so the semi join this builds keeps every probe row,
+    /// including the rows that match nothing (an anti join over the same SQL
+    /// drops every row instead). Emitting these correctly needs the
+    /// correlation's qualifiers rewritten to the derived scope, tracked by
+    /// #12840.
+    #[test]
+    fn a_bounded_exists_refuses_a_correlation_qualified_by_the_probe() {
+        let err = federated_sql_result(&a_correlation_qualified_by_the_probe(Some(5)))
+            .expect_err("a correlation qualified by the probe side must be refused");
+        assert!(
+            err.to_string().contains(
+                "not supported when the correlation's only qualifier is one the probe side also answers to"
+            ),
+            "expected the refusal to name the probe-qualified correlation, got: {err}"
+        );
+
+        // The unbounded sibling is deliberately left unpinned. Unlike the
+        // multi-relation shape, its rendering is *itself* wrong — the inner
+        // `FROM` shadows the outer relation, so the `EXISTS` reduces to "this
+        // table has a row" with or without a bound — so asserting that it still
+        // unparses would pin a defect and stand in the way of #12840's rewrite,
+        // which should be free to refuse this shape at any bound.
     }
 }

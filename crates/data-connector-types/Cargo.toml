@@ -1,0 +1,18 @@
+[package]
+description = "The vocabulary shared by the data-connector contract and every crate that builds on it: which component a connector is built for, and the errors it reports about one."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "data-connector-types"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+globset = { workspace = true }
+runtime-component = { path = "../runtime-component" }
+snafu.workspace = true
+
+[lints]
+workspace = true
