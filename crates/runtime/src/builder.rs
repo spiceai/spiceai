@@ -347,12 +347,14 @@ impl RuntimeBuilder {
         // afterwards instead would mean naming the concrete accelerator from here.
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
-        let accelerator_config = data_accelerator_api::AcceleratorRuntimeConfig {
-            cayenne_footer_cache_mb,
-        };
+        let accelerator_configs = [data_accelerator_api::AcceleratorRuntimeConfig::Cayenne(
+            data_accelerator_api::CayenneRuntimeConfig {
+                footer_cache_mb: cayenne_footer_cache_mb,
+            },
+        )];
 
         self.accelerator_engine_registry
-            .register_all(&accelerator_config)
+            .register_all(&accelerator_configs)
             .await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
@@ -1533,7 +1535,8 @@ pub(crate) fn cayenne_write_profile(
         .iter()
         .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
         .and_then(|registration| {
-            (registration.constructor)(&data_accelerator_api::AcceleratorRuntimeConfig::default())
+            registration
+                .build_with_defaults()?
                 .spicepod_write_profile(acceleration, unset_refresh_mode)
         })
 }
@@ -1738,9 +1741,9 @@ fn duckdb_budget_inputs(
     data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .find(|registration| registration.engine == runtime_acceleration::Engine::DuckDB)
-        .map_or_else(DuckDbBudgetInputs::default, |registration| {
-            (registration.constructor)(&data_accelerator_api::AcceleratorRuntimeConfig::default())
-                .memory_budget_inputs(app)
+        .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults)
+        .map_or_else(DuckDbBudgetInputs::default, |accelerator| {
+            accelerator.memory_budget_inputs(app)
         })
 }
 

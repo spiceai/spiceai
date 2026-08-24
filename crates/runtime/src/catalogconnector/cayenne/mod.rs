@@ -256,13 +256,9 @@ impl CayenneCatalogConnector {
         let tuning = data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
             .iter()
             .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
-            .map(|registration| {
-                // Built only to ask for tuning seeds, which are derived from the host
-                // rather than from any runtime-level setting.
-                (registration.constructor)(
-                    &data_accelerator_api::AcceleratorRuntimeConfig::default(),
-                )
-            });
+            // Built only to ask for tuning seeds, which are derived from the host rather
+            // than from any runtime-level setting.
+            .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults);
         let outcome = if let Some(engine) = tuning {
             engine
                 .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)

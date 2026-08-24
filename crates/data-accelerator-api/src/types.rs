@@ -73,13 +73,38 @@ impl AcceleratorEngineRegistry {
     /// `config` is passed to each constructor rather than published somewhere the
     /// constructors can read, so the settings belong to this registry alone — two
     /// `Runtime`s built concurrently in one process cannot see each other's.
-    pub async fn register_all(&self, config: &AcceleratorRuntimeConfig) {
+    /// Builds and registers every engine this build linked, configured for this
+    /// `Runtime`.
+    ///
+    /// Each engine is given the entry in `configs` for its own [`Engine`], or that
+    /// engine's defaults when `configs` names it nowhere — so a constructor is never handed
+    /// another engine's settings, and the mismatch its signature admits cannot arise here.
+    /// The first entry for an engine wins; later ones for that engine are ignored.
+    ///
+    /// The settings are passed to each constructor rather than published somewhere the
+    /// constructors can read, so they belong to this registry alone: two `Runtime`s built
+    /// concurrently in one process cannot see each other's.
+    pub async fn register_all(&self, configs: &[AcceleratorRuntimeConfig]) {
         for registration in DATA_ACCELERATOR_REGISTRATIONS {
-            self.register_accelerator_engine(
-                registration.engine,
-                (registration.constructor)(config),
-            )
-            .await;
+            let config = configs
+                .iter()
+                .find(|config| config.engine() == registration.engine)
+                .cloned()
+                .unwrap_or_else(|| AcceleratorRuntimeConfig::default_for(registration.engine));
+
+            match (registration.constructor)(&config) {
+                Ok(accelerator) => {
+                    self.register_accelerator_engine(registration.engine, accelerator)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "Failed to prepare the {} accelerator engine: {error}. Datasets accelerated with '{}' will not load.",
+                        registration.engine,
+                        registration.engine
+                    );
+                }
+            }
         }
     }
 

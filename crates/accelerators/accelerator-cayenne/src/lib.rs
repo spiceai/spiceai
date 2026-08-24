@@ -1157,11 +1157,11 @@ impl CayenneAccelerator {
 
     /// Builds the engine for the `Runtime` whose settings these are.
     ///
-    /// This is what the registration slice calls, so the footer-cache size arrives as an
-    /// argument and belongs to that one `Runtime`.
+    /// Total: the registration extracts this engine's own settings from the shared enum, so
+    /// by the time they reach here there is nothing left to reject.
     #[must_use]
-    pub fn from_runtime_config(config: &data_accelerator_api::AcceleratorRuntimeConfig) -> Self {
-        Self::with_footer_cache_mb(config.cayenne_footer_cache_mb)
+    pub fn from_runtime_config(config: &data_accelerator_api::CayenneRuntimeConfig) -> Self {
+        Self::with_footer_cache_mb(config.footer_cache_mb)
     }
 
     /// The footer-cache size this engine was configured with.
@@ -4214,7 +4214,7 @@ fn serialize_partition_child_writes(
     config.write_concurrency = Some(1);
 }
 
-data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, CayenneAccelerator);
+data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Cayenne, CayenneAccelerator);
 
 #[cfg(test)]
 mod tests {
@@ -4787,11 +4787,11 @@ mod tests {
     /// value in the range has to be distinguishable from an absent one.
     #[test]
     fn the_footer_cache_size_comes_from_the_runtime_config() {
-        use data_accelerator_api::AcceleratorRuntimeConfig;
+        use data_accelerator_api::CayenneRuntimeConfig;
 
         let configured = |mb| {
-            CayenneAccelerator::from_runtime_config(&AcceleratorRuntimeConfig {
-                cayenne_footer_cache_mb: mb,
+            CayenneAccelerator::from_runtime_config(&CayenneRuntimeConfig {
+                footer_cache_mb: mb,
             })
             .footer_cache_mb
         };
@@ -4823,16 +4823,20 @@ mod tests {
     /// test stayed green. This goes through the constructor the slice actually holds.
     #[test]
     fn the_registered_constructor_forwards_the_runtime_config() {
-        use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
+        use data_accelerator_api::{
+            AcceleratorRuntimeConfig, CayenneRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS,
+        };
 
         let registration = DATA_ACCELERATOR_REGISTRATIONS
             .iter()
             .find(|registration| registration.engine == Engine::Cayenne)
             .expect("this crate registers the Cayenne engine");
 
-        let built = (registration.constructor)(&AcceleratorRuntimeConfig {
-            cayenne_footer_cache_mb: Some(321),
-        });
+        let built =
+            (registration.constructor)(&AcceleratorRuntimeConfig::Cayenne(CayenneRuntimeConfig {
+                footer_cache_mb: Some(321),
+            }))
+            .expect("the Cayenne registration accepts Cayenne configuration");
         let cayenne = built
             .as_any()
             .downcast_ref::<CayenneAccelerator>()
@@ -4842,6 +4846,39 @@ mod tests {
             cayenne.footer_cache_mb(),
             Some(321),
             "the registered constructor must pass the runtime config to the engine"
+        );
+    }
+
+    /// Another engine's settings are refused rather than quietly treated as absent.
+    ///
+    /// The registration slice stores one function type for every engine, so this mismatch
+    /// cannot be a compile error; `register_all` and `build_with_defaults` both choose the
+    /// settings by engine, which is what keeps it from arising. This pins the remaining
+    /// behaviour of the case they prevent.
+    #[test]
+    fn another_engines_configuration_is_refused() {
+        use data_accelerator_api::{AcceleratorRuntimeConfig, DATA_ACCELERATOR_REGISTRATIONS};
+
+        let registration = DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == Engine::Cayenne)
+            .expect("this crate registers the Cayenne engine");
+
+        let error = (registration.constructor)(&AcceleratorRuntimeConfig::DuckDB)
+            .err()
+            .expect("Cayenne must refuse DuckDB configuration rather than build from it");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("cayenne") && message.contains("duckdb"),
+            "the error must name both engines, got: {message}"
+        );
+
+        // Its own settings still build, so the refusal is about the mismatch and not about
+        // the engine being unbuildable.
+        assert!(
+            (registration.constructor)(&AcceleratorRuntimeConfig::default_for(Engine::Cayenne))
+                .is_ok()
         );
     }
 
