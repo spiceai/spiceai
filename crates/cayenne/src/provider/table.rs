@@ -22598,29 +22598,37 @@ impl CayenneTableProvider {
         batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>> {
         let live_schema = self.table_schema();
-        if batches
+        let mut batches = if batches
             .iter()
             .all(|batch| batch.schema_ref().fields() == live_schema.fields())
         {
-            return Ok(batches);
-        }
+            batches
+        } else {
+            batches
+                .into_iter()
+                .map(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&live_schema)).map_err(
+                        |e| super::Error::DataValidation {
+                            table: self.table_metadata.table_name.clone(),
+                            message: format!(
+                                "Inlined rows were written under an earlier schema that cannot be \
+                                 read under the current one: {e}. Set 'on_schema_change: \
+                                 drop_and_recreate' to rebuild the acceleration on an incompatible \
+                                 schema change. See: https://spiceai.org/docs/components/data-accelerators"
+                            ),
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
 
-        batches
-            .into_iter()
-            .map(|batch| {
-                arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&live_schema)).map_err(
-                    |e| super::Error::DataValidation {
-                        table: self.table_metadata.table_name.clone(),
-                        message: format!(
-                            "Inlined rows were written under an earlier schema that cannot be \
-                             read under the current one: {e}. Set 'on_schema_change: \
-                             drop_and_recreate' to rebuild the acceleration on an incompatible \
-                             schema change. See: https://spiceai.org/docs/components/data-accelerators"
-                        ),
-                    },
-                )
-            })
-            .collect()
+        // Every entry decodes its own IPC blob, and a blob carries its own copy
+        // of the schema, so the cached view would retain one equal-but-distinct
+        // schema per entry. Interning by the batch's own content rather than
+        // forcing `live_schema` onto it keeps any metadata the blob carries: the
+        // fields-only comparison above deliberately does not look at metadata.
+        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
+        Ok(batches)
     }
 
     /// Decode one inline-data entry's IPC blob and apply the deletion-map filter,
@@ -44692,6 +44700,66 @@ mod tests {
     /// `ArcSwap` tier swap, not a generation bump). The pre-fix per-append
     /// structural bump forced every concurrent scan into a full metastore
     /// rebuild, which sustained CDC could outrun indefinitely (scan
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933> on
+    /// the inline-data cache.
+    ///
+    /// Each inline entry is its own Arrow IPC blob, and every blob carries a
+    /// copy of the schema, so decoding N entries produced N equal-but-distinct
+    /// `Schema` allocations — all retained for as long as the cached view lives.
+    #[tokio::test]
+    async fn cached_inlined_view_entries_share_one_schema() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "inline_shared_schema",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Separate inserts, so each row lands in its own inline entry and is
+        // decoded from its own IPC blob.
+        for id in 1..=4_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+
+        let view = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        let schemas: Vec<SchemaRef> = view
+            .iter()
+            .flat_map(|entry| entry.batches.iter().map(|b| Arc::clone(b.schema_ref())))
+            .collect();
+
+        assert!(
+            schemas.len() >= 2,
+            "the view must hold a batch from each entry, got {} across {} entries",
+            schemas.len(),
+            view.len()
+        );
+        for (i, schema) in schemas.iter().enumerate().skip(1) {
+            assert!(
+                Arc::ptr_eq(&schemas[0], schema),
+                "inline entry batch {i} must share one schema allocation, not carry its own copy"
+            );
+        }
+        assert_eq!(
+            schemas[0].fields().len(),
+            schema.fields().len(),
+            "sharing must not change the schema the rows are read under"
+        );
+    }
+
     /// starvation).
     #[tokio::test]
     async fn mem_tier_append_does_not_invalidate_inline_cache() {
