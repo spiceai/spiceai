@@ -620,12 +620,16 @@ impl RuntimeContext {
     /// Create a command to run spiced with the given arguments.
     ///
     /// # Arguments
+    /// * `spiced` - The runtime to launch. Which runtime that is has already
+    ///   been decided by the caller, via [`Self::resolve_spiced`]; this method
+    ///   searches for none of its own and checks no installation.
     /// * `args` - Additional arguments to pass to spiced
     /// * `http_endpoint_override` - Optional HTTP endpoint override for binding (from run command)
     ///
     /// # Errors
     ///
-    /// Returns an error if the runtime is not installed.
+    /// Returns an error if a relative `--tls-root-certificate-file` has to be
+    /// made absolute and the current working directory cannot be read.
     pub fn get_run_cmd(
         &self,
         spiced: &ResolvedSpiced,

@@ -163,7 +163,10 @@ async fn check_and_notify_upgrade(ctx: &RuntimeContext) {
 ///
 /// # Errors
 ///
-/// Returns an error if the runtime version cannot be determined.
+/// Returns an error if the runtime cannot be resolved — a `SPICED_PATH` naming
+/// nothing runnable is the case that reaches here — or if the JSON output
+/// cannot be serialized. A runtime that was located but could not be asked for
+/// its version is reported as unavailable, not returned as an error.
 pub async fn execute(ctx: &RuntimeContext, args: &VersionArgs) -> Result<()> {
     let cli = cli_version();
     // Printed before the runtime is resolved so it survives a resolution that
