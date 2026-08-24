@@ -657,7 +657,10 @@ mod tests {
 
     /// A `Sort` sandwiched between two `Projection`s, which is the shape the hoist
     /// applies to.
-    fn sorted_between_projections(sort_key: Expr) -> LogicalPlan {
+    /// The same shape with the inner projection supplied, so a guard can give it an
+    /// alias for the sort key to reference. The hoist replaces that projection's
+    /// expressions, which is what drops the alias.
+    fn sorted_between_projections_over(inner: Vec<Expr>, sort_key: Expr) -> LogicalPlan {
         LogicalPlanBuilder::scan(
             "person",
             table_source(vec![
@@ -667,7 +670,7 @@ mod tests {
             None,
         )
         .expect("scan person")
-        .project(vec![col("person.id"), col("person.age")])
+        .project(inner)
         .expect("inner projection")
         .sort(vec![sort_key.sort(false, false)])
         .expect("sort")
@@ -692,11 +695,37 @@ mod tests {
     /// the fix has to substitute references it drops rather than emit a different key.
     #[test]
     fn a_computed_sort_key_keeps_order_by_at_the_top_level() {
-        for (key_kind, sort_key, rendered_key) in [
-            ("bare-column", col("person.age"), "age"),
-            ("computed", col("person.age") + lit(1), "+ 1"),
+        for (key_kind, inner, sort_key, rendered_key, forbidden) in [
+            (
+                "bare-column",
+                vec![col("person.id"), col("person.age")],
+                col("person.age"),
+                "age",
+                None,
+            ),
+            (
+                "computed",
+                vec![col("person.id"), col("person.age")],
+                col("person.age") + lit(1),
+                "+ 1",
+                None,
+            ),
+            // The alias arm: fork PR #191 fixed two things, and the two above only
+            // reach the gate. Hoisting drops the inner projection's `doubled`, so the
+            // key has to be substituted through to `(age * 2) + 1`; emitting a bare
+            // `doubled` renders SQL the remote engine cannot bind.
+            (
+                "dropped-alias",
+                vec![
+                    col("person.id"),
+                    (col("person.age") * lit(2)).alias("doubled"),
+                ],
+                col("doubled") + lit(1),
+                "* 2",
+                Some("doubled"),
+            ),
         ] {
-            let plan = sorted_between_projections(sort_key);
+            let plan = sorted_between_projections_over(inner, sort_key);
             for (dialect_name, dialect) in federation_dialects() {
                 let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
                 let ordering_at = first_offset_of(&sql, "ORDER BY");
@@ -711,6 +740,13 @@ mod tests {
                     "{dialect_name}/{key_kind}: the ORDER BY no longer sorts by the key the plan \
                      asked for, so the rows come back in a different order: {sql}"
                 );
+                if let Some(forbidden) = forbidden {
+                    assert!(
+                        !sql[ordering_at..].contains(forbidden),
+                        "{dialect_name}/{key_kind}: the ORDER BY still names `{forbidden}`, an alias \
+                         the hoist dropped, so the remote engine cannot bind the statement: {sql}"
+                    );
+                }
             }
         }
     }
