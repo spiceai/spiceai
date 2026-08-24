@@ -71,7 +71,7 @@ limitations under the License.
 //! worker does no compare-and-set against the source. Durable write-back is
 //! safe only when the accelerator is the sole writer of the rows it delivers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -106,9 +106,10 @@ pub(crate) struct WriteBackWorker {
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
-    /// `pk_bytes` of the upsert markers the last pass found absent and held for
-    /// one retry (see [`classify_delivery`]). Only ever touched between awaits.
-    previously_absent: Mutex<HashSet<Vec<u8>>>,
+    /// The upsert markers the last pass found absent and held for one retry:
+    /// `pk_bytes` to the sequence that was deferred (see [`classify_delivery`]).
+    /// Only ever touched between awaits.
+    previously_absent: Mutex<HashMap<Vec<u8>, i64>>,
 }
 
 impl WriteBackWorker {
@@ -125,7 +126,7 @@ impl WriteBackWorker {
             federated,
             pk_columns,
             dataset_name,
-            previously_absent: Mutex::new(HashSet::new()),
+            previously_absent: Mutex::new(HashMap::new()),
         };
         tokio::spawn(async move { worker.run().await })
     }
@@ -392,9 +393,11 @@ pub(crate) struct DeliveryPlan {
     /// one more pass, in case the miss was a not-yet-visible commit rather than
     /// a row that is really gone.
     pub(crate) absent_retry: Vec<ScalarValue>,
-    /// `pk_bytes` of the `absent_retry` markers, for the next pass to recognize
-    /// a second sighting.
-    pub(crate) absent_retry_keys: Vec<Vec<u8>>,
+    /// The `absent_retry` markers as `(pk_bytes, sequence_number)`, for the next
+    /// pass to recognize a second sighting OF THE SAME COMMIT. The sequence is
+    /// part of the identity: a re-mark supersedes the deferred commit with a
+    /// newer acknowledged write, which is owed its own first retry.
+    pub(crate) absent_retry_keys: Vec<(Vec<u8>, i64)>,
     /// Keys marked deleted that the read still returned. Nothing is delivered
     /// for these and their markers must NOT be cleared — see
     /// [`classify_delivery`].
@@ -451,7 +454,7 @@ pub(crate) fn classify_delivery(
     claimed: &[PendingWriteBackMarker],
     claimed_pks: &ArrayRef,
     current: &[RecordBatch],
-    previously_absent: &HashSet<Vec<u8>>,
+    previously_absent: &HashMap<Vec<u8>, i64>,
 ) -> DataFusionResult<DeliveryPlan> {
     if claimed.len() != claimed_pks.len() {
         return Err(DataFusionError::Execution(format!(
@@ -485,13 +488,21 @@ pub(crate) fn classify_delivery(
             }
             (false, WriteBackOp::Delete) => plan.deleted.push(key),
             (false, WriteBackOp::Upsert) => {
-                if previously_absent.contains(&marker.pk_bytes) {
-                    // Absent twice running: treat it as really gone and retire
-                    // the marker, so a pruned key cannot block the queue.
+                // Matched on the sequence as well as the key: a re-mark carries
+                // a NEWER acknowledged write, and its retry must not be spent by
+                // the commit it superseded.
+                let retried_already = previously_absent
+                    .get(&marker.pk_bytes)
+                    .is_some_and(|deferred| *deferred == marker.sequence_number);
+                if retried_already {
+                    // Absent twice running for this same commit: treat it as
+                    // really gone and retire the marker, so a pruned key cannot
+                    // block the queue.
                     plan.undelivered.push(key);
                 } else {
                     plan.absent_retry.push(key);
-                    plan.absent_retry_keys.push(marker.pk_bytes.clone());
+                    plan.absent_retry_keys
+                        .push((marker.pk_bytes.clone(), marker.sequence_number));
                     // Withheld from `clearable`: give the write one more pass.
                     continue;
                 }
@@ -518,7 +529,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use cayenne::{PendingWriteBackMarker, WriteBackOp};
     use datafusion::scalar::ScalarValue;
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     const PK_COL: &str = "id";
@@ -560,8 +571,10 @@ mod tests {
     #[test]
     fn an_absent_key_without_a_delete_marker_is_never_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let seen_absent_before: HashSet<Vec<u8>> =
-            claimed.iter().map(|m| m.pk_bytes.clone()).collect();
+        let seen_absent_before: HashMap<Vec<u8>, i64> = claimed
+            .iter()
+            .map(|m| (m.pk_bytes.clone(), m.sequence_number))
+            .collect();
         let plan = classify_delivery(
             PK_COL,
             &claimed,
@@ -599,7 +612,7 @@ mod tests {
             &claimed,
             &keys(&[1]),
             &read_returning(&[]),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect("classification succeeds");
 
@@ -630,6 +643,54 @@ mod tests {
         );
     }
 
+    /// A re-mark carries a NEWER acknowledged write, and the retry history is
+    /// matched on the sequence so that write is owed its own first retry.
+    ///
+    /// Keying the history on the primary key alone would let a commit that was
+    /// deferred once spend the retry of the commit that superseded it: the next
+    /// pass would read the newer marker as a second absence and clear it — and
+    /// the compare-and-clear bound (`sequence_number <=` the claimed sequence)
+    /// matches the re-marked row, so the newer write's only durable record would
+    /// be gone.
+    #[test]
+    fn a_re_marked_key_does_not_inherit_the_superseded_commits_retry() {
+        let deferred_earlier = marker(1, WriteBackOp::Upsert);
+        let re_marked = PendingWriteBackMarker {
+            sequence_number: deferred_earlier.sequence_number + 1,
+            ..deferred_earlier.clone()
+        };
+        let previously_absent: HashMap<Vec<u8>, i64> = std::iter::once((
+            deferred_earlier.pk_bytes.clone(),
+            deferred_earlier.sequence_number,
+        ))
+        .collect();
+
+        let claimed = vec![re_marked];
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[]),
+            &previously_absent,
+        )
+        .expect("classification succeeds");
+
+        assert_eq!(
+            plan.absent_retry,
+            scalars(&[1]),
+            "the newer commit must get its own first retry"
+        );
+        assert!(
+            plan.undelivered.is_empty() && plan.clearable.is_empty(),
+            "the newer commit's marker must survive: clearing it would lose that acknowledged write"
+        );
+        assert_eq!(
+            plan.absent_retry_keys,
+            vec![(claimed[0].pk_bytes.clone(), claimed[0].sequence_number)],
+            "the retry is recorded against the newer sequence"
+        );
+    }
+
     #[test]
     fn an_absent_key_with_a_delete_marker_is_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
@@ -638,7 +699,7 @@ mod tests {
             &claimed,
             &keys(&[1]),
             &read_returning(&[]),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect("classification succeeds");
 
@@ -661,7 +722,7 @@ mod tests {
             &claimed,
             &keys(&[1]),
             &read_returning(&[1]),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect("classification succeeds");
 
@@ -716,7 +777,7 @@ mod tests {
             &claimed,
             &keys(&[1]),
             &read_returning(&[1]),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect("classification succeeds");
 
@@ -735,8 +796,9 @@ mod tests {
             marker(4, WriteBackOp::Delete), // present → deferred
         ];
         // Key 3 was already absent on the previous pass, so this one retires it.
-        let seen_absent_before: HashSet<Vec<u8>> =
-            std::iter::once(marker(3, WriteBackOp::Upsert).pk_bytes).collect();
+        let third = marker(3, WriteBackOp::Upsert);
+        let seen_absent_before: HashMap<Vec<u8>, i64> =
+            std::iter::once((third.pk_bytes, third.sequence_number)).collect();
         let plan = classify_delivery(
             PK_COL,
             &claimed,
@@ -773,8 +835,10 @@ mod tests {
             marker(1, WriteBackOp::Upsert),
             marker(2, WriteBackOp::Upsert),
         ];
-        let seen_absent_before: HashSet<Vec<u8>> =
-            claimed.iter().map(|m| m.pk_bytes.clone()).collect();
+        let seen_absent_before: HashMap<Vec<u8>, i64> = claimed
+            .iter()
+            .map(|m| (m.pk_bytes.clone(), m.sequence_number))
+            .collect();
         let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[], &seen_absent_before)
             .expect("classification succeeds");
 
@@ -793,7 +857,7 @@ mod tests {
             &claimed,
             &keys(&[1, 2]),
             &read_returning(&[]),
-            &HashSet::new(),
+            &HashMap::new(),
         )
         .expect_err("a length mismatch must not be classified");
 
@@ -813,7 +877,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![keys(&[1])]).expect("valid batch");
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
 
-        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch], &HashSet::new())
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch], &HashMap::new())
             .expect_err("a read without the key column must not be classified");
 
         assert!(
