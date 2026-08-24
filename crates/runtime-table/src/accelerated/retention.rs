@@ -25,6 +25,7 @@ use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
 use data_accelerator_api::swappable::SwappableTableProvider;
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
+use data_components::poly::PolyTableProvider;
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -36,7 +37,7 @@ use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
 use runtime_object_store::registry::default_runtime_env;
 use search::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
-use spice_table::{Index, LayerWalk, peel_to, resolve_keys_matching_predicate};
+use spice_table::{Index, LayerWalk, SpiceTable, peel_to, resolve_keys_matching_predicate};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
@@ -57,22 +58,37 @@ fn strip_index_wrapper_layers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProv
 /// retention can recognize the accelerator underneath one.
 ///
 /// [`strip_index_wrapper_layers`] walks the *layer* stack, which stops at any
-/// provider that is not a layer — and an accelerator is routinely wrapped by
-/// one of those: `UpsertDedupTableProvider` for the `upsert_remove_duplicates`
-/// and `upsert_last_write_wins` conflict modes, `SwappableTableProvider` for a
-/// snapshot-refreshed dataset. Both forward `delete_from` to their inner
-/// provider verbatim, so a delete issued against the peeled provider is
-/// equivalent to one issued against the wrapper.
+/// layer that declines [`LayerWalk::RetentionDelete`] and at any provider that
+/// is not a layer at all. An accelerator sits under both kinds:
 ///
-/// This must stay exhaustive over the wrappers that forward deletes. One this
-/// does not know about leaves the retention prune indistinguishable from a user
-/// `DELETE` at the provider, which a durable-write-back table records as delete
-/// markers — deleting rows from the federated source that retention only meant
-/// to evict from the accelerator.
+/// * `PolyTableProvider`, the read/write split every non-partitioned
+///   accelerator is published behind. It stops the retention walk deliberately
+///   — the walk must not land on one arbitrary side — but a delete is a write,
+///   so the write side is the unambiguous target, and the layer defines no
+///   `delete_from` of its own, which is where the generic delete ends up anyway.
+/// * `UpsertDedupTableProvider` (the `upsert_remove_duplicates` and
+///   `upsert_last_write_wins` conflict modes) and `SwappableTableProvider` (a
+///   snapshot-refreshed dataset), which forward `delete_from` to their inner
+///   provider verbatim.
+///
+/// Only a layer sitting directly on top is peeled, never one found deeper in
+/// the stack, so this cannot skip past a layer that does define delete
+/// semantics of its own.
+///
+/// This must stay exhaustive over the wrappers a delete passes through. One
+/// this does not know about leaves the retention prune indistinguishable from a
+/// user `DELETE` at the provider, which a durable-write-back table records as
+/// delete markers — deleting rows from the federated source that retention only
+/// meant to evict from the accelerator.
 fn peel_delete_forwarding_wrappers(tbl: &Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
     let mut current = Arc::clone(tbl);
     loop {
-        let inner = if let Some(dedup) = current.downcast_ref::<UpsertDedupTableProvider>() {
+        let inner = if let Some(poly) = current
+            .downcast_ref::<SpiceTable>()
+            .and_then(SpiceTable::layer_as::<PolyTableProvider>)
+        {
+            poly.writer()
+        } else if let Some(dedup) = current.downcast_ref::<UpsertDedupTableProvider>() {
             Arc::clone(dedup.inner())
         } else if let Some(swappable) = current.downcast_ref::<SwappableTableProvider>() {
             swappable.current()
@@ -648,7 +664,7 @@ mod tests {
     fn test_peel_delete_forwarding_wrappers_reaches_the_accelerator() {
         use datafusion::common::Constraints;
         use datafusion_table_providers::util::constraints::UpsertOptions;
-        use spice_table::{IndexLayer, SpiceTable};
+        use spice_table::IndexLayer;
 
         let mem_table: Arc<dyn TableProvider> = Arc::new(
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
@@ -663,6 +679,12 @@ mod tests {
                 Constraints::default(),
             ))
         };
+        // The read/write split every non-partitioned accelerator is published
+        // behind, built the way the accelerator builds it.
+        let poly = |inner: Arc<dyn TableProvider>| -> Arc<dyn TableProvider> {
+            Arc::new(PolyTableProvider::new(Arc::clone(&inner), inner)).into_table()
+                as Arc<dyn TableProvider>
+        };
 
         for (shape, wrapped) in [
             (
@@ -672,6 +694,20 @@ mod tests {
             (
                 "a swappable wrapper",
                 SwappableTableProvider::new(Arc::clone(&mem_table)) as Arc<dyn TableProvider>,
+            ),
+            // The production shape: the accelerator is published behind a poly
+            // split, which stops the retention layer walk.
+            ("a poly split", poly(Arc::clone(&mem_table))),
+            (
+                "a poly split over an upsert-dedup wrapper",
+                poly(upsert_dedup(Arc::clone(&mem_table))),
+            ),
+            (
+                "an index layer over a poly split over an upsert-dedup wrapper",
+                SpiceTable::over(
+                    Arc::new(IndexLayer::new()),
+                    poly(upsert_dedup(Arc::clone(&mem_table))),
+                ) as Arc<dyn TableProvider>,
             ),
             (
                 "a swappable wrapper over an upsert-dedup wrapper over a layer stack",

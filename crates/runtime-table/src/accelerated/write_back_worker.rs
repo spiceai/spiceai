@@ -32,7 +32,8 @@ limitations under the License.
 //!    - a key the read did not return, marked [`WriteBackOp::Delete`], is
 //!      deleted at the source;
 //!    - a key the read did not return, marked [`WriteBackOp::Upsert`], is not
-//!      delivered at all (see [`classify_delivery`]);
+//!      delivered at all, and its marker is retired only after a second
+//!      consecutive absence (see [`classify_delivery`]);
 //!    - a key the read DID return, marked [`WriteBackOp::Delete`], is deferred
 //!      to the next pass with its marker intact, because a commit publishes its
 //!      marker before the delete is scan-visible (see [`classify_delivery`]).
@@ -72,6 +73,7 @@ limitations under the License.
 
 use std::collections::HashSet;
 use std::sync::Arc;
+
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
@@ -82,6 +84,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
@@ -103,6 +106,9 @@ pub(crate) struct WriteBackWorker {
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
+    /// `pk_bytes` of the upsert markers the last pass found absent and held for
+    /// one retry (see [`classify_delivery`]). Only ever touched between awaits.
+    previously_absent: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl WriteBackWorker {
@@ -119,6 +125,7 @@ impl WriteBackWorker {
             federated,
             pk_columns,
             dataset_name,
+            previously_absent: Mutex::new(HashSet::new()),
         };
         tokio::spawn(async move { worker.run().await })
     }
@@ -213,7 +220,11 @@ impl WriteBackWorker {
         // Decide what to deliver for each claimed key from the marked operation
         // and whether the post-claim read still returned it.
         let pk_col = self.pk_columns[0].as_str();
-        let plan = classify_delivery(pk_col, &claimed, &pk_values, &current)?;
+        // Snapshot the keys the last pass held for a retry; the guard is dropped
+        // before any await below.
+        let previously_absent = self.previously_absent.lock().clone();
+        let plan = classify_delivery(pk_col, &claimed, &pk_values, &current, &previously_absent)?;
+        *self.previously_absent.lock() = plan.absent_retry_keys.iter().cloned().collect();
         // The read returns the deferred keys' rows too; they must not be
         // upserted, so drop them before anything is delivered.
         let current = retain_deliverable_rows(pk_col, &current, &plan.deferred)?;
@@ -225,6 +236,15 @@ impl WriteBackWorker {
                 keys = plan.deferred.len(),
                 "durable write-back: {} key(s) marked deleted are still readable in the accelerator; leaving their markers for the next pass rather than guessing between a re-created row and a delete that is committed but not yet visible",
                 plan.deferred.len(),
+            );
+        }
+
+        if !plan.absent_retry.is_empty() {
+            tracing::debug!(
+                dataset = %self.dataset_name,
+                keys = plan.absent_retry.len(),
+                "durable write-back: {} committed key(s) were not readable in the accelerator; holding their markers for one more pass in case the commit is not yet visible",
+                plan.absent_retry.len(),
             );
         }
 
@@ -363,9 +383,18 @@ pub(crate) struct DeliveryPlan {
     pub(crate) present: Vec<ScalarValue>,
     /// Keys a committed `DELETE` removed; delivered as a source delete.
     pub(crate) deleted: Vec<ScalarValue>,
-    /// Keys the read did not return that no committed `DELETE` marked. Nothing
-    /// is delivered for these — see the module's "Absence is not a delete".
+    /// Keys the read did not return that no committed `DELETE` marked, seen
+    /// absent on a previous pass too. Nothing is delivered for these and their
+    /// markers are retired — see the module's "Absence is not a delete".
     pub(crate) undelivered: Vec<ScalarValue>,
+    /// Keys the read did not return that no committed `DELETE` marked, absent
+    /// for the FIRST time. Nothing is delivered and their markers are held for
+    /// one more pass, in case the miss was a not-yet-visible commit rather than
+    /// a row that is really gone.
+    pub(crate) absent_retry: Vec<ScalarValue>,
+    /// `pk_bytes` of the `absent_retry` markers, for the next pass to recognize
+    /// a second sighting.
+    pub(crate) absent_retry_keys: Vec<Vec<u8>>,
     /// Keys marked deleted that the read still returned. Nothing is delivered
     /// for these and their markers must NOT be cleared — see
     /// [`classify_delivery`].
@@ -385,6 +414,16 @@ pub(crate) struct DeliveryPlan {
 /// a retention prune or a read that could not see the row looks identical to a
 /// deletion, and deleting on that evidence destroys rows nobody deleted — which
 /// is why this returns them as `undelivered` rather than as deletes.
+///
+/// An absent key whose marker records an [`WriteBackOp::Upsert`] is given one
+/// retry before its marker is retired. Retiring it on the first sighting would
+/// discard the only durable record of an acknowledged write whenever the miss
+/// was the same not-yet-visible-commit window described below, leaving the
+/// source on its previous value with nothing left to reconcile it. `Absence` can
+/// equally be permanent (a retention prune), so the marker cannot be held
+/// forever either — a second consecutive absence retires it, which keeps a
+/// pruned key from blocking the queue. `previously_absent` carries the
+/// `pk_bytes` the last pass deferred this way.
 ///
 /// A key the read returned whose marker records a [`WriteBackOp::Delete`] is
 /// **deferred**: nothing is delivered and its marker is withheld from the clear,
@@ -412,6 +451,7 @@ pub(crate) fn classify_delivery(
     claimed: &[PendingWriteBackMarker],
     claimed_pks: &ArrayRef,
     current: &[RecordBatch],
+    previously_absent: &HashSet<Vec<u8>>,
 ) -> DataFusionResult<DeliveryPlan> {
     if claimed.len() != claimed_pks.len() {
         return Err(DataFusionError::Execution(format!(
@@ -444,7 +484,18 @@ pub(crate) fn classify_delivery(
                 continue;
             }
             (false, WriteBackOp::Delete) => plan.deleted.push(key),
-            (false, WriteBackOp::Upsert) => plan.undelivered.push(key),
+            (false, WriteBackOp::Upsert) => {
+                if previously_absent.contains(&marker.pk_bytes) {
+                    // Absent twice running: treat it as really gone and retire
+                    // the marker, so a pruned key cannot block the queue.
+                    plan.undelivered.push(key);
+                } else {
+                    plan.absent_retry.push(key);
+                    plan.absent_retry_keys.push(marker.pk_bytes.clone());
+                    // Withheld from `clearable`: give the write one more pass.
+                    continue;
+                }
+            }
         }
         plan.clearable.push(marker.clone());
     }
@@ -467,6 +518,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use cayenne::{PendingWriteBackMarker, WriteBackOp};
     use datafusion::scalar::ScalarValue;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     const PK_COL: &str = "id";
@@ -502,11 +554,22 @@ mod tests {
     /// The regression this whole change exists for: a key that is simply gone
     /// from the accelerator — a retention prune, a read that could not see it —
     /// carries an upsert marker, and must NEVER be deleted at the source.
+    ///
+    /// On a second consecutive absence its marker is retired, so a genuinely
+    /// pruned key cannot block the queue.
     #[test]
     fn an_absent_key_without_a_delete_marker_is_never_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
-            .expect("classification succeeds");
+        let seen_absent_before: HashSet<Vec<u8>> =
+            claimed.iter().map(|m| m.pk_bytes.clone()).collect();
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[]),
+            &seen_absent_before,
+        )
+        .expect("classification succeeds");
 
         assert_eq!(
             plan,
@@ -515,17 +578,69 @@ mod tests {
                 deleted: vec![],
                 undelivered: scalars(&[1]),
                 deferred: vec![],
+                absent_retry: vec![],
+                absent_retry_keys: vec![],
                 clearable: claimed,
             },
             "an absent upsert-marked key must be reported as undelivered, never deleted"
         );
     }
 
+    /// An acknowledged write whose row the read could not see gets one more
+    /// pass before its marker is retired. Retiring it on the first sighting
+    /// would throw away the only durable record of that write whenever the miss
+    /// was the not-yet-visible-commit window, leaving the source on its previous
+    /// value with nothing left to reconcile it.
+    #[test]
+    fn an_absent_upsert_key_is_held_for_one_retry_before_its_marker_is_retired() {
+        let claimed = vec![marker(1, WriteBackOp::Upsert)];
+        let first = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[]),
+            &HashSet::new(),
+        )
+        .expect("classification succeeds");
+
+        assert_eq!(first.absent_retry, scalars(&[1]));
+        assert!(
+            first.undelivered.is_empty(),
+            "a first absence must not retire the marker"
+        );
+        assert!(
+            first.clearable.is_empty(),
+            "the marker must survive so the write can still be delivered"
+        );
+
+        // The next pass, fed what this one deferred, retires it.
+        let second = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[]),
+            &first.absent_retry_keys.iter().cloned().collect(),
+        )
+        .expect("classification succeeds");
+
+        assert_eq!(second.undelivered, scalars(&[1]));
+        assert_eq!(
+            second.clearable, claimed,
+            "a second consecutive absence retires the marker, so a pruned key cannot block the queue"
+        );
+    }
+
     #[test]
     fn an_absent_key_with_a_delete_marker_is_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
-            .expect("classification succeeds");
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[]),
+            &HashSet::new(),
+        )
+        .expect("classification succeeds");
 
         assert_eq!(plan.deleted, scalars(&[1]));
         assert!(plan.present.is_empty() && plan.undelivered.is_empty());
@@ -541,8 +656,14 @@ mod tests {
     #[test]
     fn a_present_key_whose_marker_says_delete_is_deferred_with_its_marker_kept() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
-            .expect("classification succeeds");
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[1]),
+            &HashSet::new(),
+        )
+        .expect("classification succeeds");
 
         assert_eq!(plan.deferred, scalars(&[1]));
         assert!(
@@ -590,8 +711,14 @@ mod tests {
     #[test]
     fn a_present_key_with_an_upsert_marker_is_upserted() {
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
-            .expect("classification succeeds");
+        let plan = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1]),
+            &read_returning(&[1]),
+            &HashSet::new(),
+        )
+        .expect("classification succeeds");
 
         assert_eq!(plan.present, scalars(&[1]));
         assert!(plan.deleted.is_empty() && plan.undelivered.is_empty());
@@ -604,14 +731,18 @@ mod tests {
         let claimed = vec![
             marker(1, WriteBackOp::Upsert), // present → upsert
             marker(2, WriteBackOp::Delete), // absent → delete
-            marker(3, WriteBackOp::Upsert), // absent → undelivered
+            marker(3, WriteBackOp::Upsert), // absent (twice) → undelivered
             marker(4, WriteBackOp::Delete), // present → deferred
         ];
+        // Key 3 was already absent on the previous pass, so this one retires it.
+        let seen_absent_before: HashSet<Vec<u8>> =
+            std::iter::once(marker(3, WriteBackOp::Upsert).pk_bytes).collect();
         let plan = classify_delivery(
             PK_COL,
             &claimed,
             &keys(&[1, 2, 3, 4]),
             &read_returning(&[1, 4]),
+            &seen_absent_before,
         )
         .expect("classification succeeds");
 
@@ -642,7 +773,9 @@ mod tests {
             marker(1, WriteBackOp::Upsert),
             marker(2, WriteBackOp::Upsert),
         ];
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[])
+        let seen_absent_before: HashSet<Vec<u8>> =
+            claimed.iter().map(|m| m.pk_bytes.clone()).collect();
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[], &seen_absent_before)
             .expect("classification succeeds");
 
         assert!(
@@ -655,8 +788,14 @@ mod tests {
     #[test]
     fn markers_and_decoded_keys_that_do_not_line_up_are_rejected() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let err = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &read_returning(&[]))
-            .expect_err("a length mismatch must not be classified");
+        let err = classify_delivery(
+            PK_COL,
+            &claimed,
+            &keys(&[1, 2]),
+            &read_returning(&[]),
+            &HashSet::new(),
+        )
+        .expect_err("a length mismatch must not be classified");
 
         assert!(
             err.to_string().contains("do not line up"),
@@ -674,7 +813,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![keys(&[1])]).expect("valid batch");
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
 
-        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch])
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch], &HashSet::new())
             .expect_err("a read without the key column must not be classified");
 
         assert!(
