@@ -8041,8 +8041,14 @@ impl CayenneTableProvider {
 
     /// Read a table's persisted statistics record, keeping "there is no record"
     /// distinct from "the record could not be read" (see
-    /// [`PersistedTableStatistics`]). Every reader of the persisted statistics
-    /// goes through here, so neither case can be reintroduced as the other.
+    /// [`PersistedTableStatistics`]). Every reader that needs that distinction goes
+    /// through here, so neither case can be reintroduced as the other by one of them.
+    ///
+    /// It is deliberately not the only path to the record.
+    /// [`Self::load_persisted_table_statistics`] reads the catalog directly and
+    /// collapses both cases to `None`, which is sound there: it amends a maintained
+    /// count, and an absent record and an unreadable one both mean it has no count to
+    /// amend. A reader that would act differently on the two belongs here instead.
     async fn read_persisted_table_statistics(
         catalog: &Arc<dyn MetadataCatalog>,
         table_metadata: &TableMetadata,
@@ -21688,7 +21694,7 @@ impl CayenneTableProvider {
     /// so a later `DELETE` retries it durably, which a cache-only flag cannot do.
     fn abandon_table_stats_update(&self, reason: &str) -> bool {
         tracing::warn!(
-            "Abandoning table stats update for {}: {reason}",
+            "Could not record the row count for table '{}', so queries against it now report an estimated row count instead of an exact one until the next write or DELETE re-establishes it. Cause: {reason}. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
             self.table_metadata.table_name
         );
         self.arm_row_count_taint_retry();
@@ -22010,11 +22016,9 @@ impl CayenneTableProvider {
         };
 
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
-            tracing::warn!(
-                "Failed to persist table stats for {}: {e}",
-                self.table_metadata.table_name
-            );
-            return self.abandon_table_stats_update("the statistics record could not be written");
+            return self.abandon_table_stats_update(&format!(
+                "the statistics record could not be written: {e}"
+            ));
         }
 
         // An authoritative exact count settles anything a failed taint left owed:
