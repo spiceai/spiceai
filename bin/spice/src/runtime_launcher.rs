@@ -116,27 +116,6 @@ pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()>
     Ok(())
 }
 
-/// [`run_runtime`] up to the point where the runtime has exited, returning the
-/// status it exited with instead of adopting it.
-///
-/// Split out because adopting the status ends the process, which is exactly
-/// what a test of this behavior cannot do.
-///
-/// Takes the runtime to launch rather than resolving one: resolution reads the
-/// host — `SPICED_PATH`, the running executable's directory, `PATH` — so a
-/// caller here that resolved would launch whatever runtime the developer's
-/// machine happens to offer instead of the fixture it built. The ladder has its
-/// own tests, with every rung injected.
-#[cfg(test)]
-async fn start_runtime(
-    ctx: &RuntimeContext,
-    config: &RunConfig,
-    resolved: &ResolvedSpiced,
-) -> Result<std::process::ExitStatus> {
-    ctx.ensure_local_runtime_supported()?;
-    launch_resolved_runtime(ctx, config, resolved).await
-}
-
 /// Name the runtime about to be launched, and where it came from.
 ///
 /// Announced at `info` whenever it is anything other than the binary
@@ -182,6 +161,10 @@ async fn resolve_or_install(ctx: &RuntimeContext) -> Result<ResolvedSpiced> {
 }
 
 /// Start `resolved` in the foreground and stay attached to it until it exits.
+///
+/// Returns the status the runtime exited with rather than adopting it, which is
+/// what lets a test assert the status at all — [`run_runtime`] adopting it ends
+/// the process.
 async fn launch_resolved_runtime(
     ctx: &RuntimeContext,
     config: &RunConfig,
@@ -559,7 +542,7 @@ mod tests {
                 &format!("#!/bin/sh\npwd > {}\n", observed.display()),
             );
 
-            let status = start_runtime(
+            let status = launch_resolved_runtime(
                 &ctx,
                 &RunConfig {
                     working_dir: Some(instance_dir.clone()),
@@ -587,7 +570,7 @@ mod tests {
             let (ctx, resolved) =
                 context_with_stub_runtime(&dir.path().join("bin"), "#!/bin/sh\nexit 3\n");
 
-            let status = start_runtime(&ctx, &RunConfig::default(), &resolved)
+            let status = launch_resolved_runtime(&ctx, &RunConfig::default(), &resolved)
                 .await
                 .expect("a failing runtime is an exit status, not a launcher error");
 
@@ -647,7 +630,7 @@ mod tests {
             );
 
             let launched = tokio::spawn(async move {
-                start_runtime(&ctx, &RunConfig::default(), &resolved)
+                launch_resolved_runtime(&ctx, &RunConfig::default(), &resolved)
                     .await
                     .expect("the stub runtime runs")
             });

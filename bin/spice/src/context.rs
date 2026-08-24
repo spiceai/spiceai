@@ -520,11 +520,16 @@ impl RuntimeContext {
     /// Under `sudo`, every rung names a binary the invoking user already chose
     /// or installed, which is the trust rung 5 has always extended: a runtime
     /// in the invoker's own home has been executed as root since that rung was
-    /// added. Rung 3 does not widen that, because a `PATH` directory root would
-    /// search for `spiced` is a directory root already resolved `spice` from —
-    /// anyone who can write the one can write the other. Note this reasoning
-    /// rests on the directories, *not* on `sudo` sanitizing `PATH`: `secure_path`
-    /// is set by stock `sudoers` on most Linux distributions but not on macOS.
+    /// added.
+    ///
+    /// Rung 3 extends it furthest. What bounds it is that `PATH` is the
+    /// caller's own configuration, that relative entries are refused so the
+    /// working directory cannot become one, and that the rungs below are
+    /// reached only when no entry holds a runtime at all. It does *not* rest on
+    /// `sudo` sanitizing `PATH`: `secure_path` is set by stock `sudoers` on most
+    /// Linux distributions but not on macOS, and `PATH` is searched in order, so
+    /// the directory supplying `spiced` need not be the one that supplied
+    /// `spice`. Narrowing the rung under elevation is tracked in #13316.
     /// The commands documented to run under `sudo` — `spice cloud service
     /// install` and `spice connect remove` — do not rely on it either; the
     /// former clears the environment and drops to the service account before it
@@ -596,7 +601,10 @@ impl RuntimeContext {
     /// cannot be read.
     pub fn managed_runtime_version(&self) -> Result<String> {
         let managed = self.spiced_path();
-        ensure!(is_runnable_binary(&managed), RuntimeNotInstalledSnafu);
+        ensure!(
+            self.is_managed_runtime_installed(),
+            RuntimeNotInstalledSnafu
+        );
         runtime_version_at(&managed)
     }
 
@@ -794,34 +802,35 @@ impl RuntimeContext {
 /// old binary. Silence there is the worst outcome: the user has done the thing
 /// that was supposed to fix their problem.
 pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
-    let installed = ctx.spiced_path();
-    let resolved = match ctx.resolve_spiced() {
-        Ok(Some(resolved)) => resolved,
+    if let Some(warning) = install_shadow_warning(&ctx.spiced_path(), &ctx.resolve_spiced()) {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// The line [`warn_if_install_is_shadowed`] emits, or `None` when the managed
+/// install is the file that will run.
+///
+/// Separated from the `tracing` call so each arm is assertable: reaching the
+/// failed-resolution arm through [`warn_if_install_is_shadowed`] would mean
+/// setting `SPICED_PATH` for the whole test process.
+fn install_shadow_warning(
+    installed: &Path,
+    resolved: &Result<Option<ResolvedSpiced>>,
+) -> Option<String> {
+    match resolved {
         // Nothing outranks the managed install and nothing else exists, so the
         // file just written is the file that will run.
-        Ok(None) => return,
+        Ok(None) => None,
+        // Compared by path rather than by source: the question here is whether
+        // the managed install is the file that will run, which is not the same
+        // question as whether the source is worth announcing at launch.
+        Ok(Some(resolved)) if same_file(&resolved.path, installed) => None,
+        Ok(Some(resolved)) => Some(shadowed_install_warning(installed, resolved)),
         // The install stands — the bytes are on disk — but no `spice run` can
         // reach them while resolution fails, and the caller has just reported
         // success. This is the only place the user hears otherwise.
-        Err(err) => {
-            tracing::warn!("{}", unselectable_install_warning(&installed, &err));
-            return;
-        }
-    };
-    // Compared by path rather than by source: the question here is whether the
-    // managed install is the file that will run, which is not the same question
-    // as whether the source is worth announcing at launch.
-    //
-    // Canonicalized first, because a symlink on `PATH` pointing at the managed
-    // install is a normal way to expose it. Those two paths differ lexically
-    // while naming one file, and warning there would tell a user their install
-    // has no effect when it is the very file about to run. Canonicalization
-    // needs the filesystem and can fail (a path that has since been removed);
-    // the lexical comparison is the fallback, which is what this always was.
-    if same_file(&resolved.path, &installed) {
-        return;
+        Err(cause) => Some(unselectable_install_warning(installed, cause)),
     }
-    tracing::warn!("{}", shadowed_install_warning(&installed, &resolved));
 }
 
 /// Whether two paths name the same file.
@@ -867,7 +876,7 @@ fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> Stri
 fn unselectable_install_warning(installed: &Path, cause: &Error) -> String {
     let installed = installed.display();
     format!(
-        "The managed runtime is at '{installed}', but 'spice run' cannot work out which runtime to start, so it will not start this one. Cause: {cause}"
+        "The managed runtime is at '{installed}', but 'spice run' cannot work out which runtime to start, so it will fail rather than start this one. Cause: {cause}"
     )
 }
 
@@ -949,8 +958,10 @@ pub struct ResolvedSpiced {
 }
 
 impl ResolvedSpiced {
-    /// The one place a [`ResolvedSpiced`] is built, so anchoring covers every
-    /// rung rather than the two that happen to need it today.
+    /// The constructor every rung goes through, so anchoring covers all of
+    /// them rather than the two that happen to need it today. A struct literal
+    /// skips that, which is why the rungs and the launcher's fixtures build
+    /// through here.
     ///
     /// # Errors
     ///
@@ -1124,10 +1135,12 @@ fn resolve_spiced(
 
     if let Some(search_path) = lookup.search_path.as_ref() {
         for dir in std::env::split_paths(search_path) {
-            // An empty `PATH` entry means the current directory. Letting the
-            // working directory supply the runtime would make `spice run`
-            // depend on where it was run from.
-            if dir.as_os_str().is_empty() {
+            // A relative entry — empty, `.`, `./bin` — resolves against the
+            // working directory, and the child is spawned in `--dir` rather
+            // than here. Honouring one would make `spice run` start a
+            // different runtime depending on where it was run from, which is
+            // the failure mode `.` on `PATH` is notorious for.
+            if !dir.is_absolute() {
                 continue;
             }
             let candidate = dir.join(SPICED_FILENAME);
@@ -1760,20 +1773,51 @@ mod tests {
         assert_eq!(found.source, SpicedSource::OnPath);
     }
 
-    /// An empty `PATH` entry means the working directory. Honouring it would
-    /// make `spice run` start a different runtime depending on where it was
-    /// run from, which is the failure mode `.` on `PATH` is notorious for.
+    /// An entry that is not absolute resolves against the working directory,
+    /// so honouring one would make `spice run` start a different runtime
+    /// depending on where it was run from — the failure mode `.` on `PATH` is
+    /// notorious for. Every spelling of it is refused, not just the empty one.
     #[test]
-    fn an_empty_path_entry_does_not_supply_the_runtime() {
-        let path = search_path(&["", "/usr/local/bin"]);
+    fn a_relative_path_entry_does_not_supply_the_runtime() {
+        for relative in ["", ".", "./bin", "../bin", "bin"] {
+            let path = search_path(&[relative, "/usr/local/bin"]);
+            let found = expect_resolved(ladder(
+                &[("PATH", &path)],
+                None,
+                None,
+                &[
+                    "spiced",
+                    "./spiced",
+                    "./bin/spiced",
+                    "../bin/spiced",
+                    "bin/spiced",
+                    "/usr/local/bin/spiced",
+                ],
+                "/home/me/.spice/bin/spiced",
+            ));
+            assert_eq!(
+                found.path,
+                PathBuf::from("/usr/local/bin/spiced"),
+                "a '{relative}' entry on PATH must not supply the runtime"
+            );
+        }
+    }
+
+    /// A relative entry is refused rather than merely outranked: with nothing
+    /// absolute on `PATH`, the ladder falls through to the managed install
+    /// instead of running whatever the working directory holds.
+    #[test]
+    fn a_relative_path_entry_falls_through_to_the_managed_install() {
+        let path = search_path(&[".", "./bin"]);
         let found = expect_resolved(ladder(
             &[("PATH", &path)],
             None,
             None,
-            &["spiced", "/usr/local/bin/spiced"],
+            &["./spiced", "./bin/spiced", "/home/me/.spice/bin/spiced"],
             "/home/me/.spice/bin/spiced",
         ));
-        assert_eq!(found.path, PathBuf::from("/usr/local/bin/spiced"));
+        assert_eq!(found.path, PathBuf::from("/home/me/.spice/bin/spiced"));
+        assert_eq!(found.source, SpicedSource::ManagedInstall);
     }
 
     /// `sudo` rewrites `HOME`, so a runtime installed under the invoking user's
@@ -2145,7 +2189,7 @@ mod tests {
             "the warning must name the install it is about: {warning}"
         );
         assert!(
-            warning.contains("will not start this one"),
+            warning.contains("fail rather than start this one"),
             "the warning must state the consequence, not just the failure: {warning}"
         );
         assert!(
@@ -2162,6 +2206,73 @@ mod tests {
         );
     }
 
+    /// Which arm fires, asserted by equality against the wording each one must
+    /// reach — the two wording tests above own the text itself. Asserted here
+    /// rather than through [`warn_if_install_is_shadowed`], which reads
+    /// `SPICED_PATH` and `PATH` from the process and so cannot be steered
+    /// without mutating state every other test in this binary shares.
+    #[test]
+    fn a_resolution_that_fails_is_warned_about_rather_than_swallowed() {
+        let installed = PathBuf::from("/home/me/.spice/bin/spiced");
+        let cause = SpicedPathOverrideNotRunnableSnafu {
+            path: "/tmp/typo/spiced".to_string(),
+        }
+        .build();
+
+        assert_eq!(
+            install_shadow_warning(&installed, &Err(cause)),
+            Some(unselectable_install_warning(
+                &installed,
+                &SpicedPathOverrideNotRunnableSnafu {
+                    path: "/tmp/typo/spiced".to_string(),
+                }
+                .build()
+            )),
+            "a resolution that failed must be reported, not returned from silently"
+        );
+    }
+
+    /// No candidate at all means the install just written is the only runtime
+    /// there is, so there is nothing to warn about.
+    #[test]
+    fn nothing_resolved_is_not_a_shadowed_install() {
+        assert_eq!(
+            install_shadow_warning(Path::new("/home/me/.spice/bin/spiced"), &Ok(None)),
+            None
+        );
+    }
+
+    /// The managed install resolving *is* the expected outcome, and warning
+    /// there would fire on every ordinary `spice install`.
+    #[test]
+    fn the_managed_install_resolving_is_not_a_shadowed_install() {
+        let installed = PathBuf::from("/home/me/.spice/bin/spiced");
+        let resolved = ResolvedSpiced {
+            path: installed.clone(),
+            source: SpicedSource::ManagedInstall,
+        };
+        assert_eq!(
+            install_shadow_warning(&installed, &Ok(Some(resolved))),
+            None
+        );
+    }
+
+    /// Something else resolving is the case the whole function exists for.
+    #[test]
+    fn another_runtime_resolving_is_a_shadowed_install() {
+        let installed = PathBuf::from("/home/me/.spice/bin/spiced");
+        let resolved = ResolvedSpiced {
+            path: PathBuf::from("/usr/local/bin/spiced"),
+            source: SpicedSource::OnPath,
+        };
+
+        assert_eq!(
+            install_shadow_warning(&installed, &Ok(Some(resolved.clone()))),
+            Some(shadowed_install_warning(&installed, &resolved)),
+            "a runtime outranking the managed install must be reported"
+        );
+    }
+
     /// The public entry points over a real, empty install directory.
     ///
     /// Asserts the *managed* question, which is hermetic: whatever the host's
@@ -2171,22 +2282,7 @@ mod tests {
     #[test]
     fn an_empty_bin_dir_holds_no_managed_runtime() {
         let temp = TempDir::new().expect("create temp dir");
-        let ctx = RuntimeContext {
-            spice_runtime_dir: temp.path().to_path_buf(),
-            spice_bin_dir: temp.path().join("bin"),
-            app_dir: PathBuf::from("/test/app"),
-            pods_dir: PathBuf::from("/test/app/spicepods"),
-            http_endpoint: "http://127.0.0.1:8090".to_string(),
-            http_endpoint_chosen: false,
-            api_key: None,
-            cloud_region: None,
-            user_agent: "spice/test (test; test)".to_string(),
-            extra_headers: HashMap::new(),
-            http_client: reqwest::Client::new(),
-            inference_http_client: reqwest::Client::new(),
-            inference_deadline: INFERENCE_DEADLINE,
-            tls_root_certificate_file: None,
-        };
+        let ctx = RuntimeContext::with_bin_dir_for_test(temp.path().join("bin"));
         assert!(!ctx.spiced_path().exists());
         assert!(!ctx.is_managed_runtime_installed());
         ctx.managed_runtime_version()
