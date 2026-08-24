@@ -62,6 +62,177 @@ use iceberg::{Catalog, Error as IcebergError};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
+/// The columns an equality delete keys on, as `(field IDs, column indices)` in
+/// schema order.
+///
+/// Iceberg equality deletes match rows *by value*, so a column whose equality is
+/// not well defined cannot take part. Floating point is excluded (`NaN` is not
+/// equal to itself and `-0.0 == 0.0`), nested types are excluded, and so is any
+/// column without a Parquet field ID — the reader resolves delete columns by ID,
+/// never by name.
+///
+/// The delete therefore keys on a *subset* of the row. Two rows agreeing on
+/// every returned column are indistinguishable to the delete file, so a `DELETE`
+/// whose predicate separates them only by an excluded column removes both. An
+/// empty result means no column is eligible at all; the caller must refuse the
+/// statement rather than write a delete file that matches the whole table.
+fn equality_delete_columns(schema: &ArrowSchema) -> (Vec<i32>, Vec<usize>) {
+    let mut equality_ids: Vec<i32> = Vec::new();
+    let mut projection_indices: Vec<usize> = Vec::new();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.data_type().is_nested()
+            || matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            )
+        {
+            continue;
+        }
+        if let Some(field_id) = field
+            .metadata()
+            .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            equality_ids.push(field_id);
+            projection_indices.push(idx);
+        }
+    }
+
+    (equality_ids, projection_indices)
+}
+
+/// The columns a predicate references that the equality key cannot carry, sorted
+/// and deduplicated.
+///
+/// An equality delete says "remove rows whose key columns equal these values".
+/// That is only the same statement as the original `WHERE` when the predicate is
+/// a function of the key columns alone: a row sharing the key values of a matched
+/// row then necessarily satisfies the predicate too, so nothing unmatched is
+/// removed. The moment the predicate reads a column outside the key — a float, a
+/// nested field, anything [`equality_delete_columns`] excludes — the delete file
+/// can no longer distinguish a matched row from an unmatched one beside it, and
+/// deletes both.
+///
+/// Sorted so the refusal names the same column every time; `column_refs` returns
+/// an unordered set.
+fn unkeyable_predicate_columns(
+    schema: &ArrowSchema,
+    key_indices: &[usize],
+    filters: &[datafusion::logical_expr::Expr],
+) -> Vec<String> {
+    let keyable: std::collections::HashSet<&str> = key_indices
+        .iter()
+        .map(|idx| schema.field(*idx).name().as_str())
+        .collect();
+
+    // One set across every filter, rather than one per filter as `column_refs`
+    // would give. Filter before cloning so the common case — every column
+    // keyable — allocates nothing.
+    let mut referenced: std::collections::HashSet<&datafusion::common::Column> =
+        std::collections::HashSet::new();
+    for filter in filters {
+        filter.add_column_refs(&mut referenced);
+    }
+
+    let mut unkeyable: Vec<String> = referenced
+        .into_iter()
+        .map(|column| column.name.as_str())
+        .filter(|name| !keyable.contains(name))
+        .map(str::to_string)
+        .collect();
+    // The set deduplicates by `Column`, which carries a relation, so the same
+    // name can still arrive twice; and the message must not vary run to run.
+    unkeyable.sort_unstable();
+    unkeyable.dedup();
+    unkeyable
+}
+
+/// The refusal a caller gets when the condition cannot be expressed as an
+/// equality key. Built here rather than inline so its wording is pinned by a
+/// test: it has to keep naming the table, the offending column, and what the
+/// user can do instead.
+fn unkeyable_predicate_message(table: &str, unkeyable: &[String], keyable: &[String]) -> String {
+    let quoted = |names: &[String]| {
+        names
+            .iter()
+            // Escaped: a column name is user-chosen and could otherwise carry a
+            // newline into a message that must stay on one line.
+            .map(|name| format!("'{}'", name.escape_debug()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let usable = if keyable.is_empty() {
+        "no column of this table can be matched on".to_string()
+    } else {
+        format!("this table can only be matched on {}", quoted(keyable))
+    };
+
+    format!(
+        "Failed to delete from Iceberg table '{table}': the condition reads {}, which an equality delete cannot match on, so rows the condition did not select would be deleted too. \
+        Rewrite the condition to use only columns the delete can match, or delete the rows through a source that supports row-level deletes; {usable}. \
+        Floating-point and nested columns can never be matched on, and neither can a column without a Parquet field ID. \
+        See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        quoted(unkeyable)
+    )
+}
+
+/// Whether a condition reaches somewhere an [`Expr`] walk cannot follow.
+///
+/// `DataFusion` lists `Exists` and `ScalarSubquery` among the *leaves* of an
+/// expression tree, and treats `OuterReferenceColumn` as one too, so neither the
+/// column check nor the volatility check sees anything inside a subquery: a
+/// condition that is a function of `price` — a float, which no key can carry —
+/// would name no column at all, and a `random()` buried in a subquery would
+/// look deterministic.
+///
+/// A subquery does not normally reach this far. The planner decorrelates it
+/// into a join, and `runtime_datafusion::dml_guard` refuses the statement
+/// there, because a join restricts the affected rows in a way the filter list
+/// handed to a provider cannot express. This remains as a backstop for a
+/// subquery expression that survives into a filter: what cannot be inspected
+/// cannot be proven exact.
+fn reaches_outside_the_row(filters: &[datafusion::logical_expr::Expr]) -> bool {
+    use datafusion::logical_expr::Expr;
+
+    filters.iter().any(|filter| {
+        filter
+            .exists(|expr| {
+                Ok(matches!(
+                    expr,
+                    Expr::Exists(_)
+                        | Expr::InSubquery(_)
+                        | Expr::SetComparison(_)
+                        | Expr::ScalarSubquery(_)
+                        | Expr::OuterReferenceColumn(_, _)
+                ))
+            })
+            // The closure cannot fail, but if traversal ever did, treating the
+            // condition as unprovable is the safe direction.
+            .unwrap_or(true)
+    })
+}
+
+/// Whether a condition contains a volatile expression.
+///
+/// The exactness argument is that the condition is a *deterministic function of
+/// the key columns*: two rows sharing a key tuple feed it identical inputs, so
+/// it answers the same for both and neither is deleted without the other. A
+/// volatile expression is not a function of its inputs at all — `random() < 0.5`
+/// can select one of two rows sharing a key and reject the other, and the delete
+/// file, which records only the key, then removes both.
+///
+/// Only [`Volatility::Volatile`] breaks this. `Stable` holds its value for the
+/// duration of a query, so `now()` answers the same for every row of one delete
+/// and the argument survives.
+///
+/// [`Volatility::Volatile`]: datafusion::logical_expr::Volatility::Volatile
+fn has_volatile_expression(filters: &[datafusion::logical_expr::Expr]) -> bool {
+    filters
+        .iter()
+        .any(datafusion::logical_expr::Expr::is_volatile)
+}
+
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -443,28 +614,58 @@ impl IcebergDeletionProvider {
         let iceberg_schema = table.metadata().current_schema();
         let arrow_schema = Arc::new(schema_to_arrow_schema(iceberg_schema).map_err(to_df_error)?);
 
-        // Compute (column_index, field_id) pairs for eligible equality columns
-        let mut equality_ids: Vec<i32> = Vec::new();
-        let mut projection_indices: Vec<usize> = Vec::new();
-        for (idx, field) in arrow_schema.fields().iter().enumerate() {
-            if field.data_type().is_nested()
-                || matches!(
-                    field.data_type(),
-                    arrow::datatypes::DataType::Float16
-                        | arrow::datatypes::DataType::Float32
-                        | arrow::datatypes::DataType::Float64
-                )
-            {
-                continue;
-            }
-            if let Some(field_id) = field
-                .metadata()
-                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
-                .and_then(|v| v.parse::<i32>().ok())
-            {
-                equality_ids.push(field_id);
-                projection_indices.push(idx);
-            }
+        let (equality_ids, projection_indices) = equality_delete_columns(&arrow_schema);
+
+        // An equality delete file with no key columns imposes no condition, so
+        // it would match every row: a `DELETE ... WHERE` would empty the table.
+        // Refuse the statement rather than destroy data.
+        if equality_ids.is_empty() {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to delete from Iceberg table {}: no column can identify the rows to delete. \
+                Equality deletes cannot key on floating-point or nested columns, and every other column must carry a Parquet field ID. \
+                Add an integer, string, boolean, date, timestamp, or decimal column to the table. \
+                See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                self.table_ident
+            )));
+        }
+
+        // An equality delete can only reproduce a condition built from the columns
+        // it keys on. Anything else would delete more than the condition selected,
+        // so refuse rather than approximate — losing rows silently is worse than
+        // refusing the statement.
+        // A condition reaching into a subquery cannot be inspected by the checks
+        // below, so it cannot be proven exact — see `reaches_outside_the_row`.
+        if reaches_outside_the_row(filters) {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to delete from Iceberg table '{}': the condition uses a subquery, which cannot be checked against the columns the delete matches on, so rows the condition did not select could be deleted too. \
+                Run the subquery first and delete by the values it returns. \
+                See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                self.table_ident
+            )));
+        }
+
+        // A volatile condition is not a function of the row at all, so no key can
+        // reproduce it — see `has_volatile_expression`.
+        if has_volatile_expression(filters) {
+            return Err(DataFusionError::Plan(format!(
+                "Failed to delete from Iceberg table '{}': the condition is not deterministic, so it can select one of two rows that a delete cannot tell apart and rows it did not select would be deleted too. \
+                Rewrite the condition without volatile functions such as `random()`, or select the rows to delete first and delete them by a stable column. \
+                See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                self.table_ident
+            )));
+        }
+
+        let unkeyable = unkeyable_predicate_columns(&arrow_schema, &projection_indices, filters);
+        if !unkeyable.is_empty() {
+            let keyable: Vec<String> = projection_indices
+                .iter()
+                .map(|idx| arrow_schema.field(*idx).name().clone())
+                .collect();
+            return Err(DataFusionError::Plan(unkeyable_predicate_message(
+                &self.table_ident.to_string(),
+                &unkeyable,
+                &keyable,
+            )));
         }
 
         tracing::debug!(
@@ -538,5 +739,562 @@ impl IcebergDeletionProvider {
             coalesced,
             equality_ids,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        equality_delete_columns, has_volatile_expression, unkeyable_predicate_columns,
+        unkeyable_predicate_message,
+    };
+    use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
+    use datafusion::prelude::{col, lit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn field(name: &str, data_type: DataType, field_id: Option<&str>) -> Field {
+        let field = Field::new(name, data_type, true);
+        match field_id {
+            Some(id) => field.with_metadata(HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])),
+            None => field,
+        }
+    }
+
+    #[test]
+    fn primitive_columns_with_field_ids_are_eligible() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("name", DataType::Utf8, Some("2")),
+            field("active", DataType::Boolean, Some("3")),
+            field("day", DataType::Date32, Some("4")),
+            field(
+                "seen",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                Some("5"),
+            ),
+            field("amount", DataType::Decimal128(10, 2), Some("6")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Floating point has no usable equality (`NaN != NaN`, `-0.0 == 0.0`), so
+    /// the Iceberg spec forbids keying a delete on it.
+    #[test]
+    fn floating_point_columns_are_excluded() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("f16", DataType::Float16, Some("2")),
+            field("f32", DataType::Float32, Some("3")),
+            field("f64", DataType::Float64, Some("4")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn nested_columns_are_excluded() {
+        let inner = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("tags", DataType::List(Arc::clone(&inner)), Some("2")),
+            field(
+                "meta",
+                DataType::Struct(Fields::from(vec![Field::new("k", DataType::Utf8, true)])),
+                Some("3"),
+            ),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    /// The Iceberg reader resolves delete columns by field ID, never by name, so
+    /// a column without one cannot take part.
+    #[test]
+    fn columns_without_a_usable_field_id_are_excluded() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("no_id", DataType::Utf8, None),
+            field("bad_id", DataType::Utf8, Some("not-a-number")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(indices, vec![0]);
+    }
+
+    /// The returned IDs and indices are positionally paired: index `n` of the
+    /// scan projection carries the column whose field ID is `ids[n]`. A drift
+    /// between them would write each row's values under the wrong key.
+    #[test]
+    fn ids_and_projection_indices_stay_paired_across_skipped_columns() {
+        let schema = ArrowSchema::new(vec![
+            field("skip_me", DataType::Float64, Some("10")),
+            field("id", DataType::Int64, Some("11")),
+            field("also_skip", DataType::Utf8, None),
+            field("name", DataType::Utf8, Some("13")),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert_eq!(ids, vec![11, 13]);
+        assert_eq!(indices, vec![1, 3]);
+        for (id, idx) in ids.iter().zip(indices.iter()) {
+            let meta = schema.field(*idx).metadata();
+            let declared = meta
+                .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+                .expect("eligible columns carry a field ID");
+            assert_eq!(declared, &id.to_string());
+        }
+    }
+
+    /// The case the caller must refuse: nothing is eligible, so a delete file
+    /// built from this schema would carry no key columns and match every row.
+    #[test]
+    fn a_table_with_no_eligible_column_yields_an_empty_key() {
+        let schema = ArrowSchema::new(vec![
+            field("x", DataType::Float64, Some("1")),
+            field("y", DataType::Float32, Some("2")),
+            field("z", DataType::Utf8, None),
+        ]);
+
+        let (ids, indices) = equality_delete_columns(&schema);
+        assert!(ids.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    /// `(id, label)` repeat across rows; `price` is what tells them apart — and
+    /// `price` is a float, so the delete can never key on it.
+    fn float_keyed_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("label", DataType::Utf8, Some("2")),
+            field("price", DataType::Float64, Some("3")),
+        ])
+    }
+
+    fn key_indices(schema: &ArrowSchema) -> Vec<usize> {
+        equality_delete_columns(schema).1
+    }
+
+    /// The case that must be refused. Two rows can share `(id, label)` and differ
+    /// only in `price`, so a delete keyed on `(id, label)` removes both — while
+    /// `WHERE price = 1.5` selected one. Approximating here loses a row silently
+    /// and unrecoverably, so the statement is refused instead.
+    #[test]
+    fn a_predicate_on_an_unkeyable_column_is_refused() {
+        let schema = float_keyed_schema();
+        let unkeyable = unkeyable_predicate_columns(
+            &schema,
+            &key_indices(&schema),
+            &[col("price").eq(lit(1.5))],
+        );
+
+        assert_eq!(unkeyable, vec!["price".to_string()]);
+    }
+
+    /// A predicate built only from key columns is exact: any row sharing those
+    /// values satisfies the same predicate, so nothing unmatched is removed.
+    #[test]
+    fn a_predicate_on_key_columns_only_is_allowed() {
+        let schema = float_keyed_schema();
+        let indices = key_indices(&schema);
+
+        for filters in [
+            vec![col("id").eq(lit(1_i64))],
+            vec![col("label").eq(lit("x"))],
+            vec![col("id").eq(lit(1_i64)), col("label").eq(lit("x"))],
+            vec![col("id").gt(lit(1_i64)).and(col("label").is_not_null())],
+        ] {
+            assert!(
+                unkeyable_predicate_columns(&schema, &indices, &filters).is_empty(),
+                "should be allowed: {filters:?}"
+            );
+        }
+    }
+
+    /// `random() < 0.5` names no column, so the column check alone waves it
+    /// through — and it can pick one of two rows sharing a key while rejecting
+    /// the other, which is the very over-delete this guard exists to stop.
+    #[test]
+    fn a_volatile_condition_is_detected() {
+        let volatile = datafusion::prelude::random().lt(lit(0.5));
+        assert!(has_volatile_expression(std::slice::from_ref(&volatile)));
+
+        // Also when it hides beside a perfectly keyable comparison.
+        assert!(has_volatile_expression(&[col("id")
+            .eq(lit(1_i64))
+            .and(volatile)]));
+    }
+
+    /// The column check cannot catch it: a volatile call references no column,
+    /// so it has to be rejected on its own terms.
+    #[test]
+    fn a_volatile_condition_names_no_unkeyable_column() {
+        let schema = float_keyed_schema();
+        let volatile = datafusion::prelude::random().lt(lit(0.5));
+
+        assert!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &[volatile]).is_empty(),
+            "nothing for the column check to find — which is why the volatility check exists"
+        );
+    }
+
+    /// Ordinary conditions must not be swept up by the volatility check.
+    #[test]
+    fn a_deterministic_condition_is_not_volatile() {
+        for filters in [
+            vec![col("id").eq(lit(1_i64))],
+            vec![col("label").eq(lit("x"))],
+            vec![col("id").gt(lit(1_i64)).and(col("label").is_not_null())],
+            vec![],
+        ] {
+            assert!(!has_volatile_expression(&filters), "{filters:?}");
+        }
+    }
+
+    /// `DELETE FROM t` with no condition removes every row, which an equality
+    /// delete reproduces exactly. Refusing it would be wrong.
+    #[test]
+    fn a_delete_with_no_condition_is_allowed() {
+        let schema = float_keyed_schema();
+        assert!(unkeyable_predicate_columns(&schema, &key_indices(&schema), &[]).is_empty());
+    }
+
+    /// A mixed condition is still refused, and every offending column is named
+    /// so the user does not have to rediscover them one error at a time.
+    #[test]
+    fn every_unkeyable_column_is_reported_at_once_and_in_a_stable_order() {
+        let schema = ArrowSchema::new(vec![
+            field("id", DataType::Int64, Some("1")),
+            field("price", DataType::Float64, Some("2")),
+            field("ratio", DataType::Float32, Some("3")),
+        ]);
+        let filters = vec![
+            col("ratio").gt(lit(0.5_f32)),
+            col("id").eq(lit(1_i64)),
+            col("price").eq(lit(1.5)),
+        ];
+
+        // Sorted, so the message does not vary run to run: `column_refs` is a set.
+        assert_eq!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &filters),
+            vec!["price".to_string(), "ratio".to_string()]
+        );
+    }
+
+    /// A column named twice is reported once.
+    #[test]
+    fn a_repeated_unkeyable_column_is_reported_once() {
+        let schema = float_keyed_schema();
+        let filters = vec![col("price").gt(lit(1.0)), col("price").lt(lit(9.0))];
+
+        assert_eq!(
+            unkeyable_predicate_columns(&schema, &key_indices(&schema), &filters),
+            vec!["price".to_string()]
+        );
+    }
+
+    /// The refusal has to stay actionable: name the table, the column that caused
+    /// it, what can be used instead, and where to read more. A reword must not
+    /// quietly drop any of those.
+    #[test]
+    fn the_refusal_names_the_table_the_column_and_the_way_out() {
+        let message = unkeyable_predicate_message(
+            "sales.orders",
+            &["price".to_string()],
+            &["id".to_string(), "label".to_string()],
+        );
+
+        assert!(message.contains("'sales.orders'"), "{message}");
+        assert!(message.contains("'price'"), "{message}");
+        assert!(message.contains("'id', 'label'"), "{message}");
+        assert!(
+            message.contains("rows the condition did not select would be deleted too"),
+            "must say what goes wrong, not just that it refused: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-connectors/iceberg"),
+            "{message}"
+        );
+        assert!(!message.contains('\n'), "must stay on one line: {message}");
+    }
+
+    /// When nothing is keyable the message must not claim an empty list of usable
+    /// columns — that reads as "use these" followed by nothing.
+    #[test]
+    fn the_refusal_says_so_plainly_when_no_column_is_usable() {
+        let message = unkeyable_predicate_message("sales.orders", &["price".to_string()], &[]);
+
+        assert!(
+            message.contains("no column of this table can be matched on"),
+            "{message}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end coverage against a real catalog.
+    //
+    // These commit Iceberg tables through a REST catalog and a local-filesystem
+    // warehouse, so they assert on *rows that survived a delete* rather than on
+    // the plan that would have run. That distinction is the point: every earlier
+    // attempt at this code planned exactly as intended and still removed the
+    // wrong rows, and no unit test could see it.
+    //
+    // Skipped unless ICEBERG_REST_CATALOG_URI names a running catalog, matching
+    // how `hadoop_catalog_test.rs` gates on its own endpoint. Bring one up with:
+    //
+    //   docker run -d -p 8181:8181 -v /tmp/wh:/tmp/wh \
+    //     -e CATALOG_WAREHOUSE=file:///tmp/wh \
+    //     -e CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
+    //     apache/iceberg-rest-fixture:latest
+    //
+    // The warehouse is bind-mounted at the *same* path inside the container so
+    // the absolute locations the catalog records resolve for this process too.
+    // ---------------------------------------------------------------------
+
+    use datafusion::assert_batches_sorted_eq;
+    use datafusion::datasource::TableProvider;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::prelude::SessionContext;
+    use iceberg::io::LocalFsStorageFactory;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+    use iceberg_catalog_rest::{
+        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    };
+    use iceberg_datafusion::IcebergTableProvider;
+
+    use super::IcebergDeletionProvider;
+
+    const CATALOG_URI_ENV: &str = "ICEBERG_REST_CATALOG_URI";
+    const WAREHOUSE_ENV: &str = "ICEBERG_REST_WAREHOUSE";
+
+    /// The catalog endpoint and warehouse root, or `None` when the environment
+    /// does not offer one and the test should not run.
+    fn catalog_env() -> Option<(String, String)> {
+        let uri = std::env::var(CATALOG_URI_ENV).ok()?;
+        let warehouse = std::env::var(WAREHOUSE_ENV)
+            .unwrap_or_else(|_| "file:///tmp/iceberg-e2e-warehouse".to_string());
+        (!uri.trim().is_empty()).then_some((uri, warehouse))
+    }
+
+    /// A fresh table per test. The name carries the caller so concurrently
+    /// running tests never share a table, and a stale one from an earlier run is
+    /// dropped rather than reused.
+    async fn fresh_table(name: &str) -> Option<(Arc<dyn Catalog>, NamespaceIdent, String)> {
+        let (uri, warehouse) = catalog_env()?;
+
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "rest",
+                HashMap::from([
+                    (REST_CATALOG_PROP_URI.to_string(), uri),
+                    (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse),
+                ]),
+            )
+            .await
+            .expect("load REST catalog");
+
+        let namespace = NamespaceIdent::new("delete_e2e".to_string());
+        // Ignore the already-exists error; the namespace outlives a single test.
+        let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
+
+        let table_ident = iceberg::TableIdent::new(namespace.clone(), name.to_string());
+        let _ = catalog.drop_table(&table_ident).await;
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "label", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(3, "price", Type::Primitive(PrimitiveType::Double)).into(),
+            ])
+            .build()
+            .expect("iceberg schema");
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(name.to_string())
+                    .schema(schema)
+                    // Equality deletes need v2; v1 is refused before we get here.
+                    .properties(HashMap::from([(
+                        "format-version".to_string(),
+                        "2".to_string(),
+                    )]))
+                    .build(),
+            )
+            .await
+            .expect("create table");
+
+        Some((Arc::new(catalog), namespace, name.to_string()))
+    }
+
+    async fn table_provider(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> Arc<dyn TableProvider> {
+        Arc::new(
+            IcebergTableProvider::try_new(Arc::clone(catalog), namespace.clone(), name.to_string())
+                .await
+                .expect("iceberg table provider"),
+        )
+    }
+
+    /// Every row currently in the table, as a printed table.
+    ///
+    /// Compared whole rather than projected to a tuple: an earlier version of
+    /// this helper returned only `(id, price)`, so a delete that corrupted
+    /// `label` would have passed both tests unnoticed.
+    async fn rows_now(
+        ctx: &SessionContext,
+        provider: &Arc<dyn TableProvider>,
+    ) -> Vec<arrow::array::RecordBatch> {
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect")
+    }
+
+    /// Two rows share `(id, label)` and differ only in `price` — the pair an
+    /// equality delete keyed on `(id, label)` cannot tell apart.
+    async fn seed(ctx: &SessionContext, provider: &Arc<dyn TableProvider>) {
+        let batch = arrow::array::RecordBatch::try_new(
+            provider.schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1_i64, 1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.5, 2.5, 9.0])),
+            ],
+        )
+        .expect("seed batch");
+
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                    .expect("memory source"),
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insert plan");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("insert runs");
+    }
+
+    fn deletable(
+        catalog: &Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        name: &str,
+        inner: &Arc<dyn TableProvider>,
+    ) -> Arc<dyn TableProvider> {
+        let layer = IcebergDeletionProvider::new(
+            Arc::clone(catalog),
+            namespace.clone(),
+            name.to_string(),
+            Arc::clone(inner),
+        );
+        spice_table::SpiceTable::over(Arc::new(layer), Arc::clone(inner))
+    }
+
+    /// The seeded table, compared in full: projecting to a tuple is what let an
+    /// earlier version of these tests ignore `label` entirely.
+    const ALL_THREE_ROWS: [&str; 7] = [
+        "+----+-------+-------+",
+        "| id | label | price |",
+        "+----+-------+-------+",
+        "| 1  | a     | 1.5   |",
+        "| 1  | a     | 2.5   |",
+        "| 2  | b     | 9.0   |",
+        "+----+-------+-------+",
+    ];
+
+    /// A condition the key *can* express removes exactly the rows it selected.
+    #[tokio::test]
+    async fn a_delete_on_a_keyable_column_removes_exactly_those_rows() {
+        let Some((catalog, namespace, name)) = fresh_table("keyable").await else {
+            eprintln!("skipping: {CATALOG_URI_ENV} is not set");
+            return;
+        };
+        let ctx = SessionContext::new();
+        let inner = table_provider(&catalog, &namespace, &name).await;
+        seed(&ctx, &inner).await;
+        assert_batches_sorted_eq!(ALL_THREE_ROWS, &rows_now(&ctx, &inner).await);
+
+        let plan = deletable(&catalog, &namespace, &name, &inner)
+            .delete_from(&ctx.state(), vec![col("id").eq(lit(1_i64))])
+            .await
+            .expect("delete plans");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete runs");
+
+        // Both id = 1 rows go, and only those.
+        let after = table_provider(&catalog, &namespace, &name).await;
+        assert_batches_sorted_eq!(
+            [
+                "+----+-------+-------+",
+                "| id | label | price |",
+                "+----+-------+-------+",
+                "| 2  | b     | 9.0   |",
+                "+----+-------+-------+",
+            ],
+            &rows_now(&ctx, &after).await
+        );
+    }
+
+    /// The reason this guard exists. `price` cannot be part of the key, so
+    /// `WHERE price = 1.5` has no faithful equality delete — the closest one also
+    /// removes the `price = 2.5` row. It must be refused, and the table must be
+    /// untouched afterwards. This is the assertion no unit test could make.
+    #[tokio::test]
+    async fn a_delete_on_an_unkeyable_column_is_refused_and_loses_no_rows() {
+        let Some((catalog, namespace, name)) = fresh_table("unkeyable").await else {
+            eprintln!("skipping: {CATALOG_URI_ENV} is not set");
+            return;
+        };
+        let ctx = SessionContext::new();
+        let inner = table_provider(&catalog, &namespace, &name).await;
+        seed(&ctx, &inner).await;
+
+        let error = deletable(&catalog, &namespace, &name, &inner)
+            .delete_from(&ctx.state(), vec![col("price").eq(lit(1.5_f64))])
+            .await
+            .expect_err("a condition on an unkeyable column must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains("'price'"), "{message}");
+        assert!(
+            message.contains("rows the condition did not select would be deleted too"),
+            "{message}"
+        );
+
+        // A refused delete must leave every row in place.
+        let after = table_provider(&catalog, &namespace, &name).await;
+        assert_batches_sorted_eq!(ALL_THREE_ROWS, &rows_now(&ctx, &after).await);
+    }
+
+    #[test]
+    fn an_empty_schema_yields_an_empty_key() {
+        let (ids, indices) = equality_delete_columns(&ArrowSchema::empty());
+        assert!(ids.is_empty());
+        assert!(indices.is_empty());
     }
 }

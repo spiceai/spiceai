@@ -3153,6 +3153,10 @@ mod tests {
         async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
+
+        async fn delete(&self) -> DatasetCheckpointResult<()> {
+            Ok(())
+        }
     }
 
     fn sample_schema() -> SchemaRef {

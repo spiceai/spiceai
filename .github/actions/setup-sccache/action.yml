@@ -8,6 +8,16 @@ inputs:
   spiceio_endpoint:
     description: 'Spiceio S3-compatible endpoint (used for macOS)'
     required: false
+  minio_access_key:
+    description: >-
+      MinIO access key. Required by every configuration that signs its requests, which is
+      all of them except macOS via `spiceio_endpoint`. The action needs it here rather than
+      wherever cargo eventually runs, because the pre-flight below signs a request before
+      rustc is ever wrapped.
+    required: false
+  minio_secret_key:
+    description: 'MinIO secret key. See minio_access_key.'
+    required: false
 
 runs:
   using: 'composite'
@@ -15,12 +25,45 @@ runs:
     - name: Set sccache environment variables
       if: inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')
       shell: bash
+      # Read through `env` rather than interpolating `${{ }}` into the script, so a value
+      # containing shell metacharacters stays a value.
+      env:
+        MINIO_ACCESS_KEY: ${{ inputs.minio_access_key }}
+        MINIO_SECRET_KEY: ${{ inputs.minio_secret_key }}
+        SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
       run: |
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
         echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
+
+        # Credentials have to be in the environment from here on -- before the cache config
+        # is written and before the pre-flight signs its probe request -- and not in
+        # whichever later step happens to run cargo. A probe that cannot sign falls through
+        # to the EC2 instance metadata service, which a self-hosted runner does not have;
+        # the pre-flight then clears `RUSTC_WRAPPER` for the whole job and the build
+        # compiles uncached, reporting nothing worse than a `::warning::`. Owning the
+        # credentials here is what makes that ordering impossible to get wrong at a call
+        # site.
+        # Export only where the cache actually signs. macOS prefers `spiceio_endpoint` and
+        # writes `no_credentials = true` for it, so keys are unnecessary there -- and
+        # `$GITHUB_ENV` is job-wide, so exporting them anyway would leave MinIO credentials
+        # in every later step's environment, where they can displace that step's own AWS
+        # identity. Linux and Windows always write `no_credentials = false`, and macOS falls
+        # back to the signing minio path whenever the spiceio endpoint resolves empty, so
+        # both of those still need them.
+        if [[ "${RUNNER_OS}" == "macOS" && -n "${SPICEIO_ENDPOINT}" ]]; then
+          echo "Compiler cache signs no requests on this path; leaving credentials out of the job environment."
+        elif [[ -n "${MINIO_ACCESS_KEY}" && -n "${MINIO_SECRET_KEY}" ]]; then
+          echo "AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}" >> $GITHUB_ENV
+        else
+          # Warn rather than fail: a cache that cannot answer is meant to degrade, and
+          # failing here would fail builds for an infrastructure outage -- in the merge queue
+          # that dequeues the whole batch (see #12770).
+          echo "::warning::No compiler-cache credentials supplied (minio_access_key/minio_secret_key). This cache configuration signs its requests, so the pre-flight will disable the cache and this job will compile uncached."
+        fi
 
     - name: Configure apt mirrors (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''

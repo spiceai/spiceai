@@ -22,7 +22,13 @@ on:
       - '.github/actions/setup-sccache/action.yml'
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
-      - '.github/workflows/sccache_preflight_test.yml'
+      - 'scripts/check_sccache_call_sites.py'
+      # Any workflow or action manifest: a call site that omits the cache credentials is a
+      # change there, not in the pre-flight, which cannot tell from inside whether a caller
+      # ever supplied any. Composite actions count -- four of them were forwarding the
+      # endpoint to `setup-sccache` while dropping the credentials their callers passed.
+      - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
   push:
     branches:
       - trunk
@@ -30,7 +36,13 @@ on:
       - '.github/actions/setup-sccache/action.yml'
       - '.github/actions/setup-sccache/verify_compiler_cache.sh'
       - 'scripts/test_sccache_preflight.sh'
-      - '.github/workflows/sccache_preflight_test.yml'
+      - 'scripts/check_sccache_call_sites.py'
+      # Any workflow or action manifest: a call site that omits the cache credentials is a
+      # change there, not in the pre-flight, which cannot tell from inside whether a caller
+      # ever supplied any. Composite actions count -- four of them were forwarding the
+      # endpoint to `setup-sccache` while dropping the credentials their callers passed.
+      - '.github/workflows/*.yml'
+      - '.github/actions/*/action.yml'
   workflow_dispatch:
 
 concurrency:
@@ -57,3 +69,8 @@ jobs:
         # Invoked through `bash` rather than as `./…` so the job does not depend
         # on the script's executable bit surviving a checkout on every platform.
         run: bash scripts/test_sccache_preflight.sh
+
+      # The pre-flight decides correctly and still leaves the cache off when a call site
+      # never supplied credentials for it to sign with; only the call sites show that.
+      - name: Check every compiler-cache call site passes credentials
+        run: python3 scripts/check_sccache_call_sites.py
