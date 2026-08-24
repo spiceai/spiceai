@@ -28,11 +28,17 @@ limitations under the License.
 //!     epsilon — the only places real rounding occurs in this pipeline (FP /
 //!     encoding / decimal-division error here is < 0.001%).
 //!
-//! Cells are compared after casting to `f64`. That is exact for integers and
-//! decimals whose magnitude stays below 2^53 (~9.0e15), which holds for every
-//! CH-benCH aggregate at the scale factors we run (the largest row counts and
-//! money sums are ~1e9–1e13). This bound is documented here so a future,
+//! Two decimal cells are decided on their **mantissas**, rescaled to a common
+//! scale — never on a `f64` cast, which is not a reliable equality test for them
+//! (see `decimal_pair_to_i128`). Everything else is compared after casting to
+//! `f64`: exact for integers whose magnitude stays below 2^53 (~9.0e15), which
+//! holds for every CH-benCH aggregate at the scale factors we run (the largest
+//! row counts are ~1e9–1e13). That bound is documented here so a future,
 //! enormous scale factor doesn't silently lose integer exactness unnoticed.
+//!
+//! The `f64` cast is still taken for every numeric cell, because the reported
+//! `rel %` and `max_rel_delta` are computed from it. Only the decimal pass/fail
+//! decision is made elsewhere.
 
 use arrow::array::{Array, Decimal128Array, Float64Array, RecordBatch};
 use arrow::datatypes::DataType;
@@ -486,8 +492,12 @@ mod tests {
         // the mantissa and the 10^20 divisor stop being exactly representable, so the
         // quotient is no longer correctly rounded. It reproduces the SF1000 gate's
         // `sum_d_ytd` rejection to the digit -- 9290582224.689999 against
-        // 9290582224.69. Lower scales (2 through 18) divide exactly and agree, which
-        // is why this failed intermittently rather than always.
+        // 9290582224.69.
+        //
+        // At scales 2 through 18 the two conversions ROUND TO THE SAME `f64` -- not
+        // because .69 is exactly representable in binary (it is not), but because
+        // both operands of the division are, so each side lands on the same nearest
+        // double. That is why this failed intermittently rather than always.
         let expected = batch_of(
             "sum_d_ytd",
             Arc::new(
@@ -559,6 +569,44 @@ mod tests {
         assert!(
             delta.exceeded,
             "a genuine one-cent difference must still be caught"
+        );
+    }
+
+    /// A difference living ONLY in the wider scale's low digits must still
+    /// diverge, which is what pins the rescale direction.
+    ///
+    /// The equality test above passes under either direction, so on its own it
+    /// would let an implementation that rescaled DOWN to the narrower scale
+    /// through -- and that one truncates the digits a real divergence hides in,
+    /// silently answering "equal". Here 50000.00 against 50000.0001 differs
+    /// nowhere else: rescaled up to scale 4 the mantissas are 500000000 against
+    /// 500000001 and it is caught, rescaled down to scale 2 both become 5000000
+    /// and it is missed.
+    #[test]
+    fn a_low_digit_difference_at_a_wider_scale_still_diverges() {
+        let expected = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                Decimal128Array::from(vec![5_000_000_i128])
+                    .with_precision_and_scale(38, 2)
+                    .expect("scale 2"),
+            ),
+        );
+        let actual = batch_of(
+            "sum_w_ytd",
+            Arc::new(
+                // 50000.0001 -- equal to the expected value in every digit the
+                // narrower scale can represent.
+                Decimal128Array::from(vec![500_000_001_i128])
+                    .with_precision_and_scale(38, 4)
+                    .expect("scale 4"),
+            ),
+        );
+
+        let delta = numeric_delta(&expected, &actual, &float_columns(&actual));
+        assert!(
+            delta.exceeded,
+            "a difference below the narrower scale must not be rounded away"
         );
     }
 
