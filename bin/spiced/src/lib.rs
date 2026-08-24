@@ -97,18 +97,31 @@ use connector_smb as _;
 use connector_snowflake as _;
 #[cfg(feature = "spark")]
 use connector_spark as _;
+
+// Same force-linkage for accelerator engines, which self-register via
+// `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+use podswatcher::PodsWatcher;
 use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
-use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -428,15 +441,15 @@ pub struct Args {
     /// Write the console log to bounded, rotating files in this directory
     /// instead of relying on the supervisor to store it.
     ///
-    /// Set by `spice connect service install` on a supervisor that owns no log
+    /// Set by `spice cloud service install` on a supervisor that owns no log
     /// store of its own — launchd writes whatever a job prints to the files its
     /// definition names and never bounds them, so the runtime bounds its own
     /// output instead. The policy is fixed
-    /// (`runtime_cloud_connect::service_log`) because `spice connect service
+    /// (`runtime_cloud_connect::service_log`) because `spice cloud service
     /// logs` reads these files back against the same constants.
     ///
     /// Hidden: this is the service installer's interface to the runtime, not an
-    /// operator's. `spice connect service logs` is how the files are read.
+    /// operator's. `spice cloud logs` is how the files are read.
     #[arg(long, value_name = "PATH", hide = true)]
     pub service_log_dir: Option<PathBuf>,
 
@@ -478,7 +491,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 }
 
 /// Spawn a tokio task that listens for `SIGHUP` and asks the
-/// process-wide [`runtime::tls::TlsControl`] to reload every TLS
+/// process-wide [`runtime_tls::TlsControl`] to reload every TLS
 /// material the runtime is watching. Mirrors the `nginx -s reload` /
 /// `kill -HUP <pid>` convention.
 ///
@@ -491,7 +504,7 @@ impl std::fmt::Debug for EnrollmentKeyArg {
 ///
 /// On Windows or other targets without SIGHUP semantics this is a
 /// no-op: rotation still works via the polling filesystem watcher.
-fn spawn_sighup_reload_task(control: std::sync::Arc<runtime::tls::TlsControl>) {
+fn spawn_sighup_reload_task(control: std::sync::Arc<runtime_tls::TlsControl>) {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
@@ -727,7 +740,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // callbacks here so we have one watcher, one dispatcher thread, one
     // SIGHUP target. Created lazily on success of `TlsControl::new`; if
     // the watcher fails to spawn we surface the error eagerly.
-    let tls_control = std::sync::Arc::new(runtime::tls::TlsControl::new().map_err(|e| {
+    let tls_control = std::sync::Arc::new(runtime_tls::TlsControl::new().map_err(|e| {
         Error::UnableToInitializeTls {
             source: Box::new(e),
         }
@@ -761,7 +774,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
 
     // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
     let metrics_reader = if is_cluster_mode {
-        Some(runtime::metrics_reader::MetricsReader::new())
+        Some(telemetry::metrics_reader::MetricsReader::new())
     } else {
         None
     };
@@ -777,7 +790,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // already loaded and validated while building the app, and that same
     // decision gates log capture.
     let cloud_connect_metrics = if cloud_connect_configured {
-        Some(runtime::metrics_reader::MetricsReader::new_cumulative())
+        Some(telemetry::metrics_reader::MetricsReader::new_cumulative())
     } else {
         None
     };
@@ -1074,7 +1087,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
+        // Gated like the dependency itself: `accelerator-cayenne` is a
+        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
+        #[cfg(not(windows))]
+        accelerator_cayenne::register_cayenne_telemetry();
     }
 
     // The global meter provider is now final: either `init_metrics` replaced the
@@ -1428,7 +1444,7 @@ impl DeploymentNote {
     /// deployment, and why a deployment to the portal is what makes it stick.
     fn local_awaiting_deployment(path: &Path) -> String {
         format!(
-            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. Copy it to the project's Spicepod in Spice Cloud to avoid being overwritten. See: https://spiceai.org/docs",
+            "The Spicepod at '{}' will be replaced by Spice Cloud on the next deployment. See: https://spiceai.org/docs",
             display_path(path)
         )
     }
@@ -1592,9 +1608,8 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
                 None
             } else if tolerates_missing_spicepod(args, &e, cloud_managed_state) {
                 // A cloud-managed instance that has connected but not yet
-                // received a deployment has no spicepod anywhere: none was
-                // deployed, and `spice connect` writes nothing to the instance
-                // directory. Come up on an empty spicepod so the control plane
+                // received a deployment and has no local spicepod has no
+                // spicepod anywhere. Come up on an empty spicepod so the control plane
                 // can reach it and deploy one, rather than exiting with the
                 // "run spice init" guidance that does not apply here.
                 deployment_note = Some(DeploymentNote::NoSpicepod);
@@ -1649,9 +1664,9 @@ struct MetricsInit<'a> {
     otel_config: Option<&'a app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     /// On-demand reader for cluster metrics collection.
-    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     /// On-demand reader for the metrics pushed over Cloud Connect.
-    cloud_connect_metrics: Option<runtime::metrics_reader::MetricsReader>,
+    cloud_connect_metrics: Option<telemetry::metrics_reader::MetricsReader>,
     /// `runtime.telemetry.properties`, as dimensions on every exported metric.
     resource_attributes: Vec<KeyValue>,
     /// `runtime.telemetry.metric_prefix`, applied as an SDK-level view.
@@ -2219,7 +2234,7 @@ mod tests {
         let message = DeploymentNote::local_awaiting_deployment(Path::new("/tmp/spicepod.yaml"));
         assert!(message.contains("/tmp/spicepod.yaml"));
         assert!(message.contains("will be replaced by Spice Cloud"));
-        assert!(message.contains("Copy it to the project's Spicepod in Spice Cloud"));
+        assert!(!message.contains("Copy it to the project's Spicepod in Spice Cloud"));
         assert!(message.contains("https://spiceai.org/docs"));
         assert!(!message.contains('\n'));
     }

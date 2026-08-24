@@ -16,6 +16,7 @@ use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::GetExt;
 use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue;
 use datafusion_common::Statistics;
 use datafusion_common::config::ConfigField;
 use datafusion_common::config_namespace;
@@ -262,8 +263,17 @@ pub struct WriteShardConfig {
     pub write_concurrency: usize,
     /// Optional key columns to hash-partition rows by (e.g. primary key or
     /// partition value), resolved by name against the write schema. Empty ⇒
-    /// round-robin distribution.
+    /// distribute whole batches instead of splitting them row-wise.
     pub shard_key_columns: Vec<String>,
+    /// Ascending split points that RANGE-partition rows on the single
+    /// `shard_key_columns` entry, giving each output file a disjoint, contiguous
+    /// slice of that key's domain so a predicate on it prunes. `None` ⇒ hash the
+    /// key instead, which spreads every key range across every file.
+    ///
+    /// Supply `write_concurrency - 1` bounds. Ignored unless exactly one shard
+    /// key column is set: ordering a composite key needs a lexicographic
+    /// comparison this does not implement, so a multi-column key hashes.
+    pub range_bounds: Option<Vec<ScalarValue>>,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -520,8 +530,10 @@ impl VortexFormat {
 
     /// Returns a format that fans writes across `config.write_concurrency`
     /// concurrent shard writers (clamped to the session `target_partitions`),
-    /// routing rows hashed by `config.shard_key_columns` (or round-robin when
-    /// empty). Used by the Cayenne accelerator to parallelize the Vortex encode.
+    /// routing rows by `config.shard_key_columns` — range-partitioned when
+    /// `config.range_bounds` supplies split points for a single key column,
+    /// hashed otherwise, and round-robin when no key is set. Used by the Cayenne
+    /// accelerator to parallelize the Vortex encode.
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
@@ -634,6 +646,19 @@ impl VortexFormat {
                 );
                 return ShardSpec::RoundRobin(partitions);
             }
+        }
+        // Range-partition when the caller supplied bounds for a single key
+        // column: same row-wise split as `Hash`, so every encoder is fed from
+        // the first batch, but the shards tile the key domain in order instead
+        // of scattering it, which is what lets a file's zone maps prune.
+        if let (Some(bounds), [expr]) = (write_shard.range_bounds.as_ref(), exprs.as_slice())
+            && !bounds.is_empty()
+        {
+            return ShardSpec::Range {
+                expr: Arc::clone(expr),
+                bounds: bounds.clone(),
+                partitions,
+            };
         }
         ShardSpec::Hash { exprs, partitions }
     }
@@ -1242,9 +1267,18 @@ mod tests {
     }
 
     fn shard_format(write_concurrency: usize, keys: &[&str]) -> VortexFormat {
+        shard_format_with_bounds(write_concurrency, keys, None)
+    }
+
+    fn shard_format_with_bounds(
+        write_concurrency: usize,
+        keys: &[&str],
+        range_bounds: Option<Vec<ScalarValue>>,
+    ) -> VortexFormat {
         VortexFormat::new(VortexSession::default()).with_write_shard(WriteShardConfig {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
+            range_bounds,
         })
     }
 
@@ -1284,6 +1318,49 @@ mod tests {
         assert!(matches!(
             shard_format(4, &[]).build_shard_spec(&schema, 8),
             ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    /// Bounds on a single key column select the range split, which tiles the
+    /// key domain in order instead of scattering it like a hash.
+    #[test]
+    fn build_shard_spec_bounds_select_range() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        let bounds = vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(20))];
+        match shard_format_with_bounds(3, &["k"], Some(bounds)).build_shard_spec(&schema, 8) {
+            ShardSpec::Range {
+                partitions, bounds, ..
+            } => {
+                assert_eq!(partitions, 3);
+                assert_eq!(bounds.len(), 2);
+            }
+            other => panic!("expected Range, got {other:?}"),
+        }
+    }
+
+    /// A composite key hashes: ordering it needs a lexicographic comparison the
+    /// range split does not implement.
+    #[test]
+    fn build_shard_spec_composite_key_with_bounds_still_hashes() {
+        let schema = schema_with(&[
+            ("k", arrow_schema::DataType::Int64),
+            ("j", arrow_schema::DataType::Int64),
+        ]);
+        let bounds = vec![ScalarValue::Int64(Some(10))];
+        assert!(matches!(
+            shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8),
+            ShardSpec::Hash { .. }
+        ));
+    }
+
+    /// Without bounds a keyed write hashes, which is the behavior that predates
+    /// range partitioning.
+    #[test]
+    fn build_shard_spec_key_without_bounds_hashes() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        assert!(matches!(
+            shard_format_with_bounds(4, &["k"], None).build_shard_spec(&schema, 8),
+            ShardSpec::Hash { .. }
         ));
     }
 

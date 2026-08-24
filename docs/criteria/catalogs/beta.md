@@ -17,7 +17,7 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 | MS SQL        | ➖            |                 |
 | MySQL         | ➖            |                 |
 | Oracle        | ➖            |                 |
-| PostgreSQL    | ➖            |                 |
+| PostgreSQL    | ✅            | @bjchambers     |
 | Snowflake     | ➖            |                 |
 | Spice.ai      | ✅            | @peasee         |
 | Unity Catalog | ✅            | @Sevenannn      |

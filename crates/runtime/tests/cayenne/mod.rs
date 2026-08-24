@@ -25,6 +25,7 @@ use crate::{
     RecordBatch, init_tracing,
     utils::{register_test_connectors, test_request_context, wait_until_true},
 };
+use accelerator_cayenne::s3::generate_bucket_name;
 use app::AppBuilder;
 use arrow::array::{Int64Array, StringViewArray};
 use arrow_flight::{FlightClient, FlightDescriptor, encode::FlightDataEncoderBuilder};
@@ -40,7 +41,6 @@ use rand::RngExt as _;
 use runtime::auth::EndpointAuth;
 use runtime::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use runtime::config::Config;
-use runtime::dataaccelerator::cayenne::s3::generate_bucket_name;
 use runtime::dataupdate::{DataUpdate, UpdateType};
 use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_auth::FlightBasicAuth;

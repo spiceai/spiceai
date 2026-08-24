@@ -17,13 +17,11 @@ limitations under the License.
 //! Login command and subcommands for authenticating with various data sources.
 
 mod auth_config;
-pub mod connect_org;
 mod providers;
 pub mod session;
 
 use crate::context::RuntimeContext;
 use crate::error::Result;
-use crate::manifest;
 use clap::{Args, Subcommand};
 use spice_cloud_client::redirect::same_origin_redirect_policy;
 
@@ -32,7 +30,7 @@ pub use auth_config::{
 };
 
 /// Credential storage backend for `spice login`.
-#[derive(Debug, Clone, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LoginOutput {
     /// Write credentials to .env file (default)
     #[default]
@@ -43,21 +41,16 @@ pub enum LoginOutput {
     Keychain,
 }
 
-impl PartialEq for LoginOutput {
-    fn eq(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
-    }
-}
-
 /// Arguments for the login command.
 #[derive(Args, Debug)]
 #[command(
     about = "Authenticate with Spice.ai or configure data-source credentials",
     long_about = r#"Authenticate with Spice.ai or store credentials for a specific data source.
 
-With no subcommand, performs Spice.ai login (browser flow unless `--key` is
-provided). With a provider subcommand, walks through the credentials needed by
-that connector and stores them in the configured backend.
+With no subcommand, chooses browser or access-token login for Spice Cloud
+unless `--key` supplies a Spice.ai data-plane API key. With a provider
+subcommand, walks through the credentials needed by that connector and stores
+them in the configured backend.
 
 OUTPUT BACKENDS (via `--output`)
   env       Append to a local `.env` file (default)
@@ -68,7 +61,7 @@ PROVIDERS
   dremio, s3, postgres, snowflake, databricks, delta-lake, spark, sharepoint, abfs
 
 EXAMPLES
-  spice login                              # Spice.ai browser login
+  spice login                              # Choose browser or access-token login
   spice login --key sk_live_...            # Spice.ai login with an existing API key
   spice login s3                           # Configure S3 credentials
   spice login postgres -o keychain         # Store Postgres creds in the keychain
@@ -85,6 +78,10 @@ pub struct LoginArgs {
     #[arg(long, short = 'o', default_value = "env")]
     pub output: LoginOutput,
 
+    /// Spice Cloud organization to authenticate for.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<LoginCommands>,
 }
@@ -92,6 +89,16 @@ pub struct LoginArgs {
 /// Login subcommands for different providers.
 #[derive(Subcommand, Debug)]
 pub enum LoginCommands {
+    /// Log in to Spice Cloud with a subscription in a browser
+    Subscription(crate::commands::cloud::SubscriptionLoginArgs),
+
+    /// Log in to Spice Cloud with an access token
+    #[command(alias = "pat")]
+    Token(crate::commands::cloud::TokenLoginArgs),
+
+    /// Log in to Spice Cloud with OAuth client credentials
+    Api(crate::commands::cloud::ApiLoginArgs),
+
     /// Login to a Dremio instance
     Dremio(providers::DremioArgs),
 
@@ -127,6 +134,36 @@ pub enum LoginCommands {
 /// Returns an error if authentication fails.
 pub async fn execute(ctx: &RuntimeContext, args: LoginArgs) -> Result<()> {
     match args.command {
+        Some(LoginCommands::Subscription(method)) => {
+            crate::commands::cloud::execute_login(
+                &crate::commands::cloud::LoginArgs {
+                    output: args.output,
+                    method: Some(crate::commands::cloud::LoginMethod::Subscription(method)),
+                },
+                args.org.as_deref(),
+            )
+            .await
+        }
+        Some(LoginCommands::Token(method)) => {
+            crate::commands::cloud::execute_login(
+                &crate::commands::cloud::LoginArgs {
+                    output: args.output,
+                    method: Some(crate::commands::cloud::LoginMethod::Token(method)),
+                },
+                args.org.as_deref(),
+            )
+            .await
+        }
+        Some(LoginCommands::Api(method)) => {
+            crate::commands::cloud::execute_login(
+                &crate::commands::cloud::LoginArgs {
+                    output: args.output,
+                    method: Some(crate::commands::cloud::LoginMethod::Api(method)),
+                },
+                args.org.as_deref(),
+            )
+            .await
+        }
         Some(LoginCommands::Dremio(provider_args)) => {
             providers::login_dremio(ctx, provider_args).await
         }
@@ -150,15 +187,26 @@ pub async fn execute(ctx: &RuntimeContext, args: LoginArgs) -> Result<()> {
             providers::login_sharepoint(ctx, provider_args).await
         }
         Some(LoginCommands::Abfs(provider_args)) => providers::login_abfs(ctx, provider_args).await,
+        None if args.key.is_some() => login_spiceai(ctx, args.key, args.output),
         None => {
-            // Main Spice.ai login with OAuth flow
-            login_spiceai(ctx, args.key, args.output).await
+            crate::commands::cloud::execute_login(
+                &crate::commands::cloud::LoginArgs {
+                    output: args.output,
+                    method: None,
+                },
+                args.org.as_deref(),
+            )
+            .await
         }
     }
 }
 
 /// Save credentials using the specified output backend.
-fn save_credentials(output: &LoginOutput, auth_type: &str, params: &[(&str, &str)]) -> Result<()> {
+pub(crate) fn save_credentials(
+    output: LoginOutput,
+    auth_type: &str,
+    params: &[(&str, &str)],
+) -> Result<()> {
     match output {
         LoginOutput::Env => merge_auth_config(auth_type, params),
         LoginOutput::Json => {
@@ -177,71 +225,21 @@ fn save_credentials(output: &LoginOutput, auth_type: &str, params: &[(&str, &str
     }
 }
 
-/// Login to Spice.ai using OAuth flow or direct API key.
-async fn login_spiceai(
+/// Store the data-plane API key used by `spice --cloud`.
+fn login_spiceai(
     _ctx: &RuntimeContext,
     api_key: Option<String>,
     output: LoginOutput,
 ) -> Result<()> {
     let is_json = output == LoginOutput::Json;
-
-    if let Some(key) = api_key {
-        // Direct API key authentication
-        save_credentials(&output, "SPICEAI", &[("API_KEY", key.as_str())])?;
-        if !is_json {
-            println!("\x1b[32mSuccessfully logged in to Spice.ai with API key\x1b[0m");
-        }
-        return Ok(());
-    }
-
-    // Spice.ai OAuth flow
-    let flow = session::BrowserLogin::new();
-
+    let key = api_key.ok_or_else(|| crate::error::Error::InvalidArgument {
+        message: "The data-plane API key was not provided.".to_string(),
+    })?;
+    save_credentials(output, "SPICEAI", &[("API_KEY", key.as_str())])?;
     if !is_json {
-        flow.announce();
+        println!("\x1b[32mSuccessfully logged in to Spice.ai with API key\x1b[0m");
     }
-    flow.open_browser();
-
-    tracing::info!("Waiting for authentication...");
-
-    let (access_token, auth_context) = match flow.authenticate().await? {
-        session::BrowserLoginOutcome::Declined => return Err(access_denied_error()),
-        session::BrowserLoginOutcome::Granted {
-            access_token,
-            context,
-        } => (access_token, context),
-    };
-
-    if is_json {
-        // In JSON mode, include auth context fields alongside credentials
-        let json = serde_json::json!({
-            "SPICE_SPICEAI_TOKEN": &access_token,
-            "SPICE_SPICEAI_API_KEY": auth_context.app_api_key.as_deref().unwrap_or_default(),
-            "username": &auth_context.username,
-            "org": &auth_context.org_name,
-            "app": auth_context.app_name.as_deref().unwrap_or_default(),
-        });
-        println!("{}", serde_json::to_string(&json).unwrap_or_default());
-        return Ok(());
-    }
-
-    let session = session::establish_session(
-        access_token,
-        auth_context,
-        session::CredentialStore::from_output(&output),
-    )?;
-    session::print_login_success(&session);
-
     Ok(())
-}
-
-/// The user refused the browser authorization. The standalone command reports
-/// it as a failure; an inline login maps the same outcome to a clean
-/// cancellation instead.
-fn access_denied_error() -> crate::error::Error {
-    crate::error::Error::InvalidArgument {
-        message: "Access denied".to_string(),
-    }
 }
 
 /// How long the Spice.ai browser flow waits for the user before giving up.
@@ -320,7 +318,8 @@ fn classify_exchange_status(status: reqwest::StatusCode) -> Option<ExchangeOutco
     if status == reqwest::StatusCode::NOT_FOUND {
         return Some(ExchangeOutcome::Transient(format!(
             "the exchange endpoint has no authorization for this code ({status}); \
-             a SPICE_BASE_URL pointing at the wrong deployment answers the same way"
+             a SPICE_CLOUD_API_URL (or legacy SPICE_BASE_URL) pointing at the wrong deployment \
+             answers the same way"
         )));
     }
 
@@ -476,16 +475,7 @@ fn credentialed_client() -> Result<reqwest::Client> {
 
 /// Get the Spice.ai base URL.
 pub(crate) fn spice_base_url() -> String {
-    if let Ok(url) = std::env::var("SPICE_BASE_URL") {
-        return url;
-    }
-
-    let version = env!("CARGO_PKG_VERSION");
-    if version.ends_with("-dev") {
-        "https://dev.spice.ai".to_string()
-    } else {
-        "https://spice.ai".to_string()
-    }
+    crate::commands::cloud::client::portal_base_url()
 }
 
 /// Generate a random 8-character auth code.
@@ -500,112 +490,6 @@ fn generate_auth_code() -> String {
             CHARSET[idx] as char
         })
         .collect()
-}
-
-/// Read org and app name from spicepod.yaml or spicepod.yml if it exists.
-fn read_spicepod_metadata() -> (Option<String>, Option<String>) {
-    let Some(spicepod_path) = manifest::existing_spicepod_path(std::path::Path::new(".")) else {
-        return (None, None);
-    };
-
-    let Ok(contents) = std::fs::read_to_string(spicepod_path) else {
-        return (None, None);
-    };
-
-    let Ok(yaml) = yaml::from_str::<yaml::Value>(&contents) else {
-        return (None, None);
-    };
-
-    let org_name = yaml
-        .get("metadata")
-        .and_then(|m| m.get("org"))
-        .and_then(|o| o.as_str())
-        .map(String::from);
-
-    let app_name = yaml.get("name").and_then(|n| n.as_str()).map(String::from);
-
-    (org_name, app_name)
-}
-
-/// Auth context from Spice.ai API.
-struct SpiceAuthContext {
-    username: String,
-    email: String,
-    org_name: String,
-    app_name: Option<String>,
-    app_api_key: Option<String>,
-}
-
-/// Redacts the app API key: the context rides inside login outcomes and
-/// sessions whose `Debug` output can reach logs and assertion messages.
-impl std::fmt::Debug for SpiceAuthContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SpiceAuthContext")
-            .field("username", &self.username)
-            .field("email", &self.email)
-            .field("org_name", &self.org_name)
-            .field("app_name", &self.app_name)
-            .field(
-                "app_api_key",
-                &self.app_api_key.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
-/// Get auth context from Spice.ai API.
-async fn get_spice_auth_context(
-    base_url: &str,
-    access_token: &str,
-    org_name: Option<&str>,
-    app_name: Option<&str>,
-) -> Result<SpiceAuthContext> {
-    let mut url = format!("{base_url}/api/spice-cli/auth");
-
-    let mut params = Vec::new();
-    if let Some(org) = org_name {
-        params.push(format!("org_name={}", urlencoding::encode(org)));
-    }
-    if let Some(app) = app_name {
-        params.push(format!("app_name={}", urlencoding::encode(app)));
-    }
-    if !params.is_empty() {
-        url = format!("{url}?{}", params.join("&"));
-    }
-
-    let client = credentialed_client()?;
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .send()
-        .await
-        .map_err(|e| crate::error::Error::InvalidResponse {
-            message: format!("Failed to get auth context: {e}"),
-        })?;
-
-    if !response.status().is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(crate::error::Error::InvalidResponse {
-            message: format!("Auth context request failed: {text}"),
-        });
-    }
-
-    // Parse the response - API returns nested org/app objects
-    let body: serde_json::Value =
-        response
-            .json()
-            .await
-            .map_err(|e| crate::error::Error::InvalidResponse {
-                message: format!("Failed to parse auth context: {e}"),
-            })?;
-
-    Ok(SpiceAuthContext {
-        username: body["username"].as_str().unwrap_or_default().to_string(),
-        email: body["email"].as_str().unwrap_or_default().to_string(),
-        org_name: body["org"]["name"].as_str().unwrap_or_default().to_string(),
-        app_name: body["app"]["name"].as_str().map(String::from),
-        app_api_key: body["app"]["api_key"].as_str().map(String::from),
-    })
 }
 
 #[cfg(test)]
@@ -706,7 +590,7 @@ mod tests {
             panic!("404 should be retriable");
         };
         assert!(
-            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            message.contains("404") && message.contains("SPICE_CLOUD_API_URL"),
             "the reason should name the status and the endpoint, got: {message}"
         );
     }
@@ -826,7 +710,7 @@ mod tests {
             "expected a timeout error, got: {message}"
         );
         assert!(
-            message.contains("404") && message.contains("SPICE_BASE_URL"),
+            message.contains("404") && message.contains("SPICE_CLOUD_API_URL"),
             "the timeout should point at the endpoint, got: {message}"
         );
         assert!(
@@ -868,8 +752,7 @@ mod tests {
         );
     }
 
-    /// A refusal ends the poll as a decided outcome — the standalone command
-    /// turns it into "Access denied", an inline login into a cancellation.
+    /// A refusal ends the poll as a decided outcome.
     #[tokio::test]
     async fn an_access_denied_response_stops_immediately() {
         let template = wiremock::ResponseTemplate::new(200)
@@ -884,12 +767,6 @@ mod tests {
         assert!(
             elapsed < TEST_TIMEOUT_MS,
             "a denial should not wait out the deadline, took {elapsed}ms"
-        );
-        assert!(
-            super::access_denied_error()
-                .to_string()
-                .contains("Access denied"),
-            "the standalone login must still report the denial as 'Access denied'"
         );
     }
 

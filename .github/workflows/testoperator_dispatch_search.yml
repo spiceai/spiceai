@@ -68,6 +68,14 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
+      - name: Validate spicepods - Search - FinanceBench
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/search/financebench/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
       # --max-concurrent caps how many dispatched runs execute at once. Configurations
       # that share an embedding model provider throttle each other when run concurrently
       # (https://github.com/spiceai/spiceai/issues/6653), so this stays bounded rather than

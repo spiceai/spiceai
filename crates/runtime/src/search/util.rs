@@ -106,6 +106,7 @@ mod tests {
                 Some(vec!["search_field".to_string()]),
                 None,
                 &[],
+                false,
             )
             .expect("cannot make full text table"),
         )
