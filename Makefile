@@ -137,8 +137,20 @@ endif
 # Shared so `nextest` and `verify-cli` cannot drift onto different selections:
 # a different selection resolves different features, which would make verify-cli
 # recompile instead of reading the build nextest just did.
+#
+# `runtime-cloud-connect`'s integration tests are selected for the same reason
+# cayenne's are: they stand their whole control plane up in-process — a TLS
+# enroll mock and a tonic gateway on ephemeral ports — so unlike the suites in
+# `integration*.yml` they need no credentials and no external service. They are
+# also the only coverage of the enrollment, reconnect, command-dispatch and
+# heartbeat wire paths; `--lib` cannot reach a running client at all.
+#
+# The credential-free Spice CLI integration binaries exercise the shipped
+# command surface. `cloud_integration` needs live credentials and remains in
+# the nightly gate, so select the other two binaries by name rather than every
+# integration test in the `spice` package.
 NEXTEST_SELECTION := --all --exclude libnfs
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + binary(=metrics)
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -261,6 +273,8 @@ lint-rust:
 	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
 	python3 scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
+	## Its derivation is exercised first: the live-tree scan only covers the paths today's workspace happens to contain, so a derivation that stopped working would pass unnoticed on a clean tree
+	python3 scripts/test_check_rust_gate_paths.py
 	python3 scripts/check_rust_gate_paths.py
 	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
 	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed

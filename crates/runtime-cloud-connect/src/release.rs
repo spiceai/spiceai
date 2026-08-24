@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Host-initiated release: `spice connect remove` telling the cloud that this
+//! Host-initiated release: `spice cloud unlink` telling the cloud that this
 //! instance is gone.
 //!
 //! `POST /v1/cloud-connect/release` sits on the same state-plane surface as
-//! `/enroll` and `/renew`, and is authorized the way `/renew` is: by
-//! proof-of-possession carried in the request body. The request presents the
+//! `/enroll` and `/renew`. A user bearer authorizes the organization-level
+//! mutation, while proof-of-possession in the body proves which enrolled host
+//! is being released. The request presents the
 //! instance's current leaf (`cert_pem`), whose SPIFFE SAN names exactly one
 //! instance, together with a signature made by that leaf's private key
 //! (`pop_sig`) over `spice-cloud-connect/release/v1\n{instance_id}`. A
@@ -38,12 +39,13 @@ limitations under the License.
 //! moment the customer is decommissioning the host, when the stream may already
 //! be down.
 //!
-//! Release is best-effort by design: the caller clears local state either way.
-//! Reachable, the registry row moves to the terminal `removed` status;
-//! unreachable, the row reads `disconnected` until it is deleted in the portal.
+//! A release must be acknowledged before local credential state is removed.
+//! A missing server record is equivalent to success; every other refusal or
+//! transport error leaves local state intact so the operation can be retried.
 
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 
@@ -54,6 +56,7 @@ pub const RELEASE_PATH: &str = "/v1/cloud-connect/release";
 
 /// Domain-separation prefix of the release proof-of-possession payload.
 const POP_DOMAIN: &str = "spice-cloud-connect/release/v1";
+const MAX_RELEASE_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Errors from the host-initiated release call.
 #[derive(Debug, Snafu)]
@@ -90,6 +93,14 @@ pub enum Error {
          it. See: https://spiceai.org/docs"
     ))]
     ProofOfPossession { instance_id: String, reason: String },
+}
+
+impl Error {
+    /// A previously released instance is already in the desired remote state.
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Rejected { status: 404, .. })
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -153,15 +164,15 @@ struct ReleaseResponseWire {
 /// # Errors
 ///
 /// Returns [`Error::Rejected`] when the cloud refuses the release (including
-/// the not-found a cross-org or already-deleted instance gets),
+/// the not-found response a cross-org or already-deleted instance gets),
 /// [`Error::ProofOfPossession`] when the stored private key cannot sign the
-/// request, and the transport variants when the cloud cannot be reached. A
-/// caller performing a `spice connect remove` treats **every** error as
-/// non-fatal: local state is cleared regardless, and the portal-side delete
-/// stays authoritative.
+/// request, and the transport variants when the cloud cannot be reached.
+/// The caller treats `404 Not Found` as success. Every other error is hard and
+/// local identity state must remain available for a safe retry.
 pub async fn release(
     enroll_endpoint: &str,
     identity: &Identity,
+    user_bearer: &str,
     ca_cert_pem: Option<&str>,
 ) -> Result<ReleaseOutcome> {
     let enroll_endpoint = identity
@@ -170,7 +181,7 @@ pub async fn release(
         .unwrap_or(enroll_endpoint);
     let base =
         crate::config::normalize_control_plane_endpoint(enroll_endpoint).context(EndpointSnafu)?;
-    release_to_base(&base, identity, ca_cert_pem).await
+    release_to_base(&base, identity, user_bearer, ca_cert_pem).await
 }
 
 /// Send a release to an already-vetted base URL. Keeping normalization at the
@@ -179,6 +190,7 @@ pub async fn release(
 async fn release_to_base(
     base: &str,
     identity: &Identity,
+    user_bearer: &str,
     ca_cert_pem: Option<&str>,
 ) -> Result<ReleaseOutcome> {
     let url = format!("{base}{RELEASE_PATH}");
@@ -216,7 +228,13 @@ async fn release_to_base(
     }
     let http = builder.build().context(ClientBuildSnafu)?;
 
-    let response = match http.post(&url).json(&request).send().await {
+    let response = match http
+        .post(&url)
+        .bearer_auth(user_bearer)
+        .json(&request)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(source) => {
             if crate::clock_skew::looks_like_certificate_validity_failure(&source) {
@@ -236,31 +254,64 @@ async fn release_to_base(
 
     let status = response.status();
     if !status.is_success() {
-        let message = match response.text().await {
-            Ok(text) => serde_json::from_str::<ErrorBody>(&text)
-                .map_or_else(|_| bounded(&text, 256), |body| body.error),
+        let message = match bounded_response_body(response).await {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                serde_json::from_str::<ErrorBody>(&text)
+                    .map_or_else(|_| bounded(&text, 256), |body| body.error)
+            }
             Err(_) => String::new(),
         };
         return Err(Error::Rejected {
             status: status.as_u16(),
-            message,
+            message: sanitize_terminal_text(&message),
         });
     }
 
     // A control plane that answers 2xx with no body (or an unexpected one) has
     // still accepted the release, so treat an undecodable body as success with
     // nothing extra to report rather than failing a completed operation.
-    let wire = response
-        .json::<ReleaseResponseWire>()
+    let wire = bounded_response_body(response)
         .await
+        .ok()
+        .and_then(|body| serde_json::from_slice::<ReleaseResponseWire>(&body).ok())
         .unwrap_or(ReleaseResponseWire {
             status: String::new(),
             app_name: None,
         });
     Ok(ReleaseOutcome {
-        status: wire.status,
-        app_name: wire.app_name,
+        status: sanitize_terminal_text(&wire.status),
+        app_name: wire.app_name.map(|name| sanitize_terminal_text(&name)),
     })
+}
+
+fn sanitize_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .take(1024)
+        .collect()
+}
+
+async fn bounded_response_body(response: reqwest::Response) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(std::io::Error::other)?;
+        if body.len().saturating_add(chunk.len()) > MAX_RELEASE_RESPONSE_BYTES {
+            return Err(std::io::Error::other(
+                "release response exceeded the 64 KiB limit",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Longest prefix of `s` no longer than `max` bytes on a char boundary.
@@ -322,6 +373,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
             enc_private_key_pem: String::new(),
             enc_public_key_pem: String::new(),
             enc_previous_private_key_pem: String::new(),
@@ -338,7 +390,7 @@ mod tests {
         let mut identity = self_signed_identity();
         identity.control_plane_endpoint = Some("http://control.example".to_string());
 
-        let error = release("https://api.spice.ai", &identity, None)
+        let error = release("https://api.spice.ai", &identity, "user-token", None)
             .await
             .expect_err("plaintext non-loopback control planes must fail closed");
 
@@ -354,7 +406,7 @@ mod tests {
         let mut identity = self_signed_identity();
         identity.identity_cert_pem = "expired leaf forwarded in the request body".to_string();
 
-        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, None).await else {
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, "user-token", None).await else {
             panic!("release against an unsendable endpoint must not succeed");
         };
 
@@ -378,7 +430,8 @@ mod tests {
 
         let identity = self_signed_identity();
 
-        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, Some(&ca_pem)).await else {
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, "user-token", Some(&ca_pem)).await
+        else {
             panic!("release against an unsendable endpoint must not succeed");
         };
 
@@ -395,7 +448,7 @@ mod tests {
         let mut identity = self_signed_identity();
         identity.private_key_pem = String::new();
 
-        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, None).await else {
+        let Err(err) = release(UNSENDABLE_ENDPOINT, &identity, "user-token", None).await else {
             panic!("release with a truncated identity must not succeed");
         };
 
@@ -485,6 +538,7 @@ mod tests {
             org_name: None,
             app_name: None,
             monitor_url: None,
+            new_project_url: None,
         };
         let public_key_pem = key_pair.public_key_pem();
         (identity, public_key_pem)
@@ -497,16 +551,26 @@ mod tests {
     async fn release_posts_the_certificate_and_a_pop_signature_the_cloud_can_verify() {
         use std::sync::Arc;
 
-        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
         use tokio::sync::Mutex;
 
-        type Captured = Arc<Mutex<Vec<serde_json::Value>>>;
+        type Captured = Arc<Mutex<Vec<(Option<String>, serde_json::Value)>>>;
 
         async fn release_handler(
             State(captured): State<Captured>,
+            headers: HeaderMap,
             Json(body): Json<serde_json::Value>,
         ) -> (StatusCode, Json<serde_json::Value>) {
-            captured.lock().await.push(body);
+            let authorization = headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            captured.lock().await.push((authorization, body));
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "status": "removed", "app_name": "edge-fleet" })),
@@ -526,7 +590,7 @@ mod tests {
         });
 
         let (identity, public_key_pem) = test_identity("inst_release_1");
-        let outcome = release_to_base(&format!("http://{addr}"), &identity, None)
+        let outcome = release_to_base(&format!("http://{addr}"), &identity, "user-token", None)
             .await
             .expect("release must succeed against the mock endpoint");
         assert_eq!(outcome.status, "removed");
@@ -534,7 +598,8 @@ mod tests {
 
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 1, "exactly one release request");
-        let body = &requests[0];
+        let (authorization, body) = &requests[0];
+        assert_eq!(authorization.as_deref(), Some("Bearer user-token"));
         assert_eq!(
             body["cert_pem"], identity.identity_cert_pem,
             "the request must present the instance's own leaf"

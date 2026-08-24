@@ -8,10 +8,13 @@ tests:
       runner_type: spiceai-dev-runners
       benchmark_dataset: touche2020_retrieval
       ready_wait: 1800
-    - spicepod_path: test/spicepods/search/mteb/touche2020/hf[all-minilm-l6-v2]-arrow.yaml
-      runner_type: spiceai-dev-runners
-      benchmark_dataset: touche2020_retrieval
-      ready_wait: 1800
+    # Disabled: CPU-bound all-MiniLM-L6-v2 embedding of the 382,545-doc corpus averages
+    # ~14 rows/s, so a full load takes ~7.5 hours — far beyond any reasonable ready_wait.
+    # Re-enable once embedding throughput improves or this uses a smaller corpus subset.
+    # - spicepod_path: test/spicepods/search/mteb/touche2020/hf[all-minilm-l6-v2]-arrow.yaml
+    #   runner_type: spiceai-dev-runners
+    #   benchmark_dataset: touche2020_retrieval
+    #   ready_wait: 1800
     - spicepod_path: test/spicepods/search/mteb/touche2020/hybrid[model2vec[potion-multilingual-128M]]-duckdb[file].yaml
       runner_type: spiceai-dev-runners
       benchmark_dataset: touche2020_retrieval

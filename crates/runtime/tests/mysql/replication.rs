@@ -466,31 +466,44 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     );
     drop(stream);
 
-    // `restart`: the stale position is dropped and a fresh snapshot runs.
+    // `restart`: the stale position is dropped and the acceleration is rebuilt.
+    //
+    // A position was persisted, so the acceleration this member is attached to
+    // already holds rows. It must NOT be emptied and refilled through the change
+    // stream — for the length of the re-read every query would be answered from
+    // an empty, then partially filled, table. The member hands the replacement to
+    // the consumer instead, which performs it as one atomic overwrite.
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
     store.save(&stale).await.expect("save stale position");
     let mut input = stream_input(port, 200_202, Arc::clone(&store) as Arc<dyn PositionStore>);
     input.params.invalid_position_behavior = InvalidCheckpointBehavior::Restart;
     let mut stream = start_replication_stream(input);
 
-    let envelope = next_envelope(&mut stream, "restart truncate barrier").await?;
-    assert_eq!(ops_of(&envelope), vec!["t"]);
-    let envelope = next_envelope(&mut stream, "restart snapshot").await?;
-    assert_eq!(ops_of(&envelope), vec!["c", "c"]);
-    // Post-snapshot boundary is a zero-row not-ready marker; it persists the
-    // fresh position. Readiness then follows from the live stream once caught up.
-    let envelope = next_envelope(&mut stream, "restart boundary").await?;
+    let envelope = next_envelope(&mut stream, "restart rebuild signal").await?;
+    assert!(
+        envelope.history_unavailable(),
+        "the purged position must ask the consumer to rebuild from the source"
+    );
+    // Zero rows: no truncate to empty the table, and no snapshot rows to apply
+    // on top of a table the consumer is about to replace wholesale.
     assert_eq!(num_rows(&envelope), 0);
     assert!(
-        !envelope.is_dataset_ready(),
-        "restart boundary must not signal ready; readiness is lag-based"
+        ops_of(&envelope).is_empty(),
+        "the rebuild signal carries no change rows, least of all a truncate"
     );
+    assert!(
+        !envelope.is_dataset_ready(),
+        "rebuild signal must not signal ready; readiness is lag-based"
+    );
+    // It carries the boundary committer, so committing it persists the fresh
+    // position — a no-op committer would be stripped by the consumer's heartbeat
+    // filter and leave the next start rebuilding all over again.
     envelope.commit().await?;
     let repersisted = store
         .load()
         .await
         .expect("store readable")
-        .expect("rebootstrap persists a fresh position")
+        .expect("rebuild persists a fresh position")
         .position;
     assert_ne!(repersisted.file, "binlog.999999");
 

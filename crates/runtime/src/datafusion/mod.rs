@@ -32,9 +32,7 @@ use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, Refres
 use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::swappable::SwappableTableProvider;
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
@@ -59,7 +57,12 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -136,12 +139,10 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-// `dialect`, `error` and `refresh_sql` below are named throughout the runtime
-// through these aliases, but they belong to `runtime-datafusion`. Crate-visible
-// so a crate outside the runtime has to depend on `runtime-datafusion` directly
-// rather than route through here.
-#[cfg(any(feature = "duckdb", test))]
-pub(crate) use runtime_datafusion::dialect;
+// `error` and `refresh_sql` below are named throughout the runtime through these
+// aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
+// the runtime has to depend on `runtime-datafusion` directly rather than route
+// through here.
 pub(crate) use runtime_datafusion::error;
 pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
@@ -160,7 +161,6 @@ pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
-pub(crate) mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
@@ -1129,7 +1129,10 @@ impl DataFusion {
         // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
         // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
         // another catalog.
-        sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
+        runtime_execution_plans::sync_table::resolve_table_sync(
+            schema_provider.as_ref(),
+            table_reference.table(),
+        )
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -1828,7 +1831,7 @@ impl DataFusion {
                         total_memory,
                         pool_used,
                         compaction_used,
-                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                        runtime_acceleration::memory_budget::duckdb_total_reservation_bytes(),
                     )
                     .min(ceiling);
                     cayenne::update_global_mem_tier_total(dynamic);
@@ -2797,10 +2800,11 @@ impl DataFusion {
             // Caching mode datasets are always ready immediately
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        } else if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+        } else if let Ok(checkpoint) = dataset_checkpointer(
             dataset,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            acceleration_settings.snapshot_behavior.clone(),
         )
         .await
             && checkpoint.exists().await
@@ -3088,17 +3092,13 @@ impl DataFusion {
         }
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(
+            dataset_checkpointer(
                 dataset,
                 self.accelerator_engine_registry(),
                 OpenOption::CreateIfNotExists,
+                acceleration_settings.snapshot_behavior.clone(),
             )
             .await
-            .map(|checkpoint| {
-                checkpoint
-                    .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
-                    .to_arc()
-            })
             .ok(),
         );
 
@@ -3218,7 +3218,7 @@ impl DataFusion {
             && (acceleration_settings
                 .params
                 .get("cayenne_file_path")
-                .is_some_and(|path| crate::dataaccelerator::cayenne::s3::is_s3_express_path(path))
+                .is_some_and(|path| runtime_object_store::is_s3_express_path(path))
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
@@ -3306,10 +3306,11 @@ impl DataFusion {
             return Ok(None);
         }
 
-        let Ok(cp) = DatasetCheckpoint::try_new(
+        let Ok(cp) = dataset_checkpointer(
             dataset,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
         )
         .await
         else {
@@ -3436,7 +3437,7 @@ impl DataFusion {
                             .evolve_accelerated_table_schema(
                                 dataset,
                                 acceleration_settings,
-                                &cp,
+                                cp.as_ref(),
                                 &plan,
                             )
                             .await
@@ -3582,13 +3583,14 @@ impl DataFusion {
                     Some(accel) => accel.snapshot_engine_for_source(dataset).await,
                     None => None,
                 };
-                dataaccelerator::snapshots::snapshot_before_recreate(
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    dataset,
+                    &dataset_name,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
                     snapshot_engine_override,
+                    resolved_refresh_mode(dataset, acceleration_settings),
                 )
                 .await;
             }
@@ -3637,7 +3639,7 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         acceleration_settings: &Acceleration,
-        checkpoint: &DatasetCheckpoint,
+        checkpoint: &dyn DatasetCheckpointer,
         plan: &WideningPlan,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(accelerator) = self
@@ -3785,10 +3787,11 @@ impl DataFusion {
                     return Ok(None);
                 }
 
-                let Ok(cp) = DatasetCheckpoint::try_new(
+                let Ok(cp) = dataset_checkpointer(
                     dataset.as_ref(),
                     self.accelerator_engine_registry(),
                     OpenOption::OpenExisting,
+                    SnapshotBehavior::Disabled,
                 )
                 .await
                 else {
@@ -3804,7 +3807,7 @@ impl DataFusion {
                 };
 
                 if let Err(e) = self
-                    .evolve_accelerated_table_schema(dataset, acceleration, &cp, &plan)
+                    .evolve_accelerated_table_schema(dataset, acceleration, cp.as_ref(), &plan)
                     .await
                 {
                     SCHEMA_EVOLUTION_FAILED.add(
@@ -4502,10 +4505,11 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+        if let Ok(checkpoint) = dataset_checkpointer(
             view,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
         )
         .await
             && checkpoint.exists().await
@@ -4539,17 +4543,13 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(
+            dataset_checkpointer(
                 view,
                 self.accelerator_engine_registry(),
                 OpenOption::CreateIfNotExists,
+                acceleration.snapshot_behavior.clone(),
             )
             .await
-            .map(|checkpoint| {
-                checkpoint
-                    .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
-                    .to_arc()
-            })
             .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
@@ -5245,6 +5245,20 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // A partitioned Cayenne dataset must not publish snapshots: its exported
+    // metastore slice omits the partition child tables, so the uploaded archive
+    // could not be restored, yet `create_snapshot` would still make it the
+    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.engine == Engine::Cayenne
+        && !acceleration_settings.partition_by.is_empty()
+    {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -5462,17 +5476,16 @@ async fn build_snapshot_refresh_state(
             let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
             let registry = Arc::clone(&registry_for_checkpointer);
             async move {
-                use crate::dataaccelerator::spice_sys::OpenOption;
-                use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+                use runtime_acceleration::sidecar::OpenOption;
                 use snafu::ResultExt;
-                DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
-                    .await
-                    .boxed()
-                    .map(|checkpoint| {
-                        checkpoint
-                            .with_snapshot_behavior(snapshot_behavior)
-                            .to_arc()
-                    })
+                crate::dataaccelerator::spice_sys::dataset_checkpointer(
+                    source.as_ref(),
+                    registry,
+                    OpenOption::OpenExisting,
+                    snapshot_behavior,
+                )
+                .await
+                .boxed()
             }
         });
     let manager = manager

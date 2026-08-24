@@ -36,6 +36,8 @@ on:
           - 'scifact_retrieval'
           - 'nfcorpus_retrieval'
           - 'touche2020_retrieval'
+          - 'msmarco_retrieval'
+          - 'stackoverflow_qa_retrieval'
       ready_wait:
         description: 'Seconds to wait for the spiced instance to become ready'
         required: false
@@ -104,6 +106,9 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}

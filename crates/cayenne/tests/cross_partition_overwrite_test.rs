@@ -13,7 +13,7 @@ You may obtain a copy of the License at
 //! transaction.
 //!
 //! These tests validate the building-block contract that
-//! `CayennePartitionedInsertStrategy` (in `runtime/dataaccelerator/cayenne`)
+//! `CayennePartitionedInsertStrategy` (in `accelerator-cayenne`)
 //! relies on:
 //!
 //! - `begin_overwrite` on each partition's `CayenneTableProvider` writes

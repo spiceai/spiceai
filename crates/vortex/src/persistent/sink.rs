@@ -7,8 +7,13 @@ use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue;
+use datafusion_common::arrow::array::Array;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::arrow::array::RecordBatchOptions;
+use datafusion_common::arrow::array::UInt32Array;
+use datafusion_common::arrow::compute::kernels::cmp::gt;
+use datafusion_common::arrow::compute::take;
 use datafusion_common::exec_datafusion_err;
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::ListingTableUrl;
@@ -45,6 +50,10 @@ use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
 
+use crate::persistent::cache::CachedVortexMetadata;
+use crate::persistent::cache::cache_footer;
+use crate::persistent::cache::synthetic_object_meta;
+
 /// How [`VortexSink`] fans a single input stream into N concurrent file writers.
 ///
 /// `Single` reproduces the historical one-writer-per-statement behavior. The
@@ -58,6 +67,26 @@ pub(super) enum ShardSpec {
     Single,
     /// `n` writers, batches distributed round-robin (parallel encode, no clustering).
     RoundRobin(usize),
+    /// `n` writers, rows RANGE-partitioned by `expr` on `bounds` (parallel
+    /// encode + range-clustered files).
+    ///
+    /// `bounds` holds the `n - 1` ascending split points: a row goes to shard
+    /// `i` when its key is greater than exactly `i` of them. Each output file
+    /// therefore covers a disjoint, contiguous slice of the key domain, so its
+    /// min/max zone maps stay narrow and a predicate on that key prunes — where
+    /// `Hash` and `RoundRobin` both scatter, giving every file a range that
+    /// spans the whole write.
+    ///
+    /// Like `Hash`, this splits every batch row-wise, so all `n` encoders are
+    /// fed from the first batch onward. That is the property that makes it
+    /// usable: routing whole batches to one shard at a time would idle the other
+    /// encoders, because the sink's shard and file channels are depth-1 and the
+    /// demux cannot run ahead of the encoder it is currently feeding.
+    Range {
+        expr: PhysicalExprRef,
+        bounds: Vec<ScalarValue>,
+        partitions: usize,
+    },
     /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
     Hash {
         exprs: Vec<PhysicalExprRef>,
@@ -72,24 +101,153 @@ impl ShardSpec {
         match self {
             ShardSpec::Single => 1,
             ShardSpec::RoundRobin(n) => *n,
-            ShardSpec::Hash { partitions, .. } => *partitions,
+            ShardSpec::Range { partitions, .. } | ShardSpec::Hash { partitions, .. } => *partitions,
         }
     }
 
-    /// Build a `BatchPartitioner` that routes each input batch to one of
-    /// `num_shards` shards according to this spec. `Single`/`RoundRobin` route
-    /// whole batches; `Hash` splits batches row-wise on the key expressions.
-    fn batch_partitioner(&self, num_shards: usize) -> DFResult<BatchPartitioner> {
+    /// Build the router that assigns each input batch to one of `num_shards`
+    /// shards according to this spec.
+    fn router(&self, num_shards: usize) -> DFResult<ShardRouter> {
         let timer = Time::default();
         match self {
-            ShardSpec::Hash { exprs, .. } => {
-                BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)
-            }
-            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(
+            ShardSpec::Hash { exprs, .. } => Ok(ShardRouter::Partitioned(
+                BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)?,
+            )),
+            ShardSpec::Range { expr, bounds, .. } => Ok(ShardRouter::Range {
+                expr: Arc::clone(expr),
+                // More bounds than the shard count would address a shard that
+                // does not exist; the extras are dropped rather than folded, so
+                // the retained split points stay the ascending prefix.
+                bounds: bounds
+                    .iter()
+                    .take(num_shards.saturating_sub(1))
+                    .cloned()
+                    .collect(),
+            }),
+            ShardSpec::Single | ShardSpec::RoundRobin(_) => Ok(ShardRouter::Partitioned(
                 BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1),
-            ),
+            )),
         }
     }
+}
+
+/// Assigns input batches to shard writers.
+///
+/// Split out from [`ShardSpec`] because the contiguous-run policy is stateful
+/// (it tracks how much has been routed to the current shard) and whole-batch,
+/// which `BatchPartitioner` cannot express — its round-robin advances on every
+/// batch.
+enum ShardRouter {
+    /// Delegate to `DataFusion`'s partitioner: round-robin over whole batches,
+    /// or a row-wise hash split on the key expressions.
+    Partitioned(BatchPartitioner),
+    /// Split each batch row-wise on ascending range bounds.
+    Range {
+        expr: PhysicalExprRef,
+        bounds: Vec<ScalarValue>,
+    },
+}
+
+impl ShardRouter {
+    /// Append this batch's `(shard, batch)` assignments to `routed`.
+    ///
+    /// Collected rather than sent directly because `BatchPartitioner::partition`
+    /// invokes its closure synchronously, so the sends must be awaited after it
+    /// returns.
+    fn route(
+        &mut self,
+        batch: RecordBatch,
+        routed: &mut Vec<(usize, RecordBatch)>,
+    ) -> DFResult<()> {
+        match self {
+            ShardRouter::Partitioned(partitioner) => partitioner.partition(batch, |idx, sub| {
+                routed.push((idx, sub));
+                Ok(())
+            }),
+            ShardRouter::Range { expr, bounds } => range_partition(batch, expr, bounds, routed),
+        }
+    }
+}
+
+/// Split `batch` row-wise onto `bounds.len() + 1` shards, appending each
+/// non-empty shard's rows to `routed`.
+///
+/// A row lands on shard `i` when its key is greater than exactly `i` of the
+/// ascending `bounds`, so shard `i` owns `(bounds[i-1], bounds[i]]` and the
+/// shards tile the key domain in order. NULLs compare false against every bound
+/// and therefore land on shard 0, which keeps them together rather than
+/// scattered — the same place a `NULLS FIRST` ordering would put them.
+///
+/// The bucket index is built with one vectorized comparison per bound rather
+/// than a per-row search, so the cost is `O(bounds * rows)` of SIMD work on a
+/// contiguous array instead of a branch-heavy scan.
+fn range_partition(
+    batch: RecordBatch,
+    expr: &PhysicalExprRef,
+    bounds: &[ScalarValue],
+    routed: &mut Vec<(usize, RecordBatch)>,
+) -> DFResult<()> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return Ok(());
+    }
+    if bounds.is_empty() {
+        routed.push((0, batch));
+        return Ok(());
+    }
+
+    let key = expr.evaluate(&batch)?.into_array(rows)?;
+    let mut bucket = vec![0_u32; rows];
+    for bound in bounds {
+        let scalar = bound.to_scalar()?;
+        let greater = gt(&key, &scalar)?;
+        for (index, slot) in bucket.iter_mut().enumerate() {
+            // `value()` is only defined where the comparison produced a
+            // non-NULL result; a NULL key advances no bucket, so it stays on 0.
+            if greater.is_valid(index) && greater.value(index) {
+                *slot += 1;
+            }
+        }
+    }
+
+    let shards = bounds.len() + 1;
+    let mut per_shard: Vec<Vec<u32>> = vec![Vec::new(); shards];
+    for (index, &shard) in bucket.iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            return Err(exec_datafusion_err!(
+                "Vortex range sharding cannot address a batch of {rows} rows"
+            ));
+        };
+        // `bucket` counts how many bounds the key exceeded, which is at most
+        // `bounds.len()`, so the index is in range by construction.
+        per_shard[shard as usize].push(index);
+    }
+
+    for (shard, indices) in per_shard.into_iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        // The whole batch belongs to one shard — forward it untouched rather
+        // than paying a full `take`, which is the steady state for a stream
+        // already clustered on the key.
+        if indices.len() == rows {
+            routed.push((shard, batch));
+            return Ok(());
+        }
+        let indices = UInt32Array::from(indices);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        routed.push((
+            shard,
+            RecordBatch::try_new(batch.schema(), columns).map_err(|e| {
+                exec_datafusion_err!("Vortex range sharding failed to build a shard batch: {e}")
+            })?,
+        ));
+    }
+    Ok(())
 }
 
 struct WriteOutputOptions<'a> {
@@ -308,6 +466,9 @@ impl DataSink for VortexSink {
         // parallelizes Vortex encode across shards (the framework demuxer does
         // not).
         if !self.config.table_partition_cols.is_empty() {
+            // No write-time footer caching on this path: partitioned tables are
+            // listed with real store mtimes, so an epoch-stamped entry (see
+            // `synthetic_object_meta`) could never validate.
             return FileSink::write_all(self, data, context).await;
         }
 
@@ -343,6 +504,10 @@ impl DataSink for VortexSink {
         .await?;
 
         let mut row_count = 0_u64;
+        let file_metadata_cache = context
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
         for (path, summary) in summaries {
             row_count = row_count.checked_add(summary.row_count()).ok_or_else(|| {
                 exec_datafusion_err!(
@@ -351,6 +516,17 @@ impl DataSink for VortexSink {
                     summary.row_count()
                 )
             })?;
+            // Cache the just-written footer so the first post-write scan skips
+            // the cold footer read. Only readers that list from recorded
+            // metadata can hit this entry (see `synthetic_object_meta`);
+            // listings carrying real store mtimes miss and read the footer as
+            // before.
+            cache_footer(
+                &file_metadata_cache,
+                synthetic_object_meta(path.clone(), summary.size()),
+                Arc::new(CachedVortexMetadata::from_footer(summary.footer().clone())),
+                "write",
+            );
             tracing::debug!(path = %path, "Successfully written file");
         }
 
@@ -418,8 +594,8 @@ async fn write_record_batch_stream_to_files(
         )));
     }
 
-    let mut partitioner = (num_shards > 1)
-        .then(|| output_options.shard_spec.batch_partitioner(num_shards))
+    let mut router = (num_shards > 1)
+        .then(|| output_options.shard_spec.router(num_shards))
         .transpose()?;
 
     // A failed send means a shard writer already dropped its receiver — i.e. it
@@ -440,22 +616,17 @@ async fn write_record_batch_stream_to_files(
                 remove_partition_columns(&batch, output_options.partition_column_names)?
             };
 
-            match partitioner.as_mut() {
+            match router.as_mut() {
                 None => {
                     if senders[0].send(batch).await.is_err() {
                         shard_closed_early = true;
                         break;
                     }
                 }
-                Some(partitioner) => {
-                    // `partition` invokes the closure synchronously, so collect
-                    // the (shard, sub-batch) pairs and await the sends afterward.
-                    let mut routed: Vec<(usize, RecordBatch)> = Vec::new();
-                    partitioner.partition(batch, |idx, sub| {
-                        routed.push((idx, sub));
-                        Ok(())
-                    })?;
-                    for (idx, sub) in routed {
+                Some(router) => {
+                    let mut assignments: Vec<(usize, RecordBatch)> = Vec::new();
+                    router.route(batch, &mut assignments)?;
+                    for (idx, sub) in assignments {
                         if senders[idx].send(sub).await.is_err() {
                             shard_closed_early = true;
                             break;
@@ -890,6 +1061,7 @@ mod tests {
     use crate::persistent::sink::ShardSpec;
     use crate::persistent::sink::WriteOutputOptions;
     use crate::persistent::sink::finish_file_writer;
+    use crate::persistent::sink::range_partition;
     use crate::persistent::sink::write_record_batch_stream_to_files;
 
     fn split_path(
@@ -943,6 +1115,58 @@ mod tests {
             &batches
         );
 
+        Ok(())
+    }
+
+    /// Write-time footer-cache population: `write_all` caches each written
+    /// file's footer, so the first post-write scan (e.g. right after an
+    /// acceleration refresh) skips the cold footer read.
+    #[tokio::test]
+    async fn test_write_all_populates_file_metadata_cache() -> anyhow::Result<()> {
+        use crate::persistent::cache::CachedVortexMetadata;
+
+        let ctx = TestSessionContext::default();
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE my_tbl \
+                    (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'table/';",
+            )
+            .await?;
+
+        let cache = ctx
+            .session
+            .runtime_env()
+            .cache_manager
+            .get_file_metadata_cache();
+
+        ctx.session
+            .sql("INSERT INTO my_tbl VALUES ('hello', 1), ('world', 2);")
+            .await?
+            .collect()
+            .await?;
+
+        let entries = cache.list_entries();
+        assert!(
+            !entries.is_empty(),
+            "write_all must cache the written files' footers"
+        );
+        for path in entries.keys() {
+            let entry = cache.get(path).expect("entry for listed path");
+            // The cached footer is complete: usable without reading the file back.
+            let footer = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedVortexMetadata>()
+                .expect("cached entry holds Vortex footer metadata")
+                .footer();
+            assert_eq!(footer.row_count(), 2);
+            // The validation meta carries the epoch mtime `synthetic_object_meta`
+            // stamps, so recorded-metadata listings can match it.
+            assert!(entry.meta.size > 0);
+            assert_eq!(entry.meta.last_modified.timestamp(), 0);
+        }
         Ok(())
     }
 
@@ -2368,6 +2592,149 @@ mod tests {
     fn one_col_batch(schema: &SchemaRef, values: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
             .expect("single-column i64 batch")
+    }
+
+    /// Range partitioning must split EVERY batch across the shards it spans.
+    ///
+    /// This is the property that makes it usable where contiguous whole-batch
+    /// runs are not: the sink's shard and file channels are depth-1, so a router
+    /// that sent each batch to a single shard would leave the other encoders
+    /// idle until the current one drained. Splitting row-wise feeds all of them
+    /// from the first batch.
+    #[test]
+    fn range_partition_splits_one_batch_across_every_shard() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let batch = one_col_batch(&schema, (0..100_i64).collect());
+        let expr: PhysicalExprRef = Arc::new(Column::new("a", 0));
+
+        let mut assignments = Vec::new();
+        range_partition(
+            batch,
+            &expr,
+            &[
+                ScalarValue::Int64(Some(25)),
+                ScalarValue::Int64(Some(50)),
+                ScalarValue::Int64(Some(75)),
+            ],
+            &mut assignments,
+        )?;
+
+        assert_eq!(
+            assignments.len(),
+            4,
+            "one batch spanning the domain must reach all four encoders"
+        );
+        let total: usize = assignments.iter().map(|(_, b)| b.num_rows()).sum();
+        assert_eq!(total, 100, "no row may be dropped or duplicated");
+
+        // Each shard owns a disjoint, ascending slice — that is what keeps a
+        // file's zone maps narrow enough to prune.
+        let mut ranges: Vec<(usize, i64, i64)> = assignments
+            .iter()
+            .map(|(shard, b)| {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("i64 column");
+                let values: Vec<i64> = col.iter().flatten().collect();
+                (
+                    *shard,
+                    *values.iter().min().expect("non-empty"),
+                    *values.iter().max().expect("non-empty"),
+                )
+            })
+            .collect();
+        ranges.sort_by_key(|(shard, _, _)| *shard);
+        assert_eq!(
+            ranges,
+            vec![(0, 0, 25), (1, 26, 50), (2, 51, 75), (3, 76, 99)],
+            "shards must tile the key domain in ascending, disjoint slices"
+        );
+        Ok(())
+    }
+
+    /// A batch entirely inside one shard's slice is forwarded whole, and NULL
+    /// keys collect on shard 0 rather than scattering.
+    #[test]
+    fn range_partition_handles_single_shard_batches_and_nulls() -> anyhow::Result<()> {
+        let schema = one_col_schema();
+        let expr: PhysicalExprRef = Arc::new(Column::new("a", 0));
+        let bounds = [ScalarValue::Int64(Some(10))];
+
+        let mut assignments = Vec::new();
+        range_partition(
+            one_col_batch(&schema, vec![50, 60, 70]),
+            &expr,
+            &bounds,
+            &mut assignments,
+        )?;
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].0, 1,
+            "all rows above the bound share a shard"
+        );
+        assert_eq!(assignments[0].1.num_rows(), 3);
+
+        let nullable = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let with_nulls = RecordBatch::try_new(
+            Arc::clone(&nullable),
+            vec![Arc::new(Int64Array::from(vec![None, Some(99_i64), None]))],
+        )?;
+        let mut assignments = Vec::new();
+        range_partition(with_nulls, &expr, &bounds, &mut assignments)?;
+        let null_shard = assignments
+            .iter()
+            .find(|(_, b)| b.num_rows() == 2)
+            .expect("the two NULL rows land together");
+        assert_eq!(null_shard.0, 0, "NULL keys collect on shard 0");
+        Ok(())
+    }
+
+    /// Routing changed, so pin the invariant that matters most: every input row
+    /// reaches exactly one shard.
+    #[tokio::test]
+    async fn test_range_sharding_preserves_every_row() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        let batches: Vec<RecordBatch> = (0i64..12)
+            .map(|i| one_col_batch(&schema, (i * 16..(i + 1) * 16).collect()))
+            .collect();
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                bounds: vec![
+                    ScalarValue::Int64(Some(48)),
+                    ScalarValue::Int64(Some(96)),
+                    ScalarValue::Int64(Some(144)),
+                ],
+                partitions: 4,
+            },
+        )
+        .await?;
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 12 * 16, "no row may be dropped or duplicated");
+
+        let segments: HashSet<String> = results
+            .iter()
+            .filter_map(|(p, _)| shard_segment(p))
+            .collect();
+        assert_eq!(
+            segments.len(),
+            4,
+            "a write spanning the bounds must reach all four shards, got files {:?}",
+            results
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     #[tokio::test]

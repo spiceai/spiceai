@@ -144,12 +144,37 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         None
     }
 
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // An Iceberg `CREATE TABLE` declares no `on_schema_change`; the table's schema is
+        // the one the DDL states.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // The point of the table is to be written by DML, so a scan of it must always
+        // read its own writes.
+        true
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// This source is synthesised for an Iceberg `CREATE TABLE` and is not backed by a
+    /// runtime-owned accelerator, so there is no checkpoint to open. Reports that rather
+    /// than handing back a no-op checkpointer, which would read as "checkpoint present
+    /// and empty" to the snapshot bootstrap.
+    fn checkpointer_factory(
+        &self,
+        _snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        runtime_acceleration::dataset_checkpoint::make_checkpointer_factory(|| async {
+            Err("an Iceberg DDL acceleration source has no accelerator to checkpoint".into())
+        })
     }
 }
 

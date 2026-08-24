@@ -57,7 +57,7 @@ use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use x509_certificate::CapturedX509Certificate;
 
-use crate::tls::{CertWatcher, ReloadScope, reload::record_reload_metric};
+use runtime_tls::{CertWatcher, ReloadScope, reload::record_reload_metric};
 
 /// Set of paths the bundle re-reads on every reload.
 #[derive(Clone, Debug)]
