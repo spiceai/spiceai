@@ -47,6 +47,7 @@ pub(crate) mod write_util;
 /// `compute_index` call. Each batch may issue an embedding request and a remote
 /// bulk upload, so an unbounded fan-out over a large refresh could spawn a huge
 /// number of concurrent embedding/HTTP calls.
+#[cfg(any(feature = "elasticsearch", feature = "s3_vectors"))]
 pub(crate) const MAX_CONCURRENT_INDEX_WRITES: usize = 8;
 
 #[cfg(feature = "llms")]
