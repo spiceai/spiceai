@@ -2031,6 +2031,32 @@ mod tests {
         );
     }
 
+    /// Exposing the managed install through a symlink on `PATH` is a normal
+    /// layout. The two paths differ lexically while naming one file, and
+    /// treating that as shadowing would warn that the install has no effect
+    /// when it is the very file about to run.
+    ///
+    /// Unix only: this needs a symlink, and the fallback the non-Unix path takes
+    /// is the lexical comparison the other case already covers.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_the_managed_install_is_not_shadowing_it() {
+        let temp = TempDir::new().expect("create temp dir");
+        let managed = temp.path().join("managed-spiced");
+        let exposed = temp.path().join("exposed-spiced");
+        write_mock_runtime(&managed);
+        std::os::unix::fs::symlink(&managed, &exposed).expect("link the managed install onto PATH");
+
+        assert!(
+            same_file(&exposed, &managed),
+            "a symlink and its target are one file, so neither shadows the other"
+        );
+        assert!(
+            !same_file(&temp.path().join("other-spiced"), &managed),
+            "two genuinely different paths must still compare as different"
+        );
+    }
+
     /// `spice install` and `spice upgrade` only ever write to the managed
     /// directory, so when something outranks it the warning is the only
     /// explanation a user gets for an install that changes nothing.
