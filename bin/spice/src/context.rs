@@ -1872,6 +1872,9 @@ mod tests {
     /// from announcing its runtime, and announcing on the commonest layout there
     /// is would train everyone to ignore the line that exists to say "this is
     /// not the runtime you installed".
+    // POSIX path literals: on Windows these are rooted but not absolute, so
+    // anchoring rewrites them and the equality below would not hold.
+    #[cfg(unix)]
     #[test]
     fn the_sibling_that_is_the_managed_install_is_reported_as_managed() {
         let managed = "/home/me/.spice/bin/spiced";
@@ -1900,6 +1903,9 @@ mod tests {
 
     /// A sibling that is *not* the managed install stays `Sibling` — that is the
     /// case the rung was added for, and the one worth announcing.
+    // POSIX path literals: on Windows these are rooted but not absolute, so
+    // anchoring rewrites them and the equality below would not hold.
+    #[cfg(unix)]
     #[test]
     fn a_sibling_outside_the_managed_dir_is_still_reported_as_a_sibling() {
         let sibling = "/usr/local/bin/spiced";
@@ -1960,9 +1966,15 @@ mod tests {
         let must_not_be_called = |_: &Path| {
             panic!("an absolute candidate must not be resolved against the working directory")
         };
-        let anchored = anchor_with(PathBuf::from("/opt/spice/bin/spiced"), must_not_be_called)
+        // Derived rather than written out: a POSIX-looking literal is rooted but
+        // not absolute on Windows, which has no drive prefix on it, so the
+        // short-circuit under test would not even be reached there.
+        let absolute = std::env::current_dir()
+            .expect("the test process has a working directory")
+            .join("spiced");
+        let anchored = anchor_with(absolute.clone(), must_not_be_called)
             .expect("an absolute path anchors to itself");
-        assert_eq!(anchored, PathBuf::from("/opt/spice/bin/spiced"));
+        assert_eq!(anchored, absolute);
     }
 
     /// A file without an execute bit is a half-written download, not a runtime.

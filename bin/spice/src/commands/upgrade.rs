@@ -110,6 +110,11 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         tracing::info!(
             "Already using version {target_version}. CLI and runtime upgrade not required."
         );
+        // The earliest of the no-op returns, and the one a user is most likely
+        // to hit while asking why an upgrade changed nothing. Being shadowed is
+        // the answer they need, and "already using version X" on its own reads
+        // as confirmation that the managed runtime is the one in use.
+        crate::context::warn_if_install_is_shadowed(ctx);
         return Ok(());
     }
 
