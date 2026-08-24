@@ -114,7 +114,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
         // to hit while asking why an upgrade changed nothing. Being shadowed is
         // the answer they need, and "already using version X" on its own reads
         // as confirmation that the managed runtime is the one in use.
-        crate::context::warn_if_install_is_shadowed(ctx);
+        crate::context::warn_if_install_will_not_run(ctx);
         return Ok(());
     }
 
@@ -186,7 +186,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
     // depend on whether this run had anything to download, and the no-op run is
     // where the warning matters most — a user checking why their upgrade made no
     // difference is told the version is current and nothing else.
-    crate::context::warn_if_install_is_shadowed(ctx);
+    crate::context::warn_if_install_will_not_run(ctx);
 
     Ok(())
 }

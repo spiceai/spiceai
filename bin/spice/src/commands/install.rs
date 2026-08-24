@@ -111,7 +111,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         // is not the one running, so it is the path where being shadowed most
         // needs saying — and "already installed" on its own reads as agreement
         // that the install is the one in use.
-        crate::context::warn_if_install_is_shadowed(ctx);
+        crate::context::warn_if_install_will_not_run(ctx);
         return Ok(());
     }
 
@@ -147,7 +147,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
         "Spice.ai runtime {} installed successfully",
         release.tag_name
     );
-    crate::context::warn_if_install_is_shadowed(ctx);
+    crate::context::warn_if_install_will_not_run(ctx);
 
     // Write version file for caching
     let version_file = ctx.spice_runtime_dir().join("runtime_version.txt");

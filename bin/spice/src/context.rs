@@ -511,7 +511,8 @@ impl RuntimeContext {
     /// 1. `$SPICED_PATH` — an explicit pin, honored ahead of everything.
     /// 2. `spiced` beside the running `spice`, via `current_exe()` — the
     ///    binary the user actually invoked, and its build partner.
-    /// 3. `spiced` on `PATH` — skipped entirely while elevated.
+    /// 3. `spiced` on `PATH` — skipped while root is acting for another user
+    ///    (a plain root login is not: it is reading its own `PATH`).
     /// 4. `$HOME/.spice/bin/spiced` — the managed install, and a genuine root
     ///    login's own install.
     /// 5. `~<$SUDO_USER>/.spice/bin/spiced` — what the operator installed
@@ -522,16 +523,24 @@ impl RuntimeContext {
     /// in the invoker's own home has been executed as root since that rung was
     /// added.
     ///
-    /// Rung 3 is the exception, and it closes while elevated. `PATH` is the
-    /// caller's own configuration, which is a bound only while the caller and
-    /// the process are the same identity; under `sudo` it is the invoking
-    /// user's `PATH` steering a root process, and `spice run` and
-    /// `spice version` execute what resolves here without dropping privileges.
-    /// Nothing about `sudo` prevents that on its own: `secure_path` is set by
-    /// stock `sudoers` on most Linux distributions but not on macOS, and `PATH`
-    /// is searched in order, so the directory supplying `spiced` need not be the
-    /// one that supplied `spice`. That is the rule [`GETENT_PATHS`] already
-    /// states for a much smaller binary, so the rung is skipped outright when
+    /// Rung 3 is the exception, and it closes while elevated. The line the other
+    /// rungs stay on is that the invoker performed a deliberate act naming the
+    /// binary: rung 1 is an explicit pin, and `sudo` strips `SPICED_PATH` under
+    /// the default `env_reset`, so reaching it under elevation takes `sudo -E`,
+    /// a `sudoers` entry, or `sudo SPICED_PATH=… spice`; rung 2 is not
+    /// environment at all but the directory of the binary root is already
+    /// executing, so a writable one means the compromise preceded resolution.
+    /// `PATH` is the one rung `sudo` carries through with no act by anyone, and
+    /// `spice run` and `spice version` execute what resolves here without
+    /// dropping privileges or clearing the environment. Nothing about `sudo`
+    /// prevents that: `secure_path` is stock `sudoers` on most Linux
+    /// distributions but not on macOS, and `PATH` is searched in order, so the
+    /// directory supplying `spiced` need not be the one that supplied `spice`.
+    ///
+    /// [`GETENT_PATHS`] states the same rule for a much smaller binary, and
+    /// states it as an allowlist because `getent` lives in one of two places. A
+    /// runtime legitimately lives anywhere, so an allowlist would strand
+    /// ordinary users; the rung is skipped only while
     /// [`running_as_root_for_another_user`] holds, and rungs 4 and 5 answer
     /// instead.
     ///
@@ -793,8 +802,8 @@ impl RuntimeContext {
     }
 }
 
-/// Warn when the runtime just written to the managed install directory is not
-/// the one [`RuntimeContext::resolve_spiced`] will select.
+/// Warn when the runtime in the managed install directory is not the one
+/// [`RuntimeContext::resolve_spiced`] will start.
 ///
 /// `spice install` and `spice upgrade` only ever write to `$HOME/.spice/bin`,
 /// but a `spiced` beside the CLI, on `PATH`, or pinned outranks it — so an
@@ -803,27 +812,25 @@ impl RuntimeContext {
 /// take effect: resolution erroring, and the written file failing the runnable
 /// check so that nothing resolves at all. Silence on any of them is the worst
 /// outcome: the user has done the thing that was supposed to fix their problem.
-pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
-    if let Some(warning) = install_shadow_warning(&ctx.spiced_path(), &ctx.resolve_spiced()) {
+pub fn warn_if_install_will_not_run(ctx: &RuntimeContext) {
+    if let Some(warning) = install_will_not_run_warning(&ctx.spiced_path(), &ctx.resolve_spiced()) {
         tracing::warn!("{warning}");
     }
 }
 
-/// The line [`warn_if_install_is_shadowed`] emits, or `None` when the managed
+/// The line [`warn_if_install_will_not_run`] emits, or `None` when the managed
 /// install is the file that will run.
 ///
 /// Separated from the `tracing` call so each arm is assertable: reaching the
-/// failed-resolution arm through [`warn_if_install_is_shadowed`] would mean
+/// failed-resolution arm through [`warn_if_install_will_not_run`] would mean
 /// setting `SPICED_PATH` for the whole test process.
-fn install_shadow_warning(
+fn install_will_not_run_warning(
     installed: &Path,
     resolved: &Result<Option<ResolvedSpiced>>,
 ) -> Option<String> {
     match resolved {
-        // The managed install is itself a rung, so nothing resolving means that
-        // install failed the runnable check — absent, not a file, or without an
-        // execute bit — and no other rung supplies a runtime either. The caller
-        // has already reported success, so this is the only account of it.
+        // Not "all is well": the managed install is itself a rung, so nothing
+        // resolving means that install failed the runnable check.
         Ok(None) => Some(unusable_install_warning(installed)),
         // Compared by path rather than by source: the question here is whether
         // the managed install is the file that will run, which is not the same
@@ -851,7 +858,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// The wording of [`warn_if_install_is_shadowed`].
+/// The wording of [`warn_if_install_will_not_run`].
 ///
 /// A function so the text is asserted rather than eyeballed: it is the only
 /// explanation a user gets for an upgrade that appears to succeed and changes
@@ -869,7 +876,7 @@ fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> Stri
     )
 }
 
-/// The wording of [`warn_if_install_is_shadowed`]'s nothing-resolved arm.
+/// The wording of [`warn_if_install_will_not_run`]'s nothing-resolved arm.
 ///
 /// Reached only when the managed install itself fails the runnable check:
 /// [`resolve_spiced`] answers with that install whenever it is runnable, so a
@@ -886,7 +893,7 @@ fn unusable_install_warning(installed: &Path) -> String {
     )
 }
 
-/// The wording of [`warn_if_install_is_shadowed`]'s failed-resolution arm.
+/// The wording of [`warn_if_install_will_not_run`]'s failed-resolution arm.
 ///
 /// A function for the same reason as [`shadowed_install_warning`]: it is the
 /// only account a user gets of an install that reported success and cannot be
@@ -1022,7 +1029,10 @@ struct SpicedLookup<'a> {
     /// [`is_runnable_binary`].
     is_binary: &'a dyn Fn(&Path) -> bool,
     /// Whether this process is root acting for another user — see
-    /// [`running_as_root_for_another_user`]. Closes the `PATH` rung.
+    /// [`running_as_root_for_another_user`]. Closes the `PATH` rung, and moves
+    /// with [`Self::sudo_invoker_home`]: both are decided by
+    /// [`sudo_invoker_name`], so the rung that closes and the rung that answers
+    /// in its place cannot disagree.
     elevated: bool,
 }
 
@@ -1158,10 +1168,9 @@ fn resolve_spiced(
         }
     }
 
-    // Skipped entirely while elevated: `PATH` then belongs to the invoking user
-    // and the process it would steer is root's. See
-    // [`running_as_root_for_another_user`].
-    if let Some(search_path) = lookup.search_path.as_ref().filter(|_| !lookup.elevated) {
+    if !lookup.elevated
+        && let Some(search_path) = lookup.search_path.as_ref()
+    {
         for dir in std::env::split_paths(search_path) {
             // A relative entry — empty, `.`, `./bin` — resolves against the
             // working directory, and the child is spawned in `--dir` rather
@@ -1215,8 +1224,8 @@ fn resolve_spiced(
 #[cfg(unix)]
 fn running_as_root_for_another_user() -> bool {
     is_elevation(
-        nix::unistd::geteuid().is_root(),
-        std::env::var("SUDO_USER").ok().as_deref(),
+        nix::unistd::Uid::effective().is_root(),
+        sudo_invoker_name().as_deref(),
     )
 }
 
@@ -1224,8 +1233,32 @@ fn running_as_root_for_another_user() -> bool {
 /// arm is assertable: a test cannot change this process's effective uid, and
 /// `SUDO_USER` is shared with every other test in the binary.
 #[cfg(unix)]
-fn is_elevation(euid_is_root: bool, sudo_user: Option<&str>) -> bool {
-    euid_is_root && sudo_user.is_some_and(|user| !user.is_empty() && user != "root")
+fn is_elevation(euid_is_root: bool, sudo_invoker: Option<&str>) -> bool {
+    euid_is_root && sudo_invoker.is_some()
+}
+
+/// The user who invoked `sudo`, or `None` when this process was not invoked
+/// through it.
+///
+/// The one place the invoker's identity is decided, because two rungs move
+/// together on it: rung 3 closes when there *is* an invoker, and rung 5 is what
+/// answers instead. Were they to disagree, an elevated user whose only runtime
+/// sits on `PATH` would be told to install a runtime they already have.
+///
+/// `sudo -u root` sets `SUDO_USER=root`, which is root invoking `sudo` on its
+/// own behalf: the `$HOME` rung has already looked where that would point, and
+/// the `PATH` being read is root's own.
+#[cfg(unix)]
+fn sudo_invoker_name() -> Option<String> {
+    sudo_invoker_in(std::env::var("SUDO_USER").ok())
+}
+
+/// [`sudo_invoker_name`] over the variable rather than the environment, so the
+/// exclusions are assertable — `SUDO_USER` is shared with every other test in
+/// this binary.
+#[cfg(unix)]
+fn sudo_invoker_in(sudo_user: Option<String>) -> Option<String> {
+    sudo_user.filter(|user| !user.is_empty() && user != "root")
 }
 
 /// Windows has no `sudo` to inherit a `PATH` across, so the rung stays open.
@@ -1240,13 +1273,7 @@ fn running_as_root_for_another_user() -> bool {
 /// Only consulted by the last rung of [`RuntimeContext::resolve_spiced`].
 #[cfg(unix)]
 fn sudo_invoker_home() -> Option<PathBuf> {
-    let user = std::env::var("SUDO_USER").ok()?;
-    // `sudo -u root` sets SUDO_USER=root, whose home is the `$HOME` branch we
-    // already tried — nothing new to look at.
-    if user.is_empty() || user == "root" {
-        return None;
-    }
-    passwd_home(&user).map(PathBuf::from)
+    passwd_home(&sudo_invoker_name()?).map(PathBuf::from)
 }
 
 #[cfg(not(unix))]
@@ -1664,6 +1691,7 @@ mod tests {
             None,
             managed.to_str().expect("the test install path is UTF-8"),
             &is_runnable_binary,
+            false,
         ));
         assert_eq!(found.path, managed);
         assert_eq!(found.source, SpicedSource::ManagedInstall);
@@ -1682,9 +1710,14 @@ mod tests {
         present: &[&str],
         managed_install: &str,
     ) -> Result<Option<ResolvedSpiced>> {
-        let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
-        let is_binary = |path: &Path| present.iter().any(|known| known == path);
-        ladder_with(env, current_exe, sudo_home, managed_install, &is_binary)
+        ladder_with(
+            env,
+            current_exe,
+            sudo_home,
+            managed_install,
+            &present_predicate(present),
+            false,
+        )
     }
 
     /// [`ladder`] over a process that is root acting for another user, which is
@@ -1696,41 +1729,27 @@ mod tests {
         present: &[&str],
         managed_install: &str,
     ) -> Result<Option<ResolvedSpiced>> {
-        let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
-        let is_binary = |path: &Path| present.iter().any(|known| known == path);
-        ladder_elevation(
+        ladder_with(
             env,
             current_exe,
             sudo_home,
             managed_install,
-            &is_binary,
+            &present_predicate(present),
             true,
         )
+    }
+
+    /// The invented host's runnable set: these paths name a binary and nothing
+    /// else does.
+    fn present_predicate(present: &[&str]) -> impl Fn(&Path) -> bool + use<> {
+        let present: Vec<PathBuf> = present.iter().map(PathBuf::from).collect();
+        move |path: &Path| present.iter().any(|known| known == path)
     }
 
     /// [`ladder`] with the real filesystem predicate, for the two behaviours
     /// only a real file can express: a directory named `spiced`, and a runtime
     /// with no execute bit.
     fn ladder_with(
-        env: &[(&str, &str)],
-        current_exe: Option<&str>,
-        sudo_home: Option<&str>,
-        managed_install: &str,
-        is_binary: &dyn Fn(&Path) -> bool,
-    ) -> Result<Option<ResolvedSpiced>> {
-        ladder_elevation(
-            env,
-            current_exe,
-            sudo_home,
-            managed_install,
-            is_binary,
-            false,
-        )
-    }
-
-    /// [`ladder_with`] with the elevation flag chosen, for the rung that closes
-    /// under `sudo`.
-    fn ladder_elevation(
         env: &[(&str, &str)],
         current_exe: Option<&str>,
         sudo_home: Option<&str>,
@@ -1967,27 +1986,45 @@ mod tests {
         assert_eq!(found.source, SpicedSource::SudoInvokerInstall);
     }
 
-    /// Both facts are load-bearing, and each is wrong on its own: a root login
-    /// reads its own `PATH` (no `SUDO_USER`), `sudo -u root` is root invoking
-    /// `sudo` for itself, and an unprivileged `sudo -u someone-else` gains no
-    /// root to escalate to.
+    /// Both facts are load-bearing, and each is wrong on its own: a process with
+    /// no invoker reads its own `PATH`, and an unprivileged `sudo -u somebody`
+    /// gains no root to escalate to.
     #[cfg(unix)]
     #[test]
-    fn elevation_is_root_acting_for_a_different_user() {
+    fn elevation_is_root_acting_for_another_user() {
         assert!(is_elevation(true, Some("operator")));
 
-        assert!(!is_elevation(true, None), "a plain root login is not sudo");
         assert!(
-            !is_elevation(true, Some("root")),
-            "`sudo -u root` is root acting for itself"
-        );
-        assert!(
-            !is_elevation(true, Some("")),
-            "an empty SUDO_USER names nobody"
+            !is_elevation(true, None),
+            "root with no invoker is reading its own PATH"
         );
         assert!(
             !is_elevation(false, Some("operator")),
             "without root there is nothing to escalate to"
+        );
+    }
+
+    /// Which `SUDO_USER` values name an invoker at all. Shared with rung 5, so
+    /// these exclusions decide both whether the `PATH` rung closes and whether
+    /// the invoker's own install is there to answer instead.
+    #[cfg(unix)]
+    #[test]
+    fn sudo_user_names_an_invoker_only_when_it_names_somebody_else() {
+        assert_eq!(
+            sudo_invoker_in(Some("operator".to_string())),
+            Some("operator".to_string())
+        );
+
+        assert_eq!(sudo_invoker_in(None), None, "not invoked through sudo");
+        assert_eq!(
+            sudo_invoker_in(Some("root".to_string())),
+            None,
+            "`sudo -u root` is root acting for itself"
+        );
+        assert_eq!(
+            sudo_invoker_in(Some(String::new())),
+            None,
+            "an empty SUDO_USER names nobody"
         );
     }
 
@@ -2101,6 +2138,7 @@ mod tests {
             None,
             "/home/me/.spice/bin/spiced",
             &is_runnable_binary,
+            false,
         )
         .expect("no SPICED_PATH is set")
         .expect("the real binary must still resolve");
@@ -2144,6 +2182,7 @@ mod tests {
             None,
             managed,
             &is_binary,
+            false,
         )
         .expect("the ladder must not error")
         .expect("the managed install resolves");
@@ -2175,6 +2214,7 @@ mod tests {
             None,
             "/home/me/.spice/bin/spiced",
             &is_binary,
+            false,
         )
         .expect("the ladder must not error")
         .expect("the sibling resolves");
@@ -2267,6 +2307,7 @@ mod tests {
             None,
             "/home/me/.spice/bin/spiced",
             &is_runnable_binary,
+            false,
         )
         .expect("no SPICED_PATH is set")
         .expect("the working runtime must still resolve");
@@ -2287,6 +2328,7 @@ mod tests {
             None,
             "/home/me/.spice/bin/spiced",
             &is_binary,
+            false,
         )
         .expect("the pin names a binary")
         .expect("the pin must resolve");
@@ -2398,7 +2440,7 @@ mod tests {
 
     /// Which arm fires, asserted by equality against the wording each one must
     /// reach — the two wording tests above own the text itself. Asserted here
-    /// rather than through [`warn_if_install_is_shadowed`], which reads
+    /// rather than through [`warn_if_install_will_not_run`], which reads
     /// `SPICED_PATH` and `PATH` from the process and so cannot be steered
     /// without mutating state every other test in this binary shares.
     #[test]
@@ -2410,7 +2452,7 @@ mod tests {
         .build();
 
         assert_eq!(
-            install_shadow_warning(&installed, &Err(cause)),
+            install_will_not_run_warning(&installed, &Err(cause)),
             Some(unselectable_install_warning(
                 &installed,
                 &SpicedPathOverrideNotRunnableSnafu {
@@ -2429,7 +2471,7 @@ mod tests {
     fn nothing_resolved_means_the_managed_install_cannot_be_started() {
         let installed = PathBuf::from("/home/me/.spice/bin/spiced");
         assert_eq!(
-            install_shadow_warning(&installed, &Ok(None)),
+            install_will_not_run_warning(&installed, &Ok(None)),
             Some(unusable_install_warning(&installed)),
             "an install nothing can start must be reported, not returned from silently"
         );
@@ -2470,7 +2512,7 @@ mod tests {
             source: SpicedSource::ManagedInstall,
         };
         assert_eq!(
-            install_shadow_warning(&installed, &Ok(Some(resolved))),
+            install_will_not_run_warning(&installed, &Ok(Some(resolved))),
             None
         );
     }
@@ -2485,7 +2527,7 @@ mod tests {
         };
 
         assert_eq!(
-            install_shadow_warning(&installed, &Ok(Some(resolved.clone()))),
+            install_will_not_run_warning(&installed, &Ok(Some(resolved.clone()))),
             Some(shadowed_install_warning(&installed, &resolved)),
             "a runtime outranking the managed install must be reported"
         );
