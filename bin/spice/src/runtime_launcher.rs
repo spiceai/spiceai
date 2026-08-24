@@ -121,12 +121,20 @@ pub async fn run_runtime(ctx: &RuntimeContext, config: &RunConfig) -> Result<()>
 ///
 /// Split out because adopting the status ends the process, which is exactly
 /// what a test of this behavior cannot do.
+///
+/// Takes the runtime to launch rather than resolving one: resolution reads the
+/// host — `SPICED_PATH`, the running executable's directory, `PATH` — so a
+/// caller here that resolved would launch whatever runtime the developer's
+/// machine happens to offer instead of the fixture it built. The ladder has its
+/// own tests, with every rung injected.
 #[cfg(test)]
 async fn start_runtime(
     ctx: &RuntimeContext,
     config: &RunConfig,
+    resolved: &ResolvedSpiced,
 ) -> Result<std::process::ExitStatus> {
-    start_runtime_process(ctx, config).await
+    ctx.ensure_local_runtime_supported()?;
+    launch_resolved_runtime(ctx, config, resolved).await
 }
 
 /// Name the runtime about to be launched, and where it came from.
@@ -152,17 +160,33 @@ async fn start_runtime_process(
 ) -> Result<std::process::ExitStatus> {
     ctx.ensure_local_runtime_supported()?;
 
-    // Resolve before installing, so a `SPICED_PATH` that names nothing is
-    // reported rather than answered with a download of the latest release.
-    let resolved = if let Some(resolved) = ctx.resolve_spiced()? {
-        resolved
-    } else {
-        tracing::info!("Spice.ai runtime is not installed. Installing now...");
-        crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
-            .await?;
-        ctx.resolve_spiced()?.context(RuntimeNotInstalledSnafu)?
-    };
+    let resolved = resolve_or_install(ctx).await?;
     report_resolved_runtime(&resolved);
+
+    launch_resolved_runtime(ctx, config, &resolved).await
+}
+
+/// The runtime to start, installing one when this host has none.
+///
+/// Resolution comes before the install, so a `SPICED_PATH` that names nothing
+/// is reported rather than answered with a download of the latest release.
+async fn resolve_or_install(ctx: &RuntimeContext) -> Result<ResolvedSpiced> {
+    if let Some(resolved) = ctx.resolve_spiced()? {
+        return Ok(resolved);
+    }
+
+    tracing::info!("Spice.ai runtime is not installed. Installing now...");
+    crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
+        .await?;
+    ctx.resolve_spiced()?.context(RuntimeNotInstalledSnafu)
+}
+
+/// Start `resolved` in the foreground and stay attached to it until it exits.
+async fn launch_resolved_runtime(
+    ctx: &RuntimeContext,
+    config: &RunConfig,
+    resolved: &ResolvedSpiced,
+) -> Result<std::process::ExitStatus> {
     // Route --endpoint to the appropriate endpoint based on scheme
     let (http_endpoint, flight_endpoint) = resolve_endpoint(
         config.endpoint.as_deref(),
@@ -173,7 +197,7 @@ async fn start_runtime_process(
     tracing::info!("Spice.ai runtime starting...");
 
     let spiced_args = spiced_args(config, flight_endpoint.as_deref());
-    let std_cmd = ctx.get_run_cmd(&resolved, &spiced_args, http_endpoint.as_deref())?;
+    let std_cmd = ctx.get_run_cmd(resolved, &spiced_args, http_endpoint.as_deref())?;
 
     // Convert std::process::Command to tokio::process::Command
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -477,9 +501,20 @@ mod tests {
         const READY_BUDGET: Duration = Duration::from_secs(10);
         const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-        /// Install `script` as the `spiced` a context resolves, and return that
-        /// context. The directory is the caller's to keep alive.
-        fn context_with_stub_runtime(bin_dir: &std::path::Path, script: &str) -> RuntimeContext {
+        /// Install `script` as a stub `spiced`, and return the context plus the
+        /// stub as an already-resolved runtime. The directory is the caller's to
+        /// keep alive.
+        ///
+        /// Handing back the resolution is what keeps these tests hermetic: the
+        /// stub only ever occupies the context's managed install directory, and
+        /// the ladder ranks a `SPICED_PATH` pin, a `spiced` beside the test
+        /// executable, and a `spiced` on `PATH` above it. Any of those on the
+        /// machine running the suite would otherwise be launched instead — and
+        /// a real runtime does not exit, so the failure is a hang.
+        fn context_with_stub_runtime(
+            bin_dir: &std::path::Path,
+            script: &str,
+        ) -> (RuntimeContext, ResolvedSpiced) {
             use std::os::unix::fs::PermissionsExt as _;
 
             std::fs::create_dir_all(bin_dir).expect("create the stub bin directory");
@@ -487,7 +522,13 @@ mod tests {
             std::fs::write(&stub, script).expect("write the stub runtime");
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
                 .expect("make the stub runtime executable");
-            RuntimeContext::with_bin_dir_for_test(bin_dir.to_path_buf())
+            let ctx = RuntimeContext::with_bin_dir_for_test(bin_dir.to_path_buf());
+            // Built through the production constructor rather than as a struct
+            // literal, so the stub is anchored the way every resolved runtime
+            // is and these tests launch it the same way `spice run` would.
+            let resolved = ResolvedSpiced::at(stub, crate::context::SpicedSource::ManagedInstall)
+                .expect("anchor the stub runtime");
+            (ctx, resolved)
         }
 
         /// Wait for the stub to report the state a test needs, rather than
@@ -513,7 +554,7 @@ mod tests {
             let instance_dir = dir.path().join("instance");
             std::fs::create_dir_all(&instance_dir).expect("create the instance directory");
             let observed = dir.path().join("cwd");
-            let ctx = context_with_stub_runtime(
+            let (ctx, resolved) = context_with_stub_runtime(
                 &dir.path().join("bin"),
                 &format!("#!/bin/sh\npwd > {}\n", observed.display()),
             );
@@ -524,6 +565,7 @@ mod tests {
                     working_dir: Some(instance_dir.clone()),
                     ..RunConfig::default()
                 },
+                &resolved,
             )
             .await
             .expect("the stub runtime runs");
@@ -542,9 +584,10 @@ mod tests {
             // A caller sees what the runtime reported rather than merely that
             // the CLI managed to start it.
             let dir = tempfile::tempdir().expect("create tempdir");
-            let ctx = context_with_stub_runtime(&dir.path().join("bin"), "#!/bin/sh\nexit 3\n");
+            let (ctx, resolved) =
+                context_with_stub_runtime(&dir.path().join("bin"), "#!/bin/sh\nexit 3\n");
 
-            let status = start_runtime(&ctx, &RunConfig::default())
+            let status = start_runtime(&ctx, &RunConfig::default(), &resolved)
                 .await
                 .expect("a failing runtime is an exit status, not a launcher error");
 
@@ -594,7 +637,7 @@ mod tests {
             // `sleep &` + `wait` rather than a foreground sleep: a shell runs a
             // trap only between commands, so a foreground sleep would swallow
             // the signal for its whole duration.
-            let ctx = context_with_stub_runtime(
+            let (ctx, resolved) = context_with_stub_runtime(
                 &dir.path().join("bin"),
                 &format!(
                     "#!/bin/sh\ntrap 'echo yes > {terminated}; kill \"$idle\" 2>/dev/null; exit 143' TERM\ntouch {started}\nsleep 30 & idle=$!\nwait\n",
@@ -604,7 +647,7 @@ mod tests {
             );
 
             let launched = tokio::spawn(async move {
-                start_runtime(&ctx, &RunConfig::default())
+                start_runtime(&ctx, &RunConfig::default(), &resolved)
                     .await
                     .expect("the stub runtime runs")
             });

@@ -32,8 +32,13 @@ const VERSION_CACHE_DURATION: Duration = Duration::from_hours(24); // 24 hours
 #[derive(Args, Debug)]
 #[command(
     about = "Print the Spice CLI and runtime versions and check for updates",
-    long_about = r#"Print the installed Spice CLI version, the installed Spice runtime
-version (if any), and check whether a newer release is available on GitHub.
+    long_about = r#"Print the installed Spice CLI version, the version of the Spice runtime
+'spice run' would start (if any) and where that runtime was found, and check
+whether a newer release is available on GitHub.
+
+The runtime reported is the one that will run, which need not be the one
+'spice install' wrote: a 'SPICED_PATH' pin, a 'spiced' beside the CLI, and a
+'spiced' on 'PATH' all take precedence over the managed install.
 
 The latest-version check is cached for 24 hours. Use `--cli-only` to skip the
 runtime version lookup, and `-o json` for machine-readable output.

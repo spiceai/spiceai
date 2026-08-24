@@ -17,7 +17,7 @@ limitations under the License.
 //! Runtime context for managing Spice runtime installation and configuration.
 
 use crate::error::{
-    CreateDirectorySnafu, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
+    CreateDirectorySnafu, Error, HomeDirectoryNotFoundSnafu, HttpClientBuildSnafu, Result,
     RuntimeExecutionSnafu, RuntimeNotInstalledSnafu, RuntimeVersionSnafu,
     SpicedPathNotAnchorableSnafu, SpicedPathOverrideNotRunnableSnafu,
     WindowsNativeRuntimeUnsupportedSnafu,
@@ -794,10 +794,20 @@ impl RuntimeContext {
 /// old binary. Silence there is the worst outcome: the user has done the thing
 /// that was supposed to fix their problem.
 pub fn warn_if_install_is_shadowed(ctx: &RuntimeContext) {
-    let Ok(Some(resolved)) = ctx.resolve_spiced() else {
-        return;
-    };
     let installed = ctx.spiced_path();
+    let resolved = match ctx.resolve_spiced() {
+        Ok(Some(resolved)) => resolved,
+        // Nothing outranks the managed install and nothing else exists, so the
+        // file just written is the file that will run.
+        Ok(None) => return,
+        // The install stands — the bytes are on disk — but no `spice run` can
+        // reach them while resolution fails, and the caller has just reported
+        // success. This is the only place the user hears otherwise.
+        Err(err) => {
+            tracing::warn!("{}", unselectable_install_warning(&installed, &err));
+            return;
+        }
+    };
     // Compared by path rather than by source: the question here is whether the
     // managed install is the file that will run, which is not the same question
     // as whether the source is worth announcing at launch.
@@ -843,6 +853,21 @@ fn shadowed_install_warning(installed: &Path, resolved: &ResolvedSpiced) -> Stri
     let source = resolved.source.describe();
     format!(
         "The managed runtime is at '{installed}', but 'spice run' will start '{selected}' ({source}) instead, so installing or upgrading the managed one has no effect. Remove that binary, or set `SPICED_PATH` to '{installed}' to pin the managed install. See: https://spiceai.org/docs/cli"
+    )
+}
+
+/// The wording of [`warn_if_install_is_shadowed`]'s failed-resolution arm.
+///
+/// A function for the same reason as [`shadowed_install_warning`]: it is the
+/// only account a user gets of an install that reported success and cannot be
+/// started, so it has to keep naming the install and why it is unreachable.
+///
+/// Carries no remedy of its own — `cause` is a resolution error, and those
+/// already name the fix and the docs page.
+fn unselectable_install_warning(installed: &Path, cause: &Error) -> String {
+    let installed = installed.display();
+    format!(
+        "The managed runtime is at '{installed}', but 'spice run' cannot work out which runtime to start, so it will not start this one. Cause: {cause}"
     )
 }
 
@@ -934,7 +959,7 @@ impl ResolvedSpiced {
     /// the binary that was validated the binary that runs, so a candidate that
     /// cannot be anchored is refused rather than handed on — see
     /// [`anchor_to_current_dir`].
-    fn at(path: PathBuf, source: SpicedSource) -> Result<Self> {
+    pub(crate) fn at(path: PathBuf, source: SpicedSource) -> Result<Self> {
         Ok(Self {
             path: anchor_to_current_dir(path)?,
             source,
@@ -2100,6 +2125,40 @@ mod tests {
         assert!(
             warning.contains("https://spiceai.org/docs"),
             "the warning must link the docs: {warning}"
+        );
+    }
+
+    /// A pin that names nothing runnable makes every rung unreachable, so the
+    /// install the caller just reported cannot be started by anything. The
+    /// caller keeps its success; this line is the only account of why it will
+    /// not take effect.
+    #[test]
+    fn the_unselectable_install_warning_names_the_install_and_carries_its_cause() {
+        let cause = SpicedPathOverrideNotRunnableSnafu {
+            path: "/tmp/typo/spiced".to_string(),
+        }
+        .build();
+        let warning = unselectable_install_warning(Path::new("/home/me/.spice/bin/spiced"), &cause);
+
+        assert!(
+            warning.contains("/home/me/.spice/bin/spiced"),
+            "the warning must name the install it is about: {warning}"
+        );
+        assert!(
+            warning.contains("will not start this one"),
+            "the warning must state the consequence, not just the failure: {warning}"
+        );
+        assert!(
+            warning.contains("/tmp/typo/spiced"),
+            "the cause must name the pin that cannot be resolved: {warning}"
+        );
+        assert!(
+            warning.contains("SPICED_PATH"),
+            "the cause must name the setting to change: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs"),
+            "the line a user sees must link the docs: {warning}"
         );
     }
 
