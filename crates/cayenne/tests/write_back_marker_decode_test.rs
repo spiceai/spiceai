@@ -37,12 +37,15 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 
 use cayenne::CayenneTableProvider;
 use cayenne::metadata::CreateTableOptions;
 use cayenne::row_converter::{RowConverter, SortField};
 
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::{col, lit};
 
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -50,6 +53,7 @@ use datafusion_table_providers::util::{
 
 test_with_backends!(int64_primary_key_marker_keys_round_trip);
 test_with_backends!(composite_primary_key_marker_keys_round_trip);
+test_with_backends!(int64_primary_key_decoded_keys_address_their_rows);
 
 /// Encode primary-key columns the way a committed write encodes its dirty-key
 /// markers: one `RowConverter` `OwnedRow` per row, over the key columns in key
@@ -178,6 +182,121 @@ async fn composite_primary_key_marker_keys_round_trip(
         decoded_ids.values(),
         ids.as_slice(),
         "the second key column must decode back to what was marked"
+    );
+
+    Ok(())
+}
+
+/// Decoding is only half of what delivery needs: the worker turns the decoded
+/// keys into the `pk IN (…)` filter it scans the accelerator with, then delivers
+/// the rows that scan returns. A `BIGINT` key that decodes to the right values
+/// but does not *address* its rows would still deliver nothing.
+///
+/// So this drives the same two steps against real written rows — decode the
+/// marker keys, then use them exactly as the filter — and asserts the scan
+/// returns precisely the marked rows. It stops short of the federated source
+/// (that needs the transactional commit path plus a live source, and belongs in
+/// its own test); everything up to the value the worker would send is covered.
+async fn int64_primary_key_decoded_keys_address_their_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let table = create_table(
+        &fixture,
+        "int64_pk_addressing",
+        &schema,
+        vec!["id".to_string()],
+    )
+    .await?;
+
+    // Boundary values alongside ordinary ones: their `OwnedRow` encoding is
+    // order-preserving rather than a plain big-endian copy, so a decode that
+    // dropped the transform would still round-trip small positives and only fail
+    // here, where the value has to match a real row.
+    let ids: Vec<i64> = vec![i64::MIN, -7, 0, 42, i64::MAX];
+    let values: Vec<i64> = ids.iter().map(|id| id.wrapping_mul(2)).collect();
+    common::insert_batch(
+        &table,
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(Int64Array::from(values.clone())),
+            ],
+        )?,
+    )
+    .await?;
+    // A row no marker covers: the filter built from the decoded keys must not
+    // sweep it in, or delivery would push rows nobody wrote back to the source.
+    common::insert_batch(
+        &table,
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![999_i64])),
+                Arc::new(Int64Array::from(vec![999_i64])),
+            ],
+        )?,
+    )
+    .await?;
+
+    let key_field = Field::new("id", DataType::Int64, false);
+    let marked: ArrayRef = Arc::new(Int64Array::from(ids.clone()));
+    let marker_keys = encode_marker_keys(std::slice::from_ref(&key_field), &[marked]);
+
+    // Step 1: decode, as the worker does before it can address anything.
+    let decoded = table.decode_pk_keys(&marker_keys)?;
+    let decoded_ids = decoded[0]
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("decoded key column is Int64");
+
+    // Step 2: build the worker's `pk IN (…)` filter from those decoded keys and
+    // read the rows it would deliver.
+    let filter = col("id").in_list(
+        decoded_ids.values().iter().map(|id| lit(*id)).collect(),
+        false,
+    );
+    let ctx = SessionContext::new();
+    let scanned = ctx
+        .read_table(Arc::new(table) as Arc<dyn TableProvider>)?
+        .filter(filter)?
+        .sort_by(vec![col("id")])?
+        .collect()
+        .await?;
+
+    let mut scanned_ids: Vec<i64> = Vec::new();
+    let mut scanned_values: Vec<i64> = Vec::new();
+    for batch in &scanned {
+        let id_column = batch
+            .column_by_name("id")
+            .expect("the scan returns the key column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("key column is Int64");
+        let value_column = batch
+            .column_by_name("value")
+            .expect("the scan returns the value column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value column is Int64");
+        scanned_ids.extend(id_column.values());
+        scanned_values.extend(value_column.values());
+    }
+
+    let mut expected: Vec<(i64, i64)> = ids.iter().copied().zip(values).collect();
+    expected.sort_unstable();
+    let scanned_rows: Vec<(i64, i64)> = scanned_ids
+        .iter()
+        .copied()
+        .zip(scanned_values.iter().copied())
+        .collect();
+    assert_eq!(
+        scanned_rows, expected,
+        "the decoded marker keys must address exactly the rows that were marked, with their committed values"
     );
 
     Ok(())
