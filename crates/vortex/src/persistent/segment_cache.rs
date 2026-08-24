@@ -496,9 +496,11 @@ impl SharedSegmentCache {
         }
 
         // Enumerate the exact keys and use Moka's direct async invalidation so
-        // returning means the buffers are removed from the cache table;
-        // predicate invalidation would defer physical eviction to bounded
-        // maintenance passes.
+        // returning means the buffers this enumeration reached are removed from
+        // the cache table; predicate invalidation would defer physical eviction
+        // to bounded maintenance passes. What the enumeration does not reach —
+        // because the bound below gave up on it — stays cached until capacity
+        // evicts it.
         //
         // The walk is O(entries in the whole cache), not O(retiring paths), and
         // one cache now holds every table's segments — so a single table's
@@ -1052,6 +1054,37 @@ mod tests {
             .get(path)
             .and_then(|state| state.upgrade())
             .expect("an open file registered a path state")
+    }
+
+    /// How long [`wait_for`] polls before it gives up. Long enough that a loaded
+    /// machine does not fail a healthy test, short enough that a setup which
+    /// never becomes true reports a failure rather than running to the harness's
+    /// own kill.
+    const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Poll `condition` until it holds, bounded.
+    ///
+    /// The condition these tests wait on is reached by another task or blocking
+    /// thread, so it cannot be asserted directly. An unbounded poll turns a
+    /// setup that never arrives — a pool that never schedules the occupier, a
+    /// retirement that never marks the path — into a hang, and a hung test
+    /// reports nothing at all: it is the timeout that turns it back into a
+    /// failure naming what was being waited for.
+    ///
+    /// Call this only from a test on a real clock. Under `start_paused` the
+    /// runtime auto-advances time whenever every task is idle, so the sleep
+    /// below would burn the whole budget in a handful of iterations and the
+    /// bound would fire before the condition ever could.
+    async fn wait_for(awaited: &str, condition: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {}s waiting for {awaited}",
+                READINESS_TIMEOUT.as_secs()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     /// Register a put against `path` and never finish it, the way a put stalled
@@ -1634,9 +1667,10 @@ mod tests {
                 signal.store(true, Ordering::SeqCst);
                 let _ = released.recv();
             });
-            while !occupied.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+            wait_for("the blocking pool to be saturated", || {
+                occupied.load(Ordering::SeqCst)
+            })
+            .await;
 
             tokio::time::timeout(
                 INVALIDATION_SCAN_TIMEOUT * 3,
@@ -1685,9 +1719,10 @@ mod tests {
                 signal.store(true, Ordering::SeqCst);
                 let _ = released.recv();
             });
-            while !occupied.load(Ordering::SeqCst) {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
+            wait_for("the blocking pool to be saturated", || {
+                occupied.load(Ordering::SeqCst)
+            })
+            .await;
 
             // Retirement parks on the scan it will never get, holding the path
             // state; the opener then drops underneath it.
@@ -1698,7 +1733,26 @@ mod tests {
                     .invalidate_paths(HashSet::from([retired_path]))
                     .await;
             });
-            tokio::task::yield_now().await;
+            // Wait for the retirement mark — which current-thread scheduling
+            // order alone would also reach, but only incidentally. The mark is
+            // set while `invalidate_paths` holds its own strong reference to the
+            // path state, so observing it is what makes the drop below land
+            // *underneath* the retirement: the arrangement this test needs in
+            // order to reach the give-up cleanup at all. If the drop went first,
+            // `PathSegmentCache::drop` would unregister the path itself and the
+            // assertion would pass without that cleanup ever running.
+            //
+            // Scoped so the handle cannot outlive the poll — the cleanup under
+            // test only removes an entry whose `strong_count()` has reached zero,
+            // so a strong reference held into the assertion would fail the test
+            // for a reason that has nothing to do with the code it checks.
+            {
+                let state = path_state(&shared, &path);
+                wait_for("retirement to mark the path retired", || {
+                    state.retired.load(Ordering::SeqCst)
+                })
+                .await;
+            }
             drop(file);
 
             tokio::time::timeout(INVALIDATION_SCAN_TIMEOUT * 3, invalidation)
