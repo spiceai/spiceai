@@ -30218,12 +30218,13 @@ impl CayenneTableProvider {
         if self.pk_deletion_strategy.is_position_based() {
             // Position deletes address file-local row positions, not keys, so
             // they cannot express write-back delete markers. Registration
-            // rejects the combination (`validate_durable_write_back_options`);
-            // this guards a table created before that gate existed.
+            // rejects the combination
+            // (`validate_durable_write_back_table_options`); this guards a table
+            // created before that gate existed.
             if self.marks_write_back_deletes(source) {
                 return Err(datafusion_common::DataFusionError::Plan(format!(
-                    "Failed to delete from dataset {} (cayenne): durable write-back requires key-based deletes, but this table uses position-based deletes. \
-                    Set `cayenne_deletion_mode: key` (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    "Failed to delete from dataset '{}' (cayenne): durable write-back requires key-based deletes, but this table uses position-based deletes, which cannot record which rows to delete at the federated source. \
+                    Set `cayenne_deletion_mode` to `key` (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne",
                     self.table_metadata.table_name
                 )));
             }

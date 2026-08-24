@@ -2767,8 +2767,8 @@ fn validate_durable_write_back_table_options(
 ) -> Result<(), String> {
     if options.vortex_config.deletion_mode == cayenne::metadata::DeletionMode::Position {
         return Err(format!(
-            "Failed to register dataset {table_name} (cayenne): durable write-back requires key-based deletes, but 'cayenne_deletion_mode: position' is set — a user DELETE could never reach the federated source. \
-            Set 'cayenne_deletion_mode: key' (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Failed to register dataset '{table_name}' (cayenne): durable write-back requires key-based deletes, but `cayenne_deletion_mode` is set to `position` — a user DELETE could never reach the federated source. \
+            Set `cayenne_deletion_mode` to `key` (or remove it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         ));
     }
     Ok(())
@@ -6362,9 +6362,10 @@ mod tests {
         let error = validate_durable_write_back_table_options("dl_t", &options)
             .expect_err("durable write-back with explicit position deletes must fail registration");
         assert!(
-            error.contains("cayenne_deletion_mode: position")
-                && error.contains("cayenne_deletion_mode: key"),
-            "the error must name the conflicting setting and the fix: {error}"
+            error.contains("'dl_t'")
+                && error.contains("`cayenne_deletion_mode` is set to `position`")
+                && error.contains("Set `cayenne_deletion_mode` to `key`"),
+            "the error must name the dataset, the conflicting setting, and the fix: {error}"
         );
     }
 
