@@ -382,10 +382,17 @@ pub fn non_finite_embedding_warning(
 /// only ever reached for a vector whose every component is a finite zero, so it must not
 /// mention NaN. A vector mixing zeroes with a NaN belongs to the batched non-finite report,
 /// and claiming "all zeroes" for it would name a cause the row does not have.
+///
+/// The *consequence*, by contrast, must stay narrower than it is tempting to write. What
+/// happens to a vector already indexed for this record is not a property of this call site:
+/// an appending write leaves it in place and searchable at its older value (#13504), while a
+/// `WriteWindow::ReplaceAll` refresh stages only the surviving rows and swaps the whole set
+/// in at `on_write_complete`, discarding it. So this line may not promise either outcome —
+/// only that this write did not index the record.
 #[must_use]
 pub fn all_zero_embedding_warning(index_kind: &str, index_name: &str, key: &str) -> String {
     format!(
-        "Skipping record '{key}' for {index_kind} index '{index_name}': its embedding is all zeroes, which has no direction to compare against, so this write did not index the record and any vector previously indexed for it stays searchable at that older value. {EMBEDDING_REMEDY}"
+        "Skipping record '{key}' for {index_kind} index '{index_name}': its embedding is all zeroes, which has no direction to compare against, so this write did not index the record and vector search will not match it on this write's data. {EMBEDDING_REMEDY}"
     )
 }
 
@@ -850,12 +857,12 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("stays searchable at that older value"),
-            "the line must not imply the record became unsearchable — a previously indexed vector survives a rejected rewrite: {message}"
+            !message.contains("never return"),
+            "an absolute an appending write does not deliver — the previously indexed vector stays searchable (#13504): {message}"
         );
         assert!(
-            !message.contains("never return"),
-            "an absolute the write path does not deliver: a stale vector is still returned: {message}"
+            !message.contains("stays searchable"),
+            "and not the mirror either: a ReplaceAll refresh stages only survivors and swaps the whole set in, discarding that older vector: {message}"
         );
         assert!(
             message.contains("Re-embed the affected rows"),
