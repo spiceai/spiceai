@@ -5519,7 +5519,7 @@ mod tests {
             let catalog_clone = Arc::clone(&catalog);
             let schema_clone = Arc::clone(&schema);
             let table_name = table_name.to_string();
-            let base_path = base_path.to_string();
+            let base_path = base_path.clone();
 
             let handle = tokio::spawn(async move {
                 let options = CreateTableOptions {
@@ -6944,9 +6944,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_sequence_reservations_do_not_overlap() {
-        let (_table_root, base_path) = test_table_root();
         const TASK_COUNT: usize = 16;
         const BLOCK_SIZE: u32 = 2;
+
+        let (_table_root, base_path) = test_table_root();
 
         let test_db = format!(
             "sqlite://./.test_sequence_reservation_concurrency_{}.db",
@@ -8981,8 +8982,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_on_conflict_change_falls_back() {
-        let (_table_root, base_path) = test_table_root();
         use datafusion_table_providers::util::on_conflict::OnConflict;
+
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_change_{}.db",
             uuid::Uuid::now_v7()
