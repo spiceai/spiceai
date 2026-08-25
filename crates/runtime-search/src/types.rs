@@ -126,22 +126,27 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
     }
 
     // Sort by score descending, then by dataset + primary key ascending for deterministic ordering on ties.
-    // Use BTreeMap for primary key serialization to ensure deterministic key ordering,
-    // since HashMap iteration order is non-deterministic due to hash randomization.
-    matches.sort_by(|a, b| {
+    // Serialize each primary key once (via BTreeMap, so the JSON key order is
+    // deterministic despite HashMap hash randomization) rather than re-serializing
+    // both operands on every comparison the sort makes.
+    let mut decorated: Vec<(String, Match)> = matches
+        .into_iter()
+        .map(|m| {
+            let pk: BTreeMap<_, _> = m.primary_key.iter().collect();
+            let pk_key = serde_json::to_string(&pk).unwrap_or_default();
+            (pk_key, m)
+        })
+        .collect();
+
+    decorated.sort_by(|(a_pk, a), (b_pk, b)| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.dataset.cmp(&b.dataset))
-            .then_with(|| {
-                let a_pk: BTreeMap<_, _> = a.primary_key.iter().collect();
-                let b_pk: BTreeMap<_, _> = b.primary_key.iter().collect();
-                let a_str = serde_json::to_string(&a_pk).unwrap_or_default();
-                let b_str = serde_json::to_string(&b_pk).unwrap_or_default();
-                a_str.cmp(&b_str)
-            })
+            .then_with(|| a_pk.cmp(b_pk))
     });
 
+    let mut matches: Vec<Match> = decorated.into_iter().map(|(_, m)| m).collect();
     matches.truncate(limit);
     Ok(matches)
 }
@@ -152,7 +157,10 @@ pub async fn to_matches(
     mut result: AggregationResult,
 ) -> std::result::Result<Vec<Match>, SearchError> {
     let mut output = vec![];
-    while let Some(Ok(rb)) = result.data.next().await {
+    // Propagate any stream error rather than terminating the loop on the first
+    // `Err`, which would silently return a partial (wrongly-shortened) result set.
+    while let Some(item) = result.data.next().await {
+        let rb = item.map_err(|source| SearchError::DatafusionError { source })?;
         let data = result.data_json(&rb)?;
         let primary_key = result.primary_key_json(&rb)?;
 

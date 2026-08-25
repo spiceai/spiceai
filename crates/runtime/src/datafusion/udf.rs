@@ -1127,7 +1127,7 @@ mod tests {
         // Regression guard: the DuckDB allow-state of every built-in deny-listed
         // function must match exactly what the DuckDB dialect can unparse, so the
         // dialect and the deny-list can never drift.
-        let native: HashSet<&str> = crate::datafusion::dialect::duckdb_native_function_names()
+        let native: HashSet<&str> = runtime_datafusion::dialect::duckdb_native_function_names()
             .into_iter()
             .collect();
         let support = deny_spice_functions_for_duckdb();

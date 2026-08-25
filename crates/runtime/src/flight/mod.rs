@@ -24,7 +24,6 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
-use crate::tls::TlsConfig;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -53,6 +52,7 @@ use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use std::future::Future;
 use std::num::NonZeroU32;
@@ -948,7 +948,7 @@ pub async fn start(
         // bind doesn't show up as a phantom "Flight listening" line.
         tracing::info!("Spice Runtime Flight listening on {bind_address}");
         runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-        let incoming = crate::tls::flight_incoming::tls_incoming(
+        let incoming = runtime_tls::flight_incoming::tls_incoming(
             listener,
             Arc::clone(&tls_config.flight_server_config),
         );

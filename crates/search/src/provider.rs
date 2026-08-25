@@ -225,6 +225,22 @@ impl SearchQueryProvider {
         Ok(provider)
     }
 
+    /// The tighter of [`Self::pre_limit`] (the `limit` argument the caller gave
+    /// `vector_search()` / `text_search()`) and any limit `DataFusion` pushed into the scan,
+    /// or `None` when neither side asked for one.
+    ///
+    /// This has to bound the provider's *output*, not just its search-index input:
+    /// [`Self::join_with_base`] joins on [`Self::primary_key`], and nothing requires the base
+    /// table to hold exactly one row per key, so the join can emit more rows than it consumed.
+    ///
+    /// The bound is a row count, and rows sharing a key tie under the sort below (`_score`
+    /// then primary key), so which of them survives is unspecified — and `N` rows can
+    /// represent fewer than `N` distinct hits. [`Self::new`] separately advertises that key as
+    /// a `PrimaryKey` constraint it has not verified. #13289 tracks both.
+    fn effective_limit(pre_limit: Option<usize>, limit: Option<usize>) -> Option<usize> {
+        [pre_limit, limit].into_iter().flatten().min()
+    }
+
     /// Build the underlying table scan, removing search index metadata columns from projection
     fn underlying_table_scan(
         &self,
@@ -677,7 +693,7 @@ impl TableProvider for SearchQueryProvider {
                 }));
                 sort_exprs
             },
-            limit,
+            Self::effective_limit(self.pre_limit, limit),
         )?;
 
         // Add final
@@ -759,10 +775,12 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
-    /// Base table: the source of truth. `extra` is deliberately absent from the
-    /// search index so a `SELECT *` cannot be served by the index alone and the
-    /// join under test is actually planned.
-    fn base_table() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    /// A base table of `(id, content, extra)` rows. `extra` is deliberately absent from the
+    /// search index so a `SELECT *` cannot be served by the index alone and the join under
+    /// test is actually planned.
+    fn base_table_of(
+        rows: &[(i64, &str, &str)],
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("content", DataType::Utf8, true),
@@ -771,14 +789,72 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["dog elephant", "cat"])),
-                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|(_, content, _)| *content)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, _, extra)| *extra).collect::<Vec<_>>(),
+                )),
             ],
         )
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
+
+    /// Base table: the source of truth, one row per `id`.
+    fn base_table() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        base_table_of(&[(1, "dog elephant", "a"), (2, "cat", "b")])
+    }
+
+    /// A base table holding **two** rows for `id = 1`, so an inner join on `id` emits more
+    /// rows than the search index handed it. This is in-contract: in production the join key
+    /// is whatever the index declared through `SearchIndex::primary_fields()`, and no
+    /// uniqueness check stands between that declaration and the join.
+    fn base_table_with_repeated_key() -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        base_table_of(&[
+            (1, "dog elephant", "a1"),
+            (1, "dog elephant", "a2"),
+            (2, "cat", "b"),
+        ])
+    }
+
+    /// A provider over [`base_table_with_repeated_key`], with `pre_limit` carrying the
+    /// caller's `vector_search(.., N)` argument.
+    fn provider_over_repeated_key(
+        hits: &[(i64, f64)],
+        pre_limit: Option<usize>,
+    ) -> Result<SearchQueryProvider, DataFusionError> {
+        Ok(SearchQueryProvider::new(
+            search_index_plan(hits)?,
+            base_table_with_repeated_key()?,
+            "content".to_string(),
+            vec!["id".to_string()],
+            pre_limit,
+        ))
+    }
+
+    /// Run `sql` against [`provider_over_repeated_key`] registered as `searched`.
+    async fn search_repeated_key(
+        hits: &[(i64, f64)],
+        pre_limit: Option<usize>,
+        sql: &str,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "searched",
+            Arc::new(provider_over_repeated_key(hits, pre_limit)?),
+        )?;
+        ctx.sql(sql).await?.collect().await
+    }
+
+    fn row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
     }
 
     /// A search index holding one entry per `(id, score)` pair. An `id` absent
@@ -959,6 +1035,168 @@ mod tests {
             .await?;
 
         assert_eq!(ids(&batches), vec![1]);
+        Ok(())
+    }
+
+    /// Regression test for #13274: the `limit` argument to `vector_search()` /
+    /// `text_search()` bounds the provider's output, not just how many entries it
+    /// reads from the search index. The limit was applied only to the search-index
+    /// input, so the join with the base table emitted `2` rows for a requested `1`.
+    #[tokio::test]
+    async fn a_requested_limit_survives_a_join_that_fans_out() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            Some(1),
+            "SELECT id, extra FROM searched",
+        )
+        .await?;
+
+        assert_eq!(
+            row_count(&batches),
+            1,
+            "a search asked for 1 row must return at most 1 row, however many base-table rows the join finds for that key"
+        );
+
+        Ok(())
+    }
+
+    /// The rows kept under the limit must be the highest-ranked ones. Capping the
+    /// output is only correct if it drops the *worst* rows: keeping both `id = 1`
+    /// rows and dropping the better-scoring `id = 2` would satisfy a count-only
+    /// assertion while returning the wrong results.
+    #[tokio::test]
+    async fn the_rows_kept_under_the_limit_are_the_highest_scoring() -> Result<(), DataFusionError>
+    {
+        let batches = search_repeated_key(
+            &[(1, 0.5), (2, 0.98)],
+            Some(2),
+            "SELECT id, extra FROM searched ORDER BY id",
+        )
+        .await?;
+
+        assert_eq!(
+            ids(&batches),
+            vec![1, 2],
+            "the top-scoring hit must keep its slot; the surplus row of the lower-scoring key is the one dropped"
+        );
+
+        Ok(())
+    }
+
+    /// Every combination of the rule, asserted where the provider actually decides it. The
+    /// end-to-end form of the tighter-SQL-limit direction proves nothing on its own: the outer
+    /// `LIMIT` bounds the result whatever this provider returns.
+    #[test]
+    fn the_effective_limit_is_the_tighter_of_the_two() {
+        let effective = SearchQueryProvider::effective_limit;
+
+        assert_eq!(
+            effective(Some(5), Some(1)),
+            Some(1),
+            "a tighter limit from the SQL plan wins"
+        );
+        assert_eq!(
+            effective(Some(1), Some(5)),
+            Some(1),
+            "the caller's search argument wins over a looser SQL limit"
+        );
+        assert_eq!(
+            effective(Some(3), None),
+            Some(3),
+            "the caller's search argument applies with no SQL limit at all"
+        );
+        assert_eq!(
+            effective(None, Some(3)),
+            Some(3),
+            "a SQL limit applies with no search argument"
+        );
+        assert_eq!(
+            effective(None, None),
+            None,
+            "neither side asked for a limit, so none is invented"
+        );
+    }
+
+    /// The caller's argument bounds the output end to end, where only this provider
+    /// can enforce it: a looser SQL limit leaves the surplus join rows to it.
+    #[tokio::test]
+    async fn the_search_argument_wins_over_a_looser_sql_limit() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            Some(1),
+            "SELECT id, extra FROM searched LIMIT 5",
+        )
+        .await?;
+
+        assert_eq!(row_count(&batches), 1);
+        Ok(())
+    }
+
+    /// The cap must not be invented: with no limit on either side every joined row
+    /// is still returned, including the surplus rows of a repeated key.
+    #[tokio::test]
+    async fn an_unlimited_search_still_returns_every_joined_row() -> Result<(), DataFusionError> {
+        let batches = search_repeated_key(
+            &[(1, 0.9), (2, 0.5)],
+            None,
+            "SELECT id, extra FROM searched",
+        )
+        .await?;
+
+        assert_eq!(
+            row_count(&batches),
+            3,
+            "two rows for id = 1 plus one for id = 2"
+        );
+
+        Ok(())
+    }
+
+    /// The plan-shape half of #13274, and the acceptance criterion stated directly: the
+    /// requested limit must survive as a fetch *above* the join, not only on the search-index
+    /// side beneath it. It is asserted on the plan rather than on a row count because the
+    /// property does not depend on how much the join fans out — the sibling tests above cover
+    /// the one fan-out shape this module can build, while a deployment can multiply rows for
+    /// reasons a unit test cannot reproduce.
+    ///
+    /// Deliberately shape-locked, so it is coupled to `DataFusion`'s rendered operator names.
+    /// The SQL must carry no outer `LIMIT`: that would plant a `fetch=` of its own above the
+    /// join and the assertion would pass with the fix reverted, so the fetch value is pinned
+    /// to `pre_limit` to make such a change fail rather than go quiet.
+    #[tokio::test]
+    async fn the_fetch_is_planned_above_the_join() -> Result<(), DataFusionError> {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "searched",
+            Arc::new(provider_over_repeated_key(&[(1, 0.9), (2, 0.5)], Some(1))?),
+        )?;
+
+        let plan = ctx
+            .sql("SELECT id, extra FROM searched")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let (join_line, join_indent) = rendered
+            .lines()
+            .enumerate()
+            .find_map(|(i, line)| line.contains("HashJoinExec").then(|| (i, indent(line))))
+            .unwrap_or_else(|| {
+                panic!("the base-table join is what the limit has to survive:\n{rendered}")
+            });
+
+        assert!(
+            rendered
+                .lines()
+                .take(join_line)
+                .any(|line| line.contains("fetch=1") && indent(line) < join_indent),
+            "the requested limit of 1 must be planned as a fetch above the join, not only below it:\n{rendered}"
+        );
+
         Ok(())
     }
 }

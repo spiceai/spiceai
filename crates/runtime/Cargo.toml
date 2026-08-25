@@ -10,6 +10,7 @@ version.workspace = true
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
+podswatcher = { path = "../podswatcher" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 adbc_core = { workspace = true, optional = true }
 adbc_driver_manager = { workspace = true, optional = true }
@@ -64,7 +65,6 @@ datafusion-substrait = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
 spice-table = { path = "../spice-table" }
-tokio-postgres = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -141,8 +141,6 @@ runtime-async = { path = "../runtime-async" }
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-checkpoint-duckdb = { path = "../runtime-checkpoint-duckdb", optional = true }
 runtime-checkpoint-sqlite = { path = "../runtime-checkpoint-sqlite", optional = true }
-runtime-checkpoint-postgres = { path = "../runtime-checkpoint-postgres", optional = true }
-runtime-checkpoint-turso = { path = "../runtime-checkpoint-turso", optional = true }
 runtime-component = { path = "../runtime-component" }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-auth = { path = "../runtime-auth" }
@@ -155,6 +153,8 @@ runtime-search = { path = "../runtime-search" }
 runtime-tools = { path = "../runtime-tools" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-tls = { path = "../runtime-tls" }
+runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
 runtime-object-store = { path = "../runtime-object-store" }
@@ -205,7 +205,6 @@ tracing.workspace = true
 tracing-futures.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
 twox-hash.workspace = true
 url.workspace = true
@@ -268,6 +267,11 @@ connector-mongodb = { path = "../data-connectors/connector-mongodb" }
 connector-mssql = { path = "../data-connectors/connector-mssql" }
 connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
+accelerator-postgres = { path = "../accelerators/accelerator-postgres" }
+accelerator-sqlite = { path = "../accelerators/accelerator-sqlite" }
+accelerator-turso = { path = "../accelerators/accelerator-turso" }
+accelerator-duckdb = { path = "../accelerators/accelerator-duckdb" }
+turso.workspace = true
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
 tokio-postgres = { workspace = true }
@@ -383,7 +387,10 @@ postgres = [
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
-postgres-accel = ["postgres", "dep:tokio-postgres", "dep:runtime-checkpoint-postgres"]
+# Selects the PostgreSQL-accelerator integration tests. The engine itself is a crate
+# (`accelerator-postgres`), linked by `spiced` in a shipped build and by the dev-dependency
+# below for these tests, so this feature no longer pulls anything into the library.
+postgres-accel = ["postgres"]
 
 s3_vectors = [
     "data_components/s3_vectors",
@@ -402,7 +409,7 @@ snowflake = [
     "db_connection_pool/snowflake",
     "data_components/snowflake",
 ]
-spark = ["data_components/spark_connect"]
+spark = ["data_components/spark_connect", "connector-databricks/spark"]
 # Registers the Cayenne catalog connector. Intended for benchmarking only;
 # deliberately excluded from the default feature set.
 spicebench = []
@@ -415,9 +422,7 @@ sqlite = [
     "runtime-acceleration/sqlite",
 ]
 turso = [
-    "dep:turso",
     "dep:tokio-rusqlite",
-    "dep:runtime-checkpoint-turso",
     "db_connection_pool/sqlite",
     "data_components/sqlite",
     "data_components/turso",
@@ -425,6 +430,11 @@ turso = [
     "runtime-acceleration/turso",
 ]
 vortex = []
+[target.'cfg(not(windows))'.dev-dependencies]
+# The engine itself is not built on Windows, so neither is the test code that
+# exercises it or force-links its registration.
+accelerator-cayenne = { path = "../accelerators/accelerator-cayenne" }
+
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true

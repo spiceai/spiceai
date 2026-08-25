@@ -249,39 +249,10 @@ impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedType
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum OnSchemaChange {
-    #[default]
-    Block,
-    Fail,
-    AppendNewColumns,
-    SyncAllColumns,
-    DropAndRecreate,
-}
-
-impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
-    fn from(on_schema_change: spicepod_dataset::OnSchemaChange) -> Self {
-        match on_schema_change {
-            spicepod_dataset::OnSchemaChange::Block => OnSchemaChange::Block,
-            spicepod_dataset::OnSchemaChange::Fail => OnSchemaChange::Fail,
-            spicepod_dataset::OnSchemaChange::AppendNewColumns => OnSchemaChange::AppendNewColumns,
-            spicepod_dataset::OnSchemaChange::SyncAllColumns => OnSchemaChange::SyncAllColumns,
-            spicepod_dataset::OnSchemaChange::DropAndRecreate => OnSchemaChange::DropAndRecreate,
-        }
-    }
-}
-
-impl Display for OnSchemaChange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnSchemaChange::Block => write!(f, "block"),
-            OnSchemaChange::Fail => write!(f, "fail"),
-            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
-            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
-            OnSchemaChange::DropAndRecreate => write!(f, "drop_and_recreate"),
-        }
-    }
-}
+// `on_schema_change` is the accelerator's policy for a source schema change, so it
+// lives with the acceleration contract. Re-exported for the
+// `runtime_component::dataset::OnSchemaChange` path.
+pub use runtime_acceleration::OnSchemaChange;
 
 /// Controls when the table is marked ready for queries.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

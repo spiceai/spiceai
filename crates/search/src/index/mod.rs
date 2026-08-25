@@ -42,6 +42,13 @@ use crate::index::chunking::{ChunkedSearchIndex, ChunkedVectorIndex};
 use crate::index::compound::{CompoundSearchIndex, CompoundVectorIndex};
 #[cfg(feature = "llms")]
 pub(crate) mod write_util;
+
+/// Maximum number of index-write batches processed concurrently by a single
+/// `compute_index` call. Each batch may issue an embedding request and a remote
+/// bulk upload, so an unbounded fan-out over a large refresh could spawn a huge
+/// number of concurrent embedding/HTTP calls.
+pub(crate) const MAX_CONCURRENT_INDEX_WRITES: usize = 8;
+
 #[cfg(feature = "llms")]
 pub use memory::MemoryVectorIndex;
 pub use native_vector::NativeVectorIndex;

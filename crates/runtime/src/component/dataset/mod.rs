@@ -191,6 +191,16 @@ impl AccelerationSource for Dataset {
         Some(DatasetSpec::source(self))
     }
 
+    fn on_schema_change(&self) -> Option<OnSchemaChange> {
+        Some(self.on_schema_change)
+    }
+
+    fn allows_write(&self) -> bool {
+        // A read-write dataset requires BOTH `access: read_write` and a ReadWrite API
+        // key, and `access()` is the check that folds those together.
+        self.access().allows_write()
+    }
+
     fn time_column(&self) -> Option<&str> {
         self.time_column.as_deref()
     }

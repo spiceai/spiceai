@@ -33,6 +33,9 @@ use futures::task::{Context, Poll};
 use crate::AsTableRefs;
 use crate::Sizeable;
 use crate::encoding::Encoder;
+use crate::sizing::{
+    ARC_HEADER_BYTES, ENTRY_OVERHEAD_BYTES, arc_heap_size, schema_size, table_refs_size,
+};
 
 use super::CacheStatus;
 
@@ -175,27 +178,37 @@ impl CachedQueryResult {
         self.cached_at
     }
 
-    /// Returns the accurate deep memory size of this cache entry.
-    /// Includes array data, `RecordBatch` overhead, and schema size.
+    /// The memory this entry holds, as the cache's byte budget sees it.
+    ///
+    /// Everything reachable from the entry is counted, not just its array
+    /// bytes: the schema, the input-table set, and a flat allowance for the
+    /// store's own per-entry bookkeeping. A 0-row result carries no array bytes
+    /// at all, so counting only those made it weigh a flat `size_of::<Self>()`
+    /// regardless of how wide its schema was, and the byte budget could never
+    /// evict one. See [`crate::sizing`] for the imprecisions this accepts.
     #[must_use]
     pub fn memory_size(&self) -> u64 {
-        let mut size = std::mem::size_of::<Self>() as u64;
+        let mut size = std::mem::size_of::<Self>();
 
         match &self.data {
             CachedData::Raw(batches) => {
+                size += arc_heap_size::<Vec<RecordBatch>>()
+                    + batches.len() * std::mem::size_of::<RecordBatch>();
                 for batch in batches.iter() {
-                    // Use RecordBatch's get_array_memory_size which accounts for all array data
-                    size += batch.get_array_memory_size() as u64;
-                    // Add RecordBatch struct overhead (small fixed cost per batch)
-                    size += std::mem::size_of::<RecordBatch>() as u64;
+                    // get_array_memory_size accounts for all array data.
+                    size += batch.get_array_memory_size();
                 }
             }
             CachedData::Encoded(bytes) => {
-                size += bytes.len() as u64;
+                size += bytes.len();
             }
         }
 
-        size
+        size += ARC_HEADER_BYTES + schema_size(&self.schema);
+        size += ARC_HEADER_BYTES + table_refs_size(&self.input_tables);
+        size += ENTRY_OVERHEAD_BYTES;
+
+        size as u64
     }
 }
 
@@ -331,39 +344,36 @@ mod tests {
         .expect("should create batch");
 
         let batches = vec![batch1.clone(), batch2.clone()];
-        let input_tables = Arc::new(HashSet::new());
+        let input_tables = Arc::new(HashSet::from([TableReference::bare("sales")]));
         let cached_at = Instant::now();
 
         let cached_result = CachedQueryResult::new_raw(
             batches,
             Arc::clone(&schema),
-            input_tables,
+            Arc::clone(&input_tables),
             cached_at,
             cached_at,
         );
 
-        // Calculate expected size
         let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
+            + crate::sizing::arc_heap_size::<Vec<RecordBatch>>() as u64
+            + 2 * std::mem::size_of::<RecordBatch>() as u64
             + batch1.get_array_memory_size() as u64
-            + std::mem::size_of::<RecordBatch>() as u64
             + batch2.get_array_memory_size() as u64
-            + std::mem::size_of::<RecordBatch>() as u64;
-
-        let actual_size = cached_result.memory_size();
+            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&schema)) as u64
+            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::table_refs_size(&input_tables))
+                as u64
+            + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
 
         assert_eq!(
-            actual_size, expected_size,
-            "Memory size should accurately reflect RecordBatch data size"
-        );
-
-        // Verify the size is reasonable (not zero, not absurdly large)
-        assert!(
-            actual_size > 0,
-            "Memory size should be greater than zero for non-empty batches"
+            cached_result.memory_size(),
+            expected_size,
+            "an entry must be billed its batches, its schema, its input tables and the store's per-entry overhead"
         );
         assert!(
-            actual_size < 10_000,
-            "Memory size should be reasonable for small test data"
+            cached_result.memory_size() < 10_000,
+            "Memory size should be reasonable for small test data, got {}",
+            cached_result.memory_size()
         );
     }
 
@@ -387,32 +397,75 @@ mod tests {
             None,
         );
 
-        let expected_size =
-            std::mem::size_of::<CachedQueryResult>() as u64 + encoded_data.len() as u64;
-        let actual_size = cached_result.memory_size();
+        let expected_size = std::mem::size_of::<CachedQueryResult>() as u64
+            + encoded_data.len() as u64
+            + (crate::sizing::ARC_HEADER_BYTES + crate::sizing::schema_size(&cached_result.schema))
+                as u64
+            + (crate::sizing::ARC_HEADER_BYTES
+                + crate::sizing::table_refs_size(&cached_result.input_tables)) as u64
+            + crate::sizing::ENTRY_OVERHEAD_BYTES as u64;
 
         assert_eq!(
-            actual_size, expected_size,
-            "Memory size should equal struct size plus encoded data length"
+            cached_result.memory_size(),
+            expected_size,
+            "an encoded entry must be billed its bytes plus everything it holds around them"
         );
     }
 
-    #[test]
-    fn test_memory_size_empty_batches() {
-        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
-        let batches = Vec::new();
-        let input_tables = Arc::new(HashSet::new());
+    fn empty_result_of_width(columns: usize) -> CachedQueryResult {
+        let schema = Arc::new(Schema::new(
+            (0..columns)
+                .map(|i| Field::new(format!("column_{i}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
         let cached_at = Instant::now();
 
-        let cached_result =
-            CachedQueryResult::new_raw(batches, schema, input_tables, cached_at, cached_at);
+        CachedQueryResult::new_raw(
+            Vec::new(),
+            schema,
+            Arc::new(HashSet::from([TableReference::bare("wide")])),
+            cached_at,
+            cached_at,
+        )
+    }
 
-        let expected_size = std::mem::size_of::<CachedQueryResult>() as u64;
-        let actual_size = cached_result.memory_size();
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12931>.
+    ///
+    /// A 0-row result contributes no array bytes, so when only those were
+    /// counted it weighed a flat `size_of::<Self>()` — 82 bytes, whatever its
+    /// schema — and the byte budget could never evict one. Cost has to scale
+    /// with what the entry actually holds.
+    #[test]
+    fn an_empty_result_is_billed_more_than_its_struct() {
+        let narrow = empty_result_of_width(4);
+        let wide = empty_result_of_width(200);
+        let struct_only = std::mem::size_of::<CachedQueryResult>() as u64;
 
-        assert_eq!(
-            actual_size, expected_size,
-            "Memory size for empty batches should be just struct overhead"
+        assert!(
+            narrow.memory_size() > struct_only,
+            "a 0-row entry still holds a schema and an input-table set, got {} vs {struct_only}",
+            narrow.memory_size()
+        );
+        assert!(
+            wide.memory_size() > 10 * narrow.memory_size(),
+            "a 200-column 0-row entry must cost far more than a 4-column one, got {} vs {}",
+            wide.memory_size(),
+            narrow.memory_size()
+        );
+    }
+
+    /// The bound `max_size` is meant to be: N entries of a known weight must not
+    /// fit in a budget smaller than N times that weight. Before the fix a
+    /// 1 MiB budget admitted 12,840 wide 0-row entries — ~500 MiB of real memory.
+    #[test]
+    fn a_byte_budget_bounds_a_stream_of_empty_results() {
+        let entry_weight = empty_result_of_width(200).memory_size();
+        let budget = 1024 * 1024_u64;
+
+        let admissible = budget / entry_weight;
+        assert!(
+            admissible < 200,
+            "a 1 MiB budget must not admit thousands of wide 0-row entries, it admits {admissible} at {entry_weight} bytes each"
         );
     }
 

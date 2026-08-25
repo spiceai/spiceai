@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::{
-    cmp::min,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -41,7 +40,7 @@ use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Searcher, TantivyError, Term,
+    DocAddress, Score, Searcher, TantivyError, Term,
     collector::TopDocs,
     query::{
         Bm25StatisticsProvider, BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser,
@@ -514,13 +513,16 @@ impl FullTextSearchFieldIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    fn search_query_literal(
+    /// Score the query against the index in a single `TopDocs` pass, bounded to `limit`.
+    /// Returns lightweight (score, address) pairs without resolving any stored document
+    /// contents — see [`Self::hits_to_json`], which resolves them in bounded chunks so a
+    /// large `limit` doesn't force every matched document's stored fields into memory at once.
+    fn search_top_docs(
         &self,
         literal: &str,
         filters: &[Box<dyn Query>],
         limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<(Score, DocAddress)>> {
         // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
         // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
         // are honored. Fall back to a bag-of-words OR clause for inputs the
@@ -553,15 +555,13 @@ impl FullTextSearchFieldIndex {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        let collector = TopDocs::with_limit(limit)
-            .and_offset(offset)
-            .order_by_score();
+        let collector = TopDocs::with_limit(limit).order_by_score();
 
         // When global statistics are present, score against them instead of the
         // local segments' statistics, so scores are comparable across the
         // partitions of a distributed index. The search still runs over the
         // local segments; only the BM25 collection statistics change.
-        let raw_hits = match self.global_stats.as_ref() {
+        match self.global_stats.as_ref() {
             Some(stats) => {
                 let field = self.search_field().ok_or_else(|| Error::TextSearchError {
                     source: TantivyError::FieldNotFound(self.field.clone()),
@@ -569,17 +569,17 @@ impl FullTextSearchFieldIndex {
                 let provider = GlobalBm25Provider::new(stats.as_ref(), field, &self.reader);
                 self.reader
                     .search_with_statistics_provider(&q, &collector, &provider)
-                    .context(TextSearchSnafu)?
+                    .context(TextSearchSnafu)
             }
-            None => self
-                .reader
-                .search(&q, &collector)
-                .context(TextSearchSnafu)?,
-        };
+            None => self.reader.search(&q, &collector).context(TextSearchSnafu),
+        }
+    }
 
-        let top_docs = raw_hits
-            .into_iter()
-            .map(|(score, addr)| {
+    /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
+    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks.
+    fn hits_to_json(&self, hits: &[(Score, DocAddress)]) -> Result<Vec<Value>> {
+        hits.iter()
+            .map(|&(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
                     self.reader.doc(addr).context(TextSearchSnafu)?;
 
@@ -604,9 +604,7 @@ impl FullTextSearchFieldIndex {
                 }
                 Ok(v)
             })
-            .collect::<Result<Vec<Value>>>()?;
-
-        Ok(top_docs)
+            .collect()
     }
 
     fn tantivy_json_to_arrow_decoder(
@@ -702,67 +700,70 @@ fn make_stream(
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
-        // Share the searcher into the blocking task that runs the synchronous
-        // tantivy search (mmap/disk reads + scoring + stored-field decode) off
-        // the async runtime thread (which also serves `/health`, `/v1/search`).
+        if limit == 0 {
+            return;
+        }
+
+        // Share the searcher into the blocking tasks that run synchronous tantivy work
+        // (mmap/disk reads + scoring + stored-field decode) off the async runtime thread
+        // (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
-        // Shared across pages; each page `box_clone`s the queries into its own BooleanQuery.
-        let filters = std::sync::Arc::new(filters);
-        let mut remaining_limit = limit;
-        let mut offset = 0;
-        while remaining_limit > 0 {
-            let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
-            let hits = {
-                let fts = std::sync::Arc::clone(&fts);
-                let filters = std::sync::Arc::clone(&filters);
-                let query = query.clone();
-                match tokio::task::spawn_blocking(move || {
-                    fts.search_query_literal(query.as_str(), filters.as_slice(), page_size, offset)
-                })
-                .await
-                {
-                    Ok(Ok(h)) => h,
-                    Ok(Err(e)) => {
-                        yield Err(DataFusionError::Internal(e.to_string()));
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(DataFusionError::Internal(format!(
-                            "full text search task failed: {e}"
-                        )));
-                        return;
-                    }
+
+        // Score the whole result set in a single `TopDocs` pass (bounded by `limit`), without
+        // resolving any stored document contents yet. The searcher is a fixed snapshot, so
+        // paging with `TopDocs` offsets would rescore the whole growing prefix on every page;
+        // a single pass avoids that, and these lightweight (score, address) pairs are cheap to
+        // hold in full even when `limit` is large, unlike the stored documents they address.
+        let blocking_fts = std::sync::Arc::clone(&fts);
+        let query = query.clone();
+        let top_docs = match tokio::task::spawn_blocking(move || {
+            blocking_fts.search_top_docs(query.as_str(), filters.as_slice(), limit)
+        }).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                yield Err(DataFusionError::Internal(e.to_string()));
+                return;
+            }
+            Err(e) => {
+                yield Err(DataFusionError::Internal(format!(
+                    "full text search task failed: {e}"
+                )));
+                return;
+            }
+        };
+
+        // Resolve stored documents and emit Arrow batches `DEFAULT_BATCH_SIZE` hits at a
+        // time, so memory stays bounded by the batch size rather than by `limit`.
+        for chunk in top_docs.chunks(DEFAULT_BATCH_SIZE) {
+            let blocking_fts = std::sync::Arc::clone(&fts);
+            let chunk = chunk.to_vec();
+            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&chunk)).await {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Internal(e.to_string()));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(DataFusionError::Internal(format!(
+                        "full text search task failed: {e}"
+                    )));
+                    return;
                 }
             };
 
-            // Decrement by *actual* hits returned (not the requested page size) so
-            // we stop once the index is exhausted instead of issuing further empty
-            // queries.
-            let returned = hits.len();
-            offset += returned;
-            remaining_limit = remaining_limit.saturating_sub(returned);
+            let mut decoder = match fts.tantivy_json_to_arrow_decoder(&hits)
+                .map_err(DataFusionError::from) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        yield Err(e);
+                        return
+                    }
+                };
 
-            if !hits.is_empty() {
-                let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
-                    .map_err(DataFusionError::from) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            yield Err(e);
-                            return
-                        }
-                    };
-
-                match decoder.flush() {
-                    Ok(Some(rb)) => yield Ok(rb),
-                    Ok(None) => {},
-                    Err(e) => yield Err(DataFusionError::from(e))
-                }
-            }
-
-            // Index is exhausted: a partial page (or empty page) means there are
-            // no more matching documents.
-            if returned < page_size {
-                return;
+            match decoder.flush() {
+                Ok(Some(rb)) => yield Ok(rb),
+                Ok(None) => {},
+                Err(e) => yield Err(DataFusionError::from(e))
             }
         }
     }
