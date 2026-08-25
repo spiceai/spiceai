@@ -4876,10 +4876,8 @@ mod tests {
 
         // Its own settings still build, so the refusal is about the mismatch and not about
         // the engine being unbuildable.
-        assert!(
-            (registration.constructor)(&AcceleratorRuntimeConfig::default_for(Engine::Cayenne))
-                .is_ok()
-        );
+        (registration.constructor)(&AcceleratorRuntimeConfig::default_for(Engine::Cayenne))
+            .expect("the engine must still build from its own configuration");
     }
 
     /// The write profile is the engine's answer about its *own* acceleration, so an
