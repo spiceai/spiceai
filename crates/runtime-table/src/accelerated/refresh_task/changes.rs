@@ -2430,30 +2430,33 @@ impl RefreshTask {
         );
 
         // Mid-stream schema evolution (policy != block) is a whole-burst
-        // decision, so it is settled here — before any sub-batch is applied —
-        // rather than at the first upsert. `group_into_sub_batches` emits a
-        // `Delete` ahead of an `Upsert` for a key deleted and recreated in one
-        // burst, and flushes a `Truncate` as a barrier, so deciding at the
-        // upsert lets those destructive halves commit and then refuses the
-        // replacement. The source keeps its position and redelivers, the same
-        // split re-applies the same destructive half, and the refusal fires
-        // again: the rows the burst was replacing never come back, however many
-        // times it is retried. Refusing up front leaves the acceleration
-        // untouched, so the redelivered burst is still whole and the operator's
-        // recovery runs against an intact table.
+        // decision, and it has to be settled before any sub-batch is applied.
+        // `group_into_sub_batches` emits a `Delete` ahead of the `Upsert` that
+        // recreates the same key and flushes a `Truncate` as a barrier, so a
+        // refusal raised from inside the upsert would arrive after those
+        // destructive halves had committed. Nothing recovers from that: the
+        // refusal stops the run without acknowledging, the source redelivers the
+        // same burst, the same split re-applies the same destructive half, and
+        // the refusal fires again, so the rows the burst was replacing never
+        // come back however many times it is retried. Deciding here leaves the
+        // acceleration untouched, which is what makes redelivery a safe outcome
+        // and lets the operator's recovery run against an intact table.
+        //
+        // The burst is a *coalesced* batch of source envelopes
+        // (`concat_change_batches`), so this one decision covers every envelope
+        // in the run and none of their committers ack.
         //
         // Gated on the burst carrying an upsert. A delete-only or truncate-only
         // burst never reads the incoming data schema (`process_delete_batch` and
         // `process_truncate` work from the primary keys alone), so a widening it
         // does not carry into the acceleration is not its refusal to raise —
         // classifying it would stall replication for a burst that applies
-        // cleanly. Those bursts do not reach the classifier today either, so
-        // this preserves their behavior rather than changing it.
+        // cleanly and whose ack covers a burst applied in full.
         //
-        // One call per burst replaces one per upsert sub-batch. The input is
-        // `change_batch.data_batch().schema()` either way — a burst-wide value
-        // that does not vary with the sub-batch — so the decision is unchanged
-        // and a multi-upsert burst classifies once instead of repeatedly.
+        // The input is `change_batch.data_batch().schema()`, a burst-wide value
+        // that does not vary with the sub-batch, and the target it is compared
+        // against is only changed by an upsert — so classifying once per burst
+        // reaches the same verdict as classifying per upsert sub-batch.
         if sub_batches
             .iter()
             .any(|(op_type, _)| matches!(op_type, ChangeOperationType::Upsert))
