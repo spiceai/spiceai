@@ -43,6 +43,7 @@ use datafusion::{
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -168,7 +169,7 @@ impl GlueCatalogProvider {
     async fn create_schema_provider(
         &self,
         database: String,
-    ) -> Result<(Arc<dyn SchemaProvider>, Option<String>)> {
+    ) -> Result<(Arc<dyn SchemaProvider>, Option<UnreadableSummary>)> {
         let mut tables_builder = self.client.get_tables().database_name(&database);
 
         if let Some(catalog_id) = &self.catalog_id {
@@ -414,18 +415,18 @@ fn is_readable(database: &str, table: &Table, unreadable: &mut UnreadableTables)
 /// Keying on the message instead (as a [`util::tracers::SpacedTracer`] does)
 /// would retain one entry for every distinct unreadable-table set the process
 /// ever saw, which grows without bound in a catalog whose tables churn. Storing
-/// the summary alongside the instant is what keeps a *changed* set reporting
-/// immediately rather than waiting out the interval.
+/// the set's fingerprint alongside the instant is what keeps a *changed* set
+/// reporting immediately rather than waiting out the interval.
 #[derive(Default)]
 struct UnreadableWarnings {
-    last: Mutex<HashMap<DatabaseName, (String, Instant)>>,
+    last: Mutex<HashMap<DatabaseName, (u64, Instant)>>,
 }
 
 impl UnreadableWarnings {
     /// Moves the warning state to `summaries` — one refresh's complete set of
     /// per-database unreadable-table summaries — and returns the summaries that
     /// are due to be logged.
-    fn reconcile(&self, summaries: &HashMap<DatabaseName, String>) -> Vec<String> {
+    fn reconcile(&self, summaries: &HashMap<DatabaseName, UnreadableSummary>) -> Vec<String> {
         self.reconcile_at(summaries, Instant::now())
     }
 
@@ -436,7 +437,11 @@ impl UnreadableWarnings {
     /// part-way has no complete `summaries`, and applying a partial one would
     /// both discard the state of databases it never reached and leave entries
     /// for databases the catalog does not end up holding.
-    fn reconcile_at(&self, summaries: &HashMap<DatabaseName, String>, now: Instant) -> Vec<String> {
+    fn reconcile_at(
+        &self,
+        summaries: &HashMap<DatabaseName, UnreadableSummary>,
+        now: Instant,
+    ) -> Vec<String> {
         let mut last = match self.last.lock() {
             Ok(last) => last,
             Err(poisoned) => poisoned.into_inner(),
@@ -452,16 +457,16 @@ impl UnreadableWarnings {
         let mut due = Vec::new();
         for (database, summary) in summaries {
             match last.get_mut(database) {
-                Some((last_summary, last_logged))
-                    if last_summary == summary
+                Some((last_fingerprint, last_logged))
+                    if *last_fingerprint == summary.fingerprint
                         && now.duration_since(*last_logged) < UNREADABLE_WARNING_INTERVAL => {}
                 Some(entry) => {
-                    *entry = (summary.clone(), now);
-                    due.push(summary.clone());
+                    *entry = (summary.fingerprint, now);
+                    due.push(summary.message.clone());
                 }
                 None => {
-                    last.insert(database.clone(), (summary.clone(), now));
-                    due.push(summary.clone());
+                    last.insert(database.clone(), (summary.fingerprint, now));
+                    due.push(summary.message.clone());
                 }
             }
         }
@@ -490,6 +495,23 @@ impl UnreadableWarnings {
 struct UnreadableTables {
     total: usize,
     sample: Vec<String>,
+    /// Identifies the *set*, which neither `total` nor `sample` does: the summary
+    /// spells out only [`Self::SAMPLE`] names and a count, so two different sets
+    /// of the same size that share their first sampled names render the same
+    /// line. Accumulated per name rather than stored per name, so a database of
+    /// ten thousand unreadable tables costs the same eight bytes as one.
+    fingerprint: u64,
+}
+
+/// One database's unreadable-table warning: the line an operator sees, and the
+/// fingerprint of the complete set that produced it.
+///
+/// The two travel together because [`UnreadableWarnings`] must decide "is this
+/// the same set as last time?" while logging the line — and the line alone
+/// cannot answer that, which is the whole reason `fingerprint` exists.
+struct UnreadableSummary {
+    fingerprint: u64,
+    message: String,
 }
 
 impl UnreadableTables {
@@ -504,6 +526,16 @@ impl UnreadableTables {
     /// otherwise split the summary across log lines.
     fn record(&mut self, table: &str) {
         self.total += 1;
+
+        // Order-independent, because Glue's listing order is not the operator's
+        // concern: the same tables listed differently is not news, and treating
+        // it as news would re-log a standing condition on an arbitrary refresh.
+        // `wrapping_add` rather than XOR so that a name appearing twice cannot
+        // cancel itself back out of the fingerprint.
+        let mut hasher = DefaultHasher::new();
+        table.hash(&mut hasher);
+        self.fingerprint = self.fingerprint.wrapping_add(hasher.finish());
+
         if self.sample.len() < Self::SAMPLE {
             self.sample.push(table.escape_debug().to_string());
         }
@@ -518,7 +550,7 @@ impl UnreadableTables {
     /// [`UnreadableWarnings`] rather than emitted on each one: a standing condition
     /// re-reported every minute for the life of the process is noise, while a set
     /// that *changed* — or that went away and came back — is reported at once.
-    fn summary(&self, catalog: &str, database: &str) -> Option<String> {
+    fn summary(&self, catalog: &str, database: &str) -> Option<UnreadableSummary> {
         if self.total == 0 {
             return None;
         }
@@ -530,13 +562,18 @@ impl UnreadableTables {
             n => format!(", and {n} more"),
         };
 
-        Some(format!(
+        let message = format!(
             "Catalog '{catalog}': skipping {total} Glue table(s) in database '{database}' that Spice cannot read: {named}{elided}. \
             They are not registered, so queries against them will not resolve. \
             Spice reads Glue tables stored as {SUPPORTED_INPUT_FORMATS}; run with debug logging for the reason each table was skipped, \
             or name them in the catalog's `exclude` patterns to suppress this warning. \
             For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue"
-        ))
+        );
+
+        Some(UnreadableSummary {
+            fingerprint: self.fingerprint,
+            message,
+        })
     }
 }
 
@@ -714,11 +751,32 @@ mod tests {
     const TEXT: &str = "org.apache.hadoop.mapred.TextInputFormat";
     const ORC: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 
+    /// The summary `database`'s unreadable `tables` produce, built through the
+    /// production [`UnreadableTables`] so the fingerprint under test is the one
+    /// the connector computes rather than one the test invented.
+    fn summary_of(database: &str, tables: &[&str]) -> UnreadableSummary {
+        let mut unreadable = UnreadableTables::default();
+        for table in tables {
+            unreadable.record(table);
+        }
+        unreadable
+            .summary("glue", database)
+            .expect("a non-empty unreadable set has a summary")
+    }
+
+    /// The line `database`'s unreadable `tables` log, so a test can name what it
+    /// expects to come due without re-spelling the wording. These tests are
+    /// about *which* refreshes report, not about how the line reads — that is
+    /// asserted by `a_table_glue_cannot_read_is_recorded_rather_than_dropped_silently`.
+    fn message_of(database: &str, tables: &[&str]) -> String {
+        summary_of(database, tables).message
+    }
+
     /// One refresh's per-database summaries, for [`UnreadableWarnings`].
-    fn refresh_of(summaries: &[(&str, &str)]) -> HashMap<DatabaseName, String> {
+    fn refresh_of(summaries: &[(&str, &[&str])]) -> HashMap<DatabaseName, UnreadableSummary> {
         summaries
             .iter()
-            .map(|(database, summary)| ((*database).to_string(), (*summary).to_string()))
+            .map(|(database, tables)| ((*database).to_string(), summary_of(database, tables)))
             .collect()
     }
 
@@ -726,13 +784,20 @@ mod tests {
     /// [`HashMap`].
     fn reconcile(
         warnings: &UnreadableWarnings,
-        summaries: &[(&str, &str)],
+        summaries: &[(&str, &[&str])],
         now: Instant,
     ) -> Vec<String> {
         let mut due = warnings.reconcile_at(&refresh_of(summaries), now);
         due.sort();
         due
     }
+
+    /// Three unreadable tables in `sales`, and the sets the other tests move to.
+    const SALES3: &[&str] = &["a", "b", "c"];
+    const SALES4: &[&str] = &["a", "b", "c", "d"];
+    const SALES5: &[&str] = &["a", "b", "c", "d", "e"];
+    const SALES6: &[&str] = &["a", "b", "c", "d", "e", "f"];
+    const ORDERS3: &[&str] = &["p", "q", "r"];
 
     /// A changed unreadable set must be reported at once, an unchanged one must
     /// wait out the interval, and neither may cost a map entry — the state is
@@ -744,45 +809,45 @@ mod tests {
         let start = Instant::now();
 
         assert_eq!(
-            reconcile(&warnings, &[("sales", "3 tables")], start),
-            ["3 tables"],
+            reconcile(&warnings, &[("sales", SALES3)], start),
+            [message_of("sales", SALES3)],
             "the first summary for a database must be reported"
         );
         assert!(
             reconcile(
                 &warnings,
-                &[("sales", "3 tables")],
-                start + Duration::from_secs(60)
+                &[("sales", SALES3)],
+                start + Duration::from_mins(1)
             )
             .is_empty(),
-            "the same summary inside the interval must stay suppressed"
+            "the same set inside the interval must stay suppressed"
         );
 
         // A different set is news, whatever the interval says.
-        for (elapsed, summary) in [(61, "4 tables"), (62, "5 tables"), (63, "6 tables")] {
+        for (elapsed, tables) in [(61, SALES4), (62, SALES5), (63, SALES6)] {
             assert_eq!(
                 reconcile(
                     &warnings,
-                    &[("sales", summary)],
+                    &[("sales", tables)],
                     start + Duration::from_secs(elapsed)
                 ),
-                [summary],
-                "a changed summary must be reported immediately: {summary}"
+                [message_of("sales", tables)],
+                "a changed set must be reported immediately: {tables:?}"
             );
         }
         assert_eq!(
             warnings.tracked_databases(),
             1,
-            "four distinct summaries for one database must cost one entry, not four"
+            "four distinct sets for one database must cost one entry, not four"
         );
 
         assert_eq!(
             reconcile(
                 &warnings,
-                &[("sales", "6 tables"), ("orders", "3 tables")],
+                &[("sales", SALES6), ("orders", ORDERS3)],
                 start + Duration::from_secs(64)
             ),
-            ["3 tables"],
+            [message_of("orders", ORDERS3)],
             "a summary another database has never reported must be reported, and \
              `sales` is unchanged inside its interval"
         );
@@ -796,7 +861,7 @@ mod tests {
         assert!(
             reconcile(
                 &warnings,
-                &[("sales", "6 tables")],
+                &[("sales", SALES6)],
                 start + Duration::from_secs(65)
             )
             .is_empty(),
@@ -810,10 +875,10 @@ mod tests {
         assert_eq!(
             reconcile(
                 &warnings,
-                &[("sales", "6 tables"), ("orders", "3 tables")],
+                &[("sales", SALES6), ("orders", ORDERS3)],
                 start + Duration::from_secs(66)
             ),
-            ["3 tables"],
+            [message_of("orders", ORDERS3)],
             "a database re-listed after being dropped starts over, so it reports again"
         );
     }
@@ -827,12 +892,12 @@ mod tests {
         let start = Instant::now();
 
         assert_eq!(
-            reconcile(&warnings, &[("sales", "3 tables")], start),
-            ["3 tables"]
+            reconcile(&warnings, &[("sales", SALES3)], start),
+            [message_of("sales", SALES3)]
         );
 
         // Every table readable again: no summary for `sales` at all.
-        assert!(reconcile(&warnings, &[], start + Duration::from_secs(60)).is_empty());
+        assert!(reconcile(&warnings, &[], start + Duration::from_mins(1)).is_empty());
         assert_eq!(
             warnings.tracked_databases(),
             0,
@@ -842,11 +907,76 @@ mod tests {
         assert_eq!(
             reconcile(
                 &warnings,
-                &[("sales", "3 tables")],
-                start + Duration::from_secs(120)
+                &[("sales", SALES3)],
+                start + Duration::from_mins(2)
             ),
-            ["3 tables"],
+            [message_of("sales", SALES3)],
             "the same set becoming unreadable again is a new event, not a repeat of the old one"
+        );
+    }
+
+    /// The summary spells out only [`UnreadableTables::SAMPLE`] names and a
+    /// count, so two different sets of the same size that agree on their first
+    /// sampled names render an identical line. Deciding "same as last time?" on
+    /// that line would withhold a genuinely changed set for the whole interval,
+    /// leaving the operator acting on a list of tables that is no longer the one
+    /// Spice cannot read.
+    #[test]
+    fn a_changed_set_that_renders_the_same_line_is_still_reported() {
+        let before: &[&str] = &["a", "b", "c", "d", "e", "f"];
+        let after: &[&str] = &["a", "b", "c", "d", "e", "g"];
+
+        assert_eq!(
+            message_of("sales", before),
+            message_of("sales", after),
+            "these two sets must render the same line, or this test proves nothing about \
+             telling them apart"
+        );
+
+        let warnings = UnreadableWarnings::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            reconcile(&warnings, &[("sales", before)], start),
+            [message_of("sales", before)]
+        );
+        assert_eq!(
+            reconcile(
+                &warnings,
+                &[("sales", after)],
+                start + Duration::from_mins(1)
+            ),
+            [message_of("sales", after)],
+            "a set that changed beyond the sampled names must be reported, not suppressed \
+             as a repeat of the line it happens to share"
+        );
+    }
+
+    /// The mirror of the case above: Glue returns a database's tables in its own
+    /// order, and the same tables listed differently are not news. Reporting
+    /// them would re-log a standing condition on whichever refresh the order
+    /// happened to change, which is the noise the interval exists to prevent.
+    #[test]
+    fn the_same_set_listed_in_a_different_order_is_not_reported() {
+        let listed: &[&str] = &["a", "b", "c", "d", "e", "f"];
+        let relisted: &[&str] = &["f", "e", "d", "c", "b", "a"];
+
+        let warnings = UnreadableWarnings::default();
+        let start = Instant::now();
+
+        assert_eq!(
+            reconcile(&warnings, &[("sales", listed)], start),
+            [message_of("sales", listed)]
+        );
+        assert!(
+            reconcile(
+                &warnings,
+                &[("sales", relisted)],
+                start + Duration::from_mins(1)
+            )
+            .is_empty(),
+            "the same tables in a different listing order are the same set, so the standing \
+             warning must stay suppressed"
         );
     }
 
@@ -858,14 +988,17 @@ mod tests {
         let start = Instant::now();
 
         assert_eq!(
-            reconcile(&warnings, &[("sales", "3 tables")], start),
-            ["3 tables"]
+            reconcile(&warnings, &[("sales", SALES3)], start),
+            [message_of("sales", SALES3)]
         );
         assert!(
             reconcile(
                 &warnings,
-                &[("sales", "3 tables")],
-                start + UNREADABLE_WARNING_INTERVAL - Duration::from_secs(1)
+                &[("sales", SALES3)],
+                start
+                    + UNREADABLE_WARNING_INTERVAL
+                        .checked_sub(Duration::from_secs(1))
+                        .expect("the warning interval is longer than one second")
             )
             .is_empty(),
             "one second short of the interval must stay suppressed"
@@ -873,10 +1006,10 @@ mod tests {
         assert_eq!(
             reconcile(
                 &warnings,
-                &[("sales", "3 tables")],
+                &[("sales", SALES3)],
                 start + UNREADABLE_WARNING_INTERVAL
             ),
-            ["3 tables"],
+            [message_of("sales", SALES3)],
             "the interval must expire, or a standing condition is reported once and never again"
         );
     }
@@ -938,7 +1071,8 @@ mod tests {
         one.record("archive");
         let one = one
             .summary("glue", "public")
-            .expect("one unreadable table must be reported");
+            .expect("one unreadable table must be reported")
+            .message;
         assert!(
             one.contains("Catalog 'glue': skipping 1 Glue table(s) in database 'public'"),
             "{one}"
@@ -967,7 +1101,8 @@ mod tests {
         );
         let many = many
             .summary("glue", "warehouse")
-            .expect("eight unreadable tables must be reported");
+            .expect("eight unreadable tables must be reported")
+            .message;
         assert!(many.contains("skipping 8 Glue table(s)"), "{many}");
         assert!(many.contains("t0, t1, t2, t3, t4"), "{many}");
         assert!(
@@ -985,7 +1120,8 @@ mod tests {
 
         let summary = unreadable
             .summary("glue", "public")
-            .expect("one unreadable table must be reported");
+            .expect("one unreadable table must be reported")
+            .message;
 
         assert!(
             !summary.contains('\n'),
