@@ -254,6 +254,36 @@ impl AccelerationSource for Dataset {
             snapshot_behavior,
         )
     }
+
+    fn definition_fingerprint(
+        &self,
+    ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
+        // A dataset's stored rows ARE the result of an editable definition: `from:` names
+        // the table they are copied from, and `acceleration.refresh_sql` filters and
+        // projects them. Rebinding `from:` to a same-schema table, or narrowing
+        // `refresh_sql`, changes what the rows mean while leaving the schema — the only
+        // thing snapshot metadata previously recorded — identical.
+        //
+        // Tolerant of unstamped archives, unlike a view: dataset snapshots shipped before
+        // this stamp existed, and refusing them would strand every snapshot taken before
+        // the upgrade. Mismatches are still refused, so everything published from here on
+        // is protected.
+        let mut identity = format!("from={}", self.from);
+        if let Some(refresh_sql) = self
+            .acceleration
+            .as_ref()
+            .and_then(|acceleration| acceleration.refresh_sql.as_deref())
+        {
+            identity.push_str("\nrefresh_sql=");
+            identity.push_str(refresh_sql.trim());
+        }
+        Some(
+            runtime_acceleration::acceleration_source::SourceDefinition {
+                fingerprint: crate::view::definition_fingerprint(&identity),
+                accept_unstamped: true,
+            },
+        )
+    }
 }
 
 #[cfg(test)]

@@ -366,11 +366,16 @@ impl RefreshTaskRunner {
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
     ) -> Refresh {
-        let mut r = defaults.read().await.clone();
-        if let Some(overrides) = overrides_opt {
-            r = r.with_overrides(&overrides);
+        let r = defaults.read().await.clone();
+        // Clear first: the cell is shared with the configured `Refresh` and survives across
+        // runs, so an ordinary refresh after an overridden one must retract the mark or the
+        // snapshot path would keep declining to publish forever.
+        r.materialization_overridden
+            .store(false, std::sync::atomic::Ordering::Release);
+        match overrides_opt {
+            Some(overrides) => r.with_overrides(&overrides),
+            None => r,
         }
-        r
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {

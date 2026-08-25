@@ -121,7 +121,7 @@ use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exist
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
-use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::acceleration::{SnapshotsConsistency, SnapshotsTrigger};
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -521,6 +521,48 @@ pub enum Error {
     SnapshotRefreshModeManagerUnavailable,
 
     #[snafu(display(
+        "Failed to enable acceleration snapshots for {component} '{name}': its acceleration \
+         keeps no data on disk (engine '{engine}', mode '{mode}'), so there is nothing a \
+         snapshot could capture or restore. Set `snapshots: disabled`, or give the \
+         acceleration a file-backed engine and `mode: file`. \
+         See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+    ))]
+    SnapshotsRequireFileAcceleration {
+        component: &'static str,
+        name: String,
+        engine: String,
+        mode: String,
+    },
+
+    #[snafu(display(
+        "Failed to enable acceleration snapshots for dataset '{name}': snapshots of a \
+         partitioned Cayenne acceleration are not supported, because the archive would omit \
+         the partitions' metadata and could not be restored. Set `snapshots: disabled`, or \
+         remove `partition_by` from the acceleration. \
+         See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
+    ))]
+    SnapshotsUnsupportedForPartitionedCayenne { name: String },
+
+    #[snafu(display(
+        "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
+         Set `snapshots: disabled` on the view, reduce its query to a single table scan, \
+         or set `snapshots_consistency: accept_skew` to publish anyway and accept that the \
+         stored rows may span several source positions. \
+         See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+    ))]
+    AcceleratedViewSnapshotsNotSingleRead { view_name: String, reason: String },
+
+    #[snafu(display(
+        "Failed to enable acceleration snapshots for view '{view_name}': its query could not \
+         be planned, so Spice cannot tell whether a snapshot of it would come from a single \
+         consistent read. Cause: {source}"
+    ))]
+    AcceleratedViewSnapshotsPlanFailed {
+        view_name: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display(
         "refresh_mode: snapshot could not resolve the accelerator file layout: {source}"
     ))]
     SnapshotRefreshModeLayoutUnavailable {
@@ -567,6 +609,11 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // An accelerated view whose query cannot yield a single consistent read.
+                | Self::AcceleratedViewSnapshotsNotSingleRead { .. }
+                // Snapshots asked for where they cannot work.
+                | Self::SnapshotsRequireFileAcceleration { .. }
+                | Self::SnapshotsUnsupportedForPartitionedCayenne { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -3045,6 +3092,32 @@ impl DataFusion {
                 .await
                 .ok();
 
+        // Snapshots asked for where they cannot work are refused rather than warned about.
+        // A configuration that accepts `snapshots: enabled` and then produces no snapshot
+        // is worse than one that fails: the operator believes the dataset is backed up,
+        // and finds out otherwise at the one moment it matters. Applies to bootstrap-only
+        // too — an acceleration with nothing on disk has nothing to restore into either.
+        if !acceleration_settings.snapshot_behavior.is_disabled() {
+            ensure!(
+                acceleration_layout
+                    .as_ref()
+                    .is_some_and(AccelerationLayout::is_enabled),
+                SnapshotsRequireFileAccelerationSnafu {
+                    component: "dataset",
+                    name: dataset.name.to_string(),
+                    engine: acceleration_settings.engine.to_string(),
+                    mode: acceleration_settings.mode.to_string(),
+                }
+            );
+            ensure!(
+                acceleration_settings.engine != Engine::Cayenne
+                    || acceleration_settings.partition_by.is_empty(),
+                SnapshotsUnsupportedForPartitionedCayenneSnafu {
+                    name: dataset.name.to_string(),
+                }
+            );
+        }
+
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
@@ -3065,6 +3138,9 @@ impl DataFusion {
                         refresh_mode,
                         layout.clone(),
                         snapshot_engine_override,
+                        // A dataset materializes one source and reads it once, so its
+                        // publishes need no veto.
+                        None,
                     )
                     .await?
                     {
@@ -3585,7 +3661,7 @@ impl DataFusion {
                 };
                 data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration_settings,
-                    &dataset_name,
+                    dataset,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
@@ -4461,6 +4537,57 @@ impl DataFusion {
         Ok(register_task)
     }
 
+    /// Decide whether an accelerated view may publish snapshots, and return the veto to
+    /// install for later publishes.
+    ///
+    /// `Ok(None)` means publish unconditionally — the operator set
+    /// `snapshots_consistency: accept_skew` and owns the consequence. `Ok(Some(gate))`
+    /// means the view reads once today and each later publish must prove it still does.
+    /// An `Err` refuses the view's configuration outright rather than silently
+    /// downgrading it to no snapshots, because the operator asked for snapshots and
+    /// would otherwise never learn they are not happening.
+    async fn view_snapshot_publish_gate(
+        self: &Arc<Self>,
+        view: &View,
+        table: &TableReference,
+    ) -> Result<Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>>> {
+        if matches!(
+            view.acceleration
+                .as_ref()
+                .map(|a| a.snapshots_consistency)
+                .unwrap_or_default(),
+            SnapshotsConsistency::AcceptSkew
+        ) {
+            tracing::warn!(
+                "View '{table}' publishes snapshots with `snapshots_consistency: accept_skew`, so a snapshot may hold rows captured at different source positions and a cold start will serve them. Remove `snapshots_consistency` to publish only from a single consistent read. See: https://spiceai.org/docs/components/data-accelerators/snapshots"
+            );
+            return Ok(None);
+        }
+
+        let shape = crate::view::analyzed_view_read_shape(&self.ctx, &view.sql)
+            .await
+            .context(AcceleratedViewSnapshotsPlanFailedSnafu {
+                view_name: table.to_string(),
+            })?;
+
+        if let Some(reason) = shape.refusal_reason() {
+            return AcceleratedViewSnapshotsNotSingleReadSnafu {
+                view_name: table.to_string(),
+                reason,
+            }
+            .fail();
+        }
+
+        Ok(Some(Arc::new(crate::view::ViewSnapshotPublishGate::new(
+            table.clone(),
+            Arc::clone(&view.sql),
+            &self.ctx,
+        ))
+            as Arc<
+                dyn runtime_acceleration::snapshot::SnapshotPublishGate,
+            >))
+    }
+
     pub async fn create_accelerated_view(
         self: &Arc<Self>,
         view: &View,
@@ -4561,6 +4688,86 @@ impl DataFusion {
 
         if let Some(semaphore) = &self.acceleration_refresh_semaphore {
             builder.refresh_semaphore(Arc::clone(semaphore));
+        }
+
+        // Acceleration snapshots. A view's accelerated rows are the *result* of its
+        // query, which brings two obligations a dataset does not have. A bootstrap must
+        // only load an archive materialized from this same SQL — carried by
+        // `View::definition_fingerprint`, checked inside the snapshot manager. And a
+        // publish must only capture a materialization that came from a single read,
+        // because a query that reads its sources twice captures them at two different
+        // positions and can store rows that never existed together; publishing that
+        // makes the discrepancy durable and reusable. That is decided here, and
+        // re-decided by `ViewSnapshotPublishGate` before every publish.
+        match get_acceleration_layout(view, &self.accelerator_engine_registry).await {
+            Ok(layout) if layout.is_enabled() => {
+                ensure!(
+                    acceleration.snapshot_behavior.is_disabled()
+                        || acceleration.engine != Engine::Cayenne
+                        || acceleration.partition_by.is_empty(),
+                    SnapshotsUnsupportedForPartitionedCayenneSnafu {
+                        name: table.to_string(),
+                    }
+                );
+
+                if acceleration.snapshot_behavior.create_enabled() {
+                    let publish_gate = self.view_snapshot_publish_gate(view, table).await?;
+
+                    let snapshot_engine_override = match self
+                        .accelerator_engine_registry
+                        .get_accelerator_engine(acceleration.engine)
+                        .await
+                    {
+                        Some(accel) => accel.snapshot_engine_for_source(view).await,
+                        None => None,
+                    };
+
+                    // `ViewBuilder::try_from` rejects every refresh mode but `full`, so
+                    // that is the mode the trigger is chosen for.
+                    if let Some(snapshot_config) = build_snapshot_creation_config(
+                        view,
+                        acceleration,
+                        RefreshMode::Full,
+                        layout.clone(),
+                        snapshot_engine_override,
+                        publish_gate,
+                    )
+                    .await?
+                    {
+                        builder.snapshot_creation_config(Some(snapshot_config));
+                    }
+                }
+                builder.acceleration_layout(layout);
+            }
+            // Same refusal as the dataset path: a view that accepts `snapshots: enabled`
+            // and then produces nothing is a false backup.
+            Ok(_) => {
+                ensure!(
+                    acceleration.snapshot_behavior.is_disabled(),
+                    SnapshotsRequireFileAccelerationSnafu {
+                        component: "view",
+                        name: table.to_string(),
+                        engine: acceleration.engine.to_string(),
+                        mode: acceleration.mode.to_string(),
+                    }
+                );
+            }
+            Err(e) => {
+                // Same refusal as the dataset path: a view that accepts `snapshots: enabled`
+                // and then cannot resolve anywhere to write them is a false backup.
+                ensure!(
+                    acceleration.snapshot_behavior.is_disabled(),
+                    SnapshotsRequireFileAccelerationSnafu {
+                        component: "view",
+                        name: table.to_string(),
+                        engine: acceleration.engine.to_string(),
+                        mode: acceleration.mode.to_string(),
+                    }
+                );
+                tracing::debug!(
+                    "No acceleration storage location for view '{table}', so no acceleration size metrics are reported. Cause: {e}"
+                );
+            }
         }
 
         // Wrap the DuckDB accelerator with HNSW vector indexes (if applicable).
@@ -5229,13 +5436,14 @@ async fn wait_until_dependent_tables_are_ready(
 }
 
 async fn build_snapshot_creation_config(
-    dataset: &Dataset,
+    source: &dyn crate::dataaccelerator::AccelerationSource,
     acceleration_settings: &Acceleration,
     refresh_mode: RefreshMode,
     acceleration_layout: AccelerationLayout,
     snapshot_engine_override: Option<
         Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
     >,
+    publish_gate: Option<Arc<dyn runtime_acceleration::snapshot::SnapshotPublishGate>>,
 ) -> Result<Option<SnapshotCreationConfig>> {
     // `refresh_mode: snapshot` is a read-only snapshot consumer. Even when the
     // dataset uses `acceleration.snapshots: enabled` (which normally enables
@@ -5245,22 +5453,8 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
-    // A partitioned Cayenne dataset must not publish snapshots: its exported
-    // metastore slice omits the partition child tables, so the uploaded archive
-    // could not be restored, yet `create_snapshot` would still make it the
-    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
-    if acceleration_settings.engine == Engine::Cayenne
-        && !acceleration_settings.partition_by.is_empty()
-    {
-        tracing::warn!(
-            dataset = %dataset.name,
-            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
-        );
-        return Ok(None);
-    }
-
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
-        || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
+        || (matches!(refresh_mode, RefreshMode::Append) && source.time_column().is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
     let snapshot_threshold: Option<String> =
         acceleration_settings.snapshots_trigger_threshold.clone();
@@ -5374,6 +5568,20 @@ async fn build_snapshot_creation_config(
         return Err(Error::UnsupportedAccelerationEngineForSnapshots);
     }
 
+    // A Cayenne bootstrap needs the per-dataset metastore slice that only
+    // `CayenneSnapshotEngine` writes. Publishing through the default engine would archive a
+    // raw `cayenne.db` with no slice, and nothing can restore that — while still becoming the
+    // store's `current-snapshot-id` and displacing a snapshot that could be restored.
+    // `snapshot_before_recreate` already refuses this; so must the periodic path.
+    #[cfg(not(windows))]
+    if acceleration_settings.engine == Engine::Cayenne && snapshot_engine_override.is_none() {
+        tracing::warn!(
+            "Snapshot creation is disabled for '{}': its Cayenne metastore catalog is unavailable, so an archive could not carry the metadata a restore needs",
+            source.name()
+        );
+        return Ok(None);
+    }
+
     #[cfg(any(
         feature = "duckdb",
         feature = "sqlite",
@@ -5381,7 +5589,7 @@ async fn build_snapshot_creation_config(
         not(windows)
     ))]
     Ok(SnapshotManager::try_new(
-        dataset.name.to_string(),
+        source.name().to_string(),
         acceleration_settings.snapshot_behavior.clone(),
         acceleration_layout,
         acceleration_engine,
@@ -5391,6 +5599,19 @@ async fn build_snapshot_creation_config(
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
         let sm = if let Some(engine) = snapshot_engine_override {
             sm.with_snapshot_engine(engine)
+        } else {
+            sm
+        };
+        // Stamped on publish and re-checked on bootstrap. A view's identity is its SQL; a
+        // dataset's is its `from:` plus `refresh_sql`, both of which shape the stored rows
+        // while leaving the schema untouched.
+        let sm = if let Some(definition) = source.definition_fingerprint() {
+            sm.with_source_definition(definition)
+        } else {
+            sm
+        };
+        let sm = if let Some(gate) = publish_gate {
+            sm.with_publish_gate(gate)
         } else {
             sm
         };
@@ -5488,6 +5709,14 @@ async fn build_snapshot_refresh_state(
                 .boxed()
             }
         });
+    // Fingerprinted like every other manager built from a source: `refresh_mode: snapshot`
+    // is the path that loads someone else's snapshots, so it is the last place that should
+    // accept an archive materialized from a different definition.
+    let manager = match crate::dataaccelerator::AccelerationSource::definition_fingerprint(dataset)
+    {
+        Some(definition) => manager.with_source_definition(definition),
+        None => manager,
+    };
     let manager = manager
         .with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy)
         .with_checkpointer_factory(checkpoint_factory);
@@ -5975,6 +6204,7 @@ mod tests {
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -5999,6 +6229,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;
@@ -6027,6 +6258,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Snapshot,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;
@@ -6057,6 +6289,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;
@@ -6096,6 +6329,7 @@ mod tests {
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -6134,6 +6368,7 @@ mod tests {
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -6166,6 +6401,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;
@@ -6200,6 +6436,7 @@ mod tests {
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -6233,6 +6470,7 @@ mod tests {
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -6262,6 +6500,7 @@ mod tests {
                 RefreshMode::Append,
                 AccelerationLayout::file(snapshot_path),
                 None,
+                None,
             )
             .await;
 
@@ -6290,6 +6529,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Full,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;
@@ -6322,6 +6562,7 @@ mod tests {
                 &acceleration,
                 RefreshMode::Changes,
                 AccelerationLayout::file(snapshot_path),
+                None,
                 None,
             )
             .await;

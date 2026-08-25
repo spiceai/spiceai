@@ -307,11 +307,18 @@ where
                 }
 
                 // Add all files from this directory recursively
-                add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
-                    .map_err(|e| ArchiveError::CreateArchive {
-                        path: dir_path.clone(),
-                        source: e,
-                    })?;
+                let mut members: HashSet<String> = HashSet::new();
+                add_directory_to_archive_filtered(
+                    &mut archive,
+                    dir_path,
+                    archive_prefix,
+                    &skip,
+                    &mut members,
+                )
+                .map_err(|e| ArchiveError::CreateArchive {
+                    path: dir_path.clone(),
+                    source: e,
+                })?;
             }
 
             // Append in-memory extras after the on-disk content.
@@ -360,12 +367,30 @@ where
 /// # Errors
 /// Returns an error when the destination file or any archive input cannot be
 /// read or written.
+/// What an archive run produced: its size, and the set of paths actually written into it.
+///
+/// The member set is what lets a caller verify the archive it is about to publish, rather
+/// than re-inspecting the filesystem the archive was built from — which answers a
+/// different question, and answers it wrong whenever the two disagree (a skipped symlink,
+/// a path outside the archived directories, a file recreated after the walk passed it).
+#[derive(Debug, Default)]
+pub struct ArchiveOutcome {
+    pub bytes: u64,
+    pub members: HashSet<String>,
+}
+
+/// Archive directories directly into a filesystem file without materializing the tar
+/// payload in memory, reporting what was written.
+///
+/// # Errors
+/// Returns an error when the destination file or any archive input cannot be read or
+/// written.
 pub async fn archive_directories_to_file_with_plan(
     dirs: &[(PathBuf, String)],
     destination: &Path,
     skip_relative_paths: &[PathBuf],
     extras: &[(String, Vec<u8>)],
-) -> Result<u64> {
+) -> Result<ArchiveOutcome> {
     let dirs = dirs.to_vec();
     let destination = destination.to_path_buf();
     let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
@@ -378,6 +403,7 @@ pub async fn archive_directories_to_file_with_plan(
                 source,
             })?;
         let mut archive = tar::Builder::new(file);
+        let mut members: HashSet<String> = HashSet::new();
 
         for (dir_path, archive_prefix) in &dirs {
             let metadata = match std::fs::symlink_metadata(dir_path) {
@@ -400,11 +426,17 @@ pub async fn archive_directories_to_file_with_plan(
                 );
                 continue;
             }
-            add_directory_to_archive_filtered(&mut archive, dir_path, archive_prefix, &skip)
-                .map_err(|source| ArchiveError::CreateArchive {
-                    path: dir_path.clone(),
-                    source,
-                })?;
+            add_directory_to_archive_filtered(
+                &mut archive,
+                dir_path,
+                archive_prefix,
+                &skip,
+                &mut members,
+            )
+            .map_err(|source| ArchiveError::CreateArchive {
+                path: dir_path.clone(),
+                source,
+            })?;
         }
 
         for (archive_path, bytes) in &extras {
@@ -416,6 +448,7 @@ pub async fn archive_directories_to_file_with_plan(
             archive
                 .append_data(&mut header, archive_path.as_str(), bytes.as_slice())
                 .map_err(|source| ArchiveError::WriteArchive { source })?;
+            members.insert(archive_path.clone());
         }
         archive
             .finish()
@@ -425,7 +458,10 @@ pub async fn archive_directories_to_file_with_plan(
             .map_err(|source| ArchiveError::WriteArchive { source })?;
         std::io::Write::flush(&mut file).map_err(|source| ArchiveError::WriteArchive { source })?;
         file.metadata()
-            .map(|metadata| metadata.len())
+            .map(|metadata| ArchiveOutcome {
+                bytes: metadata.len(),
+                members,
+            })
             .map_err(|source| ArchiveError::CreateArchive {
                 path: destination,
                 source,
@@ -1107,6 +1143,7 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
     dir_path: &Path,
     archive_prefix: &str,
     skip_relative_paths: &HashSet<PathBuf>,
+    members: &mut HashSet<String>,
 ) -> std::io::Result<()> {
     use std::fs;
 
@@ -1116,6 +1153,7 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
         base_path: &Path,
         archive_prefix: &str,
         skip_relative_paths: &HashSet<PathBuf>,
+        members: &mut HashSet<String>,
     ) -> std::io::Result<()> {
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
@@ -1155,9 +1193,11 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
                         base_path,
                         archive_prefix,
                         skip_relative_paths,
+                        members,
                     )?;
                 } else if metadata.is_file() {
                     archive.append_path_with_name(&path, &archive_path)?;
+                    members.insert(archive_path.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1170,6 +1210,7 @@ fn add_directory_to_archive_filtered<W: std::io::Write>(
         dir_path,
         archive_prefix,
         skip_relative_paths,
+        members,
     )
 }
 
@@ -1278,10 +1319,22 @@ mod tests {
         let archive_path = test_dir.path().join("snapshot.tar");
         let dirs = vec![(data_dir.clone(), "data/".to_string())];
         let extras = vec![("meta.json".to_string(), b"{\"v\":1}".to_vec())];
-        let bytes_written =
+        let archived =
             archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras).await?;
-        assert!(bytes_written > 0);
+        assert!(archived.bytes > 0);
         assert!(archive_path.exists());
+        // The member list is what a caller verifies the archive against, so it must name
+        // both the walked file and the in-memory extra.
+        assert!(
+            archived.members.contains("meta.json"),
+            "extras are archive members too: {:?}",
+            archived.members
+        );
+        assert!(
+            archived.members.iter().any(|m| m.starts_with("data/")),
+            "walked files are reported under their archive prefix: {:?}",
+            archived.members
+        );
 
         let extract_dir = TempDir::new().expect("Failed to create extract dir");
         extract_archive_file_with_options(

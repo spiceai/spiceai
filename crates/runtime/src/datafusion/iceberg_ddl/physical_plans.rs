@@ -176,6 +176,14 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
             Err("an Iceberg DDL acceleration source has no accelerator to checkpoint".into())
         })
     }
+
+    fn definition_fingerprint(
+        &self,
+    ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
+        // A DDL-created table holds rows written to it directly; it materializes no
+        // definition a snapshot could disagree with.
+        None
+    }
 }
 
 /// Physical plan for creating an Iceberg table.

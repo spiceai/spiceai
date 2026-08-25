@@ -57,6 +57,14 @@ pub enum AccelerationLayout {
     },
 }
 
+/// Archive prefix for the directory holding an accelerator's own metadata (for Cayenne,
+/// the metastore database). Shared between datasets, so its presence says nothing about
+/// whether any one dataset has an acceleration.
+pub const METADATA_ARCHIVE_PREFIX: &str = "metadata/";
+
+/// Archive prefix for the directory holding the accelerated data itself. Per-dataset.
+pub const DATA_ARCHIVE_PREFIX: &str = "data/";
+
 impl AccelerationLayout {
     /// Creates a file-based layout.
     #[must_use]
@@ -74,8 +82,8 @@ impl AccelerationLayout {
     pub fn cayenne(metadata_dir: PathBuf, data_dir: PathBuf) -> Self {
         Self::Directories {
             dirs: vec![
-                (metadata_dir, "metadata/".to_string()),
-                (data_dir, "data/".to_string()),
+                (metadata_dir, METADATA_ARCHIVE_PREFIX.to_string()),
+                (data_dir, DATA_ARCHIVE_PREFIX.to_string()),
             ],
         }
     }
@@ -103,6 +111,69 @@ impl AccelerationLayout {
             Self::None => None,
             Self::File { path } => Some(path),
             Self::Directories { dirs } => dirs.first().map(|(p, _)| p),
+        }
+    }
+
+    /// The path holding the accelerated data itself, as opposed to metadata an
+    /// accelerator may keep in a directory shared with other datasets.
+    ///
+    /// For a directory layout this is the entry tagged [`DATA_ARCHIVE_PREFIX`], falling
+    /// back to the last entry for a layout built by [`Self::directories`] with its own
+    /// prefixes. It is deliberately NOT [`Self::primary_path`]: that returns the first
+    /// directory, which for Cayenne is the *metastore* directory — shared by every
+    /// Cayenne dataset in the pod and created by the metastore itself the moment it
+    /// opens.
+    #[must_use]
+    pub fn data_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::None => None,
+            Self::File { path } => Some(path),
+            Self::Directories { dirs } => dirs
+                .iter()
+                .find(|(_, prefix)| prefix == DATA_ARCHIVE_PREFIX)
+                // A single-directory layout has only one candidate, so there is nothing to
+                // guess. With several and no tagged payload directory there is, and guessing
+                // wrong reports "no acceleration" for a location that holds one — which would
+                // let a bootstrap restore over live data. Answer `None`; the caller reads
+                // that as "assume something is there".
+                .or(match dirs.as_slice() {
+                    [only] => Some(only),
+                    _ => None,
+                })
+                .map(|(p, _)| p),
+        }
+    }
+
+    /// Whether an acceleration already exists on disk here.
+    ///
+    /// This is the question a snapshot bootstrap must ask: it may only restore into a
+    /// place that holds nothing, or it would overwrite live data.
+    ///
+    /// For a file layout, existence of the file answers it. For a directory layout the
+    /// directory's *existence* answers nothing — an accelerator creates its directories
+    /// during `init`, before the bootstrap runs — so the test is whether the data
+    /// directory holds any entry. An unreadable directory answers `true`: the bootstrap's
+    /// safe default is to leave whatever is there alone.
+    #[must_use]
+    pub fn has_existing_acceleration(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::File { path } => path.exists(),
+            Self::Directories { .. } => {
+                let Some(data_dir) = self.data_path() else {
+                    // Cannot tell which directory holds the data, so cannot tell whether it
+                    // is empty. Report that an acceleration exists: the cost is a skipped
+                    // bootstrap, where the other answer is a restore over live data.
+                    return true;
+                };
+                if !data_dir.exists() {
+                    return false;
+                }
+                match std::fs::read_dir(data_dir) {
+                    Ok(mut entries) => entries.next().is_some(),
+                    Err(_) => true,
+                }
+            }
         }
     }
 
@@ -194,6 +265,113 @@ mod tests {
         } else {
             panic!("Expected Directories variant");
         }
+    }
+
+    /// Regression: the bootstrap gate must not read "an acceleration exists" off a
+    /// directory the accelerator itself just created. Cayenne's metastore creates the
+    /// metadata directory the moment it opens — before the bootstrap runs — and that
+    /// directory is shared by every Cayenne dataset in the pod, so keying on it skipped
+    /// every bootstrap unconditionally.
+    #[test]
+    fn directory_layout_with_only_metastore_files_has_no_acceleration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        // What Cayenne's `init` leaves behind before the bootstrap runs.
+        std::fs::write(metadata_dir.join("cayenne.db"), b"x").expect("write metastore");
+
+        let layout = AccelerationLayout::cayenne(metadata_dir.clone(), data_dir.clone());
+
+        assert_eq!(
+            layout.primary_path(),
+            Some(&metadata_dir),
+            "primary_path still names the metadata dir; the gate must not use it"
+        );
+        assert_eq!(layout.data_path(), Some(&data_dir));
+        assert!(
+            !layout.has_existing_acceleration(),
+            "an empty data dir beside a live metastore is not an acceleration"
+        );
+    }
+
+    #[test]
+    fn directory_layout_with_data_has_an_acceleration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp.path().join("metadata");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        std::fs::create_dir_all(data_dir.join("table-id")).expect("create table dir");
+
+        let layout = AccelerationLayout::cayenne(metadata_dir, data_dir);
+        assert!(layout.has_existing_acceleration());
+    }
+
+    #[test]
+    fn missing_data_dir_has_no_acceleration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let layout = AccelerationLayout::cayenne(
+            temp.path().join("metadata"),
+            temp.path().join("never-created"),
+        );
+        assert!(!layout.has_existing_acceleration());
+    }
+
+    #[test]
+    fn file_layout_tracks_file_existence() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db = temp.path().join("accel.db");
+        let layout = AccelerationLayout::file(db.clone());
+        assert!(!layout.has_existing_acceleration());
+        std::fs::write(&db, b"x").expect("write db");
+        assert!(layout.has_existing_acceleration());
+        assert_eq!(layout.data_path(), Some(&db));
+    }
+
+    #[test]
+    fn none_layout_has_no_acceleration() {
+        assert!(!AccelerationLayout::None.has_existing_acceleration());
+        assert!(AccelerationLayout::None.data_path().is_none());
+    }
+
+    /// A multi-directory layout with no tagged payload directory cannot be resolved, and
+    /// must answer "assume an acceleration is there" — guessing wrong the other way lets a
+    /// bootstrap restore over live data.
+    #[test]
+    fn custom_prefix_layout_without_a_data_directory_is_unresolvable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let first = temp.path().join("first");
+        let last = temp.path().join("last");
+        std::fs::create_dir_all(&first).expect("create first");
+        std::fs::create_dir_all(&last).expect("create last");
+        std::fs::write(last.join("payload"), b"x").expect("write payload");
+
+        let layout = AccelerationLayout::directories(vec![
+            (first, "a/".to_string()),
+            (last, "b/".to_string()),
+        ]);
+        assert_eq!(
+            layout.data_path(),
+            None,
+            "no entry is tagged as the payload"
+        );
+        assert!(
+            layout.has_existing_acceleration(),
+            "an unresolvable layout must not invite a restore"
+        );
+    }
+
+    /// A single-directory layout has exactly one candidate, so it resolves without guessing.
+    #[test]
+    fn single_directory_layout_resolves_without_a_data_prefix() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let only = temp.path().join("only");
+        std::fs::create_dir_all(&only).expect("create dir");
+
+        let layout = AccelerationLayout::directories(vec![(only.clone(), "x/".to_string())]);
+        assert_eq!(layout.data_path(), Some(&only));
+        assert!(!layout.has_existing_acceleration());
     }
 
     #[test]

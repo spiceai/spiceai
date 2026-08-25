@@ -75,15 +75,25 @@ pub async fn download_snapshot_if_needed(
         return BootstrapStatus::none();
     }
 
-    let Some(primary_path) = layout.primary_path().cloned() else {
-        tracing::debug!("No primary path for acceleration layout, skipping download");
+    if !layout.is_enabled() {
+        tracing::debug!("No storage paths for the acceleration layout, skipping download");
         return BootstrapStatus::none();
-    };
+    }
 
-    if primary_path.exists() {
+    // Asks the layout whether an acceleration is already present, rather than testing one
+    // path for existence. For a directory-layout engine the accelerator has already
+    // created its directories by the time this runs — Cayenne's metastore creates the
+    // metadata directory the moment it opens, and that directory is shared by every
+    // Cayenne dataset in the pod — so an existence test on a path would answer "yes"
+    // unconditionally and silently skip every bootstrap.
+    if layout.has_existing_acceleration() {
         tracing::info!(
-            "Acceleration already exists at {}, skipping snapshot download",
-            primary_path.display()
+            "Acceleration for '{}' already exists at {}, skipping snapshot download",
+            source.name(),
+            layout.data_path().map_or_else(
+                || "the configured location".to_string(),
+                |p| p.display().to_string()
+            )
         );
         return BootstrapStatus::none();
     }
@@ -105,6 +115,12 @@ pub async fn download_snapshot_if_needed(
         let mut manager = manager.with_checkpointer_factory(checkpoint_factory);
         if let Some(engine_override) = engine_override {
             manager = manager.with_snapshot_engine(engine_override);
+        }
+        // A source whose rows are the result of a definition (a view's SQL) must not
+        // bootstrap an archive materialized from a different one: the rows would be
+        // wrong rather than merely old, and no schema check would catch it.
+        if let Some(definition) = source.definition_fingerprint() {
+            manager = manager.with_source_definition(definition);
         }
         let start_time = Instant::now();
         match manager.download_latest_snapshot().await {
@@ -140,7 +156,7 @@ pub async fn download_snapshot_if_needed(
 /// `engine_override` parallels [`download_snapshot_if_needed`].
 pub async fn snapshot_before_recreate(
     acceleration: &Acceleration,
-    dataset_name: &str,
+    source: &dyn AccelerationSource,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
     schema: Arc<arrow_schema::Schema>,
@@ -148,6 +164,22 @@ pub async fn snapshot_before_recreate(
     refresh_mode: RefreshMode,
 ) {
     if !acceleration.snapshot_behavior.create_enabled() {
+        return;
+    }
+
+    let dataset_name = source.name().to_string();
+
+    // A source whose rows are the result of a definition (a view's SQL) cannot publish
+    // from here. This runs inside the accelerator's `init`, before the runtime has
+    // planned the definition, so there is no way to establish that the outgoing
+    // materialization came from a single read — and publishing makes whatever it holds
+    // the store's current snapshot. The live publish path decides that question with the
+    // compiled plan in hand; this one would be guessing, and the cost of guessing wrong
+    // is a durable wrong answer rather than a missing backup.
+    if source.definition_fingerprint().is_some() {
+        tracing::warn!(
+            "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: Spice cannot confirm from here that those rows came from a single consistent read of this view's sources"
+        );
         return;
     }
 
@@ -194,7 +226,7 @@ pub async fn snapshot_before_recreate(
     }
 
     let Some(manager) = SnapshotManager::try_new(
-        dataset_name.to_string(),
+        dataset_name.clone(),
         acceleration.snapshot_behavior.clone(),
         layout,
         engine,

@@ -16,8 +16,11 @@ limitations under the License.
 
 use app::App;
 use datafusion::sql::TableReference;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use snafu::prelude::*;
-use spicepod::{component::view as spicepod_view, vector::VectorStore};
+use spicepod::{
+    acceleration as spicepod_acceleration, component::view as spicepod_view, vector::VectorStore,
+};
 use std::ops::{Deref, DerefMut};
 use std::{collections::HashMap, fs, sync::Arc};
 
@@ -114,6 +117,14 @@ pub struct ViewBuilder {
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
+    /// Carried separately from `acceleration` for the same reason as on
+    /// `DatasetBuilder`: `Acceleration::try_from` cannot resolve a
+    /// [`SnapshotBehavior`], which needs the pod-level `snapshots:` block and the
+    /// runtime's secrets and IO runtime. `build_with` resolves it once both are in
+    /// hand. A view that skips this step keeps the `Disabled` default and silently
+    /// ignores its own `snapshots:` setting.
+    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
     pub ready_state: ReadyState,
     pub vectors: Option<VectorStore>,
     pub params: HashMap<String, String>,
@@ -138,6 +149,19 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         };
 
         let metadata = view.metadata();
+
+        let acceleration_snapshot_behavior = view
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
+        let acceleration_snapshot_compaction = view
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotsCompaction::Disabled, |a| {
+                a.snapshots_compaction
+            });
 
         let acceleration = view
             .acceleration
@@ -169,6 +193,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
             metadata,
             columns: view.columns,
             acceleration,
+            acceleration_snapshot_behavior,
+            acceleration_snapshot_compaction,
             ready_state: ReadyState::from(view.ready_state),
             vectors: view.vectors,
             params: view
@@ -193,7 +219,9 @@ impl AccelerationSource for View {
             return acceleration.enabled
                 && matches!(
                     acceleration.mode,
-                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                    acceleration::Mode::File
+                        | acceleration::Mode::FileCreate
+                        | acceleration::Mode::FileUpdate
                 );
         }
         false
@@ -289,6 +317,24 @@ impl AccelerationSource for View {
             snapshot_behavior,
         )
     }
+
+    fn definition_fingerprint(
+        &self,
+    ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
+        // A view's accelerated rows are the result of its whole definition closure — its
+        // own SQL plus every view it transitively reads — so that is what a snapshot of
+        // them is valid against. Strict about unstamped archives: view snapshots have
+        // carried a stamp since the day they existed, so one without is not from this
+        // view's series.
+        Some(
+            runtime_acceleration::acceleration_source::SourceDefinition {
+                fingerprint: crate::view::definition_fingerprint(
+                    &crate::view::view_definition_closure(&self.name, &self.sql, &self.app),
+                ),
+                accept_unstamped: false,
+            },
+        )
+    }
 }
 
 impl ViewBuilder {
@@ -300,6 +346,8 @@ impl ViewBuilder {
             metadata: HashMap::default(),
             columns: vec![],
             acceleration: None,
+            acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
+            acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction::Disabled,
             ready_state: ReadyState::default(),
             vectors: None,
             params: HashMap::default(),
@@ -307,7 +355,17 @@ impl ViewBuilder {
     }
 
     #[must_use]
-    pub fn build_with(self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
+    pub fn build_with(mut self, runtime: Arc<Runtime>, app: Arc<App>) -> View {
+        if let Some(acceleration) = self.acceleration.as_mut() {
+            acceleration.snapshot_behavior = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot_behavior,
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+                self.acceleration_snapshot_compaction,
+            );
+        }
+
         View {
             spec: ViewSpec {
                 name: self.name,

@@ -21,6 +21,27 @@ use runtime_secrets::Secrets;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 
+/// Identity of the definition a source's rows were materialized from, and how to treat a
+/// snapshot that records no definition at all.
+#[derive(Debug, Clone)]
+pub struct SourceDefinition {
+    /// Stable hash of the definition. A snapshot recording a *different* value is always
+    /// refused: its rows answer a different question.
+    pub fingerprint: String,
+    /// Whether a snapshot recording NO definition may still be restored.
+    ///
+    /// `false` where every archive the source could have published carries a stamp, so an
+    /// unstamped one cannot belong to its series — true of accelerated views, for which
+    /// snapshots have never existed without one.
+    ///
+    /// `true` where stamping was introduced after archives already existed. Refusing those
+    /// would strand every snapshot taken before the upgrade, for a series whose definition
+    /// has most likely not changed at all — a large, certain cost to close a smaller,
+    /// possible hole. Accepting them still refuses every *mismatch*, so the protection
+    /// applies in full to everything published from here on.
+    pub accept_unstamped: bool,
+}
+
 pub type InitializedSourcesFuture<'a> =
     Pin<Box<dyn Future<Output = Vec<Arc<dyn AccelerationSource>>> + Send + 'a>>;
 
@@ -117,6 +138,25 @@ pub trait AccelerationSource: Send + Sync {
         &self,
         snapshot_behavior: crate::snapshot::SnapshotBehavior,
     ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
+
+    /// Stable identity of the definition whose result this source's rows are, or `None`
+    /// for a source whose rows are not a function of one.
+    ///
+    /// A dataset answers `None`: its rows are a copy of a named source table, and a
+    /// snapshot of them is meaningful against any later run of the same dataset. A view
+    /// answers with its SQL's fingerprint, because its rows are that query's *result* —
+    /// change the query and the archived rows answer a question nobody is asking any
+    /// more. The schema check cannot stand in for it: `WHERE region = 'us'` and `WHERE
+    /// region = 'eu'` share a schema and share nothing else.
+    ///
+    /// Recorded in the snapshot metadata on publish and re-checked on bootstrap, so a
+    /// restored archive can never be served under a definition it was not materialized
+    /// from.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default `None` would silently opt a new
+    /// definition-bearing source out of that check.
+    fn definition_fingerprint(&self) -> Option<SourceDefinition>;
 }
 
 /// The refresh mode `source` actually runs with, applying the connector's fill-in for an

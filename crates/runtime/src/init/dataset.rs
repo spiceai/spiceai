@@ -91,23 +91,34 @@ impl Runtime {
         // the same `runtime.dataset_load_parallelism` budget.
         let semaphore = Arc::clone(&self.dataset_load_semaphore);
 
-        // Before loading datasets, we must initialize views accelerators (if any).
-        // This is required for acceleration federation for some engines (e.g. `DuckDB`).
         let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
-        self.initialize_views_accelerators(&valid_views).await;
+        let startup_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
-        let startup_datasets = valid_datasets;
-
-        // Validate Cayenne snapshot consistency before initializing accelerators.
-        // All Cayenne datasets sharing the same metadata directory must have the same
-        // snapshot configuration (either all enabled or all disabled).
-        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        // Validate snapshot consistency before initializing ANY accelerator — views
+        // included, and ahead of `initialize_views_accelerators` below, because the
+        // check exists to refuse a configuration before it writes anything. Running it
+        // after the views had already opened their accelerations would let the very
+        // collision it names happen first.
+        //
+        // Views take part in this sweep and in `validate_snapshot_paths` below: a view
+        // carries its own `acceleration` block and joins the same accelerator instance,
+        // so a view sharing a `duckdb_file` or a Cayenne metadata directory with a
+        // dataset is exactly the collision these checks refuse. Walking datasets alone
+        // leaves it to surface as a corrupted restore instead. (Same shape as #12160,
+        // which fixed the DuckDB pool-sizing and `replace_file` walks.)
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> = startup_datasets
+            .iter()
+            .map(|ds| ds.clone_arc())
+            .chain(valid_views.iter().map(|vv| vv.view.clone_arc()))
+            .collect();
         if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
+
+        // Views' accelerators initialize before the datasets load: acceleration
+        // federation needs them in place for some engines (e.g. `DuckDB`).
+        self.initialize_views_accelerators(&valid_views).await;
 
         let init_results = self
             .initialize_datasets_accelerators(&startup_datasets)
@@ -118,6 +129,7 @@ impl Runtime {
             .iter()
             .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
             .map(|ds| ds.clone_arc())
+            .chain(valid_views.iter().map(|vv| vv.view.clone_arc()))
             .collect();
         if let Err(err) =
             validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await

@@ -203,4 +203,9 @@ impl AccelerationSource for TestAccelerationSource {
             Err("a test acceleration source has no accelerator to checkpoint".into())
         })
     }
+
+    fn definition_fingerprint(&self) -> Option<crate::acceleration_source::SourceDefinition> {
+        // The test source stands in for a dataset: no definition behind its rows.
+        None
+    }
 }

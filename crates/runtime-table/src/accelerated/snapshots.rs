@@ -274,15 +274,24 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
-        let refresh_sql = refresh
-            .read()
-            .await
-            .sql
-            .as_ref()
-            .map(super::refresh::RefreshSQL::to_sql);
+        let (refresh_sql, overridden) = {
+            let refresh = refresh.read().await;
+            (
+                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
+                refresh.materialized_from_overrides(),
+            )
+        };
+        if overridden {
+            tracing::warn!(
+                "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the acceleration was last refreshed with request-scoped overrides, whose result the configured definition does not describe"
+            );
+        }
         create_checkpoint_and_snapshot(
             &checkpointer,
-            Some(&snapshot_manager),
+            // `None` still checkpoints, it just publishes nothing — which is what an
+            // overridden materialization warrants: the rows are real and worth recording
+            // locally, but no archive of them can carry the configured definition's identity.
+            (!overridden).then_some(&snapshot_manager),
             &checkpoint_schema,
             &accelerator_write_mutex,
             &dataset_name,
@@ -306,15 +315,16 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
-            let refresh_sql = refresh
-                .read()
-                .await
-                .sql
-                .as_ref()
-                .map(super::refresh::RefreshSQL::to_sql);
+            let (refresh_sql, overridden) = {
+                let refresh = refresh.read().await;
+                (
+                    refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
+                    refresh.materialized_from_overrides(),
+                )
+            };
             create_checkpoint_and_snapshot(
                 &checkpointer,
-                Some(&snapshot_manager),
+                (!overridden).then_some(&snapshot_manager),
                 &checkpoint_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
@@ -379,15 +389,16 @@ pub fn create_periodic_snapshot_callback(
                     return;
                 }
                 if !bootstrap_status.is_bootstrapped() {
-                    let refresh_sql = refresh_clone
-                        .read()
-                        .await
-                        .sql
-                        .as_ref()
-                        .map(super::refresh::RefreshSQL::to_sql);
+                    let (refresh_sql, overridden) = {
+                        let refresh = refresh_clone.read().await;
+                        (
+                            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
+                            refresh.materialized_from_overrides(),
+                        )
+                    };
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
-                        Some(&snapshot_manager_clone),
+                        (!overridden).then_some(&snapshot_manager_clone),
                         &checkpoint_schema_clone,
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
@@ -430,15 +441,16 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
-                        let refresh_sql = refresh
-                            .read()
-                            .await
-                            .sql
-                            .as_ref()
-                            .map(super::refresh::RefreshSQL::to_sql);
+                        let (refresh_sql, overridden) = {
+                            let refresh = refresh.read().await;
+                            (
+                                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
+                                refresh.materialized_from_overrides(),
+                            )
+                        };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
-                            Some(&snapshot_manager),
+                            (!overridden).then_some(&snapshot_manager),
                             &checkpoint_schema,
                             &accelerator_write_mutex,
                             &dataset_name,

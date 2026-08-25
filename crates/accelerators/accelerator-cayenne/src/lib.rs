@@ -3428,6 +3428,27 @@ impl DataAccelerator for CayenneAccelerator {
                 "S3 Express One Zone is optimized for low-latency access within the same AWS Availability Zone. Access from outside AWS may experience higher latency."
             );
 
+            // This path returns before the snapshot bootstrap below, so an S3 Express
+            // acceleration can never restore from a snapshot — while snapshot *creation*
+            // is not gated, and would archive only the metadata directory, since the data
+            // lives in the bucket rather than under a local directory the archiver can
+            // walk. Publishing archives that nothing can consume is worse than publishing
+            // none: the operator believes the dataset is backed up. Refuse the
+            // combination instead of half-honouring it.
+            if let Some(acceleration) = source.acceleration()
+                && !matches!(
+                    acceleration.snapshot_behavior,
+                    runtime_acceleration::snapshot::SnapshotBehavior::Disabled
+                )
+            {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Failed to register dataset {} (cayenne accelerator): acceleration snapshots are not supported for S3 Express One Zone storage, because the data lives in the bucket rather than in a local directory a snapshot can capture. Set `snapshots: disabled` on this dataset, or move the acceleration to local storage by removing `cayenne_s3_zone_ids` and the S3 Express `cayenne_file_path`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots",
+                        source.name()
+                    )),
+                }));
+            }
+
             return Ok(BootstrapStatus::none());
         }
 
@@ -3445,7 +3466,7 @@ impl DataAccelerator for CayenneAccelerator {
                 );
                 data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration,
-                    &source.name().to_string(),
+                    source,
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
                     Arc::new(arrow_schema::Schema::empty()),
@@ -3536,10 +3557,28 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
-            let snapshot_engine = match self
+            let catalog = self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await
+                .await;
+
+            // An acceleration already exists if the METASTORE knows this table, not merely
+            // if the configured directory has contents. The two disagree exactly when the
+            // configured path changes: Cayenne treats a base-path change as non-destructive
+            // and keeps using the stored path, so the newly configured directory is empty
+            // while live — possibly newer — data sits under the old one. Bootstrapping on
+            // the directory alone would import an older slice, and the import replaces this
+            // dataset's metastore rows wholesale, orphaning the live files behind it.
+            if let Ok(catalog) = catalog.as_ref()
+                && catalog.get_table(&source.name().to_string()).await.is_ok()
             {
+                tracing::info!(
+                    "Acceleration for '{}' is already registered in the Cayenne metastore, so no snapshot is restored over it",
+                    source.name()
+                );
+                return Ok(BootstrapStatus::none());
+            }
+
+            let snapshot_engine = match catalog {
                 Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
                     catalog,
                     source.name().to_string(),
