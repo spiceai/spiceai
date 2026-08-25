@@ -16,12 +16,14 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray, MutableArrayData,
-        RecordBatch, RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
+        Array, ArrayData, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray,
+        MutableArrayData, RecordBatch, RecordBatchOptions, StringViewArray, StructArray,
+        make_array, new_null_array,
     },
     buffer::{Buffer, OffsetBuffer},
     datatypes::{
-        BinaryViewType, ByteViewType, DataType, Field, SchemaRef, StringViewType, TimeUnit,
+        BinaryViewType, ByteViewType, DataType, Field, FieldRef, SchemaRef, StringViewType,
+        TimeUnit,
     },
     error::ArrowError,
 };
@@ -33,6 +35,7 @@ use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
 use crate::format::{FormatOperation, format_column_data};
+use crate::type_rewrite::relabel_array_data;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -43,6 +46,13 @@ pub enum Error {
 
     #[snafu(display("Field is not nullable: {field}"))]
     FieldNotNullable { field: String },
+
+    #[snafu(display(
+        "Failed to align column '{column}': the target schema declares '{path}' non-nullable, but the column holds nulls there. \
+        Declare '{path}' nullable in the target schema, or stop the source emitting nulls for it. \
+        See: https://spiceai.org/docs/reference/spicepod/datasets"
+    ))]
+    NullsUnderNonNullableField { column: String, path: String },
 }
 
 impl From<Error> for DataFusionError {
@@ -51,7 +61,7 @@ impl From<Error> for DataFusionError {
             Error::UnableToConvertRecordBatch {
                 source: arrow_error,
             } => DataFusionError::ArrowError(Box::new(arrow_error), None),
-            Error::FieldNotNullable { .. } => {
+            Error::FieldNotNullable { .. } | Error::NullsUnderNonNullableField { .. } => {
                 DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
             }
         }
@@ -67,8 +77,15 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
     let existing_schema = record_batch.schema();
 
     // When schema is superset of the existing schema, including a new column, and nullable column,
-    // return a new RecordBatch to reflect the change
-    if schema.contains(&existing_schema) {
+    // return a new RecordBatch to reflect the change.
+    //
+    // `Schema::contains` answers "is this assignable", which permits a nested field's nullability
+    // to differ; `RecordBatch` requires a column's type and its field's type to be identical, and
+    // `with_schema` re-labels the schema without touching the columns. So a merely-assignable
+    // schema taken through here yields a batch advertising a type none of its columns carries,
+    // which reads as aligned and then fails in whichever kernel first rebuilds a column. Only an
+    // exact match may skip the per-column work below.
+    if schema.contains(&existing_schema) && declares_the_same_types(&schema, &existing_schema) {
         return record_batch
             .with_schema(schema)
             .context(UnableToConvertRecordBatchSnafu);
@@ -87,7 +104,11 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
                 record_batch.schema().field_with_name(field.name()),
                 record_batch.column_by_name(field.name()),
             ) {
-                if field.contains(existing_field) {
+                // Identical to the schema-level test above, for the same reason: `contains`
+                // alone would pass the column through still carrying a type `RecordBatch::try_new`
+                // then refuses against the field declaring it.
+                if field.contains(existing_field) && field.data_type() == existing_field.data_type()
+                {
                     Ok(Arc::clone(column))
                 } else {
                     cast_column(column, existing_field.data_type(), field, &cast_options)
@@ -117,6 +138,17 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
 }
 
+/// Whether every field of `existing` has a same-named field in `target` carrying the identical
+/// type — the condition `RecordBatch` enforces, as distinct from the assignability
+/// `Schema::contains` answers.
+fn declares_the_same_types(target: &SchemaRef, existing: &SchemaRef) -> bool {
+    existing.fields().iter().all(|existing_field| {
+        target
+            .field_with_name(existing_field.name())
+            .is_ok_and(|target_field| target_field.data_type() == existing_field.data_type())
+    })
+}
+
 /// Returns `true` when `source` → `target` is a timestamp-to-timestamp cast that
 /// only changes the time unit (and possibly the timezone string), meaning the
 /// underlying physical values need rescaling and may overflow on far-future/past
@@ -144,6 +176,10 @@ fn cast_column(
     target_field: &Field,
     strict_options: &CastOptions,
 ) -> Result<ArrayRef> {
+    if is_nullability_only_relabel(source_type, target_field.data_type()) {
+        return relabel_nullability(column, target_field);
+    }
+
     match cast_with_options(column.as_ref(), target_field.data_type(), strict_options) {
         Ok(casted) => Ok(casted),
         Err(ref e)
@@ -172,6 +208,124 @@ fn is_overflow_error(e: &ArrowError) -> bool {
         ArrowError::CastError(msg) | ArrowError::ArithmeticOverflow(msg)
             if msg.contains("Overflow") || msg.contains("overflow")
     )
+}
+
+/// Whether `target` can be reached from `source` by relabelling alone: the two describe the same
+/// values in the same buffers, and differ only in the nullability flags of nested fields.
+///
+/// `arrow_cast::cast` has no path for such a pair. For a `Map` it hands the target `entries` field
+/// straight to `MapArray::try_new`, which refuses a nullable one, so two `Map` types differing only
+/// there fail with `MapArray entries cannot contain nulls` whether or not a null is involved — a
+/// message that names neither the column nor the real disagreement.
+///
+/// Only the child-bearing types whose children [`relabel_array_data`] pairs positionally are
+/// walked; everything else is compared whole. A type this does not know about — a `Union`,
+/// `Dictionary` or `RunEndEncoded` carrying the difference — therefore fails the test and keeps
+/// its existing cast path rather than being relabelled on a pairing that was never checked.
+///
+/// Field names and metadata have to match. A rename is a different question from a nullability
+/// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
+/// from a pair of renames, which positional pairing would then carry across transposed.
+fn is_nullability_only_relabel(source: &DataType, target: &DataType) -> bool {
+    match (source, target) {
+        (DataType::List(source_item), DataType::List(target_item))
+        | (DataType::LargeList(source_item), DataType::LargeList(target_item))
+        | (DataType::ListView(source_item), DataType::ListView(target_item))
+        | (DataType::LargeListView(source_item), DataType::LargeListView(target_item)) => {
+            is_field_nullability_only_relabel(source_item, target_item)
+        }
+        (
+            DataType::FixedSizeList(source_item, source_len),
+            DataType::FixedSizeList(target_item, target_len),
+        ) if source_len == target_len => {
+            is_field_nullability_only_relabel(source_item, target_item)
+        }
+        (
+            DataType::Map(source_entries, source_sorted),
+            DataType::Map(target_entries, target_sorted),
+        ) if source_sorted == target_sorted => {
+            is_field_nullability_only_relabel(source_entries, target_entries)
+        }
+        (DataType::Struct(source_fields), DataType::Struct(target_fields))
+            if source_fields.len() == target_fields.len() =>
+        {
+            source_fields
+                .iter()
+                .zip(target_fields)
+                .all(|(source_field, target_field)| {
+                    is_field_nullability_only_relabel(source_field, target_field)
+                })
+        }
+        _ => source == target,
+    }
+}
+
+/// The [`is_nullability_only_relabel`] test for one field pair.
+fn is_field_nullability_only_relabel(source: &FieldRef, target: &FieldRef) -> bool {
+    source.name() == target.name()
+        && source.metadata() == target.metadata()
+        && source.dict_is_ordered() == target.dict_is_ordered()
+        && is_nullability_only_relabel(source.data_type(), target.data_type())
+}
+
+/// Carries `column` to `target_field`'s type by relabelling its declaration, sharing every buffer —
+/// values, offsets and validity — with the original.
+///
+/// Only called for a pair [`is_nullability_only_relabel`] accepts, so no value changes meaning.
+fn relabel_nullability(column: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
+    let data = column.to_data();
+
+    if let Some(path) =
+        narrowed_field_holding_nulls(&data, target_field.data_type(), target_field.name())
+    {
+        return NullsUnderNonNullableFieldSnafu {
+            column: target_field.name(),
+            path,
+        }
+        .fail();
+    }
+
+    relabel_array_data(data, target_field.data_type())
+        .map(make_array)
+        .context(UnableToConvertRecordBatchSnafu)
+}
+
+/// The path to the first nested field `target` declares non-nullable where `data` holds nulls.
+///
+/// Relabelling carries the validity buffers across untouched, so narrowing a field the data
+/// actually leaves null would hand on an array whose declaration contradicts its own null mask —
+/// which every later kernel is entitled to trust. Such a pair is reported against the field it
+/// disagrees on instead.
+///
+/// `data`'s type and `target` satisfy [`is_nullability_only_relabel`], so the child counts line up
+/// at every level walked here; `zip` truncates rather than indexing, so a disagreement cannot panic.
+fn narrowed_field_holding_nulls(data: &ArrayData, target: &DataType, path: &str) -> Option<String> {
+    let children: Vec<(&ArrayData, &FieldRef)> = match target {
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::Map(item, _) => data
+            .child_data()
+            .iter()
+            .zip(std::iter::once(item))
+            .collect(),
+        DataType::Struct(fields) => data.child_data().iter().zip(fields.iter()).collect(),
+        _ => return None,
+    };
+
+    for (child, field) in children {
+        let child_path = format!("{path}.{}", field.name());
+        if !field.is_nullable() && child.null_count() > 0 {
+            return Some(child_path);
+        }
+        if let Some(found) = narrowed_field_holding_nulls(child, field.data_type(), &child_path) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 /// Flattens a list of struct types with a single field into a list of primitive types.
@@ -1805,5 +1959,395 @@ mod test {
         let compacted = compact_retained_buffers(&batch);
 
         assert_eq!(compacted.num_rows(), 7);
+    }
+}
+
+#[cfg(test)]
+mod nullability_alignment_tests {
+    use super::*;
+    use arrow::array::{Int32Array, MapArray, StringArray, StructArray};
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Fields;
+
+    fn entry_fields() -> Fields {
+        vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]
+        .into()
+    }
+
+    fn map_type(entries_nullable: bool) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields()),
+                entries_nullable,
+            )),
+            false,
+        )
+    }
+
+    /// Builds a `MapArray` the way the IPC reader does — through `From<ArrayData>`, which
+    /// performs neither of the two `entries` checks. That is why a column declaring `entries`
+    /// nullable reaches schema alignment at all.
+    fn map_from_parts(
+        entries_nullable: bool,
+        entry_nulls: Option<NullBuffer>,
+        offsets: &[i32],
+        keys: Vec<&str>,
+        values: Vec<Option<&str>>,
+    ) -> MapArray {
+        let entries = StructArray::try_new(
+            entry_fields(),
+            vec![
+                Arc::new(StringArray::from(keys)) as ArrayRef,
+                Arc::new(StringArray::from(values)) as ArrayRef,
+            ],
+            entry_nulls,
+        )
+        .expect("entries struct");
+
+        let data = ArrayData::builder(map_type(entries_nullable))
+            .len(offsets.len() - 1)
+            .add_buffer(Buffer::from_slice_ref(offsets))
+            .add_child_data(entries.to_data())
+            .build()
+            .expect("map array data");
+
+        MapArray::from(data)
+    }
+
+    fn batch_of(name: &str, column: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                name,
+                column.data_type().clone(),
+                true,
+            )])),
+            vec![column],
+        )
+        .expect("batch")
+    }
+
+    fn schema_of(name: &str, data_type: DataType) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(name, data_type, true)]))
+    }
+
+    /// The constructor every kernel that rebuilds a map column goes through. A column that
+    /// survives it is one the rest of the engine can actually use.
+    fn rebuild_through_public_constructor(
+        column: &ArrayRef,
+    ) -> std::result::Result<(), ArrowError> {
+        let map = column
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map column");
+        let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
+        MapArray::try_new(field, offsets, entries, nulls, ordered).map(|_| ())
+    }
+
+    /// The address of the key column's value buffer, so a rebuild can be told from a relabel.
+    fn keys_buffer_ptr(column: &ArrayRef) -> *const u8 {
+        let map = column
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map column");
+        map.keys().to_data().buffers()[1].as_ptr()
+    }
+
+    fn map_pairs(batch: &RecordBatch) -> Vec<(String, Option<String>)> {
+        let map = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .expect("map column");
+        let keys = map
+            .keys()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("keys");
+        let values = map
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("values");
+
+        (0..keys.len())
+            .map(|i| {
+                (
+                    keys.value(i).to_string(),
+                    values.is_valid(i).then(|| values.value(i).to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// Regression test for #13285. `Schema::contains` permits a nested field's nullability to
+    /// differ, but `RecordBatch` requires a column's type and its field's type to be identical,
+    /// and `with_schema` re-labels the schema while leaving the columns alone. So alignment used
+    /// to hand back a batch advertising `entries` nullable over a column that still carried it
+    /// non-nullable — no error, and a schema contradicting its own data.
+    #[test]
+    fn an_aligned_batch_advertises_the_type_its_columns_actually_carry() {
+        let column = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 2],
+            vec!["a", "b"],
+            vec![Some("1"), None],
+        )) as ArrayRef;
+
+        let aligned = try_cast_to(
+            batch_of("col_map", column),
+            schema_of("col_map", map_type(true)),
+        )
+        .expect("a nested nullability flag is a declaration, not a value");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type(),
+            "the batch must not advertise a type none of its columns carries"
+        );
+        assert_eq!(aligned.schema().field(0).data_type(), &map_type(true));
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![
+                ("a".to_string(), Some("1".to_string())),
+                ("b".to_string(), None),
+            ],
+            "relabelling shares the buffers, so every key and value survives it unchanged"
+        );
+    }
+
+    /// The same disagreement where the schema-level path cannot fire: a sibling column genuinely
+    /// needs a cast, so every column is decided on its own. `Field::contains` waved the map column
+    /// through unchanged and `RecordBatch::try_new` then refused the batch it built, naming two
+    /// `Map` types that differ somewhere in a rendering of the whole type.
+    ///
+    /// The target here declares `entries` nullable, which the Arrow map layout does not allow;
+    /// aligning to it is still the right answer, because alignment delivers the schema it was
+    /// asked for. Bringing an illegal declaration into line is `map_entries`' job, at ingress.
+    #[test]
+    fn a_map_column_beside_one_needing_a_cast_is_aligned_rather_than_refused() {
+        let map_column = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 1],
+            vec!["a"],
+            vec![Some("1")],
+        )) as ArrayRef;
+        let keys_before = keys_buffer_ptr(&map_column);
+        let source = Schema::new(vec![
+            Field::new("col_map", map_type(false), true),
+            Field::new("n", DataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(source),
+            vec![map_column, Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::new(vec![
+            Field::new("col_map", map_type(true), true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+
+        let aligned =
+            try_cast_to(batch, target).expect("one column needing a cast must not fail the other");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type()
+        );
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![("a".to_string(), Some("1".to_string()))]
+        );
+        assert_eq!(aligned.column(1).data_type(), &DataType::Int64);
+        assert_eq!(
+            keys_buffer_ptr(aligned.column(0)),
+            keys_before,
+            "the relabel carries the values across by reference rather than rebuilding them"
+        );
+    }
+
+    /// The disagreement is not always at the top of the type. A `Map` nested inside a `Struct`
+    /// is reached through the struct arm of the walk, and `Field::contains` relaxes a nested
+    /// nullability flag at any depth — so the column was waved through carrying a struct type the
+    /// field declaring it did not match.
+    #[test]
+    fn a_map_nested_inside_a_struct_is_aligned() {
+        let struct_of = |entries_nullable: bool| {
+            DataType::Struct(
+                vec![
+                    Field::new("m", map_type(entries_nullable), true),
+                    Field::new("n", DataType::Int32, true),
+                ]
+                .into(),
+            )
+        };
+        let inner = Arc::new(map_from_parts(
+            false,
+            None,
+            &[0, 1],
+            vec!["a"],
+            vec![Some("1")],
+        )) as ArrayRef;
+        let DataType::Struct(source_fields) = struct_of(false) else {
+            unreachable!("built as a struct above")
+        };
+        let column = Arc::new(
+            StructArray::try_new(
+                source_fields,
+                vec![inner, Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+                None,
+            )
+            .expect("struct"),
+        ) as ArrayRef;
+
+        let aligned = try_cast_to(
+            batch_of("col_struct", column),
+            schema_of("col_struct", struct_of(true)),
+        )
+        .expect("a nested map's declaration is still only a declaration");
+
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type(),
+            "the batch must not advertise a type none of its columns carries"
+        );
+        assert_eq!(aligned.schema().field(0).data_type(), &struct_of(true));
+        assert_eq!(aligned.num_rows(), 1);
+    }
+
+    /// The one shape a relabel cannot carry: the entries array really does hold nulls, so
+    /// narrowing the field would hand on an array whose declaration contradicts its own null
+    /// mask. It is refused, and the refusal names the column and the field rather than
+    /// reporting Arrow's `MapArray entries cannot contain nulls` against neither.
+    #[test]
+    fn nulls_under_a_narrowed_field_are_refused_by_name() {
+        let column = Arc::new(map_from_parts(
+            true,
+            Some(NullBuffer::from(vec![true, false])),
+            &[0, 2],
+            vec!["a", "b"],
+            vec![Some("1"), Some("2")],
+        )) as ArrayRef;
+
+        let error = try_cast_to(
+            batch_of("col_map", column),
+            schema_of("col_map", map_type(false)),
+        )
+        .expect_err("entry nulls cannot be relabelled away");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("col_map") && rendered.contains("col_map.entries"),
+            "the refusal has to name the column and the field it disagrees on, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("holds nulls"),
+            "the refusal has to say what is wrong with the data, got: {rendered}"
+        );
+    }
+
+    /// A rename is a different question from a nullability flag. Admitting it here would make a
+    /// reorder of same-typed sibling fields indistinguishable from a pair of renames, which
+    /// positional pairing would carry across transposed — so a renamed field keeps the cast path.
+    #[test]
+    fn a_renamed_nested_field_is_not_relabelled() {
+        let renamed_entries = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(entry_fields()),
+                false,
+            )),
+            false,
+        );
+
+        assert!(
+            !is_nullability_only_relabel(&map_type(true), &renamed_entries),
+            "a renamed entries field is not a nullability-only difference"
+        );
+    }
+
+    /// `sorted` is a promise about the order of the entries buffer, not a declaration about it,
+    /// so a pair differing there is not relabellable however the nullability flags line up.
+    #[test]
+    fn a_map_with_a_different_sorted_flag_is_not_relabelled() {
+        let sorted = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(entry_fields()),
+                false,
+            )),
+            true,
+        );
+
+        assert!(!is_nullability_only_relabel(&map_type(true), &sorted));
+        assert!(!is_nullability_only_relabel(&map_type(false), &sorted));
+    }
+
+    /// A `FixedSizeList`'s length is how many values each row owns, so a pair differing there
+    /// describes a different layout however the nullability flags line up.
+    #[test]
+    fn a_fixed_size_list_of_a_different_length_is_not_relabelled() {
+        let fixed = |len: i32, item_nullable: bool| {
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int32, item_nullable)),
+                len,
+            )
+        };
+
+        assert!(!is_nullability_only_relabel(
+            &fixed(2, true),
+            &fixed(3, false)
+        ));
+        assert!(is_nullability_only_relabel(
+            &fixed(2, true),
+            &fixed(2, false)
+        ));
+    }
+
+    /// A type this walk does not know about fails the test and keeps its cast path, rather than
+    /// being relabelled on a child pairing that was never checked.
+    #[test]
+    fn a_difference_carried_by_an_unwalked_type_is_not_relabelled() {
+        let source = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(true)));
+        let target = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(false)));
+
+        assert!(!is_nullability_only_relabel(&source, &target));
+    }
+
+    /// An extension type lives in a field's metadata and renames what its storage buffers mean,
+    /// so a pair differing there is not a nullability-only relabel however the flags line up.
+    #[test]
+    fn a_changed_extension_type_is_not_relabelled() {
+        let extension = |name: &str| {
+            Arc::new(
+                Field::new("item", DataType::FixedSizeBinary(16), false).with_metadata(
+                    [("ARROW:extension:name".to_string(), name.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+        };
+
+        assert!(!is_nullability_only_relabel(
+            &DataType::List(extension("arrow.uuid")),
+            &DataType::List(extension("arrow.opaque")),
+        ));
+    }
+
+    /// The relabel path must not swallow the casts that already worked: a genuine type change
+    /// still goes through `arrow_cast`.
+    #[test]
+    fn a_genuine_type_change_still_casts() {
+        let batch = batch_of("n", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef);
+
+        let casted = try_cast_to(batch, schema_of("n", DataType::Int64)).expect("int widening");
+
+        assert_eq!(casted.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(casted.num_rows(), 2);
     }
 }
