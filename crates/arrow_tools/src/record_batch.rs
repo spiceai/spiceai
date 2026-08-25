@@ -16,9 +16,8 @@ limitations under the License.
 
 use arrow::{
     array::{
-        Array, ArrayData, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray,
-        MutableArrayData, RecordBatch, RecordBatchOptions, StringViewArray, StructArray,
-        make_array, new_null_array,
+        Array, ArrayRef, BinaryViewArray, GenericByteViewArray, ListArray, MutableArrayData,
+        RecordBatch, RecordBatchOptions, StringViewArray, StructArray, make_array, new_null_array,
     },
     buffer::{Buffer, OffsetBuffer},
     datatypes::{
@@ -1925,7 +1924,7 @@ mod test {
 #[cfg(test)]
 mod nullability_alignment_tests {
     use super::*;
-    use arrow::array::{Int32Array, MapArray, StringArray, StructArray};
+    use arrow::array::{ArrayData, Int32Array, MapArray, StringArray, StructArray};
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::Fields;
 
