@@ -637,8 +637,8 @@ mod deliverer_tests {
             Some(Arc::clone(&deliverer) as Arc<dyn WriteBackDeliverer>),
         );
 
-        let delivered = worker.deliver_batch().await.expect("pass succeeds");
-        assert_eq!(delivered, 1, "the one dirty marker was claimed");
+        let claimed = worker.deliver_batch().await.expect("pass succeeds");
+        assert_eq!(claimed, 1, "the one dirty marker was claimed");
         assert_eq!(
             deliverer.upserts.lock().len(),
             1,
@@ -672,8 +672,8 @@ mod deliverer_tests {
             Some(Arc::clone(&deliverer) as Arc<dyn WriteBackDeliverer>),
         );
 
-        let delivered = worker.deliver_batch().await.expect("pass succeeds");
-        assert_eq!(delivered, 1, "the one dirty marker was claimed");
+        let claimed = worker.deliver_batch().await.expect("pass succeeds");
+        assert_eq!(claimed, 1, "the one dirty marker was claimed");
         assert!(
             deliverer.upserts.lock().is_empty(),
             "no keys are present, so deliver_upserts is never called"

@@ -56,7 +56,7 @@ use crate::{configure_test_datafusion, init_tracing};
 /// How long to wait for a value to propagate in either direction — Spice → the
 /// source through the delivery worker (which polls once a second), or the source
 /// → Spice through the CDC stream.
-const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(60);
+const PROPAGATION_TIMEOUT: Duration = Duration::from_mins(1);
 /// Poll interval while waiting.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -253,7 +253,7 @@ async fn build_runtime(name: &str, datasets: Vec<Dataset>) -> Result<Arc<Runtime
     // worker thread is dropped and a stall says only that it elapsed.
     eprintln!("[{name}] runtime built; loading components");
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(120)) => {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
             // Deliberately does not read component statuses: that lock is held by
             // the load still in flight, so inspecting it here hangs instead of
             // reporting.
@@ -267,11 +267,9 @@ async fn build_runtime(name: &str, datasets: Vec<Dataset>) -> Result<Arc<Runtime
     Ok(rt)
 }
 
-fn tracing_filter() -> Option<&'static str> {
-    Some(
-        "integration=debug,runtime=debug,connector_postgres=debug,\
-         data_components::postgres_replication=debug,info",
-    )
+fn tracing_filter() -> &'static str {
+    "integration=debug,runtime=debug,connector_postgres=debug,\
+     data_components::postgres_replication=debug,info"
 }
 
 // ── UPDATE delivery ─────────────────────────────────────────────────────────
@@ -285,7 +283,7 @@ fn tracing_filter() -> Option<&'static str> {
 /// holding, and — after the barrier — that the accelerator still holds it once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(tracing_filter());
+    let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
         .scope(async {
@@ -385,7 +383,7 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
 /// keep the rewrite out, this wait would time out and say so.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(tracing_filter());
+    let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
         .scope(async {
@@ -491,7 +489,7 @@ async fn a_source_trigger_rewrite_reaches_the_accelerator() -> Result<(), anyhow
 /// having on its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(tracing_filter());
+    let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
         .scope(async {
@@ -541,7 +539,7 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
 /// write-back path, since the tests above set both.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_back_bootstraps_without_an_explicit_slot() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(tracing_filter());
+    let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
         .scope(async {
