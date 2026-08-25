@@ -85,10 +85,11 @@ impl Kernel {
     /// This split governs whether an engine's counterpart could be *repaired* in
     /// the emitted SQL: a propagating function's non-finite result is visible in
     /// its output, where a normalizing one hands back a finite number no screen
-    /// can identify. It was not enough to make either of `DuckDB`'s pushable,
-    /// though — `array_inner_product` propagates as `Dot` does, and still raises
-    /// on a NULL array element, which no wrapping expression can screen (#13088). The shared non-finite test drives all three
-    /// kernels, so if this is ever wrong for `Dot`/`L2Squared` — a simsimd
+    /// can identify. It was not enough to make either of `DuckDB`'s vector
+    /// functions pushable, though — `array_inner_product` propagates as `Dot`
+    /// does, and still raises on a NULL array element, which no wrapping
+    /// expression can screen (#13088). The shared non-finite test drives all
+    /// three kernels, so if this is ever wrong for `Dot`/`L2Squared` — a simsimd
     /// change, a different SIMD dispatch — that test fails rather than the
     /// missing guard going unnoticed.
     fn hides_non_finite_input(self) -> bool {

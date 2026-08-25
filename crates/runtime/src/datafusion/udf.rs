@@ -1061,12 +1061,10 @@ mod tests {
         // `rand` is allowed purely by virtue of being in the dialect — no manual
         // carve-out.
         let support = deny_spice_functions_for_duckdb();
-        for name in ["rand"] {
-            assert!(
-                support.supports(&make_named_expr(name)),
-                "{name} has a native DuckDB equivalent and should be pushed down"
-            );
-        }
+        assert!(
+            support.supports(&make_named_expr("rand")),
+            "rand has a native DuckDB equivalent and should be pushed down"
+        );
         // No *equivalent* DuckDB function — must stay denied. The two vector UDFs
         // are here rather than above even though DuckDB has similarly-named
         // functions, because neither answers what the UDF answers (#13088):
