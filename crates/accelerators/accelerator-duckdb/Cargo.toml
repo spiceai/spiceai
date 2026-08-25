@@ -56,6 +56,11 @@ tokio = { workspace = true, features = ["sync", "rt"] }
 # need this crate's `create_table_provider`.
 runtime-table = { path = "../../runtime-table" }
 spice-table = { path = "../../spice-table" }
+# Test-only: `duckdb_vector_udf_pushdown_matches_local` compares the local vector
+# kernels against the SQL the DuckDB dialect renders for them, so it needs both
+# implementations in one process. `runtime-datafusion-udfs` is shared-utility, so
+# this is a downward edge either way.
+runtime-datafusion-udfs = { path = "../../runtime-datafusion-udfs" }
 insta.workspace = true
 tempfile.workspace = true
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["duckdb", "test-support"] }

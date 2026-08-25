@@ -23,8 +23,12 @@ limitations under the License.
 //! 1. **Spice functions** — the UDFs Spice defines (`bucket`, `cosine_distance`,
 //!    `rerank`, …) plus any the user registers. No remote source knows them, so
 //!    they are denied by default; a backend whose unparser dialect rewrites one
-//!    into a real remote function (`cosine_distance` → `array_cosine_distance`)
-//!    carves it back out by declaring it [`FunctionSupportBuilder::native`].
+//!    into a remote function that returns the *same value* (`inner_product` →
+//!    `array_inner_product`) carves it back out by declaring it
+//!    [`FunctionSupportBuilder::native`]. A same-looking remote function is not
+//!    sufficient: the carve-out makes one call answer from two implementations,
+//!    so a disagreement between them is not an error but a different result for
+//!    the same query (spiceai/spiceai#13088).
 //! 2. **`DataFusion` built-ins a specific backend cannot evaluate** — e.g. the
 //!    nested array/list/map functions relative to `PostgreSQL`. These are
 //!    allowed by default; only the backend knows which subset it lacks, so it

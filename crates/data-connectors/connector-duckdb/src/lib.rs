@@ -77,17 +77,23 @@ impl DuckDB {
     /// function" error from `DuckDB`. Installing the deny-list makes `DuckDB`'s
     /// `can_execute_plan` refuse such plans so `DataFusion` evaluates the affected
     /// expressions locally instead. We use [`deny_spice_functions_for_duckdb`]
-    /// (rather than the generic deny-list) so functions `DuckDB` *does* support
-    /// natively — e.g. `cosine_distance`, which `DuckDB` unparses to
-    /// `array_cosine_distance` — still federate. See issue #10703.
+    /// (rather than the generic deny-list) so functions `DuckDB` evaluates to the
+    /// same value — e.g. `inner_product`, which `DuckDB` unparses to
+    /// `array_inner_product` — still federate. See issue #10703.
+    ///
+    /// The carve-out is per-function and rests on value equivalence, not on
+    /// `DuckDB` having a function of a similar name: `cosine_distance` stays
+    /// denied because `array_cosine_distance` returns a differently-scaled
+    /// distance (see issue #13088).
     fn with_spice_deny_list(factory: DuckDBTableFactory) -> DuckDBTableFactory {
         // The spiceai table-providers fork restores the `with_function_support`
         // deny-list seam on DuckDBTableFactory (see issue #10703). Install the
-        // DuckDB-aware deny-list so Spice-only UDFs that DuckDB can't run are
-        // evaluated locally, while functions DuckDB's dialect can rewrite (e.g.
-        // cosine_distance -> array_cosine_distance) still federate. The factory's
-        // seam takes the table-providers FunctionSupport type, so we build the
-        // deny-list directly in that type from the runtime's shared name list.
+        // DuckDB-aware deny-list so Spice-only UDFs that DuckDB can't run — or
+        // runs differently — are evaluated locally, while functions DuckDB's
+        // dialect can rewrite value-for-value (e.g. inner_product ->
+        // array_inner_product) still federate. The factory's seam takes the
+        // table-providers FunctionSupport type, so we build the deny-list
+        // directly in that type from the runtime's shared name list.
         factory.with_function_support(deny_spice_functions_for_duckdb_table_providers())
     }
 

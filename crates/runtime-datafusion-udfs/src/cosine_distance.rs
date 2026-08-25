@@ -34,10 +34,13 @@ limitations under the License.
 //! `1 - distance`, so any fabricated distance for a failed embedding competes
 //! with real matches, and NULL is what keeps it out of the results.
 //!
-//! The NULL applies to these kernels only. `cosine_distance` is allowed to
-//! federate, where it unparses to the engine's own function (`DuckDB`'s
-//! `array_cosine_distance`) and that engine decides what a non-finite input
-//! scores — see #13088.
+//! These kernels are the only implementation: `cosine_distance` is denied from
+//! federation on every backend, so the value above is what a query gets wherever
+//! the table lives. `DuckDB` was the exception until #13088 — its
+//! `array_cosine_distance` returns `1 - cosine_similarity` over `[0, 2]`, twice
+//! the distance above, and answers `2.0` both for a zero-magnitude vector (0.5
+//! here) and for a non-finite element (NULL here). A backend earns a pushdown by
+//! matching this contract, not by having a function of the same name.
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Float64Builder, GenericListArray, LargeListArray, ListArray,

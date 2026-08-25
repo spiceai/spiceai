@@ -30,7 +30,7 @@ pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
 /// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
 /// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
-/// `array_cosine_distance`, `array_inner_product`).
+/// `array_inner_product`, `array_distance`).
 ///
 ///  - replaces the `make_array` constructor with a `DuckDB` array literal
 ///    (`make_array` is not supported in `DuckDB`)
@@ -116,24 +116,79 @@ fn spice_array_fn_to_sql(
     Ok(Some(ast_fn))
 }
 
-/// Converts the `cosine_distance` UDF into `DuckDB`'s `array_cosine_distance`:
-/// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
-pub(crate) fn cosine_distance_to_sql(
-    unparser: &datafusion::sql::unparser::Unparser,
-    args: &[Expr],
-) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_cosine_distance")
+/// Wraps `expr` so a non-finite result becomes `NULL`, the way the Spice vector
+/// kernels do.
+///
+/// The kernels return `NULL` when a distance is not defined rather than a
+/// fabricated number, because `_score` is `1 - distance` and any number at all
+/// competes with real matches (see `runtime_datafusion_udfs::vector_simd`). A
+/// pushed-down call has to carry that contract too, or the same row scores
+/// differently depending only on whether the table federated.
+///
+/// `nullif` rather than `CASE WHEN isfinite(..)`: `DuckDB` compares `NaN` equal
+/// to `NaN` and each infinity equal to itself, so the chain below reaches every
+/// non-finite value while naming `expr` once. `CASE` would have to repeat the
+/// whole call — operands included — in both arms.
+///
+/// Measured against `DuckDB` v1.5.5: the chain returns `NULL` for `NaN`, `inf`
+/// and `-inf`, passes finite values through unchanged, and leaves the result's
+/// `FLOAT` type alone (a `DOUBLE` sentinel would widen it).
+///
+/// This screens the *result*, so it only reaches an engine function that lets a
+/// non-finite input reach its output. `array_inner_product` accumulates its
+/// operands directly and does propagate — the same reason
+/// `Kernel::hides_non_finite_input` is `false` for `Dot`. A function that
+/// normalizes, and so answers a finite number for a non-finite input, cannot be
+/// repaired this way and does not belong in the pushdown list at all.
+fn null_if_not_finite(expr: ast::Expr) -> ast::Expr {
+    ["nan", "inf", "-inf"]
+        .into_iter()
+        .fold(expr, |acc, sentinel| {
+            ast::Expr::Function(Function {
+                name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("nullif"))]),
+                args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: vec![
+                        ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(acc)),
+                        ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::Value(ValueWithSpan {
+                                value: ast::Value::SingleQuotedString(sentinel.to_string()),
+                                span: sqlparser::tokenizer::Span::empty(),
+                            })),
+                            data_type: ast::DataType::Float(ast::ExactNumberInfo::None),
+                            kind: ast::CastKind::DoubleColon,
+                            array: false,
+                            format: None,
+                        })),
+                    ],
+                    clauses: vec![],
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: vec![],
+                parameters: ast::FunctionArguments::None,
+                uses_odbc_syntax: false,
+            })
+        })
 }
 
 /// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
-/// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
-/// call to `DuckDB` (>= 1.5.3) is exact.
+/// product, `sum(a[i] * b[i])`), screened so a non-finite result is `NULL`.
+///
+/// The two compute the same value for finite operands, which is what makes the
+/// pushdown sound. They disagreed on a non-finite one — the UDF answers `NULL`,
+/// `DuckDB` propagated the `NaN` or infinity — so [`null_if_not_finite`] closes
+/// that. Numeric precision is a separate axis and unchanged: `DuckDB`
+/// accumulates in `FLOAT` where `simsimd` accumulates wider, so a dot product
+/// that overflows `FLOAT` alone now federates to `NULL` rather than to `inf`,
+/// which is the same direction the local output check takes.
 /// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
 pub(crate) fn inner_product_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    spice_array_fn_to_sql(unparser, args, "array_inner_product")
+    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(null_if_not_finite))
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -447,62 +502,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cosine_distance_to_sql_scalars() {
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            // raw values
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![lit(1.0), lit(2.0), lit(3.0)],
-            )),
-            // values wrapped as literals
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
-                ],
-            )),
-        ];
-        let result = cosine_distance_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression");
-
-        let expected =
-            "array_cosine_distance([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3])";
-
-        assert_eq!(result.to_string(), expected);
-    }
-
-    #[test]
-    fn test_cosine_distance_to_sql_column_and_scalar() {
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            Expr::Column(Column {
-                relation: Some(TableReference::from("table_name")),
-                name: "column_name".to_string(),
-                spans: Spans::new(),
-            }),
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
-                ],
-            )),
-        ];
-
-        let result = cosine_distance_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression");
-        let expected =
-            r#"array_cosine_distance("table_name"."column_name", [4.0, 5.0, 6.0]::FLOAT[3])"#;
-
-        assert_eq!(result.to_string(), expected);
+    fn cosine_distance_is_not_pushed_down_to_duckdb() {
+        // Regression test for #13088. `array_cosine_distance` is NOT the DuckDB
+        // equivalent of this UDF: measured against DuckDB v1.5.5 it answers
+        // `1 - cosine_similarity` over [0, 2] where the UDF answers
+        // `(1 - cosine_similarity) / 2` over [0, 1] — twice the distance for
+        // every non-identical pair — plus 2.0 where the UDF answers 0.5 (a
+        // zero-magnitude vector) and NULL (a non-finite element). While it was
+        // carved out of the deny-list, the same query returned one number
+        // locally and a different one federated.
+        assert!(
+            !crate::dialect::duckdb_native_function_names()
+                .contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
+            "cosine_distance must stay denied so DataFusion evaluates it locally; \
+             array_cosine_distance returns a differently-scaled distance"
+        );
     }
 
     #[test]
@@ -530,9 +544,70 @@ mod tests {
         let result = inner_product_to_sql(&unparser, &args)
             .expect("should execute successfully")
             .expect("should return expression");
-        let expected =
-            r#"array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])"#;
+        // The nullif chain is the NULL-for-non-finite contract the local kernel
+        // holds, carried into the pushed-down SQL (#13088). The operands appear
+        // once: `CASE WHEN isfinite(..)` would have to repeat the whole call.
+        let expected = r#"nullif(nullif(nullif(array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3]), 'nan'::FLOAT), 'inf'::FLOAT), '-inf'::FLOAT)"#;
         assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn inner_product_screen_names_its_operands_once() {
+        // The screen must not duplicate the operands: a repeated column is
+        // harmless, but a repeated *literal* embedding doubles the size of every
+        // pushed-down vector filter, and a repeated volatile sub-expression would
+        // be evaluated twice.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            Expr::Column(Column {
+                relation: Some(TableReference::from("t")),
+                name: "embedding".to_string(),
+                spans: Spans::new(),
+            }),
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![lit(4.0), lit(5.0), lit(6.0)],
+            )),
+        ];
+        let rendered = inner_product_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression")
+            .to_string();
+        assert_eq!(
+            rendered.matches("array_inner_product").count(),
+            1,
+            "the screened rendering must call array_inner_product once, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn inner_product_screen_covers_every_non_finite_value() {
+        // Each of the three non-finite values needs its own sentinel: DuckDB
+        // compares NaN equal to NaN and each infinity equal to itself, but an
+        // infinity is not equal to a NaN, so one nullif cannot reach all three.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![lit(1.0), lit(2.0)],
+            )),
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![lit(3.0), lit(4.0)],
+            )),
+        ];
+        let rendered = inner_product_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression")
+            .to_string();
+        for sentinel in ["'nan'::FLOAT", "'inf'::FLOAT", "'-inf'::FLOAT"] {
+            assert!(
+                rendered.contains(sentinel),
+                "screened rendering must nullif against {sentinel}, got {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -590,13 +665,13 @@ mod tests {
 
     #[test]
     fn duckdb_native_function_names_advertises_denylisted_pushables() {
-        // The federation deny-list relies on these names to let `cosine_distance`
+        // The federation deny-list relies on these names to let `inner_product`
         // and `rand` push down to DuckDB, so the dialect must advertise them.
+        // `cosine_distance` used to be asserted here too; it is now asserted
+        // *absent* by `cosine_distance_is_not_pushed_down_to_duckdb`, because
+        // DuckDB's `array_cosine_distance` answers a differently-scaled distance
+        // (#13088).
         let names = crate::dialect::duckdb_native_function_names();
-        assert!(
-            names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
-            "duckdb_native_function_names() missing cosine_distance; got {names:?}"
-        );
         assert!(
             names.contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
             "duckdb_native_function_names() missing inner_product; got {names:?}"

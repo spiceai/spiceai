@@ -103,6 +103,7 @@ dependencies = [
  "runtime-checkpoint-api",
  "runtime-checkpoint-duckdb",
  "runtime-datafusion",
+ "runtime-datafusion-udfs",
  "runtime-parameters",
  "runtime-table",
  "runtime-table-partition",

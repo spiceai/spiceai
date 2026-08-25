@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
-use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
 use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod duckdb;
@@ -41,12 +40,26 @@ const REGEXP_COUNT_NAME: &str = "regexp_count";
 /// federation deny-list consults to decide what can be pushed down). Keeping
 /// them derived from one list guarantees the dialect's translation capability
 /// and the deny-list carve-out can never drift apart.
+///
+/// **An entry here asserts value equivalence, not just that a similarly-named
+/// `DuckDB` function exists.** Adding one makes the same call answer from two
+/// implementations depending only on where the table lives, so the two have to
+/// agree on every input — including the ones no formula mentions: a zero-
+/// magnitude vector, and an element that is `NaN` or an infinity. A function
+/// whose `DuckDB` counterpart disagrees anywhere belongs out of this list, where
+/// `DataFusion` evaluates it locally. `duckdb_vector_udf_pushdown_matches_local`
+/// in `accelerators/accelerator-duckdb` measures that agreement against a real
+/// `DuckDB` for every vector UDF listed here.
 fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
-        (
-            COSINE_DISTANCE_UDF_NAME,
-            Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
-        ),
+        // `cosine_distance` is deliberately absent. `DuckDB`'s
+        // `array_cosine_distance` returns `1 - cosine_similarity` over `[0, 2]`,
+        // while this UDF returns `(1 - cosine_similarity) / 2` over `[0, 1]`, so
+        // the rewrite reported twice the distance for every non-identical pair.
+        // It also answers `2.0` where the UDF answers `0.5` for a zero-magnitude
+        // vector and `NULL` for a non-finite element — and `2.0` is
+        // simultaneously the legitimate value for opposite vectors, so no screen
+        // over the result can tell the three apart. See issue #13088.
         (
             INNER_PRODUCT_UDF_NAME,
             Box::new(duckdb::inner_product_to_sql) as ScalarFnToSqlHandler,
@@ -101,11 +114,16 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
 /// Names of the functions [`new_duckdb_dialect`] rewrites to native `DuckDB`
 /// SQL.
 ///
-/// Any Spice-specific function in this list has a real `DuckDB` equivalent and
-/// can therefore be federated (pushed down) to `DuckDB` rather than denied. The
-/// federation deny-list derives its `DuckDB` carve-out from this list (see
+/// Any Spice-specific function in this list has a `DuckDB` equivalent that
+/// returns the same value for the same input, and can therefore be federated
+/// (pushed down) to `DuckDB` rather than denied. The federation deny-list
+/// derives its `DuckDB` carve-out from this list (see
 /// [`crate::function_support::deny_spice_functions_for_duckdb`]), so the dialect
 /// and the deny-list stay in sync automatically.
+///
+/// "Equivalent" is the load-bearing word: a name `DuckDB` also happens to have
+/// is not enough, because a mismatch here is not an error but a different
+/// answer. See [`duckdb_scalar_overrides`] for what the entry asserts.
 #[must_use]
 pub fn duckdb_native_function_names() -> Vec<&'static str> {
     duckdb_scalar_overrides()
