@@ -170,6 +170,8 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "first_marked_at",
             // Appended last, matching the DDL column order + the ALTER backfill.
             "op",
+            "delivery_attempts",
+            "last_delivery_attempt",
         ],
     },
     ExpectedTable {

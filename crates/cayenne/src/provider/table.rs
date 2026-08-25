@@ -6821,21 +6821,59 @@ impl CayenneTableProvider {
             .downcast_ref::<crate::CayenneCatalog>()
     }
 
-    /// List up to `limit` undelivered write-back markers (oldest commit first).
+    /// List up to `limit` markers from the fresh delivery queue — never
+    /// attempted, or deferred exactly once — oldest commit first.
+    ///
     /// Each marker carries the key's `OwnedRow` encoding, the sequence of the
     /// commit that dirtied it, and that commit's [`WriteBackOp`] — feed the
     /// `pk_bytes` back to [`Self::decode_pk_keys`] and the markers to
-    /// [`Self::clear_dirty_keys`].
+    /// [`Self::clear_dirty_keys`] or [`Self::record_delivery_attempts`].
     ///
     /// # Errors
     /// Propagates the underlying metastore error.
-    pub async fn list_dirty_keys(&self, limit: usize) -> Result<Vec<PendingWriteBackMarker>> {
+    pub async fn list_fresh_dirty_keys(&self, limit: usize) -> Result<Vec<PendingWriteBackMarker>> {
         let Some(catalog) = self.cayenne_catalog() else {
             return Ok(Vec::new());
         };
         Ok(catalog
-            .list_pending_write_back(self.table_id(), limit)
+            .list_pending_write_back_fresh(self.table_id(), limit)
             .await?)
+    }
+
+    /// List up to `limit` markers from the deferred delivery queue —
+    /// chronically undeliverable, least-recently-attempted first.
+    ///
+    /// Drawn on a budget of its own so that markers nothing can deliver, which
+    /// are never retired, cannot starve the fresh queue.
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn list_deferred_dirty_keys(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingWriteBackMarker>> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(Vec::new());
+        };
+        Ok(catalog
+            .list_pending_write_back_deferred(self.table_id(), limit)
+            .await?)
+    }
+
+    /// Record that a delivery pass judged these markers undeliverable, moving
+    /// them into (or along) the deferred rotation. The markers themselves are
+    /// left in place — see [`crate::CayenneCatalog::record_write_back_delivery_attempts`].
+    ///
+    /// # Errors
+    /// Propagates the underlying metastore error.
+    pub async fn record_delivery_attempts(&self, markers: &[PendingWriteBackMarker]) -> Result<()> {
+        let Some(catalog) = self.cayenne_catalog() else {
+            return Ok(());
+        };
+        catalog
+            .record_write_back_delivery_attempts(self.table_id(), markers)
+            .await?;
+        Ok(())
     }
 
     /// Compare-and-clear delivered write-back markers (see

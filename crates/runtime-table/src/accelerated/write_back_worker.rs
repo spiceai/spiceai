@@ -21,10 +21,11 @@ limitations under the License.
 //! It reconciles the dirty-key markers a committed write leaves in
 //! `cayenne_pending_write_back` to the federated source, in strict order:
 //!
-//! 1. **List** a batch of the oldest markers (`list_dirty_keys`) — a plain
-//!    read, NOT an atomic reservation; concurrency safety comes from the
-//!    compare-and-clear in step 4, not from claiming these markers here.
-//!    Each marker carries the [`WriteBackOp`] of the commit that dirtied it.
+//! 1. **List** a batch of markers from the two claim queues (see *Claim
+//!    scheduling* below) — a plain read, NOT an atomic reservation; concurrency
+//!    safety comes from the compare-and-clear in step 4, not from claiming these
+//!    markers here. Each marker carries the [`WriteBackOp`] of the commit that
+//!    dirtied it.
 //! 2. **Read** those keys' *current* committed values from the accelerator
 //!    (a fenced point scan), AFTER the list.
 //! 3. **Deliver** to the source idempotently, from the marked intent:
@@ -32,8 +33,8 @@ limitations under the License.
 //!    - a key the read did not return, marked [`WriteBackOp::Delete`], is
 //!      deleted at the source;
 //!    - a key the read did not return, marked [`WriteBackOp::Upsert`], is not
-//!      delivered at all, and its marker is retired only after a second
-//!      consecutive absence (see [`classify_delivery`]);
+//!      delivered at all and its marker is **kept**, to be retried on a later
+//!      pass (see [`classify_delivery`]);
 //!    - a key the read DID return, marked [`WriteBackOp::Delete`], is deferred
 //!      to the next pass with its marker intact, because a commit publishes its
 //!      marker before the delete is scan-visible (see [`classify_delivery`]).
@@ -53,14 +54,45 @@ limitations under the License.
 //! transaction (never in the CDC apply path), so an echo of our own write cannot
 //! spawn a fresh delivery.
 //!
-//! # Absence is not a delete
+//! # Absence is not a delete, and it is not a reason to give up
 //!
 //! Delivery acts on the operation each marker records, never on whether the
 //! accelerator still holds the key. A key can be missing for reasons that are
-//! not a deletion — a retention policy pruned it, or the read could not see it —
+//! not a deletion — the read could not see it yet, or something evicted it —
 //! and turning any of those into a source `DELETE` destroys rows nobody deleted.
 //! A committed `DELETE` marks its keys explicitly, which is what makes the
 //! source delete safe to issue.
+//!
+//! Absence is equally not grounds for *dropping* the marker. The marker is the
+//! only durable record that an acknowledged write has not reached the source, so
+//! retiring one because a pass could not read its key would silently lose that
+//! write — the source keeps its previous value and nothing is left to reconcile
+//! it. A marker is therefore cleared only by delivery (or by `drop_table`). The
+//! accelerator is expected to hold every acknowledged write, so a key that
+//! cannot be read is a condition to wait out, not evidence to act on. Retention
+//! is the one thing that legitimately evicts a live row, which is why a
+//! durable-write-back dataset refuses to configure it
+//! (`validate_durable_write_back_retention`, in `accelerator-cayenne`).
+//!
+//! # Claim scheduling
+//!
+//! Because markers are never retired, an undeliverable one stays in the table
+//! indefinitely — and a single claim taking the oldest N markers would hand
+//! every pass the same wedged set once N of them accumulated, starving every
+//! newer write behind them. The markers carry their own schedule instead
+//! (`delivery_attempts`, `last_delivery_attempt`), and each pass draws from two
+//! queues on separate budgets:
+//!
+//! * **fresh** ([`FRESH_CLAIM_BATCH`]) — never attempted, plus the one immediate
+//!   retry a first miss is owed, oldest commit first. The common deferral is a
+//!   delete whose marker is published before the delete is scan-visible, which
+//!   resolves in milliseconds; it must not have to wait out a rotation.
+//! * **deferred** ([`DEFERRED_CLAIM_BATCH`]) — everything that has missed twice
+//!   or more, least-recently-attempted first, so waiting longer monotonically
+//!   improves a marker's position and nothing can be starved.
+//!
+//! Both queues are delivered as one batch: one point scan, one delivery, one
+//! compare-and-clear. The split governs what is *claimed*, not how it is sent.
 //!
 //! # Known limitation — mixed writers
 //!
@@ -71,10 +103,10 @@ limitations under the License.
 //! worker does no compare-and-set against the source. Durable write-back is
 //! safe only when the accelerator is the sole writer of the rows it delivers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::record_batch::RecordBatch;
@@ -91,11 +123,24 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use super::write::write_back::execute_insert;
 use crate::federated::FederatedTable;
 
-/// Markers claimed per delivery pass.
+/// Markers claimed per delivery pass, across both queues — the point scan and
+/// the delivery it feeds are sized by this, not by either queue alone.
 const CLAIM_BATCH: usize = 1024;
+/// The deferred rotation's share of a pass. A minority share, so a large wedged
+/// set can slow fresh delivery but never crowd it out; at this size a thousand
+/// wedged markers still rotate fully through in a few seconds.
+const DEFERRED_CLAIM_BATCH: usize = CLAIM_BATCH / 8;
+/// The fresh queue takes the rest. A pass that cannot fill the deferred share —
+/// the healthy case, where nothing is wedged — does not hand the remainder back
+/// to the fresh queue, so the batch is a ceiling rather than a target.
+const FRESH_CLAIM_BATCH: usize = CLAIM_BATCH - DEFERRED_CLAIM_BATCH;
 /// Idle poll interval when the dirty set is empty (not a failure — the error
 /// backoff must not grow on empty polls).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often to restate that markers are stuck. The deferred rotation re-claims
+/// them every pass, so an unthrottled warning would repeat every second for as
+/// long as the condition lasts.
+const STALL_WARNING_INTERVAL: Duration = Duration::from_mins(5);
 
 pub(crate) struct WriteBackWorker {
     /// A write-clone of the durable-write-back Cayenne provider — shares the
@@ -106,10 +151,10 @@ pub(crate) struct WriteBackWorker {
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
-    /// The upsert markers the last pass found absent and held for one retry:
-    /// `pk_bytes` to the sequence that was deferred (see [`classify_delivery`]).
-    /// Only ever touched between awaits.
-    previously_absent: Mutex<HashMap<Vec<u8>, i64>>,
+    /// When the stuck-marker warning was last emitted. Purely a log rate limit —
+    /// the delivery schedule itself lives on the markers, so nothing here is
+    /// load-bearing across a restart. Only ever touched between awaits.
+    stall_warned_at: Mutex<Option<Instant>>,
 }
 
 impl WriteBackWorker {
@@ -126,7 +171,7 @@ impl WriteBackWorker {
             federated,
             pk_columns,
             dataset_name,
-            previously_absent: Mutex::new(HashMap::new()),
+            stall_warned_at: Mutex::new(None),
         };
         tokio::spawn(async move { worker.run().await })
     }
@@ -153,16 +198,19 @@ impl WriteBackWorker {
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
         loop {
             match self.deliver_batch().await {
-                Ok(delivered) => {
+                Ok(claimed_fresh) => {
                     // Success — reset the error backoff.
                     backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
-                    if delivered < CLAIM_BATCH {
-                        // Dirty set drained (fewer than a full batch remained);
+                    if claimed_fresh < FRESH_CLAIM_BATCH {
+                        // Fresh queue drained (fewer than a full batch remained);
                         // idle-poll for the next commit — NOT an error, so the
-                        // backoff stays reset.
+                        // backoff stays reset. Pacing on the fresh queue alone is
+                        // deliberate: the deferred rotation is never "drained",
+                        // so pacing on the whole claim would spin at full tilt
+                        // for as long as anything was stuck.
                         tokio::time::sleep(POLL_INTERVAL).await;
                     }
-                    // Else a full batch was claimed — more may remain; loop
+                    // Else a full fresh batch was claimed — more may remain; loop
                     // immediately to keep draining.
                 }
                 Err(e) => {
@@ -178,14 +226,28 @@ impl WriteBackWorker {
         }
     }
 
-    /// One claim → read → deliver → clear pass. Returns the number of markers
-    /// delivered (0 when the dirty set is empty).
+    /// One claim → read → deliver → clear pass. Returns how many markers were
+    /// claimed from the **fresh** queue, which is what paces the loop; the
+    /// deferred rotation has no drained state to pace on.
     async fn deliver_batch(&self) -> DataFusionResult<usize> {
-        let claimed = self
+        let fresh = self
             .provider
-            .list_dirty_keys(CLAIM_BATCH)
+            .list_fresh_dirty_keys(FRESH_CLAIM_BATCH)
             .await
             .map_err(to_df_err)?;
+        let deferred = self
+            .provider
+            .list_deferred_dirty_keys(DEFERRED_CLAIM_BATCH)
+            .await
+            .map_err(to_df_err)?;
+        self.warn_if_markers_are_stuck(&deferred);
+
+        let claimed_fresh = fresh.len();
+        // The two queues partition the marker set (`delivery_attempts <= 1`
+        // against `> 1`), so concatenating cannot produce a duplicate key — and
+        // from here on the pass treats them identically.
+        let mut claimed = fresh;
+        claimed.extend(deferred);
         if claimed.is_empty() {
             return Ok(0);
         }
@@ -221,11 +283,7 @@ impl WriteBackWorker {
         // Decide what to deliver for each claimed key from the marked operation
         // and whether the post-claim read still returned it.
         let pk_col = self.pk_columns[0].as_str();
-        // Snapshot the keys the last pass held for a retry; the guard is dropped
-        // before any await below.
-        let previously_absent = self.previously_absent.lock().clone();
-        let plan = classify_delivery(pk_col, &claimed, &pk_values, &current, &previously_absent)?;
-        *self.previously_absent.lock() = plan.absent_retry_keys.iter().cloned().collect();
+        let plan = classify_delivery(pk_col, &claimed, &pk_values, &current)?;
         // The read returns the deferred keys' rows too; they must not be
         // upserted, so drop them before anything is delivered.
         let current = retain_deliverable_rows(pk_col, &current, &plan.deferred)?;
@@ -240,22 +298,12 @@ impl WriteBackWorker {
             );
         }
 
-        if !plan.absent_retry.is_empty() {
+        if !plan.absent.is_empty() {
             tracing::debug!(
                 dataset = %self.dataset_name,
-                keys = plan.absent_retry.len(),
-                "durable write-back: {} committed key(s) were not readable in the accelerator; holding their markers for one more pass in case the commit is not yet visible",
-                plan.absent_retry.len(),
-            );
-        }
-
-        if !plan.undelivered.is_empty() {
-            tracing::warn!(
-                dataset = %self.dataset_name,
-                keys = plan.undelivered.len(),
-                "Dataset '{}': {} committed row(s) are no longer in the accelerator and were not written back, so the source may still hold their previous values. Nothing was deleted at the source: a row can go missing without having been deleted (a retention policy removed it, or the read could not see it), and only a committed DELETE authorizes deleting it at the source. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
-                self.dataset_name,
-                plan.undelivered.len(),
+                keys = plan.absent.len(),
+                "durable write-back: {} committed key(s) were not readable in the accelerator; keeping their markers to retry, since nothing but delivery may retire one",
+                plan.absent.len(),
             );
         }
 
@@ -319,19 +367,56 @@ impl WriteBackWorker {
                 datafusion::physical_plan::collect(delete_plan, session_state.task_ctx()).await?;
         }
 
-        // Ack: clear only markers still at/below the claimed sequence. Keys that
-        // were not delivered are cleared too — their marker describes a commit
-        // that has been superseded, and keeping it would grow the dirty set
-        // without bound while re-warning every pass. A commit that re-dirtied the
-        // key during this pass bumped its sequence above what was claimed, so its
-        // marker survives the clear and is delivered next pass. Deferred keys are
-        // excluded outright: their delete has not been delivered, so clearing
-        // their marker would lose it (see `classify_delivery`).
+        // Ack: clear only markers this pass actually delivered, and only while
+        // their stored sequence is still at/below the claimed one — a commit that
+        // re-dirtied the key during this pass bumped it above what was claimed,
+        // so its marker survives and is delivered next pass. Everything withheld
+        // keeps its marker: nothing but delivery may retire one.
         self.provider
             .clear_dirty_keys(&plan.clearable)
             .await
             .map_err(to_df_err)?;
-        Ok(plan.clearable.len())
+        // Charge the withheld markers an attempt, which is what moves them into
+        // the deferred rotation and orders them within it. Recorded after the
+        // clear so a delivery failure above aborts the pass without charging a
+        // key that was never judged.
+        self.provider
+            .record_delivery_attempts(&plan.withheld)
+            .await
+            .map_err(to_df_err)?;
+        Ok(claimed_fresh)
+    }
+
+    /// Restate, at most every [`STALL_WARNING_INTERVAL`], that markers are stuck.
+    ///
+    /// A non-empty deferred rotation means acknowledged writes have failed to
+    /// reach the source repeatedly. Nothing is lost — the markers are kept and
+    /// retried — but it will not resolve on its own if the accelerator has
+    /// genuinely dropped those rows, so it needs to be visible rather than
+    /// silently patient. The count covers both reasons a pass withholds a key
+    /// (unreadable, or delete-marked and still readable), so the message names
+    /// the outcome rather than guessing which.
+    fn warn_if_markers_are_stuck(&self, deferred: &[PendingWriteBackMarker]) {
+        let Some(worst) = deferred.iter().map(|m| m.delivery_attempts).max() else {
+            return;
+        };
+        {
+            let mut warned_at = self.stall_warned_at.lock();
+            let now = Instant::now();
+            if warned_at.is_some_and(|at| now.duration_since(at) < STALL_WARNING_INTERVAL) {
+                return;
+            }
+            *warned_at = Some(now);
+        }
+        tracing::warn!(
+            dataset = %self.dataset_name,
+            keys = deferred.len(),
+            attempts = worst,
+            "Dataset '{}': {} committed row(s) have not been written back to the federated source after repeated attempts (one of them {} times), so the source still holds their previous values. Their markers are kept and keep being retried, and nothing has been deleted at the source; if this does not clear on its own, the accelerator is missing rows it acknowledged. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration",
+            self.dataset_name,
+            deferred.len(),
+            worst,
+        );
     }
 }
 
@@ -384,27 +469,22 @@ pub(crate) struct DeliveryPlan {
     pub(crate) present: Vec<ScalarValue>,
     /// Keys a committed `DELETE` removed; delivered as a source delete.
     pub(crate) deleted: Vec<ScalarValue>,
-    /// Keys the read did not return that no committed `DELETE` marked, seen
-    /// absent on a previous pass too. Nothing is delivered for these and their
-    /// markers are retired — see the module's "Absence is not a delete".
-    pub(crate) undelivered: Vec<ScalarValue>,
-    /// Keys the read did not return that no committed `DELETE` marked, absent
-    /// for the FIRST time. Nothing is delivered and their markers are held for
-    /// one more pass, in case the miss was a not-yet-visible commit rather than
-    /// a row that is really gone.
-    pub(crate) absent_retry: Vec<ScalarValue>,
-    /// The `absent_retry` markers as `(pk_bytes, sequence_number)`, for the next
-    /// pass to recognize a second sighting OF THE SAME COMMIT. The sequence is
-    /// part of the identity: a re-mark supersedes the deferred commit with a
-    /// newer acknowledged write, which is owed its own first retry.
-    pub(crate) absent_retry_keys: Vec<(Vec<u8>, i64)>,
+    /// Keys the read did not return that no committed `DELETE` marked. Nothing
+    /// is delivered for these and their markers are kept — see the module's
+    /// "Absence is not a delete, and it is not a reason to give up".
+    pub(crate) absent: Vec<ScalarValue>,
     /// Keys marked deleted that the read still returned. Nothing is delivered
-    /// for these and their markers must NOT be cleared — see
-    /// [`classify_delivery`].
+    /// for these and their markers are kept — see [`classify_delivery`]. Kept
+    /// apart from `absent` because these DO have rows in the read, which must be
+    /// dropped before the upsert (see [`retain_deliverable_rows`]).
     pub(crate) deferred: Vec<ScalarValue>,
-    /// The claimed markers this pass may clear once it has delivered: every
-    /// claimed marker except the deferred ones.
+    /// The claimed markers this pass may clear once it has delivered: the
+    /// `present` and `deleted` ones.
     pub(crate) clearable: Vec<PendingWriteBackMarker>,
+    /// The claimed markers this pass delivered nothing for: the `absent` and
+    /// `deferred` ones, which keep their markers and are charged one delivery
+    /// attempt so the schedule can rotate them.
+    pub(crate) withheld: Vec<PendingWriteBackMarker>,
 }
 
 /// Decide what to deliver for each claimed key.
@@ -414,19 +494,18 @@ pub(crate) struct DeliveryPlan {
 ///
 /// A key the read did not return is deleted at the source **only** when its
 /// marker records a [`WriteBackOp::Delete`]. Absence on its own proves nothing:
-/// a retention prune or a read that could not see the row looks identical to a
-/// deletion, and deleting on that evidence destroys rows nobody deleted — which
-/// is why this returns them as `undelivered` rather than as deletes.
+/// a read that could not see the row yet looks identical to a deletion, and
+/// deleting on that evidence destroys rows nobody deleted — which is why this
+/// returns them as `absent` rather than as deletes.
 ///
-/// An absent key whose marker records an [`WriteBackOp::Upsert`] is given one
-/// retry before its marker is retired. Retiring it on the first sighting would
-/// discard the only durable record of an acknowledged write whenever the miss
-/// was the same not-yet-visible-commit window described below, leaving the
-/// source on its previous value with nothing left to reconcile it. `Absence` can
-/// equally be permanent (a retention prune), so the marker cannot be held
-/// forever either — a second consecutive absence retires it, which keeps a
-/// pruned key from blocking the queue. `previously_absent` carries the
-/// `pk_bytes` the last pass deferred this way.
+/// An absent key whose marker records an [`WriteBackOp::Upsert`] keeps its
+/// marker indefinitely. Retiring it would discard the only durable record of an
+/// acknowledged write, leaving the source on its previous value with nothing
+/// left to reconcile it — and no bound on the retries makes that safe, since a
+/// miss that has recurred a hundred times is no more evidence the row is gone
+/// than the first one was. The marker is charged an attempt instead, which moves
+/// it into the claim rotation that keeps it from starving newer writes (see the
+/// module's *Claim scheduling*).
 ///
 /// A key the read returned whose marker records a [`WriteBackOp::Delete`] is
 /// **deferred**: nothing is delivered and its marker is withheld from the clear,
@@ -444,8 +523,9 @@ pub(crate) struct DeliveryPlan {
 ///   goes on to remove the row while the source keeps it, with no marker left
 ///   to reconcile them.
 ///
-/// Deferring converges in both cases on the next pass, so it cannot grow the
-/// dirty set without bound.
+/// Deferring converges in both cases on the next pass, which is why this one
+/// stays in the fresh claim queue for its first retry rather than being demoted
+/// to the rotation.
 ///
 /// `claimed` and `claimed_pks` are parallel: `claimed_pks[i]` is the decoded key
 /// of `claimed[i]`.
@@ -454,7 +534,6 @@ pub(crate) fn classify_delivery(
     claimed: &[PendingWriteBackMarker],
     claimed_pks: &ArrayRef,
     current: &[RecordBatch],
-    previously_absent: &HashMap<Vec<u8>, i64>,
 ) -> DataFusionResult<DeliveryPlan> {
     if claimed.len() != claimed_pks.len() {
         return Err(DataFusionError::Execution(format!(
@@ -481,31 +560,16 @@ pub(crate) fn classify_delivery(
         let key = ScalarValue::try_from_array(claimed_pks.as_ref(), index)?;
         match (present.contains(&key), marker.op) {
             (true, WriteBackOp::Upsert) => plan.present.push(key),
+            (false, WriteBackOp::Delete) => plan.deleted.push(key),
             (true, WriteBackOp::Delete) => {
                 plan.deferred.push(key);
-                // Withheld from `clearable`: this marker must survive the pass.
+                plan.withheld.push(marker.clone());
                 continue;
             }
-            (false, WriteBackOp::Delete) => plan.deleted.push(key),
             (false, WriteBackOp::Upsert) => {
-                // Matched on the sequence as well as the key: a re-mark carries
-                // a NEWER acknowledged write, and its retry must not be spent by
-                // the commit it superseded.
-                let retried_already = previously_absent
-                    .get(&marker.pk_bytes)
-                    .is_some_and(|deferred| *deferred == marker.sequence_number);
-                if retried_already {
-                    // Absent twice running for this same commit: treat it as
-                    // really gone and retire the marker, so a pruned key cannot
-                    // block the queue.
-                    plan.undelivered.push(key);
-                } else {
-                    plan.absent_retry.push(key);
-                    plan.absent_retry_keys
-                        .push((marker.pk_bytes.clone(), marker.sequence_number));
-                    // Withheld from `clearable`: give the write one more pass.
-                    continue;
-                }
+                plan.absent.push(key);
+                plan.withheld.push(marker.clone());
+                continue;
             }
         }
         plan.clearable.push(marker.clone());
@@ -529,18 +593,22 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use cayenne::{PendingWriteBackMarker, WriteBackOp};
     use datafusion::scalar::ScalarValue;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     const PK_COL: &str = "id";
 
     fn marker(pk: i64, op: WriteBackOp) -> PendingWriteBackMarker {
+        attempted_marker(pk, op, 0)
+    }
+
+    fn attempted_marker(pk: i64, op: WriteBackOp, attempts: i64) -> PendingWriteBackMarker {
         PendingWriteBackMarker {
             // The classifier reads the op and relies on the caller's decoded key
             // array for identity, so the exact encoding here is immaterial.
             pk_bytes: pk.to_be_bytes().to_vec(),
             sequence_number: pk,
             op,
+            delivery_attempts: attempts,
         }
     }
 
@@ -563,148 +631,96 @@ mod tests {
     }
 
     /// The regression this whole change exists for: a key that is simply gone
-    /// from the accelerator — a retention prune, a read that could not see it —
-    /// carries an upsert marker, and must NEVER be deleted at the source.
-    ///
-    /// On a second consecutive absence its marker is retired, so a genuinely
-    /// pruned key cannot block the queue.
+    /// from the accelerator — a read that could not see it, something that
+    /// evicted it — carries an upsert marker, and must NEVER be deleted at the
+    /// source. Its marker is kept so the write can still be delivered.
     #[test]
     fn an_absent_key_without_a_delete_marker_is_never_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let seen_absent_before: HashMap<Vec<u8>, i64> = claimed
-            .iter()
-            .map(|m| (m.pk_bytes.clone(), m.sequence_number))
-            .collect();
-        let plan = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[]),
-            &seen_absent_before,
-        )
-        .expect("classification succeeds");
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
+            .expect("classification succeeds");
 
         assert_eq!(
             plan,
             DeliveryPlan {
                 present: vec![],
                 deleted: vec![],
-                undelivered: scalars(&[1]),
+                absent: scalars(&[1]),
                 deferred: vec![],
-                absent_retry: vec![],
-                absent_retry_keys: vec![],
-                clearable: claimed,
+                clearable: vec![],
+                withheld: claimed,
             },
-            "an absent upsert-marked key must be reported as undelivered, never deleted"
+            "an absent upsert-marked key must deliver nothing and keep its marker, never be deleted"
         );
     }
 
-    /// An acknowledged write whose row the read could not see gets one more
-    /// pass before its marker is retired. Retiring it on the first sighting
-    /// would throw away the only durable record of that write whenever the miss
-    /// was the not-yet-visible-commit window, leaving the source on its previous
-    /// value with nothing left to reconcile it.
+    /// An acknowledged write whose row the read could not see keeps its marker
+    /// however many passes have already missed it. Retiring one would throw away
+    /// the only durable record of that write, leaving the source on its previous
+    /// value with nothing left to reconcile it — and a miss that has recurred a
+    /// hundred times is no more evidence the row is gone than the first was, so
+    /// no attempt count makes retiring it safe.
     #[test]
-    fn an_absent_upsert_key_is_held_for_one_retry_before_its_marker_is_retired() {
-        let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let first = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[]),
-            &HashMap::new(),
-        )
-        .expect("classification succeeds");
+    fn an_absent_upsert_marker_survives_any_number_of_failed_attempts() {
+        for attempts in [0, 1, 2, 50, 10_000] {
+            let claimed = vec![attempted_marker(1, WriteBackOp::Upsert, attempts)];
+            let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
+                .expect("classification succeeds");
 
-        assert_eq!(first.absent_retry, scalars(&[1]));
-        assert!(
-            first.undelivered.is_empty(),
-            "a first absence must not retire the marker"
-        );
-        assert!(
-            first.clearable.is_empty(),
-            "the marker must survive so the write can still be delivered"
-        );
-
-        // The next pass, fed what this one deferred, retires it.
-        let second = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[]),
-            &first.absent_retry_keys.iter().cloned().collect(),
-        )
-        .expect("classification succeeds");
-
-        assert_eq!(second.undelivered, scalars(&[1]));
-        assert_eq!(
-            second.clearable, claimed,
-            "a second consecutive absence retires the marker, so a pruned key cannot block the queue"
-        );
+            assert_eq!(
+                plan.absent,
+                scalars(&[1]),
+                "a marker attempted {attempts} times is still owed delivery"
+            );
+            assert!(
+                plan.clearable.is_empty(),
+                "the marker must survive after {attempts} attempts: clearing it loses the write"
+            );
+            assert_eq!(plan.withheld, claimed);
+        }
     }
 
-    /// A re-mark carries a NEWER acknowledged write, and the retry history is
-    /// matched on the sequence so that write is owed its own first retry.
-    ///
-    /// Keying the history on the primary key alone would let a commit that was
-    /// deferred once spend the retry of the commit that superseded it: the next
-    /// pass would read the newer marker as a second absence and clear it — and
-    /// the compare-and-clear bound (`sequence_number <=` the claimed sequence)
-    /// matches the re-marked row, so the newer write's only durable record would
-    /// be gone.
+    /// Every claimed marker leaves the pass in exactly one of the two sets, so a
+    /// marker can neither be dropped without being delivered nor be both cleared
+    /// and charged an attempt.
     #[test]
-    fn a_re_marked_key_does_not_inherit_the_superseded_commits_retry() {
-        let deferred_earlier = marker(1, WriteBackOp::Upsert);
-        let re_marked = PendingWriteBackMarker {
-            sequence_number: deferred_earlier.sequence_number + 1,
-            ..deferred_earlier.clone()
-        };
-        let previously_absent: HashMap<Vec<u8>, i64> = std::iter::once((
-            deferred_earlier.pk_bytes.clone(),
-            deferred_earlier.sequence_number,
-        ))
-        .collect();
-
-        let claimed = vec![re_marked];
+    fn every_claimed_marker_is_either_cleared_or_withheld() {
+        let claimed = vec![
+            marker(1, WriteBackOp::Upsert),
+            marker(2, WriteBackOp::Delete),
+            marker(3, WriteBackOp::Upsert),
+            marker(4, WriteBackOp::Delete),
+        ];
         let plan = classify_delivery(
             PK_COL,
             &claimed,
-            &keys(&[1]),
-            &read_returning(&[]),
-            &previously_absent,
+            &keys(&[1, 2, 3, 4]),
+            &read_returning(&[1, 4]),
         )
         .expect("classification succeeds");
 
+        let mut accounted: Vec<&PendingWriteBackMarker> =
+            plan.clearable.iter().chain(plan.withheld.iter()).collect();
+        accounted.sort_by_key(|marker| marker.sequence_number);
         assert_eq!(
-            plan.absent_retry,
-            scalars(&[1]),
-            "the newer commit must get its own first retry"
-        );
-        assert!(
-            plan.undelivered.is_empty() && plan.clearable.is_empty(),
-            "the newer commit's marker must survive: clearing it would lose that acknowledged write"
-        );
-        assert_eq!(
-            plan.absent_retry_keys,
-            vec![(claimed[0].pk_bytes.clone(), claimed[0].sequence_number)],
-            "the retry is recorded against the newer sequence"
+            accounted,
+            claimed.iter().collect::<Vec<_>>(),
+            "each claimed marker must be accounted for exactly once"
         );
     }
 
     #[test]
     fn an_absent_key_with_a_delete_marker_is_deleted_at_the_source() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let plan = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[]),
-            &HashMap::new(),
-        )
-        .expect("classification succeeds");
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[]))
+            .expect("classification succeeds");
 
         assert_eq!(plan.deleted, scalars(&[1]));
-        assert!(plan.present.is_empty() && plan.undelivered.is_empty());
+        assert!(plan.present.is_empty() && plan.absent.is_empty());
+        assert_eq!(
+            plan.clearable, claimed,
+            "the delete was delivered, so its marker is retired"
+        );
     }
 
     /// A delete-marked key the read still returned is ambiguous — a later
@@ -717,14 +733,8 @@ mod tests {
     #[test]
     fn a_present_key_whose_marker_says_delete_is_deferred_with_its_marker_kept() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let plan = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[1]),
-            &HashMap::new(),
-        )
-        .expect("classification succeeds");
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
+            .expect("classification succeeds");
 
         assert_eq!(plan.deferred, scalars(&[1]));
         assert!(
@@ -772,17 +782,11 @@ mod tests {
     #[test]
     fn a_present_key_with_an_upsert_marker_is_upserted() {
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
-        let plan = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1]),
-            &read_returning(&[1]),
-            &HashMap::new(),
-        )
-        .expect("classification succeeds");
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1]), &read_returning(&[1]))
+            .expect("classification succeeds");
 
         assert_eq!(plan.present, scalars(&[1]));
-        assert!(plan.deleted.is_empty() && plan.undelivered.is_empty());
+        assert!(plan.deleted.is_empty() && plan.absent.is_empty());
     }
 
     /// One pass mixes every outcome; the upsert and delete sets must stay
@@ -792,34 +796,36 @@ mod tests {
         let claimed = vec![
             marker(1, WriteBackOp::Upsert), // present → upsert
             marker(2, WriteBackOp::Delete), // absent → delete
-            marker(3, WriteBackOp::Upsert), // absent (twice) → undelivered
+            marker(3, WriteBackOp::Upsert), // absent → withheld
             marker(4, WriteBackOp::Delete), // present → deferred
         ];
-        // Key 3 was already absent on the previous pass, so this one retires it.
-        let third = marker(3, WriteBackOp::Upsert);
-        let seen_absent_before: HashMap<Vec<u8>, i64> =
-            std::iter::once((third.pk_bytes, third.sequence_number)).collect();
         let plan = classify_delivery(
             PK_COL,
             &claimed,
             &keys(&[1, 2, 3, 4]),
             &read_returning(&[1, 4]),
-            &seen_absent_before,
         )
         .expect("classification succeeds");
 
         assert_eq!(plan.present, scalars(&[1]));
         assert_eq!(plan.deleted, scalars(&[2]));
-        assert_eq!(plan.undelivered, scalars(&[3]));
+        assert_eq!(plan.absent, scalars(&[3]));
         assert_eq!(plan.deferred, scalars(&[4]));
         assert_eq!(
             plan.clearable,
             vec![
                 marker(1, WriteBackOp::Upsert),
                 marker(2, WriteBackOp::Delete),
-                marker(3, WriteBackOp::Upsert),
             ],
-            "every marker except the deferred one may be cleared"
+            "only the two markers this pass delivered may be cleared"
+        );
+        assert_eq!(
+            plan.withheld,
+            vec![
+                marker(3, WriteBackOp::Upsert),
+                marker(4, WriteBackOp::Delete),
+            ],
+            "both undelivered markers are kept and charged an attempt"
         );
         for key in &plan.deleted {
             assert!(
@@ -835,31 +841,25 @@ mod tests {
             marker(1, WriteBackOp::Upsert),
             marker(2, WriteBackOp::Upsert),
         ];
-        let seen_absent_before: HashMap<Vec<u8>, i64> = claimed
-            .iter()
-            .map(|m| (m.pk_bytes.clone(), m.sequence_number))
-            .collect();
-        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[], &seen_absent_before)
+        let plan = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &[])
             .expect("classification succeeds");
 
         assert!(
             plan.present.is_empty() && plan.deleted.is_empty(),
             "a read that returned nothing must not be read as 'every key was deleted'"
         );
-        assert_eq!(plan.undelivered, scalars(&[1, 2]));
+        assert_eq!(plan.absent, scalars(&[1, 2]));
+        assert!(
+            plan.clearable.is_empty(),
+            "a read that returned nothing must retire no marker"
+        );
     }
 
     #[test]
     fn markers_and_decoded_keys_that_do_not_line_up_are_rejected() {
         let claimed = vec![marker(1, WriteBackOp::Delete)];
-        let err = classify_delivery(
-            PK_COL,
-            &claimed,
-            &keys(&[1, 2]),
-            &read_returning(&[]),
-            &HashMap::new(),
-        )
-        .expect_err("a length mismatch must not be classified");
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1, 2]), &read_returning(&[]))
+            .expect_err("a length mismatch must not be classified");
 
         assert!(
             err.to_string().contains("do not line up"),
@@ -877,7 +877,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![keys(&[1])]).expect("valid batch");
         let claimed = vec![marker(1, WriteBackOp::Upsert)];
 
-        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch], &HashMap::new())
+        let err = classify_delivery(PK_COL, &claimed, &keys(&[1]), &[batch])
             .expect_err("a read without the key column must not be classified");
 
         assert!(

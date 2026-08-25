@@ -716,6 +716,17 @@ impl SqliteMetastore {
     /// (highest-sequence) commit. Legacy rows default to `0`, which is what they
     /// were: before this column every marker came from an upsert commit.
     ///
+    /// `delivery_attempts` and `last_delivery_attempt` schedule the two claim
+    /// queues the delivery worker draws from. A marker no pass could deliver is
+    /// never retired — absence is not evidence a write should be dropped — so
+    /// the undeliverable ones have to be kept from monopolizing a claim that
+    /// takes the oldest N markers. `delivery_attempts` partitions the set:
+    /// `<= 1` is fresh work plus the one immediate retry a transient miss needs,
+    /// `> 1` is the chronic set, drawn on a separate budget and rotated
+    /// least-recently-attempted first by `last_delivery_attempt` (NULL until a
+    /// pass has judged the key undeliverable). Both reset on a re-mark, since a
+    /// newer commit is fresh work and must not inherit failure history.
+    ///
     /// Unlike `cayenne_insert_record`, this table is **never** cleared at
     /// checkpoint/overwrite (that would drop acked-but-undelivered writes);
     /// `drop_table` deletes its rows explicitly.
@@ -726,6 +737,8 @@ impl SqliteMetastore {
             sequence_number BIGINT NOT NULL,
             first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             op INTEGER NOT NULL DEFAULT 0,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt TEXT,
             PRIMARY KEY (table_id, pk_bytes)
         ) WITHOUT ROWID
     ";
@@ -889,6 +902,14 @@ impl SqliteMetastore {
     /// complement also accelerates the hot read path's
     /// `WHERE table_id = ? AND published = 1` (`get_published_inlined_deletes`).
     const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
+    /// Partial index over the chronically-undeliverable write-back markers, the
+    /// rotation the delivery worker's second claim query reads
+    /// (`WHERE table_id = ? AND delivery_attempts > 1 ORDER BY
+    /// last_delivery_attempt ASC`). Partial rather than full because a marker is
+    /// inserted on the *commit* path: every index over the whole table taxes
+    /// every durable write, whereas this one covers only markers a pass has
+    /// already failed to deliver twice — none in a healthy table.
+    const PENDING_WRITE_BACK_DEFERRED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_pending_write_back_deferred ON cayenne_pending_write_back(table_id, last_delivery_attempt) WHERE delivery_attempts > 1";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -1113,6 +1134,21 @@ impl MetastoreBackend for SqliteMetastore {
                     [],
                 );
 
+                // Delivery scheduling for write-back markers (see
+                // PENDING_WRITE_BACK_TABLE_DDL). Legacy rows take `0` / NULL —
+                // "never attempted" — which puts them in the fresh queue, the
+                // correct place for a marker this build has not yet judged.
+                // Forward-only for the same reason as `op` above. Appended last
+                // to match CREATE TABLE and EXPECTED_TABLES.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_pending_write_back ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_pending_write_back ADD COLUMN last_delivery_attempt TEXT",
+                    [],
+                );
+
                 // Per-tombstone activation flag for `cayenne_inlined_delete`. The
                 // ALTER sets every existing row to the column default (0). Rows
                 // that predate this flag were ALWAYS active under the old
@@ -1226,6 +1262,24 @@ impl MetastoreBackend for SqliteMetastore {
             .map_err(
                 |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                     message: duplicate_delete_file_index_error_message("SQLite", e),
+                },
+            )?;
+
+        // Separate from the block above so a failure here is not reported as the
+        // duplicate-delete-file conflict that block's message describes. Runs
+        // after the `delivery_attempts` migration: the partial predicate names
+        // that column, so creating it against a metastore predating it fails.
+        guard
+            .call(|conn| {
+                conn.execute(Self::PENDING_WRITE_BACK_DEFERRED_INDEX_DDL, [])?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!(
+                        "Failed to create the pending write-back deferred-delivery index: {e}"
+                    ),
                 },
             )?;
 
@@ -2710,10 +2764,12 @@ mod tests {
         .await;
     }
 
-    /// A catalog written before the marker `op` column gains it, and its existing
-    /// markers read back as upserts — which is what they are: before the column
-    /// only upsert commits marked keys, so defaulting them to `delete` would make
-    /// the next delivery pass delete live source rows.
+    /// A catalog written before the marker `op` and delivery-schedule columns
+    /// gains all three. Its existing markers read back as upserts — which is what
+    /// they are: before `op` only upsert commits marked keys, so defaulting them
+    /// to `delete` would make the next delivery pass delete live source rows —
+    /// and as never-attempted, which puts them in the fresh claim queue, the
+    /// right place for a marker no pass on this build has judged.
     #[tokio::test]
     async fn test_pending_write_back_op_column_migrates_legacy_markers_to_upsert() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -2752,8 +2808,8 @@ mod tests {
 
         metastore.init_schema().await.expect("init schema migrates");
 
-        // `op` is appended last, matching the DDL and EXPECTED_TABLES order that
-        // `validate_existing_schema` compares against.
+        // The added columns are appended in order, matching the DDL and
+        // EXPECTED_TABLES order that `validate_existing_schema` compares against.
         assert_eq!(
             table_columns(&metastore, "cayenne_pending_write_back").await,
             vec![
@@ -2761,25 +2817,34 @@ mod tests {
                 "pk_bytes",
                 "sequence_number",
                 "first_marked_at",
-                "op"
+                "op",
+                "delivery_attempts",
+                "last_delivery_attempt",
             ],
-            "the migrated table must carry op as its last column"
+            "the migrated table must carry the added columns last, in DDL order"
         );
 
-        let ops: Vec<i64> = metastore
+        let migrated: Vec<(i64, i64, Option<String>)> = metastore
             .query(
                 QueryParams {
-                    sql: "SELECT op FROM cayenne_pending_write_back",
+                    sql: "SELECT op, delivery_attempts, last_delivery_attempt \
+                          FROM cayenne_pending_write_back",
                     params: vec![],
                 },
-                |row| row.get_i64(0),
+                |row| {
+                    Ok((
+                        row.get_i64(0)?,
+                        row.get_i64(1)?,
+                        row.get_optional_string(2)?,
+                    ))
+                },
             )
             .await
             .expect("read the migrated marker");
         assert_eq!(
-            ops,
-            vec![crate::metadata::WriteBackOp::Upsert.as_i64()],
-            "a marker written before the op column must read back as an upsert"
+            migrated,
+            vec![(crate::metadata::WriteBackOp::Upsert.as_i64(), 0, None)],
+            "a legacy marker must read back as an unattempted upsert"
         );
     }
 

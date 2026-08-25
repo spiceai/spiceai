@@ -380,6 +380,8 @@ impl TursoMetastore {
             sequence_number BIGINT NOT NULL,
             first_marked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             op INTEGER NOT NULL DEFAULT 0,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            last_delivery_attempt TEXT,
             PRIMARY KEY (table_id, pk_bytes)
         )
     ";
@@ -512,6 +514,10 @@ impl TursoMetastore {
     /// translator binds the `WHERE` predicate and skips non-matching rows during
     /// index population, matching `SQLite` partial-index semantics.
     const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
+    /// Partial index over the chronically-undeliverable write-back markers. See
+    /// the `SQLite` `PENDING_WRITE_BACK_DEFERRED_INDEX_DDL` doc for why it is
+    /// partial rather than full.
+    const PENDING_WRITE_BACK_DEFERRED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_pending_write_back_deferred ON cayenne_pending_write_back(table_id, last_delivery_attempt) WHERE delivery_attempts > 1";
 }
 
 /// Borrowed view of a `turso::Row` implementing `MetastoreRow`. Typed
@@ -787,6 +793,25 @@ impl MetastoreBackend for TursoMetastore {
             )
             .await;
 
+        // Delivery scheduling for write-back markers (see
+        // PENDING_WRITE_BACK_TABLE_DDL). Legacy rows take `0` / NULL — "never
+        // attempted" — which puts them in the fresh queue, the correct place for
+        // a marker this build has not yet judged. Forward-only for the same
+        // reason as `op` above. Appended last to match CREATE TABLE and
+        // EXPECTED_TABLES column order.
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_pending_write_back ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_pending_write_back ADD COLUMN last_delivery_attempt TEXT",
+                (),
+            )
+            .await;
+
         // Per-tombstone activation flag for `cayenne_inlined_delete`. When the
         // ALTER actually adds the column (Ok), every existing row took the
         // default (0); backfill legacy rows to 1 because they were always active
@@ -946,6 +971,14 @@ impl MetastoreBackend for TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to create inlined_delete unpublished index: {e}"),
+            })?;
+
+        // Must likewise run AFTER the `delivery_attempts` migration above: the
+        // partial predicate references that column.
+        conn.execute(Self::PENDING_WRITE_BACK_DEFERRED_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to create pending_write_back deferred index: {e}"),
             })?;
 
         // Stamp the current schema version now that all migrations have succeeded,

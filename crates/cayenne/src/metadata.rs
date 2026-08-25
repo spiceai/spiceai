@@ -228,6 +228,11 @@ pub struct PendingWriteBackMarker {
     pub sequence_number: i64,
     /// The operation that commit performed on the key.
     pub op: WriteBackOp,
+    /// How many delivery passes have judged this key undeliverable, `0` until
+    /// one has. Resets when a newer commit re-marks the key, so it counts the
+    /// failures of the commit the marker currently describes rather than of the
+    /// key over all time.
+    pub delivery_attempts: i64,
 }
 
 /// Durable write-back delete markers to record in the SAME metastore transaction

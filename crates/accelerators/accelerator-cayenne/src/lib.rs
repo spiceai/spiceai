@@ -2653,6 +2653,20 @@ impl CayenneAccelerator {
                 detail: message.into(),
             });
         }
+        // Retention evicts rows the accelerator has acknowledged but not yet
+        // written back, which a marker set that is never retired cannot survive.
+        if durable_write_back
+            && let Some(acceleration) = source.acceleration()
+            && let Err(message) = validate_durable_write_back_retention(
+                table_name,
+                acceleration.retention_period.as_deref(),
+                acceleration.retention_sql.as_deref(),
+            )
+        {
+            return Err(Error::InvalidConfiguration {
+                detail: message.into(),
+            });
+        }
         // Datalake (cold) tier object store: built from the dedicated
         // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
         let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
@@ -2751,6 +2765,48 @@ impl CayenneAccelerator {
 /// explicit `position` conflicts.
 ///
 /// Pure (no I/O, no logging) so the rule stays unit-testable.
+/// Registration-time validation of retention against durable federated
+/// write-back.
+///
+/// A durable-write-back dataset keeps a marker for every acknowledged write
+/// until the delivery worker has reconciled it to the federated source, and only
+/// delivery retires one: a marker whose key cannot be read is retried, never
+/// dropped, because dropping it would silently lose that write. Retention breaks
+/// the premise, since it removes a live row the accelerator has already
+/// acknowledged — the marker then has nothing to deliver, and the source keeps a
+/// value the user believes was written. Time-based retention does not even
+/// leave a deletion to observe: Cayenne applies it as a read-time filter, so an
+/// expired row stops being readable while it is still physically present.
+///
+/// The combination is refused rather than degraded because neither degradation
+/// is acceptable to choose on the user's behalf: ignoring retention grows the
+/// accelerator without bound, and ignoring write-back loses writes.
+fn validate_durable_write_back_retention(
+    table_name: &str,
+    retention_period: Option<&str>,
+    retention_sql: Option<&str>,
+) -> Result<(), String> {
+    // Deliberately keyed on the settings being present rather than on
+    // `retention_check_enabled`, which governs only the runtime's retention
+    // loop: `retention_sql` and `retention_period` also drive Cayenne's own
+    // background prune and its read-time filter, neither of which consults it.
+    let configured: Vec<&str> = [
+        retention_period.map(|_| "`retention_period`"),
+        retention_sql.map(|_| "`retention_sql`"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if configured.is_empty() {
+        return Ok(());
+    }
+    let configured = configured.join(" and ");
+    Err(format!(
+        "Failed to register dataset '{table_name}' (cayenne): durable write-back cannot be combined with retention ({configured}), because retention removes rows from the accelerator before they have been written back to the federated source, losing those writes. \
+        Remove {configured}, or set `write_mode` to `accelerator_only` to keep retention. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))
+}
+
 fn validate_durable_write_back_table_options(
     table_name: &str,
     options: &cayenne::metadata::CreateTableOptions,
@@ -6384,6 +6440,38 @@ mod tests {
             validate_durable_write_back_table_options("dl_t", &options)
                 .expect("key and auto deletion modes register with durable write-back");
         }
+    }
+
+    /// Retention evicts rows the accelerator has acknowledged but has not yet
+    /// written back, and a marker set that is never retired cannot survive that
+    /// — so the combination is refused rather than silently degraded either way.
+    #[test]
+    fn test_validate_durable_write_back_rejects_retention() {
+        for (period, sql, expected) in [
+            (Some("30d"), None, "`retention_period`"),
+            (None, Some("time < now() - 1d"), "`retention_sql`"),
+            (
+                Some("30d"),
+                Some("time < now() - 1d"),
+                "`retention_period` and `retention_sql`",
+            ),
+        ] {
+            let error = validate_durable_write_back_retention("wb_t", period, sql)
+                .expect_err("durable write-back with retention must fail registration");
+            assert!(
+                error.contains("'wb_t'")
+                    && error.contains(expected)
+                    && error.contains("`write_mode` to `accelerator_only`")
+                    && error.contains("https://spiceai.org/docs"),
+                "the error must name the dataset, every retention setting that is configured, a fix, and a docs link: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_durable_write_back_accepts_no_retention() {
+        validate_durable_write_back_retention("wb_t", None, None)
+            .expect("durable write-back registers when no retention is configured");
     }
 
     #[test]

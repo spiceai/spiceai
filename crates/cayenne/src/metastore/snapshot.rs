@@ -182,23 +182,40 @@ impl DatasetMetastoreSlice {
 /// `None` when the row already has the current shape (or is not a shape this
 /// build knows how to normalize — the caller's length check then rejects it).
 ///
-/// `cayenne_pending_write_back` gained a trailing `op` column; a slice exported
-/// before it carries four-column rows. Those markers default to upsert, which
-/// is what they are: before the column existed only upsert commits marked keys
-/// (the same reasoning as the live table's `ALTER … DEFAULT 0` migration —
-/// defaulting them to delete would make the next delivery pass delete live
-/// source rows).
+/// `cayenne_pending_write_back` has gained trailing columns twice, so a slice
+/// carries one of three widths depending on the build that exported it. Each
+/// missing column takes the same value the live table's `ALTER … DEFAULT`
+/// migration gives it:
+///
+/// * `op` (four-column rows) defaults to upsert, which is what those markers
+///   are — before the column existed only upsert commits marked keys, and
+///   defaulting them to delete would make the next delivery pass delete live
+///   source rows.
+/// * `delivery_attempts` / `last_delivery_attempt` (five-column rows) default
+///   to never-attempted, which puts a restored marker in the fresh claim queue
+///   — the right place for one no pass on this build has judged yet.
 fn normalize_legacy_slice_row(table_name: &str, row: &SliceRow) -> Option<SliceRow> {
-    const PENDING_WRITE_BACK_PRE_OP_COLUMNS: usize = 4;
-    if table_name == "cayenne_pending_write_back" && row.len() == PENDING_WRITE_BACK_PRE_OP_COLUMNS
-    {
-        let mut normalized = row.clone();
+    const PRE_OP_COLUMNS: usize = 4;
+    const PRE_SCHEDULING_COLUMNS: usize = 5;
+    const CURRENT_COLUMNS: usize = 7;
+
+    if table_name != "cayenne_pending_write_back" || row.len() >= CURRENT_COLUMNS {
+        return None;
+    }
+    let mut normalized = row.clone();
+    if normalized.len() == PRE_OP_COLUMNS {
         normalized.push(SliceValue::Integer(
             crate::metadata::WriteBackOp::Upsert.as_i64(),
         ));
-        return Some(normalized);
     }
-    None
+    if normalized.len() == PRE_SCHEDULING_COLUMNS {
+        normalized.push(SliceValue::Integer(0));
+        normalized.push(SliceValue::Null);
+    }
+    // A width this build does not recognize is left for the caller's length
+    // check to reject, rather than padded into a row whose columns do not line
+    // up with what the values mean.
+    (normalized.len() == CURRENT_COLUMNS).then_some(normalized)
 }
 
 /// Returns the (`path_column_index`, `path_is_relative_column_index`) for tables
@@ -700,16 +717,56 @@ mod tests {
             SliceValue::Integer(1),
             SliceValue::Text(String::new()),
             SliceValue::Integer(0),
+            SliceValue::Integer(0),
+            SliceValue::Null,
         ];
         assert!(
             normalize_legacy_slice_row("cayenne_pending_write_back", &current_shape).is_none(),
-            "a five-column row is already current"
+            "a seven-column row is already current"
         );
         let four_columns: SliceRow = current_shape[..4].to_vec();
         assert!(
             normalize_legacy_slice_row("cayenne_table", &four_columns).is_none(),
             "only cayenne_pending_write_back rows are normalized"
         );
+        assert!(
+            normalize_legacy_slice_row("cayenne_pending_write_back", &current_shape[..3].to_vec())
+                .is_none(),
+            "a width this build does not recognize must be rejected, not padded"
+        );
+    }
+
+    /// Both historical export widths pad up to the current shape, and both land
+    /// on never-attempted so a restored marker joins the fresh claim queue.
+    #[test]
+    fn normalize_legacy_slice_row_pads_every_known_legacy_width() {
+        let five_columns: SliceRow = vec![
+            SliceValue::Blob(String::new()),
+            SliceValue::Blob(String::new()),
+            SliceValue::Integer(1),
+            SliceValue::Text(String::new()),
+            SliceValue::Integer(crate::metadata::WriteBackOp::Delete.as_i64()),
+        ];
+        let normalized = normalize_legacy_slice_row("cayenne_pending_write_back", &five_columns)
+            .expect("a five-column row is padded to the current shape");
+        assert_eq!(
+            normalized[4],
+            SliceValue::Integer(crate::metadata::WriteBackOp::Delete.as_i64()),
+            "padding must not disturb the op the export carried"
+        );
+        assert_eq!(normalized[5], SliceValue::Integer(0));
+        assert_eq!(normalized[6], SliceValue::Null);
+
+        let four_columns: SliceRow = five_columns[..4].to_vec();
+        let normalized = normalize_legacy_slice_row("cayenne_pending_write_back", &four_columns)
+            .expect("a four-column row is padded to the current shape");
+        assert_eq!(
+            normalized[4],
+            SliceValue::Integer(crate::metadata::WriteBackOp::Upsert.as_i64()),
+            "a marker predating the op column is an upsert"
+        );
+        assert_eq!(normalized[5], SliceValue::Integer(0));
+        assert_eq!(normalized[6], SliceValue::Null);
     }
 
     #[tokio::test]

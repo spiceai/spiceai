@@ -1024,6 +1024,12 @@ impl CayenneCatalog {
     /// highest-sequence commit for that key. Without that coupling a delete
     /// marker could keep an older commit's `upsert` op and be delivered as a
     /// resurrection of the row it deleted.
+    ///
+    /// The delivery schedule (`delivery_attempts`, `last_delivery_attempt`)
+    /// travels with the sequence for the same reason: a winning re-mark carries
+    /// data no pass has tried to deliver, so it returns the marker to the fresh
+    /// claim queue rather than letting it inherit the failure history of the
+    /// commit it superseded.
     pub(crate) async fn mark_dirty_keys_in_txn(
         &self,
         txn: &mut dyn MetastoreTransaction,
@@ -1040,12 +1046,17 @@ impl CayenneCatalog {
         for chunk in dirty_pk_bytes.chunks(MAX_ROWS_PER_CHUNK) {
             const PREFIX: &str = "INSERT INTO cayenne_pending_write_back \
                  (table_id, pk_bytes, sequence_number, op) VALUES ";
-            // `op` follows the winning sequence (see the doc comment). Both
-            // assignments read the pre-UPDATE `sequence_number`, so the CASE
-            // decides against the stored value, not the one just written.
+            // `op` and the delivery schedule follow the winning sequence (see
+            // the doc comment). Every assignment reads the pre-UPDATE
+            // `sequence_number`, so each CASE decides against the stored value,
+            // not the one just written.
             const SUFFIX: &str = " ON CONFLICT(table_id, pk_bytes) DO UPDATE SET \
                  op = CASE WHEN excluded.sequence_number >= cayenne_pending_write_back.sequence_number \
                       THEN excluded.op ELSE cayenne_pending_write_back.op END, \
+                 delivery_attempts = CASE WHEN excluded.sequence_number >= cayenne_pending_write_back.sequence_number \
+                      THEN 0 ELSE cayenne_pending_write_back.delivery_attempts END, \
+                 last_delivery_attempt = CASE WHEN excluded.sequence_number >= cayenne_pending_write_back.sequence_number \
+                      THEN NULL ELSE cayenne_pending_write_back.last_delivery_attempt END, \
                  sequence_number = MAX(cayenne_pending_write_back.sequence_number, excluded.sequence_number)";
             let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + chunk.len() * 24);
             sql.push_str(PREFIX);
@@ -1074,18 +1085,67 @@ impl CayenneCatalog {
         Ok(())
     }
 
-    /// List up to `limit` undelivered write-back markers for `table_id`, oldest
-    /// commit sequence first.
-    pub(crate) async fn list_pending_write_back(
+    /// List up to `limit` markers from the **fresh** claim queue for `table_id`,
+    /// oldest commit sequence first.
+    ///
+    /// "Fresh" is `delivery_attempts <= 1`: markers no pass has judged yet, plus
+    /// the one immediate retry a transient miss is owed. The overwhelmingly
+    /// common deferral is a delete whose marker is published before the delete
+    /// is scan-visible, which resolves within milliseconds — demoting it to the
+    /// rotation below on its first miss would make it wait out a whole sweep of
+    /// the chronic set instead.
+    pub(crate) async fn list_pending_write_back_fresh(
         &self,
+        table_id: &str,
+        limit: usize,
+    ) -> CatalogResult<Vec<PendingWriteBackMarker>> {
+        self.list_pending_write_back_queue(
+            "SELECT pk_bytes, sequence_number, op, delivery_attempts \
+             FROM cayenne_pending_write_back \
+             WHERE table_id = ?1 AND delivery_attempts <= 1 \
+             ORDER BY sequence_number ASC LIMIT ?2",
+            table_id,
+            limit,
+        )
+        .await
+    }
+
+    /// List up to `limit` markers from the **deferred** claim queue for
+    /// `table_id`, least-recently-attempted first.
+    ///
+    /// A marker is never retired for being undeliverable, so the chronically
+    /// undeliverable ones would otherwise sit at the head of an oldest-first
+    /// claim forever and starve every newer write behind them. They are drawn on
+    /// their own budget instead, ordered by `last_delivery_attempt` so waiting
+    /// longer monotonically improves a marker's position — an attempt *count*
+    /// would let a steady trickle of newly-deferred keys jump the queue
+    /// indefinitely ahead of the long-suffering ones.
+    pub(crate) async fn list_pending_write_back_deferred(
+        &self,
+        table_id: &str,
+        limit: usize,
+    ) -> CatalogResult<Vec<PendingWriteBackMarker>> {
+        self.list_pending_write_back_queue(
+            "SELECT pk_bytes, sequence_number, op, delivery_attempts \
+             FROM cayenne_pending_write_back \
+             WHERE table_id = ?1 AND delivery_attempts > 1 \
+             ORDER BY last_delivery_attempt ASC LIMIT ?2",
+            table_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_pending_write_back_queue(
+        &self,
+        sql: &'static str,
         table_id: &str,
         limit: usize,
     ) -> CatalogResult<Vec<PendingWriteBackMarker>> {
         self.metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT pk_bytes, sequence_number, op FROM cayenne_pending_write_back \
-                          WHERE table_id = ?1 ORDER BY sequence_number ASC LIMIT ?2",
+                    sql,
                     params: vec![
                         insert_record_table_id_value(table_id),
                         MetastoreValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
@@ -1096,10 +1156,48 @@ impl CayenneCatalog {
                         pk_bytes: row.get_blob(0)?,
                         sequence_number: row.get_i64(1)?,
                         op: WriteBackOp::from_i64(row.get_i64(2)?),
+                        delivery_attempts: row.get_i64(3)?,
                     })
                 },
             )
             .await
+    }
+
+    /// Record that a pass judged these markers undeliverable: bump
+    /// `delivery_attempts` and stamp `last_delivery_attempt`, which is what
+    /// moves a marker into the deferred rotation and orders it there.
+    ///
+    /// Guarded on the claimed sequence exactly as
+    /// [`Self::clear_pending_write_back`] is: a newer commit that re-marked the
+    /// key during this pass reset the schedule deliberately, and this pass's
+    /// failure belongs to the commit that has since been superseded, not to the
+    /// fresh one. Batched in one transaction.
+    pub(crate) async fn record_write_back_delivery_attempts(
+        &self,
+        table_id: &str,
+        markers: &[PendingWriteBackMarker],
+    ) -> CatalogResult<()> {
+        if markers.is_empty() {
+            return Ok(());
+        }
+        let txn = self.metastore.begin_transaction().await?;
+        let table_id_value = insert_record_table_id_value(table_id);
+        for marker in markers {
+            txn.execute(ExecuteParams {
+                sql: "UPDATE cayenne_pending_write_back \
+                      SET delivery_attempts = delivery_attempts + 1, \
+                          last_delivery_attempt = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                      WHERE table_id = ?1 AND pk_bytes = ?2 AND sequence_number <= ?3",
+                params: vec![
+                    table_id_value.clone(),
+                    MetastoreValue::Blob(marker.pk_bytes.clone()),
+                    MetastoreValue::Integer(marker.sequence_number),
+                ],
+            })
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(())
     }
 
     /// Compare-and-clear delivered markers: for each `(pk_bytes, claimed_seq)`,
