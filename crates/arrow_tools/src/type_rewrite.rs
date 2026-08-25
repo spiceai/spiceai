@@ -313,22 +313,30 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 ///
 /// # Errors
 ///
-/// Returns an `ArrowError` when `target_type` asks for anything beyond a field name or a
-/// nullability flag — a different unit, timezone, signedness, width, precision or scale reads
-/// the same buffers as different values, so it is refused rather than reinterpreted. Also
+/// Returns an `ArrowError` when `target_type` changes what the buffers mean — a different unit,
+/// timezone, signedness, width, precision or scale, an extension type, or a nested field's
+/// `dict_is_ordered` all read the same bytes as different values, so they are refused rather than
+/// reinterpreted. Field names, nullability flags, and field metadata outside the two
+/// `ARROW:extension:*` keys are permitted, since none of them changes how a value is read. Also
 /// returns an `ArrowError` when `target_type` does not describe the layout `data` holds.
 pub fn relabel_array_data(
     data: ArrayData,
     target_type: &DataType,
 ) -> Result<ArrayData, ArrowError> {
-    if data.data_type() == target_type {
-        return Ok(data);
-    }
-
     // `build` below only validates buffer *shape*, so every same-layout target it accepts would
     // be rebuilt — `Int32` under a `UInt32` label turns -1 into 4294967295 without an error.
     // Meaning is checked here instead, once for the whole tree rather than at each level.
+    //
+    // Checked before the equality short-circuit rather than after it: `Field`'s `PartialEq` leaves
+    // `dict_is_ordered` out, so a target differing from `data`'s type in only that flag compares
+    // equal and would be waved through as nothing-to-do — handing back unordered values to a caller
+    // that asked for, and will go on to describe, an ordered dictionary. The walk is `O(type tree)`
+    // against the rebuild's `O(rows)`, so paying it on the identical case costs nothing that shows.
     ensure_relabel_is_metadata_only(data.data_type(), target_type)?;
+
+    if data.data_type() == target_type {
+        return Ok(data);
+    }
 
     relabel_validated_array_data(data, target_type)
 }
@@ -462,7 +470,17 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
 /// field without changing how its values are read, and the Delta column-mapping caller relabels
 /// across schemas whose fields differ in exactly that way — rejecting all metadata differences
 /// would refuse a correct relabel to guard something that is not a reinterpretation.
+///
+/// A field's `dict_is_ordered` is checked here for the same reason and needs checking *here*
+/// specifically: it claims the dictionary's values carry an order, which is a statement about what
+/// the same key buffer means, exactly as `Map`'s `sorted` flag is. It lives on the field rather
+/// than in `DataType::Dictionary`, and `Field`'s `PartialEq` leaves it out, so no comparison of
+/// types or fields anywhere else in this walk can see it.
 fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Result<(), ArrowError> {
+    if source.dict_is_ordered() != target.dict_is_ordered() {
+        return Err(relabel_changes_dictionary_order(source, target));
+    }
+
     let extension_parts = [
         (
             EXTENSION_TYPE_NAME_KEY,
@@ -487,6 +505,30 @@ fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Resu
         }
     }
     ensure_relabel_is_metadata_only(source.data_type(), target.data_type())
+}
+
+/// The error [`ensure_field_relabel_is_metadata_only`] reports for a changed `dict_is_ordered`.
+fn relabel_changes_dictionary_order(source: &Field, target: &Field) -> ArrowError {
+    // `dict_is_ordered` reads as `None` for a field that is not a dictionary at all, which the
+    // data-type walk refuses on its own — spell it rather than printing an `Option`, so the one
+    // line an operator sees never asks them to read Rust.
+    let ordered = |field: &Field| match field.dict_is_ordered() {
+        Some(true) => "ordered",
+        Some(false) => "unordered",
+        None => "not a dictionary",
+    };
+
+    // Field names come from the schema, so escape them: an embedded newline would break the
+    // one-line contract this error is read under, and split one log record into two.
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel the Arrow field '{}' as '{}': `dict_is_ordered` differs ({} vs {}), which \
+         republishes the same dictionary keys as carrying an order they do not. Sort the dictionary \
+         values instead of relabelling them.",
+        source.name().escape_debug(),
+        target.name().escape_debug(),
+        ordered(source),
+        ordered(target),
+    ))
 }
 
 /// The error [`ensure_field_relabel_is_metadata_only`] reports for an extension-type change.
@@ -555,8 +597,9 @@ fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int32Array, ListArray};
+    use arrow::array::{Array, DictionaryArray, Int32Array, ListArray, StringArray};
     use arrow::buffer::{Buffer, OffsetBuffer};
+    use arrow::datatypes::Int32Type;
     use arrow_schema::{DataType, Field, Fields, IntervalUnit, Schema, UnionFields, UnionMode};
 
     /// A `Map` whose `entries` field is nullable, built the way IPC decode delivers it —
@@ -848,6 +891,62 @@ mod tests {
         assert!(
             err.to_string().contains("unset"),
             "the error must say the source had no extension type, got: {err}"
+        );
+    }
+
+    /// `dict_is_ordered` claims the dictionary's values carry an order, so republishing unordered
+    /// keys under it is the same class of reinterpretation as `Map`'s `sorted` flag, which this
+    /// guard already refuses. It hides better: the flag lives on `Field` rather than in
+    /// `DataType::Dictionary`, and `Field`'s `PartialEq` leaves it out, so a target differing only
+    /// in that flag compares *equal* to the source everywhere else in this module.
+    #[test]
+    fn relabel_refuses_a_dictionary_order_claim_at_depth() {
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let item =
+            Arc::new(Field::new("item", dictionary.clone(), true).with_dict_is_ordered(false));
+        let values = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec!["b", "a"])),
+        )
+        .expect("a dictionary over two values");
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+
+        // Renamed as well as reordered, so the rebuild is genuinely reached: a rename alone is
+        // permitted, which is exactly the "another permitted field change" that carries the
+        // ordered claim into the rebuilt level.
+        let target = DataType::List(Arc::new(
+            Field::new("renamed", dictionary.clone(), true).with_dict_is_ordered(true),
+        ));
+        let err = relabel_array_data(list.to_data(), &target)
+            .expect_err("publishing an unordered dictionary as ordered must be refused");
+        assert!(
+            err.to_string().contains("dict_is_ordered"),
+            "the error must name the flag that differs, got: {err}"
+        );
+
+        // The same claim with *no* other change: `Field: PartialEq` ignores `dict_is_ordered`, so
+        // this target compares equal to the source's type and would be waved through by an
+        // equality short-circuit that ran before the check.
+        let ordered_only = DataType::List(Arc::new(
+            Field::new("item", dictionary, true).with_dict_is_ordered(true),
+        ));
+        assert_eq!(
+            list.data_type(),
+            &ordered_only,
+            "fixture check: these two types must compare equal, or this arm proves nothing about \
+             the short-circuit"
+        );
+        let err = relabel_array_data(list.to_data(), &ordered_only).expect_err(
+            "an ordered claim that changes nothing `PartialEq` can see must still be refused",
+        );
+        assert!(
+            err.to_string().contains("dict_is_ordered"),
+            "the short-circuit must not bypass the check, got: {err}"
         );
     }
 
