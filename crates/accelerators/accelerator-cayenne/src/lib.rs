@@ -1160,9 +1160,12 @@ fn dir_contains(outer: &Path, inner: &Path) -> bool {
 /// cannot overlap — the data path is on object storage; and `Err` when either path
 /// cannot be resolved, which the caller must treat as a refusal rather than as `Ok(None)`.
 ///
-/// The data directory is compared in its fully resolved form only: `remove_dir_all`
-/// refuses a final-component symlink rather than following it, so the recursive walk
-/// only ever happens at the resolved directory.
+/// The data directory is compared in its fully resolved form only, because that is where
+/// the recursive walk happens: `remove_dir_all` unlinks a final-component symlink rather
+/// than descending it (pinned by
+/// `remove_dir_all_unlinks_a_symlink_rather_than_descending_it`), so nothing beneath the
+/// target is deleted. What the unlink does cost is every *name* under the alias, and a
+/// metastore configured through one is not compared here — #13465.
 async fn overlapping_metastore_dir(
     data_dir: &str,
     metadata_dir: &str,
@@ -1215,8 +1218,8 @@ fn is_metastore_file(file_name: &std::ffi::OsStr) -> bool {
 /// disk with nothing able to reach it. Nothing on this path can tell an alias somebody
 /// configured from an incidental one, so a link whose target directly holds a catalog
 /// refuses the teardown: a false refusal is loud and an operator can move the link, while
-/// the orphaning is silent and permanent. A `data_dir` that is *itself* a link is left
-/// alone — `remove_dir_all` refuses a final-component symlink outright.
+/// the orphaning is silent and permanent. A `data_dir` that is *itself* a link is
+/// dereferenced once and then walked, for the same reason and with the same rule.
 ///
 /// The examination is one level deep by design: an alias points *at* a metadata directory,
 /// so the catalog is directly inside it, and following further would have to guard against
@@ -1256,14 +1259,25 @@ async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>
 }
 
 async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf>> {
-    match tokio::fs::symlink_metadata(data_dir).await {
-        Ok(metadata) if metadata.is_symlink() => return Ok(None),
-        Ok(_) => {}
+    let root = match tokio::fs::symlink_metadata(data_dir).await {
+        // A `data_dir` that is itself a link is dereferenced once and then walked. The
+        // teardown unlinks the link and the caller recreates a real, empty directory in
+        // its place, so *every* name under the alias dies even though the files behind it
+        // live — which is the same loss as a catalog directly inside the directory, and
+        // is refused the same way.
+        Ok(metadata) if metadata.is_symlink() => match tokio::fs::canonicalize(data_dir).await {
+            Ok(resolved) if resolved.is_dir() => resolved,
+            // Dangling, or naming a file: no catalog is reachable through it.
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        },
+        Ok(_) => data_dir.to_path_buf(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
-    }
+    };
 
-    let mut pending = vec![data_dir.to_path_buf()];
+    let mut pending = vec![root];
     while let Some(dir) = pending.pop() {
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(entries) => entries,
@@ -1528,9 +1542,7 @@ impl CayenneAccelerator {
         Self::ensure_metastore_outside_data_dir(source, data_dir).await?;
         Self::ensure_no_catalog_under_data_dir(source, data_dir).await?;
 
-        // The same path the proof above walked, not the raw string: the two must name
-        // one directory, or the deletion is not the thing that was proved safe.
-        tokio::fs::remove_dir_all(fs_probe_path(data_dir))
+        tokio::fs::remove_dir_all(data_dir)
             .await
             .map_err(|source_error| Error::AccelerationDataDirRemovalFailed {
                 table_name: source.name().to_string(),
@@ -1552,16 +1564,19 @@ impl CayenneAccelerator {
     /// change in between (#13109), and the delete-time call cannot make the preflight
     /// redundant, since by then the catalog rows are already gone.
     ///
-    /// No object-store exemption, unlike [`overlapping_metastore_dir`]: that one skips a
-    /// data path it can prove is remote, but `is_local_path` is a substring test, so a
-    /// local directory whose name merely contains `://` would be waved through here while
-    /// `remove_dir_all` still walked it. A path that is genuinely remote is simply absent
-    /// from the filesystem, and the walk answers `None` for it at the cost of one `stat`.
+    /// Reads `data_dir` exactly as written, with neither the object-store exemption nor
+    /// the `file:` stripping [`overlapping_metastore_dir`] applies. Both would make the
+    /// proof describe a different tree from the one that gets deleted: `is_local_path` is
+    /// a substring test, so a local directory whose name merely contains `://` would be
+    /// waved through while `remove_dir_all` still walked it; and `remove_dir_all` — like
+    /// the `exists()` test each caller gates on — is handed the string itself. A path that
+    /// is genuinely remote is simply absent from the filesystem, and the walk answers
+    /// `None` for it at the cost of one `stat`.
     async fn ensure_no_catalog_under_data_dir(
         source: &dyn AccelerationSource,
         data_dir: &str,
     ) -> Result<()> {
-        let found = metastore_file_under(Path::new(fs_probe_path(data_dir)))
+        let found = metastore_file_under(Path::new(data_dir))
             .await
             .map_err(|source_error| Error::MetastoreScanFailed {
                 table_name: source.name().to_string(),
@@ -5617,6 +5632,35 @@ mod tests {
         );
     }
 
+    /// The invariant the whole guard is built on, asserted rather than assumed:
+    /// `remove_dir_all` on a path whose final component is a symlink **unlinks the link**
+    /// and leaves its target untouched. So a teardown costs an aliased catalog its name,
+    /// never its bytes — which is why the refusals below are worded around names, and why
+    /// a link is examined rather than descended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_dir_all_unlinks_a_symlink_rather_than_descending_it() {
+        let base = tempfile::tempdir().expect("temp dir");
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::write(real.join("cayenne.db"), b"catalog").expect("catalog");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        tokio::fs::remove_dir_all(&link)
+            .await
+            .expect("removing a symlinked directory succeeds");
+
+        assert!(
+            link.symlink_metadata().is_err(),
+            "the link itself is what is removed"
+        );
+        assert!(
+            real.join("cayenne.db").exists(),
+            "the catalog behind the link keeps its bytes — only the name is gone"
+        );
+    }
+
     /// The `cayenne.db` name and the sidecars `SQLite` keeps beside it are what mark a
     /// directory as holding a catalog. A name that merely starts with it is not one:
     /// `cayenne.db.backup` is an operator's copy, and a dataset may legitimately be
@@ -5797,6 +5841,52 @@ mod tests {
         );
     }
 
+    /// A data directory that is *itself* a link is dereferenced once and walked. The
+    /// teardown unlinks the alias and the caller recreates a real, empty directory in its
+    /// place, so a catalog reachable only by a name under the alias is orphaned exactly as
+    /// it would be by a link one level down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_data_directory_that_is_itself_a_link_is_still_read_through() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = TestAccelerationSource::new("q").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let elsewhere = base.path().join("elsewhere");
+        let foreign_metastore = elsewhere.join("catalog");
+        std::fs::create_dir_all(&foreign_metastore).expect("foreign metastore dir");
+        let catalog_file = foreign_metastore.join("cayenne.db");
+        std::fs::write(&catalog_file, b"catalog").expect("catalog file");
+
+        let data_dir = base.path().join("q");
+        std::os::unix::fs::symlink(&elsewhere, &data_dir).expect("symlink the data dir");
+
+        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect_err("a link whose target holds a catalog must refuse the teardown");
+
+        assert!(
+            data_dir.symlink_metadata().is_ok(),
+            "the alias must survive the refused teardown"
+        );
+        assert!(
+            catalog_file.exists(),
+            "the catalog must survive the refused teardown"
+        );
+    }
+
     /// The link rule must stay narrow: a symlink to an ordinary directory aliases no
     /// catalog, and refusing on every link would block teardowns no operator could clear.
     #[cfg(unix)]
@@ -5882,6 +5972,48 @@ mod tests {
         assert!(
             catalog_file.exists(),
             "the catalog must survive the refused teardown"
+        );
+    }
+
+    /// The deletion may only ever reach the tree the caller authorized. Each teardown
+    /// gates on `PathBuf::from(&dir_path).exists()` and hands `remove_dir_all` that same
+    /// string, so normalizing the path anywhere in between would delete a directory
+    /// nothing checked — here, the real `{base}/q` rather than the relative `file:/…` the
+    /// caller tested. The catalog beneath it is the sentinel that proves it was not.
+    #[tokio::test]
+    async fn the_teardown_deletes_only_the_tree_its_caller_checked() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = TestAccelerationSource::new("q").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let resolved = base.path().join("q");
+        let catalog_file = resolved.join("catalog").join("cayenne.db");
+        std::fs::create_dir_all(resolved.join("catalog")).expect("catalog dir");
+        std::fs::write(&catalog_file, b"catalog").expect("catalog file");
+
+        // The `file:` spelling the metastore comparison strips. Nothing exists at the
+        // relative path it denotes, so the teardown must fail to remove it and must not
+        // reach for the real directory instead.
+        let spelled = format!("file://{}", resolved.to_string_lossy());
+        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &spelled)
+            .await
+            .expect_err("nothing exists at the path the caller would have checked");
+
+        assert!(
+            catalog_file.exists(),
+            "the teardown must not normalize its way into a tree its caller never checked"
         );
     }
 
