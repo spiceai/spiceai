@@ -42791,8 +42791,15 @@ mod tests {
     /// and no invalidation of its own — an entry leaves only when another `put`
     /// pushes it out under capacity pressure — and every Cayenne file is written
     /// once under a fresh uuid7 directory, so a footer that outlives its file
-    /// can never be looked up again yet keeps a share of a process-wide budget
-    /// that live metadata for every other table, Parquet included, competes for.
+    /// can never be looked up again yet keeps a share of a budget that live
+    /// metadata for every other table on the same environment, Parquet
+    /// included, competes for.
+    ///
+    /// "on the same environment" is the sharing boundary, and it is narrower
+    /// than the process: the cache hangs off the `RuntimeEnv`. This test runs
+    /// against one environment, so it covers what a deployment without a
+    /// dedicated Cayenne compaction environment sees; the second cache such a
+    /// deployment has is spiceai/spiceai#13497.
     #[tokio::test]
     async fn committed_compaction_invalidates_retired_segments_and_footers_after_cleanup() {
         use arrow::array::Int64Array;
