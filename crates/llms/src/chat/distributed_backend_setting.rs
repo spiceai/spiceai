@@ -27,12 +27,16 @@ pub enum DistributedBackendSetting {
     /// Pool the model over the `nodes` list via mistral.rs's ring all-reduce
     /// (a Spice enterprise feature; standard builds are single-node only).
     Ring,
+    /// Pool the model over the `nodes` list via NCCL's on-device collectives.
+    /// Needs a build carrying the `nccl` feature (which excludes `ring`) and the
+    /// NCCL runtime on every node.
+    Nccl,
 }
 
 impl DistributedBackendSetting {
     /// The values accepted in a Spicepod. The parameter spec validates against this same
     /// slice, so the documented vocabulary and the parsed one cannot drift.
-    pub const VALUES: &'static [&'static str] = &["none", "ring"];
+    pub const VALUES: &'static [&'static str] = &["none", "ring", "nccl"];
 }
 
 impl FromStr for DistributedBackendSetting {
@@ -44,6 +48,7 @@ impl FromStr for DistributedBackendSetting {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "none" => Ok(Self::None),
             "ring" => Ok(Self::Ring),
+            "nccl" => Ok(Self::Nccl),
             other => Err(format!(
                 "must be one of: {}. Found {other}",
                 Self::VALUES.join(", ")
@@ -65,6 +70,8 @@ mod tests {
             ("", DistributedBackendSetting::None),
             ("ring", DistributedBackendSetting::Ring),
             ("Ring", DistributedBackendSetting::Ring),
+            ("nccl", DistributedBackendSetting::Nccl),
+            ("NCCL", DistributedBackendSetting::Nccl),
         ] {
             assert_eq!(
                 raw.parse::<DistributedBackendSetting>()
@@ -77,7 +84,7 @@ mod tests {
 
     #[test]
     fn rejects_values_outside_the_spec() {
-        for raw in ["nccl", "true", "false", "1", "0"] {
+        for raw in ["mpi", "true", "false", "1", "0"] {
             assert!(
                 raw.parse::<DistributedBackendSetting>().is_err(),
                 "{raw:?} should be rejected"

@@ -419,12 +419,13 @@ fn parse_distributed_config(
             if nodes.is_some() || node_rank.is_some() {
                 return Err(LlmError::InvalidParamValueError {
                     param: "distributed_backend".to_string(),
-                    message: "`nodes`/`node_rank` are set but `distributed_backend` is not `ring`; set `distributed_backend: ring` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
+                    message: "`nodes`/`node_rank` are set but `distributed_backend` is `none`; set `distributed_backend` to `ring` or `nccl` to enable multi-node inference, or remove `nodes`/`node_rank`.".to_string(),
                 });
             }
             return Ok(None);
         }
         DistributedBackendSetting::Ring => llms::chat::DistributedBackend::Ring,
+        DistributedBackendSetting::Nccl => llms::chat::DistributedBackend::Nccl,
     };
 
     let node_rank = match node_rank.map(str::trim) {
@@ -450,7 +451,7 @@ fn parse_distributed_config(
         return Err(LlmError::InvalidParamValueError {
             param: "nodes".to_string(),
             message:
-                "`distributed_backend: ring` requires `nodes`: a comma-separated, rank-ordered list of node addresses (e.g. `10.0.0.1,10.0.0.2`)."
+                "multi-node inference requires `nodes`: a comma-separated, rank-ordered list of node addresses (e.g. `10.0.0.1,10.0.0.2`)."
                     .to_string(),
         });
     }

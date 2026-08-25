@@ -37,13 +37,28 @@ struct RingConfigFile {
 }
 
 /// Backend used for multi-node distributed (tensor-parallel) inference of a local model.
-/// Currently only mistral.rs's pure-TCP `ring` all-reduce.
+///
+/// The two backends are selected at BUILD time, not at run time: mistral.rs compiles in
+/// one or the other (`llms/distributed` vs `llms/nccl`, which cannot both be enabled).
+/// A binary therefore accepts exactly one of these values and rejects the other with a
+/// message naming the feature it was built without.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributedBackend {
     /// mistral.rs ring all-reduce over plain TCP. No system dependency. The reduction
     /// rotates the ring once per peer, so it is correct at any world size >= 2.
+    ///
+    /// Every collective stages its payload device -> host -> TCP -> device, allocating a
+    /// fresh tensor per hop, so decode latency is dominated by that staging rather than
+    /// by the link: the wire carries a low-single-digit percentage of a token's cost.
     Ring,
+    /// NCCL collectives, which stay on the GPU instead of staging through host memory.
+    /// Needs the NCCL runtime on every node and a build carrying the `nccl` feature.
+    Nccl,
 }
+
+/// TCP port on which rank 0 hands the NCCL unique id to the other ranks. Only the head
+/// binds it; every other rank dials it once, during model load.
+const NCCL_HEAD_PORT: u16 = 12344;
 
 /// Topology for running one local model across multiple nodes (tensor-parallel).
 ///
@@ -99,6 +114,87 @@ impl DistributedConfig {
     }
 }
 
+/// Apply `cfg` to the environment mistral.rs reads while it builds the pipeline, picking
+/// the wiring that matches the requested backend. Returns the ring's temp-file guard when
+/// the ring backend is in use (it must outlive the model); NCCL needs no such file.
+pub(crate) fn configure_distributed(
+    cfg: &DistributedConfig,
+) -> Result<Option<tempfile::TempPath>, ChatError> {
+    match cfg.backend {
+        DistributedBackend::Ring => configure_ring_distributed(cfg).map(Some),
+        DistributedBackend::Nccl => configure_nccl_distributed(cfg).map(|()| None),
+    }
+}
+
+/// Translate a [`DistributedConfig`] into the `MISTRALRS_MN_*` environment mistral.rs
+/// reads to bring up a multi-node NCCL communicator.
+///
+/// Spice runs exactly one rank per node, so the local world size is always 1 and this
+/// node's global rank is its `node_rank`: mistral.rs computes `local_rank + rank_offset`,
+/// where a worker's offset is `(worker_id + 1) * local_world_size`. Rank 0 publishes the
+/// NCCL unique id over [`NCCL_HEAD_PORT`]; the others fetch it from there.
+///
+/// Like the ring path this MUST run before `load_model_from_hf`, since there is no
+/// builder API for rank/world size.
+pub(crate) fn configure_nccl_distributed(cfg: &DistributedConfig) -> Result<(), ChatError> {
+    if !cfg!(feature = "nccl") {
+        return Err(ChatError::FailedToLoadModel {
+            source: "`distributed_backend: nccl` was requested, but this build does not include NCCL distributed inference (build with the `nccl` Cargo feature, which replaces `distributed`/`ring`).".into(),
+        });
+    }
+
+    if let Err((param, message)) = cfg.validate() {
+        return Err(ChatError::InvalidParamValueError {
+            param: param.to_string(),
+            message,
+        });
+    }
+
+    let world_size = cfg.world_size();
+    let rank = cfg.node_rank;
+    let head = cfg.nodes[0].trim().to_string();
+
+    // SAFETY: set once during model initialization, before mistral.rs reads these while
+    // constructing the pipeline. Loading is not concurrent with other environment access
+    // here, so no other thread races these writes. Each branch clears the other role's
+    // variables so a re-load in this process cannot inherit a stale role.
+    unsafe {
+        std::env::set_var("MISTRALRS_MN_GLOBAL_WORLD_SIZE", world_size.to_string());
+        std::env::set_var("MISTRALRS_MN_LOCAL_WORLD_SIZE", "1");
+        if rank == 0 {
+            std::env::set_var(
+                "MISTRALRS_MN_HEAD_NUM_WORKERS",
+                (world_size - 1).to_string(),
+            );
+            std::env::set_var("MISTRALRS_MN_HEAD_PORT", NCCL_HEAD_PORT.to_string());
+            std::env::remove_var("MISTRALRS_MN_WORKER_SERVER_ADDR");
+            std::env::remove_var("MISTRALRS_MN_WORKER_ID");
+        } else {
+            std::env::set_var(
+                "MISTRALRS_MN_WORKER_SERVER_ADDR",
+                format!("{head}:{NCCL_HEAD_PORT}"),
+            );
+            std::env::set_var("MISTRALRS_MN_WORKER_ID", (rank - 1).to_string());
+            std::env::remove_var("MISTRALRS_MN_HEAD_NUM_WORKERS");
+            std::env::remove_var("MISTRALRS_MN_HEAD_PORT");
+        }
+    }
+
+    tracing::info!(
+        rank,
+        world_size,
+        head = %head,
+        "Configured distributed NCCL inference"
+    );
+    if rank != 0 {
+        tracing::warn!(
+            "This node is rank {rank} (not the head): it runs as a tensor-parallel compute replica, blocking inside model load instead of serving its own API. Send inference requests to rank 0 ({head})."
+        );
+    }
+
+    Ok(())
+}
+
 /// Translate a [`DistributedConfig`] into a per-node mistral.rs ring topology,
 /// write it to a temp `RING_CONFIG` file, and point the `RING_CONFIG` env var at
 /// it. mistral.rs reads that env var while building the pipeline (there is no
@@ -107,9 +203,7 @@ impl DistributedConfig {
 pub(crate) fn configure_ring_distributed(
     cfg: &DistributedConfig,
 ) -> Result<tempfile::TempPath, ChatError> {
-    match cfg.backend {
-        DistributedBackend::Ring => {}
-    }
+    debug_assert_eq!(cfg.backend, DistributedBackend::Ring);
 
     if !cfg!(feature = "distributed") {
         return Err(ChatError::FailedToLoadModel {

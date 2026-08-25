@@ -43,7 +43,7 @@ use async_openai::types::chat::{
 pub mod mistral;
 pub mod nsql;
 #[cfg(feature = "local_llm")]
-use crate::chat::distributed::configure_ring_distributed;
+use crate::chat::distributed::configure_distributed;
 #[cfg(feature = "local_llm")]
 pub use crate::chat::distributed::{DistributedBackend, DistributedConfig};
 #[cfg(feature = "local_llm")]
@@ -365,11 +365,12 @@ pub async fn create_hf_model(
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
 ) -> Result<Arc<dyn Chat>> {
-    // Configure multi-node distributed (ring) inference before loading: the
-    // loader reads `RING_CONFIG` from the environment while building the
-    // pipeline. The returned guard keeps the temp file alive for the model.
+    // Configure multi-node distributed inference before loading: the loader reads the
+    // topology (`RING_CONFIG`, or the `MISTRALRS_MN_*` set for NCCL) from the environment
+    // while building the pipeline. Any returned guard keeps the temp file alive for the
+    // model.
     let ring_config = if let Some(cfg) = distributed {
-        Some(configure_ring_distributed(&cfg)?)
+        configure_distributed(&cfg)?
     } else {
         // Defensive: clear any `RING_CONFIG` left set by a prior distributed
         // load in this process, so this single-node load can't accidentally
@@ -420,7 +421,7 @@ pub async fn create_local_model(
     // loader reads `RING_CONFIG` from the environment while building the
     // pipeline. The returned guard keeps the temp file alive for the model.
     let ring_config = if let Some(cfg) = distributed {
-        Some(configure_ring_distributed(&cfg)?)
+        configure_distributed(&cfg)?
     } else {
         // Defensive: clear any `RING_CONFIG` left set by a prior distributed
         // load in this process, so this single-node load can't accidentally
