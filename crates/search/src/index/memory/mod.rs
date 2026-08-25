@@ -206,9 +206,9 @@ impl MemoryVectorIndex {
             .map(|(key, vector)| {
                 let keep = match (key, vector) {
                     (Some(key), Some(vector)) => {
-                        // All-zero / all-NaN vectors have no defined direction and
-                        // would corrupt similarity scores — skip them.
-                        let all_zero_or_nan = vector.iter().all(|&v| v == 0.0 || v.is_nan());
+                        // An all-zero vector has no defined direction and would corrupt
+                        // similarity scores — skip it.
+                        let all_zero = write_util::is_finite_all_zero(vector);
                         // A single NaN or infinity poisons every score computed against the
                         // vector, so one bad component disqualifies the whole row too.
                         let non_finite = write_util::first_non_finite(vector).is_some();
@@ -216,15 +216,16 @@ impl MemoryVectorIndex {
                         // deliberately silent: `update_embedding_column_in_batch` runs first on
                         // this path and has already named every affected row in one batched
                         // warning, so warning again per row would multiply one degraded
-                        // embedding response into a line per record.
-                        if all_zero_or_nan {
+                        // embedding response into a line per record. That is why `all_zero`
+                        // excludes `NaN` — `[0.0, NaN]` belongs to the batched report alone.
+                        if all_zero {
                             tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
+                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes"
                             );
                         } else if !non_finite {
                             keys.push(key.clone());
                         }
-                        !all_zero_or_nan && !non_finite
+                        !all_zero && !non_finite
                     }
                     (None, _) => {
                         tracing::warn!(
@@ -572,6 +573,40 @@ mod tests {
         }
     }
 
+    /// Embeds one row's text as a wholly zero vector and every other row normally.
+    /// `byte_vector` sums the text's bytes, so no other row can come out all-zero.
+    #[derive(Debug)]
+    struct ZeroEmbed {
+        zeroed_text: String,
+    }
+
+    impl ZeroEmbed {
+        fn vector_for(&self, text: &str) -> Vec<f32> {
+            if text == self.zeroed_text {
+                vec![0.0_f32; usize::try_from(DIM).expect("DIM is positive")]
+            } else {
+                byte_vector(text)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Embed for ZeroEmbed {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![self.vector_for(&s)]),
+                EmbeddingInput::StringArray(v) => {
+                    Ok(v.iter().map(|s| self.vector_for(s)).collect())
+                }
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn size(&self) -> i32 {
+            DIM
+        }
+    }
+
     /// These tests never execute a query plan, so the query-time `embed(text, model)` UDF is
     /// only needed to construct the index.
     fn embed_udf() -> Arc<ScalarUDF> {
@@ -876,6 +911,25 @@ mod tests {
             indexed_ids(&index),
             vec![1, 2, 3],
             "zeroing one component leaves a finite vector, which stays indexed"
+        );
+    }
+
+    /// A vector with no non-zero component has no direction, so every similarity score
+    /// against it is meaningless and the row must not be indexed. This branch is the only
+    /// warning such a row gets: the batched non-finite report deliberately does not claim
+    /// an all-zero vector, because it is finite.
+    #[tokio::test]
+    async fn an_all_zero_embedding_is_not_indexed() {
+        let index = memory_index_with(Arc::new(ZeroEmbed {
+            zeroed_text: "row 2".to_string(),
+        }));
+        write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 3],
+            "row 2's embedding is wholly zero, which has no direction under cosine, so the \
+             row must not be indexed"
         );
     }
 }

@@ -303,6 +303,19 @@ pub fn first_non_finite(embedding: &[f32]) -> Option<usize> {
     embedding.iter().position(|value| !value.is_finite())
 }
 
+/// Whether every component of `embedding` is exactly zero.
+///
+/// This is the predicate behind the per-record "all zeroes" report. It deliberately does
+/// not treat `NaN` as a zero: a vector such as `[0.0, NaN]` is already named by
+/// [`warn_non_finite_embeddings`] in one batched line, so counting it as all-zero here
+/// would report the same row twice — once per batch and once per record — and a wholly
+/// poisoned batch would emit a line per row. The two predicates together still cover the
+/// same rows, because any `NaN` a looser test would have absorbed is non-finite.
+#[must_use]
+pub fn is_finite_all_zero(embedding: &[f32]) -> bool {
+    embedding.iter().all(|&value| value == 0.0)
+}
+
 /// The remedy clause every non-finite-embedding warning ends with, kept in one place so the
 /// advice and the docs link cannot drift between the paths that skip a record and the ones
 /// that null its embedding.
@@ -708,6 +721,48 @@ mod tests {
         assert_eq!(first_non_finite(&[0.0, 0.0, 0.0]), None);
         assert_eq!(first_non_finite(&[-1.5, 0.0, 2.5]), None);
         assert_eq!(first_non_finite(&[]), None);
+    }
+
+    /// The per-record report is for finite all-zero vectors only. A predicate of
+    /// `v == 0.0 || v.is_nan()` also matches `[0.0, NaN]` and `[NaN, NaN]`, which the
+    /// batched non-finite warning has already named — reporting them here too turns one
+    /// degraded embedding response into a line per row.
+    #[test]
+    fn is_finite_all_zero_excludes_a_nan_padded_vector() {
+        assert!(is_finite_all_zero(&[0.0, 0.0, 0.0]));
+        assert!(is_finite_all_zero(&[0.0, -0.0]));
+        assert!(!is_finite_all_zero(&[0.0, f32::NAN]));
+        assert!(!is_finite_all_zero(&[f32::NAN, f32::NAN]));
+        assert!(!is_finite_all_zero(&[0.0, 1.0]));
+    }
+
+    /// Splitting the report between [`is_finite_all_zero`] and [`first_non_finite`] must
+    /// change only which warning a row gets, never whether it is written. Every vector the
+    /// looser `v == 0.0 || v.is_nan()` test absorbed carries a `NaN`, so the non-finite
+    /// half still claims it.
+    #[test]
+    fn the_split_predicates_filter_the_same_vectors_as_the_combined_one() {
+        let vectors: [&[f32]; 9] = [
+            &[],
+            &[0.0, 0.0],
+            &[0.0, -0.0],
+            &[0.0, f32::NAN],
+            &[f32::NAN, f32::NAN],
+            &[1.0, f32::NAN],
+            &[1.0, f32::INFINITY],
+            &[1.0, 2.0],
+            &[0.0, 1.0],
+        ];
+        for vector in vectors {
+            let combined = vector.iter().all(|&v| v == 0.0 || v.is_nan())
+                || first_non_finite(vector).is_some();
+            let split = is_finite_all_zero(vector) || first_non_finite(vector).is_some();
+            assert_eq!(
+                split, combined,
+                "{vector:?} changes whether the row is written, but the split only moves \
+                 which warning names it"
+            );
+        }
     }
 
     /// The warning is what a user gets to explain a row that vanished from search, so it

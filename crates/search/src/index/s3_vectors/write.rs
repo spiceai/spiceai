@@ -27,7 +27,7 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use crate::index::write_util::{
-    self, embed_column, extract_and_format_primary_key, first_non_finite,
+    self, embed_column, extract_and_format_primary_key, first_non_finite, is_finite_all_zero,
     sort_columns_alphabetically, update_embedding_column_in_batch,
 };
 use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
@@ -265,15 +265,17 @@ pub fn extract_and_format_metadata(
     Ok(metadata)
 }
 
-/// Filter out invalid embedding vectors where all values are either zero or NaN.
+/// Filter out embedding vectors that cannot be scored.
 ///
-/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs), and
-/// vectors carrying any non-finite component at all — a single NaN or infinity poisons every
-/// score computed against the vector, so the whole record is dropped rather than indexed.
-/// For example:
-/// - `[0.0, 0.0]` -> filtered (all zeros)
-/// - `[NaN, NaN]` -> filtered (all NaN)
-/// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
+/// Two shapes are dropped: a vector whose every component is zero, which has no direction,
+/// and a vector carrying any non-finite component at all — a single NaN or infinity poisons
+/// every score computed against the vector, so the whole record is dropped rather than
+/// indexed. The two overlap, and which one claims a row decides which warning names it: the
+/// all-zero test excludes NaN so that a partly-NaN vector is reported once, by the batched
+/// non-finite warning, rather than once per record as well. For example:
+/// - `[0.0, 0.0]` -> filtered (all zeros), reported per record
+/// - `[NaN, NaN]` -> filtered (non-finite), reported in the batched warning
+/// - `[0.0, NaN]` -> filtered (non-finite), reported in the batched warning
 /// - `[1.0, NaN]` -> filtered (one non-finite component)
 /// - `[1.0, f32::INFINITY]` -> filtered (one non-finite component)
 /// - `[1.0, 0.0]` -> kept (finite, with a valid non-zero value)
@@ -293,12 +295,13 @@ fn filter_zero_vectors(
         let Some(embedding) = &embeddings[i] else {
             continue;
         };
-        // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-        let all_zero_or_nan = embedding.iter().all(|&x| x == 0.0 || x.is_nan());
+        // An all-zero vector has no defined direction, so every score against it is
+        // meaningless.
+        let all_zero = is_finite_all_zero(embedding);
         // A single NaN or infinity poisons every score computed against the vector, so one
         // bad component disqualifies the whole record too.
         let non_finite = first_non_finite(embedding).is_some();
-        if !all_zero_or_nan && !non_finite {
+        if !all_zero && !non_finite {
             continue;
         }
 
@@ -309,10 +312,11 @@ fn filter_zero_vectors(
         // Only the all-zero case is reported per record. A non-finite one is deliberately
         // silent: `update_embedding_column_in_batch` runs before this filter and has already
         // named every affected row in one batched warning, so warning again per row would
-        // turn one degraded embedding response into a line per record.
-        if all_zero_or_nan {
+        // turn one degraded embedding response into a line per record. That is why
+        // `all_zero` excludes `NaN` — `[0.0, NaN]` belongs to the batched report alone.
+        if all_zero {
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
             );
         }
 
