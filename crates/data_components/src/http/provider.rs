@@ -327,6 +327,16 @@ impl moka::Expiry<CacheKey, CachedResponse> for RetainForItsOwnWindow {
     }
 }
 
+/// What an entry costs the budget, or `None` when that cannot be represented.
+///
+/// `moka` weighs in `u32`, so an entry of 4 GiB or more cannot be charged what
+/// it holds. Such an entry is not admitted: on a cache configured larger than
+/// that, charging two 6 GiB responses 4 GiB each would let 12 GiB sit inside an
+/// 8 GiB budget.
+fn entry_weight(key: &CacheKey, value: &CachedResponse) -> Option<u32> {
+    u32::try_from(key.retained_bytes().saturating_add(value.retained_bytes())).ok()
+}
+
 /// Builds a response cache with `max_bytes` of headroom.
 ///
 /// The weigher counts the key as well as the response: the key owns copies of
@@ -336,10 +346,10 @@ fn build_response_cache(max_bytes: usize) -> ResponseCache {
     moka::future::Cache::builder()
         .max_capacity(max_bytes as u64)
         .weigher(|key: &CacheKey, value: &CachedResponse| {
-            // `moka` weighs in `u32`; an entry larger than that saturates rather
-            // than wrapping to a small weight and escaping the budget.
-            u32::try_from(key.retained_bytes().saturating_add(value.retained_bytes()))
-                .unwrap_or(u32::MAX)
+            // Saturating is a backstop, not the bound: an entry that does not fit
+            // a `u32` is refused at admission by `entry_weight`, because charging
+            // it less than it costs is how a budget silently stops holding.
+            entry_weight(key, value).unwrap_or(u32::MAX)
         })
         .expire_after(RetainForItsOwnWindow)
         .build()
@@ -1140,6 +1150,15 @@ impl HttpTableProvider {
                     .map(str::trim)
                 {
                     match seconds.parse::<u64>() {
+                        // A second `max-age` makes the response's freshness
+                        // ambiguous, and letting the later one win would let
+                        // `max-age=0, max-age=600` be retained for ten minutes
+                        // when the origin also said not to reuse it at all.
+                        // Ambiguous is treated as refused, as elsewhere here.
+                        Ok(_) if directives.max_age.is_some() => {
+                            directives.max_age = None;
+                            directives.no_store = true;
+                        }
                         Ok(seconds) => directives.max_age = Some(Duration::from_secs(seconds)),
                         // A `max-age` we cannot read is not the same as no
                         // `max-age`: leaving it unset would let a configured
@@ -1636,19 +1655,30 @@ impl HttpTableProvider {
             self.cache_fallback_ttl,
             fetch_result.response_age,
         ) {
-            self.cache
-                .insert(
-                    cache_key,
-                    CachedResponse {
-                        content: Arc::new(fetch_result.content.clone()),
-                        max_age: retain_for,
-                        detected_format: Some(fetch_result.detected_format.clone()),
-                        response_date: fetch_result.response_date,
-                        response_status: fetch_result.response_status,
-                        response_headers: Arc::new(fetch_result.response_headers.clone()),
-                    },
-                )
-                .await;
+            let entry = CachedResponse {
+                content: Arc::new(fetch_result.content.clone()),
+                max_age: retain_for,
+                detected_format: Some(fetch_result.detected_format.clone()),
+                response_date: fetch_result.response_date,
+                response_status: fetch_result.response_status,
+                response_headers: Arc::new(fetch_result.response_headers.clone()),
+            };
+            // An entry the budget cannot charge for is not admitted: it would be
+            // billed less than it holds, which is how a byte bound stops binding.
+            if entry_weight(&cache_key, &entry).is_some() {
+                self.cache.insert(cache_key, entry).await;
+                // Occupancy is `moka`'s own deferred bookkeeping, so it answers
+                // for the last settled state rather than for this insert.
+                // Settling here keeps the gauges from describing a cache one
+                // write out of date for as long as the dataset stays idle. Only
+                // on admission: a hit moves nothing worth the housekeeping.
+                self.cache.run_pending_tasks().await;
+            } else {
+                tracing::debug!(
+                    "Not retaining {}: the response is larger than the cache can account for",
+                    cache_key.redacted_label()
+                );
+            }
             self.record_cache_gauges();
         }
 
@@ -3617,7 +3647,10 @@ impl HttpTableProvider {
 
 #[cfg(test)]
 mod response_cache_tests {
-    use super::{CacheKey, CachedResponse, HttpTableProvider, ResponseCache, build_response_cache};
+    use super::{
+        CacheKey, CachedResponse, HttpTableProvider, ResponseCache, build_response_cache,
+        entry_weight,
+    };
     use reqwest::Client;
     use std::sync::Arc;
     use std::time::Duration;
@@ -3936,6 +3969,46 @@ mod response_cache_tests {
             provider.cache.entry_count(),
             0,
             "an error response the origin did not mark retainable must leave nothing behind"
+        );
+    }
+
+    /// A second `max-age` makes the response's freshness ambiguous. Letting the
+    /// later value win would retain `max-age=0, max-age=600` for ten minutes
+    /// when the origin also said not to reuse it at all.
+    #[test]
+    fn conflicting_max_age_directives_refuse_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an ambiguous freshness must not be resolved in favour of caching"
+        );
+
+        // Also across repeated fields, which is the same ambiguity.
+        let split = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=0"), Some("max-age=600")].into_iter(),
+        );
+        assert_eq!(
+            HttpTableProvider::effective_retention(&split, None, None),
+            None
+        );
+    }
+
+    /// The byte budget only binds while every entry can be charged what it
+    /// holds, and `moka` weighs in `u32`, so an entry of 4 GiB or more cannot
+    /// be. Admission refuses those rather than storing them at a discount.
+    ///
+    /// Only the chargeable side is asserted here: the refusal branch needs a
+    /// 4 GiB body to reach, which is not worth allocating in a unit test. What
+    /// this does guard is the inversion that would actually bite — a guard that
+    /// rejects ordinary responses and silently empties the cache. That an
+    /// ordinary response is still admitted end to end is covered by
+    /// `a_cacheable_response_is_admitted_and_then_served_without_the_origin`.
+    #[test]
+    fn an_ordinary_entry_is_chargeable() {
+        assert!(
+            entry_weight(&key(1), &entry(4096, Duration::from_mins(5))).is_some(),
+            "an ordinary response must be chargeable, or nothing would ever be cached"
         );
     }
 
