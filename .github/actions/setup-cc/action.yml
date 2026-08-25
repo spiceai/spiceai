@@ -86,10 +86,17 @@ runs:
         # dies far downstream as "ld: library 'odbc' not found" (#13475). clang expands
         # LIBRARY_PATH into -L entries after those already on the command line, so this
         # restores the search path without displacing anything a build script emitted,
-        # and it is not a cargo fingerprint input, so it costs no rebuild. Both the
-        # linked and the keg directory are listed: the probe above accepts a formula
-        # that is in the Cellar but unlinked.
-        library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/lib:$brew_prefix/opt/unixodbc/lib"
+        # and it is not a cargo fingerprint input, so it costs no rebuild.
+        #
+        # Only the unixodbc keg goes on the path, never $brew_prefix/lib. The keg holds
+        # just the libodbc* families; the linked directory holds a few hundred dylibs,
+        # and measured with `cc -l<name> -Wl,-t`, publishing it newly satisfies -lcrypto,
+        # -lssl and -lzstd, none of which resolve without it. A crate whose build script
+        # emits one of those names (openssl-sys, libssh2-sys, zstd-sys) would then link a
+        # second, differently-built copy on every macOS job in the repo. The keg path is
+        # also what covers the unlinked-formula case the probe above accepts, so the
+        # linked directory would contribute nothing but that blast radius.
+        library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
         if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
           echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
           exit 1
