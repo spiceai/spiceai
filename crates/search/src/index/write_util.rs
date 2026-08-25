@@ -312,6 +312,20 @@ pub const NON_FINITE_EMBEDDING_REMEDY: &str = "Re-embed the affected rows, or ch
 /// The maximum number of row indexes named in a [`non_finite_embedding_warning`].
 const NON_FINITE_SAMPLE_LIMIT: usize = 5;
 
+/// Report the rows an embedding builder could not index, if there were any.
+///
+/// Every builder that nulls a defective embedding emits through here, so the emptiness
+/// check and the log level cannot drift apart between them.
+pub fn warn_non_finite_embeddings(index_name: &str, affected_rows: &[usize], total_rows: usize) {
+    if affected_rows.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        "{}",
+        non_finite_embedding_warning(index_name, affected_rows, total_rows)
+    );
+}
+
 /// One line explaining why some rows are not searchable, built in a pure function so a
 /// reword cannot quietly drop the index name, the consequence, or the docs link.
 #[must_use]
@@ -399,12 +413,7 @@ pub fn create_embedding_array(
         }
     }
 
-    if !non_finite_rows.is_empty() {
-        tracing::warn!(
-            "{}",
-            non_finite_embedding_warning(index_name, &non_finite_rows, embedding_vectors.len())
-        );
-    }
+    warn_non_finite_embeddings(index_name, &non_finite_rows, embedding_vectors.len());
 
     Ok(Arc::new(builder.finish()))
 }

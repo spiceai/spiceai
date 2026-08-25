@@ -365,9 +365,9 @@ pub(super) fn validate_vector(vector: &[f32], dims: i32, context: &str) -> DataF
             vector.len()
         )));
     }
-    if vector.iter().any(|value| !value.is_finite()) {
+    if let Some(position) = crate::index::write_util::first_non_finite(vector) {
         return Err(DataFusionError::Execution(format!(
-            "DuckDB vector {context} contains a non-finite value."
+            "DuckDB vector {context} contains a non-finite value at position {position}."
         )));
     }
     Ok(())

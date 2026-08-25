@@ -38,7 +38,7 @@ use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
 use crate::index::elasticsearch::ElasticsearchIndex;
 use crate::index::embedding_col;
-use crate::index::write_util::{first_non_finite, non_finite_embedding_warning};
+use crate::index::write_util::{first_non_finite, warn_non_finite_embeddings};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -499,12 +499,7 @@ fn create_embedding_array(
         }
     }
 
-    if !non_finite_rows.is_empty() {
-        tracing::warn!(
-            "{}",
-            non_finite_embedding_warning(es_index, &non_finite_rows, embedding_vectors.len())
-        );
-    }
+    warn_non_finite_embeddings(es_index, &non_finite_rows, embedding_vectors.len());
 
     Ok(Arc::new(builder.finish()))
 }

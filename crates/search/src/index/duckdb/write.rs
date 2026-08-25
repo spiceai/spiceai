@@ -31,7 +31,7 @@ use crate::index::{
     Index,
     duckdb::DuckDBVectorIndex,
     embedding_col,
-    write_util::{first_non_finite, non_finite_embedding_warning},
+    write_util::{first_non_finite, warn_non_finite_embeddings},
 };
 
 #[derive(Debug, Snafu)]
@@ -213,12 +213,7 @@ fn create_embedding_array(
         }
     }
 
-    if !non_finite_rows.is_empty() {
-        tracing::warn!(
-            "{}",
-            non_finite_embedding_warning(index_name, &non_finite_rows, embedding_vectors.len())
-        );
-    }
+    warn_non_finite_embeddings(index_name, &non_finite_rows, embedding_vectors.len());
 
     Ok(Arc::new(builder.finish()))
 }
