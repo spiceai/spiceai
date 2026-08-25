@@ -1513,7 +1513,7 @@ impl HttpTableProvider {
             detected_format
         );
 
-        let directives = Self::parse_cache_control_values(
+        let mut directives = Self::parse_cache_control_values(
             response
                 .headers()
                 .get_all(CACHE_CONTROL)
@@ -1529,9 +1529,21 @@ impl HttpTableProvider {
         let header_age = response
             .headers()
             .get(reqwest::header::AGE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .and_then(|value| {
+                let parsed = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                // An `Age` we cannot read leaves the response's remaining freshness
+                // unknown, and treating it as zero would hand back a full window to
+                // a response that may have almost none left. Unreadable resolves
+                // against caching here as it does for `Cache-Control`.
+                if parsed.is_none() {
+                    directives.forbid_retention = true;
+                }
+                parsed
+            });
 
         // Extract Date header from response
         let response_date = response
@@ -1575,7 +1587,15 @@ impl HttpTableProvider {
         Ok(HttpFetchResult {
             content,
             directives,
-            response_age: Some(header_age.unwrap_or_default() + attempt_started.elapsed()),
+            // Saturating: `Age` is untrusted response data, and an origin
+            // sending a value near `u64::MAX` would otherwise overflow the
+            // addition and panic. Saturating leaves the response with no
+            // freshness left, which is the right answer for an absurd age.
+            response_age: Some(
+                header_age
+                    .unwrap_or_default()
+                    .saturating_add(attempt_started.elapsed()),
+            ),
             detected_format,
             response_date,
             response_status: status_code,
@@ -3874,6 +3894,73 @@ mod response_cache_tests {
             provider.cache.entry_count(),
             0,
             "a response whose freshness elapsed in transit must not be retained"
+        );
+    }
+
+    /// An `Age` that cannot be read leaves the remaining freshness unknown.
+    /// Treating it as zero would hand a full window back to a response that may
+    /// have almost none left, so it refuses retention as an unreadable
+    /// `Cache-Control` does.
+    #[tokio::test]
+    async fn an_unreadable_age_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "not-a-number")
+                    .set_body_string(r#"{"rows":7}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "an unreadable Age must not yield a fresh full window"
+        );
+    }
+
+    /// `Age` is untrusted response data. A value near `u64::MAX` overflows the
+    /// addition of the elapsed round trip and panics, taking down the query
+    /// rather than declining to cache.
+    ///
+    /// The delay is load-bearing, not a readiness wait: `Duration` carries into
+    /// its seconds field only once the elapsed time reaches a second, so without
+    /// it the addition stays inside the nanosecond field and cannot overflow —
+    /// the test would then pass whether or not the addition saturates.
+    #[tokio::test]
+    async fn an_absurd_age_neither_panics_nor_is_retained() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("age", "18446744073709551615")
+                    .set_body_string(r#"{"rows":8}"#)
+                    .set_delay(Duration::from_millis(1100)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is served rather than panicking the query");
+        assert_eq!(served.content, r#"{"rows":8}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response older than any window has no freshness left to retain"
         );
     }
 
