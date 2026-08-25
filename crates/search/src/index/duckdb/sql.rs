@@ -450,11 +450,11 @@ mod tests {
         );
     }
 
-    /// regression test for #13144: a search filter on a timezone-aware timestamp column used to be
-    /// rendered `TO_TIMESTAMP(EPOCH_MS("ts") / 1000)`, which truncates the column to whole
-    /// milliseconds, so a comparison inside a millisecond selected a different set of rows than the
-    /// caller asked for. `flat_sql` projects `id` alone, so this also covers a filter on a column
-    /// the projection drops.
+    /// regression test for #13144: a timezone-aware timestamp column is already the type and the
+    /// reference frame the rendered literal is in, so it must be compared directly. Rendered
+    /// through `EPOCH_MS` it is truncated to whole milliseconds, and a comparison inside a
+    /// millisecond then selects a different set of rows than the caller asked for. `flat_sql`
+    /// projects `id` alone, so this also covers a filter on a column the projection drops.
     #[test]
     fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
         let schema = docs_schema(vec![Field::new(

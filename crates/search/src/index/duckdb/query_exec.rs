@@ -325,9 +325,8 @@ mod tests {
 
     /// regression test for #13144: the filters are rendered against the whole table's schema, so a
     /// timezone-aware timestamp column keeps its sub-millisecond digits even when the projection
-    /// drops it. Rendering against the *projected* schema — or against no schema, which is what the
-    /// two sites did before — leaves the column unresolved and normalizes it through `EPOCH_MS`,
-    /// truncating the comparison to whole milliseconds.
+    /// drops it. Against the projected schema — or against no schema — that column is unresolved,
+    /// so it normalizes through `EPOCH_MS` and the comparison is truncated to whole milliseconds.
     #[tokio::test]
     async fn scan_renders_filters_against_the_whole_table_schema() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
