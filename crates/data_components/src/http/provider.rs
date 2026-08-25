@@ -100,16 +100,38 @@ pub enum Error {
     JsonNesting { source: super::json_nest::Error },
 
     #[snafu(display(
-        "Failed to fetch {url}: the origin answered {status}, which `on_error_response` \
+        "Failed to fetch {endpoint}: the origin answered {status}, which `on_error_response` \
         is set to treat as a failed request rather than as data. \
         Fix the origin, or set `on_error_response: store` on this dataset to keep recording \
         the response body as a row. \
         See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
-    ErrorResponse { status: u16, url: String },
+    ErrorResponse { status: u16, endpoint: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The part of a request URL that is safe to put in an error or a log line: scheme,
+/// host, port and path.
+///
+/// A request's query carries whatever the dataset put there — an API key, a signed
+/// parameter, a pagination cursor, a search term — and `request_query_filters` lets a
+/// query's own values reach it, so the full URL is not printable. Userinfo and the
+/// fragment go for the same reason. The path stays, because an error has to name which
+/// fetch failed to be worth reading; [`CacheKey::redacted_label`] hashes even that, but
+/// it labels a debug line rather than telling an operator what to fix.
+fn endpoint_label(url: &Url) -> String {
+    let mut label = url.clone();
+    label.set_query(None);
+    label.set_fragment(None);
+    // Both setters only fail on a cannot-be-a-base URL, which cannot reach here: this is
+    // an http(s) URL the client just fetched. Ignoring the result would leave credentials
+    // in the label, so fall back to the origin, which never carries them.
+    if label.set_username("").is_err() || label.set_password(None).is_err() {
+        return url.origin().ascii_serialization();
+    }
+    label.to_string()
+}
 
 /// What the connector does with a response the origin did not mark as successful.
 ///
@@ -169,10 +191,19 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
-            // The origin answered, and said the answer was not a success. External, not a
-            // plan error: nothing about the query is wrong.
-            Error::ErrorResponse { .. } => {
-                DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
+            // The origin answered, and said the answer was not a success. Which
+            // DataFusionError this becomes decides whether a *refresh* retries it:
+            // `check_and_mark_retriable_error` wraps everything except `Plan`/`SQL`/
+            // `SchemaError` as retriable, so an `External` 404 would have one refresh
+            // invocation re-asking an origin that will keep saying no. The statuses worth
+            // re-asking are the ones the request ladder already retries, so both read the
+            // same predicate rather than two taxonomies that can drift apart.
+            Error::ErrorResponse { status, .. } => {
+                if HttpTableProvider::is_retryable_status(status) {
+                    DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
+                } else {
+                    DataFusionError::Plan(err.to_string())
+                }
             }
             // Retry exhaustion is an external error
             Error::AllRetriesFailed { max_retries, url } => {
@@ -1308,7 +1339,7 @@ impl HttpTableProvider {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
             return Err(RetryError::transient(Error::ErrorResponse {
                 status: status_code,
-                url: url.to_string(),
+                endpoint: endpoint_label(url),
             }));
         }
 
@@ -1324,12 +1355,13 @@ impl HttpTableProvider {
                     // statuses worth retrying, so retrying here would only repeat them.
                     return Err(RetryError::Permanent(Error::ErrorResponse {
                         status: status_code,
-                        url: url.to_string(),
+                        endpoint: endpoint_label(url),
                     }));
                 }
                 ErrorResponseAction::Warn => {
                     tracing::warn!(
-                        "The request to {url} answered {status_code}, and that response body is being recorded as a row, so a full refresh replaces this dataset's previous contents with it. Set `on_error_response: error` to fail the refresh and keep the previous contents instead. See: https://spiceai.org/docs/components/data-connectors/https"
+                        "The request to {} answered {status_code}, and that response body is being recorded as a row, so a full refresh replaces this dataset's previous contents with it. Set `on_error_response: error` to fail the refresh and keep the previous contents instead. See: https://spiceai.org/docs/components/data-connectors/https",
+                        endpoint_label(url)
                     );
                 }
                 ErrorResponseAction::Store => {}
@@ -6203,6 +6235,85 @@ mod tests {
             .await?
             .collect()
             .await
+    }
+
+    #[test]
+    fn refusing_a_permanent_status_is_not_a_retriable_refresh_failure() {
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+
+        // What this pins is not the DataFusionError variant but what the refresh layer
+        // does with it: `check_and_mark_retriable_error` treats everything except
+        // Plan/SQL/SchemaError as retriable, so an over-broad mapping has one refresh
+        // invocation re-asking an origin that will keep answering 404.
+        for status in [400, 401, 403, 404, 410, 451] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+            }
+            .into();
+            assert!(
+                !is_retriable_error(&check_retriable(df)),
+                "{status} will not change on a retry, so a refresh must not re-ask for it"
+            );
+        }
+
+        // The statuses the request ladder itself retries are the ones a later refresh may
+        // usefully retry too; the two read the same predicate so they cannot drift.
+        for status in [429, 500, 502, 503, 504] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+            }
+            .into();
+            assert!(
+                is_retriable_error(&check_retriable(df)),
+                "{status} is transient, so a later refresh should retry it"
+            );
+        }
+    }
+
+    /// Put a `DataFusionError` through the same wrapping the refresh path applies before
+    /// it asks whether the error is retriable.
+    fn check_retriable(err: DataFusionError) -> DataFusionError {
+        datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(err)
+    }
+
+    #[test]
+    fn an_error_never_prints_the_part_of_a_url_that_carries_secrets() {
+        let url = Url::parse(
+            "https://tenant:hunter2@api.example.com:8443/v1/items?api_key=SECRET&cursor=TOKEN#frag",
+        )
+        .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["hunter2", "tenant", "SECRET", "TOKEN", "api_key", "frag"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}': {label}"
+            );
+        }
+
+        // Still has to say which fetch failed, or the error is not worth reading.
+        assert!(
+            label.contains("api.example.com") && label.contains("/v1/items"),
+            "the label must still name the endpoint and path: {label}"
+        );
+        assert!(
+            label.contains("8443"),
+            "a non-default port is part of the endpoint: {label}"
+        );
+
+        // And the message built from it inherits that, on both the error and the row-keeping
+        // path — the warning interpolates the same label.
+        let message = Error::ErrorResponse {
+            status: 503,
+            endpoint: label,
+        }
+        .to_string();
+        assert!(
+            !message.contains("SECRET") && !message.contains("hunter2"),
+            "the rendered error must not carry the query or userinfo: {message}"
+        );
     }
 
     #[test]
