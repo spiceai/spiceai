@@ -49,9 +49,10 @@ jobs:
           mkdir -p "${ARTIFACT_DIR}"
 
           # Flatten downloaded artifacts to a single directory of .tar.gz release assets.
-          # Match the asset set the tagged publish jobs attach. They download
-          # spice/spice.exe/spiced/spiced_metal by name and deliberately leave
-          # spiced_odbc off the release, so recovery must not add it.
+          # Match the asset set the tagged publish jobs attach: they download
+          # spice/spice.exe/spiced/spiced_metal by name, so spiced_odbc has
+          # never shipped on a release. Recovery must not be the path that
+          # adds it.
           find "${ARTIFACT_DIR}/raw" -type f -name "*.tar.gz" ! -name "spiced_odbc_*" -print -exec cp -f {} "${ARTIFACT_DIR}/" \;
 
           # Keep only flattened archives at top-level release dir.
