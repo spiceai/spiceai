@@ -2708,11 +2708,16 @@ impl RefreshTask {
     /// and the accelerator schema and act per the dataset's installed
     /// `on_schema_change` policy:
     ///
+    /// Called once per upsert-bearing burst from `write_change_with_context`,
+    /// before any of the burst's sub-batches is applied, so a refusal here leaves
+    /// the acceleration untouched.
+    ///
     /// - Cayenne + allowed widening ⇒ evolve LIVE via the provider's
     ///   `evolve_schema_live` (fence + flush + metastore update + in-memory
-    ///   schema swap, idempotent) and continue — the cast below becomes a
-    ///   pass-through to the evolved schema. A failed evolve stops the stream;
-    ///   the source redelivers and the idempotent evolve self-heals.
+    ///   schema swap, idempotent) and continue — the narrowing cast in
+    ///   `process_upsert_batch` becomes a pass-through to the evolved schema. A
+    ///   failed evolve stops the stream; the source redelivers and the
+    ///   idempotent evolve self-heals.
     /// - Other engines ⇒ NO mid-life engine DDL: keep today's narrowing cast,
     ///   warn once, count the failure — restart-time evolution applies it.
     /// - `fail` policy ⇒ terminal actionable error.
@@ -2737,7 +2742,7 @@ impl RefreshTask {
         // that never changed.
         //
         // The match test is rule-aware rather than rebuilding the schema up front: this
-        // runs per upsert sub-batch and almost always matches, and rewriting one
+        // runs once per upsert-bearing burst and almost always matches, and rewriting one
         // `DataType` for the few columns that differ is cheaper than allocating a whole
         // `Schema` that is then discarded.
         if cdc_data_schema_matches(
