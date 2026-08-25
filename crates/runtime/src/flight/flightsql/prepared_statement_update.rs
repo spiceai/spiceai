@@ -181,6 +181,7 @@ pub(crate) async fn do_put_update(
     query: CommandPreparedStatementUpdate,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let _start = metrics::track_flight_request("do_put", Some("prepared_statement_update")).await;
     let streaming_flight = streaming_flight
         .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
 

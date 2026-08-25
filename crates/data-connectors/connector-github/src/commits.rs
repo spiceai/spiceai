@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use runtime::dataconnector::ConnectorComponent;
-use runtime::datafusion::error::find_datafusion_root;
+use data_connector_api::ConnectorComponent;
+use runtime_datafusion::error::find_datafusion_root;
 
 use super::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,

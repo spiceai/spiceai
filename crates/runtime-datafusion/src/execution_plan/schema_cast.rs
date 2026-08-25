@@ -19,7 +19,10 @@ use arrow_tools::record_batch;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::Statistics;
+use datafusion::common::{
+    Statistics,
+    tree_node::{Transformed, TreeNode},
+};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -87,28 +90,54 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Propagate input ordering only when all ordered columns exist in the output
-        // schema with the same data type. Column indices are remapped by name because
-        // the output schema may reorder columns relative to the input. Type casts are
-        // not universally monotonic (e.g., Utf8→numeric, float NaN handling), so we
-        // only propagate ordering when no type change occurs for the ordered columns.
+        // Propagate input ordering only when all columns referenced by each sort
+        // expression exist in the output schema with the same data type. Column
+        // indices are remapped by name because the output schema may reorder columns
+        // relative to the input. Type casts are not universally monotonic (e.g.,
+        // Utf8→numeric, float NaN handling), so an ordering that references a cast
+        // column is not propagated.
         let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
         if let Some(ordering) = input.properties().output_ordering() {
             let remapped: Option<Vec<PhysicalSortExpr>> = ordering
                 .iter()
                 .map(|sort_expr| {
-                    let col = sort_expr.expr.downcast_ref::<Column>()?;
-                    let input_idx = col.index();
-                    if input_idx >= input_schema.fields().len() {
-                        return None;
-                    }
-                    let col_name = input_schema.field(input_idx).name();
-                    let (output_idx, output_field) = output_schema.column_with_name(col_name)?;
-                    if input_schema.field(input_idx).data_type() != output_field.data_type() {
-                        return None;
-                    }
+                    let expr = Arc::clone(&sort_expr.expr)
+                        .transform_up(|expr| {
+                            let Some(col) = expr.downcast_ref::<Column>() else {
+                                return Ok(Transformed::no(expr));
+                            };
+                            let input_field = input_schema.fields().get(col.index()).ok_or_else(
+                                || {
+                                    DataFusionError::Plan(format!(
+                                        "Sort expression references column '{}' at invalid index {}",
+                                        col.name(),
+                                        col.index()
+                                    ))
+                                },
+                            )?;
+                            let (output_idx, output_field) = output_schema
+                                .column_with_name(col.name())
+                                .ok_or_else(|| {
+                                    DataFusionError::Plan(format!(
+                                        "Sort expression references column '{}' missing from the schema cast output",
+                                        col.name()
+                                    ))
+                                })?;
+                            if input_field.data_type() != output_field.data_type() {
+                                return Err(DataFusionError::Plan(format!(
+                                    "Sort expression references column '{}' whose type changes during the schema cast",
+                                    col.name()
+                                )));
+                            }
+                            Ok(Transformed::yes(
+                                Arc::new(Column::new(col.name(), output_idx))
+                                    as Arc<dyn PhysicalExpr>,
+                            ))
+                        })
+                        .ok()?
+                        .data;
                     Some(PhysicalSortExpr {
-                        expr: Arc::new(Column::new(col_name, output_idx)),
+                        expr,
                         options: sort_expr.options,
                     })
                 })
@@ -380,10 +409,17 @@ impl TableProvider for EnsureSchema {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::expressions::col as physical_col;
     use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::{
+        logical_expr::Operator,
+        physical_expr::{
+            LexOrdering,
+            expressions::{BinaryExpr, Literal},
+        },
+        scalar::ScalarValue,
+    };
 
     fn input_schema_with_extra_column() -> SchemaRef {
         // Input has 3 columns including an internal "fetched_at" column
@@ -524,6 +560,44 @@ mod tests {
             schema_cast.properties().output_ordering().is_some(),
             "Ordering should be propagated when types match"
         );
+    }
+
+    #[test]
+    fn test_expression_ordering_propagated_when_referenced_types_match() {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("embedding", DataType::Float64, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("embedding", DataType::Float64, true),
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let sort_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))),
+            Operator::Minus,
+            physical_col("embedding", &input_schema).expect("col embedding"),
+        ));
+        let lex_ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(sort_expr).desc()])
+            .expect("lex ordering");
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+        let output_ordering = schema_cast
+            .properties()
+            .output_ordering()
+            .expect("expression ordering should be propagated");
+        let binary = output_ordering[0]
+            .expr
+            .downcast_ref::<BinaryExpr>()
+            .expect("sort expression should remain binary");
+        let column = binary
+            .right()
+            .downcast_ref::<Column>()
+            .expect("right operand should remain a column");
+        assert_eq!(column.name(), "embedding");
+        assert_eq!(column.index(), 0, "column index should match output schema");
     }
 
     #[test]

@@ -30,21 +30,18 @@ limitations under the License.
 //! In a single-node session the wrapper is a transparent pass-through: it returns
 //! the inner scan unchanged, so non-distributed plans are unaffected.
 
-use std::borrow::Cow;
+use spice_table::{LayerWalk, SpiceTable, TableLayer};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
-use datafusion::common::{Constraints, Result as DFResult, Statistics};
-use datafusion::datasource::TableType;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
+use datafusion::common::Result as DFResult;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 
-use crate::execution_plan::{IcebergScanExec, session_is_distributed};
+use runtime_execution_plans::{IcebergScanExec, session_is_distributed};
 
 /// Wraps an Iceberg `TableProvider` so its scans can cross Ballista node
 /// boundaries. Carries the `DataFusion` [`TableReference`] used to resolve this
@@ -63,6 +60,13 @@ impl std::fmt::Debug for IcebergClusterTableProvider {
 }
 
 impl IcebergClusterTableProvider {
+    /// Presents this layer over the table it wraps.
+    #[must_use]
+    pub fn into_table(self: Arc<Self>) -> Arc<SpiceTable> {
+        let below = Arc::clone(&self.inner);
+        SpiceTable::over(self, below)
+    }
+
     /// Wraps `inner` with the reference used to resolve it for distributed
     /// execution.
     #[must_use]
@@ -82,46 +86,14 @@ impl IcebergClusterTableProvider {
 // Deny missing trait methods so that a newly added `TableProvider` method (even
 // one with a default) forces an explicit decision here, rather than silently
 // bypassing this wrapper's distributed-scan handling.
-#[deny(clippy::missing_trait_methods)]
-#[async_trait]
-impl TableProvider for IcebergClusterTableProvider {
-    fn schema(&self) -> ArrowSchemaRef {
-        self.inner.schema()
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&'_ self) -> Option<Cow<'_, LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    fn supports_filters_pushdown(
+impl IcebergClusterTableProvider {
+    /// Builds the plan for a scan of this layer.
+    ///
+    /// Reached only through this type's `TableLayer::scan_with_args`, which is
+    /// the single scan entry point a layer exposes.
+    async fn scan_plan(
         &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn scan(
-        &self,
+        _below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
@@ -147,18 +119,42 @@ impl TableProvider for IcebergClusterTableProvider {
 
         Ok(plan)
     }
+}
+
+#[async_trait]
+impl TableLayer for IcebergClusterTableProvider {
+    /// Wraps a cluster-visible Iceberg scan so it can cross node boundaries. It
+    /// carries no schema, CDC or write semantics of its own, so only read and
+    /// index discovery reach past it. This is the layer `runtime-table` cannot
+    /// name, and it answers for itself so nothing has to.
+    fn route<'a>(
+        &'a self,
+        walk: LayerWalk,
+        below: &'a Arc<dyn TableProvider>,
+    ) -> Option<&'a Arc<dyn TableProvider>> {
+        // Exhaustive on purpose: a wildcard would answer a future walk kind
+        // for this layer without anyone deciding what it should say.
+        match walk {
+            LayerWalk::Read | LayerWalk::Index => Some(below),
+            // Serialising a scan for a remote node is all this layer does; a
+            // source, CDC, write or retention walk has no meaning through it.
+            LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete => None,
+        }
+    }
 
     async fn scan_with_args<'a>(
         &self,
+        below: &Arc<dyn TableProvider>,
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
-        // Route through our own `scan` (mirroring the trait's default) so the
-        // distributed `IcebergScanExec` wrapping is applied. Forwarding straight
-        // to `self.inner` would bypass it and make Iceberg scans unserializable.
         let projection = args.projection().map(<[usize]>::to_vec);
         let plan = self
-            .scan(
+            .scan_plan(
+                below,
                 state,
                 projection.as_ref(),
                 args.filters().unwrap_or(&[]),
@@ -166,35 +162,5 @@ impl TableProvider for IcebergClusterTableProvider {
             )
             .await?;
         Ok(plan.into())
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, overwrite).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
-    }
-
-    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
     }
 }

@@ -65,17 +65,25 @@ pub(crate) async fn handle(
 
     // We need to peek at the stream in case we branch below to prepared statements
     let Some(Ok(first_message)) = streaming_flight.peek().await else {
-        let _start = metrics::track_flight_request("do_put", None);
+        let _start = metrics::track_flight_request("do_put", None).await;
         return Err(Status::invalid_argument("No flight data provided"));
     };
     let Some(fd) = &first_message.flight_descriptor else {
-        let _start = metrics::track_flight_request("do_put", None);
+        let _start = metrics::track_flight_request("do_put", None).await;
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
     // Extract table path from FlightSQL commands if present
     let table_path_override = if let Ok(message) = Any::decode(&*fd.cmd) {
-        match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
+        let command = match Command::try_from(message) {
+            Ok(command) => command,
+            Err(e) => {
+                let _start = metrics::track_flight_request("do_put", None).await;
+                return Err(Status::internal(format!("{e:?}")));
+            }
+        };
+
+        match command {
             Command::CommandPreparedStatementQuery(query) => {
                 return prepared_statement_query::do_put_query(query, streaming_flight).await;
             }
@@ -131,8 +139,11 @@ pub(crate) async fn handle(
     };
 
     // Check if the request should be rate limited.
-    if let Some(rate_limit_check) = rate_limit_check_fn {
-        rate_limit_check()?;
+    if let Some(rate_limit_check) = rate_limit_check_fn
+        && let Err(status) = rate_limit_check()
+    {
+        let _start = metrics::track_flight_request("do_put", None).await;
+        return Err(status);
     }
 
     let context = RequestContext::current(AsyncMarker::new().await);
@@ -145,6 +156,7 @@ pub(crate) async fn handle(
                 .iter()
                 .any(|group| *group == "write" || *group == "read_write")
             {
+                let _start = metrics::track_flight_request("do_put", None).await;
                 return Err(Status::permission_denied(
                     "Write access denied. Verify that authentication key used has write access and try again.",
                 ));
@@ -156,6 +168,7 @@ pub(crate) async fn handle(
                     "Allowing unauthenticated DoPut on executor in mTLS scheduler-trusted mode"
                 );
             } else {
+                let _start = metrics::track_flight_request("do_put", None).await;
                 return Err(Status::unauthenticated(
                     "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
                 ));
@@ -165,11 +178,11 @@ pub(crate) async fn handle(
 
     // Since it is not a prepared statement we can take from the stream
     let Some(Ok(first_message)) = streaming_flight.next().await else {
-        let _start = metrics::track_flight_request("do_put", None);
+        let _start = metrics::track_flight_request("do_put", None).await;
         return Err(Status::invalid_argument("No flight data provided"));
     };
     let Some(fd) = &first_message.flight_descriptor else {
-        let _start = metrics::track_flight_request("do_put", None);
+        let _start = metrics::track_flight_request("do_put", None).await;
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
 
@@ -177,7 +190,7 @@ pub(crate) async fn handle(
     let path_vec = table_path_override.as_ref().unwrap_or(&fd.path);
 
     if path_vec.is_empty() {
-        let _start = metrics::track_flight_request("do_put", None);
+        let _start = metrics::track_flight_request("do_put", None).await;
         return Err(Status::invalid_argument("No path provided"));
     }
 
@@ -232,7 +245,11 @@ pub(crate) async fn handle(
         )
         .await;
 
-        if let Err(e) = datafusion.caching().invalidate_for_table(path.clone()) {
+        if let Err(e) = datafusion
+            .caching()
+            .invalidate_for_table(path.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for distributed Flight DoPut table {path}: {e}"
             );

@@ -306,6 +306,12 @@ impl S3VectorsTable {
         client: &Arc<dyn S3Vectors + Send + Sync>,
         id: &S3VectorIdentifier,
     ) -> Result<bool> {
+        // An index ARN identifies an existing index directly. It has no bucket name, so
+        // `GetVectorBucket` cannot validate it; `get_index_if_exists` performs that check next.
+        if matches!(id, S3VectorIdentifier::IndexArn(_)) {
+            return Ok(true);
+        }
+
         let bucket_name_opt = id.bucket_name().map(ToString::to_string);
         match client
             .get_vector_bucket(
@@ -729,6 +735,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_arn_does_not_check_for_a_bucket() {
+        let mock_client = Arc::new(MockClient::new());
+        let client = Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>;
+        let id = S3VectorIdentifier::IndexArn(
+            "arn:aws:s3vectors:us-east-2:123456789012:bucket/test-bucket/index/test-index"
+                .to_string(),
+        );
+
+        let exists = S3VectorsTable::check_if_bucket_exists(&client, &id)
+            .await
+            .expect("an index ARN must bypass bucket validation");
+
+        assert!(exists);
+        assert_eq!(mock_client.get_vector_bucket_call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_write_chunk_without_spilling() -> Result<(), Box<dyn std::error::Error>> {
         let mock_client = Arc::new(MockClient::new());
         let table = create_test_table(
@@ -879,6 +902,68 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_by_keys_removes_only_the_targeted_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mock_client = Arc::new(MockClient::new());
+        let table = create_test_table(
+            Arc::clone(&mock_client) as Arc<dyn S3Vectors + Send + Sync>,
+            "test-index",
+        );
+
+        table
+            .client
+            .create_vector_bucket(
+                &CreateVectorBucketInput::builder()
+                    .vector_bucket_name("test-bucket")
+                    .build()?,
+            )
+            .await?;
+        table
+            .client
+            .create_index(
+                &CreateIndexInput::builder()
+                    .index_name("test-index")
+                    .vector_bucket_name("test-bucket")
+                    .data_type(S3DataType::Float32)
+                    .dimension(3)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()?,
+            )
+            .await?;
+
+        table
+            .write_chunk_with_spilling(&create_test_vectors(3), None)
+            .await
+            .expect("seed write should succeed");
+        assert_eq!(
+            mock_client.vector_keys("test-index"),
+            vec!["key0", "key1", "key2"]
+        );
+
+        table
+            .delete_by_keys(vec!["key1".to_string()])
+            .await
+            .expect("delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // Deleting a key that is not present is a no-op, matching the real `DeleteVectors`.
+        table
+            .delete_by_keys(vec!["absent".to_string()])
+            .await
+            .expect("deleting an absent key should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
+
+        // An empty key set short-circuits before any client call and changes nothing.
+        table
+            .delete_by_keys(vec![])
+            .await
+            .expect("empty delete should succeed");
+        assert_eq!(mock_client.vector_keys("test-index"), vec!["key0", "key2"]);
 
         Ok(())
     }

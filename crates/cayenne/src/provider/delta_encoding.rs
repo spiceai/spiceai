@@ -120,6 +120,40 @@ pub(crate) enum WriteClass {
     Maintenance,
 }
 
+/// How a snapshot write should be treated: the encoding policy it falls under,
+/// and whether it may fan its encode across shards at all.
+///
+/// Bundled because both answer "what kind of write is this?", travel together
+/// through every write path, and are decided by the same caller at the same
+/// point — the one that built the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WritePolicy {
+    pub(crate) class: WriteClass,
+    pub(crate) fan_out: crate::provider::table::EncodeFanOut,
+}
+
+impl WritePolicy {
+    /// A fresh CDC/inline delta, free to shard — the hot ingest shape.
+    pub(crate) const DELTA: Self = Self {
+        class: WriteClass::Delta,
+        fan_out: crate::provider::table::EncodeFanOut::Sized,
+    };
+
+    /// A maintenance rewrite that may shard: compaction outputs and overwrites
+    /// whose output shape carries nothing a reader depends on.
+    pub(crate) const MAINTENANCE: Self = Self {
+        class: WriteClass::Maintenance,
+        fan_out: crate::provider::table::EncodeFanOut::Sized,
+    };
+
+    /// A maintenance rewrite that must emit ONE sequence of files, whatever the
+    /// table is configured for. See [`crate::provider::table::EncodeFanOut`].
+    pub(crate) const MAINTENANCE_SERIAL: Self = Self {
+        class: WriteClass::Maintenance,
+        fan_out: crate::provider::table::EncodeFanOut::Serial,
+    };
+}
+
 /// Level used for every [`WriteClass::Maintenance`] write: the full default
 /// `BtrBlocks` cascade. Aliases the metadata constant so the config default
 /// and the mapping boundary can't drift apart.

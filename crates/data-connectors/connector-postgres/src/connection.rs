@@ -24,7 +24,7 @@ limitations under the License.
 //! read pool still only understands key=value today, but CDC must honor the URI
 //! form used in docs and secrets.
 
-use runtime::parameters::{ExposedParamLookup, Parameters};
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use std::fmt::Write as _;
 use std::str::FromStr;
 

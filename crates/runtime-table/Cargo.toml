@@ -1,0 +1,83 @@
+[package]
+description = "The Spice runtime's table-provider layers: the accelerated table (refresh, retention, CDC apply, caching) and the federated table it wraps."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-table"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+async-stream.workspace = true
+async-trait.workspace = true
+cache = { path = "../cache" }
+cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
+chrono.workspace = true
+data-accelerator-api = { path = "../data-accelerator-api" }
+data-connector-api = { path = "../data-connector-api" }
+runtime-async = { path = "../runtime-async" }
+data_components = { path = "../data_components", features = ["flightsql"] }
+datafusion.workspace = true
+datafusion-datasource.workspace = true
+datafusion-expr.workspace = true
+datafusion-federation.workspace = true
+datafusion-functions-json.workspace = true
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+datafusion-table-providers.workspace = true
+fundu.workspace = true
+futures.workspace = true
+opentelemetry.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-component = { path = "../runtime-component" }
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-object-store = { path = "../runtime-object-store" }
+runtime-request-context = { path = "../runtime-request-context" }
+runtime-resources = { path = "../runtime-resources" }
+runtime-search = { path = "../runtime-search" }
+runtime-status = { path = "../runtime-status" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
+search = { path = "../search", default-features = false }
+serde.workspace = true
+snafu.workspace = true
+spice-table = { path = "../spice-table" }
+spicepod = { path = "../spicepod" }
+telemetry = { path = "../telemetry" }
+twox-hash.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+utoipa = { workspace = true, optional = true }
+
+# These three came across with the code that reads them and are forwarded from
+# `runtime`'s features of the same name, so the carve does not change what is
+# compiled. They are NOT new capability features — see the "a feature is a crate"
+# rule in CLAUDE.md; they retire with the rest of `runtime`'s feature set.
+#
+# `kafka` matters for behaviour, not just codegen: `handle_stream_error` classifies
+# `EmptyBatch`/`PollExceeded` as transient so a Kafka CDC stream retries instead of
+# failing the dataset. Compiling without it silently drops that classification.
+[features]
+debezium = ["kafka"]
+kafka = ["data_components/kafka"]
+openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
+
+[dev-dependencies]
+insta.workspace = true
+opentelemetry-prometheus.workspace = true
+opentelemetry_sdk.workspace = true
+prometheus.workspace = true
+
+[lints]
+workspace = true

@@ -24,7 +24,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
-    flight::{metrics, util::attach_cache_metadata},
+    flight::{metrics, traced_ticket, util::attach_cache_metadata},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 use telemetry::timing::TimedStream;
@@ -32,14 +32,37 @@ use telemetry::timing::TimedStream;
 use super::{Service, flightsql, to_tonic_err};
 
 pub(crate) async fn handle(
-    request: Request<Ticket>,
+    mut request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    // `get_flight_info` answered the client with a trace id and wrapped the
+    // ticket with it. Adopting it here, before any query runs, is what makes
+    // that id name this execution — the work that can fail — rather than the
+    // planning call the client could not have correlated on. The response
+    // carries it back from the request-context middleware, which also reaches
+    // the failures.
+    adopt_ticket_trace_id(
+        &RequestContext::current(AsyncMarker::new().await),
+        &mut request,
+    );
+
     let msg: Any = match Message::decode(&*request.get_ref().ticket) {
         Ok(msg) => msg,
-        Err(_) => return Box::pin(do_get_simple(request)).await,
+        Err(_) => {
+            return Box::pin(do_get_simple(request)).await;
+        }
     };
 
-    match Command::try_from(msg).map_err(to_tonic_err)? {
+    // The arms below record per-command; a ticket that is not a `Command` reaches
+    // none of them, so it is recorded here.
+    let command = match Command::try_from(msg) {
+        Ok(command) => command,
+        Err(e) => {
+            let _start = metrics::track_flight_request("do_get", None).await;
+            return Err(to_tonic_err(e));
+        }
+    };
+
+    match command {
         Command::CommandStatementQuery(command) => {
             Box::pin(flightsql::statement_query::do_get(command)).await
         }
@@ -138,6 +161,20 @@ pub(crate) async fn handle(
             )))
         }
     }
+}
+
+/// Records the trace id a `get_flight_info` wrapped into the ticket on the
+/// request, and leaves `request` holding the ticket underneath.
+///
+/// A ticket without one — minted by an older runtime, or by a client that
+/// built its own — is left alone and the query numbers itself.
+fn adopt_ticket_trace_id(request_context: &RequestContext, request: &mut Request<Ticket>) {
+    let Some((trace_id, inner)) = traced_ticket::unwrap(request.get_ref()) else {
+        return;
+    };
+
+    request_context.propagate_trace_id(trace_id);
+    *request.get_mut() = inner;
 }
 
 async fn do_get_simple(

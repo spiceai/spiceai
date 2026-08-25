@@ -52,6 +52,8 @@ jobs:
     # the real check runs on the merge-group commit.
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: self-hosted
+    # Slowest observed success in the 2026-07-25..08-08 window: 8 min.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

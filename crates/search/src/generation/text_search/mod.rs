@@ -11,7 +11,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::{
-    cmp::min,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -29,27 +28,27 @@ use arrow_json::reader::Decoder;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    logical_expr::sqlparser::ast::Expr, physical_plan::stream::RecordBatchStreamAdapter,
+    catalog::TableProvider,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    logical_expr::{Expr, TableProviderFilterPushDown},
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 
 use ::util::format_datafusion_error;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::{Number, Value};
 use snafu::{ResultExt, Snafu};
 use tantivy::{
-    Searcher, TantivyError,
+    DocAddress, Score, Searcher, TantivyError,
     collector::TopDocs,
-    query::{Occur, QueryParser, QueryParserError},
+    query::{BooleanQuery, ConstScoreQuery, Occur, Query, QueryParser, QueryParserError},
     query_grammar::{Delimiter, UserInputAst, UserInputLeaf, UserInputLiteral},
     schema::{FieldType, OwnedValue},
     tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer},
 };
 
-use super::{
-    CandidateGeneration, Error as GenerationError, Result as GenerationResult,
-    TextSearchSnafu as GenerationTextSearchSnafu,
-};
+use super::{CandidateGeneration, Result as GenerationResult};
 
 /// Maximum number of results in a single full-text search request, before any pagination.
 /// This size is designated for latency performance on the underlying index.
@@ -217,7 +216,7 @@ pub struct FullTextSearchFieldIndex {
     stored_columns: HashSet<String>,
 
     /// Provide hints to the final Arrow datatype for a given column. Keys are column names.
-    /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`]s and the Arrow type must be inferred from Tanitvy JSON results (via [`arrow_json::reader::infer_json_schema_from_iterator`]).
+    /// Tantivy [`FieldType`]s are less specific than [`arrow::datatypes::DataType`], so source-schema type hints preserve the original Arrow types.
     /// For columns present, use the associated [`arrow::datatypes::Field`].
     type_hints: HashMap<String, Arc<arrow::datatypes::Field>>,
 }
@@ -263,7 +262,7 @@ impl FullTextSearchFieldIndex {
         Ok(fts)
     }
 
-    ///  Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
+    /// Schema is based on the [`tantivy::schema::Schema`] with `self.type_hints` applied.
     /// Field order follows the underlying tantivy schema (not the `HashSet` cache).
     fn schema(&self) -> Arc<Schema> {
         let search_schema = self.reader.schema();
@@ -282,6 +281,32 @@ impl FullTextSearchFieldIndex {
                 Some(Field::new(field_name, data_type, nullable))
             })
             .collect::<Vec<_>>();
+
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Schema for every result page produced by [`Self::search`].
+    ///
+    /// Tantivy omits absent stored values from a document's JSON. Supplying this
+    /// fixed schema to the JSON decoder makes those absent nullable values Arrow
+    /// nulls instead of removing their columns from a result page.
+    fn result_schema(&self) -> Arc<Schema> {
+        let schema = self.schema();
+        let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+
+        if let Some((_, value_field)) = schema.column_with_name(self.field.as_str()) {
+            fields.push(Arc::new(Field::new(
+                SEARCH_VALUE_COLUMN_NAME,
+                value_field.data_type().clone(),
+                value_field.is_nullable(),
+            )));
+        }
+
+        fields.push(Arc::new(Field::new(
+            SEARCH_SCORE_COLUMN_NAME,
+            arrow::datatypes::DataType::Float64,
+            false,
+        )));
 
         Arc::new(Schema::new(fields))
     }
@@ -324,43 +349,71 @@ impl FullTextSearchFieldIndex {
         )
     }
 
-    pub async fn search(
+    /// Classify each pushed-down filter for [`TableProvider::supports_filters_pushdown`].
+    ///
+    /// Every column is classified against the underlying tantivy schema and field types, so the
+    /// classification stays in lockstep with what [`Self::translate_filters`] can actually build.
+    #[must_use]
+    pub fn classify_filters(&self, filters: &[&Expr]) -> Vec<TableProviderFilterPushDown> {
+        let schema = self.reader.schema();
+        filters
+            .iter()
+            .map(|f| tantivy_datafusion_filter::classify_filter(schema, f))
+            .collect()
+    }
+
+    /// Translate the filters DataFusion pushed into this scan into tantivy queries.
+    ///
+    /// A filter DataFusion pushes was previously advertised as `Exact`/`Inexact` by
+    /// [`Self::classify_filters`], so it must translate; a filter that cannot be translated is a
+    /// lockstep violation and is surfaced as an error rather than silently dropped (which would
+    /// return wrong results for a filter DataFusion believes was applied).
+    pub fn translate_filters(
+        &self,
+        filters: &[Expr],
+    ) -> Result<Vec<Box<dyn Query>>, DataFusionError> {
+        let schema = self.reader.schema();
+        filters
+            .iter()
+            .map(|f| {
+                tantivy_datafusion_filter::translate_filter(schema, f).ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "Full text search received a filter it advertised as pushable but cannot translate: {f}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    pub fn search(
         &self,
         query: String,
-        opt_filters: &[&Expr],
+        filters: Vec<Box<dyn Query>>,
         limit: usize,
     ) -> GenerationResult<SendableRecordBatchStream> {
-        if !opt_filters.is_empty() {
-            return Err(Error::UnsupportedFiltersError).context(GenerationTextSearchSnafu)?;
-        }
-        let strm = make_stream(self.clone(), query, limit);
-        let mut strm = Box::pin(strm.peekable());
-        let schema = match strm.as_mut().peek().await {
-            None => Arc::new(Schema::empty()),
-            Some(Ok(rb)) => rb.schema(),
-            Some(Err(e)) => {
-                return Err(GenerationError::internal(
-                    format!("Failed to parse schema of full text search results: {e}").as_str(),
-                ));
-            }
-        };
+        let strm = make_stream(self.clone(), query, filters, limit);
+        let schema = self.result_schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, strm)) as SendableRecordBatchStream)
     }
 
-    fn search_query_literal(
+    /// Score the query against the index in a single `TopDocs` pass, bounded to `limit`.
+    /// Returns lightweight (score, address) pairs without resolving any stored document
+    /// contents — see [`Self::hits_to_json`], which resolves them in bounded chunks so a
+    /// large `limit` doesn't force every matched document's stored fields into memory at once.
+    fn search_top_docs(
         &self,
         literal: &str,
+        filters: &[Box<dyn Query>],
         limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<(Score, DocAddress)>> {
         // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
         // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
         // are honored. Fall back to a bag-of-words OR clause for inputs the
         // parser rejects (e.g. unbalanced quotes, lone special characters in
         // conversational queries).
         let parser = self.query_parser();
-        let q = match parser.parse_query(literal) {
+        let text_query = match parser.parse_query(literal) {
             Ok(parsed) => parsed,
             Err(_) => parser
                 .build_query_from_user_input_ast(parse_query_literal(literal))
@@ -369,17 +422,33 @@ impl FullTextSearchFieldIndex {
                 })?,
         };
 
-        let top_docs = self
-            .reader
-            .search(
-                &q,
-                &TopDocs::with_limit(limit)
-                    .and_offset(offset)
-                    .order_by_score(),
-            )
-            .context(TextSearchSnafu)?
-            .into_iter()
-            .map(|(score, addr)| {
+        // `Must`-combine each pushed-down SQL filter with the full-text clause so the top-K is
+        // computed over the filtered document set (the filter is applied inside the index, not
+        // above the candidate cap).
+        let q: Box<dyn Query> = if filters.is_empty() {
+            text_query
+        } else {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(filters.len() + 1);
+            clauses.push((Occur::Must, text_query));
+            for f in filters {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(f.box_clone(), 0.0)),
+                ));
+            }
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        self.reader
+            .search(&q, &TopDocs::with_limit(limit).order_by_score())
+            .context(TextSearchSnafu)
+    }
+
+    /// Resolve a slice of scored hits' stored document contents into JSON. Kept separate from
+    /// [`Self::search_top_docs`] so callers can decode `hits` in bounded chunks.
+    fn hits_to_json(&self, hits: &[(Score, DocAddress)]) -> Result<Vec<Value>> {
+        hits.iter()
+            .map(|&(score, addr)| {
                 let doc: HashMap<tantivy::schema::Field, OwnedValue> =
                     self.reader.doc(addr).context(TextSearchSnafu)?;
 
@@ -404,36 +473,14 @@ impl FullTextSearchFieldIndex {
                 }
                 Ok(v)
             })
-            .collect::<Result<Vec<Value>>>()?;
-
-        Ok(top_docs)
+            .collect()
     }
 
     fn tantivy_json_to_arrow_decoder(
         &self,
         hits: &[Value],
     ) -> std::result::Result<Decoder, ArrowError> {
-        let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
-            hits.iter().map(Ok),
-        )?);
-
-        let schema = Arc::new(Schema::new(
-            schema
-                .fields()
-                .into_iter()
-                .map(|f| {
-                    // Use [`Self::type_hints`].
-                    if let Some(new_field) = self.type_hints.get(f.name()) {
-                        new_field
-                    } else {
-                        f
-                    }
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
-
-        let mut decoder = arrow_json::ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+        let mut decoder = arrow_json::ReaderBuilder::new(self.result_schema()).build_decoder()?;
 
         decoder.serialize(hits)?;
 
@@ -518,67 +565,74 @@ impl CandidateGeneration for FullTextSearchCandidate {
 fn make_stream(
     fts: FullTextSearchFieldIndex,
     query: String,
+    filters: Vec<Box<dyn Query>>,
     limit: usize,
 ) -> impl Stream<Item = std::result::Result<RecordBatch, DataFusionError>> {
     stream! {
-        // Share the searcher into the blocking task that runs the synchronous
-        // tantivy search (mmap/disk reads + scoring + stored-field decode) off
-        // the async runtime thread (which also serves `/health`, `/v1/search`).
+        if limit == 0 {
+            return;
+        }
+
+        // Share the searcher into the blocking tasks that run synchronous tantivy work
+        // (mmap/disk reads + scoring + stored-field decode) off the async runtime thread
+        // (which also serves `/health`, `/v1/search`).
         let fts = std::sync::Arc::new(fts);
-        let mut remaining_limit = limit;
-        let mut offset = 0;
-        while remaining_limit > 0 {
-            let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
-            let hits = {
-                let fts = std::sync::Arc::clone(&fts);
-                let query = query.clone();
-                match tokio::task::spawn_blocking(move || {
-                    fts.search_query_literal(query.as_str(), page_size, offset)
-                })
-                .await
-                {
-                    Ok(Ok(h)) => h,
-                    Ok(Err(e)) => {
-                        yield Err(DataFusionError::Internal(e.to_string()));
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(DataFusionError::Internal(format!(
-                            "full text search task failed: {e}"
-                        )));
-                        return;
-                    }
+
+        // Score the whole result set in a single `TopDocs` pass (bounded by `limit`), without
+        // resolving any stored document contents yet. The searcher is a fixed snapshot, so
+        // paging with `TopDocs` offsets would rescore the whole growing prefix on every page;
+        // a single pass avoids that, and these lightweight (score, address) pairs are cheap to
+        // hold in full even when `limit` is large, unlike the stored documents they address.
+        let blocking_fts = std::sync::Arc::clone(&fts);
+        let query = query.clone();
+        let top_docs = match tokio::task::spawn_blocking(move || {
+            blocking_fts.search_top_docs(query.as_str(), filters.as_slice(), limit)
+        }).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                yield Err(DataFusionError::Internal(e.to_string()));
+                return;
+            }
+            Err(e) => {
+                yield Err(DataFusionError::Internal(format!(
+                    "full text search task failed: {e}"
+                )));
+                return;
+            }
+        };
+
+        // Resolve stored documents and emit Arrow batches `DEFAULT_BATCH_SIZE` hits at a
+        // time, so memory stays bounded by the batch size rather than by `limit`.
+        for chunk in top_docs.chunks(DEFAULT_BATCH_SIZE) {
+            let blocking_fts = std::sync::Arc::clone(&fts);
+            let chunk = chunk.to_vec();
+            let hits = match tokio::task::spawn_blocking(move || blocking_fts.hits_to_json(&chunk)).await {
+                Ok(Ok(h)) => h,
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Internal(e.to_string()));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(DataFusionError::Internal(format!(
+                        "full text search task failed: {e}"
+                    )));
+                    return;
                 }
             };
 
-            // Decrement by *actual* hits returned (not the requested page size) so
-            // we stop once the index is exhausted instead of issuing further empty
-            // queries.
-            let returned = hits.len();
-            offset += returned;
-            remaining_limit = remaining_limit.saturating_sub(returned);
+            let mut decoder = match fts.tantivy_json_to_arrow_decoder(&hits)
+                .map_err(DataFusionError::from) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        yield Err(e);
+                        return
+                    }
+                };
 
-            if !hits.is_empty() {
-                let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
-                    .map_err(DataFusionError::from) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            yield Err(e);
-                            return
-                        }
-                    };
-
-                match decoder.flush() {
-                    Ok(Some(rb)) => yield Ok(rb),
-                    Ok(None) => {},
-                    Err(e) => yield Err(DataFusionError::from(e))
-                }
-            }
-
-            // Index is exhausted: a partial page (or empty page) means there are
-            // no more matching documents.
-            if returned < page_size {
-                return;
+            match decoder.flush() {
+                Ok(Some(rb)) => yield Ok(rb),
+                Ok(None) => {},
+                Err(e) => yield Err(DataFusionError::from(e))
             }
         }
     }

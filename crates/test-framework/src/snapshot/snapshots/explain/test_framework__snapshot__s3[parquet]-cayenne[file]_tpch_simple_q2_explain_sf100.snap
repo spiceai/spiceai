@@ -13,7 +13,7 @@ description: "Query: tpch_simple_q2"
 | physical_plan | ScalarSubqueryExec: subqueries=1                                                                             |
 |               |   FilterExec: l_linenumber@0 = scalar_subquery(<pending>)                                                    |
 |               |     SchemaCastScanExec                                                                                       |
-|               |       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=91                                         |
+|               |       CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>                                      |
 |               |         BytesProcessedExec                                                                                   |
 |               |           DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[l_linenumber], file_type=vortex |
 |               |   ProjectionExec: expr=[7 as max(lineitem.l_linenumber)]                                                     |

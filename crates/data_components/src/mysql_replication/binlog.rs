@@ -65,6 +65,86 @@ use crate::cdc::{ChangeEnvelope, StreamError, build_heartbeat_envelope};
 /// that (fake rotates and heartbeats report 0) are not resumable.
 pub(super) const MIN_VALID_EVENT_POS: u64 = 4;
 
+/// Floor, in seconds, for how long the source will hold unread dump data before
+/// aborting the connection. Applied to the dump session because the server
+/// default is 60s.
+///
+/// The dump is one-way once started, so the server never waits for us to say
+/// anything — `net_write_timeout` fires purely on data we have not read. Every
+/// `refresh_mode: changes` dataset on a connection shares one dump, and the
+/// pump must-delivers each envelope into a bounded per-dataset channel, so a
+/// single dataset whose apply loop stalls (an in-memory-tier spill, for
+/// instance) stops the socket being drained for all of them. At the default the
+/// source then aborts the dump and every member resumes from its last acked
+/// position while already far behind, which deepens lag and invites the next
+/// abort.
+///
+/// 180s clears the worst apply cycle observed on CH-benCHmark SF1000 (~100s)
+/// with ~1.8x margin. This is empirical headroom, not a bound: the apply tail
+/// is not provably bounded (`cdc_max_coalesced_envelopes`/`_bytes` bound the
+/// burst, not how long a spill takes), so a genuinely wedged apply still
+/// reaches the timeout — it stays visible as the member send stall warning and
+/// its `replication_member_send_stalled_seconds_total` counter.
+///
+/// A floor rather than an assignment: an operator who already raised
+/// `net_write_timeout` past this — the manual workaround for exactly this
+/// symptom — must not have it lowered by connecting a newer runtime, so the
+/// statement takes the greater of their value and this one.
+const DUMP_NET_WRITE_TIMEOUT_SECS: u32 = 180;
+
+/// One statement issued on the dump connection before `COM_BINLOG_DUMP`.
+struct PreDumpStatement {
+    sql: String,
+    /// What the user loses if the server rejects this statement, when that is
+    /// worth saying. The heartbeat spellings are deliberately tried in pairs
+    /// and one of them is unknown on any given server version, so those carry
+    /// nothing and a rejection stays at debug.
+    rejection_warning: Option<&'static str>,
+}
+
+/// The session setup a dump connection needs, in the order it is issued.
+///
+/// Split out from [`open_binlog_stream`] so the statements — in particular
+/// which of them address a *user* variable versus a *system* one — are
+/// assertable without a `MySQL` server.
+fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStatement> {
+    // Ask the source to send heartbeat events while idle so the stream can
+    // detect dead connections and advance its checkpoint. Half the
+    // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
+    // the interval. The session variable is in nanoseconds; MySQL 8.4
+    // renamed the replica-facing vocabulary, so set both spellings (unknown
+    // user variables are inert).
+    let heartbeat_nanos = (checkpoint_interval / 2)
+        .max(Duration::from_millis(500))
+        .as_nanos()
+        .min(u128::from(u64::MAX));
+    // Two separate statements: if a server rejects one spelling, the other
+    // must still take effect (a combined statement fails atomically).
+    let mut statements: Vec<PreDumpStatement> =
+        ["master_heartbeat_period", "source_heartbeat_period"]
+            .into_iter()
+            .map(|var| PreDumpStatement {
+                sql: format!("SET @{var} = {heartbeat_nanos}"),
+                rejection_warning: None,
+            })
+            .collect();
+    // `net_write_timeout` is a system variable, so it needs the `SESSION`
+    // form — the `SET @net_write_timeout` spelling the heartbeats use would
+    // define an unrelated user variable and leave the server default in place.
+    // `GREATEST` against the inherited value keeps this a floor in one
+    // statement, with no round-trip to read the current setting first.
+    statements.push(PreDumpStatement {
+        sql: format!(
+            "SET SESSION net_write_timeout = \
+             CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
+        ),
+        rejection_warning: Some(
+            "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
+        ),
+    });
+    statements
+}
+
 pub(super) async fn open_binlog_stream(
     params: &ReplicationParams,
     resume: &BinlogPosition,
@@ -74,26 +154,20 @@ pub(super) async fn open_binlog_stream(
 ) -> std::result::Result<BinlogStream, mysql_async::Error> {
     let mut conn = Conn::new(params.opts.clone()).await?;
 
-    // Ask the source to send heartbeat events while idle so the stream can
-    // detect dead connections and advance its checkpoint. Half the
-    // checkpoint interval (min 500ms) keeps idle persists within ~1.5×
-    // the interval. The session variable is in nanoseconds; MySQL 8.4
-    // renamed the replica-facing vocabulary, so set both spellings (unknown
-    // user variables are inert).
-    let heartbeat_nanos = (params.checkpoint_interval / 2)
-        .max(Duration::from_millis(500))
-        .as_nanos()
-        .min(u128::from(u64::MAX));
-    // Two separate statements: if a server rejects one spelling, the other
-    // must still take effect (a combined statement fails atomically).
-    for var in ["master_heartbeat_period", "source_heartbeat_period"] {
-        if let Err(e) = mysql_async::prelude::Queryable::query_drop(
-            &mut conn,
-            format!("SET @{var} = {heartbeat_nanos}"),
-        )
-        .await
-        {
-            tracing::debug!(dataset = %dataset_name, error = %e, "failed to set @{var}");
+    for PreDumpStatement {
+        sql,
+        rejection_warning,
+    } in pre_dump_session_statements(params.checkpoint_interval)
+    {
+        if let Err(e) = mysql_async::prelude::Queryable::query_drop(&mut conn, sql.as_str()).await {
+            match rejection_warning {
+                Some(consequence) => {
+                    tracing::warn!(dataset = %dataset_name, statement = %sql, error = %e, "Failed to configure the MySQL binlog dump session for dataset {dataset_name}: {consequence}");
+                }
+                None => {
+                    tracing::debug!(dataset = %dataset_name, statement = %sql, error = %e, "failed to set a binlog dump session variable");
+                }
+            }
         }
     }
 
@@ -943,6 +1017,125 @@ mod tests {
 
     use super::*;
     use crate::mysql_replication::setup::SourceColumn;
+
+    /// `MySQL`'s documented default for `net_write_timeout`, which is what aborts
+    /// a dump whose socket the pump stopped draining (#12527).
+    const SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS: u32 = 60;
+
+    fn statement_setting<'a>(
+        statements: &'a [PreDumpStatement],
+        variable: &str,
+    ) -> Option<&'a str> {
+        statements
+            .iter()
+            .find(|statement| statement.sql.contains(variable))
+            .map(|statement| statement.sql.as_str())
+    }
+
+    /// The warning the statement setting `variable` carries, if it carries one.
+    fn statement_rejection_warning(
+        statements: &[PreDumpStatement],
+        variable: &str,
+    ) -> Option<&'static str> {
+        statements
+            .iter()
+            .find(|statement| statement.sql.contains(variable))
+            .and_then(|statement| statement.rejection_warning)
+    }
+
+    #[test]
+    fn the_dump_session_raises_net_write_timeout() {
+        // Regression test for #12527: without this the source aborts the shared
+        // dump 60s into one dataset's slow apply cycle, and every
+        // `refresh_mode: changes` dataset on the connection re-streams from its
+        // acked position while already behind.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("the dump session must raise net_write_timeout");
+        assert_eq!(
+            sql,
+            format!(
+                "SET SESSION net_write_timeout = \
+                 CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
+            ),
+            "net_write_timeout is a SYSTEM variable: the `SET @net_write_timeout` spelling the \
+             heartbeats use would define an unrelated user variable and silently leave the \
+             server default in place"
+        );
+        assert!(
+            !sql.contains("SET @net_write_timeout"),
+            "a user-variable spelling is inert for a system variable: {sql}"
+        );
+        const {
+            assert!(
+                DUMP_NET_WRITE_TIMEOUT_SECS > SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS,
+                "raising the timeout to at most the server default would change nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dump_session_never_lowers_an_operators_higher_net_write_timeout() {
+        // Raising `net_write_timeout` on the source is the manual workaround for
+        // this symptom, so an operator who has already done it must not have it
+        // lowered by connecting a runtime carrying this fix. `GREATEST` against
+        // the session's inherited value makes the statement a floor; a bare
+        // assignment would clamp their setting down to ours.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        let sql = statement_setting(&statements, "net_write_timeout")
+            .expect("the dump session must raise net_write_timeout");
+        assert!(
+            sql.contains("GREATEST(@@SESSION.net_write_timeout,"),
+            "the statement must take the greater of the inherited value and ours: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_net_write_timeout_is_worth_a_warning() {
+        // The heartbeat spellings are tried in pairs and one is always unknown,
+        // so those must stay quiet; a rejected net_write_timeout leaves the
+        // reconnect cliff in place and is the one the user can act on.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        for statement in &statements {
+            assert_eq!(
+                statement.rejection_warning.is_some(),
+                statement.sql.contains("net_write_timeout"),
+                "unexpected error visibility for {}",
+                statement.sql
+            );
+        }
+        let warning = statement_rejection_warning(&statements, "net_write_timeout")
+            .expect("a rejected net_write_timeout must say what it costs");
+        assert!(
+            warning.contains("https://spiceai.org/docs/"),
+            "the warning must point at the fix: {warning}"
+        );
+    }
+
+    #[test]
+    fn both_heartbeat_spellings_are_set_as_user_variables_in_nanoseconds() {
+        // Half the checkpoint interval, in nanoseconds, on both the pre-8.4 and
+        // 8.4 spellings — unchanged by the net_write_timeout addition.
+        let statements = pre_dump_session_statements(Duration::from_secs(10));
+        for var in ["master_heartbeat_period", "source_heartbeat_period"] {
+            assert_eq!(
+                statement_setting(&statements, var),
+                Some(format!("SET @{var} = 5000000000").as_str()),
+                "{var} must stay a user variable, in nanoseconds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_checkpoint_interval_floors_the_heartbeat_at_500ms() {
+        // A sub-second interval would otherwise ask the source to heartbeat
+        // continuously.
+        let statements = pre_dump_session_statements(Duration::from_millis(100));
+        assert_eq!(
+            statement_setting(&statements, "master_heartbeat_period"),
+            Some("SET @master_heartbeat_period = 500000000")
+        );
+    }
 
     /// A layout of `(name, COLUMN_TYPE)` columns in ordinal order.
     fn layout_of(columns: &[(&str, &str)]) -> TableLayout {

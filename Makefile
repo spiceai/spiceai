@@ -102,13 +102,72 @@ endif
 # of the gate agreeing on which crates need system libraries, so a sign-off on
 # such a host fails only for reasons in the branch under test. The crate has no
 # unit tests of its own.
-# The `query_metrics` test binary is listed explicitly because `--lib` skips it:
-# it needs its own process to control the OTel meter-provider install order.
+#
+# One cargo invocation, not one per test group: under `resolver = "2"` the
+# resolved feature set of every crate is a function of which packages are
+# selected, so `--all`, `-p cayenne` and `-p runtime` each resolve a different
+# dependency graph and none of them can reuse another's artifacts
+# (spiceai/spiceai#12337). One selection resolves once, and a nextest filterset
+# decides which of the built tests actually run.
+#
+# `--tests` rather than `--lib` is what brings cayenne's integration tests and
+# the `metrics` binary into that one selection. It builds every test target
+# in the workspace, including ones the filterset never runs. Naming just the
+# wanted targets with `--test <glob>` would build fewer, but a new test file that
+# didn't match the glob would silently stop being covered — cayenne already has
+# a test target that doesn't follow the `*_test` convention its other 55 do.
+#
+# `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
+# own process to control the OTel meter-provider install order. Every metrics
+# test lives in that one binary, so selecting it by name here covers all of them:
+# naming individual binaries is what left two of them built but never run.
+#
+# `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
+# labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
+# out would silently drop runtime-parameters-derive's tests from the gate.
+# `--tests` also builds the 14 bin targets as unit-test harnesses; `--lib` never
+# ran those, and nothing here selects `kind(=bin)`, so it still doesn't.
+#
+# Running cayenne's integration tests under the workspace resolve rather than
+# `-p cayenne` enables its `turso` feature, which puts 304 `*_turso` variants in
+# the gate alongside their SQLite siblings. They need more stack than the 2 MiB
+# std gives a thread; `test_with_backends!` reserves it (see
+# `crates/cayenne/tests/common/mod.rs`), so no name needs excluding here.
+#
+# Shared so `nextest` and `verify-cli` cannot drift onto different selections:
+# a different selection resolves different features, which would make verify-cli
+# recompile instead of reading the build nextest just did.
+#
+# `runtime-cloud-connect`'s integration tests are selected for the same reason
+# cayenne's are: they stand their whole control plane up in-process — a TLS
+# enroll mock and a tonic gateway on ephemeral ports — so unlike the suites in
+# `integration*.yml` they need no credentials and no external service. They are
+# also the only coverage of the enrollment, reconnect, command-dispatch and
+# heartbeat wire paths; `--lib` cannot reach a running client at all.
+#
+# The credential-free Spice CLI integration binaries exercise the shipped
+# command surface. `cloud_integration` needs live credentials and remains in
+# the nightly gate, so select the other two binaries by name rather than every
+# integration test in the `spice` package.
+NEXTEST_SELECTION := --all --exclude libnfs
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics)
+# Extra narrowing for callers that can't run everything (CI lacks credentials
+# for some tests). It has to *intersect* the expression above rather than sit
+# beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
+# match everything the first one excluded and widen the run instead.
+ifneq ($(strip $(NEXTEST_FILTER_EXTRA)),)
+_NEXTEST_FILTER := ($(NEXTEST_FILTER)) & ($(NEXTEST_FILTER_EXTRA))
+else
+_NEXTEST_FILTER := $(NEXTEST_FILTER)
+endif
+# A filterset smuggled in through NEXTEST_FLAG would silently widen the run for
+# the reason above, and a gate that runs more than it was asked to reads as green.
+ifneq (,$(findstring -E,$(NEXTEST_FLAG))$(findstring --filterset,$(NEXTEST_FLAG)))
+$(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_EXTRA instead, which intersects the gate's own filterset rather than being unioned with it)
+endif
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --exclude libnfs --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
-	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
-	@cargo nextest run -p runtime --test query_metrics $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -119,6 +178,27 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
+# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
+# build already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and `spice` has three. A CLI link error therefore fails
+# `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
+# whole graph at a selection no other phase in the gate shares.
+#
+# That is an assumption about cargo's target selection, and it is the quiet kind
+# to lose: removing `spice`'s `tests/` targets would stop its bin from being built,
+# and the gate would drop CLI coverage without a single failure. So ask cargo
+# whether the bin is in that build graph, rather than looking for the file — a warm
+# `target/` would still hold a stale binary from an earlier build, so a file check
+# would pass at exactly the moment coverage was lost. Same selection as `nextest`,
+# so after it this is a fingerprint scan (measured ~2s), not a build.
+.PHONY: verify-cli
+verify-cli:
+	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
+	mkdir -p "$(TARGET_DIR)"; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
+	python3 scripts/verify_cli_build.py "$$out" version.txt
+
 .PHONY: nextest-packages
 nextest-packages:
 	@test -n "$(strip $(PACKAGES))" || { echo 'nextest-packages requires PACKAGES="crate1 crate2"' >&2; exit 1; }
@@ -190,8 +270,16 @@ lint-rust:
 	cargo fmt $(_FMT_FLAGS) -- --check
 	## Crate-layering guard (fast, no compile): no crate may depend on a higher tier. See docs/dev/crate_layering.md
 	python3 scripts/check_crate_layers.py
+	## Table-layer guard (fast, no compile): a provider-wrapping TableProvider silently stops every layer walk. See docs/dev/crate_layering.md
+	python3 scripts/check_table_layers.py
 	## Rust-gate path-list guard (fast, no compile): the sign-off, Attestation, and merge-queue path lists must agree. See docs/dev/ci_signoff.md
+	## Its derivation is exercised first: the live-tree scan only covers the paths today's workspace happens to contain, so a derivation that stopped working would pass unnoticed on a clean tree
+	python3 scripts/test_check_rust_gate_paths.py
 	python3 scripts/check_rust_gate_paths.py
+	## Unreachable-module guard (fast, no compile): every file under a crate's src/ must be reachable from its crate root, or nothing compiles it
+	## Its parser is exercised first: the live-tree scan only covers the shapes today's workspace happens to contain, so a parser regression for any other shape would pass unnoticed
+	python3 scripts/test_check_module_reachability.py
+	python3 scripts/check_module_reachability.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
@@ -329,7 +417,7 @@ TARGET_DIR := $(or $(CARGO_TARGET_DIR),target)
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,scylladb
 
 .PHONY: install
 install: build

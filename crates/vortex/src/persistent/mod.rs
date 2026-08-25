@@ -4,6 +4,7 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+pub use cache::synthetic_object_meta;
 mod format;
 pub mod metrics;
 mod opener;
@@ -20,6 +21,10 @@ pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
+pub use segment_cache::{
+    install_process_segment_cache, process_segment_cache_capacity_bytes,
+    register_segment_cache_metrics,
+};
 pub use source::VortexSource;
 
 #[cfg(test)]

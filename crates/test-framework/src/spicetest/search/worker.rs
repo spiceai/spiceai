@@ -190,6 +190,17 @@ impl VectorSearchWorker {
                     .send()
                     .await?;
 
+                let status = res.status();
+                if !status.is_success() {
+                    let body = res.text().await.unwrap_or_default();
+                    // Collapse whitespace so the error stays on a single line.
+                    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+                    anyhow::bail!(
+                        "Search request '{}' failed with status {status}: {body}",
+                        request.id
+                    );
+                }
+
                 let response: SearchResponse = res.json().await?;
                 let duration = start.elapsed();
                 results.insert(

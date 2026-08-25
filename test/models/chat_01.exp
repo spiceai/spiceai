@@ -5,7 +5,7 @@ source [file join [file dirname [info script]] repl_helpers.exp]
 # Runtime response timeout
 set timeout 30
 
-spawn spice chat
+spawn spice chat {*}[repl_endpoint_args]
 
 proc verify_datasets_access {} {
     global timeout

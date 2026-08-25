@@ -215,6 +215,27 @@ impl AccelerationSource for View {
         &self.name
     }
 
+    fn connector_name(&self) -> Option<&str> {
+        // A view has no `from:` — its rows come from its SQL, not a connector — so
+        // there is no connector default to apply. `ViewBuilder::try_from` also
+        // rejects every refresh mode except `full`, which is the fallback a `None`
+        // resolves to.
+        None
+    }
+
+    fn on_schema_change(&self) -> Option<runtime_acceleration::OnSchemaChange> {
+        // A view declares no `on_schema_change`: its columns follow its SQL, so there is
+        // no source schema for an accelerator to reconcile against.
+        None
+    }
+
+    fn allows_write(&self) -> bool {
+        // A view is not writable, and `ViewBuilder::try_from` rejects every refresh mode
+        // except `full`, so a view is never the read-only CDC replica the scan-freshness
+        // decision is about.
+        false
+    }
+
     fn time_column(&self) -> Option<&str> {
         None
     }
@@ -256,6 +277,17 @@ impl AccelerationSource for View {
             #[cfg(not(feature = "duckdb"))]
             datasets
         })
+    }
+
+    fn checkpointer_factory(
+        &self,
+        snapshot_behavior: runtime_acceleration::snapshot::SnapshotBehavior,
+    ) -> runtime_acceleration::dataset_checkpoint::DatasetCheckpointerFactory {
+        crate::dataaccelerator::spice_sys::checkpointer_factory(
+            self,
+            self.runtime.accelerator_engine_registry(),
+            snapshot_behavior,
+        )
     }
 }
 

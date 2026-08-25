@@ -24,6 +24,7 @@ use tokio::time::Instant;
 use runtime_request_context::RequestContext;
 
 use super::error_code::ErrorCode;
+use super::single_line;
 use runtime_metrics::query as metrics;
 
 #[derive(Clone)]
@@ -52,7 +53,10 @@ impl QueryTracker {
         error_message: String,
         error_code: ErrorCode,
     ) {
-        tracing::debug!("Query finished with error: {error_message}; code: {error_code}",);
+        // The failure is named by `finish` below, which collapses the message to
+        // one record and picks the level from `error_code`. Naming it here too
+        // would log a memory-pool breakdown across as many lines as it has
+        // consumers, which a collector cannot group.
         self.error_message = Some(error_message);
         self.error_code = Some(error_code);
         self.finish(request_context, "");
@@ -142,6 +146,40 @@ impl QueryTracker {
             metrics::FAILURES.add(1, &labels);
         }
 
+        // The failure record on the console.
+        //
+        // Deliberately outside the `task_history_enabled` gate below: the
+        // `task_history` target reaches only the task-history table, so with the
+        // table switched off a failed query left no record naming its trace id —
+        // the very case that gate exists to survive. `finish` is the single
+        // terminal step for every tracked query, so a failure is named here
+        // exactly once, on every protocol, while the query's trace span is still
+        // entered — which is what puts the id on the record.
+        //
+        // A refusal for want of memory is logged at `warn` and everything else at
+        // `debug`. A malformed query is the caller's problem and would only be
+        // noise, but a runtime refusing queries for want of memory is an outage
+        // its operator cannot see any other way: `/health` is served by a
+        // separate tokio runtime and stays green throughout.
+        //
+        // `single_line` is passed as a macro argument, not bound first, so a
+        // multi-KB memory-pool breakdown is only re-collected when the level it
+        // is being logged at is actually enabled.
+        if let Some(error_message) = &self.error_message {
+            match &self.error_code {
+                Some(code @ ErrorCode::ResourcesExhausted) => {
+                    tracing::warn!(
+                        "Query refused, out of memory ({code}): {}",
+                        single_line(error_message)
+                    );
+                }
+                Some(code) => {
+                    tracing::debug!("Query failed ({code}): {}", single_line(error_message));
+                }
+                None => tracing::debug!("Query failed: {}", single_line(error_message)),
+            }
+        }
+
         if self.task_history_enabled {
             trace_query(request_context, &self, captured_output, &datasets_label);
         }
@@ -202,4 +240,129 @@ fn trace_query(
 
     tracing::info!(target: "task_history", protocol = ?request_context.protocol(), datasets = datasets_label, "labels");
     tracing::info!(target: "task_history", captured_output = %captured_output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_request_context::{Protocol, RequestContextBuilder};
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// Everything a probe subscriber wrote while a tracker finished with
+    /// `error`, with the task-history table off — the configuration whose
+    /// failures reach no table at all.
+    fn tracker_finished_with(error: Option<(&str, ErrorCode)>) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&buffer);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || WriteTo(Arc::clone(&writer))),
+        );
+
+        let request_context = RequestContextBuilder::new(Protocol::Internal).build();
+        let tracker = QueryTracker {
+            task_history_enabled: false,
+            schema: None,
+            query_duration_secs: None,
+            query_execution_duration_secs: None,
+            rows_produced: 0,
+            results_cache_hit: None,
+            is_accelerated: None,
+            error_message: None,
+            error_code: None,
+            query_duration_timer: Instant::now(),
+            query_execution_duration_timer: Instant::now(),
+            datasets: Arc::new(HashSet::new()),
+        };
+
+        tracing::subscriber::with_default(subscriber, || match error {
+            Some((message, code)) => {
+                tracker.finish_with_error(&request_context, message.to_string(), code);
+            }
+            None => tracker.finish(&request_context, ""),
+        });
+
+        let captured = buffer.lock().expect("probe buffer poisoned").clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// `Arc<Mutex<Vec<u8>>>` is not itself a `MakeWriter`, so the closure above
+    /// hands out this newtype instead.
+    struct WriteTo(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WriteTo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("probe buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A refusal for want of memory is the runtime's own capacity condition and
+    /// the only signal an operator gets, so it has to survive the default
+    /// verbosity — and reach the log as one record, or a collector cannot group
+    /// it. Everything else stays at `debug`: a malformed query is the caller's
+    /// problem, and promoting every one would bury this.
+    #[test]
+    fn a_memory_refusal_is_named_at_warn_on_one_line() {
+        let logged = tracker_finished_with(Some((
+            "Resources exhausted: top consumers as:\n  HashJoinInput#12 consumed 1.0 GB\n\
+             Error: Failed to allocate 256.0 MB",
+            ErrorCode::ResourcesExhausted,
+        )));
+
+        let records: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("Query refused, out of memory"))
+            .collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "expected exactly one record, got: {logged}"
+        );
+        assert!(
+            records[0].contains("WARN")
+                && records[0].contains("HashJoinInput#12 consumed 1.0 GB")
+                && records[0].contains("Failed to allocate 256.0 MB"),
+            "the whole breakdown must ride on that one WARN record, got: {}",
+            records[0]
+        );
+    }
+
+    #[test]
+    fn other_failures_stay_at_debug() {
+        let logged = tracker_finished_with(Some((
+            "Error during planning: table 'nope' not found",
+            ErrorCode::QueryPlanningError,
+        )));
+
+        assert!(
+            logged.contains("Query failed") && logged.contains("table 'nope' not found"),
+            "the record must still name the failure, got: {logged}"
+        );
+        assert!(
+            !logged.contains("Query refused, out of memory"),
+            "an ordinary query failure is not a capacity condition, got: {logged}"
+        );
+    }
+
+    /// The record exists to explain a failure, so a query that had none must
+    /// not produce it.
+    #[test]
+    fn a_successful_query_names_no_failure() {
+        let logged = tracker_finished_with(None);
+
+        assert!(
+            !logged.contains("Query failed") && !logged.contains("out of memory"),
+            "a successful query must log no failure, got: {logged}"
+        );
+    }
 }

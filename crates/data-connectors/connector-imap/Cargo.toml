@@ -11,6 +11,7 @@ arrow.workspace = true
 async-trait.workspace = true
 charset.workspace = true
 chrono.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
 imap.workspace = true
@@ -18,9 +19,13 @@ mailparse.workspace = true
 linkme.workspace = true
 paste.workspace = true
 regex.workspace = true
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
+runtime-parameters = { path = "../../runtime-parameters" }
 secrecy.workspace = true
 snafu.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true
