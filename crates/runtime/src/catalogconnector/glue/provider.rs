@@ -40,11 +40,12 @@ use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
     common::Result as DFResult,
 };
+use parking_lot::Mutex;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long the standing "cannot read these tables" warning is suppressed for
@@ -189,12 +190,7 @@ impl GlueCatalogProvider {
                 .table_list
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| {
-                    // Selection first: a table the catalog's `exclude:` withholds
-                    // is not one to report as unreadable.
-                    is_selected(&self.selector, &database, t.name())
-                        && is_readable(&database, t, &mut unreadable)
-                })
+                .filter(|t| is_registrable(&self.selector, &database, t, &mut unreadable))
                 .collect::<Vec<_>>();
 
             for table in some_tables {
@@ -406,8 +402,29 @@ fn is_readable(database: &str, table: &Table, unreadable: &mut UnreadableTables)
     }
 }
 
+/// Whether `table` is one to register, recording it in `unreadable` when it is a
+/// table Spice keeps but cannot read.
+///
+/// Selection is evaluated first and the short circuit is the point, not an
+/// ordering detail: a table the catalog's `exclude:` withholds is not one to
+/// report as unreadable, so it must never reach [`is_readable`]'s accumulator.
+/// Evaluating the pair in the other order would warn an operator about tables
+/// they asked Spice to leave alone.
+fn is_registrable(
+    selector: &TableSelector,
+    database: &str,
+    table: &Table,
+    unreadable: &mut UnreadableTables,
+) -> bool {
+    is_selected(selector, database, table.name()) && is_readable(database, table, unreadable)
+}
+
 /// When each database's standing "cannot read these tables" warning was last
-/// emitted, and what it said.
+/// emitted, and a fingerprint of the table set it was emitted for.
+///
+/// The rendered message is deliberately not retained — it is only ever produced
+/// from the summary at hand — and two different sets can render the same line,
+/// so the fingerprint rather than the text is what decides whether a set changed.
 ///
 /// Keyed on the database rather than on the message, so the map holds at most
 /// one entry per database the catalog listed on its last successful refresh —
@@ -442,10 +459,7 @@ impl UnreadableWarnings {
         summaries: &HashMap<DatabaseName, UnreadableSummary>,
         now: Instant,
     ) -> Vec<String> {
-        let mut last = match self.last.lock() {
-            Ok(last) => last,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut last = self.last.lock();
 
         // A database this refresh did not report a summary for either has no
         // unreadable table any more or is no longer in the catalog. Keeping its
@@ -477,10 +491,7 @@ impl UnreadableWarnings {
     /// alternative did not have.
     #[cfg(test)]
     fn tracked_databases(&self) -> usize {
-        match self.last.lock() {
-            Ok(last) => last.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        }
+        self.last.lock().len()
     }
 }
 
@@ -1068,6 +1079,57 @@ mod tests {
             ],
             "every table the connector cannot read must be named"
         );
+    }
+
+    /// The two predicates are exercised as the connector applies them — as one
+    /// expression, over a table that is both excluded and unreadable. Calling
+    /// each half on its own says nothing about the order they run in, and the
+    /// order is the whole behaviour: swapping it makes Spice warn an operator
+    /// about ORC tables their `exclude:` deliberately withholds.
+    #[test]
+    fn an_excluded_table_is_never_reported_as_unreadable() {
+        let selector = selector(&[], &["archive.*"]);
+        let mut unreadable = UnreadableTables::default();
+
+        // Excluded *and* unreadable: the only shape that separates the orders.
+        assert!(!is_registrable(
+            &selector,
+            "archive",
+            &glue_table("orc_dump", Some(ORC)),
+            &mut unreadable
+        ));
+        assert_eq!(
+            unreadable.total, 0,
+            "a table `exclude:` withholds must not be reported as unreadable: {:?}",
+            unreadable.sample
+        );
+
+        // Excluded and readable, and readable-but-in-a-kept-database, so the
+        // assertion above cannot pass by refusing or accepting everything.
+        assert!(!is_registrable(
+            &selector,
+            "archive",
+            &glue_table("orders", Some(PARQUET)),
+            &mut unreadable
+        ));
+        assert!(is_registrable(
+            &selector,
+            "public",
+            &glue_table("orders", Some(PARQUET)),
+            &mut unreadable
+        ));
+        assert_eq!(unreadable.total, 0);
+
+        // A kept table Spice cannot read is still reported: the exclusion is
+        // what silences the accumulator, not the extraction.
+        assert!(!is_registrable(
+            &selector,
+            "public",
+            &glue_table("orc_dump", Some(ORC)),
+            &mut unreadable
+        ));
+        assert_eq!(unreadable.total, 1);
+        assert_eq!(unreadable.sample, vec!["orc_dump".to_string()]);
     }
 
     /// The summary is what an operator sees by default, so it has to say how many
