@@ -1882,7 +1882,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("max_request_partitions")
             .description("Maximum number of HTTP request partitions that can be created from request_path, request_query, request_body, and request_headers filters. If unset, the number of request partitions is not capped."),
         ParameterSpec::runtime("response_cache_max_size_bytes")
-            .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB). Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
+            .description("Byte budget for the responses this dataset caches, counting response bodies and the request keys they are held under. Once reached, entries are evicted to stay inside it. Set '0' to disable the response cache. Default: 67108864 (64 MiB), applied per dataset, so raise it only where a dataset earns it. Applies to dynamic JSON API endpoints only; structured HTTP file datasets do not use this cache."),
         ParameterSpec::runtime("response_cache_fallback_ttl")
             .description("How long to keep a response whose origin sent no 'Cache-Control' header at all, for example '5m' or '30s'. An origin that did send 'Cache-Control' is always honoured instead, including its refusals. Unset by default, which keeps such responses uncached."),
         ParameterSpec::runtime("health_probe")

@@ -308,6 +308,15 @@ impl CachedResponse {
 /// Deliberately modest: this cache exists to serve repeats of the *same* request
 /// inside its `max-age`, so its useful working set is small, while the cost of
 /// getting it wrong is memory that no other limit bounds.
+///
+/// Fixed rather than derived from the machine's memory, and the distinction
+/// matters: this budget is held **per dataset**, so what actually multiplies it
+/// is the number of HTTP datasets, which no per-provider derivation can see.
+/// Scaling it with total memory would look like memory accounting while still
+/// missing the term that matters, and would make the same pod behave
+/// differently on a larger host. A predictable default that a dataset can raise
+/// where it earns it is the honest version; bounding the *total* needs one
+/// budget shared across datasets, which is a larger change than a default.
 pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The connector's response cache: bounded in bytes and expiring per entry.
