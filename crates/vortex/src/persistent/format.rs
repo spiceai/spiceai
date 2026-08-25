@@ -494,20 +494,24 @@ impl VortexFormat {
     /// — and physically evicts them before returning.
     ///
     /// Callers pass the paths of objects a retirement has confirmed absent.
-    /// Neither cache has a TTL or any invalidation of its own — an entry leaves
-    /// only when another `put` pushes it out under capacity pressure — so an
-    /// artifact whose file has been retired would otherwise keep a share of a
-    /// budget every other table draws on for the life of the process. This call
-    /// is the only thing that hands it back.
+    /// Neither cache has a TTL or any invalidation of its own, so a retired
+    /// artifact leaves only when another `put` pushes it out under capacity
+    /// pressure. Both outcomes cost something: pressure that does arrive
+    /// reclaims the entry, but until then it holds a share of a budget every
+    /// other table draws on and displaces a live artifact when it is finally
+    /// evicted, and pressure that never arrives — an idle or generously sized
+    /// cache — leaves it resident for the life of the process. This call is the
+    /// only way to hand that share back without waiting on that pressure.
     ///
     /// The two halves are not equally ordered against reads already in flight.
     /// The segment half is: `SharedSegmentCache` registers per-path state and
     /// drains in-flight puts before enumerating keys. The footer half is not —
     /// `infer_schema` and `infer_stats` miss the cache, `await` the object-store
     /// read, and only then insert what they read, so a scan that missed before
-    /// this call can insert after it and leave one entry per raced path resident
-    /// for the life of the process. Giving the footer side the same coordination
-    /// is tracked in <https://github.com/spiceai/spiceai/issues/13447>.
+    /// this call can insert after it and leave one entry per raced path behind,
+    /// on the same terms as any other un-evicted entry above. Giving the footer
+    /// side the same coordination is tracked in
+    /// <https://github.com/spiceai/spiceai/issues/13447>.
     ///
     /// Both caches key on the object-store location, so one path set addresses
     /// both; taking them together is what stops a caller releasing one and
