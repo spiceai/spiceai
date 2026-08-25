@@ -544,7 +544,7 @@ impl SharedSegmentCache {
                 tracing::error!(
                     target: "vortex::segment_cache",
                     %error,
-                    "Failed to search cached data for the {count} file(s) just retired — {paths} — so their segments stay cached until capacity evicts them. Cause: {error}",
+                    "Failed to search the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: {error}",
                     count = paths.len(),
                     paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
@@ -560,7 +560,7 @@ impl SharedSegmentCache {
                 tracing::error!(
                     target: "vortex::segment_cache",
                     timeout_secs,
-                    "Gave up after {timeout_secs}s searching cached data for the {count} file(s) just retired — {paths} — so their segments stay cached until capacity evicts them. Cause: the host cannot keep up with the work already queued on it.",
+                    "Gave up after {timeout_secs}s searching the Cayenne-accelerated data cached for the {count} file(s) just retired — {paths} — so the memory those files occupy is held until other reads push it out. Restart the runtime to reclaim it immediately, and give the host less concurrent work. See: https://spiceai.org/docs/components/data-accelerators/cayenne. Cause: the host cannot keep up with the work already queued on it.",
                     count = paths.len(),
                     paths = describe_paths(&paths.iter().collect::<Vec<_>>()),
                 );
@@ -657,10 +657,11 @@ fn describe_paths(paths: &[&Path]) -> String {
 fn drain_gave_up_warning(stalled: &[&Path]) -> String {
     format!(
         "Gave up after {timeout_secs}s waiting for in-flight cache writes on {stalled_paths} \
-         retiring file(s) — {paths} — so their segments stay cached past the retirement: a write \
-         that finishes clears its own entry, but one cancelled after inserting leaves the segment \
-         until capacity eviction. Queries are unaffected because those files are already deleted. \
-         Writes this slow mean the host cannot keep up with the work already queued on it.",
+         retiring file(s) of the Cayenne-accelerated data — {paths} — so their segments stay \
+         cached past the retirement: a write that finishes clears its own entry, but one cancelled \
+         after inserting leaves the segment until capacity eviction. Queries are unaffected because \
+         those files are already deleted. Writes this slow mean the host cannot keep up with the \
+         work already queued on it. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
         timeout_secs = ACTIVE_PUT_DRAIN_TIMEOUT.as_secs(),
         stalled_paths = stalled.len(),
         paths = describe_paths(stalled),
@@ -882,6 +883,10 @@ mod tests {
         assert!(
             warning.contains("2 retiring file(s)"),
             "the warning must count the files it is about: {warning}"
+        );
+        assert!(
+            warning.contains("https://spiceai.org/docs/"),
+            "an operator reading this needs somewhere to go: {warning}"
         );
         assert_eq!(
             warning.lines().count(),
