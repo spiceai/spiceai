@@ -88,7 +88,7 @@ pub struct PingoraBackend<V>
 where
     V: Clone + Send + Sync + 'static,
 {
-    cache: Arc<Lru<KeyedValue<V>, 16>>,
+    cache: Arc<Lru<KeyedValue<V>, NUM_KEY_SHARDS>>,
     // 16-shard metadata tracking for TTL checks and key iteration
     // Each shard covers 1/16th of the key space (key % 16)
     // Stores expiry time and weight for each key
@@ -252,14 +252,31 @@ where
     /// the two value types that reach it, `CachedQueryResult` and `CachedSearchResult`,
     /// answer `AsTableRefs` with an `Arc` clone.
     ///
-    /// An entry present when its shard is reached is always seen; one admitted into a
+    /// The shard's *metadata* write lock is held across its walk, and that is what makes
+    /// the first half of the guarantee below true rather than aspirational. `get` expresses
+    /// a read as `remove` + re-`admit` under that shard's metadata *read* lock, so a scan
+    /// holding no metadata lock can land between the two, see a matching key as absent, and
+    /// leave the entry for the re-admit to restore — after which any lookup with no
+    /// invalidation-clock check of its own serves it. Excluding `get` costs that shard's
+    /// metadata readers (`len()`, `iter_keys()`, and hits) the length of the walk, on top of
+    /// the pingora-lru hold above. It introduces no new lock ordering: metadata shard first,
+    /// then the pingora-lru shard beneath `iter_for_each`, the order `insert` and `get`
+    /// already take, and eviction materialises its victims before taking either.
+    ///
+    /// So: an entry resident when its shard is reached is always seen; one admitted into a
     /// shard after that shard has been walked is not.
     fn keys_matching<F>(&self, predicate: F) -> Vec<u64>
     where
         F: Fn(&V) -> bool,
     {
         let mut matched: Vec<u64> = Vec::new();
-        for shard in 0..self.cache.shards() {
+        // Both shard arrays are `NUM_KEY_SHARDS` long and both place a key at
+        // `key % NUM_KEY_SHARDS`, so metadata shard `i` guards exactly the entries
+        // `iter_for_each(i, ..)` walks. Enumerating the metadata shards rather than
+        // `0..self.cache.shards()` is what keeps that pairing an index the compiler
+        // checks instead of an assumption.
+        for (shard, metadata) in self.metadata_shards.iter().enumerate() {
+            let _metadata = metadata.write();
             self.cache.iter_for_each(shard, |(entry, _weight)| {
                 if predicate(&entry.value) {
                     matched.push(entry.key);
@@ -1717,6 +1734,44 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert_eq!(backend.len().await, 0);
+    }
+
+    /// `get` expresses a read as `remove` + re-`admit` under the key's metadata shard read
+    /// lock, so a scan holding no metadata lock can land between the two, see the key as
+    /// absent, and leave a matching entry behind for the re-admit to restore. Pinned by the
+    /// consequence a scan can observe about itself: while it is inside the shard holding the
+    /// entry, that shard's metadata lock is not available for reading, which is the lock a
+    /// concurrent `get` needs before it can open the window at all.
+    #[tokio::test]
+    async fn a_shard_scan_excludes_a_concurrent_get_on_that_shard() {
+        let backend = create_backend(1024, 60);
+        // 48 % 16 == 0, so this entry lives in shard 0 and `get(&48)` reads metadata
+        // shard 0 across its `remove`/re-`admit` pair.
+        let key = 48u64;
+        backend.insert(key, TestValue::new("v48")).await;
+
+        let shard_idx = PingoraBackend::<TestValue>::get_shard_index(key);
+        let shards = Arc::clone(&backend.metadata_shards);
+        let observed_read_lock = std::sync::atomic::AtomicBool::new(false);
+
+        // The predicate runs inside the walk of the shard holding the entry, which is the
+        // instant a concurrent `get` would have to be excluded from. `try_read` rather than
+        // `read`: a blocking probe from inside the walk would deadlock on success and hang
+        // the test instead of failing it.
+        let removed = backend.invalidate_matching(|value| {
+            if shards[shard_idx].try_read().is_some() {
+                observed_read_lock.store(true, Ordering::Relaxed);
+            }
+            value.data == "v48"
+        });
+
+        assert!(
+            !observed_read_lock.load(Ordering::Relaxed),
+            "the scan left this shard's metadata readable, so a `get` could take that lock \
+             and hide the entry behind its remove/re-admit pair for the rest of the walk"
+        );
+        assert_eq!(removed, 1, "the matching entry must still be invalidated");
+        assert_eq!(backend.get(&key).await, None);
     }
 
     /// The scan has to reach every shard, not just the one a small fixture
