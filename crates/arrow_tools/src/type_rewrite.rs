@@ -342,7 +342,9 @@ pub fn relabel_array_data(
 }
 
 /// The rebuild half of [`relabel_array_data`], called once `target_type` is known to differ from
-/// `data`'s type only in field names and nullability flags.
+/// `data`'s type only in field names, nullability flags, and field metadata outside the two
+/// `ARROW:extension:*` keys — the three differences
+/// [`ensure_relabel_is_metadata_only`] admits, and so the three this may be handed.
 fn relabel_validated_array_data(
     data: ArrayData,
     target_type: &DataType,
@@ -386,7 +388,8 @@ fn relabel_validated_array_data(
 /// Rejects a `target_type` that would change what `source`'s buffers mean.
 ///
 /// [`relabel_array_data`] promises to carry values across unchanged, so only the parts of a type
-/// that hold no data may differ: field names, and nullability flags, at every level. Everything
+/// that hold no data may differ: field names, nullability flags, and the field metadata that is
+/// not an `ARROW:extension:*` key, at every level. Everything
 /// a buffer's interpretation depends on — primitive width and signedness, timestamp/interval/
 /// duration unit, timezone, decimal precision and scale, `FixedSizeList` size, `Union` mode and
 /// type ids, `Dictionary` key type, `Map` `sorted` flag — has to match exactly.
@@ -476,7 +479,22 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
 /// the same key buffer means, exactly as `Map`'s `sorted` flag is. It lives on the field rather
 /// than in `DataType::Dictionary`, and `Field`'s `PartialEq` leaves it out, so no comparison of
 /// types or fields anywhere else in this walk can see it.
+///
+/// Its neighbour `dict_id` is `PartialEq`-invisible in the same way and is deliberately *not*
+/// compared. It names the IPC dictionary batch a key buffer indexes into, so it would belong here
+/// on meaning grounds, but nothing in this repository sets or preserves it — every field is built
+/// through a constructor that leaves it `0` — and Arrow has deprecated the whole mechanism for
+/// removal since 54.0.0. Comparing it would add a use of an API on its way out in order to refuse
+/// a relabel no caller can construct.
 fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Result<(), ArrowError> {
+    // The data type is walked first so that the two field-level checks below report only on a
+    // relabel that is otherwise metadata-only. Both arms refuse, so the order cannot change what
+    // is admitted — only which cause is named, and the outer one is the misleading half:
+    // `Dictionary<_, Utf8>` -> `Utf8` differs in `dict_is_ordered` (`Some(false)` vs `None`)
+    // *because* it drops the dictionary encoding, and reporting it as a dictionary that merely
+    // needs sorting sends the reader after the wrong change.
+    ensure_relabel_is_metadata_only(source.data_type(), target.data_type())?;
+
     if source.dict_is_ordered() != target.dict_is_ordered() {
         return Err(relabel_changes_dictionary_order(source, target));
     }
@@ -504,7 +522,7 @@ fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Resu
             ));
         }
     }
-    ensure_relabel_is_metadata_only(source.data_type(), target.data_type())
+    Ok(())
 }
 
 /// The error [`ensure_field_relabel_is_metadata_only`] reports for a changed `dict_is_ordered`.
@@ -947,6 +965,42 @@ mod tests {
         assert!(
             err.to_string().contains("dict_is_ordered"),
             "the short-circuit must not bypass the check, got: {err}"
+        );
+    }
+
+    /// A relabel that drops the dictionary encoding differs in `dict_is_ordered` too, because the
+    /// flag reads `None` for a field that is not a dictionary at all. Reported as a dictionary
+    /// order claim, it sends the reader after a sort they cannot perform, so the data-type walk has
+    /// to be the half that answers.
+    #[test]
+    fn dropping_a_dictionary_is_reported_as_the_type_change_it_is() {
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let item = Arc::new(Field::new("item", dictionary, true).with_dict_is_ordered(false));
+        let values = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec!["b", "a"])),
+        )
+        .expect("a dictionary over two values");
+        let list = ListArray::new(
+            Arc::clone(&item),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+
+        // `Some(false)` vs `None`: the flags differ, but only as a consequence of the encoding
+        // being removed.
+        let undictionaried = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let err = relabel_array_data(list.to_data(), &undictionaried)
+            .expect_err("removing dictionary encoding must be refused");
+        let message = err.to_string();
+        assert!(
+            !message.contains("dict_is_ordered"),
+            "removing the encoding must not be reported as an order claim, got: {message}"
+        );
+        assert!(
+            message.contains("Dictionary") && message.contains("Utf8"),
+            "the error must name the types it refuses to relabel between, got: {message}"
         );
     }
 
