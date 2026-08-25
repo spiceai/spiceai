@@ -27,7 +27,12 @@ use llms::embeddings::{Embed, EmbeddingInput};
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
-use crate::index::{duckdb::DuckDBVectorIndex, embedding_col};
+use crate::index::{
+    Index,
+    duckdb::DuckDBVectorIndex,
+    embedding_col,
+    write_util::{first_non_finite, non_finite_embedding_warning},
+};
 
 #[derive(Debug, Snafu)]
 pub(super) enum WriteError {
@@ -80,6 +85,7 @@ pub(super) async fn write_embeddings(
     .await?;
 
     update_embedding_column_in_batch(
+        index.name(),
         &record,
         &index.embedded_column,
         &embedding_vectors,
@@ -127,6 +133,7 @@ async fn embed_column(
 }
 
 fn update_embedding_column_in_batch(
+    index_name: &str,
     record: &RecordBatch,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
@@ -135,7 +142,7 @@ fn update_embedding_column_in_batch(
     let embedding_column_name = embedding_col(embedded_column_name);
     let schema = record.schema();
     let mut columns = record.columns().to_vec();
-    let embedding_array = create_embedding_array(embedding_vectors, dimension)?;
+    let embedding_array = create_embedding_array(index_name, embedding_vectors, dimension)?;
 
     let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
         columns[idx] = embedding_array;
@@ -156,6 +163,7 @@ fn update_embedding_column_in_batch(
 
 #[expect(clippy::cast_sign_loss)]
 fn create_embedding_array(
+    index_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
 ) -> Result<Arc<dyn Array>, WriteError> {
@@ -176,11 +184,19 @@ fn create_embedding_array(
     let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), dim);
     builder = builder.with_field(Field::new_list_field(DataType::Float32, false));
 
+    let mut non_finite_rows: Vec<usize> = Vec::new();
     for (row, embedding) in embedding_vectors.iter().enumerate() {
         match embedding {
-            Some(vector) if vector.len() == expected => {
+            // A non-finite component has no defined distance under any metric the HNSW
+            // index offers, so the row is stored with a NULL embedding rather than indexed.
+            Some(vector) if vector.len() == expected && first_non_finite(vector).is_none() => {
                 builder.values().append_slice(vector);
                 builder.append(true);
+            }
+            Some(vector) if vector.len() == expected => {
+                non_finite_rows.push(row);
+                builder.values().append_value_n(0.0, expected);
+                builder.append(false);
             }
             Some(vector) => {
                 return Err(WriteError::EmbeddingDimensionMismatch {
@@ -197,5 +213,63 @@ fn create_embedding_array(
         }
     }
 
+    if !non_finite_rows.is_empty() {
+        tracing::warn!(
+            "{}",
+            non_finite_embedding_warning(index_name, &non_finite_rows, embedding_vectors.len())
+        );
+    }
+
     Ok(Arc::new(builder.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Array, FixedSizeListArray};
+
+    use super::create_embedding_array;
+
+    /// The HNSW write path never screened its vectors — `validate_vector` existed but was
+    /// only ever called on the query side, so a `[NaN, 2.0]` embedding was indexed and every
+    /// distance computed against it came back NaN (regression test for #13089).
+    #[test]
+    fn a_non_finite_embedding_is_nulled_rather_than_indexed() {
+        let embeddings = vec![
+            Some(vec![0.1, 0.2]),
+            Some(vec![f32::NAN, 0.2]),
+            Some(vec![0.1, f32::INFINITY]),
+            Some(vec![f32::NEG_INFINITY, 0.2]),
+            None,
+            Some(vec![0.0, 0.0]),
+        ];
+
+        let array = create_embedding_array("duckdb_vector_index", &embeddings, 2)
+            .expect("builds the array");
+        let list = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("FixedSizeListArray");
+
+        assert_eq!(list.len(), 6);
+        assert!(list.is_valid(0), "a finite embedding stays indexed");
+        assert!(list.is_null(1), "a NaN component nulls the embedding");
+        assert!(list.is_null(2), "an infinite component nulls the embedding");
+        assert!(
+            list.is_null(3),
+            "a negative-infinite component nulls the embedding"
+        );
+        assert!(list.is_null(4), "a missing embedding stays null");
+        assert!(
+            list.is_valid(5),
+            "an all-zero embedding is finite and stays indexed"
+        );
+    }
+
+    /// A dimension mismatch must still be an error, not silently nulled by the new screen.
+    #[test]
+    fn a_dimension_mismatch_is_still_an_error() {
+        let embeddings = vec![Some(vec![0.1, 0.2, 0.3])];
+        create_embedding_array("duckdb_vector_index", &embeddings, 2)
+            .expect_err("a wrong-width embedding is rejected");
+    }
 }

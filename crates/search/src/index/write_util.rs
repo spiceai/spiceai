@@ -254,6 +254,7 @@ pub async fn embed_column(
 
 /// Update the embedding column in the `RecordBatch` with the computed embeddings.
 pub fn update_embedding_column_in_batch(
+    index_name: &str,
     record: &RecordBatch,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
@@ -265,7 +266,7 @@ pub fn update_embedding_column_in_batch(
     let mut columns = record.columns().to_vec();
 
     // Create new embedding array that will replace the existing column or be added as a new column
-    let embedding_array = create_embedding_array(embedding_vectors, dimension)?;
+    let embedding_array = create_embedding_array(index_name, embedding_vectors, dimension)?;
 
     // Check if the embedding column already exists
     let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
@@ -290,9 +291,59 @@ pub fn update_embedding_column_in_batch(
         .map_err(Box::from)
 }
 
+/// The position of the first element of `embedding` that is not a finite number.
+///
+/// This is the one definition of "this vector cannot be scored" that every vector write
+/// path shares. A `NaN` or infinite component has no defined distance under any metric an
+/// index offers — cosine, L2 and inner product alike — so it poisons every score computed
+/// against it. An all-zero vector is a different case and deliberately not covered here:
+/// it is well defined for L2 and inner product, and `cosine_distance` answers `0.5` for it.
+#[must_use]
+pub fn first_non_finite(embedding: &[f32]) -> Option<usize> {
+    embedding.iter().position(|value| !value.is_finite())
+}
+
+/// The remedy clause every non-finite-embedding warning ends with, kept in one place so the
+/// advice and the docs link cannot drift between the paths that skip a record and the ones
+/// that null its embedding.
+pub const NON_FINITE_EMBEDDING_REMEDY: &str = "Re-embed the affected rows, or check the embedding model configured for this dataset. \
+     See: https://spiceai.org/docs/components/embeddings";
+
+/// The maximum number of row indexes named in a [`non_finite_embedding_warning`].
+const NON_FINITE_SAMPLE_LIMIT: usize = 5;
+
+/// One line explaining why some rows are not searchable, built in a pure function so a
+/// reword cannot quietly drop the index name, the consequence, or the docs link.
+#[must_use]
+pub fn non_finite_embedding_warning(
+    index_name: &str,
+    affected_rows: &[usize],
+    total_rows: usize,
+) -> String {
+    let sample = affected_rows
+        .iter()
+        .take(NON_FINITE_SAMPLE_LIMIT)
+        .map(usize::to_string)
+        .join(", ");
+    let ellipsis = if affected_rows.len() > NON_FINITE_SAMPLE_LIMIT {
+        ", ..."
+    } else {
+        ""
+    };
+    format!(
+        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are stored without an embedding and vector search will never return them (rows {sample}{ellipsis}). {NON_FINITE_EMBEDDING_REMEDY}",
+        affected_rows.len()
+    )
+}
+
 /// Create an Arrow array from embedding vectors.
+///
+/// An embedding carrying a non-finite value is stored as a NULL list slot rather than
+/// indexed — see [`first_non_finite`]. The row itself is kept, because this builds one
+/// column of a batch whose other columns already have their rows.
 #[expect(clippy::cast_sign_loss)]
 pub fn create_embedding_array(
+    index_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
 ) -> Result<Arc<dyn Array>, Box<Error>> {
@@ -319,6 +370,7 @@ pub fn create_embedding_array(
     builder = builder.with_field(field);
 
     let expected_dim = dimension as usize;
+    let mut non_finite_rows: Vec<usize> = Vec::new();
     for (row_index, embedding_opt) in embedding_vectors.iter().enumerate() {
         if let Some(embedding) = embedding_opt {
             // Validate embedding dimension matches expected dimension
@@ -328,6 +380,12 @@ pub fn create_embedding_array(
                     actual: embedding.len(),
                     row_index,
                 }));
+            }
+            if first_non_finite(embedding).is_some() {
+                non_finite_rows.push(row_index);
+                builder.values().append_value_n(0.0, expected_dim);
+                builder.append(false);
+                continue;
             }
             // Optimized: append_slice automatically marks all values as valid
             // without needing to allocate a separate validity vector
@@ -339,6 +397,13 @@ pub fn create_embedding_array(
             builder.values().append_value_n(0.0, expected_dim);
             builder.append(false);
         }
+    }
+
+    if !non_finite_rows.is_empty() {
+        tracing::warn!(
+            "{}",
+            non_finite_embedding_warning(index_name, &non_finite_rows, embedding_vectors.len())
+        );
     }
 
     Ok(Arc::new(builder.finish()))
@@ -448,8 +513,8 @@ mod tests {
     fn test_create_embedding_array_valid_embeddings() {
         let embeddings = vec![Some(vec![0.1, 0.2, 0.3]), None, Some(vec![0.7, 0.8, 0.9])];
 
-        let result =
-            create_embedding_array(&embeddings, 3).expect("Failed to create embedding array");
+        let result = create_embedding_array("test_index", &embeddings, 3)
+            .expect("Failed to create embedding array");
 
         let list_array = result
             .as_any()
@@ -481,7 +546,7 @@ mod tests {
     fn test_create_embedding_array_empty_embeddings() {
         let embeddings: Vec<Option<Vec<f32>>> = vec![None, None];
 
-        let result = create_embedding_array(&embeddings, 0);
+        let result = create_embedding_array("test_index", &embeddings, 0);
 
         // Should fail because no valid embeddings to determine dimension
         assert!(result.is_err());
@@ -502,8 +567,9 @@ mod tests {
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
-            .expect("Failed to update embedding column");
+        let result =
+            update_embedding_column_in_batch("test_index", &record, "text", &new_embeddings, 3)
+                .expect("Failed to update embedding column");
 
         // Verify the updated batch has the new embeddings
         let embedding_column = result.column(1);
@@ -532,8 +598,9 @@ mod tests {
 
         let new_embeddings = vec![Some(vec![0.1, 0.2, 0.3]), Some(vec![0.4, 0.5, 0.6])];
 
-        let result = update_embedding_column_in_batch(&record, "text", &new_embeddings, 3)
-            .expect("Failed to handle missing embedding column");
+        let result =
+            update_embedding_column_in_batch("test_index", &record, "text", &new_embeddings, 3)
+                .expect("Failed to handle missing embedding column");
 
         // Should append the embedding column with the correct name
         let expected_embedding_col = embedding_col("text");
@@ -574,7 +641,7 @@ mod tests {
             Some(vec![0.3, 0.4, 0.5]), // dimension 3 - MISMATCH!
         ];
 
-        let result = create_embedding_array(&embeddings, 2);
+        let result = create_embedding_array("test_index", &embeddings, 2);
 
         assert!(
             result.is_err(),
@@ -605,10 +672,89 @@ mod tests {
             Some(vec![0.7, 0.8, 0.9]),
         ];
 
-        let result = create_embedding_array(&embeddings, 3);
+        let result = create_embedding_array("test_index", &embeddings, 3);
         assert!(
             result.is_ok(),
             "Should succeed when all embedding dimensions match"
+        );
+    }
+
+    /// A vector with one bad component among real values must not be treated as usable —
+    /// the pre-fix predicate tested `all` and let `[NaN, 2.0, 3.0]` through (regression
+    /// test for #13089).
+    #[test]
+    fn first_non_finite_rejects_a_single_bad_component() {
+        assert_eq!(first_non_finite(&[f32::NAN, 2.0, 3.0]), Some(0));
+        assert_eq!(first_non_finite(&[1.0, f32::INFINITY, 3.0]), Some(1));
+        assert_eq!(first_non_finite(&[1.0, 2.0, f32::NEG_INFINITY]), Some(2));
+        assert_eq!(first_non_finite(&[f32::NAN, f32::NAN]), Some(0));
+    }
+
+    /// An all-zero vector is well defined for L2 and inner product, and `cosine_distance`
+    /// answers 0.5 for it, so it is deliberately not a non-finite defect.
+    #[test]
+    fn first_non_finite_accepts_finite_vectors_including_all_zero() {
+        assert_eq!(first_non_finite(&[0.0, 0.0, 0.0]), None);
+        assert_eq!(first_non_finite(&[-1.5, 0.0, 2.5]), None);
+        assert_eq!(first_non_finite(&[]), None);
+    }
+
+    /// The warning is what a user gets to explain a row that vanished from search, so it
+    /// must keep naming the index, the count, the consequence, and the docs link.
+    #[test]
+    fn non_finite_warning_names_index_consequence_and_docs() {
+        let message = non_finite_embedding_warning("my_index", &[1, 4], 10);
+        assert!(message.contains("'my_index'"), "{message}");
+        assert!(message.contains("2 of 10"), "{message}");
+        assert!(
+            message.contains("vector search will never return them"),
+            "{message}"
+        );
+        assert!(message.contains("rows 1, 4"), "{message}");
+        assert!(
+            message.contains("https://spiceai.org/docs/components/embeddings"),
+            "{message}"
+        );
+    }
+
+    /// Only the first few row indexes are named, so a whole-batch failure cannot produce a
+    /// log line proportional to the batch.
+    #[test]
+    fn non_finite_warning_truncates_a_long_row_list() {
+        let rows: Vec<usize> = (0..50).collect();
+        let message = non_finite_embedding_warning("my_index", &rows, 50);
+        assert!(message.contains("50 of 50"), "{message}");
+        assert!(message.contains("rows 0, 1, 2, 3, 4, ..."), "{message}");
+        assert!(!message.contains(", 5,"), "{message}");
+    }
+
+    /// A partially non-finite embedding is stored as a NULL list slot, not indexed, and the
+    /// rest of the batch is untouched (regression test for #13089).
+    #[test]
+    fn create_embedding_array_nulls_a_non_finite_embedding() {
+        let embeddings = vec![
+            Some(vec![0.1, 0.2, 0.3]),
+            Some(vec![f32::NAN, 2.0, 3.0]),
+            Some(vec![1.0, f32::INFINITY, 3.0]),
+            None,
+            Some(vec![0.0, 0.0, 0.0]),
+        ];
+
+        let array = create_embedding_array("test_index", &embeddings, 3)
+            .expect("builds the embedding array");
+        let list = array
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .expect("FixedSizeListArray");
+
+        assert_eq!(list.len(), 5);
+        assert!(list.is_valid(0), "a finite embedding stays indexed");
+        assert!(list.is_null(1), "a NaN component nulls the embedding");
+        assert!(list.is_null(2), "an infinite component nulls the embedding");
+        assert!(list.is_null(3), "a missing embedding stays null");
+        assert!(
+            list.is_valid(4),
+            "an all-zero embedding is finite and stays indexed"
         );
     }
 

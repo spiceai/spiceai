@@ -38,6 +38,7 @@ use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
 use crate::index::elasticsearch::ElasticsearchIndex;
 use crate::index::embedding_col;
+use crate::index::write_util::{first_non_finite, non_finite_embedding_warning};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -296,7 +297,7 @@ fn build_documents(
             continue;
         }
 
-        if embedding.iter().any(|x| !x.is_finite()) {
+        if first_non_finite(embedding).is_some() {
             non_finite_skips += 1;
             if non_finite_samples.len() < SAMPLE_LIMIT {
                 non_finite_samples.push(row);
@@ -468,11 +469,19 @@ fn create_embedding_array(
     let item_field = Field::new_list_field(DataType::Float32, false);
     builder = builder.with_field(item_field);
 
+    let mut non_finite_rows: Vec<usize> = Vec::new();
     for (row, emb) in embedding_vectors.iter().enumerate() {
         match emb {
-            Some(v) if v.len() == expected => {
+            // The bulk path already declines to index a non-finite vector; null it here too so
+            // the batch handed downstream cannot carry a vector Elasticsearch never stored.
+            Some(v) if v.len() == expected && first_non_finite(v).is_none() => {
                 builder.values().append_slice(v);
                 builder.append(true);
+            }
+            Some(v) if v.len() == expected => {
+                non_finite_rows.push(row);
+                builder.values().append_value_n(0.0, expected);
+                builder.append(false);
             }
             Some(v) => {
                 return Err(Error::EmbeddingDimensionMismatch {
@@ -488,6 +497,13 @@ fn create_embedding_array(
                 builder.append(false);
             }
         }
+    }
+
+    if !non_finite_rows.is_empty() {
+        tracing::warn!(
+            "{}",
+            non_finite_embedding_warning(es_index, &non_finite_rows, embedding_vectors.len())
+        );
     }
 
     Ok(Arc::new(builder.finish()))
@@ -878,8 +894,11 @@ fn scan_failed_items(items: &[Value]) -> (usize, Option<String>) {
 mod tests {
     use serde_json::json;
 
+    use arrow::array::{Array, FixedSizeListArray};
+
     use super::{
-        Error, MAX_CATEGORY_LEN, UNRECOGNIZED_CATEGORY, categorical_token, inspect_bulk_response,
+        Error, MAX_CATEGORY_LEN, UNRECOGNIZED_CATEGORY, categorical_token, create_embedding_array,
+        inspect_bulk_response,
     };
 
     /// A primary-key value of the shape that makes this a data-leak: identifying on its own.
@@ -1218,5 +1237,32 @@ mod tests {
             message.contains("missing a boolean `errors` field"),
             "expected the non-boolean `errors` case to be rejected by shape: {message}"
         );
+    }
+
+    /// The bulk path already declines to index a non-finite vector, but the batch it hands
+    /// downstream is what the accelerated table and the schema check see. Before #13089 that
+    /// batch still carried the vector Elasticsearch had refused.
+    #[test]
+    fn a_non_finite_embedding_is_nulled_in_the_returned_batch() {
+        let embeddings = vec![
+            Some(vec![0.1, 0.2]),
+            Some(vec![f32::NAN, 0.2]),
+            Some(vec![0.1, f32::INFINITY]),
+            None,
+            Some(vec![0.0, 0.0]),
+        ];
+
+        let array =
+            create_embedding_array("idx", &embeddings, 2).expect("builds the embedding array");
+        let list = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("FixedSizeListArray");
+
+        assert!(list.is_valid(0), "a finite embedding stays indexed");
+        assert!(list.is_null(1), "a NaN component nulls the embedding");
+        assert!(list.is_null(2), "an infinite component nulls the embedding");
+        assert!(list.is_null(3), "a missing embedding stays null");
+        assert!(list.is_valid(4), "an all-zero embedding is finite");
     }
 }

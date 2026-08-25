@@ -27,8 +27,8 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use crate::index::write_util::{
-    self, embed_column, extract_and_format_primary_key, sort_columns_alphabetically,
-    update_embedding_column_in_batch,
+    self, embed_column, extract_and_format_primary_key, first_non_finite,
+    sort_columns_alphabetically, update_embedding_column_in_batch,
 };
 use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
 
@@ -177,6 +177,7 @@ async fn process_single_batch(
     // Update the embedding column in the batch with computed embeddings
     // Ideally, we can just do `S3VectorPartitionedTable::insert_into` (or similar) with this big boy
     let updated_record = update_embedding_column_in_batch(
+        index.name(),
         &record,
         &index.embedded_column,
         &embedding_vectors,
@@ -287,23 +288,37 @@ fn filter_zero_vectors(
 ) {
     // Filter in reverse order to avoid index shifting when removing elements
     for i in (0..embeddings.len()).rev() {
-        if let Some(embedding) = &embeddings[i]
-            // Single pass: check if all values are zero or NaN (both are invalid embeddings)
-            && embedding.iter().all(|&x| x == 0.0 || x.is_nan())
-        {
-            let key_str = primary_keys
-                .get(i)
-                .and_then(|k| k.as_ref().map(String::as_str))
-                .unwrap_or("unknown");
+        let Some(embedding) = &embeddings[i] else {
+            continue;
+        };
+        // Single pass: check if all values are zero or NaN (both are invalid embeddings)
+        let all_zero_or_nan = embedding.iter().all(|&x| x == 0.0 || x.is_nan());
+        // A single NaN or infinity poisons every score computed against the vector, so one
+        // bad component disqualifies the whole record too.
+        let non_finite = first_non_finite(embedding).is_some();
+        if !all_zero_or_nan && !non_finite {
+            continue;
+        }
+
+        let key_str = primary_keys
+            .get(i)
+            .and_then(|k| k.as_ref().map(String::as_str))
+            .unwrap_or("unknown");
+        if all_zero_or_nan {
             tracing::warn!(
                 "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
             );
+        } else {
+            tracing::warn!(
+                "Skipping record '{key_str}' for S3 Vector index '{index_name}': the embedding contains a NaN or infinite value, so the record is not indexed and vector search will never return it. {}",
+                write_util::NON_FINITE_EMBEDDING_REMEDY
+            );
+        }
 
-            embeddings.remove(i);
-            primary_keys.remove(i);
-            for values in metadata.values_mut() {
-                values.remove(i);
-            }
+        embeddings.remove(i);
+        primary_keys.remove(i);
+        for values in metadata.values_mut() {
+            values.remove(i);
         }
     }
 
@@ -355,6 +370,61 @@ mod tests {
         assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
         assert_eq!(filtered_embeddings[1], None);
         assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
+    }
+
+    /// A vector whose components are mostly real but carry one NaN or infinity has no
+    /// defined distance under any metric, so the record must not reach the index. Before
+    /// #13089 the filter tested `all`, so only a wholly-invalid vector was caught and
+    /// `[NaN, 2.0]` was written.
+    #[test]
+    fn filter_drops_a_partially_non_finite_vector() {
+        use serde_json::Value;
+        use std::collections::HashMap;
+
+        let embeddings = vec![
+            Some(vec![1.0, 2.0]),               // Keep — finite
+            Some(vec![f32::NAN, 2.0]),          // Drop — one NaN among real values
+            Some(vec![1.0, f32::INFINITY]),     // Drop — one infinity among real values
+            Some(vec![f32::NEG_INFINITY, 1.0]), // Drop — one negative infinity
+            Some(vec![0.0, 0.0]),               // Drop — all zero (pre-existing behaviour)
+            None,                               // Keep — no embedding to screen
+            Some(vec![3.0, 4.0]),               // Keep — finite
+        ];
+        let keys: Vec<Option<String>> = (1..=7).map(|i| Some(format!("key{i}"))).collect();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "test".to_string(),
+            (1..=7)
+                .map(|i| Some(Value::Number(i.into())))
+                .collect::<Vec<_>>(),
+        );
+
+        let (filtered_embeddings, filtered_keys, filtered_metadata) =
+            filter_zero_vectors(embeddings, keys, metadata, "test_index");
+
+        assert_eq!(filtered_embeddings.len(), 3);
+        assert_eq!(filtered_keys.len(), 3);
+        assert_eq!(filtered_metadata["test"].len(), 3);
+        assert_eq!(filtered_embeddings[0], Some(vec![1.0, 2.0]));
+        assert_eq!(filtered_embeddings[1], None);
+        assert_eq!(filtered_embeddings[2], Some(vec![3.0, 4.0]));
+        assert_eq!(
+            filtered_keys,
+            vec![
+                Some("key1".to_string()),
+                Some("key6".to_string()),
+                Some("key7".to_string()),
+            ]
+        );
+        // The metadata stays aligned with the rows that survived.
+        assert_eq!(
+            filtered_metadata["test"],
+            vec![
+                Some(Value::Number(1.into())),
+                Some(Value::Number(6.into())),
+                Some(Value::Number(7.into())),
+            ]
+        );
     }
 
     /// Test that filter_zero_vectors correctly filters out NaN embeddings.

@@ -208,15 +208,23 @@ impl MemoryVectorIndex {
                     (Some(key), Some(vector)) => {
                         // All-zero / all-NaN vectors have no defined direction and
                         // would corrupt similarity scores — skip them.
-                        let valid = !vector.iter().all(|&v| v == 0.0 || v.is_nan());
-                        if valid {
-                            keys.push(key.clone());
-                        } else {
+                        let all_zero_or_nan = vector.iter().all(|&v| v == 0.0 || v.is_nan());
+                        // A single NaN or infinity poisons every score computed against the
+                        // vector, so one bad component disqualifies the whole row too.
+                        let non_finite = write_util::first_non_finite(vector).is_some();
+                        if all_zero_or_nan {
                             tracing::warn!(
                                 "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
                             );
+                        } else if non_finite {
+                            tracing::warn!(
+                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': the embedding contains a NaN or infinite value, so the record is not indexed and vector search will never return it. {}",
+                                write_util::NON_FINITE_EMBEDDING_REMEDY
+                            );
+                        } else {
+                            keys.push(key.clone());
                         }
-                        valid
+                        !all_zero_or_nan && !non_finite
                     }
                     (None, _) => {
                         tracing::warn!(
@@ -426,6 +434,7 @@ impl SearchIndex for MemoryVectorIndex {
         );
 
         let updated = write_util::update_embedding_column_in_batch(
+            INDEX_NAME,
             &record,
             &self.embedded_column,
             &embedding_vectors,
@@ -526,6 +535,43 @@ mod tests {
         }
     }
 
+    /// An embedder that returns one bad component among real values for a chosen row — the
+    /// shape a provider produces on a numerically unstable response.
+    #[derive(Debug)]
+    struct PoisonEmbed {
+        poisoned_text: String,
+        bad_value: f32,
+    }
+
+    impl PoisonEmbed {
+        fn vector_for(&self, text: &str) -> Vec<f32> {
+            if text == self.poisoned_text {
+                let mut vector = byte_vector(text);
+                vector[0] = self.bad_value;
+                vector
+            } else {
+                byte_vector(text)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Embed for PoisonEmbed {
+        async fn embed(&self, input: EmbeddingInput) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            match input {
+                EmbeddingInput::String(s) => Ok(vec![self.vector_for(&s)]),
+                EmbeddingInput::StringArray(v) => {
+                    Ok(v.iter().map(|s| self.vector_for(s)).collect())
+                }
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn size(&self) -> i32 {
+            DIM
+        }
+    }
+
     /// These tests never execute a query plan, so the query-time `embed(text, model)` UDF is
     /// only needed to construct the index.
     fn embed_udf() -> Arc<ScalarUDF> {
@@ -543,11 +589,15 @@ mod tests {
     }
 
     fn memory_index() -> MemoryVectorIndex {
+        memory_index_with(Arc::new(ByteEmbed))
+    }
+
+    fn memory_index_with(embedder: Arc<dyn Embed>) -> MemoryVectorIndex {
         MemoryVectorIndex::try_new(
             "content".to_string(),
             vec![Field::new("id", DataType::Int64, false)],
             MetadataColumns::none(),
-            Arc::new(ByteEmbed),
+            embedder,
             embed_udf(),
             "model_name".to_string(),
             MemoryDistanceMetric::Cosine,
@@ -789,5 +839,43 @@ mod tests {
             .expect("the write window closes");
 
         assert_eq!(indexed_ids(&index), vec![1, 3]);
+    }
+
+    /// A vector carrying one NaN among real values must not reach the store. Before #13089 the
+    /// filter tested `all`, so only a wholly-zero-or-NaN vector was skipped and a poisoned row
+    /// was indexed — every score computed against it is NaN.
+    #[tokio::test]
+    async fn a_partially_non_finite_embedding_is_not_indexed() {
+        for bad_value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let index = memory_index_with(Arc::new(PoisonEmbed {
+                poisoned_text: "row 2".to_string(),
+                bad_value,
+            }));
+            write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+
+            assert_eq!(
+                indexed_ids(&index),
+                vec![1, 3],
+                "row 2's embedding carries {bad_value}, which has no defined distance under \
+                 any metric, so the row must not be indexed"
+            );
+        }
+    }
+
+    /// The screen is for non-finite components only: a vector with a zero among real values is
+    /// still finite and scoreable, so it must stay indexed.
+    #[tokio::test]
+    async fn a_zeroed_component_leaves_the_embedding_indexed() {
+        let index = memory_index_with(Arc::new(PoisonEmbed {
+            poisoned_text: "row 2".to_string(),
+            bad_value: 0.0,
+        }));
+        write_window(&index, WriteWindow::Append, &[1, 2, 3]).await;
+
+        assert_eq!(
+            indexed_ids(&index),
+            vec![1, 2, 3],
+            "zeroing one component leaves a finite vector, which stays indexed"
+        );
     }
 }
