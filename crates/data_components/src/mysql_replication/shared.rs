@@ -1080,6 +1080,58 @@ impl MemberStart {
     const fn is_loading(self) -> bool {
         matches!(self, Self::Snapshot | Self::Rebuild)
     }
+
+    /// Whether a start resolved *without* a usable position must persist the
+    /// head it just captured, before any rows land.
+    ///
+    /// Only [`Self::Stream`] does. The two loading starts carry a boundary
+    /// committer that persists the head after their rows are durably applied,
+    /// so recording it up front would let a crash mid-load resume past base
+    /// rows that never arrived. A member that loads nothing has no such
+    /// committer, and its head has to be recorded for the next start.
+    const fn persists_head_before_loading(self) -> bool {
+        // Exhaustive over the closed enum rather than a `matches!`: a start
+        // added later has to state which side it is on here, instead of
+        // inheriting "does not persist" from a wildcard.
+        match self {
+            Self::Stream => true,
+            Self::Snapshot | Self::Rebuild => false,
+        }
+    }
+}
+
+/// Which start a member takes when it holds no position it can resume from.
+///
+/// `has_recorded_position` is asked first, because it — not `snapshot_mode` —
+/// answers whether the acceleration is already holding rows. A position that
+/// was recorded but can no longer be resumed from means the source's binary log
+/// no longer explains those rows: a row deleted at the source inside the
+/// unreachable window has no change event left to carry the deletion, so
+/// streaming from the current head would serve that row in every later query,
+/// and persisting the head would make it permanent.
+///
+/// `initial_snapshot: disabled` does not suppress the rebuild. It says a
+/// *first* load must not read the table — a statement about rows the stream has
+/// not been asked to deliver — and cannot say that an acceleration whose
+/// history the source dropped may keep serving rows the source no longer has.
+/// `mysql_replication_invalid_checkpoint_behavior` decides that case, and
+/// `restart`, the behavior that let this member arrive here rather than failing
+/// its stream, asks for exactly this recovery. The rebuild does not use the
+/// snapshot path: it is a single zero-row signal the consumer answers with an
+/// atomic replacement ([`MemberStart::Rebuild`]).
+///
+/// Pure so the ordering is unit-testable without a live `MySQL`.
+fn start_without_usable_position(
+    snapshot_mode: InitialSnapshotMode,
+    has_recorded_position: bool,
+) -> MemberStart {
+    if has_recorded_position {
+        MemberStart::Rebuild
+    } else if snapshot_mode == InitialSnapshotMode::Disabled {
+        MemberStart::Stream
+    } else {
+        MemberStart::Snapshot
+    }
 }
 
 /// Resolve a fresh (non-rejoin) member's start position, applying
@@ -1221,9 +1273,9 @@ async fn resolve_start_position(
     }
 
     // No usable position: capture the head (and its executed GTID set, when
-    // GTID-positioning) first so the snapshot overlap replays idempotently, then
-    // either snapshot from it or (snapshot disabled) stream from it after
-    // persisting it up front.
+    // GTID-positioning) first so the load's overlap replays idempotently, then
+    // load from it — by snapshot or by rebuild — or, for a member with nothing
+    // to load, stream from it after persisting it up front.
     let (head, head_gtid) = if use_gtid {
         super::setup::fetch_head_and_gtid(conn).await?
     } else {
@@ -1232,7 +1284,8 @@ async fn resolve_start_position(
             GtidSet::new(),
         )
     };
-    if params.snapshot_mode == InitialSnapshotMode::Disabled {
+    let start = start_without_usable_position(params.snapshot_mode, has_recorded_position);
+    if start.persists_head_before_loading() {
         let initial = PersistedPosition {
             position: head.clone(),
             schema_json: checkpoint_schema_json.map(ToString::to_string),
@@ -1246,12 +1299,8 @@ async fn resolve_start_position(
         if let Err(e) = position_store.save(&initial).await {
             tracing::warn!(dataset = %dataset_name, error = %e, "failed to persist initial binlog head");
         }
-        Ok((head, head_gtid, MemberStart::Stream))
-    } else if has_recorded_position {
-        Ok((head, head_gtid, MemberStart::Rebuild))
-    } else {
-        Ok((head, head_gtid, MemberStart::Snapshot))
     }
+    Ok((head, head_gtid, start))
 }
 
 /// Apply `invalid_checkpoint_behavior` for one member: `Error` fails the
@@ -2671,6 +2720,73 @@ mod tests {
             assert!(!envelope.is_no_op_heartbeat());
             assert!(!envelope.is_dataset_ready());
         }
+    }
+
+    #[test]
+    fn an_unusable_position_rebuilds_even_when_the_initial_snapshot_is_disabled() {
+        // Regression test for #13024. Asking `initial_snapshot` before "is this
+        // acceleration already holding rows" lets a durable acceleration whose
+        // binlog position the source purged stream on from the current head:
+        // every row deleted at the source inside the purged window survives in
+        // the acceleration and is served by every later query, with nothing
+        // logged.
+        //
+        // A recorded position is the evidence that rows are there, so it
+        // decides, whatever the snapshot mode says.
+        for mode in [
+            InitialSnapshotMode::Auto,
+            InitialSnapshotMode::Always,
+            InitialSnapshotMode::Disabled,
+        ] {
+            assert_eq!(
+                start_without_usable_position(mode, true),
+                MemberStart::Rebuild,
+                "a recorded position that cannot be resumed from must be rebuilt under \
+                 initial_snapshot: {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_load_still_honours_the_initial_snapshot_mode() {
+        // The other half of the ordering: with nothing recorded there are no
+        // rows to preserve, so the mode is the only instruction and it is
+        // followed. `disabled` must not be turned into a re-read of the whole
+        // table on every cold start.
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Disabled, false),
+            MemberStart::Stream
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Auto, false),
+            MemberStart::Snapshot
+        );
+        assert_eq!(
+            start_without_usable_position(InitialSnapshotMode::Always, false),
+            MemberStart::Snapshot
+        );
+    }
+
+    #[test]
+    fn only_a_start_that_loads_nothing_persists_the_head_up_front() {
+        // A loading start's head is persisted by its boundary committer, once
+        // its rows are durably applied. Recording it before they land would let
+        // a crash mid-load resume past base rows that never arrived — so a
+        // rebuild reached with the snapshot disabled must not pick up the
+        // streaming member's up-front save.
+        assert!(
+            !MemberStart::Rebuild.persists_head_before_loading(),
+            "a rebuild's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            !MemberStart::Snapshot.persists_head_before_loading(),
+            "a snapshot's head is persisted by its boundary committer, not before its rows land"
+        );
+        assert!(
+            MemberStart::Stream.persists_head_before_loading(),
+            "a member that loads nothing has no committer, so its head must be recorded here or \
+             the next start resumes from an older position"
+        );
     }
 
     #[test]

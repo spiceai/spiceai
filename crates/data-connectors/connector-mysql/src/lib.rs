@@ -161,7 +161,12 @@ const PARAMETERS: &[ParameterSpec] = &[
             "When `refresh_mode: changes` loads the table's existing rows: 'auto' (default) \
              snapshots when no resumable binlog position exists and resumes without a snapshot \
              when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
-             start, discarding any persisted position. Default: auto.",
+             start, discarding any persisted position. 'disabled' governs the first load only: \
+             an acceleration that already holds rows is still rebuilt when its recorded position \
+             can no longer be resumed from and \
+             `mysql_replication_invalid_checkpoint_behavior` is 'restart', because otherwise it \
+             would keep serving rows the source deleted while its history was gone. \
+             Default: auto.",
         )
         .default("auto")
         .one_of_ignore_ascii_case(InitialSnapshotMode::VALUES)
@@ -184,8 +189,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("replication_invalid_checkpoint_behavior")
         .description(
             "What to do when the persisted binlog position was purged from the source: 'error' \
-             (default) surfaces an actionable error; 'restart' drops the saved position and \
-             re-snapshots the table. Default: error.",
+             (default) surfaces an actionable error; 'restart' re-reads the table, whatever \
+             `mysql_replication_initial_snapshot` is set to. Default: error.",
         )
         .default("error")
         .one_of_ignore_ascii_case(InvalidCheckpointBehavior::VALUES)
