@@ -44,14 +44,25 @@ pub enum EsFieldType {
     /// ES `float`/`double`. Comparisons are pushed but marked inexact: the JSON round-trip and
     /// the SQL literal may not share Elasticsearch's binary representation, so `DataFusion`
     /// re-checks. Unlike [`EsFieldType::QuantizedFloat`], the indexed value round-trips the
-    /// source value exactly (no scaling/rounding), so a range clause is always a superset.
+    /// source value exactly (no scaling/rounding), so a range clause is always a superset —
+    /// except at a literal value of zero, see the signed-zero note below.
+    ///
+    /// A literal value of `0.0` (either sign) is never pushed for equality/`IN`/`range`/
+    /// `BETWEEN`: `-0.0` and `+0.0` compare equal under SQL/IEEE 754, but Lucene's sortable
+    /// encoding (which backs Elasticsearch's `term`/`range` queries on numeric fields) orders
+    /// them as distinct, adjacent values. An inclusive boundary or `term` built from a literal of
+    /// one sign can then fail to match a stored value of the other sign — a false negative no
+    /// `DataFusion` re-check can recover — so the translation layer rejects the clause entirely
+    /// rather than risk it.
     Float,
     /// ES `half_float`/`scaled_float`. The indexed value is *quantized* (rounded, or scaled then
     /// rounded to an integer) rather than round-tripped, so a `range`/`BETWEEN` boundary compares
     /// the quantized value against a query threshold and can exclude a source row that actually
     /// satisfies the SQL predicate — a false negative no `DataFusion` re-check can recover.
     /// Equality still pushes: Elasticsearch applies the same quantization to the query literal,
-    /// so a `term` match is still a safe superset.
+    /// so a `term` match is still a safe superset — except at a literal value of zero, which
+    /// carries the same signed-zero hazard documented on [`Self::Float`] and is likewise never
+    /// pushed.
     QuantizedFloat,
     /// ES `keyword`/`wildcard`/`constant_keyword`: a whole-value, non-analyzed string.
     /// `term`/`range`/`prefix` match the stored value exactly.

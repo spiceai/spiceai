@@ -147,6 +147,11 @@ fn translate_eq(
     if !field_type.accepts_value_length(value) {
         return Outcome::Unsupported;
     }
+    // See `is_float_zero_hazard`: a `term` built from a zero literal of one sign can miss a
+    // stored value of the other sign.
+    if is_float_zero_hazard(field_type, value) {
+        return Outcome::Unsupported;
+    }
     let field = field_type.value_field(column);
     // `is_confirmed_scalar` caps exactness for a field whose cardinality Elasticsearch's mapping
     // cannot confirm — see `EsFilterSchema::is_confirmed_scalar`.
@@ -168,6 +173,11 @@ fn translate_range(
     // field over its `ignore_above` limit (see `EsFieldType::supports_range`); nor for a field
     // Elasticsearch has no `doc_values` for.
     if !field_type.supports_range() || !schema.has_doc_values(column) {
+        return Outcome::Unsupported;
+    }
+    // See `is_float_zero_hazard`: an inclusive-adjacent boundary built from a zero literal of one
+    // sign can exclude a stored value of the other sign.
+    if is_float_zero_hazard(field_type, value) {
         return Outcome::Unsupported;
     }
     let field = field_type.value_field(column);
@@ -209,6 +219,10 @@ fn translate_in_list(
         // unsafe to push: dropping just that literal from `terms` would still exclude a row
         // matching it via that branch, which no re-check above the scan can recover.
         if !field_type.accepts_value_length(&value) {
+            return Outcome::Unsupported;
+        }
+        // See `is_float_zero_hazard`: same reasoning as `translate_eq`, applied per literal.
+        if is_float_zero_hazard(field_type, &value) {
             return Outcome::Unsupported;
         }
         values.push(value);
@@ -254,6 +268,11 @@ fn translate_between(
         return Outcome::Unsupported;
     };
     if !value_matches_field(field_type, &low) || !value_matches_field(field_type, &high) {
+        return Outcome::Unsupported;
+    }
+    // See `is_float_zero_hazard`: either boundary being a zero literal risks excluding a stored
+    // value of the other sign at that end of the range.
+    if is_float_zero_hazard(field_type, &low) || is_float_zero_hazard(field_type, &high) {
         return Outcome::Unsupported;
     }
 
@@ -460,6 +479,17 @@ fn value_matches_field(field_type: &EsFieldType, value: &Value) -> bool {
     }
 }
 
+/// Whether pushing `value` against `field_type` risks the signed-zero hazard documented on
+/// [`EsFieldType::Float`]/[`EsFieldType::QuantizedFloat`]: `-0.0` and `+0.0` compare equal under
+/// SQL/IEEE 754, but Elasticsearch's underlying sortable numeric encoding orders them as distinct,
+/// adjacent values, so a `term`/`range` clause built from a zero literal of one sign can miss a
+/// stored value of the other sign — a false negative no `DataFusion` re-check can recover.
+/// `false` for every other field type, which has no such hazard.
+fn is_float_zero_hazard(field_type: &EsFieldType, value: &Value) -> bool {
+    matches!(field_type, EsFieldType::Float | EsFieldType::QuantizedFloat)
+        && value.as_f64() == Some(0.0)
+}
+
 /// Convert a non-NULL `DataFusion` [`ScalarValue`] into a JSON value for a `term`/`range`/`terms`
 /// clause. Returns `None` for NULL scalars and for types this translator does not model (dates,
 /// timestamps, decimals, nested types).
@@ -598,6 +628,63 @@ mod tests {
             clause(&expr),
             json!({ "range": { "score": { "lte": 9.9 } } })
         );
+    }
+
+    #[test]
+    fn float_eq_zero_is_unsupported() {
+        // `-0.0`/`+0.0` compare equal under SQL but index to distinct sortable values in
+        // Elasticsearch, so a `term` built from one sign could miss a stored value of the other.
+        for zero in [0.0_f64, -0.0_f64] {
+            let expr = col("score").eq(lit(zero));
+            assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+            assert_eq!(translate_filter(&schema(), &expr), None);
+        }
+    }
+
+    #[test]
+    fn float_range_zero_boundary_is_unsupported() {
+        for zero in [0.0_f64, -0.0_f64] {
+            for expr in [
+                col("score").gt(lit(zero)),
+                col("score").gt_eq(lit(zero)),
+                col("score").lt(lit(zero)),
+                col("score").lt_eq(lit(zero)),
+            ] {
+                assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+            }
+        }
+    }
+
+    #[test]
+    fn float_between_zero_boundary_is_unsupported() {
+        let expr = Expr::Between(datafusion::logical_expr::expr::Between::new(
+            Box::new(col("score")),
+            false,
+            Box::new(lit(-1.0_f64)),
+            Box::new(lit(0.0_f64)),
+        ));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn quantized_float_eq_zero_is_unsupported() {
+        let expr = col("weight").eq(lit(0.0_f64));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn in_list_with_zero_float_is_unsupported() {
+        // A single zero-valued literal makes the whole IN-list unsafe, same as an over-length
+        // keyword literal (see `in_list_with_one_over_length_literal_is_unsupported`).
+        let expr = col("score").in_list(vec![lit(1.5_f64), lit(0.0_f64)], false);
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn float_eq_nonzero_is_still_pushed() {
+        // Only literal zero triggers the signed-zero guard; other float literals are unaffected.
+        let expr = col("score").eq(lit(1.5_f64));
+        assert_eq!(classify(&expr), TableProviderFilterPushDown::Inexact);
     }
 
     #[test]
