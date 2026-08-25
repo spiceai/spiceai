@@ -75,6 +75,10 @@ impl DatasetCheckpointer for MockCheckpointer {
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
     }
+
+    async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

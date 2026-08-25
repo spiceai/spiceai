@@ -204,16 +204,18 @@ pub struct FullTextDatabaseIndex {
     /// `on_write_start` sets it; `on_write_complete`/`on_write_failed` clear it.
     defer_commit: Arc<AtomicBool>,
 
-    /// Set when this index is also fed by a change-data-capture stream, which
-    /// drives `compute_index` outside the sink write lifecycle.
+    /// True when this index is also fed by a change-data-capture or append stream, which
+    /// drives `compute_index` outside the sink write lifecycle. Fixed at construction
+    /// (see `try_new`'s `stream_attached` parameter) and shared via `Arc` with every handle
+    /// `with_new_base` derives from this index, since they all drive the same writer.
     ///
     /// A single [`tantivy::IndexWriter`] stages every pending operation together,
     /// so a commit cannot be scoped to one caller's documents: committing inside a
     /// deferred window would publish a partially-written refresh, and rolling the
-    /// window back would discard CDC documents staged alongside it. Deferral is
-    /// therefore disabled outright for a CDC-fed index — correctness over the
+    /// window back would discard the stream's documents staged alongside it. Deferral is
+    /// therefore disabled outright for a stream-attached index — correctness over the
     /// one-commit-per-refresh optimization.
-    cdc_attached: Arc<AtomicBool>,
+    stream_attached: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -279,16 +281,16 @@ impl Index for FullTextDatabaseIndex {
     }
 
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        // A CDC-fed index never defers: its change stream calls `compute_index`
-        // outside this lifecycle, and the shared writer cannot commit one caller's
-        // documents without also publishing (or, on rollback, discarding) the other's.
+        // A stream-attached index never defers: its change/append stream calls
+        // `compute_index` outside this lifecycle, and the shared writer cannot commit one
+        // caller's documents without also publishing (or, on rollback, discarding) the other's.
         //
         // That also rules out the `ReplaceAll` clear below, whose atomicity depends on the
         // deferred window: an immediately-committed clear would publish an empty index for the
-        // length of the refresh, and would discard change-stream documents staged alongside it.
-        // A CDC-fed index is told about deletions explicitly by its change stream, so it does
+        // length of the refresh, and would discard stream documents staged alongside it.
+        // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.cdc_attached.load(Ordering::Acquire) {
+        if self.stream_attached.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -305,28 +307,39 @@ impl Index for FullTextDatabaseIndex {
         // index state, so surface the error and leave `defer_commit` unset (the
         // writer keeps its per-write commit behavior rather than deferring on a
         // writer in an unknown state).
-        let mut index_writer = self.writer.lock().await;
-        rollback_writer(&mut index_writer)
-            .context(TextSearchIndexingSnafu)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // The writer operations below (rollback, delete_all_documents) are
+        // synchronous tantivy work, so run them off the async runtime thread. The
+        // writer lock is taken and the flag stored inside the blocking task, so the
+        // reset + clear + flag store stay atomic w.r.t. `compute_index` exactly as
+        // before.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        let is_replace_all = window == WriteWindow::ReplaceAll;
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            rollback_writer(&mut index_writer).context(TextSearchIndexingSnafu)?;
 
-        // A replacing write reproduces the table's whole contents, so every document this index
-        // already holds is either re-sent by this window or belongs to a row the source dropped.
-        // Stage the clear *inside* the window that is about to open: `delete_all_documents`
-        // needs a commit to take effect, so the wipe and the repopulation land in the single
-        // `on_write_complete` commit and a searcher never observes an empty index (#12066).
-        //
-        // Ordering matters. The rollback above discards operations staged by an abandoned
-        // window, and it must happen before the clear so it cannot revert it.
-        if window == WriteWindow::ReplaceAll {
-            index_writer
-                .delete_all_documents()
-                .context(TextSearchIndexingSnafu)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        }
+            // A replacing write reproduces the table's whole contents, so every document this
+            // index already holds is either re-sent by this window or belongs to a row the source
+            // dropped. Stage the clear *inside* the window that is about to open:
+            // `delete_all_documents` needs a commit to take effect, so the wipe and the
+            // repopulation land in the single `on_write_complete` commit and a searcher never
+            // observes an empty index (#12066).
+            //
+            // Ordering matters. The rollback above discards operations staged by an abandoned
+            // window, and it must happen before the clear so it cannot revert it.
+            if is_replace_all {
+                index_writer
+                    .delete_all_documents()
+                    .context(TextSearchIndexingSnafu)?;
+            }
 
-        self.defer_commit.store(true, Ordering::Release);
-        Ok(())
+            defer_commit.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
@@ -336,29 +349,40 @@ impl Index for FullTextDatabaseIndex {
         // and commit the staged window before it is finalized here; clearing it under
         // the lock also ensures a later CDC write is never stuck deferring. Committing
         // when nothing was staged (e.g. an empty refresh) is a harmless no-op.
-        let mut index_writer = self.writer.lock().await;
-        self.defer_commit.store(false, Ordering::Release);
+        // `commit()` fsyncs the file-backed index and the reader reload remaps
+        // segments — both synchronous. Run them off the async runtime thread. The
+        // flag is cleared under the writer lock inside the task, preserving the
+        // ordering guarantee w.r.t. a concurrent `compute_index`.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            defer_commit.store(false, Ordering::Release);
 
-        let commit_result = index_writer
-            .commit()
-            .map(|_| ())
-            .context(FailedToInsertDataIntoIndexSnafu);
-        if let Err(e) = &commit_result {
-            tracing::warn!("Rolling back full-text index writer after failed commit: {e}");
-            if let Err(rb_err) = rollback_writer(&mut index_writer) {
-                tracing::error!("Failed to rollback full-text index writer: {rb_err}");
+            let commit_result = index_writer
+                .commit()
+                .map(|_| ())
+                .context(FailedToInsertDataIntoIndexSnafu);
+            if let Err(e) = &commit_result {
+                tracing::warn!("Rolling back full-text index writer after failed commit: {e}");
+                if let Err(rb_err) = rollback_writer(&mut index_writer) {
+                    tracing::error!("Failed to rollback full-text index writer: {rb_err}");
+                }
             }
-        }
-        drop(index_writer);
-        commit_result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            drop(index_writer);
+            commit_result?;
 
-        self.reader
-            .reload()
-            .boxed()
-            .context(InvalidIndexingSnafu {
-                context: "Full-text index committed, but failed to reload the reader to the latest revision. Queries will be served from the previous revision until the next update.".to_string(),
-            })
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            reader
+                .reload()
+                .boxed()
+                .context(InvalidIndexingSnafu {
+                    context: "Full-text index committed, but failed to reload the reader to the latest revision. Queries will be served from the previous revision until the next update.".to_string(),
+                })
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -367,15 +391,23 @@ impl Index for FullTextDatabaseIndex {
         // the flag: otherwise a concurrent `compute_index` could observe the cleared
         // flag, acquire the lock first, and commit the staged partial refresh — making
         // a failed write visible to queries.
-        let mut index_writer = self.writer.lock().await;
-        self.defer_commit.store(false, Ordering::Release);
+        // Rollback is synchronous tantivy work; run it off the async runtime
+        // thread. The flag is cleared under the writer lock inside the task,
+        // preserving the ordering guarantee w.r.t. a concurrent `compute_index`.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit = Arc::clone(&self.defer_commit);
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            defer_commit.store(false, Ordering::Release);
 
-        // A rollback failure must reach the caller: staged operations that could not
-        // be discarded may leak into a later commit and make a partial refresh
-        // visible.
-        rollback_writer(&mut index_writer)
-            .context(TextSearchIndexingSnafu)
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            // A rollback failure must reach the caller: staged operations that could not
+            // be discarded may leak into a later commit and make a partial refresh
+            // visible.
+            rollback_writer(&mut index_writer).context(TextSearchIndexingSnafu)
+        })
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
 
@@ -386,6 +418,7 @@ impl FullTextDatabaseIndex {
         primary_key_override: Option<Vec<String>>,
         directory: Option<PathBuf>,
         store_field: &[String],
+        stream_attached: bool,
     ) -> Result<Self, super::Error> {
         let pks = Self::validate_primary_key(&inner, primary_key_override)?;
         let tantivy_schema = Self::create_tantivy_schema(
@@ -422,7 +455,7 @@ impl FullTextDatabaseIndex {
             primary_key: pks,
             reader,
             defer_commit: Arc::new(AtomicBool::new(false)),
-            cdc_attached: Arc::new(AtomicBool::new(false)),
+            stream_attached: Arc::new(AtomicBool::new(stream_attached)),
         })
     }
 
@@ -528,58 +561,80 @@ impl FullTextDatabaseIndex {
         // Prepare documents to insert/delete with read lock.
         let index_schema = self.reader.searcher().schema().clone();
         let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
-        let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
-            context: "Failed to write data to intermediate JSON string for indexing".to_string(),
-        })?;
-        let docs = parse_json_array(&index_schema, doc_json.as_str())
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-
-        let mut index_writer = self.writer.lock().await;
-        // Read the deferral flag while holding the writer lock so the decision to
-        // commit is serialized with `on_write_complete`/`on_write_failed` closing the
-        // window. Reading it before acquiring the lock would allow this call to observe
-        // a cleared flag and commit a window the hooks have not finalized yet.
-        let defer_commit = self.defer_commit.load(Ordering::Acquire);
-        // Deletion.
-        for t in terms_to_delete {
-            index_writer.delete_term(t);
+        // Convert to tantivy documents one record batch at a time. Encoding all
+        // batches into a single JSON string and parsing it into one Vec<Map> held
+        // the whole document set in memory three times over (JSON string + maps +
+        // documents); decoding per batch bounds the intermediate footprint to a
+        // single batch while the documents accumulate.
+        let mut docs = Vec::new();
+        for batch in &rb {
+            let doc_json =
+                write_to_json_string(slice::from_ref(batch)).context(InvalidIndexingSnafu {
+                    context: "Failed to write data to intermediate JSON string for indexing"
+                        .to_string(),
+                })?;
+            let mut batch_docs = parse_json_array(&index_schema, doc_json.as_str())
+                .context(FailedToInsertDataIntoIndexSnafu)?;
+            docs.append(&mut batch_docs);
         }
-        // Insertion. In a sink-driven full refresh or append, `on_write_start` has
-        // set `defer_commit`, so documents are staged and the single commit happens
-        // once in `on_write_complete` — one fsync barrier per refresh instead of one
-        // per record batch. Otherwise (the CDC path, which drives `compute_index`
-        // directly without the lifecycle hooks) commit immediately. On failure,
-        // rollback to discard staged operations so they don't leak into a later commit.
-        let write_result = (|| {
-            for doc in docs {
-                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+
+        // The writer operations (delete_term, add_document, commit) and the reader
+        // reload are synchronous tantivy work — commit fsyncs the file-backed index —
+        // so run them off the async runtime thread. The deferral flag is read while
+        // holding the writer lock inside the task so the decision to commit stays
+        // serialized with `on_write_complete`/`on_write_failed` closing the window.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit_flag = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            let defer_commit = defer_commit_flag.load(Ordering::Acquire);
+            // Deletion.
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
             }
+            // Insertion. In a sink-driven full refresh or append, `on_write_start` has
+            // set `defer_commit`, so documents are staged and the single commit happens
+            // once in `on_write_complete` — one fsync barrier per refresh instead of one
+            // per record batch. Otherwise (the CDC path, which drives `compute_index`
+            // directly without the lifecycle hooks) commit immediately. On failure,
+            // rollback to discard staged operations so they don't leak into a later commit.
+            let write_result = (|| {
+                for doc in docs {
+                    index_writer.add_document(doc).context(IndexCreationSnafu)?;
+                }
+                if defer_commit {
+                    Ok(())
+                } else {
+                    index_writer
+                        .commit()
+                        .map(|_| ())
+                        .context(FailedToInsertDataIntoIndexSnafu)
+                }
+            })();
+            if let Err(e) = &write_result {
+                tracing::warn!("Rolling back index writer after failed write: {e}");
+                if let Err(rb_err) = rollback_writer(&mut index_writer) {
+                    tracing::error!("Failed to rollback index writer: {rb_err}");
+                }
+            }
+            drop(index_writer);
+            write_result?;
+
             if defer_commit {
-                Ok(())
-            } else {
-                index_writer
-                    .commit()
-                    .map(|_| ())
-                    .context(FailedToInsertDataIntoIndexSnafu)
+                // The reader is reloaded once in `on_write_complete`, after the commit.
+                return Ok(());
             }
-        })();
-        if let Err(e) = &write_result {
-            tracing::warn!("Rolling back index writer after failed write: {e}");
-            if let Err(rb_err) = rollback_writer(&mut index_writer) {
-                tracing::error!("Failed to rollback index writer: {rb_err}");
-            }
-        }
-        drop(index_writer);
-        write_result?;
 
-        if defer_commit {
-            // The reader is reloaded once in `on_write_complete`, after the commit.
-            return Ok(());
-        }
-
-        self.reader.reload().boxed().context(InvalidIndexingSnafu {
-            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+            })
         })
+        .await
+        .map_err(|e| super::Error::InvalidIndexingError {
+            source: Box::new(e),
+            context: "The full-text index write task failed to complete".to_string(),
+        })?
     }
 
     /// Deletes every document whose primary key matches a row of `keys` — the tantivy
@@ -604,49 +659,54 @@ impl FullTextDatabaseIndex {
             return Ok(());
         }
 
-        let mut index_writer = self.writer.lock().await;
-        // Read the deferral flag under the writer lock, exactly as `update_index` does. A sink
-        // write window shares this one writer, so committing here would publish whatever that
-        // window has staged: a partially rewritten table, or the whole-index clear that
-        // `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the deletes and let the
-        // window's own `on_write_complete` commit publish them together.
-        let defer_commit = self.defer_commit.load(Ordering::Acquire);
-        for t in terms_to_delete {
-            index_writer.delete_term(t);
-        }
-        if defer_commit {
-            // The reader is reloaded once in `on_write_complete`, after the commit.
-            return Ok(());
-        }
-
-        let commit_result = index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu);
-        if let Err(e) = &commit_result {
-            tracing::warn!("Rolling back index writer after failed delete commit: {e}");
-            if let Err(rb_err) = index_writer.rollback() {
-                tracing::error!("Failed to rollback index writer: {rb_err}");
+        // delete_term/commit and the reader reload are synchronous tantivy work
+        // (commit fsyncs), so run them off the async runtime thread. The deferral
+        // flag is read under the writer lock inside the task, exactly as
+        // `update_index` does.
+        let writer = Arc::clone(&self.writer);
+        let defer_commit_flag = Arc::clone(&self.defer_commit);
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), super::Error> {
+            let mut index_writer = writer.blocking_lock();
+            // A sink write window shares this one writer, so committing here would publish
+            // whatever that window has staged: a partially rewritten table, or the whole-index
+            // clear that `on_write_start` stages for a `WriteWindow::ReplaceAll`. Stage the
+            // deletes and let the window's own `on_write_complete` commit publish them together.
+            let defer_commit = defer_commit_flag.load(Ordering::Acquire);
+            for t in terms_to_delete {
+                index_writer.delete_term(t);
             }
-        }
-        drop(index_writer);
-        commit_result?;
+            if defer_commit {
+                // The reader is reloaded once in `on_write_complete`, after the commit.
+                return Ok(());
+            }
 
-        self.reader.reload().boxed().context(InvalidIndexingSnafu {
-            context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
+            let commit_result = index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu);
+            if let Err(e) = &commit_result {
+                tracing::warn!("Rolling back index writer after failed delete commit: {e}");
+                if let Err(rb_err) = index_writer.rollback() {
+                    tracing::error!("Failed to rollback index writer: {rb_err}");
+                }
+            }
+            drop(index_writer);
+            commit_result?;
+
+            reader.reload().boxed().context(InvalidIndexingSnafu {
+                context: "Deleted from full-text index, but failed to update search path to reference the latest commit. Queries may still return deleted rows until the next update.".to_string(),
+            })
         })
+        .await
+        .map_err(|e| super::Error::InvalidIndexingError {
+            source: Box::new(e),
+            context: "The full-text index delete task failed to complete".to_string(),
+        })?
     }
 
     #[must_use]
     pub fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
-    }
-
-    /// Record that a change-data-capture stream also writes to this index, which
-    /// permanently disables the deferred-commit window (see `cdc_attached`).
-    ///
-    /// Called when the change stream that includes this index is constructed.
-    pub fn mark_cdc_attached(&self) {
-        self.cdc_attached.store(true, Ordering::Release);
     }
 
     #[must_use]
@@ -671,7 +731,7 @@ impl FullTextDatabaseIndex {
             defer_commit: Arc::clone(&self.defer_commit),
             // Shared for the same reason as `defer_commit`: both handles drive the
             // same tantivy writer and must agree on whether deferral is allowed.
-            cdc_attached: Arc::clone(&self.cdc_attached),
+            stream_attached: Arc::clone(&self.stream_attached),
         }
     }
 
@@ -1008,6 +1068,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
     }
@@ -1345,6 +1406,7 @@ mod tests {
                 "subtitle".to_string(),
                 "body".to_string(),
             ],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
         index
@@ -1427,6 +1489,7 @@ mod tests {
                 "subtitle".to_string(),
                 "body".to_string(),
             ],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
         index
@@ -1490,6 +1553,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1612,6 +1676,7 @@ mod tests {
             Some(vec!["id1".to_string(), "id2".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1778,6 +1843,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &[],
+            false,
         )
         .expect("Failed to create index");
 
@@ -1819,6 +1885,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -1898,6 +1965,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
     }
@@ -2111,6 +2179,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -2142,6 +2211,7 @@ mod tests {
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            false,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
@@ -2177,23 +2247,22 @@ mod tests {
         );
     }
 
-    /// A CDC-fed index shares one tantivy writer with the sink write path, so it must
-    /// never defer: a window commit would publish a partial refresh, and a window
-    /// rollback would discard the change stream's documents.
+    /// A stream-attached index shares one tantivy writer with the sink write path, so it
+    /// must never defer: a window commit would publish a partial refresh, and a window
+    /// rollback would discard the stream's documents.
     #[tokio::test]
-    async fn test_cdc_attached_index_never_defers_commits() {
+    async fn test_stream_attached_index_never_defers_commits() {
         let index = FullTextDatabaseIndex::try_new(
             create_test_table(),
             vec!["content".to_string()],
             Some(vec!["id".to_string()]),
             None,
             &["content".to_string()],
+            true,
         )
         .expect("Failed to create FullTextDatabaseIndex");
 
-        index.mark_cdc_attached();
-
-        // Opening a window is a no-op for a CDC-fed index.
+        // Opening a window is a no-op for a stream-attached index.
         index
             .on_write_start(WriteWindow::Append)
             .await
@@ -2215,7 +2284,7 @@ mod tests {
             let results = search_and_format(&search_index, "apple").await;
             assert!(
                 results.contains("apple banana"),
-                "a CDC-fed index must commit immediately even inside a write window, got:\n{results}"
+                "a stream-attached index must commit immediately even inside a write window, got:\n{results}"
             );
         }
 
@@ -2231,42 +2300,41 @@ mod tests {
         let results = search_and_format(&search_index, "apple").await;
         assert!(
             results.contains("apple banana"),
-            "committed CDC documents must survive a failed write window, got:\n{results}"
+            "committed stream documents must survive a failed write window, got:\n{results}"
         );
     }
 
     /// A warm full-text tier can be registered inside a
     /// [`CompoundSearchIndex`](crate::index::compound::CompoundSearchIndex) rather than
-    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is marked
-    /// CDC-attached, it must stop deferring commits regardless of whether writes reach it
+    /// directly, with writes routed to it via [`SearchIndex::write`]. Once that tier is built
+    /// stream-attached, it must stop deferring commits regardless of whether writes reach it
     /// directly or through the compound, or a failed write window discards the change
     /// stream's documents for good.
     #[tokio::test]
-    async fn test_cdc_attached_compound_primary_never_defers_commits() {
+    async fn test_stream_attached_compound_primary_never_defers_commits() {
         use crate::index::compound::{CompoundReadMode, CompoundSearchIndex};
 
-        let new_tier = || {
+        let new_tier = |stream_attached: bool| {
             FullTextDatabaseIndex::try_new(
                 create_test_table(),
                 vec!["content".to_string()],
                 Some(vec!["id".to_string()]),
                 None,
                 &["content".to_string()],
+                stream_attached,
             )
             .expect("Failed to create FullTextDatabaseIndex")
         };
 
         // Keep a handle on the warm tier: it shares the tantivy writer and reader with the
         // clone held by the compound, so searching it observes the compound's writes.
-        let warm = new_tier();
+        let warm = new_tier(true);
         let compound = CompoundSearchIndex::try_new(
             Arc::new(warm.clone()) as Arc<dyn SearchIndex>,
-            Arc::new(new_tier()) as Arc<dyn SearchIndex>,
+            Arc::new(new_tier(false)) as Arc<dyn SearchIndex>,
             CompoundReadMode::PrimaryOnly,
         )
         .expect("two full-text tiers over the same table are compatible");
-
-        warm.mark_cdc_attached();
 
         // A sink-driven refresh opens a write window on both tiers.
         compound
@@ -2328,6 +2396,7 @@ mod tests {
             Some(primary_key.iter().map(|p| (*p).to_string()).collect()),
             Some(directory.to_path_buf()),
             &[],
+            false,
         )
     }
 

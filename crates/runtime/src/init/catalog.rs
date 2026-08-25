@@ -247,7 +247,7 @@ impl Runtime {
         for catalog in &existing_catalogs {
             if !valid_catalogs.iter().any(|c| c.name == catalog.name) {
                 tracing::warn!(
-                    "Failed to deregister catalog '{}'. Removing loaded catalogs is not currently supported.",
+                    "Catalog '{}' was removed from the Spicepod, but a loaded catalog cannot be removed while Spice is running: its tables stay queryable until Spice restarts.",
                     catalog.name
                 );
             }

@@ -19,8 +19,8 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 | `standalone-sqlite` | SQLite **outside** Spice | `rusqlite` (not Spice SQLite accel) |
 | `standalone-chdb` | chDB **outside** Spice | `chdb-rust` |
 | `spice-cayenne` | Cayenne accelerator | `CayenneTableProvider` |
-| `spice-duckdb-accel` | Spice DuckDB accelerator | `runtime::dataaccelerator::duckdb` |
-| `spice-sqlite-accel` | Spice SQLite accelerator | `runtime::dataaccelerator::sqlite` |
+| `spice-duckdb-accel` | Spice DuckDB accelerator | `accelerator_duckdb` |
+| `spice-sqlite-accel` | Spice SQLite accelerator | `accelerator_sqlite` |
 
 **DuckDB and chDB cannot co-link** in one process; multi-engine coverage is
 pairwise across separate test binaries.

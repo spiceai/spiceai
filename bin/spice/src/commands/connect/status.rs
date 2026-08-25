@@ -14,14 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The one status model both status commands render.
-//!
-//! `spice connect status` renders all of [`ConnectStatus`].
-//! `spice connect service status` renders the *same* [`ServiceStatus`] value
-//! filtered out of it. Neither command queries, normalizes, labels, or caches
-//! service state of its own, so the two cannot answer differently — the
-//! failure that two independent status implementations produce as soon as one
-//! of them learns a new state.
+//! The local instance status model rendered by `spice cloud status`.
 //!
 //! One snapshot is collected per invocation and then rendered, rather than
 //! probed per printed line, so the report describes a single moment.
@@ -109,8 +102,13 @@ pub(crate) struct ConnectionStatus {
     /// Cloud-assigned instance identifier.
     pub(crate) identifier: Option<String>,
     pub(crate) org_name: Option<String>,
+    /// The attached project's cloud id. This is the attachment itself, so an
+    /// instance holding one is attached whether or not the control plane also
+    /// supplied the name and monitor URL below.
+    pub(crate) app_id: Option<String>,
     pub(crate) app_name: Option<String>,
-    /// Cloud-constructed portal monitor URL, when the instance is attached.
+    /// Cloud-constructed portal monitor URL, when the instance is attached and
+    /// the control plane supplied one.
     pub(crate) monitor_url: Option<String>,
     /// The gateway the control stream dials.
     pub(crate) gateway_addr: Option<String>,
@@ -142,23 +140,13 @@ pub(crate) struct DeploymentStatus {
     pub(crate) secret_names: Vec<String>,
 }
 
-/// Everything `spice connect status` reports about one instance directory.
+/// Everything `spice cloud status` reports about one instance directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ConnectStatus {
     pub(crate) schema_version: u32,
     pub(crate) connection: ConnectionStatus,
     pub(crate) service: ServiceStatus,
     pub(crate) deployment: DeploymentStatus,
-}
-
-/// The document `spice connect service status --output json` writes.
-///
-/// It carries the byte-identical `service` object from [`ConnectStatus`], so
-/// automation never has to reconcile a full and a filtered schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ServiceStatusDocument<'a> {
-    pub(crate) schema_version: u32,
-    pub(crate) service: &'a ServiceStatus,
 }
 
 impl ConnectStatus {
@@ -225,6 +213,7 @@ impl ConnectStatus {
             endpoint: endpoint.to_string(),
             identifier: None,
             org_name: None,
+            app_id: None,
             app_name: None,
             monitor_url: None,
             gateway_addr: None,
@@ -242,7 +231,7 @@ impl ConnectStatus {
                 connection.diagnostic = Some(format!(
                     "The Spice Cloud Connect identity at {} could not be read: {err}. \
                      Re-enroll this directory with `spiced --token <enrollment-key>`, or \
-                     release it with `spice connect remove`. See: https://spiceai.org/docs",
+                     release it with `spice cloud unlink`. See: https://spiceai.org/docs",
                     connection.identity_path.display()
                 ));
                 None
@@ -265,6 +254,7 @@ impl ConnectStatus {
                 (!id.gateway_addr.is_empty()).then(|| id.gateway_addr.clone());
             connection.identifier = Some(id.identifier.clone());
             connection.org_name.clone_from(&id.org_name);
+            connection.app_id.clone_from(&id.app_id);
             connection.app_name.clone_from(&id.app_name);
             connection.monitor_url.clone_from(&id.monitor_url);
 
@@ -312,13 +302,6 @@ impl ConnectStatus {
     }
 
     /// The service half on its own, for the filtered command.
-    pub(crate) fn service_document(&self) -> ServiceStatusDocument<'_> {
-        ServiceStatusDocument {
-            schema_version: self.schema_version,
-            service: &self.service,
-        }
-    }
-
     /// The one-line diagnosis for a degraded snapshot, naming whichever part of
     /// it is degraded, or `None` when there is nothing wrong.
     ///
@@ -496,32 +479,19 @@ pub(crate) fn render(status: &ConnectStatus, format: OutputFormat) -> Result<()>
     }
 }
 
-/// Write the service half in `format`, from the same snapshot.
-///
-/// # Errors
-///
-/// Returns an error when the report cannot be serialized.
-pub(crate) fn render_service(status: &ConnectStatus, format: OutputFormat) -> Result<()> {
-    match format {
-        OutputFormat::Json => write_json(&status.service_document()),
-        OutputFormat::Table => {
-            println!(
-                "Spice Cloud Connect service: {}",
-                describe_service_state(&status.service)
-            );
-            render_service_lines(&status.service);
-            Ok(())
-        }
-    }
-}
-
 fn render_connection(connection: &ConnectionStatus) {
     match connection.state {
         ConnectionState::Enrolled => {
             println!(
                 "Spice Cloud Connect: connected{}",
-                match (&connection.org_name, &connection.app_name) {
-                    (Some(org), Some(app)) => format!(" — {org} / {app}"),
+                // The attachment is `app_id`; the name only labels it. An
+                // instance holding a project it has no name for is still
+                // attached, and saying otherwise is wrong.
+                match (&connection.org_name, &connection.app_id) {
+                    (Some(org), Some(_)) => format!(
+                        " — {org} / {}",
+                        connection.app_name.as_deref().unwrap_or("attached project")
+                    ),
                     (Some(org), None) => format!(" — {org} (no app attached)"),
                     _ => String::new(),
                 }
@@ -680,7 +650,7 @@ fn render_next_steps(status: &ConnectStatus) {
     }
     if !status.service.installed {
         println!(
-            "No service is installed for this directory. Run `spice connect service install` to \
+            "No service is installed for this directory. Run `spice cloud service install` to \
              keep this instance running across reboots."
         );
     }
@@ -717,31 +687,6 @@ mod tests {
             status.degradation(),
             None,
             "a directory with no service is not degraded"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_full_and_filtered_json_share_one_service_object() {
-        // The acceptance criterion: automation must never have to reconcile two
-        // service schemas.
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let instance_dir = dir.path().join("edge-1");
-        let config_dir = instance_dir.join(".spice");
-        let status = snapshot(dir.path(), &instance_dir, &config_dir).await;
-
-        let full: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&status).expect("serialize full"))
-                .expect("parse full");
-        let filtered: serde_json::Value = serde_json::from_str(
-            &serde_json::to_string(&status.service_document()).expect("serialize filtered"),
-        )
-        .expect("parse filtered");
-
-        assert_eq!(full["schema_version"], filtered["schema_version"]);
-        assert_eq!(
-            serde_json::to_string(&full["service"]).expect("re-serialize full service"),
-            serde_json::to_string(&filtered["service"]).expect("re-serialize filtered service"),
-            "the service object must be byte-identical in both documents"
         );
     }
 
@@ -830,20 +775,6 @@ mod tests {
         assert!(status.degradation().is_some());
     }
 
-    #[test]
-    fn the_filtered_service_status_is_not_degraded_by_hidden_connection_state() {
-        let mut status = golden_status();
-        status.connection.state = ConnectionState::Unusable;
-        status.connection.diagnostic = Some("identity needs repair".to_string());
-
-        assert!(status.degradation().is_some());
-        assert_eq!(
-            status.service_degradation(),
-            None,
-            "the service-only document reports a healthy running service"
-        );
-    }
-
     #[tokio::test]
     async fn a_deployed_spicepod_is_reported() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -897,6 +828,7 @@ mod tests {
                 endpoint: "https://api.spice.ai".to_string(),
                 identifier: Some("inst_0123456789".to_string()),
                 org_name: Some("acme".to_string()),
+                app_id: Some("14034".to_string()),
                 app_name: Some("edge-analytics".to_string()),
                 monitor_url: Some("https://spice.ai/acme/edge-analytics/monitor".to_string()),
                 gateway_addr: Some("connect.aws.spiceai.io:443".to_string()),
@@ -947,23 +879,6 @@ mod tests {
         // automation surface changed and the version has to change with it.
         let json = serde_json::to_string_pretty(&golden_status()).expect("serialize");
         insta::assert_snapshot!("connect_status_schema", json);
-    }
-
-    #[test]
-    fn the_filtered_service_json_document_matches_its_golden_schema() {
-        let status = golden_status();
-        let json = serde_json::to_string_pretty(&status.service_document()).expect("serialize");
-        insta::assert_snapshot!("connect_service_status_schema", json);
-    }
-
-    #[test]
-    fn every_service_field_of_the_full_document_appears_in_the_filtered_one() {
-        // The two fixtures are reviewed separately, so this is what keeps them
-        // from drifting into two schemas between reviews.
-        let status = golden_status();
-        let full = serde_json::to_value(&status).expect("serialize full");
-        let filtered = serde_json::to_value(status.service_document()).expect("serialize filtered");
-        assert_eq!(full["service"], filtered["service"]);
     }
 
     #[tokio::test]

@@ -79,7 +79,6 @@ use futures::StreamExt;
 use parking_lot::RwLock;
 use runtime::Runtime;
 use runtime::datafusion::query::Error as QueryError;
-use runtime::metrics_reader::MetricsReader;
 use runtime::status::ComponentStatus;
 #[cfg(test)]
 use runtime_cloud_connect::config::IDENTITY_FILE;
@@ -98,6 +97,7 @@ use runtime_cloud_connect::{
     identity::{AppAttachment, AttachmentState, IdentityStore},
 };
 use runtime_secrets::stores::cloud_delivered::{CLOUD_DELIVERED_STORE, CloudDeliveredSecretStore};
+use telemetry::metrics_reader::MetricsReader;
 use tokio::io::AsyncWriteExt;
 
 use crate::log_capture::LogRingBuffer;
@@ -310,7 +310,7 @@ fn build_config(runtime_version: &str) -> CloudConnectConfig {
 ///
 /// An environment override never silently retargets an instance that already
 /// enrolled somewhere: renewal would send this instance's credential to a
-/// control plane it never enrolled with. `spice connect` rejects exactly this
+/// control plane it never enrolled with. `spice cloud link` rejects exactly this
 /// mismatch, so the runtime has to agree with it rather than quietly win.
 ///
 /// The legacy endpoint file is deliberately not consulted — it is superseded
@@ -327,7 +327,7 @@ fn reconcile_requested_endpoint(
         DiskControlPlaneEndpoint::Absent => Ok(requested),
         DiskControlPlaneEndpoint::Resolved(bound) if requested == bound => Ok(bound),
         DiskControlPlaneEndpoint::Resolved(bound) => Err(format!(
-            "SPICE_CLOUD_ENDPOINT ({requested}) does not match the control plane this instance enrolled with ({bound}). Unset the variable, or release the instance with `spice connect remove` before enrolling elsewhere."
+            "SPICE_CLOUD_ENDPOINT ({requested}) does not match the control plane this instance enrolled with ({bound}). Unset the variable, or release the instance with `spice cloud unlink` before enrolling elsewhere."
         )),
         DiskControlPlaneEndpoint::Invalid => {
             Err("the control-plane binding on disk could not be read, so the requested endpoint cannot be checked against it.".to_string())
@@ -1165,7 +1165,7 @@ impl SpicedRuntimeHandle {
     /// on caching.
     ///
     /// Short on purpose: the cache is best-effort and its failure is reported, so
-    /// a deployment must not stall behind a `spice connect` that runs for as long
+    /// a deployment must not stall behind a `spice cloud link` that runs for as long
     /// as an operator takes. Long enough to outlast a release, which only unlinks
     /// a few files.
     #[cfg(test)]
@@ -1185,7 +1185,7 @@ impl SpicedRuntimeHandle {
         secrets: Arc<runtime_cloud_connect::sealed_secrets::DeliveredSecrets>,
     ) -> Option<String> {
         // Excludes a release in ANOTHER process — a `Remove` handled by a second
-        // `spiced` on this config directory, or a local `spice connect remove` —
+        // `spiced` on this config directory, or a local `spice cloud unlink` —
         // which deletes this cache together with the identity holding its key.
         // Within one process the control stream already serializes the two, but
         // the lock is what makes that true across processes.
@@ -1578,7 +1578,7 @@ impl RuntimeHandle for SpicedRuntimeHandle {
 
     fn unsupported_reason(&self, capability: Capability) -> String {
         match capability {
-            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, run `spice connect service restart` on the host (or restart the container, for an instance a container runtime owns). See: https://spiceai.org/docs".to_string(),
+            Capability::Restart => "Restart is unsupported on standalone spiced: it is not a control the runtime offers on demand, and no deployment needs one — a deployment applies to the running instance and reports anything it could not put into effect. To restart the instance anyway, run `spice cloud service restart` on the host (or restart the container, for an instance a container runtime owns). See: https://spiceai.org/docs".to_string(),
             Capability::UpgradeRuntime => "UpgradeRuntime is unsupported on standalone spiced: it cannot replace its own binary. Upgrade it the way you installed it (`spice upgrade`, your container image, or your package manager). See: https://spiceai.org/docs".to_string(),
             Capability::GetLogs => "Log capture is not enabled for this runtime: Spice Cloud Connect must be configured before startup for spiced to install the log-capture layer. See: https://spiceai.org/docs".to_string(),
             Capability::ApplySpicepod
@@ -1909,6 +1909,15 @@ impl RuntimeHandle for SpicedRuntimeHandle {
                 "delivered_secrets_persisted": self.cache_key().is_some(),
             })),
         )
+    }
+
+    /// Always `Some`: this handle holds the pending set, so an empty answer
+    /// means nothing is pending rather than nothing known.
+    ///
+    /// Read from the same place [`SpicedRuntimeHandle::status`] reads it, so the
+    /// heartbeat and the status document cannot report different sets.
+    async fn restart_required(&self) -> Option<Vec<String>> {
+        Some(self.pending.read().restart_required())
     }
 
     async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
@@ -2637,7 +2646,7 @@ mod tests {
 
     /// An environment override must not retarget an enrolled instance: renewal
     /// would carry this instance's credential to a control plane it never
-    /// enrolled with. `spice connect` refuses the same mismatch.
+    /// enrolled with. `spice cloud link` refuses the same mismatch.
     #[test]
     fn an_environment_endpoint_never_overrides_a_durable_binding() {
         let bound = || DiskControlPlaneEndpoint::Resolved("https://bound.example".to_string());
@@ -4502,14 +4511,19 @@ tools:
     }
 
     /// What is pending is what `GetStatus` reports, so a caller that asked
-    /// after the deploy reads the same answer as one that watched it.
+    /// after the deploy reads the same answer as one that watched it — and the
+    /// heartbeat carries that same set, from the same source, so a caller
+    /// watching only the heartbeat is not told something else.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_reports_what_the_last_deployment_left_pending() {
+    async fn status_and_heartbeat_report_what_the_last_deployment_left_pending() {
         let dir = scratch_dir("status-pending");
         let handle = handle_serving(&dir, SERVING).await;
 
         let status = handle.status().await.expect("status is reported");
         assert_eq!(status.detail["restart_required"], serde_json::json!([]));
+        // Present and empty, never absent: this handle holds the pending set,
+        // so an empty answer means nothing is pending, not nothing known.
+        assert_eq!(handle.restart_required().await, Some(Vec::new()));
 
         let deployed = format!("{SERVING}runtime:\n  dataset_load_parallelism: 2\n");
         handle
@@ -4521,6 +4535,10 @@ tools:
         assert_eq!(
             status.detail["restart_required"],
             serde_json::json!(["runtime"])
+        );
+        assert_eq!(
+            handle.restart_required().await,
+            Some(vec!["runtime".to_string()])
         );
 
         let _ = std::fs::remove_dir_all(&dir);

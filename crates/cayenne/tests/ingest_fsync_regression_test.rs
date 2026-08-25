@@ -950,7 +950,7 @@ fn deletion_index_tracks_bloom_capacity_field() {
 // path (commit cc953f0262).
 
 const PARTITIONED_INSERT_STRATEGY_SRC: &str =
-    include_str!("../../runtime/src/dataaccelerator/cayenne/partitioned_insert_strategy/mod.rs");
+    include_str!("../../accelerators/accelerator-cayenne/src/partitioned_insert_strategy/mod.rs");
 
 #[test]
 fn partition_lookup_uses_read_lock_fast_path() {

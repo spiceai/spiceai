@@ -37,7 +37,9 @@ url.workspace = true
 util = { path = "../util", default-features = false }
 
 [dev-dependencies]
+axum.workspace = true
 insta = { workspace = true, features = ["json", "redactions"] }
+serde_json.workspace = true
 
 [features]
 ftp = ["dep:suppaftp", "dep:bb8"]

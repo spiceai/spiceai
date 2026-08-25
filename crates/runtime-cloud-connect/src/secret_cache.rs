@@ -36,7 +36,7 @@ limitations under the License.
 //! # Format
 //!
 //! One JSON document. The header fields are plaintext for bounded inspection,
-//! but `spice connect status` reports their names only after opening the body
+//! but `spice cloud status` reports their names only after opening the body
 //! with the identity's cache key. The values are in the sealed body and nowhere
 //! else.
 //!
@@ -490,7 +490,7 @@ fn sync_absence(path: &Path) -> Result<()> {
 
 /// Read only the plaintext header, without the key.
 ///
-/// This is what lets `spice connect status` say which secrets are cached, and
+/// This is what lets `spice cloud status` say which secrets are cached, and
 /// from which deployment, on a host where it holds no key at all. Returns `None`
 /// when there is no cache or it cannot be parsed.
 #[must_use]
