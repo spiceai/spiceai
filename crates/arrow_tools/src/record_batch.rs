@@ -2042,19 +2042,6 @@ mod nullability_alignment_tests {
         Arc::new(Schema::new(vec![Field::new(name, data_type, true)]))
     }
 
-    /// The constructor every kernel that rebuilds a map column goes through. A column that
-    /// survives it is one the rest of the engine can actually use.
-    fn rebuild_through_public_constructor(
-        column: &ArrayRef,
-    ) -> std::result::Result<(), ArrowError> {
-        let map = column
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .expect("map column");
-        let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
-        MapArray::try_new(field, offsets, entries, nulls, ordered).map(|_| ())
-    }
-
     /// The address of the key column's value buffer, so a rebuild can be told from a relabel.
     fn keys_buffer_ptr(column: &ArrayRef) -> *const u8 {
         let map = column
