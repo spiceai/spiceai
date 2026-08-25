@@ -20,16 +20,21 @@ limitations under the License.
 //!
 //! These sit beside the echo-suppression suite and deliberately do not repeat
 //! it: the question here is not whether an echo is dropped but whether the row
-//! the source ends up holding is the row the accelerator committed.
+//! the source ends up holding is the row the accelerator committed. An
+//! upsert-keyed CDC apply makes a leaked echo largely idempotent for a plain
+//! value overwrite, so a row-count or sum assertion cannot itself distinguish
+//! "echo dropped" from "echo re-applied" — that guarantee is the
+//! echo-suppression suite's job (`replication_write_back_echo.rs`), not this
+//! file's.
 //!
-//! Both tests use the same WAL-ordering barrier the echo suite established,
-//! because an upsert-keyed CDC apply makes a leaked echo largely idempotent and
-//! a time-based assertion would be a guess: once a local write has demonstrably
-//! reached the source, an *external* sentinel row is written directly to the
-//! source, and the test waits for that sentinel to appear in the accelerator.
-//! Logical replication is delivered in commit order, so a visible sentinel
-//! proves the pump has already processed every earlier transaction — including
-//! the echo of our own delivery. Only then is the table asserted.
+//! The trigger-rewrite test below uses a WAL-ordering barrier to make its
+//! assertion deterministic rather than time-based: once a local write has
+//! demonstrably reached the source, an *external* sentinel row is written
+//! directly to the source, and the test waits for that sentinel to appear in
+//! the accelerator. Logical replication is delivered in commit order, so a
+//! visible sentinel proves the pump has already processed every earlier
+//! transaction — including the echo of our own delivery. Only then is the
+//! table asserted.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -84,22 +89,6 @@ async fn exec(client: &Client, sql: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Terminate the walsender backend serving `slot`, forcing the still-running
-/// pump to reconnect and resume from the slot's held `confirmed_flush` — the
-/// same resume path a network blip takes, which replays every transaction the
-/// ack floor had not yet passed (including an un-acked echo of our own
-/// delivery).
-async fn force_stream_reconnect(client: &Client, slot: &str) -> Result<(), anyhow::Error> {
-    client
-        .execute(
-            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
-             WHERE slot_name = $1 AND active_pid IS NOT NULL",
-            &[&slot],
-        )
-        .await?;
-    Ok(())
-}
-
 /// A single `int4` column from the source, or `None` when no row matched.
 async fn source_value(client: &Client, sql: &str) -> Result<Option<i64>, anyhow::Error> {
     let rows = client
@@ -110,15 +99,6 @@ async fn source_value(client: &Client, sql: &str) -> Result<Option<i64>, anyhow:
         None => Ok(None),
         Some(row) => Ok(row.try_get::<_, Option<i32>>(0)?.map(i64::from)),
     }
-}
-
-/// A single `count(*)` from the source.
-async fn source_count(client: &Client, sql: &str) -> Result<i64, anyhow::Error> {
-    let row = client
-        .query_one(sql, &[])
-        .await
-        .map_err(|e| anyhow!("postgres error running `{sql}`: {e}"))?;
-    Ok(row.try_get::<_, i64>(0)?)
 }
 
 // ── accelerator helpers ─────────────────────────────────────────────────────
@@ -286,116 +266,6 @@ async fn build_runtime(name: &str, datasets: Vec<Dataset>) -> Result<Arc<Runtime
 fn tracing_filter() -> &'static str {
     "integration=debug,runtime=debug,connector_postgres=debug,\
      data_components::postgres_replication=debug,info"
-}
-
-// ── UPDATE delivery ─────────────────────────────────────────────────────────
-
-/// An UPDATE committed through Spice reaches the source, and a subsequent
-/// write-back INSERT is not double-applied across a forced reconnect.
-///
-/// The write path for an update is its own code (`update_write_back`) and the
-/// delivery worker reconciles it by upserting the row's *current* committed
-/// value, so an update exercises a different pair of legs than the insert and
-/// delete the echo suite drives. But that same upsert-by-primary-key apply
-/// makes a leaked UPDATE echo unobservable: replaying `amount = 99` a second
-/// time writes the identical value, so no row count or sum assertion over the
-/// update alone can tell "echo dropped" from "echo re-applied". The INSERT of
-/// a brand-new key below is the part of this test that actually exercises the
-/// double-apply guarantee, because a leaked echo of a new row is a genuine
-/// duplicate, not a no-op upsert — and it is driven across a forced walsender
-/// reconnect so a replayed (not just a live) echo is covered too.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
-    let _tracing = init_tracing(Some(tracing_filter()));
-
-    test_request_context()
-        .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
-            let source = connect(port).await?;
-            let slot = "spice_wb_update_slot";
-            exec(
-                &source,
-                "CREATE TABLE public.wb_update (id int PRIMARY KEY, amount int NOT NULL)",
-            )
-            .await?;
-            exec(
-                &source,
-                "INSERT INTO public.wb_update VALUES (1, 10), (2, 20)",
-            )
-            .await?;
-
-            let accel = tempfile::tempdir()?;
-            let rt = build_runtime(
-                "write_back_update",
-                vec![write_back_dataset(port, "wb_update", slot, accel.path())],
-            )
-            .await?;
-            wait_for("the bootstrap snapshot", Some(2), || {
-                accel_scalar(&rt, "SELECT count(*) FROM wb_update")
-            })
-            .await?;
-
-            // An UPDATE of a bootstrapped row: committed to the accelerator, then
-            // delivered to the source as an upsert of its current value.
-            run_query(&rt, "UPDATE wb_update SET amount = 99 WHERE id = 2").await?;
-            wait_for("the updated row at the source", Some(99), || {
-                source_value(&source, "SELECT amount FROM public.wb_update WHERE id = 2")
-            })
-            .await?;
-
-            // Force the pump to reconnect and resume from the slot's held
-            // confirmed_flush, replaying whatever the ack floor had not yet
-            // passed — including a still-un-acked echo of the UPDATE above.
-            force_stream_reconnect(&source, slot).await?;
-
-            // A write-back INSERT of a brand-new key: unlike the UPDATE above,
-            // a leaked echo of this event is a genuine duplicate row, so it can
-            // actually distinguish suppression from re-application.
-            run_query(&rt, "INSERT INTO wb_update (id, amount) VALUES (101, 13)").await?;
-            wait_for("the inserted row at the source", Some(101), || {
-                source_value(&source, "SELECT id FROM public.wb_update WHERE id = 101")
-            })
-            .await?;
-
-            // Barrier: an external sentinel committed after the delivery. Once it
-            // is visible here, the pump has processed past the delivery's echo.
-            exec(&source, "INSERT INTO public.wb_update VALUES (100, 7)").await?;
-            wait_for("the sentinel", Some(1), || {
-                accel_scalar(&rt, "SELECT count(*) FROM wb_update WHERE id = 100")
-            })
-            .await?;
-
-            assert_accel(
-                &rt,
-                "SELECT amount FROM wb_update WHERE id = 2",
-                99,
-                "the accelerator must still hold the value it committed",
-            )
-            .await?;
-            assert_accel(
-                &rt,
-                "SELECT count(*) FROM wb_update",
-                4,
-                "a leaked echo of the new-key insert would add a duplicate row",
-            )
-            .await?;
-            assert_accel(
-                &rt,
-                "SELECT sum(amount) FROM wb_update",
-                129,
-                "10 + 99 + 13 + 7: a re-applied insert echo would double-count",
-            )
-            .await?;
-            // The source agrees, so nothing was delivered twice or lost.
-            let source_sum =
-                source_count(&source, "SELECT sum(amount)::int8 FROM public.wb_update").await?;
-            assert_eq!(source_sum, 129, "the source holds the same total");
-
-            rt.shutdown().await;
-            Ok(())
-        })
-        .await
 }
 
 // ── a source-side trigger inside the delivery transaction ───────────────────
