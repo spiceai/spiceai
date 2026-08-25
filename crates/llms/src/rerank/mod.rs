@@ -20,9 +20,10 @@ limitations under the License.
 //! A reranker scores a set of candidate documents against a query string and
 //! returns per-document relevance scores. Two kinds of rerankers are supported:
 //!
-//! - **Native** (future): dedicated cross-encoder or reranker-API providers
-//!   such as Cohere Rerank, Voyage Rerank, Jina Rerank, or local BGE. These
-//!   implement [`Rerank`] directly.
+//! - **Native**: dedicated cross-encoder or reranker-API providers such as
+//!   Cohere Rerank, Voyage Rerank, Jina Rerank, or a local BGE-style
+//!   cross-encoder ([`TeiRerank`], run in-process via the candle TEI backend).
+//!   These implement [`Rerank`] directly.
 //! - **LLM-backed**: any model in the chat-completion store can be used as a
 //!   reranker via [`LlmRerank`], which prompts the model listwise or
 //!   pointwise and parses JSON scores from the response.
@@ -32,7 +33,10 @@ limitations under the License.
 //! use any already-registered chat model as a reranker without extra config.
 
 use async_trait::async_trait;
-use snafu::Snafu;
+
+// The contract lives in `rerank-api`, below every provider; re-exported so existing
+// `llms::rerank::…` paths resolve, including SNAFU's generated context selectors.
+pub use rerank_api::*;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -46,83 +50,17 @@ pub mod http;
 pub mod jina;
 pub mod voyage;
 
+// The native local reranker rides the same candle backend as local embeddings,
+// so it is gated on the same feature.
+#[cfg(feature = "local_embed")]
+pub mod tei;
+
 pub use cohere::CohereReranker;
 pub use http::HttpReranker;
 pub use jina::JinaReranker;
+#[cfg(feature = "local_embed")]
+pub use tei::TeiRerank;
 pub use voyage::VoyageReranker;
-
-/// Name → reranker map. Holds native rerankers (e.g. Cohere, Voyage, BGE) once
-/// provider support lands. Users can also use any chat model as a reranker
-/// today via the `LlmRerank` adapter, so this store may be empty even in a
-/// fully-functional deployment.
-pub type RerankerModelStore = std::collections::HashMap<String, Arc<dyn Rerank>>;
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum Error {
-    #[snafu(display("Reranker model '{model}' failed: {source}"))]
-    ModelCallFailed {
-        model: String,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Reranker model '{model}' returned an unparseable response. Expected a JSON array of {{id, score}} (listwise) or object {{score}} (pointwise), but the model returned: {response}"
-    ))]
-    UnparseableResponse { model: String, response: String },
-
-    #[snafu(display(
-        "Reranker model '{model}' returned no scores for the provided documents (expected {expected}, got {actual})."
-    ))]
-    MismatchedScoreCount {
-        model: String,
-        expected: usize,
-        actual: usize,
-    },
-
-    #[snafu(display("Reranker health check failed: {source}"))]
-    HealthCheckFailed {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display(
-        "Failed to build HTTP client for reranker '{model}' — standard timeout/TLS defaults are unavailable."
-    ))]
-    HttpClientCreationFailed { model: String },
-}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// A reranker scores documents against a query. Higher score == more relevant.
-///
-/// Implementations must return exactly `documents.len()` scores, in the same
-/// order as the input: `rerank(query, &docs)[i]` is the score for `docs[i]`.
-/// Any mismatch surfaces as [`Error::MismatchedScoreCount`].
-///
-/// Note: the built-in [`LlmRerank`] adapter is deliberately lenient with
-/// partial LLM output — missing ids in a listwise response default to `0.0`
-/// (least relevant) rather than erroring — because models occasionally skip
-/// entries. Native rerankers are expected to score every document.
-#[async_trait]
-pub trait Rerank: Send + Sync + Debug {
-    async fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<f32>>;
-
-    /// Name of this reranker model (for tracing / error messages).
-    fn model_name(&self) -> Option<&str> {
-        None
-    }
-
-    /// Whether this reranker runs remotely. UDTF callers can use this to
-    /// decide parallelism / rate-limit policy.
-    fn is_remote(&self) -> bool {
-        true
-    }
-
-    async fn health(&self) -> Result<()> {
-        let _ = self.rerank("health check", &["ok".to_string()]).await?;
-        Ok(())
-    }
-}
 
 /// Strategy for prompting an LLM to rerank documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

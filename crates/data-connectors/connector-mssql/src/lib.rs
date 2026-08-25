@@ -28,11 +28,12 @@ use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use data_components::mssql::{
     self, SqlServerTableProvider, connection_manager::SqlServerConnectionPool,
 };
-use datafusion::datasource::TableProvider;
-use runtime::dataconnector::{
+use data_connector_api::ConnectorContext;
+use data_connector_api::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use datafusion::datasource::TableProvider;
 use runtime_component::dataset::DatasetSpec;
 use runtime_parameters::{ParameterSpec, Parameters};
 use snafu::{ResultExt, Snafu};
@@ -195,10 +196,11 @@ impl DataConnectorFactory for SqlServerFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             Ok(Arc::new(SqlServer::new(&params.parameters).await?) as Arc<dyn DataConnector>)
         })
@@ -260,6 +262,7 @@ impl DataConnector for SqlServer {
 
     async fn read_provider(
         &self,
+        _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let provider = SqlServerTableProvider::new(Arc::clone(&self.conn), &dataset.path().into())
@@ -274,10 +277,10 @@ impl DataConnector for SqlServer {
     }
 }
 
-// Self-register into runtime's linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
+// Self-register into `data-connector-api`'s linkme `DATA_CONNECTOR_REGISTRATIONS` slice. Any binary/tool that
 // should see this connector must force-link the crate (`use connector_mssql as _;`) -- a plain
 // Cargo dependency won't link the slice static. See `register_data_connector!` docs.
-runtime::register_data_connector!(
+data_connector_api::register_data_connector!(
     register_mssql_connector,
     MSSQL_CONNECTOR_REGISTRATION,
     CONNECTOR_NAME,

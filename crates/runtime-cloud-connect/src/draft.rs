@@ -64,9 +64,32 @@ const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(test)]
 const LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const REMOVAL_LOCK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_DRAFT_BYTES: u64 = 1024 * 1024;
 
 /// Current schema of the draft file.
-const DRAFT_SCHEMA_VERSION: u32 = 2;
+const DRAFT_SCHEMA_VERSION: u32 = 3;
+
+/// Non-secret enrollment authority facts for one operation. The actual
+/// bearer/enrollment key is deliberately absent. Token assertions may change
+/// during recovery; an authenticated operation remains bound to its org.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EnrollmentAuthorityBinding {
+    Token { expected_org: Option<String> },
+    AuthenticatedSession { organization: String },
+}
+
+/// Control-plane and authority provenance for one enrollment operation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentRequestBinding {
+    pub endpoint: String,
+    pub authority: EnrollmentAuthorityBinding,
+}
 
 #[derive(Deserialize)]
 struct DraftSchemaHeader {
@@ -85,11 +108,22 @@ pub enum Error {
     #[snafu(display("Failed to serialize the enrollment draft: {source}"))]
     Serialize { source: serde_json::Error },
 
-    #[snafu(display("Failed to parse the enrollment draft at {}: {source}", path.display()))]
+    #[snafu(display(
+        "Failed to parse the enrollment draft at {} (line {}, column {})",
+        path.display(),
+        source.line(),
+        source.column()
+    ))]
     Parse {
         path: PathBuf,
         source: serde_json::Error,
     },
+
+    #[snafu(display(
+        "The enrollment draft at {} cannot be replayed safely: {reason}. Preserve the draft and contact Spice Cloud support before removing it or starting a new enrollment",
+        path.display()
+    ))]
+    Invalid { path: PathBuf, reason: &'static str },
 
     #[snafu(display(
         "The enrollment draft at {} uses unsupported schema {found} (this runtime requires \
@@ -103,6 +137,12 @@ pub enum Error {
 
     #[snafu(display("Failed to generate enrollment key material: {source}"))]
     Material { source: crate::identity::Error },
+
+    #[snafu(display(
+        "The pending enrollment at {} belongs to a different control plane or authority. Retry with the original endpoint and organization; the exact-replay state was preserved",
+        path.display()
+    ))]
+    RequestBindingMismatch { path: PathBuf },
 
     #[snafu(display(
         "Another live process is still enrolling this config directory under the lock at {}. Wait for that process to finish and retry",
@@ -126,7 +166,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// identity after promotion has started and race a new operation against the
 /// first process.
 pub struct EnrollmentTransactionLock {
+    /// Canonical name observed when the transaction was acquired. Retained for
+    /// diagnostics and, for ordinary callers, replacement detection.
     config_dir: PathBuf,
+    /// Directory root used for every protected state operation. On Linux a
+    /// removal that arrived through a retained descriptor gets a descriptor
+    /// owned by this guard, so a later rename cannot redirect its cleanup.
+    protected_config_dir: PathBuf,
+    directory_is_pinned: bool,
     draft_path: PathBuf,
     file: std::fs::File,
     #[cfg(unix)]
@@ -142,13 +189,52 @@ impl EnrollmentTransactionLock {
         Self::acquire_with_budget(config_dir, std::time::Duration::ZERO)
     }
 
+    pub(crate) fn acquire_for_removal(config_dir: &Path) -> Result<Self> {
+        Self::acquire_with_budget(config_dir, REMOVAL_LOCK_WAIT_BUDGET)
+    }
+
     fn acquire_with_budget(config_dir: &Path, wait_budget: std::time::Duration) -> Result<Self> {
-        std::fs::create_dir_all(config_dir).context(IoSnafu {
-            path: config_dir.to_path_buf(),
-        })?;
+        #[cfg(target_os = "linux")]
+        let directory_is_pinned = is_retained_descriptor_path(config_dir);
+        #[cfg(not(target_os = "linux"))]
+        let directory_is_pinned = false;
+
+        // A retained `/proc/self/fd/N` path is already the caller's pinned
+        // authority. Duplicate N directly before any pathname operation; a
+        // canonicalize-then-open sequence would resolve the descriptor back to
+        // its mutable name and could lock a replacement directory instead.
+        #[cfg(target_os = "linux")]
+        let pinned_directory = if directory_is_pinned {
+            let draft_path = EnrollmentDraft::path_in(config_dir);
+            let (directory, _) =
+                crate::identity::open_verified_state_parent_unix(&draft_path, || {}).context(
+                    IoSnafu {
+                        path: config_dir.to_path_buf(),
+                    },
+                )?;
+            Some(directory)
+        } else {
+            None
+        };
+
+        if !directory_is_pinned {
+            std::fs::create_dir_all(config_dir).context(IoSnafu {
+                path: config_dir.to_path_buf(),
+            })?;
+        }
         // Pin every later draft and identity operation to the directory named
         // at acquisition time. Retargeting a symlink ancestor after this point
         // must not redirect state while the lock stays on the original inode.
+        #[cfg(target_os = "linux")]
+        let config_dir = if let Some(directory) = pinned_directory.as_ref() {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        } else {
+            std::fs::canonicalize(config_dir).context(IoSnafu {
+                path: config_dir.to_path_buf(),
+            })?
+        };
+        #[cfg(not(target_os = "linux"))]
         let config_dir = std::fs::canonicalize(config_dir).context(IoSnafu {
             path: config_dir.to_path_buf(),
         })?;
@@ -162,14 +248,39 @@ impl EnrollmentTransactionLock {
             });
         }
         #[cfg(unix)]
-        let directory = std::fs::File::open(&config_dir).context(IoSnafu {
-            path: config_dir.clone(),
-        })?;
-        let draft_path = EnrollmentDraft::path_in(&config_dir);
-        let lock_path = EnrollmentDraft::lock_path(&draft_path);
+        let directory = {
+            #[cfg(target_os = "linux")]
+            if let Some(directory) = pinned_directory {
+                directory
+            } else {
+                std::fs::File::open(&config_dir).context(IoSnafu {
+                    path: config_dir.clone(),
+                })?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::fs::File::open(&config_dir).context(IoSnafu {
+                    path: config_dir.clone(),
+                })?
+            }
+        };
+        let lock_path = EnrollmentDraft::lock_path(&EnrollmentDraft::path_in(&config_dir));
         let file = EnrollmentDraft::acquire_publication_lock_with_budget(&lock_path, wait_budget)?;
+
+        #[cfg(target_os = "linux")]
+        let protected_config_dir = if directory_is_pinned {
+            use std::os::fd::AsRawFd as _;
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        } else {
+            config_dir.clone()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let protected_config_dir = config_dir.clone();
+        let draft_path = EnrollmentDraft::path_in(&protected_config_dir);
         let transaction = Self {
             config_dir,
+            protected_config_dir,
+            directory_is_pinned,
             draft_path,
             file,
             #[cfg(unix)]
@@ -179,10 +290,14 @@ impl EnrollmentTransactionLock {
         Ok(transaction)
     }
 
-    /// The canonical directory this transaction owns.
+    /// The directory root this transaction owns.
+    ///
+    /// Ordinary enrollment returns the canonical pathname. A Linux removal
+    /// acquired through a retained descriptor returns this guard's own
+    /// descriptor-relative root so the protected inode survives a rename.
     pub(crate) fn config_dir(&self) -> Result<&Path> {
         self.ensure_directory_stable()?;
-        Ok(&self.config_dir)
+        Ok(&self.protected_config_dir)
     }
 
     /// Verify that the canonical path still resolves to the directory inode
@@ -195,18 +310,27 @@ impl EnrollmentTransactionLock {
             let retained = self.directory.metadata().context(IoSnafu {
                 path: self.config_dir.clone(),
             })?;
-            let named = std::fs::metadata(&self.config_dir).context(IoSnafu {
-                path: self.config_dir.clone(),
+            let checked_path = if self.directory_is_pinned {
+                &self.protected_config_dir
+            } else {
+                &self.config_dir
+            };
+            let named = std::fs::metadata(checked_path).context(IoSnafu {
+                path: checked_path.clone(),
             })?;
-            let final_entry = std::fs::symlink_metadata(&self.config_dir).context(IoSnafu {
-                path: self.config_dir.clone(),
-            })?;
-            if final_entry.file_type().is_symlink()
-                || retained.dev() != named.dev()
-                || retained.ino() != named.ino()
-            {
+            let was_replaced = if self.directory_is_pinned {
+                false
+            } else {
+                std::fs::symlink_metadata(&self.config_dir)
+                    .context(IoSnafu {
+                        path: self.config_dir.clone(),
+                    })?
+                    .file_type()
+                    .is_symlink()
+            };
+            if was_replaced || retained.dev() != named.dev() || retained.ino() != named.ino() {
                 return Err(Error::Io {
-                    path: self.config_dir.clone(),
+                    path: checked_path.clone(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "the enrollment transaction directory was renamed or replaced",
@@ -235,16 +359,82 @@ impl EnrollmentTransactionLock {
             .map_err(|source| Error::AcquireTaskPanicked { source })?
     }
 
-    pub(crate) fn load_or_create(
+    pub(crate) fn protects(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        if self.directory_is_pinned {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let Some(parent) = path.parent() else {
+                return false;
+            };
+            let Ok(retained) = self.directory.metadata() else {
+                return false;
+            };
+            let Ok(wanted) = std::fs::metadata(parent) else {
+                return false;
+            };
+            return retained.dev() == wanted.dev() && retained.ino() == wanted.ino();
+        }
+        path.parent()
+            .is_some_and(|wanted| same_directory(&self.config_dir, wanted))
+    }
+
+    /// Resolve a state path into the directory this transaction pinned.
+    /// Returns `None` when the caller's spelling no longer names that directory,
+    /// which is the fail-closed result after an ancestor substitution.
+    pub(crate) fn protected_path(&self, path: &Path) -> Option<PathBuf> {
+        self.ensure_directory_stable().ok()?;
+        let file_name = path.file_name()?;
+        self.protects(path)
+            .then(|| self.protected_config_dir.join(file_name))
+    }
+
+    /// Acquire exclusive ownership of a config directory's enrollment
+    /// transaction without blocking a Tokio worker thread.
+    ///
+    /// Callers that need to publish additional retry state beside the
+    /// enrollment draft retain this guard and pass it to
+    /// `enroll_now_with_transaction`, closing the gap between the two durable
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be acquired or the blocking
+    /// task panics.
+    pub async fn acquire_async(config_dir: &Path) -> Result<Self> {
+        let config_dir = config_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::acquire(&config_dir))
+            .await
+            .map_err(|source| Error::AcquireTaskPanicked { source })?
+    }
+
+    /// Load the published draft, or durably create it while this transaction
+    /// owns the directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be read, validated, or published.
+    pub fn load_or_create(
         &self,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<EnrollmentDraft> {
         self.ensure_directory_stable()?;
-        let result = match std::fs::read_to_string(&self.draft_path) {
-            Ok(contents) => EnrollmentDraft::load_published(&self.draft_path, &contents),
+        let result = match read_bounded_regular_file(&self.draft_path, MAX_DRAFT_BYTES) {
+            Ok(contents) => {
+                let draft = EnrollmentDraft::load_published(&self.draft_path, &contents)?;
+                draft.validate_request(&self.draft_path, binding)?;
+                Ok(draft)
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                EnrollmentDraft::publish_locked(&self.draft_path, &self.file, instance, region)
+                EnrollmentDraft::publish_locked(
+                    &self.draft_path,
+                    &self.file,
+                    instance,
+                    region,
+                    binding,
+                )
             }
             Err(source) => Err(Error::Io {
                 path: self.draft_path.clone(),
@@ -354,19 +544,52 @@ fn open_unix_publication_lock(lock_path: &Path) -> std::io::Result<(std::fs::Fil
             "the enrollment transaction lock name contains a NUL byte",
         )
     })?;
-    let lock_descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            0o600,
-        )
-    };
-    if lock_descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let lock = unsafe { std::fs::File::from_raw_fd(lock_descriptor) };
+    let lock = crate::lock_file::create_or_open_lock_at(&directory, &name)?;
     Ok((lock, directory))
+}
+
+/// Whether two paths name the same directory, rather than the same spelling.
+///
+/// A config directory reached through a relative path, an absolute one, or an
+/// ancestor symlink is still that directory, and treating those as different is
+/// what makes a transaction refuse the very file it protects. Resolution needs
+/// both to exist; when either cannot be resolved there is nothing better than
+/// the spelling to go on.
+pub(crate) fn same_directory(one: &Path, other: &Path) -> bool {
+    // `Path::new("identity.json").parent()` is `Some("")`, the current
+    // directory said a different way. Canonicalizing the empty path fails while
+    // canonicalizing `.` succeeds, so without this the two spellings of one
+    // directory compare as different.
+    let one = if one.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        one
+    };
+    let other = if other.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        other
+    };
+    match (std::fs::canonicalize(one), std::fs::canonicalize(other)) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => one == other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_retained_descriptor_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let Ok(relative) = path.strip_prefix("/proc/self/fd") else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(descriptor)) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && !descriptor.as_bytes().is_empty()
+        && descriptor.as_bytes().iter().all(u8::is_ascii_digit)
 }
 
 /// The provisional, retry-stable state of one enrollment operation.
@@ -406,6 +629,10 @@ pub struct EnrollmentDraft {
     /// process reuses this value even if its command-line configuration
     /// changed while the operation was pending.
     pub region: Option<String>,
+    /// The normalized control-plane endpoint and non-secret authority facts.
+    /// These prevent a lost response from being replayed to another cloud or
+    /// under a different organization by a later process.
+    pub binding: EnrollmentRequestBinding,
 }
 
 impl std::fmt::Debug for EnrollmentDraft {
@@ -420,6 +647,7 @@ impl std::fmt::Debug for EnrollmentDraft {
             .field("enc_public_key_pem", &"[PUBLIC KEY]")
             .field("instance", &self.instance)
             .field("region", &self.region)
+            .field("binding", &self.binding)
             .finish()
     }
 }
@@ -429,6 +657,20 @@ impl EnrollmentDraft {
     #[must_use]
     pub fn path_in(config_dir: &Path) -> PathBuf {
         config_dir.join(ENROLLMENT_DRAFT_FILE)
+    }
+
+    /// Load an existing draft without creating or mutating enrollment state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unreadable, malformed, or unsupported draft data.
+    pub fn load_optional(config_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::path_in(config_dir);
+        match read_bounded_regular_file(&path, MAX_DRAFT_BYTES) {
+            Ok(contents) => Self::parse_at(&path, &contents).map(Some),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::Io { path, source }),
+        }
     }
 
     fn lock_path(path: &Path) -> PathBuf {
@@ -452,16 +694,17 @@ impl EnrollmentDraft {
         config_dir: &Path,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<Self> {
-        EnrollmentTransactionLock::acquire(config_dir)?.load_or_create(instance, region)
+        EnrollmentTransactionLock::acquire(config_dir)?.load_or_create(instance, region, binding)
     }
 
-    fn parse_at(path: &Path, contents: &str) -> Result<Self> {
+    fn parse_at(path: &Path, contents: &[u8]) -> Result<Self> {
         // Read only the version first. A future schema may add fields that the
         // current strict draft parser deliberately rejects, but operators must
         // still receive the unsupported-schema recovery guidance rather than a
         // generic parse error that obscures the pending enrollment identity.
-        let header = serde_json::from_str::<DraftSchemaHeader>(contents).context(ParseSnafu {
+        let header = serde_json::from_slice::<DraftSchemaHeader>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
         })?;
         if header.schema_version != DRAFT_SCHEMA_VERSION {
@@ -470,19 +713,31 @@ impl EnrollmentDraft {
                 found: header.schema_version,
             });
         }
-        serde_json::from_str::<Self>(contents).context(ParseSnafu {
+        let draft = serde_json::from_slice::<Self>(contents).context(ParseSnafu {
             path: path.to_path_buf(),
-        })
+        })?;
+        if let Some(reason) = draft.material().validation_error() {
+            return Err(Error::Invalid {
+                path: path.to_path_buf(),
+                reason,
+            });
+        }
+        Ok(draft)
     }
 
-    fn load_published(path: &Path, contents: &str) -> Result<Self> {
+    fn load_published(path: &Path, contents: &[u8]) -> Result<Self> {
         Self::parse_at(path, contents)
     }
 
     /// Generate a fresh draft and persist it at `path` before returning it,
     /// so the operation ID is durable before the first request that uses it.
     #[cfg(test)]
-    fn create_at(path: &Path, instance: &InstanceFacts, region: Option<&str>) -> Result<Self> {
+    fn create_at(
+        path: &Path,
+        instance: &InstanceFacts,
+        region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context(IoSnafu {
                 path: parent.to_path_buf(),
@@ -491,7 +746,7 @@ impl EnrollmentDraft {
 
         let lock_path = Self::lock_path(path);
         let publication_lock = Self::acquire_publication_lock(&lock_path)?;
-        Self::publish_locked(path, &publication_lock, instance, region)
+        Self::publish_locked(path, &publication_lock, instance, region, binding)
     }
 
     #[cfg(test)]
@@ -618,13 +873,18 @@ impl EnrollmentDraft {
         _publication_lock: &std::fs::File,
         instance: &InstanceFacts,
         region: Option<&str>,
+        binding: &EnrollmentRequestBinding,
     ) -> Result<Self> {
         // A caller may have observed NotFound before acquiring the lock, but
         // another process can publish before this process owns it. Re-read
         // while locked so a delayed creator cannot replace the durable winner
         // through the atomic rename below.
-        match std::fs::read_to_string(path) {
-            Ok(contents) => return Self::parse_at(path, &contents),
+        match read_bounded_regular_file(path, MAX_DRAFT_BYTES) {
+            Ok(contents) => {
+                let draft = Self::parse_at(path, &contents)?;
+                draft.validate_request(path, binding)?;
+                return Ok(draft);
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(Error::Io {
@@ -645,12 +905,44 @@ impl EnrollmentDraft {
             enc_public_key_pem: material.enc_public_key_pem,
             instance: instance.clone(),
             region: region.map(str::to_string),
+            binding: binding.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&draft).context(SerializeSnafu)?;
         crate::identity::atomic_write_owner_only(path, &bytes).context(IoSnafu {
             path: path.to_path_buf(),
         })?;
         Ok(draft)
+    }
+
+    /// Confirm a retry targets the same control plane and authority as the
+    /// durable draft.
+    ///
+    /// The declared region is deliberately not part of the replay key: a
+    /// resumed enrollment keeps the region recorded when the draft was
+    /// published, so a differing `--region` on a retry must not invalidate
+    /// exact-replay state.
+    fn validate_request(&self, path: &Path, binding: &EnrollmentRequestBinding) -> Result<()> {
+        let authority_matches = match (&self.binding.authority, &binding.authority) {
+            (
+                EnrollmentAuthorityBinding::Token { .. },
+                EnrollmentAuthorityBinding::Token { .. },
+            ) => true,
+            (
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: persisted,
+                },
+                EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: requested,
+                },
+            ) => persisted == requested,
+            _ => false,
+        };
+        if self.binding.endpoint != binding.endpoint || !authority_matches {
+            return Err(Error::RequestBindingMismatch {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     /// Remove the draft for `config_dir`. A missing file is success. Deletion
@@ -687,7 +979,18 @@ impl EnrollmentDraft {
                     path: path.to_path_buf(),
                 })?;
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match crate::identity::sync_parent_directory(path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(Error::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
             Err(source) => {
                 return Err(Error::Io {
                     path: path.to_path_buf(),
@@ -712,9 +1015,95 @@ impl EnrollmentDraft {
     }
 }
 
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the enrollment draft was not a bounded regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the enrollment draft must not be hard-linked",
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the enrollment draft exceeded its size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A bare relative identity path has an empty parent, which is the current
+    /// directory written a different way. Canonicalizing `""` fails while `"."`
+    /// succeeds, so comparing the two spellings would make one directory look
+    /// like two — and the release would then try to take a second transaction on
+    /// a directory it already holds, which is a single non-blocking attempt, so
+    /// every `Remove` would fail.
+    #[test]
+    fn an_empty_directory_path_is_the_current_directory() {
+        assert!(
+            super::same_directory(std::path::Path::new(""), std::path::Path::new(".")),
+            "an empty path and `.` name the same directory"
+        );
+        assert_eq!(
+            std::path::Path::new("identity.json").parent(),
+            Some(std::path::Path::new("")),
+            "which is the parent a bare relative identity path has"
+        );
+    }
+
+    /// Directory identity, not spelling: the same directory reached through a
+    /// different route is still that directory.
+    #[test]
+    fn a_directory_reached_another_way_is_the_same_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let nested = dir.path().join("config");
+        std::fs::create_dir(&nested).expect("create the config dir");
+
+        assert!(
+            super::same_directory(&nested, &nested.join(".")),
+            "a trailing `.` does not make a different directory"
+        );
+        assert!(
+            !super::same_directory(&nested, dir.path()),
+            "but genuinely different directories still differ"
+        );
+    }
     use super::*;
+
+    fn test_binding() -> EnrollmentRequestBinding {
+        EnrollmentRequestBinding {
+            endpoint: "https://api.spice.ai".to_string(),
+            authority: EnrollmentAuthorityBinding::Token {
+                expected_org: Some("acme".to_string()),
+            },
+        }
+    }
 
     fn test_instance(runtime_version: &str) -> InstanceFacts {
         InstanceFacts {
@@ -731,6 +1120,7 @@ mod tests {
             config_dir,
             &test_instance("v2.2.0-test"),
             Some("us-west-2"),
+            &test_binding(),
         )
     }
 
@@ -757,7 +1147,8 @@ mod tests {
         let second = EnrollmentDraft::load_or_create(
             dir.path(),
             &test_instance("v9.9.9-replacement"),
-            Some("eu-west-1"),
+            Some("us-west-2"),
+            &test_binding(),
         )
         .expect("reload");
 
@@ -769,6 +1160,82 @@ mod tests {
         assert_eq!(first.csr_pem, second.csr_pem);
         assert_eq!(first.instance, second.instance);
         assert_eq!(first.region, second.region);
+    }
+
+    #[test]
+    fn token_recovery_reuses_the_draft_across_a_new_assertion_and_region() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = load_or_create(dir.path()).expect("create");
+        let recovered = EnrollmentDraft::load_or_create(
+            dir.path(),
+            &test_instance("v9.9.9-replacement"),
+            Some("eu-west-1"),
+            &EnrollmentRequestBinding {
+                endpoint: "https://api.spice.ai".to_string(),
+                authority: EnrollmentAuthorityBinding::Token {
+                    expected_org: Some("corrected-org".to_string()),
+                },
+            },
+        )
+        .expect("a new token assertion recovers the exact operation");
+
+        assert_eq!(
+            recovered.enrollment_operation_id,
+            first.enrollment_operation_id
+        );
+        assert_eq!(recovered.region, first.region);
+        assert_eq!(recovered.binding, first.binding);
+    }
+
+    #[test]
+    fn recovery_rejects_another_endpoint_or_authenticated_org() {
+        let endpoint_dir = tempfile::tempdir().expect("endpoint tempdir");
+        load_or_create(endpoint_dir.path()).expect("create token draft");
+        let endpoint_error = EnrollmentDraft::load_or_create(
+            endpoint_dir.path(),
+            &test_instance("v2.2.0-test"),
+            Some("us-west-2"),
+            &EnrollmentRequestBinding {
+                endpoint: "https://other.example".to_string(),
+                authority: EnrollmentAuthorityBinding::Token { expected_org: None },
+            },
+        )
+        .expect_err("another endpoint cannot receive the persisted operation");
+        assert!(
+            matches!(endpoint_error, Error::RequestBindingMismatch { .. }),
+            "{endpoint_error}"
+        );
+
+        let auth_dir = tempfile::tempdir().expect("auth tempdir");
+        let original = EnrollmentRequestBinding {
+            endpoint: "https://api.spice.ai".to_string(),
+            authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                organization: "acme".to_string(),
+            },
+        };
+        EnrollmentDraft::load_or_create(
+            auth_dir.path(),
+            &test_instance("v2.2.0-test"),
+            None,
+            &original,
+        )
+        .expect("create authenticated draft");
+        let org_error = EnrollmentDraft::load_or_create(
+            auth_dir.path(),
+            &test_instance("v2.2.0-test"),
+            None,
+            &EnrollmentRequestBinding {
+                endpoint: original.endpoint,
+                authority: EnrollmentAuthorityBinding::AuthenticatedSession {
+                    organization: "other".to_string(),
+                },
+            },
+        )
+        .expect_err("another authenticated org cannot receive the operation");
+        assert!(
+            matches!(org_error, Error::RequestBindingMismatch { .. }),
+            "{org_error}"
+        );
     }
 
     #[test]
@@ -795,6 +1262,41 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).expect("corrupt draft remains"),
             "{not json",
+            "ambiguous enrollment state must not be silently replaced"
+        );
+    }
+
+    #[test]
+    fn draft_parse_errors_never_echo_persisted_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let sensitive = "private-key-material-that-must-not-be-printed";
+        std::fs::write(&path, format!(r#"{{"schema_version":"{sensitive}"}}"#))
+            .expect("write malformed draft");
+
+        let error = load_or_create(dir.path()).expect_err("must refuse malformed draft");
+        let rendered = error.to_string();
+        assert!(rendered.contains("line"), "{rendered}");
+        assert!(!rendered.contains(sensitive), "{rendered}");
+    }
+
+    #[test]
+    fn cryptographically_inconsistent_draft_is_never_replayed_or_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let mut corrupted = load_or_create(dir.path()).expect("create draft");
+        corrupted.enc_public_key_pem = IdentityStore::generate_enrollment()
+            .expect("generate mismatched material")
+            .enc_public_key_pem;
+        let serialized = serde_json::to_string_pretty(&corrupted).expect("serialize draft");
+        std::fs::write(&path, &serialized).expect("write corrupt draft");
+
+        let error = load_or_create(dir.path()).expect_err("must refuse unsafe replay");
+        assert!(matches!(error, Error::Invalid { .. }), "{error}");
+        assert!(error.to_string().contains("do not match"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("corrupt draft remains"),
+            serialized,
             "ambiguous enrollment state must not be silently replaced"
         );
     }
@@ -857,7 +1359,8 @@ mod tests {
         let delayed = EnrollmentDraft::create_at(
             &path,
             &test_instance("v9.9.9-delayed"),
-            Some("eu-central-1"),
+            Some("us-west-2"),
+            &test_binding(),
         )
         .expect("delayed creator loads the winner");
 
@@ -980,7 +1483,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
         transaction
-            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .load_or_create(
+                &test_instance("v2.2.0-test"),
+                Some("us-west-2"),
+                &test_binding(),
+            )
             .expect("publish draft while locked");
 
         let error = EnrollmentDraft::delete(dir.path()).expect_err("live enrollment owns draft");
@@ -1000,7 +1507,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let transaction = EnrollmentTransactionLock::acquire(dir.path()).expect("acquire lock");
         transaction
-            .load_or_create(&test_instance("v2.2.0-test"), Some("us-west-2"))
+            .load_or_create(
+                &test_instance("v2.2.0-test"),
+                Some("us-west-2"),
+                &test_binding(),
+            )
             .expect("publish draft while locked");
 
         let started = std::time::Instant::now();
@@ -1033,6 +1544,55 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the draft holds private key material");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_reads_reject_symlinks_without_reading_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("outside.json");
+        let path = EnrollmentDraft::path_in(dir.path());
+        std::fs::write(&target, "sensitive target").expect("write target");
+        symlink(&target, &path).expect("create draft symlink");
+
+        let error = load_or_create(dir.path()).expect_err("symlink must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(target).expect("target remains readable"),
+            "sensitive target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draft_reads_reject_fifos_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = EnrollmentDraft::path_in(dir.path());
+        let path_c = CString::new(path.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `path_c` is a valid NUL-terminated path and `0o600` is a
+        // valid mode. `mkfifo` retains neither argument.
+        let result = unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "create FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let error = load_or_create(dir.path()).expect_err("FIFO must be rejected");
+        assert!(matches!(error, Error::Io { .. }), "{error}");
+        assert!(
+            std::fs::metadata(path)
+                .expect("FIFO metadata")
+                .file_type()
+                .is_fifo()
+        );
     }
 
     #[cfg(unix)]
@@ -1163,6 +1723,7 @@ mod tests {
         assert_eq!(
             fields,
             vec![
+                "binding",
                 "csr_pem",
                 "enc_private_key_pem",
                 "enc_public_key_pem",

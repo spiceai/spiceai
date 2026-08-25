@@ -79,13 +79,9 @@ pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
     schema_evolution: bool,
-    /// Retained so `read_provider` can resolve the checkpoint store over the dataset's
-    /// accelerator. `None` only in unit tests, which build params without a runtime
-    /// attached.
-    context: Option<Arc<dyn ConnectorContext>>,
 }
 
-// Hand-written because the retained `ConnectorContext` handle is not `Debug`.
+// Hand-written because `KafkaConfig` is not `Debug`.
 impl std::fmt::Debug for Debezium {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Debezium")
@@ -219,32 +215,7 @@ impl Debezium {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
             schema_evolution,
-            context: None,
         })
-    }
-
-    /// Attach the runtime context the checkpoint store is resolved through.
-    ///
-    /// Separate from [`Self::new`] so unit tests can build a connector from parameters
-    /// alone, which is how they already construct one.
-    #[must_use]
-    fn with_context(mut self, context: Option<Arc<dyn ConnectorContext>>) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Resolve the checkpoint store over this dataset's accelerator.
-    async fn checkpoint_store(
-        &self,
-        dataset: &DatasetSpec,
-    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
-        let context = self
-            .context
-            .as_ref()
-            .ok_or_else(|| CheckpointError::Store {
-                source: "no runtime is attached to the Debezium connector".into(),
-            })?;
-        context.debezium_checkpoint_store(dataset).await
     }
 }
 
@@ -325,13 +296,13 @@ impl DataConnectorFactory for DebeziumFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
-            let context = params.context.clone();
-            let debezium = Debezium::new(params.parameters)?.with_context(context);
+            let debezium = Debezium::new(params.parameters)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
         })
     }
@@ -345,7 +316,7 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
-register_data_connector!("debezium", DebeziumFactory);
+data_connector_api::register_data_connector!("debezium", DebeziumFactory);
 
 #[async_trait]
 impl DataConnector for Debezium {
@@ -359,6 +330,7 @@ impl DataConnector for Debezium {
 
     async fn read_provider(
         &self,
+        context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
@@ -386,12 +358,16 @@ impl DataConnector for Debezium {
         let dataset_name = dataset.name.to_string();
 
         let debezium_kafka_sys = if dataset.is_file_accelerated() {
-            Some(self.checkpoint_store(dataset).await.boxed().context(
-                super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                },
-            )?)
+            Some(
+                context
+                    .debezium_checkpoint_store(dataset)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            )
         } else {
             tracing::warn!(
                 dataset = %dataset_name,
@@ -598,8 +574,9 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
+        _context: &dyn ConnectorContext,
         federated_table: Arc<dyn FederatedTableProvider>,
         _dataset: &DatasetSpec,
         _acceleration: AccelerationContents,

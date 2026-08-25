@@ -44,7 +44,8 @@ use datafusion::prelude::arrow_cast;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{LogicalPlanBuilder, ScalarUDF, binary_expr, cast, col};
 use datafusion_functions_json::udfs::json_get_udf;
-use futures::future::{join_all, try_join_all};
+use futures::future::join_all;
+use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
 use runtime_table_partition::insert::partition_batch;
 use snafu::ResultExt;
@@ -53,7 +54,7 @@ use spice_table::Index;
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::s3_vectors::compute_query::EmbedQuery;
 use crate::index::write_util::extract_and_format_primary_key;
-use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use datafusion::{
     common::Column,
@@ -383,7 +384,10 @@ impl Index for S3Vector {
         let futs = batches
             .into_iter()
             .map(|rb| async { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {

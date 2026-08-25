@@ -136,7 +136,7 @@ fn pre_dump_session_statements(checkpoint_interval: Duration) -> Vec<PreDumpStat
     statements.push(PreDumpStatement {
         sql: format!(
             "SET SESSION net_write_timeout = \
-             GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS})"
+             CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
         ),
         rejection_warning: Some(
             "the source can still abort the shared binlog connection when one dataset's apply loop stalls, delaying changes for every changes-mode dataset on it. Grant the replication user permission to set session variables, or raise the source's net_write_timeout. See: https://spiceai.org/docs/components/data-connectors/mysql",
@@ -1056,7 +1056,7 @@ mod tests {
             sql,
             format!(
                 "SET SESSION net_write_timeout = \
-                 GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS})"
+                 CAST(GREATEST(@@SESSION.net_write_timeout, {DUMP_NET_WRITE_TIMEOUT_SECS}) AS UNSIGNED)"
             ),
             "net_write_timeout is a SYSTEM variable: the `SET @net_write_timeout` spelling the \
              heartbeats use would define an unrelated user variable and silently leave the \

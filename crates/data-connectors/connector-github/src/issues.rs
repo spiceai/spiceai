@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::dataconnector::ConnectorComponent;
+use data_connector_api::ConnectorComponent;
 use runtime_datafusion::error::find_datafusion_root;
 
 use super::{

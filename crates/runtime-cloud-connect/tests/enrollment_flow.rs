@@ -40,7 +40,7 @@ limitations under the License.
     reason = "integration-test harness — readability over lint strictness"
 )]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,12 +48,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use runtime_cloud_connect::config::CloudConnectConfig;
 use runtime_cloud_connect::handlers::{
-    ApplyOutcome, Capability, CommandError, RuntimeHandle, SpicepodDeployment,
+    Capability, CommandError, RuntimeHandle, SpicepodDeployment,
 };
 use runtime_cloud_connect::identity::{AppAttachment, AttachmentState, IdentityStore};
 use runtime_cloud_connect::proto;
@@ -87,6 +87,7 @@ fn reconnect_identity(identifier: &str, gateway_addr: String) -> runtime_cloud_c
         org_name: None,
         app_name: None,
         monitor_url: None,
+        new_project_url: None,
         enc_private_key_pem: String::new(),
         enc_public_key_pem: String::new(),
         enc_previous_private_key_pem: String::new(),
@@ -106,6 +107,7 @@ async fn start_rejects_a_persisted_public_key_that_does_not_match_the_mtls_ident
 
     let config = enroll_config(
         "127.0.0.1:9".parse().expect("parse unused endpoint"),
+        None,
         dir.path(),
     );
     let runtime: Arc<dyn RuntimeHandle> =
@@ -227,6 +229,9 @@ impl RuntimeHandle for AttachmentRuntime {
         capability == Capability::AttachApp
     }
 
+    // This attachment-only test handle cannot hold delivered secrets.
+    async fn clear_cloud_delivered_secrets(&self) {}
+
     /// Mirrors the production handle: the tuple is persisted into the identity
     /// file before the command is acknowledged, so the test can assert what
     /// ends up on disk — org durability across detach and bare re-attach —
@@ -259,10 +264,13 @@ impl RuntimeHandle for CapturedRuntime {
         capability == Capability::ApplySpicepod
     }
 
+    // This test adapter persists only the Spicepod and holds no secret store.
+    async fn clear_cloud_delivered_secrets(&self) {}
+
     async fn apply_spicepod(
         &self,
         deployment: SpicepodDeployment<'_>,
-    ) -> Result<ApplyOutcome, CommandError> {
+    ) -> Result<serde_json::Value, CommandError> {
         let path = deployment
             .config_dir
             .join(runtime_cloud_connect::config::CLOUD_MANAGED_SPICEPOD_FILE);
@@ -275,11 +283,7 @@ impl RuntimeHandle for CapturedRuntime {
             spicepod_yaml: deployment.spicepod_yaml.to_string(),
             app_id: deployment.app_id.map(str::to_string),
         });
-        // `settled`, not `exit_to_apply`: this handle has no process to restart,
-        // and asking the client to exit would take the test process with it.
-        Ok(ApplyOutcome::settled(
-            serde_json::json!({ "path": path.display().to_string() }),
-        ))
+        Ok(serde_json::json!({ "path": path.display().to_string() }))
     }
 }
 
@@ -300,8 +304,10 @@ async fn spawn_server(mock: MockServer) -> SocketAddr {
 }
 
 // --------------------------------------------------------------------------
-// Mock cloud enroll endpoint (plain HTTP; the enroll contract is HTTPS in
-// production, which is reqwest's standard path and not under test here).
+// Mock cloud enroll endpoint, served over TLS by the same throwaway CA that
+// signs the client CSRs. `EnrollClient::new` normalizes the configured endpoint
+// through an HTTPS-only policy, so a plaintext mock is unreachable by
+// construction and the client is handed this CA to verify the listener.
 // --------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -313,10 +319,14 @@ struct EnrollMockState {
     /// When set, every request is rejected with this (status, code, error).
     reject: Option<(u16, &'static str, &'static str)>,
     ca: Arc<EnrollCa>,
+    reported_not_after: Arc<Mutex<Vec<String>>>,
 }
 
 struct EnrollCa {
     certificate_pem: String,
+    /// Leaf the mock's own listener presents, signed by this CA.
+    server_cert_der: rustls::pki_types::CertificateDer<'static>,
+    server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
     issuer: Issuer<'static, KeyPair>,
 }
 
@@ -335,23 +345,53 @@ impl EnrollCa {
         let certificate = parameters
             .self_signed(&key)
             .expect("self-sign enrollment test CA");
+        // The issuer owns the CA parameters and key, and signs both the
+        // listener's leaf below and the client CSRs that arrive later.
+        let issuer = Issuer::new(parameters, key);
+
+        let server_key = KeyPair::generate().expect("generate enrollment mock listener key");
+        let mut server_parameters = CertificateParams::default();
+        server_parameters
+            .distinguished_name
+            .push(DnType::CommonName, "spice-test-enroll-endpoint");
+        server_parameters.subject_alt_names = vec![
+            SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            SanType::DnsName(
+                "localhost"
+                    .try_into()
+                    .expect("localhost is a valid DNS SAN"),
+            ),
+        ];
+        server_parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_certificate = server_parameters
+            .signed_by(&server_key, &issuer)
+            .expect("sign enrollment mock listener leaf");
+
         Self {
             certificate_pem: certificate.pem(),
-            issuer: Issuer::new(parameters, key),
+            server_cert_der: server_certificate.der().clone(),
+            server_key_der: rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()),
+            ),
+            issuer,
         }
     }
 
-    fn sign_csr(&self, csr_pem: &str) -> String {
-        CertificateSigningRequestParams::from_pem(csr_pem)
-            .expect("parse enrollment CSR")
+    fn sign_csr(&self, csr_pem: &str, validity: Duration) -> (String, String) {
+        let now = std::time::SystemTime::now();
+        let not_after = now + validity;
+        let mut request =
+            CertificateSigningRequestParams::from_pem(csr_pem).expect("parse enrollment CSR");
+        request.params.not_before = (now - Duration::from_mins(1)).into();
+        request.params.not_after = not_after.into();
+        let certificate = request
             .signed_by(&self.issuer)
             .expect("sign enrollment CSR")
-            .pem()
+            .pem();
+        let reported_not_after = chrono::DateTime::<chrono::Utc>::from(not_after)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        (certificate, reported_not_after)
     }
-}
-
-fn not_after_in(hours: i64) -> String {
-    (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
 }
 
 async fn enroll_handler(
@@ -365,9 +405,15 @@ async fn enroll_handler(
             Json(serde_json::json!({ "code": code, "error": error, "retryable": false })),
         );
     }
-    let identity_certificate = state
-        .ca
-        .sign_csr(body["csr_pem"].as_str().expect("CSR is a string"));
+    let (identity_certificate, not_after) = state.ca.sign_csr(
+        body["csr_pem"].as_str().expect("CSR is a string"),
+        Duration::from_hours(24),
+    );
+    state
+        .reported_not_after
+        .lock()
+        .await
+        .push(not_after.clone());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -375,7 +421,7 @@ async fn enroll_handler(
             "identity_cert_pem": identity_certificate,
             "ca_bundle_pem": state.ca.certificate_pem.clone(),
             "gateway_addr": state.gateway_addr,
-            "not_after": not_after_in(24),
+            "not_after": not_after,
             "organization": {"id": 7, "name": "unit-org"},
             "portal": {"new_project_url": "https://cloud.test/unit-org/new?instance=inst_unit_test"},
             "attachment": null,
@@ -383,37 +429,111 @@ async fn enroll_handler(
     )
 }
 
-/// Serve the mock enroll endpoint on an ephemeral port; returns its address
-/// and the captured request log.
+/// A TCP listener that hands `axum::serve` TLS streams. A handshake that fails
+/// drops that connection and the listener keeps serving, because a test client
+/// that mistrusts the CA must see a TLS error rather than a hung accept loop.
+struct TlsListener {
+    tcp: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, address) = self.tcp.accept().await.expect("accept enroll connection");
+            if let Ok(stream) = self.acceptor.accept(stream).await {
+                return (stream, address);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.tcp.local_addr()
+    }
+}
+
+/// The running mock: where it listens, what it captured, and the CA a client
+/// has to trust to reach it.
+struct EnrollMock {
+    addr: SocketAddr,
+    /// Captured request bodies, in arrival order.
+    requests: Arc<Mutex<Vec<Value>>>,
+    /// The `not_after` the mock reported for each certificate it issued.
+    reported_not_after: Arc<Mutex<Vec<String>>>,
+    /// PEM of the CA that signed the listener's certificate.
+    ca_cert_pem: String,
+}
+
+/// Serve the mock enroll endpoint over HTTPS on an ephemeral port.
 async fn spawn_enroll_server(
     gateway_addr: String,
     reject: Option<(u16, &'static str, &'static str)>,
-) -> (SocketAddr, Arc<Mutex<Vec<Value>>>) {
+) -> EnrollMock {
+    // `rustls::ServerConfig` is built from the process-default crypto provider
+    // and panics when none is installed. Idempotent, so every mock can ask.
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let reported_not_after = Arc::new(Mutex::new(Vec::new()));
+    let ca = Arc::new(EnrollCa::new());
+    let ca_cert_pem = ca.certificate_pem.clone();
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![ca.server_cert_der.clone()],
+            ca.server_key_der.clone_key(),
+        )
+        .expect("build the enroll mock's TLS configuration");
     let state = EnrollMockState {
         requests: Arc::clone(&requests),
         gateway_addr,
         reject,
-        ca: Arc::new(EnrollCa::new()),
+        ca,
+        reported_not_after: Arc::clone(&reported_not_after),
     };
     let app = Router::new()
         .route("/v1/cloud-connect/enroll", post(enroll_handler))
         .with_state(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
-    let addr = listener.local_addr().expect("local_addr");
+    let tcp = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the enroll mock");
+    let addr = tcp.local_addr().expect("local_addr");
+    let listener = TlsListener {
+        tcp,
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls)),
+    };
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (addr, requests)
+    EnrollMock {
+        addr,
+        requests,
+        reported_not_after,
+        ca_cert_pem,
+    }
 }
 
-fn enroll_config(enroll_addr: SocketAddr, dir: &std::path::Path) -> CloudConnectConfig {
+/// `ca_cert_pem` is the CA of the endpoint being addressed, or `None` for an
+/// address nothing listens on — the endpoint is still normalized at startup, so
+/// even an unused one has to satisfy the HTTPS-only policy.
+fn enroll_config(
+    enroll_addr: SocketAddr,
+    ca_cert_pem: Option<String>,
+    dir: &std::path::Path,
+) -> CloudConnectConfig {
     CloudConnectConfig {
-        enroll_endpoint: format!("http://{enroll_addr}"),
-        // No override: the stream must connect to the gateway_addr issued
-        // by the enroll response (http:// scheme because insecure=true).
+        enroll_endpoint: format!("https://{enroll_addr}"),
+        // No override: the stream must connect to the gateway_addr issued by the
+        // enroll response, over h2c because insecure=true. `insecure` selects
+        // the control-stream scheme only — it never relaxes the enroll
+        // endpoint's, which is HTTPS in every configuration.
         gateway_endpoint: None,
-        ca_cert_pem: None,
+        ca_cert_pem,
         insecure: true,
         identity_path: dir.join("identity.json"),
         config_dir: dir.to_path_buf(),
@@ -459,9 +579,9 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
     let mock_state = Arc::clone(&mock.state);
     let gateway_addr = spawn_server(mock).await;
 
-    let (enroll_addr, enroll_requests) = spawn_enroll_server(gateway_addr.to_string(), None).await;
+    let enroll = spawn_enroll_server(gateway_addr.to_string(), None).await;
 
-    let config = enroll_config(enroll_addr, dir.path());
+    let config = enroll_config(enroll.addr, Some(enroll.ca_cert_pem.clone()), dir.path());
 
     // Enrollment happens BEFORE the client exists — the `spiced --token`
     // sequence — and its return means the identity is durable.
@@ -489,19 +609,36 @@ async fn pre_runtime_enroll_persists_identity_and_connects() {
     assert!(identity.public_key_pem.contains("PUBLIC KEY"));
     assert!(identity.private_key_pem.contains("PRIVATE KEY"));
     assert_eq!(identity.gateway_addr, gateway_addr.to_string());
+    // The portal metadata the enroll reported is durable too: every later start
+    // reports the same organization and sends an unattached instance to the
+    // same page, without deriving a portal route of its own.
+    assert_eq!(identity.org_name.as_deref(), Some("unit-org"));
+    assert_eq!(
+        identity.new_project_url.as_deref(),
+        Some("https://cloud.test/unit-org/new?instance=inst_unit_test")
+    );
     assert_eq!(
         identity.ca_bundle_pem.matches("BEGIN CERTIFICATE").count(),
         1,
         "enroll ca_bundle_pem should be persisted into identity.json"
     );
-    assert!(
-        identity.not_after_unix.is_some_and(|secs| secs > 0),
-        "not_after must be parsed"
+    let reported_not_after = enroll.reported_not_after.lock().await;
+    let reported_not_after = chrono::DateTime::parse_from_rfc3339(
+        reported_not_after
+            .first()
+            .expect("the mock records its response expiry"),
+    )
+    .expect("parse the reported response expiry")
+    .timestamp();
+    assert_eq!(
+        identity.not_after_unix,
+        Some(u64::try_from(reported_not_after).expect("reported expiry is after the Unix epoch")),
+        "the signed durable renewal deadline must match the independently captured response expiry"
     );
 
     // The enroll request carried the canonical contract shape: kind + token
     // + csr_pem + host facts nested under `instance`.
-    let requests = enroll_requests.lock().await.clone();
+    let requests = enroll.requests.lock().await.clone();
     assert_eq!(requests.len(), 1, "exactly one enroll request");
     let body = &requests[0];
     assert_eq!(body["kind"], "standalone");
@@ -574,13 +711,13 @@ async fn a_terminal_rejection_creates_no_identity_and_stops_immediately() {
 
     // The cloud terminally rejects the key (unknown/consumed). No gateway
     // is involved.
-    let (enroll_addr, enroll_requests) = spawn_enroll_server(
+    let enroll = spawn_enroll_server(
         String::new(),
         Some((401, "invalid_token", "unknown enrollment key")),
     )
     .await;
 
-    let config = enroll_config(enroll_addr, dir.path());
+    let config = enroll_config(enroll.addr, Some(enroll.ca_cert_pem.clone()), dir.path());
     let err = runtime_cloud_connect::enroll_now(&config, &token_authority(), quick_retry())
         .await
         .expect_err("a terminal rejection fails the bootstrap");
@@ -594,7 +731,7 @@ async fn a_terminal_rejection_creates_no_identity_and_stops_immediately() {
     // afterwards finds no identity and stays disabled.
     assert!(!identity_path.exists(), "no identity on rejection");
     assert_eq!(
-        enroll_requests.lock().await.len(),
+        enroll.requests.lock().await.len(),
         1,
         "a terminal rejection must not be retried"
     );
@@ -645,8 +782,9 @@ async fn apply_spicepod_writes_file_and_acks() {
     });
 
     let config = CloudConnectConfig {
-        // Never contacted: the identity is pre-seeded and unbounded.
-        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        // Never contacted: the identity is pre-seeded and unbounded. It is
+        // still normalized at startup, and that policy is HTTPS-only.
+        enroll_endpoint: "https://127.0.0.1:9".to_string(),
         gateway_endpoint: None,
         ca_cert_pem: None,
         insecure: true,
@@ -803,7 +941,9 @@ async fn attach_app_applies_complete_state_and_rejects_empty_ids() {
         identity_path: identity_path.clone(),
     });
     let config = CloudConnectConfig {
-        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        // Never contacted, but normalized at startup, and that policy is
+        // HTTPS-only.
+        enroll_endpoint: "https://127.0.0.1:9".to_string(),
         gateway_endpoint: None,
         ca_cert_pem: None,
         insecure: true,
@@ -965,7 +1105,9 @@ async fn unknown_command_is_nacked_rather_than_dropped() {
     IdentityStore::store(&identity_path, &identity).unwrap();
 
     let config = CloudConnectConfig {
-        enroll_endpoint: "http://127.0.0.1:9".to_string(),
+        // Never contacted, but normalized at startup, and that policy is
+        // HTTPS-only.
+        enroll_endpoint: "https://127.0.0.1:9".to_string(),
         gateway_endpoint: None,
         ca_cert_pem: None,
         insecure: true,

@@ -34,41 +34,66 @@ use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use snafu::prelude::*;
+use util::single_line;
 
 use crate::{
     DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, FieldMetadata, Read,
     RefreshableCatalogProvider, SOURCE_TYPE_METADATA_KEY, metadata_enriched_table_provider,
 };
 
+/// Every variant is worded to read as the `Cause:` clause of the message that
+/// reports it. Each is raised inside a schema or table refresh whose own message
+/// states the problem -- naming the catalog, the schema and the step that failed
+/// -- and the impact on what the user can query, so a variant that named any of
+/// those would say it twice. What they owe the user is the specific failure and
+/// its fix.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to get connection from PostgreSQL pool: {source}. Check `pg_host`/`pg_port`/`pg_user`/`pg_pass`/`pg_sslmode` in the dataset params and that the server is reachable. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "Failed to connect to PostgreSQL: {source}. Check the `pg_host`, `pg_port`, `pg_user`, `pg_pass` and `pg_sslmode` parameters, and that the database is reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     ConnectionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    // Raised only by this module's `information_schema` discovery queries --
+    // never anything the user wrote -- so the fix is a grant, not "check your
+    // SQL". A query can also fail after connecting (a dropped connection), where
+    // no grant helps, so reachability stays in it. The step being performed is
+    // named by the message reporting this, and the relation the server objected
+    // to by `source`; the query text itself is debug detail and stays out.
     #[snafu(display(
-        "PostgreSQL query failed: {source}. Check SQL syntax and that referenced tables exist. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "A PostgreSQL query failed: {source}. Check that the connected role can read `information_schema` and `pg_catalog`, and that the database is still reachable from Spice. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     QueryFailed { source: tokio_postgres::Error },
 
+    /// The bulk column-type lookup failing is reported by the fallback warning,
+    /// which names the catalog, the schema and the step, so this adds only the
+    /// fix -- hence a display that opens with its own source.
     #[snafu(display(
-        "Failed to resolve table schemas for the PostgreSQL catalog: {source}. Check that the connected role can read `pg_catalog`, and that every column type is supported or `unsupported_type_action` permits it. Docs: https://spiceai.org/docs/components/data-connectors/postgres"
+        "{source}. Check that the connected role can read `pg_catalog`, and that every column type is supported or `unsupported_type_action` permits it. Docs: {POSTGRES_CONNECTOR_DOCS}"
     ))]
     SchemaResolutionFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to resolve table schemas for the PostgreSQL catalog: the connection pool returned a connection of an unexpected type. An unexpected error occurred. Report a bug: https://github.com/spiceai/spiceai/issues"
+        "An unexpected error occurred. Report this bug: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedConnectionType {},
 
+    /// Listing the catalog's schemas is the one discovery step with no
+    /// per-schema warning to report it -- it fails the whole refresh -- so
+    /// naming the step is this variant's job. The catalog is named by the error
+    /// that wraps this one.
+    #[snafu(display("Failed to list the catalog's schemas. Cause: {source}"))]
+    SchemaListingFailed {
+        source: connector_postgres_common::Error,
+    },
+
     /// Wraps errors from the shared `connector-postgres-common` queries
-    /// (`list_schemas`/`list_tables`, re-exported below) so this crate's own
-    /// callers can still propagate them with `?`.
+    /// (`list_tables`, re-exported below) so this crate's own callers can still
+    /// propagate them with `?`.
     #[snafu(display("{source}"), context(false))]
     Common {
         source: connector_postgres_common::Error,
@@ -77,7 +102,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Linked by the messages about include/exclude patterns and catalog
+/// registration, which have no data-connector equivalent.
 const POSTGRES_CATALOG_DOCS: &str = "https://spiceai.org/docs/components/catalogs/postgres";
+
+/// Linked by everything a dataset using the `PostgreSQL` data connector would hit
+/// identically -- connection parameters, role grants, `unsupported_type_action`.
+/// Those are documented with the connector, so the connector's page is the one
+/// that answers them for a catalog user too.
+const POSTGRES_CONNECTOR_DOCS: &str =
+    "https://spiceai.org/docs/components/data-connectors/postgres";
 
 pub use connector_postgres_common::{
     ReplicaIdentityOutcome, ReplicationSlotStatus, SkipReason, ViewRelation,
@@ -161,12 +195,13 @@ impl PostgresCatalogProvider {
             // queries issued, never the catalog's namespace.
             if !self.selector.may_select_within(schema_name) {
                 tracing::debug!(
-                    schema = %schema_name,
-                    "Schema cannot match any include pattern, skipping its metadata queries"
+                    "Schema '{schema_name}' of PostgreSQL catalog '{}' cannot match any include pattern; skipping its table discovery",
+                    self.catalog_name
                 );
                 schemas.insert(
                     schema_name.clone(),
                     Arc::new(PostgresSchemaProvider::new(
+                        self.catalog_name.clone(),
                         Arc::clone(&self.pool),
                         schema_name.clone(),
                         Arc::clone(&self.table_creator),
@@ -180,9 +215,13 @@ impl PostgresCatalogProvider {
                 Ok(fks) => fks,
                 Err(e) => {
                     tracing::warn!(
-                        schema = %schema_name,
-                        error = %e,
-                        "Failed to query foreign keys for schema, continuing without FK metadata"
+                        "{}",
+                        schema_metadata_warning(
+                            &self.catalog_name,
+                            schema_name,
+                            SchemaMetadata::ForeignKeys,
+                            &e.to_string(),
+                        )
                     );
                     HashMap::new()
                 }
@@ -191,15 +230,20 @@ impl PostgresCatalogProvider {
                 Ok(comments) => comments,
                 Err(e) => {
                     tracing::warn!(
-                        schema = %schema_name,
-                        error = %e,
-                        "Failed to query comments for schema, continuing without comment metadata"
+                        "{}",
+                        schema_metadata_warning(
+                            &self.catalog_name,
+                            schema_name,
+                            SchemaMetadata::Descriptions,
+                            &e.to_string(),
+                        )
                     );
                     HashMap::new()
                 }
             };
 
             let schema_provider = PostgresSchemaProvider::new(
+                self.catalog_name.clone(),
                 Arc::clone(&self.pool),
                 schema_name.clone(),
                 Arc::clone(&self.table_creator),
@@ -228,30 +272,29 @@ impl PostgresCatalogProvider {
                 guard.get(schema_name).cloned()
             };
 
-            match schema_refresh_outcome(refresh_result.is_ok(), previous.is_some()) {
+            let outcome = schema_refresh_outcome(refresh_result.is_ok(), previous.is_some());
+            if let Err(e) = &refresh_result
+                && let Some(warning) = schema_discovery_warning(
+                    &self.catalog_name,
+                    schema_name,
+                    outcome,
+                    &e.to_string(),
+                )
+            {
+                tracing::warn!("{warning}");
+            }
+
+            match outcome {
                 SchemaRefreshOutcome::InsertNew => {
                     schemas.insert(schema_name.clone(), Arc::new(schema_provider));
                 }
                 SchemaRefreshOutcome::KeepPrevious => {
                     // Only the (Err, Some) branch reaches here, so both are present.
-                    if let (Err(e), Some(previous)) = (&refresh_result, previous) {
-                        tracing::warn!(
-                            schema = %schema_name,
-                            error = %e,
-                            "Failed to discover tables for schema, keeping last-known-good state"
-                        );
+                    if let Some(previous) = previous {
                         schemas.insert(schema_name.clone(), previous);
                     }
                 }
-                SchemaRefreshOutcome::Skip => {
-                    if let Err(e) = &refresh_result {
-                        tracing::warn!(
-                            schema = %schema_name,
-                            error = %e,
-                            "Failed to discover tables for schema, skipping schema"
-                        );
-                    }
-                }
+                SchemaRefreshOutcome::Skip => {}
             }
         }
 
@@ -431,7 +474,9 @@ impl PostgresCatalogProvider {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        Ok(list_schemas(&self.pool).await?)
+        list_schemas(&self.pool)
+            .await
+            .context(SchemaListingFailedSnafu)
     }
 }
 
@@ -465,6 +510,9 @@ impl RefreshableCatalogProvider for PostgresCatalogProvider {
 
 /// A schema provider for `PostgreSQL` that discovers tables within a schema.
 pub struct PostgresSchemaProvider {
+    /// Named by every message this schema logs: a schema name alone does not
+    /// tell an operator running several catalogs which one is degraded.
+    catalog_name: String,
     pool: Arc<PostgresConnectionPool>,
     schema_name: String,
     table_creator: Arc<dyn Read>,
@@ -488,12 +536,14 @@ impl std::fmt::Debug for PostgresSchemaProvider {
 impl PostgresSchemaProvider {
     #[must_use]
     pub fn new(
+        catalog_name: String,
         pool: Arc<PostgresConnectionPool>,
         schema_name: String,
         table_creator: Arc<dyn Read>,
         selector: TableSelector,
     ) -> Self {
         Self {
+            catalog_name,
             pool,
             schema_name,
             table_creator,
@@ -546,16 +596,22 @@ impl PostgresSchemaProvider {
             Ok(schemas) => schemas,
             Err(e) => {
                 tracing::warn!(
-                    schema = %self.schema_name,
-                    error = %e,
-                    "Failed to resolve this PostgreSQL schema's table schemas in one query, falling back to per-table resolution"
+                    "{}",
+                    column_types_fallback_warning(
+                        &self.catalog_name,
+                        &self.schema_name,
+                        &e.to_string(),
+                    )
                 );
                 HashMap::new()
             }
         };
 
         let tables = build_table_providers_for_schema(
-            &self.schema_name,
+            SchemaLocation {
+                catalog: &self.catalog_name,
+                schema: &self.schema_name,
+            },
             table_names,
             &self.table_creator,
             &self.selector,
@@ -705,8 +761,113 @@ fn empty_catalog_warning(
     };
 
     Some(format!(
-        "PostgreSQL catalog {catalog_name} registered no tables, so queries against it will not resolve any table. {cause}. Docs: {POSTGRES_CATALOG_DOCS}"
+        "PostgreSQL catalog '{catalog_name}' registered no tables, so queries against it will not resolve any table. {cause}. Docs: {POSTGRES_CATALOG_DOCS}"
     ))
+}
+
+/// The metadata a schema query contributes to the tables it describes, named
+/// as the user meets it rather than as the query that fetches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaMetadata {
+    ForeignKeys,
+    Descriptions,
+}
+
+/// The one-line report for a schema whose table discovery failed.
+///
+/// Discovery failing is not fatal (#11724), which is exactly what makes the
+/// wording load-bearing: the user's symptom is a schema that is empty or stale,
+/// and this line is the only explanation they get.
+///
+/// Every message here states one problem and then its impact -- "failed to X, so
+/// Y" -- rather than reporting the impact and the failure as if they were two
+/// separate events, and ends with the cause, which carries the specific fix and
+/// a documentation link where it has one.
+///
+/// Returns `None` for a schema that refreshed successfully, which has nothing
+/// to report.
+fn schema_discovery_warning(
+    catalog_name: &str,
+    schema_name: &str,
+    outcome: SchemaRefreshOutcome,
+    cause: &str,
+) -> Option<String> {
+    let cause = single_line(cause);
+    match outcome {
+        SchemaRefreshOutcome::InsertNew => None,
+        SchemaRefreshOutcome::KeepPrevious => Some(format!(
+            "PostgreSQL catalog '{catalog_name}' failed to list the tables of schema '{schema_name}', so it is still serving the tables it discovered earlier, which may now be out of date: a table added, renamed or dropped since then is not reflected. The schema is retried on the next refresh. Cause: {cause}"
+        )),
+        SchemaRefreshOutcome::Skip => Some(format!(
+            "PostgreSQL catalog '{catalog_name}' failed to list the tables of schema '{schema_name}', so no table in that schema is registered and queries against '{catalog_name}.{schema_name}' will not resolve. The rest of the catalog is unaffected, and the schema is retried on the next refresh. Cause: {cause}"
+        )),
+    }
+}
+
+/// The one-line report for a schema whose tables registered without the foreign
+/// keys or descriptions a metadata query would have attached.
+fn schema_metadata_warning(
+    catalog_name: &str,
+    schema_name: &str,
+    metadata: SchemaMetadata,
+    cause: &str,
+) -> String {
+    let cause = single_line(cause);
+    match metadata {
+        SchemaMetadata::ForeignKeys => format!(
+            "PostgreSQL catalog '{catalog_name}' failed to determine the foreign keys of schema '{schema_name}', so anything relying on them -- including SQL generated from natural language -- cannot see how its tables join. Cause: {cause}"
+        ),
+        SchemaMetadata::Descriptions => format!(
+            "PostgreSQL catalog '{catalog_name}' failed to read the table and column descriptions of schema '{schema_name}', so the comments defined in PostgreSQL are unavailable to queries and to the tools that read them. Cause: {cause}"
+        ),
+    }
+}
+
+/// The one-line report for a schema whose column types could not be read in one
+/// query. Nothing the user queries changes -- each table is described on its own
+/// instead -- so this reports the cost, and says so rather than implying data is
+/// missing.
+fn column_types_fallback_warning(catalog_name: &str, schema_name: &str, cause: &str) -> String {
+    let cause = single_line(cause);
+    format!(
+        "PostgreSQL catalog '{catalog_name}' failed to describe the tables of schema '{schema_name}' in a single query, so each is described separately and this refresh is slower; the tables it registers are unaffected. Cause: {cause}"
+    )
+}
+
+/// Where a table is being registered, as its messages name it. The catalog and
+/// the schema travel together because no message on this path names one without
+/// the other: a schema name alone does not tell an operator running several
+/// catalogs which one lost a table.
+#[derive(Debug, Clone, Copy)]
+struct SchemaLocation<'a> {
+    catalog: &'a str,
+    schema: &'a str,
+}
+
+/// The one-line report for a table that was selected but could not be loaded.
+/// The cause comes from the table's own loader rather than this module, so this
+/// message carries the fix and the documentation link itself.
+fn table_skipped_warning(location: SchemaLocation<'_>, table_name: &str, cause: &str) -> String {
+    let SchemaLocation { catalog, schema } = location;
+    let cause = single_line(cause);
+    format!(
+        "PostgreSQL catalog '{catalog}' failed to load table '{schema}.{table_name}', so it is absent from the catalog and queries against '{catalog}.{schema}.{table_name}' will not resolve. It is retried on the next refresh. Cause: {cause}. Check that the connected role has SELECT on the table, and that its column types are supported or `unsupported_type_action` permits them. Docs: {POSTGRES_CONNECTOR_DOCS}"
+    )
+}
+
+/// The one-line report for a table registered without its foreign keys because
+/// they could not be recorded. Recording them is Spice's own work on data it
+/// just read, so a failure here is a bug rather than something the user can fix.
+fn table_foreign_keys_warning(
+    location: SchemaLocation<'_>,
+    table_name: &str,
+    cause: &str,
+) -> String {
+    let SchemaLocation { catalog, schema } = location;
+    let cause = single_line(cause);
+    format!(
+        "PostgreSQL catalog '{catalog}' failed to record the foreign keys of table '{schema}.{table_name}', so anything relying on them cannot see how it joins to other tables. Cause: {cause}. Report this bug: https://github.com/spiceai/spiceai/issues"
+    )
 }
 
 /// What `refresh_schemas` does with a single schema after attempting to refresh
@@ -738,7 +899,7 @@ fn schema_refresh_outcome(refresh_succeeded: bool, has_previous: bool) -> Schema
 }
 
 async fn build_table_providers_for_schema(
-    schema_name: &str,
+    location: SchemaLocation<'_>,
     table_names: Vec<String>,
     table_creator: &Arc<dyn Read>,
     selector: &TableSelector,
@@ -746,12 +907,18 @@ async fn build_table_providers_for_schema(
     comments: &CommentMap,
     schemas: &HashMap<String, SchemaRef>,
 ) -> HashMap<String, Arc<dyn TableProvider>> {
+    let SchemaLocation {
+        catalog: catalog_name,
+        schema: schema_name,
+    } = location;
     let mut tables = HashMap::new();
 
     for table_name in table_names {
         let schema_with_table = format!("{schema_name}.{table_name}");
         if let Some(reason) = selector.rejection_reason(&schema_with_table) {
-            tracing::debug!("Table {schema_with_table} is not selected ({reason}), skipping");
+            tracing::debug!(
+                "Table '{schema_with_table}' is not selected ({reason}); it is absent from PostgreSQL catalog '{catalog_name}'"
+            );
             continue;
         }
 
@@ -778,10 +945,8 @@ async fn build_table_providers_for_schema(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                schema = %schema_name,
-                                table = %table_name,
-                                error = %e,
-                                "Failed to serialize foreign key metadata for table {schema_name}.{table_name}; registering without FK metadata"
+                                "{}",
+                                table_foreign_keys_warning(location, &table_name, &e.to_string(),)
                             );
                         }
                     }
@@ -806,10 +971,8 @@ async fn build_table_providers_for_schema(
             }
             Err(e) => {
                 tracing::warn!(
-                    schema = %schema_name,
-                    table = %table_name,
-                    error = %e,
-                    "Failed to create table provider for PostgreSQL table {schema_with_table}, skipping"
+                    "{}",
+                    table_skipped_warning(location, &table_name, &e.to_string())
                 );
             }
         }
@@ -898,8 +1061,11 @@ impl SchemaProvider for PostgresSchemaProvider {
 mod tests {
     use super::{
         CommentMap, ForeignKeyConstraint, ForeignKeyMap, POSTGRES_CATALOG_DOCS,
-        SchemaRefreshOutcome, TableComments, build_table_providers_for_schema,
-        empty_catalog_warning, foreign_key_target, schema_refresh_outcome, select_relations,
+        POSTGRES_CONNECTOR_DOCS, SchemaLocation, SchemaMetadata, SchemaRefreshOutcome,
+        TableComments, build_table_providers_for_schema, column_types_fallback_warning,
+        empty_catalog_warning, foreign_key_target, schema_discovery_warning,
+        schema_metadata_warning, schema_refresh_outcome, select_relations,
+        table_foreign_keys_warning, table_skipped_warning,
     };
     use crate::{
         DESCRIPTION_METADATA_KEY, FOREIGN_KEYS_METADATA_KEY, Read, SOURCE_TYPE_METADATA_KEY,
@@ -1136,6 +1302,133 @@ mod tests {
         }
     }
 
+    /// A schema whose discovery fails is skipped or held at its last known
+    /// contents, and the log line is the only explanation the user gets for a
+    /// catalog that is missing tables or serving stale ones. Both must name the
+    /// catalog and the schema, and say which of the two happened.
+    #[test]
+    fn schema_discovery_warning_says_what_the_user_will_observe() {
+        let skipped = schema_discovery_warning(
+            "pg",
+            "sales",
+            SchemaRefreshOutcome::Skip,
+            // The shape the pool really produces: a cause that spans lines. A
+            // tidy fixture would let a formatter that never normalizes pass.
+            "Failed to connect to PostgreSQL: PostgreSQL connection failed.\ndb error: connection refused",
+        )
+        .expect("a failed discovery should report");
+
+        assert!(
+            skipped.contains("PostgreSQL catalog 'pg'") && skipped.contains("schema 'sales'"),
+            "names the catalog and the schema: {skipped}"
+        );
+        assert!(
+            skipped.contains("failed to list the tables of schema 'sales'"),
+            "states the problem first: {skipped}"
+        );
+        assert!(
+            skipped.contains("so no table in that schema is registered")
+                && skipped.contains("queries against 'pg.sales' will not resolve"),
+            "then its impact, as one situation rather than two: {skipped}"
+        );
+        assert!(
+            skipped.contains("Cause: Failed to connect to PostgreSQL: PostgreSQL connection failed. db error: connection refused"),
+            "and ends with the cause, labelled and collapsed to one line: {skipped}"
+        );
+
+        let kept = schema_discovery_warning(
+            "pg",
+            "sales",
+            SchemaRefreshOutcome::KeepPrevious,
+            "Failed to connect to PostgreSQL: PostgreSQL connection failed.\ndb error: connection refused",
+        )
+        .expect("a failed discovery should report");
+        assert!(
+            kept.contains("failed to list the tables of schema 'sales'")
+                && kept.contains("out of date"),
+            "a schema held at its last known contents is stale, not absent: {kept}"
+        );
+
+        for message in [&skipped, &kept] {
+            assert!(!message.contains('\n'), "stays on one line: {message:?}");
+            assert!(
+                !message.contains("table provider") && !message.contains("last-known-good"),
+                "uses no internal vocabulary: {message}"
+            );
+        }
+
+        assert!(
+            schema_discovery_warning("pg", "sales", SchemaRefreshOutcome::InsertNew, "").is_none(),
+            "a schema that refreshed has nothing to report"
+        );
+    }
+
+    /// The remaining degrade-and-continue paths leave a table or a whole schema
+    /// short of something the user configured, so each has to name the catalog
+    /// and what is missing from it.
+    #[test]
+    fn degraded_refresh_warnings_name_the_catalog_and_the_loss() {
+        // Every cause here spans lines, so a builder that stopped normalizing
+        // would fail the one-line assertion below rather than pass on a fixture.
+        let multiline = "permission denied for table pg_constraint\nCaused by: denied";
+        let fks = schema_metadata_warning("pg", "sales", SchemaMetadata::ForeignKeys, multiline);
+        assert!(
+            fks.contains(
+                "PostgreSQL catalog 'pg' failed to determine the foreign keys of schema 'sales'"
+            ) && fks.contains("cannot see how its tables join"),
+            "one problem, then its impact: {fks}"
+        );
+
+        let comments =
+            schema_metadata_warning("pg", "sales", SchemaMetadata::Descriptions, multiline);
+        assert!(
+            comments.contains("failed to read the table and column descriptions of schema 'sales'"),
+            "{comments}"
+        );
+
+        let fallback = column_types_fallback_warning("pg", "sales", multiline);
+        assert!(
+            fallback.contains("slower") && fallback.contains("unaffected"),
+            "the fallback costs time, not tables, and must say so: {fallback}"
+        );
+
+        let location = SchemaLocation {
+            catalog: "pg",
+            schema: "sales",
+        };
+        let skipped =
+            table_skipped_warning(location, "orders", "unsupported type\nCaused by: jsonb");
+        assert!(
+            skipped.contains("failed to load table 'sales.orders'")
+                && skipped.contains("queries against 'pg.sales.orders' will not resolve"),
+            "{skipped}"
+        );
+        assert!(
+            skipped.contains("SELECT on the table") && skipped.contains(POSTGRES_CONNECTOR_DOCS),
+            "the loader's error carries no fix, so this message must: {skipped}"
+        );
+
+        let table_fks = table_foreign_keys_warning(location, "orders", "invalid json\nat line 2");
+        assert!(
+            table_fks.contains("github.com/spiceai/spiceai/issues"),
+            "recording foreign keys is Spice's own work, so a failure is a bug: {table_fks}"
+        );
+
+        for message in [&fks, &comments, &fallback, &skipped, &table_fks] {
+            assert!(!message.contains('\n'), "stays on one line: {message:?}");
+            assert!(
+                message.contains("failed to") && message.contains(", so "),
+                "states one problem and then its impact: {message}"
+            );
+            assert!(
+                !message.contains("metadata")
+                    && !message.contains("table provider")
+                    && !message.contains("serialize"),
+                "uses no internal vocabulary: {message}"
+            );
+        }
+    }
+
     /// The empty-catalog warning has to fire when a catalog *becomes* empty and
     /// stay quiet while it stays that way, or a steady misconfiguration prints
     /// once a refresh interval forever and the log stops being worth reading.
@@ -1167,7 +1460,7 @@ mod tests {
 
         let message = empty_catalog_warning("pg", None, 0, 0, 2, &filtered)
             .expect("an empty filtered catalog should warn");
-        assert!(message.contains("pg"), "names the catalog: {message}");
+        assert!(message.contains("'pg'"), "names the catalog: {message}");
         assert!(
             message.contains("include: ['public.orders']")
                 && message.contains("exclude: ['public.secret']"),
@@ -1293,7 +1586,10 @@ mod tests {
         );
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &read,
             &TableSelector::select_all(),
@@ -1325,7 +1621,10 @@ mod tests {
         let no_comments: CommentMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             &selector,
@@ -1349,7 +1648,10 @@ mod tests {
         let no_comments: CommentMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             &selector,
@@ -1374,7 +1676,10 @@ mod tests {
         let no_comments: CommentMap = HashMap::new();
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             &TableSelector::select_all(),
@@ -1403,7 +1708,10 @@ mod tests {
         let no_comments: CommentMap = HashMap::new();
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             &TableSelector::select_all(),
@@ -1433,7 +1741,10 @@ mod tests {
         );
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string(), "lineitem".to_string()],
             &table_creator,
             &TableSelector::select_all(),
@@ -1485,7 +1796,10 @@ mod tests {
         );
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["order_lines".to_string()],
             &table_creator,
             &TableSelector::select_all(),
@@ -1540,7 +1854,10 @@ mod tests {
         );
 
         let tables = build_table_providers_for_schema(
-            "public",
+            SchemaLocation {
+                catalog: "pg",
+                schema: "public",
+            },
             vec!["orders".to_string()],
             &table_creator,
             &TableSelector::select_all(),
