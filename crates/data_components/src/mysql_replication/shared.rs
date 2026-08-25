@@ -1109,22 +1109,33 @@ impl MemberStart {
 /// Which start a member takes when it holds no position it can resume from.
 ///
 /// `has_recorded_position` is asked first, because it — not `snapshot_mode` —
-/// answers whether the acceleration is already holding rows. A position that
-/// was recorded but can no longer be resumed from means the source's binary log
-/// no longer explains those rows: a row deleted at the source inside the
-/// unreachable window has no change event left to carry the deletion, so
-/// streaming from the current head would serve that row in every later query,
-/// and persisting the head would make it permanent.
+/// answers whether the acceleration is already holding rows. Two routes arrive
+/// here with one recorded, and a rebuild answers both:
 ///
-/// `initial_snapshot: disabled` does not suppress the rebuild. It says a
+/// * **The checkpoint was found unusable** and `invalid_checkpoint_behavior` is
+///   `restart` (`error` fails the member's stream before reaching here). The
+///   source's binary log no longer explains the rows already there: a row
+///   deleted at the source inside the unreachable window has no change event
+///   left to carry the deletion, so streaming from the current head would serve
+///   that row in every later query, and persisting the head would make it
+///   permanent.
+/// * **`initial_snapshot: always`**, which discards a still-resumable position
+///   by request. Nothing is wrong with the source on this route and
+///   `invalid_checkpoint_behavior` is never consulted — but the acceleration is
+///   holding rows just the same, so it is replaced rather than emptied and
+///   refilled.
+///
+/// `initial_snapshot: disabled` does not suppress the first of those. It says a
 /// *first* load must not read the table — a statement about rows the stream has
 /// not been asked to deliver — and cannot say that an acceleration whose
 /// history the source dropped may keep serving rows the source no longer has.
-/// `mysql_replication_invalid_checkpoint_behavior` decides that case, and
-/// `restart`, the behavior that let this member arrive here rather than failing
-/// its stream, asks for exactly this recovery. The rebuild does not use the
-/// snapshot path: it is a single zero-row signal the consumer answers with an
-/// atomic replacement ([`MemberStart::Rebuild`]).
+/// `mysql_replication_invalid_checkpoint_behavior` decides that, and `restart`
+/// asks for exactly this recovery. `disabled` and `always` are values of one
+/// parameter, so an acceleration reaching a rebuild under `disabled` reached it
+/// by the unusable-checkpoint route and no other.
+///
+/// Neither route uses the snapshot path: a rebuild is a single zero-row signal
+/// the consumer answers with an atomic replacement ([`MemberStart::Rebuild`]).
 ///
 /// Pure so the ordering is unit-testable without a live `MySQL`.
 fn start_without_usable_position(
@@ -2738,7 +2749,10 @@ mod tests {
         // logged.
         //
         // A recorded position is the evidence that rows are there, so it
-        // decides, whatever the snapshot mode says.
+        // decides, whatever the snapshot mode says. `always` is included
+        // because it reaches the same helper by the other route — it discards a
+        // still-resumable position by request — and must reload the rows it is
+        // holding by replacement rather than by emptying and refilling.
         for mode in [
             InitialSnapshotMode::Auto,
             InitialSnapshotMode::Always,
@@ -2747,7 +2761,7 @@ mod tests {
             assert_eq!(
                 start_without_usable_position(mode, true),
                 MemberStart::Rebuild,
-                "a recorded position that cannot be resumed from must be rebuilt under \
+                "a recorded position that will not be resumed from must be rebuilt under \
                  initial_snapshot: {mode:?}"
             );
         }
