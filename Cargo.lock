@@ -5093,6 +5093,7 @@ dependencies = [
  "runtime-parameters",
  "scylla",
  "snafu",
+ "tokio",
  "tracing",
 ]
 
