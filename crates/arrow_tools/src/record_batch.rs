@@ -76,8 +76,9 @@ impl From<Error> for DataFusionError {
 pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
 
-    // When schema is superset of the existing schema, including a new column, and nullable column,
-    // return a new RecordBatch to reflect the change.
+    // Re-label the batch wholesale when the target asks for nothing the columns do not already
+    // carry. `Fields::contains` pairs positionally and demands equal length, so this covers a
+    // schema that only relaxes a field — a column the target adds is handled per column below.
     //
     // `Schema::contains` answers "is this assignable", which permits a nested field's nullability
     // to differ; `RecordBatch` requires a column's type and its field's type to be identical, and
@@ -138,15 +139,22 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
 }
 
-/// Whether every field of `existing` has a same-named field in `target` carrying the identical
-/// type — the condition `RecordBatch` enforces, as distinct from the assignability
-/// `Schema::contains` answers.
+/// Whether the two schemas declare identical types, field by field — the condition `RecordBatch`
+/// enforces, as distinct from the assignability [`Schema::contains`] answers.
+///
+/// Paired positionally, the way `Fields::contains` pairs them, so this and the test it qualifies
+/// are answering about the same field pairs rather than two pairings that could disagree when a
+/// name repeats. Names themselves are not re-compared: `contains` has already established those.
 fn declares_the_same_types(target: &SchemaRef, existing: &SchemaRef) -> bool {
-    existing.fields().iter().all(|existing_field| {
-        target
-            .field_with_name(existing_field.name())
-            .is_ok_and(|target_field| target_field.data_type() == existing_field.data_type())
-    })
+    target.fields().len() == existing.fields().len()
+        && target
+            .fields()
+            .iter()
+            .zip(existing.fields())
+            .all(|(target_field, existing_field)| {
+                Arc::ptr_eq(target_field, existing_field)
+                    || target_field.data_type() == existing_field.data_type()
+            })
 }
 
 /// Returns `true` when `source` → `target` is a timestamp-to-timestamp cast that
