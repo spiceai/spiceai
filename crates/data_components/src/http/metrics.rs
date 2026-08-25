@@ -14,40 +14,71 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Gauges for the HTTP connector's response cache.
+//! Occupancy counters for the HTTP connector's response cache.
 //!
-//! This cache is not one of the caches under `runtime.caching`, so it had no
-//! instrumentation at all: whatever it held appeared only as process memory with
-//! no attribution, and an operator watching cache gauges would see nothing
-//! however large it grew. These two make its occupancy answerable.
+//! The cache is not one of the caches under `runtime.caching`, so it had no
+//! instrumentation at all: whatever it held showed up only as process memory
+//! with nothing to attribute it to, and an operator watching cache gauges would
+//! have seen nothing however large it grew.
+//!
+//! Only the counters live here. Publishing them is the connector's job, because
+//! that is where the dataset a cache belongs to is known — these are reported
+//! per dataset, and one shared registry of gauges could not say which dataset a
+//! figure came from.
 
-use std::sync::LazyLock;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use opentelemetry::{
-    global,
-    metrics::{Gauge, Meter},
-};
+/// Names of the metrics reported from [`HttpCacheMetrics`].
+///
+/// Kept beside the counters so a connector registering them cannot drift from
+/// what this module actually tracks.
+pub mod names {
+    /// Bytes retained, response bodies and their request keys together.
+    pub const RESPONSE_CACHE_SIZE_BYTES: &str = "response_cache_size_bytes";
+    /// Responses currently held. Read beside the byte figure this says whether
+    /// the cache holds a few large responses or very many small ones, which is
+    /// what distinguishes a payload-bound cache from a cardinality-bound one.
+    pub const RESPONSE_CACHE_ITEMS_COUNT: &str = "response_cache_items_count";
+}
 
-static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http_response_cache"));
+/// Live occupancy of one dataset's response cache.
+///
+/// Shared between the table provider that owns the cache and the metrics
+/// provider that reports it, so reporting never has to reach into the cache
+/// itself.
+#[derive(Debug, Default)]
+pub struct HttpCacheMetrics {
+    retained_bytes: AtomicU64,
+    items: AtomicU64,
+}
 
-/// Bytes currently retained by the connector's response cache: the response
-/// bodies, their headers, and the request-shaped keys.
-pub static HTTP_RESPONSE_CACHE_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("http_response_cache_size_bytes")
-        .with_description(
-            "Bytes retained by the HTTP connector's response cache, including response bodies and their request keys.",
-        )
-        .with_unit("By")
-        .build()
-});
+impl HttpCacheMetrics {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
 
-/// Entries currently held. Read beside the byte gauge this says whether the
-/// cache is holding a few large responses or very many small ones, which is what
-/// distinguishes a payload-bound cache from a cardinality-bound one.
-pub static HTTP_RESPONSE_CACHE_ITEMS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("http_response_cache_items_count")
-        .with_description("Number of responses held by the HTTP connector's response cache.")
-        .build()
-});
+    /// Records the cache's current occupancy.
+    ///
+    /// These are the cache implementation's own figures rather than a tally
+    /// maintained here, so they can lag a write by one housekeeping cycle. They
+    /// are also refreshed only when a request consults the cache, so on an idle
+    /// dataset they report the last observed occupancy rather than a live one —
+    /// which is the same thing, since nothing enters or leaves the cache except
+    /// on a request.
+    pub fn record(&self, retained_bytes: u64, items: u64) {
+        self.retained_bytes.store(retained_bytes, Ordering::Relaxed);
+        self.items.store(items, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained_bytes.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn items(&self) -> u64 {
+        self.items.load(Ordering::Relaxed)
+    }
+}
