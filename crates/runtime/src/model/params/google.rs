@@ -34,6 +34,7 @@ pub struct GoogleModelParams {
     /// `google_service_account_key`, or `google_application_default_credentials` is required.
     pub service_account_path: Option<String>,
     /// GCP service account JSON key as a string.
+    #[param(autoload_secret)]
     pub service_account_key: Option<SecretString>,
     /// Use Google Application Default Credentials for authentication. If the
     /// `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, uses that path.
