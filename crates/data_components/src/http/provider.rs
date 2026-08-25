@@ -53,6 +53,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::Instant,
     time::{Duration, SystemTime},
 };
 use url::Url;
@@ -225,8 +226,12 @@ struct CacheDirectives {
     /// Whether a `Cache-Control` header was present at all.
     present: bool,
     max_age: Option<Duration>,
-    /// `no-store` or `no-cache`; either forbids retention outright.
-    no_store: bool,
+    /// Whether anything the origin sent forbids retention. Set by `no-store`
+    /// and `no-cache`, and also where the origin's intent cannot be read at all
+    /// — an unreadable field, an unparseable or conflicting `max-age` — because
+    /// this path resolves ambiguity against caching. Named for what it decides
+    /// rather than for the one directive that most often sets it.
+    forbid_retention: bool,
 }
 
 #[derive(Clone)]
@@ -269,7 +274,7 @@ impl CachedResponse {
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(self.max_age),
-                no_store: false,
+                forbid_retention: false,
             },
             // Zero rather than the origin's age: the window carried here is
             // already what was left when the entry was admitted.
@@ -1139,7 +1144,7 @@ impl HttpTableProvider {
         for value in values {
             directives.present = true;
             let Some(header) = value else {
-                directives.no_store = true;
+                directives.forbid_retention = true;
                 continue;
             };
             for directive in header.split(',') {
@@ -1157,18 +1162,18 @@ impl HttpTableProvider {
                         // Ambiguous is treated as refused, as elsewhere here.
                         Ok(_) if directives.max_age.is_some() => {
                             directives.max_age = None;
-                            directives.no_store = true;
+                            directives.forbid_retention = true;
                         }
                         Ok(seconds) => directives.max_age = Some(Duration::from_secs(seconds)),
                         // A `max-age` we cannot read is not the same as no
                         // `max-age`: leaving it unset would let a configured
                         // fallback stand in for a directive the origin did send.
-                        Err(_) => directives.no_store = true,
+                        Err(_) => directives.forbid_retention = true,
                     }
                 } else if directive.eq_ignore_ascii_case("no-store")
                     || directive.eq_ignore_ascii_case("no-cache")
                 {
-                    directives.no_store = true;
+                    directives.forbid_retention = true;
                 }
             }
         }
@@ -1190,7 +1195,7 @@ impl HttpTableProvider {
         fallback_ttl: Option<Duration>,
         response_age: Option<Duration>,
     ) -> Option<Duration> {
-        if directives.no_store {
+        if directives.forbid_retention {
             return None;
         }
         match directives.max_age {
@@ -1432,6 +1437,14 @@ impl HttpTableProvider {
             .await
             .map_err(RetryError::transient)?;
 
+        // The freshness window is spent from the moment the origin generated the
+        // response, so the round trip spends it too — waiting on the origin and
+        // downloading the body alike. A `max-age=1` response that takes two
+        // seconds to arrive is stale before it lands, and timing nothing would
+        // admit it for another second. Timed per attempt, so a retry is not
+        // charged for the attempt that failed before it.
+        let attempt_started = Instant::now();
+
         let mut request_builder = if let Some(body_content) = body {
             let mut req = self.client.post(url.clone());
             let ct = self.content_type.as_deref().unwrap_or("application/json");
@@ -1484,7 +1497,7 @@ impl HttpTableProvider {
 
         // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
         // 4xx like 404 "not found" is a valid business response, not an error
-        Self::extract_response(response, status_code, path_label).await
+        Self::extract_response(response, status_code, path_label, attempt_started).await
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -1492,6 +1505,7 @@ impl HttpTableProvider {
         response: reqwest::Response,
         status_code: u16,
         path_label: &str,
+        attempt_started: Instant,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -1512,7 +1526,7 @@ impl HttpTableProvider {
         // to add and it is a count of seconds, so unlike deriving the age from
         // `Date` it does not turn a skewed origin clock into a cache that
         // refuses everything.
-        let response_age = response
+        let header_age = response
             .headers()
             .get(reqwest::header::AGE)
             .and_then(|value| value.to_str().ok())
@@ -1561,7 +1575,7 @@ impl HttpTableProvider {
         Ok(HttpFetchResult {
             content,
             directives,
-            response_age,
+            response_age: Some(header_age.unwrap_or_default() + attempt_started.elapsed()),
             detected_format,
             response_date,
             response_status: status_code,
@@ -3828,6 +3842,41 @@ mod response_cache_tests {
         assert_eq!(provider.cache.weighted_size(), 0);
     }
 
+    /// A response can be stale before it lands. `max-age` is spent from when the
+    /// origin generated the response, so a round trip longer than the window
+    /// leaves nothing to retain — admitting it would serve data the origin
+    /// already considered expired.
+    ///
+    /// This is the one place a fixed delay is the subject rather than a
+    /// readiness wait: the elapsed round trip is exactly what is under test.
+    #[tokio::test]
+    async fn a_response_slower_than_its_freshness_window_is_not_admitted() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=1")
+                    .set_body_string(r#"{"rows":6}"#)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        let served = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served to its caller");
+        assert_eq!(served.content, r#"{"rows":6}"#);
+
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response whose freshness elapsed in transit must not be retained"
+        );
+    }
+
     /// The positive control: a response the origin *does* allow to be cached is
     /// admitted, and the next identical request is served without reaching the
     /// origin again. Without this, a cache that admitted nothing at all would
@@ -4020,7 +4069,7 @@ mod response_cache_tests {
         let directives = HttpTableProvider::parse_cache_control_values(
             [Some("max-age=600"), Some("no-store")].into_iter(),
         );
-        assert!(directives.no_store);
+        assert!(directives.forbid_retention);
         assert_eq!(
             HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             None,
@@ -4105,7 +4154,7 @@ mod response_cache_tests {
     #[test]
     fn no_store_beats_a_max_age_sent_with_it() {
         let directives = HttpTableProvider::parse_cache_control(Some("no-store, max-age=600"));
-        assert!(directives.no_store);
+        assert!(directives.forbid_retention);
         assert_eq!(
             HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             None,
@@ -5179,7 +5228,7 @@ mod tests {
             directives: CacheDirectives {
                 present: true,
                 max_age: Some(Duration::from_mins(1)),
-                no_store: false,
+                forbid_retention: false,
             },
             response_age: None,
             detected_format: "json".to_string(),
