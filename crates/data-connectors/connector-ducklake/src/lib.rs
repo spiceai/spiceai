@@ -448,6 +448,7 @@ data_connector_api::register_data_connector!(
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{Expr, ScalarUDF, TableProviderFilterPushDown};
     use datafusion::prelude::{col, lit};
     use datafusion::sql::TableReference;
@@ -479,6 +480,11 @@ mod tests {
     ///
     /// It drives `configure_ducklake_factory`, the function production calls, so
     /// dropping `with_function_support` there fails here.
+    ///
+    /// `cosine_distance` is the probe only because it is denied today. If it ever
+    /// federates again (spiceai/spiceai#13506), this test needs a UDF that does
+    /// not — it asserts that the deny-list is *installed*, not which functions it
+    /// happens to contain.
     #[tokio::test]
     async fn ducklake_denies_spice_udf_pushdown() {
         let pool = Arc::new(DuckDbConnectionPool::new_memory().expect("in-memory DuckDB pool"));
@@ -499,13 +505,12 @@ mod tests {
             .await
             .expect("table provider builds for the created table");
 
-        let distance =
-            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                Arc::new(ScalarUDF::from(
-                    runtime_datafusion_udfs::cosine_distance::CosineDistance::new(),
-                )),
-                vec![col("embedding"), col("embedding")],
-            ));
+        let distance = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(ScalarUDF::from(
+                runtime_datafusion_udfs::cosine_distance::CosineDistance::new(),
+            )),
+            vec![col("embedding"), col("embedding")],
+        ));
         let filter = distance.lt(lit(0.3));
 
         let pushdown = provider

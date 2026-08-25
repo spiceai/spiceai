@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![expect(
+    clippy::expect_used,
+    reason = "integration-test setup: a failure here is a broken test, not a runtime path"
+)]
+
 //! Does a vector UDF that `DuckDB` is allowed to evaluate answer the same as the
 //! local kernel?
 //!
@@ -68,7 +73,12 @@ enum Outcome {
     Error(String),
 }
 
-/// Shorthand for a fully-populated operand.
+/// Shorthand for a fully-populated operand: a present row whose every element is
+/// present.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Some is the meaning — an Operand's outer layer is row presence"
+)]
 fn dense(v: [f32; DIM]) -> Operand {
     Some(v.map(Some))
 }
@@ -78,7 +88,7 @@ fn dense(v: [f32; DIM]) -> Operand {
 fn battery() -> Vec<Case> {
     let nan = f32::NAN;
     let inf = f32::INFINITY;
-    let mut cases = vec![
+    let cases = vec![
         Case {
             label: "identical",
             lhs: dense([1.0, 0.0, 0.0, 0.0]),
@@ -148,36 +158,36 @@ fn battery() -> Vec<Case> {
             lhs: dense([1.0, 2.0, 3.0, nan]),
             rhs: dense([1.0, 2.0, 3.0, 4.0]),
         },
+        // NULL is not a variant of "no defined distance" — it is a separate way
+        // for a row to have no answer, and an engine may raise on it rather than
+        // return NULL. `compute_fsl_f32` treats a null outer row and a null inner
+        // slot identically (both append NULL), so a pushdown has to as well.
+        Case {
+            label: "null_row_lhs",
+            lhs: None,
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "null_row_rhs",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: None,
+        },
+        Case {
+            label: "null_row_both",
+            lhs: None,
+            rhs: None,
+        },
+        Case {
+            label: "null_element_lhs",
+            lhs: Some([None, Some(0.0), Some(0.0), Some(0.0)]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "null_element_rhs",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: Some([Some(1.0), Some(0.0), Some(0.0), None]),
+        },
     ];
-    // NULL is not a variant of "no defined distance" — it is a separate way for a
-    // row to have no answer, and an engine may raise on it rather than return
-    // NULL. `compute_fsl_f32` treats a null outer row and a null inner slot
-    // identically (both append NULL), so a pushdown has to as well.
-    cases.push(Case {
-        label: "null_row_lhs",
-        lhs: None,
-        rhs: dense([1.0, 0.0, 0.0, 0.0]),
-    });
-    cases.push(Case {
-        label: "null_row_rhs",
-        lhs: dense([1.0, 0.0, 0.0, 0.0]),
-        rhs: None,
-    });
-    cases.push(Case {
-        label: "null_row_both",
-        lhs: None,
-        rhs: None,
-    });
-    cases.push(Case {
-        label: "null_element_lhs",
-        lhs: Some([None, Some(0.0), Some(0.0), Some(0.0)]),
-        rhs: dense([1.0, 0.0, 0.0, 0.0]),
-    });
-    cases.push(Case {
-        label: "null_element_rhs",
-        lhs: dense([1.0, 0.0, 0.0, 0.0]),
-        rhs: Some([Some(1.0), Some(0.0), Some(0.0), None]),
-    });
     cases
 }
 
@@ -391,14 +401,23 @@ fn agrees(local: &Outcome, remote: &Outcome) -> bool {
 async fn duckdb_vector_udf_pushdown_matches_local() {
     let native = duckdb_native_function_names();
     let cases = battery();
-    let mut measured = 0_usize;
+    // Only a UDF the dialect advertises has two implementations to compare; the
+    // rest are evaluated locally and have nothing to disagree with.
+    //
+    // No Spice vector UDF is advertised today, so this is empty and the loop
+    // below compares nothing. That is deliberate, not dead weight: it is the gate
+    // that fires the moment one is added back. Re-adding either `cosine_distance`
+    // or `inner_product` to `duckdb_scalar_overrides` makes this test fail,
+    // naming the input class that diverges — which is how the neuter matrix for
+    // #13088 showed it is armed rather than idle. The two tests below carry the
+    // measured evidence for each denial, so this file does not rest on the loop
+    // alone.
+    let federating: Vec<(&str, ScalarUDF)> = vector_udfs()
+        .into_iter()
+        .filter(|(name, _)| native.contains(name))
+        .collect();
 
-    for (name, udf) in vector_udfs() {
-        if !native.contains(&name) {
-            // Denied, so there is only one implementation and nothing to compare.
-            continue;
-        }
-        measured += 1;
+    for (name, udf) in federating {
         let local = local_outcomes(&udf, &cases).await;
         let remote = duckdb_outcomes(&udf, &cases);
         assert_eq!(
@@ -429,22 +448,6 @@ async fn duckdb_vector_udf_pushdown_matches_local() {
             );
         }
     }
-
-    // No Spice vector UDF federates to DuckDB today, so `measured` is 0 and the
-    // loop above compares nothing. That is deliberate, not dead weight: this is
-    // the gate that fires the moment one is added back. Re-adding either
-    // `cosine_distance` or `inner_product` to `duckdb_scalar_overrides` makes it
-    // fail, naming the input class that diverges — which is how the neuter matrix
-    // for #13088 proved it is armed. The two tests below carry the measured
-    // evidence for each denial, so this file does not rely on an idle loop alone.
-    assert_eq!(
-        measured,
-        native
-            .iter()
-            .filter(|n| vector_udfs().iter().any(|(name, _)| name == *n))
-            .count(),
-        "the loop must measure every vector UDF the dialect advertises"
-    );
 }
 
 /// A new entry in the dialect's override list has to be classified here before
