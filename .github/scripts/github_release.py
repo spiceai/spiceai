@@ -133,9 +133,14 @@ def truncateBody(body, owner, repo, tag):
     kept = body[:MAX_BODY_CHARS - len(notice)]
 
     # Cut on a line boundary so the body never ends mid-sentence or mid-link.
-    lastNewline = kept.rfind("\n")
-    if lastNewline > 0:
-        kept = kept[:lastNewline]
+    # A body with no line break in the retained prefix falls back to a word
+    # break, which still drops a partial URL whole. Dropping the prefix
+    # entirely would discard the whole body to satisfy the boundary.
+    boundary = kept.rfind("\n")
+    if boundary <= 0:
+        boundary = kept.rfind(" ")
+    if boundary > 0:
+        kept = kept[:boundary]
 
     print(f"Body is {len(body)} characters, over the {MAX_BODY_CHARS} limit; truncating to {len(kept) + len(notice)}")
 

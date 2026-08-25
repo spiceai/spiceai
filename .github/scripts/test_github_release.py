@@ -182,6 +182,29 @@ class TruncateBodyTests(unittest.TestCase):
             result,
         )
 
+    def test_single_line_body_falls_back_to_a_word_break(self):
+        # rfind("\n") returns -1 when the retained prefix holds no line break,
+        # which previously left the final partial token -- a URL among them --
+        # in the published body.
+        body = "word " * github_release.MAX_BODY_CHARS
+
+        result = github_release.truncateBody(body, "spiceai", "spiceai", "v2.2.0")
+        kept = result.split("\n\n---\n\n")[0]
+
+        self.assertLessEqual(len(result), github_release.MAX_BODY_CHARS)
+        self.assertTrue(body.startswith(kept))
+        self.assertEqual(body[len(kept)], " ")
+
+    def test_leading_newline_body_keeps_its_content(self):
+        # rfind("\n") returns 0 here; cutting at it would leave an empty body.
+        body = "\n" + "word " * github_release.MAX_BODY_CHARS
+
+        result = github_release.truncateBody(body, "spiceai", "spiceai", "v2.2.0")
+        kept = result.split("\n\n---\n\n")[0]
+
+        self.assertLessEqual(len(result), github_release.MAX_BODY_CHARS)
+        self.assertGreater(len(kept), github_release.MAX_BODY_CHARS // 2)
+
     def test_oversized_body_is_cut_on_a_line_boundary(self):
         result = github_release.truncateBody(self._oversized(), "spiceai", "spiceai", "v2.2.0")
         kept = result.split("\n\n---\n\n")[0]
