@@ -40754,10 +40754,11 @@ mod tests {
     /// Break the statistics WRITE while leaving the read leg working, so a persist
     /// bails at the UPSERT with its cached `raw` still warm.
     ///
-    /// That combination is what exposes the re-derivation hole: the abandon path
-    /// does not touch `raw`, and `raw` is only replaced by a *successful* persist,
-    /// so it stays at the pre-gap record — still flagged exact — for anything that
-    /// later re-derives `count_exact` from it.
+    /// That combination is what puts the re-derivation hole in reach: the persist
+    /// fails with a warm pre-gap record still flagged exact, which is precisely
+    /// what a later re-derivation of `count_exact` would read exactness back out
+    /// of. Whether it can is the property under test — `arm_row_count_taint_retry`
+    /// drops `raw` as part of abandoning, so that pass finds nothing to trust.
     fn hide_table_statistics_table(temp_dir: &std::path::Path) {
         open_metastore_db(temp_dir)
             .execute_batch(
@@ -40885,8 +40886,9 @@ mod tests {
              pre-gap baseline to resurrect exactness from"
         );
 
-        // Re-derive exactly as the schema-width pass does. `count_exact` comes back
-        // `true` from that pre-gap record; the gap must still veto it.
+        // Re-derive exactly as the schema-width pass does. With `raw` dropped by the
+        // abandon there is no pre-gap record left to read exactness back out of, and
+        // the armed gap must veto it independently of that.
         let widened_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("category", DataType::Utf8, true),
