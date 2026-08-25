@@ -523,7 +523,9 @@ impl UnreadableTables {
     /// five of them.
     ///
     /// Names come from Glue, so they are escaped — a name holding a newline would
-    /// otherwise split the summary across log lines.
+    /// otherwise split the summary across log lines. They are quoted as well as
+    /// escaped in [`Self::summary`], so that a name containing the delimiter
+    /// cannot read as two names or as the elision that follows them.
     fn record(&mut self, table: &str) {
         self.total += 1;
 
@@ -556,11 +558,23 @@ impl UnreadableTables {
         }
 
         let total = self.total;
-        let named = self.sample.join(", ");
+        let named = self
+            .sample
+            .iter()
+            .map(|table| format!("'{table}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let elided = match total - self.sample.len() {
             0 => String::new(),
             n => format!(", and {n} more"),
         };
+
+        // Escaped for the same reason the table names are, and it has to be done
+        // here rather than left to the caller: these two sit on the same log line
+        // as the names, so a newline in either splits the one WARN an operator
+        // gets into two records, the second of which reads as its own event.
+        let catalog = catalog.escape_debug();
+        let database = database.escape_debug();
 
         let message = format!(
             "Catalog '{catalog}': skipping {total} Glue table(s) in database '{database}' that Spice cannot read: {named}{elided}. \
@@ -1077,7 +1091,7 @@ mod tests {
             one.contains("Catalog 'glue': skipping 1 Glue table(s) in database 'public'"),
             "{one}"
         );
-        assert!(one.contains("archive"), "{one}");
+        assert!(one.contains("'archive'"), "{one}");
         assert!(one.contains(SUPPORTED_INPUT_FORMATS), "{one}");
         assert!(
             one.contains("queries against them will not resolve"),
@@ -1104,29 +1118,75 @@ mod tests {
             .expect("eight unreadable tables must be reported")
             .message;
         assert!(many.contains("skipping 8 Glue table(s)"), "{many}");
-        assert!(many.contains("t0, t1, t2, t3, t4"), "{many}");
+        assert!(many.contains("'t0', 't1', 't2', 't3', 't4'"), "{many}");
         assert!(
             many.contains("and 3 more"),
             "the summary must count the names it left out: {many}"
         );
-        assert!(!many.contains("t5"), "the sample must stop at five: {many}");
+        assert!(
+            !many.contains("'t5'"),
+            "the sample must stop at five: {many}"
+        );
     }
 
     /// Table names come from Glue, and a log line has to stay one line.
+    ///
+    /// Every identifier the line interpolates is checked, not only the table
+    /// names: the catalog name comes from the user's spicepod and the database
+    /// name from AWS, and all three land on the same line, so a newline in any
+    /// one of them splits the single WARN an operator gets for a missing table
+    /// into two records — the second of which reads as an event of its own.
     #[test]
-    fn a_table_name_cannot_break_the_summary_across_lines() {
+    fn no_identifier_can_break_the_summary_across_lines() {
+        let forged = "orders\nWARN forged log line";
+        for (catalog, database, table) in [
+            ("glue", "public", forged),
+            ("glue", forged, "orders"),
+            (forged, "public", "orders"),
+        ] {
+            let mut unreadable = UnreadableTables::default();
+            unreadable.record(table);
+
+            let summary = unreadable
+                .summary(catalog, database)
+                .expect("one unreadable table must be reported")
+                .message;
+
+            assert!(
+                !summary.contains('\n'),
+                "an embedded newline must not reach the log: {summary}"
+            );
+            assert!(
+                summary.contains("\\nWARN"),
+                "the newline must be shown escaped rather than dropped: {summary}"
+            );
+        }
+    }
+
+    /// A table name may contain the delimiter that separates the sampled names,
+    /// or the wording of the elision that follows them. Quoting each name is
+    /// what stops one table reading as two, or as a count of tables the summary
+    /// never left out — escaping alone does not, since neither a comma nor a
+    /// word is a control character.
+    #[test]
+    fn a_table_name_cannot_impersonate_the_list_or_the_elision() {
         let mut unreadable = UnreadableTables::default();
-        unreadable.record("orders\nWARN forged log line");
+        unreadable.record("orders, and 7 more");
+        unreadable.record("events");
 
         let summary = unreadable
             .summary("glue", "public")
-            .expect("one unreadable table must be reported")
+            .expect("two unreadable tables must be reported")
             .message;
 
         assert!(
-            !summary.contains('\n'),
-            "an embedded newline must not reach the log: {summary}"
+            summary.contains("'orders, and 7 more', 'events'"),
+            "each name must be quoted as one identifier: {summary}"
         );
-        assert!(summary.contains("orders\\nWARN"), "{summary}");
+        assert!(
+            summary.contains("skipping 2 Glue table(s)"),
+            "the count is what says how many there are, and it must not be \
+             contradicted by a name that reads like an elision: {summary}"
+        );
     }
 }
