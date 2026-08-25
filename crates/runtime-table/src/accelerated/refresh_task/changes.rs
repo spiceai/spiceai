@@ -2783,12 +2783,17 @@ impl RefreshTask {
                 // accelerator pins the partitioned provider to
                 // `SchemaEvolutionMode::Disabled` when it builds it, so a
                 // restart re-classifies and refuses again (#12999). The one
-                // exception is `mode: file_update`, which never asks the engine
-                // to evolve in place — `recreates_on_schema_mismatch` is true for
-                // it regardless of engine, so registration drops and recreates
-                // the table against the new schema. The refusal message names
-                // that mode rather than the write target, because the mode is
-                // what the operator can read off their own spicepod.
+                // exception is `mode: file_update`, and its recreate is a
+                // fallback rather than a bypass: Cayenne is in the
+                // in-place-evolution set, so registration still calls
+                // `evolve_accelerated_table_schema` first and reaches the
+                // drop-and-recreate only once the partitioned accelerator
+                // refuses. What the mode guarantees is that the recreate
+                // follows — `recreates_on_schema_mismatch` is true for it
+                // regardless of engine — so the refusal is never where the
+                // change stops. The refusal message names that mode rather than
+                // the write target, because the mode is what the operator can
+                // read off their own spicepod.
                 #[cfg(not(windows))]
                 if matches!(
                     extract_cayenne_write_target(&self.accelerator),
