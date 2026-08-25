@@ -220,7 +220,12 @@ impl MemoryVectorIndex {
                         // excludes `NaN` — `[0.0, NaN]` belongs to the batched report alone.
                         if all_zero {
                             tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes"
+                                "{}",
+                                write_util::all_zero_embedding_warning(
+                                    "memory vector",
+                                    INDEX_NAME,
+                                    key
+                                )
                             );
                         } else if !non_finite {
                             keys.push(key.clone());

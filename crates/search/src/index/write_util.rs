@@ -319,7 +319,7 @@ pub fn is_finite_all_zero(embedding: &[f32]) -> bool {
 /// The remedy clause every non-finite-embedding warning ends with, kept in one place so the
 /// advice and the docs link cannot drift between the paths that skip a record and the ones
 /// that null its embedding.
-pub const NON_FINITE_EMBEDDING_REMEDY: &str = "Re-embed the affected rows, or check the embedding model configured for this dataset. \
+pub const EMBEDDING_REMEDY: &str = "Re-embed the affected rows, or check the embedding model configured for this dataset. \
      See: https://spiceai.org/docs/components/embeddings";
 
 /// The maximum number of row indexes named in a [`non_finite_embedding_warning`].
@@ -360,8 +360,23 @@ pub fn non_finite_embedding_warning(
         ""
     };
     format!(
-        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are not indexed and vector search will never return them (rows {sample}{ellipsis}). {NON_FINITE_EMBEDDING_REMEDY}",
+        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are not indexed and vector search will never return them (rows {sample}{ellipsis}). {EMBEDDING_REMEDY}",
         affected_rows.len()
+    )
+}
+
+/// One line explaining why a single all-zero-embedding record is not searchable, built in a
+/// pure function so a reword cannot quietly drop the key, the index, the consequence or the
+/// docs link.
+///
+/// The cause is deliberately narrower than [`non_finite_embedding_warning`]'s: this line is
+/// only ever reached for a vector whose every component is a finite zero, so it must not
+/// mention NaN. A vector mixing zeroes with a NaN belongs to the batched non-finite report,
+/// and claiming "all zeroes" for it would name a cause the row does not have.
+#[must_use]
+pub fn all_zero_embedding_warning(index_kind: &str, index_name: &str, key: &str) -> String {
+    format!(
+        "Skipping record '{key}' for {index_kind} index '{index_name}': its embedding is all zeroes, which has no direction to compare against, so the record is not indexed and vector search will never return it. {EMBEDDING_REMEDY}"
     )
 }
 
@@ -792,6 +807,53 @@ mod tests {
             message.contains("https://spiceai.org/docs/components/embeddings"),
             "{message}"
         );
+    }
+
+    /// The per-record all-zero line has to carry what the batched non-finite one carries: the
+    /// record, the index, what the user will observe, and where to go. Only the cause differs.
+    ///
+    /// It must *not* mention NaN. The predicate feeding it is `is_finite_all_zero`, so a
+    /// vector mixing zeroes with a NaN reaches the batched non-finite report instead; naming
+    /// NaN here would describe a cause the reported row does not have.
+    #[test]
+    fn all_zero_warning_names_record_consequence_and_docs() {
+        let message = all_zero_embedding_warning("memory vector", "my_index", "row-7");
+        assert!(message.contains("'row-7'"), "{message}");
+        assert!(
+            message.contains("memory vector index 'my_index'"),
+            "{message}"
+        );
+        assert!(message.contains("all zeroes"), "{message}");
+        assert!(
+            message.contains("not indexed"),
+            "the line must state the consequence, not only the cause: {message}"
+        );
+        assert!(
+            message.contains("vector search will never return it"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Re-embed the affected rows"),
+            "the line must give an actionable remedy: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/embeddings"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("NaN"),
+            "a NaN-bearing vector is reported by the batched non-finite line, so this one must not claim NaN as the cause: {message}"
+        );
+    }
+
+    /// Both causes point at the same fix, so the remedy is shared rather than restated — a
+    /// divergence would give two backends two different answers to the same question.
+    #[test]
+    fn both_embedding_warnings_share_one_remedy() {
+        let all_zero = all_zero_embedding_warning("S3 Vector", "idx", "k");
+        let non_finite = non_finite_embedding_warning("idx", &[0], 1);
+        assert!(all_zero.contains(EMBEDDING_REMEDY), "{all_zero}");
+        assert!(non_finite.contains(EMBEDDING_REMEDY), "{non_finite}");
     }
 
     /// Only the first few row indexes are named, so a whole-batch failure cannot produce a

@@ -38,7 +38,7 @@ use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
 use crate::index::elasticsearch::ElasticsearchIndex;
 use crate::index::embedding_col;
-use crate::index::write_util::{first_non_finite, warn_non_finite_embeddings};
+use crate::index::write_util::{EMBEDDING_REMEDY, first_non_finite, warn_non_finite_embeddings};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -341,7 +341,7 @@ fn build_documents(
     }
     if zero_or_nan_skips > 0 {
         tracing::warn!(
-            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': the embedding is all zeros, or mixes zeros with a NaN, so those records are not indexed and vector search will never return them (rows {zero_or_nan_samples:?}). {EMBEDDING_REMEDY}"
         );
     }
     // This is the one place a non-finite embedding is reported for Elasticsearch: the

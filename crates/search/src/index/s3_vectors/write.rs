@@ -27,8 +27,9 @@ use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
 use crate::index::write_util::{
-    self, embed_column, extract_and_format_primary_key, first_non_finite, is_finite_all_zero,
-    sort_columns_alphabetically, update_embedding_column_in_batch,
+    self, all_zero_embedding_warning, embed_column, extract_and_format_primary_key,
+    first_non_finite, is_finite_all_zero, sort_columns_alphabetically,
+    update_embedding_column_in_batch,
 };
 use crate::index::{SearchIndex, embedding_col, s3_vectors::S3Vector};
 
@@ -316,7 +317,8 @@ fn filter_zero_vectors(
         // `all_zero` excludes `NaN` — `[0.0, NaN]` belongs to the batched report alone.
         if all_zero {
             tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes"
+                "{}",
+                all_zero_embedding_warning("S3 Vector", index_name, key_str)
             );
         }
 
