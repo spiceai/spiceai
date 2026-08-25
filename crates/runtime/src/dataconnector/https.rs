@@ -1738,9 +1738,12 @@ const HTTP_CACHE_METRIC_SPECS: &[MetricSpec] = &[
     .auto_register(),
 ];
 
-/// Every metric this connector can report, whether or not rate control is
-/// emitting: `available_metrics` is consulted to answer what a user may enable,
-/// and a name missing from it is warned about as unavailable.
+/// Everything this connector reports when rate control is emitting too.
+///
+/// Advertising is not free: dataset initialization registers every auto metric a
+/// provider advertises, and a metric with no callback behind it fails
+/// registration and logs an error. So the list has to narrow to what this
+/// provider can actually observe — see [`HttpsMetricsProvider::available_metrics`].
 static HTTP_ALL_METRIC_SPECS: LazyLock<Vec<MetricSpec>> = LazyLock::new(|| {
     let mut specs = HTTP_CACHE_METRIC_SPECS.to_vec();
     specs.extend_from_slice(HTTP_RATE_CONTROL_METRIC_SPECS);
@@ -1769,7 +1772,16 @@ impl MetricsProvider for HttpsMetricsProvider {
     }
 
     fn available_metrics(&self) -> &'static [MetricSpec] {
-        &HTTP_ALL_METRIC_SPECS
+        // Only what this provider can observe. Every auto-registering metric
+        // advertised here is registered for the dataset, and one whose callback
+        // is absent fails that registration with an error log — so advertising
+        // the rate-control family while it is disabled would put eleven of those
+        // in the log of every ordinary HTTP dataset.
+        if self.rate_control.is_some() {
+            &HTTP_ALL_METRIC_SPECS
+        } else {
+            HTTP_CACHE_METRIC_SPECS
+        }
     }
 
     fn callback_to_observe_metric(
@@ -3246,6 +3258,27 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 "{metric_name} must have an observation callback"
             );
         }
+
+        // Advertising is not free. Dataset initialization registers every auto
+        // metric a provider advertises, and one whose callback is absent fails
+        // that registration with an error log — so advertising the rate-control
+        // family while it is disabled would put one of those in the log of every
+        // ordinary HTTP dataset.
+        for metric in metrics_provider.available_metrics() {
+            assert!(
+                metrics_provider
+                    .callback_to_observe_metric(metric, vec![])
+                    .is_some(),
+                "{} is advertised but cannot be observed, so registering it fails",
+                metric.name
+            );
+        }
+        assert!(
+            metrics_provider
+                .get_metric("rate_control_available_permits")
+                .is_none(),
+            "rate-control metrics must not be advertised while rate control is off"
+        );
     }
 
     /// Rate-control metrics keep working through the combined provider — a

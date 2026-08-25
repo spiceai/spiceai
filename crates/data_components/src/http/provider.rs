@@ -271,6 +271,9 @@ impl CachedResponse {
                 max_age: Some(self.max_age),
                 no_store: false,
             },
+            // Zero rather than the origin's age: the window carried here is
+            // already what was left when the entry was admitted.
+            response_age: None,
             detected_format: self.detected_format.unwrap_or_default(),
             response_date: self.response_date,
             response_status: self.response_status,
@@ -286,8 +289,13 @@ impl CachedResponse {
 /// getting it wrong is memory that no other limit bounds.
 pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
-/// The connector's response cache: bounded in bytes, expiring per entry, and
-/// coalescing concurrent misses for the same key.
+/// The connector's response cache: bounded in bytes and expiring per entry.
+///
+/// Concurrent misses for the same key are *not* collapsed into one origin
+/// request. Fetching through the cache is what would give that, and it cannot
+/// express this cache's admission rule — whether a response may be kept is only
+/// knowable from the response, while a fetch-through cache stores whatever the
+/// fetch returns.
 ///
 /// Bounding is the point. The keys are request-shaped — path, query, body and
 /// headers — so on a request-keyed workload the number of distinct keys is
@@ -296,8 +304,8 @@ pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
 /// is invisible to `runtime.caching` limits because it is not one of those
 /// caches.
 ///
-/// `moka` supplies all three properties directly: a weigher for the byte budget,
-/// and per-entry expiry driven by each response's own retention window.
+/// `moka` supplies both properties directly: a weigher for the byte budget, and
+/// per-entry expiry driven by each response's own retention window.
 type ResponseCache = moka::future::Cache<CacheKey, CachedResponse>;
 
 /// Per-entry expiry taken from the retention resolved at admission.
@@ -467,6 +475,9 @@ struct HttpFetchResult {
     /// What the origin's `Cache-Control` said. The retention decision is made by
     /// the caller, which is where a configured fallback is in scope.
     directives: CacheDirectives,
+    /// How long the response had already been alive when it reached us, from its
+    /// `Age` header. A response relayed by an intermediary arrives part-spent.
+    response_age: Option<Duration>,
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
@@ -612,14 +623,15 @@ impl HttpTableProvider {
         self
     }
 
-    /// Sets the response cache's byte budget and, optionally, an upper bound on
-    /// how long an entry may be kept.
+    /// Sets the response cache's byte budget and, optionally, the retention to
+    /// apply to a response whose origin sent no `Cache-Control` at all.
     ///
-    /// `max_bytes` of zero disables the cache. `ttl` retires entries the origin
-    /// would still call fresh, which is the only way to bound retention when an
-    /// origin sends a very long `max-age` — and, conversely, the cache stores
-    /// nothing at all unless the origin sends a positive `max-age`, since that
-    /// is what marks a response cacheable.
+    /// `max_bytes` of zero disables the cache. `ttl` is a fallback, not a
+    /// ceiling: it never shortens or overrides what an origin asked for, and an
+    /// origin that did send `Cache-Control` is always honoured instead —
+    /// including its refusals. Leaving it `None` keeps a header-less response
+    /// uncached, so the cache then stores nothing unless the origin sent a
+    /// positive `max-age`.
     #[must_use]
     pub fn with_cache_limits(self, max_bytes: usize, ttl: Option<Duration>) -> Self {
         // Replaced rather than mutated: the budget governs a structure that has
@@ -1090,17 +1102,50 @@ impl HttpTableProvider {
         }
     }
 
+    /// The single-field form, for tests that are not about repetition.
+    ///
+    /// The fetch path reads every `Cache-Control` field the response carried, so
+    /// this exists only to keep those tests legible.
+    #[cfg(test)]
     fn parse_cache_control(cache_control_header: Option<&str>) -> CacheDirectives {
+        Self::parse_cache_control_values(cache_control_header.map(Some).into_iter())
+    }
+
+    /// Reads the directives from every `Cache-Control` field the response
+    /// carried.
+    ///
+    /// HTTP allows the header to be repeated, and the repeats are as binding as
+    /// a single combined one: reading only the first would admit a response that
+    /// sent `max-age` there and `no-store` in the next field. A `None` item is a
+    /// field whose bytes are not valid text — the origin spoke and we could not
+    /// read it, which is treated as a refusal rather than as silence, because
+    /// the alternative is to fall back to a locally configured TTL on a response
+    /// that may well have said `no-store`.
+    fn parse_cache_control_values<'a>(
+        values: impl Iterator<Item = Option<&'a str>>,
+    ) -> CacheDirectives {
         let mut directives = CacheDirectives::default();
 
-        if let Some(header) = cache_control_header {
+        for value in values {
             directives.present = true;
+            let Some(header) = value else {
+                directives.no_store = true;
+                continue;
+            };
             for directive in header.split(',') {
                 let directive = directive.trim();
-                if let Some(value) = directive.strip_prefix("max-age=")
-                    && let Ok(seconds) = value.parse::<u64>()
+                if let Some(seconds) = directive
+                    .strip_prefix("max-age=")
+                    .or_else(|| directive.strip_prefix("max-age ="))
+                    .map(str::trim)
                 {
-                    directives.max_age = Some(Duration::from_secs(seconds));
+                    match seconds.parse::<u64>() {
+                        Ok(seconds) => directives.max_age = Some(Duration::from_secs(seconds)),
+                        // A `max-age` we cannot read is not the same as no
+                        // `max-age`: leaving it unset would let a configured
+                        // fallback stand in for a directive the origin did send.
+                        Err(_) => directives.no_store = true,
+                    }
                 } else if directive.eq_ignore_ascii_case("no-store")
                     || directive.eq_ignore_ascii_case("no-cache")
                 {
@@ -1124,16 +1169,29 @@ impl HttpTableProvider {
     fn effective_retention(
         directives: &CacheDirectives,
         fallback_ttl: Option<Duration>,
+        response_age: Option<Duration>,
     ) -> Option<Duration> {
         if directives.no_store {
             return None;
         }
         match directives.max_age {
-            Some(max_age) if max_age.as_secs() > 0 => Some(max_age),
+            // `max-age` is measured from when the origin generated the response,
+            // not from when it reached us, so what may be retained is the part
+            // that has not already elapsed. A response relayed with `Age: 599`
+            // against `max-age: 600` has a second left, and keeping it for the
+            // full window would serve it stale for the rest.
+            Some(max_age) if max_age.as_secs() > 0 => {
+                let remaining = max_age.saturating_sub(response_age.unwrap_or(Duration::ZERO));
+                (!remaining.is_zero()).then_some(remaining)
+            }
             // A `Cache-Control` that carried no usable `max-age` is still the
             // origin having spoken, so the local fallback does not step in.
             Some(_) => None,
             None if directives.present => None,
+            // The fallback is not reduced by `Age`: it is how long the operator
+            // asked us to keep a response the origin said nothing about, rather
+            // than a claim about how fresh the origin considered it.
+            //
             // A zero fallback is a configured refusal to retain, not a window
             // of no length: returning it would admit an entry that is expired
             // on arrival but still occupies the byte budget.
@@ -1422,11 +1480,25 @@ impl HttpTableProvider {
             detected_format
         );
 
-        let cache_control_header = response
+        let directives = Self::parse_cache_control_values(
+            response
+                .headers()
+                .get_all(CACHE_CONTROL)
+                .iter()
+                .map(|value| value.to_str().ok()),
+        );
+
+        // How much of the response's freshness was already spent before it
+        // reached us. Only `Age` is read: it is what an intermediary is required
+        // to add and it is a count of seconds, so unlike deriving the age from
+        // `Date` it does not turn a skewed origin clock into a cache that
+        // refuses everything.
+        let response_age = response
             .headers()
-            .get(CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok());
-        let directives = Self::parse_cache_control(cache_control_header);
+            .get(reqwest::header::AGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
 
         // Extract Date header from response
         let response_date = response
@@ -1470,6 +1542,7 @@ impl HttpTableProvider {
         Ok(HttpFetchResult {
             content,
             directives,
+            response_age,
             detected_format,
             response_date,
             response_status: status_code,
@@ -1558,9 +1631,11 @@ impl HttpTableProvider {
         // then fill the budget with responses the origin forbade storing and
         // evict the ones it was allowed to keep. The refusal has to be honoured
         // here, where it is unconditional.
-        if let Some(retain_for) =
-            Self::effective_retention(&fetch_result.directives, self.cache_fallback_ttl)
-        {
+        if let Some(retain_for) = Self::effective_retention(
+            &fetch_result.directives,
+            self.cache_fallback_ttl,
+            fetch_result.response_age,
+        ) {
             self.cache
                 .insert(
                     cache_key,
@@ -3864,6 +3939,93 @@ mod response_cache_tests {
         );
     }
 
+    /// A repeated `Cache-Control` field binds as much as a single combined one.
+    /// Reading only the first would admit a response that put `max-age` there
+    /// and `no-store` in the next field.
+    #[test]
+    fn a_refusal_in_a_later_cache_control_field_still_binds() {
+        let directives = HttpTableProvider::parse_cache_control_values(
+            [Some("max-age=600"), Some("no-store")].into_iter(),
+        );
+        assert!(directives.no_store);
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "a no-store in any field refuses retention"
+        );
+    }
+
+    /// A header we cannot read is the origin having spoken, not silence. Treating
+    /// it as absent would let a configured fallback retain a response that may
+    /// well have refused retention.
+    #[test]
+    fn an_unreadable_cache_control_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control_values([None].into_iter());
+        assert!(directives.present, "the origin did send a header");
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None,
+            "an unreadable directive must not fall through to the fallback"
+        );
+    }
+
+    /// Likewise a `max-age` whose value will not parse.
+    #[test]
+    fn an_unreadable_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control("max-age=soon".into());
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// `max-age` runs from when the origin generated the response, so a response
+    /// relayed by an intermediary arrives part-spent and may only be kept for
+    /// what is left. Keeping it for the full window would serve it stale.
+    #[test]
+    fn an_aged_response_is_retained_only_for_what_is_left() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_secs(599))
+            ),
+            Some(Duration::from_secs(1)),
+            "600s of freshness minus 599s already spent leaves one second"
+        );
+    }
+
+    #[test]
+    fn a_response_whose_freshness_is_spent_is_not_retained() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &directives,
+                None,
+                Some(Duration::from_mins(10))
+            ),
+            None,
+            "a response that arrives already stale must not be admitted"
+        );
+    }
+
+    /// The fallback is how long the operator asked us to keep a response the
+    /// origin said nothing about, so an `Age` from an intermediary does not eat
+    /// into it.
+    #[test]
+    fn age_does_not_shorten_the_configured_fallback() {
+        let silent = HttpTableProvider::parse_cache_control(None);
+        assert_eq!(
+            HttpTableProvider::effective_retention(
+                &silent,
+                Some(Duration::from_mins(5)),
+                Some(Duration::from_hours(1))
+            ),
+            Some(Duration::from_mins(5))
+        );
+    }
+
     /// `no-store` is the origin refusing retention, and it wins over a `max-age`
     /// sent beside it. Parsing only `max-age` meant such a response was cached in
     /// defiance of the directive.
@@ -3872,7 +4034,7 @@ mod response_cache_tests {
         let directives = HttpTableProvider::parse_cache_control(Some("no-store, max-age=600"));
         assert!(directives.no_store);
         assert_eq!(
-            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1))),
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             None,
             "an origin that says no-store must not be retained, fallback or not"
         );
@@ -3882,7 +4044,7 @@ mod response_cache_tests {
     fn no_cache_is_also_a_refusal() {
         let directives = HttpTableProvider::parse_cache_control(Some("no-cache"));
         assert_eq!(
-            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1))),
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             None
         );
     }
@@ -3892,7 +4054,7 @@ mod response_cache_tests {
     fn the_origins_max_age_is_used_when_present() {
         let directives = HttpTableProvider::parse_cache_control(Some("max-age=300"));
         assert_eq!(
-            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1))),
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             Some(Duration::from_mins(5)),
             "the origin decides its own freshness, not the local fallback"
         );
@@ -3905,12 +4067,12 @@ mod response_cache_tests {
     fn the_fallback_applies_only_when_the_origin_was_silent() {
         let silent = HttpTableProvider::parse_cache_control(None);
         assert_eq!(
-            HttpTableProvider::effective_retention(&silent, Some(Duration::from_mins(1))),
+            HttpTableProvider::effective_retention(&silent, Some(Duration::from_mins(1)), None),
             Some(Duration::from_mins(1)),
             "a header-less origin may use the configured fallback"
         );
         assert_eq!(
-            HttpTableProvider::effective_retention(&silent, None),
+            HttpTableProvider::effective_retention(&silent, None, None),
             None,
             "and with no fallback it is not cached, as before"
         );
@@ -3923,7 +4085,7 @@ mod response_cache_tests {
         let directives = HttpTableProvider::parse_cache_control(Some("max-age=0"));
         assert_eq!(directives.max_age, Some(Duration::ZERO));
         assert_eq!(
-            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1))),
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
             None,
             "max-age=0 means do not reuse this response"
         );
@@ -4946,6 +5108,7 @@ mod tests {
                 max_age: Some(Duration::from_mins(1)),
                 no_store: false,
             },
+            response_age: None,
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -4954,8 +5117,8 @@ mod tests {
                 ("x-request-id".to_string(), "req-123".to_string()),
             ],
         };
-        // Seeded directly: there is no separate write path any more, because the
-        // cache is fetched *through* rather than written to alongside a fetch.
+        // Seeded directly, because admission is part of `get_response` rather
+        // than a write path a test can call on its own.
         provider
             .cache
             .insert(
@@ -7369,6 +7532,7 @@ mod tests {
         HttpFetchResult {
             content: String::new(),
             directives: CacheDirectives::default(),
+            response_age: None,
             detected_format: "application/json".to_string(),
             response_date: None,
             response_status: 200,
@@ -7816,6 +7980,7 @@ mod tests {
         let fetch_result = HttpFetchResult {
             content: String::new(),
             directives: CacheDirectives::default(),
+            response_age: None,
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 201,
@@ -7889,6 +8054,7 @@ mod tests {
         let fetch_result = HttpFetchResult {
             content: String::new(),
             directives: CacheDirectives::default(),
+            response_age: None,
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
