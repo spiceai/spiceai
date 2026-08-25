@@ -49,7 +49,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 
 **Not included by default:**
 
-- ScyllaDB data connector (`scylladb` feature)
+- ODBC (`odbc`), Elasticsearch (`elasticsearch`), NFS (`nfs`), and ScyllaDB (`scylladb`) data connectors
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
 - WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
@@ -78,7 +78,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 
 **Included Features:**
 
-- All data connectors except ScyllaDB, which local open source builds can enable with the `scylladb` feature
+- The default distribution's data connectors, minus ADBC (`adbc` feature)
 - All data accelerators
 - Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
 - Default memory allocator (snmalloc)
