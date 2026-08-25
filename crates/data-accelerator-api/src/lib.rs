@@ -200,7 +200,8 @@ impl AcceleratorRegistration {
             Ok(accelerator) => Some(accelerator),
             Err(error) => {
                 tracing::error!(
-                    "Failed to prepare the {} accelerator engine: {error}. Acceleration using this engine will not be available.",
+                    "Failed to prepare the '{}' accelerator engine, so Spice cannot determine how it handles an acceleration and datasets using `engine: {}` may not load. Cause: {error}. This is an internal error, not a configuration mistake — please report it at https://github.com/spiceai/spiceai/issues",
+                    self.engine,
                     self.engine
                 );
                 None
@@ -367,11 +368,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    // Not user-facing: reaching this means a caller paired an engine's registration with
-    // another engine's settings, which every path in this crate chooses by engine.
-    #[snafu(display(
-        "Internal error: the {expected} accelerator engine was given {actual} configuration"
-    ))]
+    // Worded as the cause clause it appears as: the messages that embed it supply the
+    // impact and where to report it. Reaching this means a caller paired an engine's
+    // registration with another engine's settings, which every path here chooses by engine.
+    #[snafu(display("the {expected} engine was given {actual} configuration"))]
     MismatchedEngineConfig { expected: Engine, actual: Engine },
 }
 

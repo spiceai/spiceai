@@ -70,12 +70,6 @@ impl AcceleratorEngineRegistry {
     /// Builds and registers every engine this build linked, configured for this
     /// `Runtime`.
     ///
-    /// `config` is passed to each constructor rather than published somewhere the
-    /// constructors can read, so the settings belong to this registry alone — two
-    /// `Runtime`s built concurrently in one process cannot see each other's.
-    /// Builds and registers every engine this build linked, configured for this
-    /// `Runtime`.
-    ///
     /// Each engine is given the entry in `configs` for its own [`Engine`], or that
     /// engine's defaults when `configs` names it nowhere — so a constructor is never handed
     /// another engine's settings, and the mismatch its signature admits cannot arise here.
@@ -99,7 +93,7 @@ impl AcceleratorEngineRegistry {
                 }
                 Err(error) => {
                     tracing::error!(
-                        "Failed to prepare the {} accelerator engine: {error}. Datasets accelerated with '{}' will not load.",
+                        "Failed to prepare the '{}' accelerator engine, so no dataset accelerated with `engine: {}` will load. Cause: {error}. This is an internal error, not a configuration mistake — please report it at https://github.com/spiceai/spiceai/issues",
                         registration.engine,
                         registration.engine
                     );
