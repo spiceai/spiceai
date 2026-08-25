@@ -11,12 +11,19 @@ if token == None:
 
 authHeader = { "Authorization": f"token {token}"}
 
+# GitHub rejects a release body longer than this with a 422. Release notes are
+# also read from a file rather than taken as an argument: a body this large
+# exceeds MAX_ARG_STRLEN (128 KiB), so the exec fails with E2BIG before Python
+# ever starts.
+MAX_BODY_CHARS = 125000
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--owner')
 parser.add_argument('--repo')
 parser.add_argument('--tag')
 parser.add_argument('--release-name')
 parser.add_argument('--body')
+parser.add_argument('--body-file')
 parser.add_argument('--prerelease')
 parser.add_argument('action')
 parser.add_argument('artifact', nargs='+')
@@ -104,6 +111,36 @@ def updateRelease(id, owner, repo, release_name, body, prerelease):
         print(resp.json())
 
 
+def readBody(args):
+    """Resolve the release body, preferring --body-file over --body."""
+    if args.body_file:
+        with open(args.body_file, encoding="utf-8") as f:
+            return f.read()
+
+    return args.body
+
+def truncateBody(body, owner, repo, tag):
+    """Trim an oversized body to fit GitHub's limit, linking to the full notes."""
+    if body is None or len(body) <= MAX_BODY_CHARS:
+        return body
+
+    notice = (
+        "\n\n---\n\n"
+        f"Release notes truncated to fit GitHub's {MAX_BODY_CHARS} character limit. "
+        f"Full notes: https://github.com/{owner}/{repo}/blob/{tag}/docs/release_notes/{tag}.md\n"
+    )
+
+    kept = body[:MAX_BODY_CHARS - len(notice)]
+
+    # Cut on a line boundary so the body never ends mid-sentence or mid-link.
+    lastNewline = kept.rfind("\n")
+    if lastNewline > 0:
+        kept = kept[:lastNewline]
+
+    print(f"Body is {len(body)} characters, over the {MAX_BODY_CHARS} limit; truncating to {len(kept) + len(notice)}")
+
+    return kept + notice
+
 def extract_title_from_body(body, fallback_name):
     """Extract the first # heading from body as the release title, returning (title, remaining_body)."""
     if body:
@@ -120,7 +157,8 @@ def actionUpload(args):
 
     is_prerelease = args.prerelease == "true"
 
-    release_name, body = extract_title_from_body(args.body, args.release_name)
+    body = truncateBody(readBody(args), args.owner, args.repo, args.tag)
+    release_name, body = extract_title_from_body(body, args.release_name)
 
     # Step 2: Create the release if it doesn't exist
     if releaseInfo == None:
