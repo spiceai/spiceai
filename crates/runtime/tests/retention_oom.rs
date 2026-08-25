@@ -422,8 +422,7 @@ async fn stage_test_binary(
     match stripped {
         Ok(status) if status.success() => return Ok(()),
         Ok(status) => eprintln!(
-            "strip --strip-debug exited {}, staging the unstripped binary instead",
-            status.code().unwrap_or_default()
+            "strip --strip-debug failed ({status}), staging the unstripped binary instead"
         ),
         Err(error) => {
             eprintln!("could not run strip ({error}), staging the unstripped binary instead");
