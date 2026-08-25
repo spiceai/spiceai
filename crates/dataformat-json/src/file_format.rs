@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::source::SpiceJsonSource;
 use crate::{
     ArrayToNdjson, ArrayToNdjsonPush, JsonPointerReader, ReadResult, SodaReader,
-    extract_flattened_from_nested, is_soda_response, peek_first_non_ws_byte, unnest_struct_schema,
+    body_opens_a_json_array, extract_flattened_from_nested, is_soda_response, unnest_struct_schema,
 };
 
 use arrow::array::RecordBatch;
@@ -502,6 +502,14 @@ impl Decoder for SpiceJsonDecoder {
     }
 
     fn flush(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
+        // `can_flush_early` is false, so the deserializer only flushes once the
+        // input stream is exhausted. That makes this the one place the adapter
+        // can be told the file has ended, and the only place a still-open array
+        // can be reported instead of silently returning the rows read so far.
+        if let Some(push) = &self.array_to_ndjson_push {
+            push.finish()?;
+        }
+
         let projected_schema = Arc::clone(&self.projected_schema);
         self.inner.flush().map(move |batch| {
             batch.map(|batch| {
@@ -646,7 +654,7 @@ fn infer_json_schema_for_format(
                     .to_string(),
             ));
         }
-        Format::Auto | Format::Json => peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'['),
+        Format::Auto | Format::Json => body_opens_a_json_array(&mut reader)?,
     };
 
     if is_array {
@@ -776,6 +784,49 @@ mod tests {
             .expect("field should exist in schema");
         schema
             .field_with_name("age")
+            .expect("field should exist in schema");
+    }
+
+    /// Format detection runs before the array reader and *consumes* the
+    /// prefix it skips, so whichever predicate it uses decides what the
+    /// reader's own guards ever get to see. With the wider
+    /// `is_ascii_whitespace`, a leading form feed — which `serde_json` rejects
+    /// — was eaten here and the body reached `ArrayToNdjson` already looking
+    /// well formed.
+    ///
+    /// This goes through `infer_json_schema_for_format`, the wiring the
+    /// default `Format::Auto` actually uses; a test that constructs the
+    /// adapter itself passes whether or not detection is correct.
+    #[test]
+    fn a_leading_form_feed_is_not_eaten_by_format_detection() {
+        for format in [Format::Auto, Format::Json, Format::Array] {
+            for body in [
+                &b"\x0c[{\"a\":1}]"[..],
+                &b"\x0b[{\"a\":1}]"[..],
+                // A prefix that starts like a BOM and is not one. Inference
+                // rejects these on its own — it re-parses the original buffer
+                // rather than the reader detection advanced — so these rows
+                // pin that, not the propagation fix. What the *scan* paths do
+                // with the same bodies is
+                // `array_detection_propagates_an_error_that_consumed_bytes`.
+                &b"\xEF{\"a\":1}"[..],
+                &b"\xEF\xBB{\"a\":1}"[..],
+            ] {
+                let mut take = || true;
+                assert!(
+                    infer_json_schema_for_format(body, format, &mut take).is_err(),
+                    "{format:?} accepted {:?}, which serde_json rejects",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        // The four bytes JSON does admit still reach the array reader.
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(b" \t\r\n[{\"a\":1}]", Format::Auto, &mut take)
+            .expect("JSON whitespace before the array must remain acceptable");
+        schema
+            .field_with_name("a")
             .expect("field should exist in schema");
     }
 
@@ -1323,5 +1374,166 @@ mod tests {
         schema
             .field_with_name("val")
             .expect("field should exist in schema");
+    }
+
+    mod truncated_array {
+        use super::*;
+        use arrow::datatypes::{DataType, Field};
+        use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
+        use futures::{StreamExt, executor::block_on};
+
+        fn schema() -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+        }
+
+        fn decoder(schema: &SchemaRef) -> SpiceJsonDecoder {
+            let inner = json::reader::ReaderBuilder::new(Arc::clone(schema))
+                .build_decoder()
+                .expect("build arrow json decoder");
+            SpiceJsonDecoder::new(inner, true, None, Arc::clone(schema))
+        }
+
+        /// Rows read before the input ran out must not be handed back as if
+        /// they were the whole file.
+        #[test]
+        fn flush_rejects_an_array_that_never_closed() {
+            for body in [
+                &br#"[{"a":1},{"a":2}"#[..],
+                &br#"[{"a":1},"#[..],
+                &br"[1,2,3"[..],
+                &br"["[..],
+            ] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the prefix");
+
+                let err = dec.flush().expect_err(
+                    "an array with no closing bracket must be reported, not silently truncated",
+                );
+                assert!(
+                    err.to_string().contains("closing ']'"),
+                    "unexpected error for {:?}: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        #[test]
+        fn flush_rejects_a_body_that_is_not_an_array() {
+            for body in [&b""[..], &b"   \n\t "[..]] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the prefix");
+
+                let err = dec
+                    .flush()
+                    .expect_err("a body with no array at all must be reported");
+                assert!(
+                    err.to_string().contains("opening '['"),
+                    "unexpected error for {:?}: {err}",
+                    String::from_utf8_lossy(body)
+                );
+            }
+        }
+
+        #[test]
+        fn flush_accepts_a_closed_array() {
+            for body in [&br#"[{"a":1},{"a":2}]"#[..], &br"[]"[..], &b"  [ ]  "[..]] {
+                let schema = schema();
+                let mut dec = decoder(&schema);
+                dec.decode(body).expect("decode should accept the body");
+
+                // Flush is called repeatedly until it yields no more batches;
+                // a closed array must stay clean across every call.
+                for _ in 0..3 {
+                    dec.flush().unwrap_or_else(|e| {
+                        panic!(
+                            "closed array {:?} must flush clean: {e}",
+                            String::from_utf8_lossy(body)
+                        )
+                    });
+                }
+            }
+        }
+
+        /// The whole point of `finish` is that the deserializer reaches it, so
+        /// drive the real `deserialize_stream` wiring rather than `flush` alone.
+        #[test]
+        fn the_stream_fails_instead_of_returning_a_short_table() {
+            let schema = schema();
+            let chunks: Vec<Result<bytes::Bytes>> = vec![
+                Ok(bytes::Bytes::from_static(br#"[{"a":1},"#)),
+                Ok(bytes::Bytes::from_static(br#"{"a":2}"#)),
+            ];
+
+            // Bounded: `deserialize_stream` re-polls the exhausted input and so
+            // repeats any decoder error indefinitely. Consumers stop at the
+            // first error; the test only needs to see one arrive.
+            let batches: Vec<_> = block_on(
+                deserialize_stream(
+                    futures::stream::iter(chunks),
+                    DecoderDeserializer::new(decoder(&schema)),
+                )
+                .take(8)
+                .collect(),
+            );
+
+            let rows: usize = batches
+                .iter()
+                .filter_map(|b| b.as_ref().ok())
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert!(
+                batches.iter().any(Result::is_err),
+                "a truncated array yielded {rows} rows and no error"
+            );
+        }
+
+        /// The buffered reader already rejects these bodies. The streaming
+        /// adapter reading the same file must not disagree with it.
+        #[test]
+        fn both_readers_reject_the_same_truncated_body() {
+            let body = br#"[{"a":1},{"a":2}"#;
+
+            let mut pulled = Vec::new();
+            let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
+                .expect("array start is present")
+                .read_to_end(&mut pulled);
+            assert!(pull.is_err(), "buffered reader accepted a truncated array");
+
+            let schema = schema();
+            let mut dec = decoder(&schema);
+            dec.decode(body).expect("decode should accept the prefix");
+            assert!(
+                dec.flush().is_err(),
+                "streaming adapter accepted a truncated array the buffered reader rejects"
+            );
+        }
+
+        /// A body carrying more than the array it opens with is the other way
+        /// a file can be read short, and the two readers have to agree about
+        /// it as well: whichever one a dataset happens to be scanned through,
+        /// the same file has to reach the same verdict.
+        #[test]
+        fn both_readers_reject_the_same_trailing_content() {
+            let body = br#"[{"a":1}]{"a":2}"#;
+
+            let mut pulled = Vec::new();
+            let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
+                .expect("array start is present")
+                .read_to_end(&mut pulled);
+            assert!(
+                pull.is_err(),
+                "buffered reader read a second array as part of the first"
+            );
+
+            let schema = schema();
+            let mut dec = decoder(&schema);
+            let decoded = dec.decode(body);
+            assert!(
+                decoded.is_err() || dec.flush().is_err(),
+                "streaming adapter accepted trailing content the buffered reader rejects"
+            );
+        }
     }
 }

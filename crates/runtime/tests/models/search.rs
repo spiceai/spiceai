@@ -31,6 +31,7 @@ use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::Client;
 use reqwest::header::HeaderMap;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
@@ -48,7 +49,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{get_tpcds_dataset, sort_json_keys};
 
@@ -137,6 +138,86 @@ async fn http_sql(base_url: &str, sql: &str) -> Result<Value, anyhow::Error> {
     let response_str = http_post(&format!("{base_url}/v1/sql").to_string(), sql, headers).await?;
     serde_json::from_str(&response_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse 'v1/sql' HTTP response: {e}"))
+}
+
+/// The header `/v1/search` uses to report how the results cache served a
+/// request: `MISS`, `HIT`, `BYPASS` or `STALE`. Set from
+/// `CacheStatus::to_header_string`.
+const SEARCH_CACHE_STATUS_HEADER: &str = "Search-Results-Cache-Status";
+
+/// How long the cache tests wait for the detached cache write to land before
+/// giving up and asserting on whatever status they last saw.
+const CACHE_HIT_WAIT: Duration = Duration::from_secs(5);
+
+/// POST to `/v1/search` and return that response's
+/// `Search-Results-Cache-Status` value.
+///
+/// The cache tests assert on this header rather than on elapsed time: the
+/// runtime reports the cache disposition directly, so the assertion does not
+/// depend on how loaded the runner is.
+async fn search_cache_status(
+    base_url: &str,
+    body: &str,
+    extra_headers: HeaderMap,
+) -> Result<String, anyhow::Error> {
+    let mut headers = HeaderMap::new();
+    headers.extend(extra_headers);
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let url = format!("{base_url}/v1/search");
+    let response = Client::new()
+        .post(url)
+        .headers(headers)
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let message = response.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    let Some(header) = response.headers().get(SEARCH_CACHE_STATUS_HEADER) else {
+        return Err(anyhow::anyhow!("no {SEARCH_CACHE_STATUS_HEADER} header"));
+    };
+    let cache_status = header
+        .to_str()
+        .map_err(|e| anyhow::anyhow!("invalid {SEARCH_CACHE_STATUS_HEADER}: {e}"))?;
+
+    Ok(cache_status.to_string())
+}
+
+/// Search until the results cache reports a `HIT`, or until `max_wait` elapses,
+/// and return the last status seen — so the caller asserts on it and reports
+/// what it actually got.
+///
+/// The request straight after a cache-populating one can legitimately still
+/// miss. `wrap_cache_to_result` hands the write to a detached `tokio::spawn` so
+/// that draining the response stream cannot deadlock against it, which means
+/// `put_raw_key` can land after the caller already holds its response —
+/// receiving a response is not a happens-before for the insert. Asserting `HIT`
+/// on the very next request would be its own race, so poll for it, deadlined so
+/// that a cache which never populates fails the assertion instead of retrying
+/// forever.
+///
+/// Mirrors `utils::wait_until_true`, but keeps the last status and propagates
+/// request errors instead of collapsing both into `false`.
+async fn search_until_cache_hit(
+    base_url: &str,
+    body: &str,
+    max_wait: Duration,
+) -> Result<String, anyhow::Error> {
+    let start = Instant::now();
+    loop {
+        let status = search_cache_status(base_url, body, HeaderMap::new()).await?;
+        if status == "HIT" || start.elapsed() >= max_wait {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 pub async fn run_search_test(
@@ -2156,34 +2237,43 @@ async fn test_search_with_cache() -> Result<(), anyhow::Error> {
         .scope(async {
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
-            let start = Instant::now();
-            run_search_test(http_base_url.as_str(), &SearchTestCase::new(
-                "with_cache_pre_cache",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 100,
-                })),
-            ), None, false).await?;
-            let duration = start.elapsed();
-            let mut measured_cache_times = Vec::new();
-            for _ in 0..10 {
-                let start = Instant::now();
-                run_search_test(http_base_url.as_str(), &SearchTestCase::new(
-                    "with_cache_post_cache",
-                    SearchTestType::Http(json!({
-                        "text": "new patient",
-                        "limit": 100,
-                    })),
-                ), None, false).await?;
-                let duration_cached = start.elapsed();
-                measured_cache_times.push(duration_cached);
-            }
+            let search_body = json!({
+                "text": "new patient",
+                "limit": 100,
+            });
 
-            // take the median time from the cached responses
-            measured_cache_times.sort();
-            let duration_cached = measured_cache_times[measured_cache_times.len() / 2];
+            // The uncached request: populates the cache, and snapshots the body
+            // the cached responses below are compared against.
+            run_search_test(
+                http_base_url.as_str(),
+                &SearchTestCase::new(
+                    "with_cache_pre_cache",
+                    SearchTestType::Http(search_body.clone()),
+                ),
+                None,
+                false,
+            )
+            .await?;
 
-            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            // The runtime reports the cache disposition on every response, so
+            // assert on that rather than on how long the requests took: a
+            // repeat of a request already in the cache must be served from it.
+            let status =
+                search_until_cache_hit(&http_base_url, &search_body.to_string(), CACHE_HIT_WAIT)
+                    .await?;
+            assert_eq!(
+                status, "HIT",
+                "a repeated search should be served from the results cache"
+            );
+
+            // The cached response body must still match the uncached one.
+            run_search_test(
+                http_base_url.as_str(),
+                &SearchTestCase::new("with_cache_post_cache", SearchTestType::Http(search_body)),
+                None,
+                false,
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -2203,9 +2293,12 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
         }),
     );
 
+    // Comfortably longer than `CACHE_HIT_WAIT`: this test is about the bypass,
+    // not about expiry, so an entry ageing out mid-test would only be a source
+    // of flakes.
     let cache_config = CacheConfig {
         enabled: true,
-        item_ttl: Some("10s".to_string()),
+        item_ttl: Some("60s".to_string()),
         ..Default::default()
     };
 
@@ -2224,30 +2317,57 @@ async fn test_search_with_cache_bypass() -> Result<(), anyhow::Error> {
         .scope(async {
             let api_config = start_app(app).await?;
             let http_base_url = format!("http://{}", api_config.http_bind_address);
-            let start = Instant::now();
+            let search_body = json!({
+                "text": "new patient",
+                "limit": 2,
+            });
 
             let mut bypass_headers = HeaderMap::new();
             bypass_headers.insert("Cache-Control", "no-cache".parse().expect("valid header"));
-            run_search_test(http_base_url.as_str(), &SearchTestCase::new(
-                "with_cache_bypass_pre_cache",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                })),
-            ), Some(bypass_headers.clone()), false).await?;
-            let duration = start.elapsed().as_secs_f64();
-            let start = Instant::now();
-            run_search_test(http_base_url.as_str(), &SearchTestCase::new(
-                "with_cache_bypass_post_cache",
-                SearchTestType::Http(json!({
-                    "text": "new patient",
-                    "limit": 2,
-                })),
-            ), Some(bypass_headers), false).await?;
-            let duration_cached = start.elapsed().as_secs_f64();
 
-            assert!(duration >= duration_cached*0.7 || duration <= duration_cached*1.3,
-                "Cache bypass did not return similar performance. First: {duration:?}, Second: {duration_cached:?}");
+            // Warm the cache with an ordinary request first, so the bypass below
+            // has an entry it could wrongly be served from.
+            run_search_test(
+                http_base_url.as_str(),
+                &SearchTestCase::new(
+                    "with_cache_bypass_pre_cache",
+                    SearchTestType::Http(search_body.clone()),
+                ),
+                None,
+                false,
+            )
+            .await?;
+            let warm =
+                search_until_cache_hit(&http_base_url, &search_body.to_string(), CACHE_HIT_WAIT)
+                    .await?;
+            assert_eq!(warm, "HIT", "the cache should be warm before the bypass");
+
+            // A `Cache-Control: no-cache` search must never be served from the
+            // cache, even now that a fresh entry exists for the same key. The
+            // bypass path still *writes* to the cache, so a later ordinary
+            // request is expected to hit: bypass means "not served from the
+            // cache", not "not stored in it".
+            let bypassed = search_cache_status(
+                &http_base_url,
+                &search_body.to_string(),
+                bypass_headers.clone(),
+            )
+            .await?;
+            assert_eq!(
+                bypassed, "BYPASS",
+                "a no-cache search must bypass the results cache"
+            );
+
+            run_search_test(
+                http_base_url.as_str(),
+                &SearchTestCase::new(
+                    "with_cache_bypass_post_cache",
+                    SearchTestType::Http(search_body),
+                ),
+                Some(bypass_headers),
+                false,
+            )
+            .await?;
             Ok(())
         })
         .await

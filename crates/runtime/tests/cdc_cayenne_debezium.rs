@@ -42,7 +42,14 @@ limitations under the License.
 //! configures a keyed `refresh_mode: changes` Cayenne dataset.
 
 #![cfg(not(windows))]
+#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
+
+// Accelerator engines are their own crates and self-register through a linkme slice. Each
+// integration test is a separate binary that links independently, and the linker drops an
+// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -73,9 +80,9 @@ use datafusion_table_providers::util::column_reference::ColumnReference;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
 use futures::stream as fstream;
-use runtime::accelerated_table::refresh::Refresh;
-use runtime::accelerated_table::refresh_task::RefreshTaskBuilder;
-use runtime::federated_table::FederatedTable;
+use runtime::accelerated::refresh::Refresh;
+use runtime::accelerated::refresh_task::RefreshTaskBuilder;
+use runtime::federated::FederatedTable;
 use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
 use tokio::runtime::Handle;
@@ -237,7 +244,7 @@ async fn setup_keyed_cayenne_with_schema(
 fn make_refresh_task(
     accelerator: Arc<dyn TableProvider>,
     table_name: &str,
-) -> runtime::accelerated_table::refresh_task::RefreshTask {
+) -> runtime::accelerated::refresh_task::RefreshTask {
     let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
     RefreshTaskBuilder::new(
         RuntimeStatus::new(),

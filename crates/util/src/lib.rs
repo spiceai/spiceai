@@ -29,12 +29,13 @@ pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
 pub mod topological_ordering;
+pub mod tracers;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;
 mod tracing_util;
 use tokio::{sync::oneshot, time::Instant};
-pub use tracing_util::{in_tracing_context, in_tracing_context_async};
+pub use tracing_util::{in_tracing_context, in_tracing_context_async, single_line};
 pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod expr;
@@ -46,6 +47,7 @@ pub mod time;
 pub mod time_format;
 #[cfg(feature = "datafusion")]
 pub mod timestamp_filter;
+pub mod timezone;
 
 pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
 

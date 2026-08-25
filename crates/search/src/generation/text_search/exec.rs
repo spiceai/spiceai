@@ -12,7 +12,7 @@ limitations under the License.
 */
 use std::{fmt::Formatter, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, error::ArrowError};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, error::ArrowError};
 use async_stream::stream;
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
@@ -80,7 +80,21 @@ impl std::fmt::Debug for FullTextSearchExec {
 }
 impl DisplayAs for FullTextSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "FullTextSearchTableExec q={}", self.query)
+        write!(
+            f,
+            "FullTextSearchTableExec q={}, limit={}",
+            self.query, self.limit
+        )?;
+        if !self.filters.is_empty() {
+            let filters = self
+                .filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, ", filters=[{filters}]")?;
+        }
+        Ok(())
     }
 }
 
@@ -114,29 +128,55 @@ impl ExecutionPlan for FullTextSearchExec {
         let limit = self.limit;
         let query = self.query.clone();
 
+        // Translate the pushed-down SQL filters into tantivy queries up front (cheap, sync). Any
+        // filter that fails to translate was advertised as pushable by `supports_filters_pushdown`
+        // but cannot be built — a lockstep bug — so fail the scan rather than silently drop it.
+        let filter_queries = match idx.translate_filters(&self.filters) {
+            Ok(queries) => queries,
+            Err(e) => {
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    futures::stream::once(async move { Err(e) }),
+                )));
+            }
+        };
+
         let s = stream! {
-          // TODO: Support filters.
             match idx
-                .search(query, &[], limit)
-                .await
+                .search(query, filter_queries, limit)
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {
                     while let Some(item) = stream.next().await {
                         match item {
                             Err(e) => yield Err(e),
                             Ok(rb) => {
-                                // Apply projection. Must return in the order it exists in
-                                // `self.schema()`, not in the record batch. Use
-                                // `Schema::index_of` instead of cloning all field names
-                                // and doing a linear search per projected column.
+                                // Apply projection in the declared schema order. A missing
+                                // field is a corrupt result page, not a column to omit: omitting
+                                // it shifts every following column by position.
                                 let rb_schema = rb.schema();
-                                let proj: Vec<usize> = schema
+                                let proj = schema
                                     .fields()
                                     .iter()
-                                    .filter_map(|f| rb_schema.index_of(f.name()).ok())
-                                    .collect();
+                                    .map(|f| {
+                                        rb_schema.index_of(f.name()).map_err(|_| {
+                                            DataFusionError::Internal(format!(
+                                                "Full text search result page is missing column '{}': expected schema {schema}, got {rb_schema}",
+                                                f.name(),
+                                            ))
+                                        })
+                                    })
+                                    .collect::<DataFusionResult<Vec<_>>>();
 
-                                yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
+                                match proj {
+                                    Ok(proj) => {
+                                        let projected = rb.project(proj.as_slice()).map_err(DataFusionError::from);
+                                        yield projected.and_then(|projected| {
+                                            RecordBatch::try_new(Arc::clone(&schema), projected.columns().to_vec())
+                                                .map_err(DataFusionError::from)
+                                        });
+                                    }
+                                    Err(e) => yield Err(e),
+                                }
                             }
                         }
                     }

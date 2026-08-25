@@ -1202,7 +1202,7 @@ impl CayenneTableProvider {
                 // The prepared insert is a lazily-consumed stream of unknown
                 // size; shard across the full write concurrency (prior behavior).
                 None,
-                super::delta_encoding::WriteClass::Delta,
+                super::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {
@@ -1295,7 +1295,7 @@ impl CayenneTableProvider {
         // cross-partition append. Refuse before cloning or consuming input until
         // those states are included in the coordinated transaction.
         let current_snapshot_id = self.get_current_snapshot_id();
-        let target_snapshot_id = Self::new_staging_snapshot_id();
+        let (_, target_snapshot_id) = Self::new_staging_snapshot_id_pair();
         let mut setup_cleanup = DeferredSetupCleanup {
             table: self.clone_for_write_operations(),
             snapshots: vec![target_snapshot_id.clone()],

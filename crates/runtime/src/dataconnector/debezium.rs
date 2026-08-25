@@ -15,34 +15,32 @@ limitations under the License.
 */
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
-use crate::accelerated_table::refresh_task::changes::{
-    CdcSchemaEvolution, SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED,
-    SCHEMA_EVOLUTION_FAILED, install_cdc_schema_evolution, schema_evolution_labels,
-    widening_plan_kind,
-};
+use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::dataset::{Dataset, OnSchemaChange};
-use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
+use crate::component::dataset::{DatasetSpec, OnSchemaChange};
+use crate::dataconnector::parameters::ConnectorContext;
 use crate::dataconnector::schema_projection::{ProjectionPolicy, parse_schema_projection};
-use crate::dataconnector::{
-    ConnectorComponent,
-    kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
-};
+use crate::dataconnector::{ConnectorComponent, kafka::SidecarOffsetCommitHook};
 use crate::datafusion::refresh_sql;
-use crate::federated_table::FederatedTable;
-use crate::schema_evolution::evolution_allowed;
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    evolution_allowed, schema_evolution_labels, widening_plan_kind,
+};
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cdc::ChangesStream;
+use data_components::cdc::{AccelerationContents, ChangesStream};
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
 use data_components::schema_discovery::merge_inferred_and_declared_schemas;
+use data_connector_api::federated::FederatedTableProvider;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
+use runtime_checkpoint_api::CheckpointError;
+use runtime_checkpoint_api::debezium::{DebeziumCheckpoint, DebeziumCheckpointStore};
 use runtime_metrics::component::MetricsProvider;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -77,11 +75,21 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
     schema_evolution: bool,
+}
+
+// Hand-written because `KafkaConfig` is not `Debug`.
+impl std::fmt::Debug for Debezium {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Debezium")
+            .field("kafka_config", &self.kafka_config)
+            .field("batching", &self.batching)
+            .field("schema_evolution", &self.schema_evolution)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Debezium {
@@ -288,10 +296,11 @@ impl DataConnectorFactory for DebeziumFactory {
         self
     }
 
-    fn create(
-        &self,
+    fn create<'a>(
+        &'a self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        _context: &'a dyn ConnectorContext,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send + 'a>> {
         Box::pin(async move {
             let debezium = Debezium::new(params.parameters)?;
             Ok(Arc::new(debezium) as Arc<dyn DataConnector>)
@@ -307,7 +316,7 @@ impl DataConnectorFactory for DebeziumFactory {
     }
 }
 
-register_data_connector!("debezium", DebeziumFactory);
+data_connector_api::register_data_connector!("debezium", DebeziumFactory);
 
 #[async_trait]
 impl DataConnector for Debezium {
@@ -321,7 +330,8 @@ impl DataConnector for Debezium {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        context: &dyn ConnectorContext,
+        dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
@@ -348,15 +358,16 @@ impl DataConnector for Debezium {
         let dataset_name = dataset.name.to_string();
 
         let debezium_kafka_sys = if dataset.is_file_accelerated() {
-            Some(Arc::new(
-                DebeziumKafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
+            Some(
+                context
+                    .debezium_checkpoint_store(dataset)
                     .await
                     .boxed()
                     .context(super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
                     })?,
-            ))
+            )
         } else {
             tracing::warn!(
                 dataset = %dataset_name,
@@ -563,10 +574,12 @@ impl DataConnector for Debezium {
         true
     }
 
-    fn changes_stream(
+    async fn changes_stream(
         &self,
-        federated_table: Arc<FederatedTable>,
-        _dataset: &Dataset,
+        _context: &dyn ConnectorContext,
+        federated_table: Arc<dyn FederatedTableProvider>,
+        _dataset: &DatasetSpec,
+        _acceleration: AccelerationContents,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;
@@ -603,31 +616,55 @@ pub(crate) struct DebeziumKafkaMetadata {
     pub(crate) offsets: Vec<KafkaOffset>,
 }
 
+/// The stored checkpoint, as the connector speaks it.
+///
+/// The durable form carries the change-event field descriptors as JSON; the connector
+/// wants them typed, so the two differ by exactly that conversion.
 async fn get_metadata_from_accelerator(
-    debezium_kafka_sys: &DebeziumKafkaSys,
-) -> Result<Option<DebeziumKafkaMetadata>, spice_sys::Error> {
-    debezium_kafka_sys.get().await
+    debezium_kafka_sys: &dyn DebeziumCheckpointStore,
+) -> Result<Option<DebeziumKafkaMetadata>, CheckpointError> {
+    let Some(checkpoint) = debezium_kafka_sys.get().await? else {
+        return Ok(None);
+    };
+    let schema_fields = serde_json::from_str(&checkpoint.schema_fields_json).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    Ok(Some(DebeziumKafkaMetadata {
+        consumer_group_id: checkpoint.consumer_group_id,
+        topic: checkpoint.topic,
+        primary_keys: checkpoint.primary_keys,
+        schema_fields,
+        offsets: checkpoint.offsets,
+    }))
 }
 
 async fn set_metadata_to_accelerator(
-    debezium_kafka_sys: &DebeziumKafkaSys,
+    debezium_kafka_sys: &dyn DebeziumCheckpointStore,
     metadata: &DebeziumKafkaMetadata,
-) -> Result<(), spice_sys::Error> {
-    debezium_kafka_sys.upsert(metadata).await
-}
-
-#[async_trait]
-impl SidecarOffsetStore for DebeziumKafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        DebeziumKafkaSys::upsert_offsets(self, offsets).await
-    }
+) -> Result<(), CheckpointError> {
+    let schema_fields_json = serde_json::to_string(&metadata.schema_fields).map_err(|source| {
+        CheckpointError::Store {
+            source: Box::new(source),
+        }
+    })?;
+    debezium_kafka_sys
+        .upsert(&DebeziumCheckpoint {
+            consumer_group_id: metadata.consumer_group_id.clone(),
+            topic: metadata.topic.clone(),
+            primary_keys: metadata.primary_keys.clone(),
+            schema_fields_json,
+            offsets: metadata.offsets.clone(),
+        })
+        .await
 }
 
 async fn get_metadata_from_kafka(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
-    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
     declared_schema: Option<&SchemaRef>,
     schema_evolution: bool,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
@@ -783,7 +820,7 @@ async fn get_metadata_from_kafka(
 /// Peek at the most recent message on `topic` using a temporary consumer.
 /// Does not touch the real consumer or its group offsets.
 async fn fetch_latest_change_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -814,7 +851,7 @@ async fn fetch_latest_change_event(
 
 /// Read the first available message.
 async fn fetch_first_event(
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_consumer: &KafkaConsumer,
 ) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
@@ -861,10 +898,10 @@ async fn fetch_first_event(
 /// `block` (legacy `schema_evolution: true`) keeps today's blind adoption.
 async fn refresh_schema_if_evolved(
     metadata: DebeziumKafkaMetadata,
-    dataset: &Dataset,
+    dataset: &DatasetSpec,
     topic: &str,
     kafka_config: &KafkaConfig,
-    debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    debezium_kafka_sys: Option<&dyn DebeziumCheckpointStore>,
     declared_schema: Option<&SchemaRef>,
     on_schema_change: OnSchemaChange,
 ) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
@@ -1063,7 +1100,7 @@ async fn refresh_schema_if_evolved(
 
 /// Returns the primary key column names from `acceleration.primary_key`, used as a
 /// fallback when no Kafka messages are available to extract Debezium primary keys from.
-fn primary_keys_from_acceleration(dataset: &Dataset) -> Vec<String> {
+fn primary_keys_from_acceleration(dataset: &DatasetSpec) -> Vec<String> {
     dataset
         .acceleration
         .as_ref()

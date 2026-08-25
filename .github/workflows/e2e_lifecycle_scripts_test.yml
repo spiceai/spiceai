@@ -1,0 +1,95 @@
+---
+name: E2E Lifecycle Scripts Test
+
+# The E2E jobs share two scripts for starting and stopping the runtime, and
+# both are load-bearing for CI reliability rather than for any product
+# behaviour — which is exactly why they need their own tests. A stop that
+# misses the `spiced` child leaks a listener into the next job on a reused
+# self-hosted runner, and a readiness wait that cannot explain a timeout sends
+# whoever triages it back to a bare "the action has timed out" (#12058).
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+    paths:
+      - '.github/actions/allocate-spice-ports/**'
+      - '.github/actions/stop-spice/**'
+      - '.github/actions/wait-for-spice-ready/**'
+      - 'scripts/test_e2e_spice_lifecycle.sh'
+      - 'scripts/test_e2e_spice_ports.sh'
+      - 'test/models/**'
+      - '.github/workflows/e2e_lifecycle_scripts_test.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - '.github/actions/allocate-spice-ports/**'
+      - '.github/actions/stop-spice/**'
+      - '.github/actions/wait-for-spice-ready/**'
+      - 'scripts/test_e2e_spice_lifecycle.sh'
+      - 'scripts/test_e2e_spice_ports.sh'
+      - 'test/models/**'
+      - '.github/workflows/e2e_lifecycle_scripts_test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test-e2e-lifecycle-scripts:
+    name: Unit tests for the E2E runtime lifecycle scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both families the E2E jobs actually run on. macOS matters most —
+          # that is where the reused self-hosted runners are — and it ships an
+          # older bash, so it catches syntax the Linux runners would accept.
+          - os: linux-x64
+            runner: ubuntu-24.04
+          - os: macos-arm64
+            runner: macos-latest
+    # Stubbed processes and ports throughout: the tests read the repository and
+    # nothing else, so they need no write scope and no credentials.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        # Invoked through `bash` so the job does not depend on the script's
+        # executable bit surviving a checkout on every platform.
+        run: bash scripts/test_e2e_spice_lifecycle.sh
+
+      - name: Run port allocation tests
+        run: bash scripts/test_e2e_spice_ports.sh
+
+      # The REPL scripts and their tests only ran inside the model E2E jobs,
+      # which are skipped on pull requests — so a change to them reached the
+      # merge queue unexercised. They need nothing but `expect`, so they can run
+      # here on every PR that touches them instead.
+      - name: Install expect (linux)
+        if: matrix.os == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.os == 'macos-arm64'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Run REPL script tests
+        run: bash test/models/expect_test.sh

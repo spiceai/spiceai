@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::time::Duration;
 
+use crate::cdc::AccelerationContents;
 use pgwire_replication::{CaCertificate, PgOutputFormat};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -47,6 +48,12 @@ pub fn ca_certificate_from_param(value: &str) -> CaCertificate {
 ///
 /// Built by the connector from spicepod params; see
 /// `connector-postgres::lib::replication_params_from_connector_params`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an independent user-facing parameter (or a derived \
+              accelerator property); folding them into enums would obscure the 1:1 \
+              mapping to spicepod params"
+)]
 #[derive(Clone)]
 pub struct ReplicationParams {
     pub host: String,
@@ -73,7 +80,52 @@ pub struct ReplicationParams {
     /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
     /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
     pub snapshot_on_resume: bool,
+    /// `true` when the dataset's accelerator does not survive a process restart
+    /// (the same condition that forces [`Self::snapshot_on_resume`]).
+    ///
+    /// Such a slot has no resume value across restarts — the accelerator boots
+    /// empty and re-snapshots regardless — while a slot left behind keeps
+    /// pinning WAL on the source for as long as Spice is down, which can fill
+    /// the primary's disk. So the shared-slot pump drops the slot on graceful
+    /// shutdown (see `slot::drop_slot_after_shutdown`) — it is the only path
+    /// that observes `cdc::shutdown_epoch`; a per-dataset generated slot still
+    /// outlives the process. An ungraceful exit likewise leaves the slot behind.
+    /// Either way the cost is WAL retention, never correctness, because
+    /// `snapshot_on_resume` re-snapshots on the next start regardless.
+    ///
+    /// Distinct from `snapshot_on_resume`, which a *durable* accelerator can
+    /// also set via `pg_replication_initial_snapshot: always` — dropping that
+    /// slot would be wrong.
+    pub ephemeral_accelerator: bool,
+    /// What the dataset's accelerator held when this stream was built.
+    ///
+    /// Only [`AccelerationContents::Empty`] carries weight, and only over the
+    /// single question of whether a *missing* watermark is evidence of a gap: an
+    /// acceleration holding no rows cannot be hiding a row the source deleted
+    /// while it was away, which is the divergence a rebuild exists to repair.
+    /// Anything else — including a probe that could not answer — leaves the
+    /// rebuild in place.
+    ///
+    /// Even then it only applies when an initial snapshot is going to run, since
+    /// otherwise the rebuild is the only thing that would load the table at all.
+    ///
+    /// Per-dataset, so it is deliberately not part of the shared-slot params
+    /// compatibility check: two datasets legitimately share a slot while one is
+    /// empty and the other is populated.
+    pub acceleration: AccelerationContents,
     pub status_interval: Duration,
+    /// How often an idle member's durably-recorded applied position is carried
+    /// forward to what the slot has acknowledged on its behalf (see
+    /// `shared::flush_idle_watermarks`). Internal, not a user param.
+    ///
+    /// Coarse on purpose. The record only has to be current enough that the *next*
+    /// start does not mistake ordinary idle drift for a gap, and a graceful shutdown
+    /// flushes once more regardless — so this interval governs only how much a
+    /// *crash* can leave behind, where the cost is one rebuild and never a wrong
+    /// resume. Each tick writes at most one small blob per member whose position
+    /// actually moved, into that dataset's own accelerator; a busy member records its
+    /// position through its own commits and costs nothing here.
+    pub watermark_flush_interval: Duration,
     /// Lag-based readiness threshold: the dataset is marked Ready once its
     /// replication lag (now minus the newest applied commit's source time)
     /// falls below this, so a snapshotting or backlog-draining dataset stays
@@ -107,6 +159,34 @@ pub struct ReplicationParams {
     /// still emits text for types lacking a binary send function, so the text
     /// decode path stays live regardless of this setting.
     pub pg_output_format: PgOutputFormat,
+
+    /// How long the shared slot keeps holding its ack floor for a table that is
+    /// in the publication but has no attached member — see
+    /// `shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE` for what the hold is for and
+    /// what letting it lapse costs.
+    ///
+    /// Internal, not a spicepod parameter: the connector always supplies the
+    /// default. It is a field only so a test can shorten it, since the behavior
+    /// that depends on the hold lapsing is otherwise unreachable in under five
+    /// minutes. Read from the params of whichever member opened the slot.
+    pub unclaimed_reservation_grace: Duration,
+}
+
+impl ReplicationParams {
+    /// Whether this slot carries nothing worth keeping across a restart, so it
+    /// may be released at shutdown and fast-forwarded past a backlog.
+    ///
+    /// Both conditions are required, and the second is the subtle one. An
+    /// ephemeral accelerator boots empty, but that only makes the slot
+    /// disposable if a snapshot is actually going to rebuild it. With
+    /// `pg_replication_initial_snapshot: disabled` no snapshot ever runs -- the
+    /// documented workflow is to pre-seed the accelerator yourself -- and the
+    /// slot is then the *only* thing carrying the changes that happened while
+    /// Spice was down. Dropping it there loses them with no way to replay.
+    #[must_use]
+    pub fn slot_is_disposable(&self) -> bool {
+        self.ephemeral_accelerator && self.snapshot_on_resume
+    }
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -122,6 +202,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
             .field("snapshot_on_resume", &self.snapshot_on_resume)
+            .field("ephemeral_accelerator", &self.ephemeral_accelerator)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
             .field("shared", &self.shared)
@@ -743,6 +824,36 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
 -----END CERTIFICATE-----
 ";
 
+    /// `slot_is_disposable` gates BOTH releasing the slot at shutdown and
+    /// fast-forwarding it past a backlog, so a wrong `true` discards WAL that
+    /// nothing else will replace. Each condition is asserted individually
+    /// necessary.
+    #[test]
+    fn a_slot_is_disposable_only_with_an_empty_accelerator_and_a_guaranteed_snapshot() {
+        let with = |ephemeral, snapshot_on_resume| {
+            let mut p = verify_full_params(None);
+            p.ephemeral_accelerator = ephemeral;
+            p.snapshot_on_resume = snapshot_on_resume;
+            p.slot_is_disposable()
+        };
+
+        // Boots empty and will re-snapshot: the WAL is genuinely redundant.
+        assert!(with(true, true));
+
+        // Durable accelerator, snapshot forced by `initial_snapshot: always`.
+        // Its snapshot upserts into rows that already exist, so discarding the
+        // WAL that carried the source's deletes would leave them behind.
+        assert!(!with(false, true));
+
+        // Empty accelerator but `initial_snapshot: disabled`, so no snapshot
+        // ever runs -- the operator pre-seeds and the slot is the only thing
+        // carrying the changes from while Spice was down. Regression for the
+        // review finding that the shutdown drop was gated on ephemerality alone.
+        assert!(!with(true, false));
+
+        assert!(!with(false, false));
+    }
+
     /// `verify-full` params — the strictest mode, and the one that actually
     /// consults `sslrootcert`. A weaker mode would build a connector even with
     /// the CA ignored, which is exactly the vacuity this fix is about.
@@ -759,12 +870,17 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
             publication_name: "pub".to_string(),
             initial_snapshot: true,
             snapshot_on_resume: false,
+            ephemeral_accelerator: false,
+            acceleration: AccelerationContents::Unknown,
             status_interval: Duration::from_secs(5),
+            watermark_flush_interval: Duration::from_secs(30),
             ready_lag: Duration::from_secs(2),
             bootstrap_batch_size: 1024,
             shared: false,
             member_channel_capacity: 16,
             pg_output_format: PgOutputFormat::Binary,
+            unclaimed_reservation_grace:
+                crate::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
         }
     }
 

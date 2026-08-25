@@ -36,7 +36,9 @@ s3_vectors = { path = "../s3_vectors", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+spice-table = { path = "../spice-table" }
 tantivy = { workspace = true, optional = true }
+tantivy_datafusion_filter = { path = "../tantivy_datafusion_filter", optional = true }
 tokio.workspace = true
 tracing.workspace = true
 util = { path = "../util", features = ["datafusion"] }
@@ -47,7 +49,7 @@ duckdb = ["datafusion-table-providers/duckdb", "dep:datafusion-table-providers",
 elasticsearch = ["data_components/elasticsearch", "dep:elasticsearch", "llms"]
 llms = ["dep:llms", "dep:runtime-datafusion-udfs"]
 s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
-text_search = ["dep:tantivy"]
+text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }

@@ -195,19 +195,27 @@ impl InlineBatchBuffer {
         &self.batches
     }
 
+    #[must_use]
+    pub(crate) fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Reconstitute the original stream: re-emit the buffered head ahead of the
+    /// unconsumed remainder, so the write path sees every row exactly once and in
+    /// order.
+    ///
+    /// The buffer already owns the batches, so replaying them is a plain
+    /// `stream::iter` — no `MemorySourceConfig`/`ExecutionPlan` round trip, and
+    /// therefore no `TaskContext` and nothing to fail.
     pub(crate) fn into_chained_stream(
         self,
         remaining_stream: SendableRecordBatchStream,
-        context: &Arc<TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let buffered_exec =
-            MemorySourceConfig::try_new_exec(&[self.batches], Arc::clone(&self.schema), None)?;
-        let buffered_stream = execute_stream(buffered_exec, Arc::clone(context))?;
-        let chained_stream = Box::pin(StreamExt::chain(buffered_stream, remaining_stream));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+    ) -> SendableRecordBatchStream {
+        let replay = futures::stream::iter(self.batches.into_iter().map(Ok));
+        Box::pin(RecordBatchStreamAdapter::new(
             self.schema,
-            chained_stream,
-        )))
+            StreamExt::chain(replay, remaining_stream),
+        ))
     }
 }
 
@@ -1203,7 +1211,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // (partition/retention tables) — those keep the prior full
                 // fan-out sizing and the full default delta encoding.
                 estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -1408,7 +1416,7 @@ impl<'a> AppendMutationWriter<'a> {
             buffer.total_rows() as u64,
             buffer.total_bytes() as u64,
         );
-        let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
+        let re_stream = buffer.into_chained_stream(prepared_stream);
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
             estimated_bytes,
@@ -1443,7 +1451,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {
@@ -1544,7 +1552,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
-                crate::provider::delta_encoding::WriteClass::Delta,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
             )
             .await
         {

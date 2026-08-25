@@ -47,9 +47,7 @@
 // A oneof is its own group and numbers its arms contiguously from 1; the
 // enclosing message's remaining fields follow it. Every other message numbers
 // contiguously from 1 in declaration order. New fields take the next free
-// number. Nothing is skipped or reserved: the two sides of this contract ship
-// together, so a removed field's number is free to be reused rather than frozen
-// for a peer that does not exist.
+// number. Removed field and enum numbers are reserved and never reused.
 //
 // Protobuf shares one number space across a message and the oneofs inside it,
 // so a message whose oneof starts at 1 declares that oneof first and its own
@@ -94,6 +92,13 @@ enum ResultCode {
   RESULT_CODE_FAILED = 4;
   // The instance hit a fault of its own while handling the command.
   RESULT_CODE_INTERNAL = 5;
+  // A command of this kind is already in flight; this one was refused before
+  // any work started. Retryable once the first one finishes.
+  RESULT_CODE_BUSY = 6;
+  // The command ran but its result exceeds what the control stream carries.
+  // No partial payload accompanies this code — a narrower command may
+  // succeed, an identical retry will not.
+  RESULT_CODE_RESULT_TOO_LARGE = 7;
 }
 
 // Coarse runtime state. The single vocabulary for "how is this runtime
@@ -171,6 +176,8 @@ message ControlMessage {
     Pause pause = 13;
     ApplySecrets apply_secrets = 14;
     DeleteSecrets delete_secrets = 15;
+    ExecuteQuery execute_query = 18;
+    AttachApp attach_app = 19;
   }
 
   // Correlates the eventual `CommandResult`. Empty for an unsolicited
@@ -231,6 +238,13 @@ message Heartbeat {
   uint32 active_models = 6;
   uint32 active_spicepods = 7;
   map<string, string> runtime_versions = 8;
+  // Presence distinguishes an unreported status from a reported empty status.
+  StandaloneRuntimeStatus standalone_runtime = 9;
+}
+
+message StandaloneRuntimeStatus {
+  // Configuration paths whose desired values require a restart to take effect.
+  repeated string restart_required = 1;
 }
 
 // Terminal reply to a command, correlated by `command_id`.
@@ -295,8 +309,40 @@ message Restart {
   RestartMode mode = 1;
 }
 
+// `sealed_secret_payload` carries a standalone instance's app secrets
+// alongside its spicepod, in the same dispatch: applying a spicepod is a
+// restart, so secrets arriving in a separate command would land after the
+// components that needed them had already tried to load.
+//
+// It reuses SealedSecretPayload's shape rather than inlining flat fields, so
+// there is exactly one envelope type and one crypto path in the system — but
+// here it carries the OUTER seal, exactly as ApplySecrets does: the gateway
+// wraps the control plane's inner envelope (itself a SealedSecretPayload,
+// sealed to the instance's enrolled encryption key) in an HPKE seal to the
+// session's announced SecretsKey. A session that has not announced one cannot
+// receive it — the same gate as ApplySecrets, so standalone gets the same
+// double-seal guarantee as an operator-managed cluster.
+//
+// Unlike ApplySecrets there is no namespace/secret_name on this message: a
+// standalone instance has no Kubernetes namespace or Secret to name, so both
+// halves of the AAD are pinned literals every party must hold identically and
+// none of them sends — see `cloud-connect-crypto`, which is the single source
+// for them. Absent means "no secrets with this deploy" and is backward
+// compatible with peers that predate the field.
+//
+// Redelivering a spicepod the instance is already serving is a no-op, not
+// another apply: applying restarts the instance, so an apply-on-redelivery is a
+// restart loop.
 message ApplySpicepod {
   string spicepod_yaml = 1;
+  SealedSecretPayload sealed_secret_payload = 2;
+  // The app this instance's telemetry is attributed to. The control plane knows
+  // which app an instance is attached to and the instance cannot derive it, so
+  // it rides the same command that tells the instance what to run. The runtime
+  // stamps it as `scp_app_id`, the label the metrics backend's app dashboards
+  // filter on; empty means the control plane named none, and an instance that
+  // has never been given one exports no metrics rather than unattributed ones.
+  string app_id = 3;
 }
 
 message UpgradeRuntime {
@@ -348,6 +394,52 @@ message Drain {}
 
 message Pause {
   PauseState state = 1;
+}
+
+// Run a SQL query against the instance's in-process runtime and return the
+// rows as a complete Arrow IPC stream in `CommandResult.binary`.
+//
+// READ-ONLY. The statement is planned and then refused if it carries DDL, DML,
+// COPY, or a write-capable extension: this command arrives from the control
+// plane rather than from someone holding the instance's own credentials, so it
+// reads the instance and never changes it.
+//
+// The instance holds the limits, not the caller: at most 500 rows and at most
+// 4 MiB of Arrow IPC in the single result, one query in flight at a time — a
+// second is answered RESULT_CODE_BUSY before it executes — and a deadline after
+// which the query is abandoned and the slot freed. An oversized result is
+// RESULT_CODE_RESULT_TOO_LARGE with no payload; there is no partial success and
+// no chunking.
+//
+// The SQL text and the result values never leave the instance except as this
+// command's own result: nothing about them reaches the control plane's logs,
+// traces, or metrics, which carry only the command id, duration, row count,
+// byte count, and outcome. The instance still records the statement in its own
+// local query history, the same as for a query it received directly.
+//
+// `CommandResult.message` is the one place caller-derived text rides the wire:
+// on RESULT_CODE_INVALID_ARGUMENT it carries the engine's diagnostic, without
+// which a rejected statement cannot be fixed. It goes to the caller who wrote
+// the query and is not to be logged or retained on the way.
+//
+// There is no cancellation command: a caller that stops waiting releases its
+// own waiter, and the query runs on inside the instance until it finishes or
+// hits the instance's deadline.
+message ExecuteQuery {
+  string sql = 1;
+  // Requested row cap. Zero means the instance default; the effective cap is
+  // min(max_rows, 500) with zero mapping to 500.
+  uint32 max_rows = 2;
+}
+
+// `app_id` absent means detached; in that shape every metadata field MUST also
+// be absent. When `app_id` is present, every present field must be non-empty
+// and must not carry leading or trailing whitespace.
+message AttachApp {
+  optional string app_id = 1;
+  optional string org_name = 2;
+  optional string app_name = 3;
+  optional string monitor_url = 4;
 }
 
 // Sealed secrets delivery. A secret value is sealed TWICE with HPKE
@@ -418,7 +510,7 @@ message SecretPayload {
 //
 // Unsolicited: the runtime exports on its own cadence rather than answering a
 // command, so this rides on ClientMessage with no command_id and draws no
-// CommandResult. Nothing emits it yet.
+// CommandResult.
 //
 // `otlp_request` is a serialized
 // `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest` in

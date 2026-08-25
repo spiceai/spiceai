@@ -1,0 +1,10 @@
+# Frozen output of: git log v2.1.3..HEAD --format='%an <%ae>' --no-merges | sort -u
+# followed by the GitHub handle resolved from each author's PRs.
+Benjamin Chambers <bjchambers@spice.ai>        -> bjchambers
+Jack Eadie <jack@spice.ai>                     -> Jeadie
+Kari Fabri <kari@example.com>                  -> karifabri     (first contribution)
+Luke Kim <luke@spice.ai>                       -> lukekim
+Phillip LeBlanc <phillip@spice.ai>             -> phillipleblanc
+Sergei Grebnov <sergei@spice.ai>               -> sgrebnov
+dependabot[bot] <support@github.com>           -> dependabot[bot]
+github-actions[bot] <actions@github.com>       -> github-actions[bot]

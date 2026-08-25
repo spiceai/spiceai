@@ -30,6 +30,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
@@ -70,9 +71,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_tls::TlsConfig;
 use snafu::prelude::*;
 use status::ComponentStatus;
-use tls::TlsConfig;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -84,8 +85,7 @@ use crate::cluster::{
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
-pub mod accelerated_table;
-pub(crate) mod accelerator_memory_budget;
+pub use runtime_table::accelerated;
 pub mod auth;
 pub mod builder;
 pub mod catalogconnector;
@@ -96,13 +96,13 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datasets_health_monitor;
-pub mod dataupdate;
+pub(crate) mod drasi;
+pub use runtime_acceleration::dataupdate;
 pub(crate) mod egress;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod executor_table;
 pub mod extension;
-pub mod federated_table;
+pub use runtime_table::federated;
 pub mod flight;
 mod http;
 
@@ -114,22 +114,31 @@ mod init;
 pub mod internal_table;
 pub mod jobs;
 mod management;
-pub mod metrics_reader;
 mod metrics_server;
 pub mod model;
 mod object_store_state;
-mod opentelemetry;
+pub mod opentelemetry;
 pub mod otel_push_exporter;
-pub mod resource_monitor;
+// Host/container resource introspection lives in `runtime-resources`; it names
+// nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
+pub mod resource_monitor {
+    pub use runtime_resources::*;
+}
 
-pub use runtime_parameters as parameters;
+// Connector parameters live in `runtime-parameters`; the runtime names them
+// through this alias. Crate-visible so that a crate outside the runtime has to
+// depend on `runtime-parameters` directly rather than route through here — the
+// layering guard cannot see a path that hides inside a legal crate-level edge.
+pub(crate) use runtime_parameters as parameters;
 
-pub mod podswatcher;
+pub use metrics_server::prometheus_reader;
 pub mod request;
 mod scheduling;
-pub(crate) mod schema_evolution;
+pub(crate) use runtime_component::schema_evolution;
 pub mod search;
-pub mod secrets {
+// Secrets live in `runtime-secrets`. Crate-visible for the same reason as
+// `parameters` above: reach for `runtime-secrets` instead.
+pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
@@ -137,10 +146,8 @@ mod secrets_preflight;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
-pub mod tls;
 pub mod token_providers;
 pub mod tools;
-pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;
 mod view;
@@ -307,11 +314,29 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} (drasi): Drasi forwarding publishes the dataset's change stream, but this dataset has no change stream to publish — it is {reason}. Set 'acceleration.refresh_mode: changes' on a source that supports change data capture, or remove the 'drasi' block. See: https://spiceai.org/docs/reference/spicepod/datasets#drasi"
+    ))]
+    DrasiWithoutChangeStream {
+        dataset_name: String,
+        reason: String,
+    },
+
+    #[snafu(display(
         "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
         dataset_name: String,
         connector: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column primary key is supported today, but this dataset declares a {pk_columns}-column key ({primary_key}). Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackCompositePrimaryKey {
+        dataset_name: String,
+        connector: String,
+        primary_key: String,
+        pk_columns: usize,
     },
 
     #[snafu(display(
@@ -324,15 +349,14 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[cfg(feature = "postgres-accel")]
+    // The list comes from the accelerator registration slice, so it names the engines
+    // this build actually linked. A hand-written list is wrong for every build that
+    // omits an engine, which is every build that omits an engine crate.
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
-    ))]
-    AcceleratorEngineNotAvailable { name: String },
-
-    #[cfg(not(feature = "postgres-accel"))]
-    #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
+        "The accelerator engine '{name}' is not available in this build. Valid engines are {available}. \
+        Set `acceleration.engine` to one of those, or install a build that includes '{name}'. \
+        For details, visit: https://spiceai.org/docs/components/data-accelerators",
+        available = data_accelerator_api::registered_engine_list()
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -359,7 +383,9 @@ pub enum Error {
         reason: String,
     },
 
-    #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
+    #[snafu(display(
+        "Failed to load catalog '{catalog}': {source}. It is retried automatically; if it persists, report this bug: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToLoadCatalogConnector {
         catalog: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -381,6 +407,17 @@ pub enum Error {
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display(
+        "Failed to reload dataset {dataset}: its acceleration did not complete a refresh within {timeout_secs}s of being recreated. \
+        Reloading the dataset from scratch instead. \
+        Check that the dataset's source is reachable, and for 'refresh_mode: changes' that its change stream is producing data. \
+        See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    HotReloadRefreshTimedOut {
+        dataset: TableReference,
+        timeout_secs: u64,
+    },
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
@@ -531,6 +568,33 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, Copy)]
 pub struct LogErrors(pub bool);
 
+/// State of the initial [`Runtime::load_components`] pass.
+///
+/// The load has no deadline: `load_dataset` retries a transient failure for as
+/// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
+/// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
+/// the load running indefinitely. A caller holding the configuration that fixes
+/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
+/// rather than race it: a load left running keeps registering datasets from the
+/// app it started against, after a new app has replaced it.
+///
+/// `in_flight` starts `true` — a load is pending from the moment the runtime
+/// exists — so a supersede that lands before the load begins still stops it,
+/// and `load_components` returns without starting.
+struct InitialLoad {
+    cancel: CancellationToken,
+    in_flight: AtomicBool,
+}
+
+impl Default for InitialLoad {
+    fn default() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            in_flight: AtomicBool::new(true),
+        }
+    }
+}
+
 #[derive(Clone)]
 #[expect(clippy::struct_field_names)]
 pub struct Runtime {
@@ -547,6 +611,10 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
+    /// State of the process's one-time initial component load, so a caller that
+    /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
+    /// Shared, not copied, so every clone of the runtime supersedes the same load.
+    initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
     http_rate_control_registry: Arc<dataconnector::http_rate_control::HttpRateControlRegistry>,
@@ -566,13 +634,13 @@ pub struct Runtime {
     prometheus_registry: Option<prometheus::Registry>,
     /// On-demand metrics reader for cluster observability.
     /// Used by `GetMetrics` RPC and executor control stream to collect local OTLP metrics.
-    metrics_reader: Option<metrics_reader::MetricsReader>,
+    metrics_reader: Option<telemetry::metrics_reader::MetricsReader>,
     rate_limits: Arc<RateLimits>,
     io_runtime: Handle,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
-    spaced_tracer: Arc<tracers::SpacedTracer>,
+    spaced_tracer: Arc<util::tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
     tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
@@ -1161,7 +1229,7 @@ impl Runtime {
     /// - `GetMetrics` RPC to return local metrics to peer schedulers
     /// - Executors responding to metrics requests from schedulers via control stream
     #[must_use]
-    pub fn metrics_reader(&self) -> Option<&metrics_reader::MetricsReader> {
+    pub fn metrics_reader(&self) -> Option<&telemetry::metrics_reader::MetricsReader> {
         self.metrics_reader.as_ref()
     }
 
@@ -1232,6 +1300,13 @@ impl Runtime {
         if caching.embeddings.is_some() {
             CachedEmbeddingResult::init();
         }
+    }
+
+    /// Publishes the component counters at zero. Must be called after
+    /// `init_metrics` in spiced, for the same reason as
+    /// [`Runtime::init_cache_metrics`].
+    pub fn init_component_metrics(&self) {
+        runtime_metrics::publish_component_counters_at_zero();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -1337,7 +1412,7 @@ impl Runtime {
                     Arc::new(move || {
                         metrics_reader_for_collector
                             .as_ref()
-                            .map(metrics_reader::MetricsReader::collect_otlp)
+                            .map(telemetry::metrics_reader::MetricsReader::collect_otlp)
                             .unwrap_or_default()
                     });
                 (
@@ -1636,20 +1711,151 @@ impl Runtime {
         }
     }
 
+    /// Installs the `runtime.drasi` forwarders for the runtime's own tables.
+    ///
+    /// A misconfiguration disables forwarding with a loud warning rather than
+    /// failing startup. These tables carry telemetry, and refusing to start the
+    /// runtime because a downstream reaction engine was misconfigured trades a
+    /// much larger outage for a smaller one.
+    async fn init_drasi_forwarders(self: &Arc<Self>) {
+        let Some(app) = self.read_app().await else {
+            return;
+        };
+        let Some(spec) = app.runtime.drasi.as_ref() else {
+            return;
+        };
+
+        if spec.forwarding == spicepod::drasi::DrasiForwarding::Disabled {
+            tracing::debug!("'runtime.drasi' is present but disabled; not forwarding.");
+            return;
+        }
+
+        if spec.tables.is_empty() {
+            tracing::warn!(
+                "'runtime.drasi' is configured but names no tables, so nothing is forwarded to Drasi. Add entries under 'runtime.drasi.tables'."
+            );
+            return;
+        }
+
+        match crate::drasi::internal::InternalForwarders::try_new(spec).await {
+            Ok(forwarders) => {
+                tracing::warn!(
+                    "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+                );
+                tracing::info!(
+                    "Forwarding {} runtime table(s) to the Drasi source {}",
+                    spec.tables.len(),
+                    spec.source_id
+                );
+                self.df.set_drasi_forwarders(Arc::new(forwarders));
+            }
+            Err(e) => {
+                tracing::warn!("Not forwarding runtime tables to Drasi: {e}");
+            }
+        }
+    }
+
+    /// Abandon the initial component load.
+    ///
+    /// The load has no deadline — `load_dataset` retries a transient failure for
+    /// as long as the runtime is up — so a process that is on its way out (a
+    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
+    /// stop it: left running it keeps registering datasets from the
+    /// configuration being replaced, for the whole of the shutdown drain.
+    ///
+    /// Returns `true` only when this call is the one that stopped a pending or
+    /// running load, and `false` once the load has finished or was already
+    /// superseded.
+    ///
+    /// Components already registered when this fires stay registered; only the
+    /// load's remaining work is dropped.
+    pub fn supersede_initial_load(&self) -> bool {
+        if self.initial_load.in_flight.swap(false, Ordering::SeqCst) {
+            tracing::info!(
+                "Superseding the initial component load: a new configuration replaces the one being loaded"
+            );
+            self.initial_load.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the initial component load is still running.
+    ///
+    /// While it is, what is registered is not yet what the loaded app describes,
+    /// so a caller that reconciles a new app against the loaded one — the diff
+    /// [`Runtime::apply_app`] performs — would treat components the load has not
+    /// reached yet as already registered.
+    #[must_use]
+    pub fn initial_load_in_flight(&self) -> bool {
+        self.initial_load.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Reports every `${ store:key }` reference the app cannot resolve, as one
+    /// consolidated block, before any component is loaded.
+    ///
+    /// Runs at the start of the load rather than when the runtime is built,
+    /// because the two are not the same moment for the stores the runtime owns
+    /// rather than the spicepod: Cloud Connect registers its delivered-secrets
+    /// store on the built runtime and fills it from the local cache, and a
+    /// preflight that ran before that reported every delivered secret as
+    /// missing while the components that referenced them went on to load
+    /// perfectly well.
+    ///
+    /// Diagnostics only: it never changes whether or how components load, and
+    /// it never logs secret values.
+    async fn secrets_preflight(&self) {
+        // A cluster executor resolves every reference over the scheduler RPC
+        // store, one round trip each, and the scheduler has already checked
+        // them — so checking here re-reports the scheduler's own findings at
+        // the cost of a round trip per reference.
+        if matches!(self.distributed, Some(DistributedNode::Executor { .. })) {
+            return;
+        }
+
+        let Some(app) = self.app.read().await.clone() else {
+            return;
+        };
+        // A snapshot rather than the read guard: a lookup can be a network
+        // round trip, and holding the guard across it stalls a writer (and
+        // risks the write-preferring deadlock `Secrets::snapshot` documents).
+        let secrets = secrets::Secrets::snapshot(&self.secrets).await;
+        secrets_preflight::run(&app, &secrets).await;
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
+    ///
+    /// [`Runtime::supersede_initial_load`] abandons the load — including before
+    /// it starts, in which case this returns immediately and the superseding
+    /// caller loads the app it applied.
     pub async fn load_components(self: Arc<Self>) {
+        if self.initial_load.cancel.is_cancelled() {
+            tracing::info!(
+                "Skipping the initial component load: it was superseded before it started"
+            );
+            return;
+        }
+
+        self.secrets_preflight().await;
+
         Arc::clone(&self).set_components_initializing().await;
 
         Arc::clone(&self).start_extensions().await;
 
-        // Must be loaded before datasets
-        self.load_embeddings().await;
-        self.load_rerankers().await;
+        // Installed before anything can write: the forwarders resolve a table's
+        // key lazily from the constraints handed to them at write time, so they
+        // do not need the runtime tables to exist yet — and installing them here
+        // rather than alongside `task_history` keeps `runtime.drasi` working
+        // when task history itself is disabled.
+        self.init_drasi_forwarders().await;
 
-        // Spawn each component load in its own task to run in parallel
+        // Spawned before `load_embeddings`/`load_rerankers` so the table is registered as early as
+        // possible: it depends only on the app config, not on embeddings/rerankers being loaded, and
+        // other startup paths (tracing, `datasets_health_monitor`) start querying it immediately.
         let task_history = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -1659,6 +1865,11 @@ impl Runtime {
             }
         });
 
+        // Must be loaded before datasets
+        self.load_embeddings().await;
+        self.load_rerankers().await;
+
+        // Spawn each remaining component load in its own task to run in parallel
         let datasets = tokio::spawn({
             let self_clone = Arc::clone(&self);
             async move {
@@ -1708,8 +1919,9 @@ impl Runtime {
 
         let components = vec![task_history, datasets, catalogs, models];
 
-        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
-        let cancel_loading = CancellationToken::new();
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
+        // A child of the initial-load token so `supersede_initial_load` abandons the load through this same path.
+        let cancel_loading = self.initial_load.cancel.child_token();
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
@@ -1738,7 +1950,13 @@ impl Runtime {
             )
             .await;
 
-        if let Err(err) = load_result.await {
+        let load_outcome = load_result.await;
+
+        // The initial load is over — completed, failed, or cancelled — so a
+        // later deployment has nothing left to supersede and applies normally.
+        self.initial_load.in_flight.store(false, Ordering::SeqCst);
+
+        if let Err(err) = load_outcome {
             if !matches!(err, Error::ComponentsInitializationCancelled) {
                 tracing::error!("Could not start the Spice runtime: {err}");
             }
@@ -1774,7 +1992,7 @@ impl Runtime {
         }
     }
 
-    // Closes and deallocates all resources (including the static registries)
+    // Closes and deallocates all resources, including this runtime's accelerator engines.
     pub async fn shutdown(&self) {
         if self.status.is_shutdown() {
             return;
@@ -1859,12 +2077,12 @@ impl Runtime {
             }
         }
 
-        dataconnector::unregister_all().await;
-        catalogconnector::unregister_all().await;
+        // `dataconnector`, `catalogconnector`, and `document_parse` hold only
+        // stateless factories (see the comments atop their `register_all()`)
+        // — clearing them here would strip connectors/parsers out from
+        // under every other `Runtime` in this process, so shutdown skips them.
         self.accelerator_engine_registry.unregister_all().await;
         tools::factory::unregister_all_factories(self).await;
-
-        document_parse::unregister_all().await;
 
         // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
         // group includes only Metrics endpoints.
@@ -1958,16 +2176,9 @@ impl Runtime {
     }
 }
 
-// Moved to `data-accelerator-api` (so the accelerator builder can name the data
-// directory without an upward dependency); re-exported here for path compatibility.
+// The accelerator data directory is named by `data-accelerator-api`, so an engine
+// below `runtime` can resolve it; re-exported here for path compatibility.
 pub use data_accelerator_api::spice_data_base_path;
-
-#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
-#[expect(clippy::result_large_err)]
-pub(crate) fn make_spice_data_directory() -> Result<()> {
-    make_spice_data_sub_directory(&[])?;
-    Ok(())
-}
 
 #[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {

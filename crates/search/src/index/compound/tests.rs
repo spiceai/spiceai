@@ -30,7 +30,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use runtime_datafusion_index::Index;
+use spice_table::{Index, WriteWindow};
 
 use super::{CompoundReadMode, CompoundSearchIndex, CompoundVectorIndex, Error};
 use crate::index::{SearchIndex, VectorIndex};
@@ -56,6 +56,9 @@ struct MockIndex {
     write_output_rows: Option<usize>,
     fail_write: bool,
     fail_on_write_start: bool,
+    fail_on_write_complete: bool,
+    /// What this mock reports from `Index::write_start_failure_is_fatal`.
+    write_start_fatal: bool,
     /// What this mock reports from `Index::write_complete_failure_is_fatal`.
     write_complete_fatal: bool,
     /// What this mock reports from `Index::deletes_by_partial_key`.
@@ -76,6 +79,8 @@ impl MockIndex {
             write_output_rows: None,
             fail_write: false,
             fail_on_write_start: false,
+            fail_on_write_complete: false,
+            write_start_fatal: false,
             write_complete_fatal: false,
             deletes_partial_key: false,
             events: Arc::clone(events),
@@ -151,8 +156,8 @@ impl Index for MockIndex {
         vec![self.search_column.clone(), self.label.to_string()]
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        self.record("on_write_start");
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        self.record(&format!("on_write_start:{window:?}"));
         if self.fail_on_write_start {
             return Err(DataFusionError::Execution(format!(
                 "{} refuses to start a write",
@@ -169,6 +174,12 @@ impl Index for MockIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         self.record("on_write_complete");
+        if self.fail_on_write_complete {
+            return Err(DataFusionError::Execution(format!(
+                "{} refuses to finalize a write",
+                self.label
+            )));
+        }
         Ok(())
     }
 
@@ -179,6 +190,10 @@ impl Index for MockIndex {
 
     fn deletes_by_partial_key(&self) -> bool {
         self.deletes_partial_key
+    }
+
+    fn write_start_failure_is_fatal(&self) -> bool {
+        self.write_start_fatal
     }
 
     fn write_complete_failure_is_fatal(&self) -> bool {
@@ -498,13 +513,19 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
     let secondary = MockIndex::new("secondary", &events);
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
 
-    idx.on_write_start().await.expect("start");
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect("start");
     idx.on_write_complete().await.expect("complete");
     idx.on_write_failed().await.expect("failed");
 
     let events = events.lock().expect("event log mutex").clone();
     for side in ["primary", "secondary"] {
-        for event in ["on_write_start", "on_write_complete", "on_write_failed"] {
+        for event in [
+            "on_write_start:Append",
+            "on_write_complete",
+            "on_write_failed",
+        ] {
             assert!(
                 events.contains(&format!("{side}:{event}")),
                 "missing {side}:{event} in {events:?}"
@@ -513,61 +534,66 @@ async fn lifecycle_hooks_forward_to_both_indexes() {
     }
 }
 
-/// A compound index is stale if *either* half fails to finalize, so the fatality flag
-/// must be the union of both halves rather than the trait default (#12038).
-#[test]
-fn write_complete_fatality_is_the_union_of_both_search_halves() {
+/// A wrapper that swallowed the window would silently downgrade a replacing write to an
+/// append on the index it wraps, leaving entries for rows the source dropped (#12066). Both
+/// halves must be told the same window.
+#[tokio::test]
+async fn replace_all_window_forwards_to_both_indexes() {
     let events = Arc::new(Mutex::new(vec![]));
+    let primary = MockIndex::new("primary", &events);
+    let secondary = MockIndex::new("secondary", &events);
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
 
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.write_complete_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.write_complete_fatal = secondary_fatal;
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("start");
 
-        let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-        assert_eq!(
-            idx.write_complete_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
+    let events = events.lock().expect("event log mutex").clone();
+    for side in ["primary", "secondary"] {
+        assert!(
+            events.contains(&format!("{side}:on_write_start:ReplaceAll")),
+            "missing {side}:on_write_start:ReplaceAll in {events:?}"
         );
     }
 }
 
+/// A compound applies each half's own fatality to that half's own failure and swallows the
+/// best-effort ones, so every error it returns is already fatal — whatever the halves report
+/// individually. The trait default (`false`) would still downgrade a fatal half (#12421), which is
+/// why both are `true` rather than inherited (#12038 for the finalize half).
 #[test]
-fn write_complete_fatality_is_the_union_of_both_vector_halves() {
+fn fatality_is_reported_for_the_compound_not_the_halves() {
     let events = Arc::new(Mutex::new(vec![]));
 
-    for (primary_fatal, secondary_fatal, expected) in [
-        (false, false, false),
-        (true, false, true),
-        (false, true, true),
-        (true, true, true),
-    ] {
-        let mut primary = MockIndex::new("primary", &events);
-        primary.dimension = Some(4);
-        primary.write_complete_fatal = primary_fatal;
-        let mut secondary = MockIndex::new("secondary", &events);
-        secondary.dimension = Some(4);
-        secondary.write_complete_fatal = secondary_fatal;
+    for (primary_fatal, secondary_fatal) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mock = |label: &'static str, fatal: bool, dimension: Option<i32>| {
+            let mut idx = MockIndex::new(label, &events);
+            idx.dimension = dimension;
+            idx.write_start_fatal = fatal;
+            idx.write_complete_fatal = fatal;
+            idx
+        };
+        let case = format!("primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}");
 
-        let idx = CompoundVectorIndex::try_new(
-            Arc::new(primary) as Arc<dyn VectorIndex>,
-            Arc::new(secondary) as Arc<dyn VectorIndex>,
+        let search = compound(
+            mock("primary", primary_fatal, None),
+            mock("secondary", secondary_fatal, None),
+            CompoundReadMode::PrimaryOnly,
+        );
+        assert!(search.write_start_failure_is_fatal(), "search: {case}");
+        assert!(search.write_complete_failure_is_fatal(), "search: {case}");
+
+        let vector = CompoundVectorIndex::try_new(
+            Arc::new(mock("primary", primary_fatal, Some(4))) as Arc<dyn VectorIndex>,
+            Arc::new(mock("secondary", secondary_fatal, Some(4))) as Arc<dyn VectorIndex>,
             CompoundReadMode::PrimaryOnly,
         )
         .expect("compatible vector indexes");
 
-        assert_eq!(
-            idx.write_complete_failure_is_fatal(),
-            expected,
-            "primary_fatal={primary_fatal}, secondary_fatal={secondary_fatal}"
-        );
+        assert!(vector.write_start_failure_is_fatal(), "vector: {case}");
+        assert!(vector.write_complete_failure_is_fatal(), "vector: {case}");
     }
 }
 
@@ -619,22 +645,182 @@ fn partial_key_deletion_requires_both_halves() {
     }
 }
 
+/// A secondary whose *own* start failure is best-effort must not close the primary's window.
+/// The write runs anyway, so closing the window the primary staged silently downgrades a
+/// [`WriteWindow::ReplaceAll`] to an in-place write: readers observe a partially rebuilt index
+/// and rows the source dropped are never cleared (#12826).
 #[tokio::test]
-async fn on_write_start_rolls_back_primary_when_secondary_fails() {
+async fn on_write_start_keeps_the_primary_window_when_a_best_effort_secondary_fails() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.dimension = Some(4);
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.dimension = Some(4);
+    secondary.fail_on_write_start = true;
+
+    let idx = CompoundVectorIndex::try_new(
+        Arc::new(primary) as Arc<dyn VectorIndex>,
+        Arc::new(secondary) as Arc<dyn VectorIndex>,
+        CompoundReadMode::PrimaryOnly,
+    )
+    .expect("compatible vector indexes");
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("a best-effort secondary start failure must not fail the start");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "the primary's staged window must stay open for the write that follows: {events:?}"
+    );
+}
+
+/// The mirror case: a secondary that declares its own start failure fatal *does* abandon the
+/// write, so the primary's window must close with it.
+#[tokio::test]
+async fn on_write_start_rolls_back_the_primary_when_a_fatal_secondary_fails() {
     let events = Arc::new(Mutex::new(vec![]));
     let primary = MockIndex::new("primary", &events);
     let mut secondary = MockIndex::new("secondary", &events);
     secondary.fail_on_write_start = true;
+    secondary.write_start_fatal = true;
 
     let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
-    idx.on_write_start()
+    idx.on_write_start(WriteWindow::Append)
         .await
-        .expect_err("secondary start failure must propagate");
+        .expect_err("a fatal secondary start failure must propagate");
 
     let events = events.lock().expect("event log mutex").clone();
     assert!(
         events.contains(&"primary:on_write_failed".to_string()),
         "primary write window must be rolled back: {events:?}"
+    );
+}
+
+/// A best-effort *primary* start failure must not abandon the write either, even next to a
+/// fatal secondary. Reporting the union of the two flags escalated it: the sink saw "fatal"
+/// from the secondary and rejected a write only the primary's advisory tuning had failed
+/// (#12826).
+#[tokio::test]
+async fn on_write_start_continues_past_a_best_effort_primary_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.write_start_fatal = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect("a best-effort primary start failure must not fail the start");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        events.contains(&"secondary:on_write_start:Append".to_string()),
+        "the secondary must still be started: {events:?}"
+    );
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a start that failed partway owns its own cleanup: {events:?}"
+    );
+}
+
+/// Both halves failing to start is the only path that reaches the rollback branch with the
+/// primary's window never opened. The write is still abandoned — the secondary declares its own
+/// start failure fatal — but the primary must not be rolled back: a start that failed partway
+/// owns its cleanup, so `on_write_failed` would "restore" settings it never overrode (#12826).
+#[tokio::test]
+async fn on_write_start_does_not_roll_back_a_primary_whose_own_start_failed() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.fail_on_write_start = true;
+    secondary.write_start_fatal = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect_err("a fatal secondary start failure must propagate");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a primary whose own start failed must not be rolled back: {events:?}"
+    );
+}
+
+/// The finalize hook has the same shape as the start hook: a half that declares its own finalize
+/// failure best-effort must not fail the write just because the *other* half declares its own
+/// fatal. Elasticsearch's `_forcemerge` beside a tantivy primary is the live pairing (#12826).
+#[tokio::test]
+async fn on_write_complete_swallows_a_best_effort_half_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.write_complete_fatal = true;
+    let mut secondary = MockIndex::new("secondary", &events);
+    secondary.fail_on_write_complete = true;
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_complete()
+        .await
+        .expect("a best-effort half's finalize failure must not fail the write");
+
+    let events = events.lock().expect("event log mutex").clone();
+    for side in ["primary", "secondary"] {
+        assert!(
+            events.contains(&format!("{side}:on_write_complete")),
+            "both halves must be finalized: {events:?}"
+        );
+    }
+}
+
+/// The mirror case: the half that declares its own finalize fatal does fail the write, and the
+/// other half is still finalized rather than skipped.
+#[tokio::test]
+async fn on_write_complete_reports_a_fatal_half_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_complete = true;
+    primary.write_complete_fatal = true;
+    let secondary = MockIndex::new("secondary", &events);
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    let err = idx
+        .on_write_complete()
+        .await
+        .expect_err("a fatal half's finalize failure must fail the write");
+    assert!(err.to_string().contains("primary"), "{err}");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        events.contains(&"secondary:on_write_complete".to_string()),
+        "the other half must still be finalized: {events:?}"
+    );
+}
+
+/// A fatal primary start failure stops before the secondary is started at all.
+#[tokio::test]
+async fn on_write_start_stops_at_a_fatal_primary_failure() {
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut primary = MockIndex::new("primary", &events);
+    primary.fail_on_write_start = true;
+    primary.write_start_fatal = true;
+    let secondary = MockIndex::new("secondary", &events);
+
+    let idx = compound(primary, secondary, CompoundReadMode::PrimaryOnly);
+    idx.on_write_start(WriteWindow::Append)
+        .await
+        .expect_err("a fatal primary start failure must propagate");
+
+    let events = events.lock().expect("event log mutex").clone();
+    assert!(
+        !events.contains(&"secondary:on_write_start:Append".to_string()),
+        "the secondary must not be started after a fatal primary failure: {events:?}"
+    );
+    assert!(
+        !events.contains(&"primary:on_write_failed".to_string()),
+        "a start that failed partway owns its own cleanup: {events:?}"
     );
 }
 
@@ -964,13 +1150,13 @@ mod warm_memory {
     use super::*;
     use crate::SEARCH_SCORE_COLUMN_NAME;
     use crate::index::memory::{MemoryDistanceMetric, MemoryVectorIndex};
-    use crate::metadata::MetadataColumns;
+    use crate::metadata::{MetadataColumn, MetadataColumns};
     use arrow::array::{
         FixedSizeListArray, Float32Array, Float32Builder, Float64Array, ListBuilder,
     };
     use datafusion::logical_expr::ColumnarValue;
     use datafusion::scalar::ScalarValue;
-    use datafusion_expr::{Volatility, create_udf};
+    use datafusion_expr::{Volatility, create_udf, ident};
     use llms::embeddings::{Embed, EmbeddingInput};
 
     const DIM: i32 = 3;
@@ -1041,6 +1227,51 @@ mod warm_memory {
             MemoryDistanceMetric::Cosine,
         )
         .expect("valid memory index")
+    }
+
+    fn dotted_column_memory_index() -> MemoryVectorIndex {
+        MemoryVectorIndex::try_new(
+            "message.body".to_string(),
+            vec![Field::new("id", DataType::Int64, false)],
+            MetadataColumns::from(vec![
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "_spice.search_field",
+                    DataType::Utf8,
+                    false,
+                ))),
+                MetadataColumn::NonFilterable(Arc::new(Field::new(
+                    "CapitalCase",
+                    DataType::Utf8,
+                    false,
+                ))),
+            ]),
+            Arc::new(ByteEmbed),
+            embed_udf(),
+            "model_name".to_string(),
+            MemoryDistanceMetric::Cosine,
+        )
+        .expect("valid memory index")
+    }
+
+    fn dotted_column_input_batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("message.body", DataType::Utf8, false),
+            Field::new("_spice.search_field", DataType::Utf8, false),
+            Field::new("CapitalCase", DataType::Utf8, false),
+        ]));
+        #[expect(clippy::cast_possible_wrap, reason = "small test row counts")]
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(vec!["text"; rows])),
+                Arc::new(StringArray::from(vec!["message.body"; rows])),
+                Arc::new(StringArray::from(vec!["capital"; rows])),
+            ],
+        )
+        .expect("valid dotted-column input batch")
     }
 
     fn embedding_field() -> Field {
@@ -1178,6 +1409,36 @@ mod warm_memory {
 
         let plan = idx.list_table_provider().expect("list plan builds");
         assert_eq!(collect_ids(plan).await, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn query_supports_dotted_column_names() {
+        let index = dotted_column_memory_index();
+        index
+            .write(dotted_column_input_batch(2))
+            .await
+            .expect("write succeeds");
+
+        let plan = index.query_table_provider("q").expect("query plan builds");
+        assert_eq!(collect_ids(Arc::unwrap_or_clone(plan)).await, vec![0, 1]);
+
+        let chunk_metadata_plan = LogicalPlanBuilder::new_from_arc(
+            index.query_table_provider("q").expect("query plan builds"),
+        )
+        .project(vec![ident("_spice.search_field"), ident("CapitalCase")])
+        .expect("metadata projection builds")
+        .build()
+        .expect("metadata plan builds");
+        let context = SessionContext::new();
+        let batches = context
+            .execute_logical_plan(chunk_metadata_plan)
+            .await
+            .expect("metadata query executes")
+            .collect()
+            .await
+            .expect("metadata query collects");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
     }
 
     #[tokio::test]

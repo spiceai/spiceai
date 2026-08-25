@@ -24,15 +24,19 @@ use datafusion::{
     logical_expr::LogicalPlan,
 };
 use futures::future::try_join_all;
-use runtime_datafusion_index::Index;
+use spice_table::{Index, WriteWindow};
 
 use crate::index::{SearchIndex, VectorIndex};
 
 use super::{
-    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys, compound_on_write_start,
-    compound_required_columns, compound_write, fallback::fallback_on_empty_plan,
-    validate_compatibility,
+    COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL, COMPOUND_WRITE_START_FAILURE_IS_FATAL,
+    CompoundReadMode, CompoundVectorIndex, Error, compound_delete_by_keys,
+    compound_delete_by_predicate, compound_on_write_complete, compound_on_write_start,
+    compound_required_columns, compound_resolve_delete_keys, compound_write,
+    fallback::fallback_on_empty_plan, validate_compatibility,
 };
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::prelude::Expr;
 
 /// A [`SearchIndex`] that writes through to two compatible underlying indexes and serves
 /// reads from the primary (optionally falling back to the secondary on empty results).
@@ -80,6 +84,7 @@ impl CompoundSearchIndex {
 }
 
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl Index for CompoundSearchIndex {
     fn name(&self) -> &'static str {
         "CompoundSearchIndex"
@@ -99,8 +104,8 @@ impl Index for CompoundSearchIndex {
         try_join_all(futs).await
     }
 
-    async fn on_write_start(&self) -> Result<(), DataFusionError> {
-        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref()).await
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        compound_on_write_start(self.primary.as_ref(), self.secondary.as_ref(), window).await
     }
 
     async fn on_write_failed(&self) -> Result<(), DataFusionError> {
@@ -114,16 +119,36 @@ impl Index for CompoundSearchIndex {
     }
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
-        // As with `on_write_failed`: both completion callbacks must run.
-        let (primary_result, secondary_result) = futures::join!(
-            self.primary.on_write_complete(),
-            self.secondary.on_write_complete()
-        );
-        primary_result.and(secondary_result)
+        compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {
         compound_delete_by_keys(self.primary.as_ref(), self.secondary.as_ref(), keys).await
+    }
+
+    async fn resolve_delete_keys(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        compound_resolve_delete_keys(self.required_columns(), table, session, filters).await
+    }
+
+    async fn delete_by_predicate(
+        &self,
+        table: &Arc<dyn TableProvider>,
+        session: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<()> {
+        compound_delete_by_predicate(
+            self.primary.as_ref(),
+            self.secondary.as_ref(),
+            table,
+            session,
+            filters,
+        )
+        .await
     }
 
     fn deletes_by_partial_key(&self) -> bool {
@@ -132,10 +157,12 @@ impl Index for CompoundSearchIndex {
         self.primary.deletes_by_partial_key() && self.secondary.deletes_by_partial_key()
     }
 
+    fn write_start_failure_is_fatal(&self) -> bool {
+        COMPOUND_WRITE_START_FAILURE_IS_FATAL
+    }
+
     fn write_complete_failure_is_fatal(&self) -> bool {
-        // Either half failing to finalize leaves this compound index stale.
-        self.primary.write_complete_failure_is_fatal()
-            || self.secondary.write_complete_failure_is_fatal()
+        COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
     }
 
     fn as_any(&self) -> &dyn Any {

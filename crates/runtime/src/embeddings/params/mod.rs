@@ -29,6 +29,8 @@ pub mod openai;
 
 use std::str::FromStr;
 
+use tokenizers::TruncationDirection;
+
 /// Pooling strategy for local (TEI-based) embedding models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
@@ -61,10 +63,62 @@ impl FromStr for Pooling {
     }
 }
 
+/// How local (TEI-based) embedding models handle an input longer than the
+/// model's maximum sequence length. Mirrors AWS Bedrock's `truncate` /
+/// `truncation_mode` convention (see `CohereEmbeddingTruncate`,
+/// `NovaTruncationMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Truncation {
+    /// Reject the whole embedding request with an input-validation error,
+    /// rather than silently dropping part of an over-long input. Default.
+    #[default]
+    None,
+    /// Discard the end of the input, keeping the start.
+    End,
+    /// Discard the start of the input, keeping the end.
+    Start,
+}
+
+impl Truncation {
+    /// `None` when an over-long input should be rejected; `Some(direction)`
+    /// when it should instead be truncated in that direction. This is the
+    /// value the TEI backend (`TeiEmbed::from_hf`/`from_local`) takes directly.
+    #[must_use]
+    pub fn direction(self) -> Option<TruncationDirection> {
+        match self {
+            Truncation::None => None,
+            Truncation::End => Some(TruncationDirection::Right),
+            Truncation::Start => Some(TruncationDirection::Left),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Truncation::None => "NONE",
+            Truncation::End => "END",
+            Truncation::Start => "START",
+        }
+    }
+}
+
+impl FromStr for Truncation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "NONE" => Ok(Truncation::None),
+            "END" => Ok(Truncation::End),
+            "START" => Ok(Truncation::Start),
+            other => Err(format!("must be one of: NONE, END, START. Found {other}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime_parameters::typed::TypedParams;
+    use runtime_parameters_typed::TypedParams;
     use secrecy::{ExposeSecret, SecretString};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -160,6 +214,7 @@ mod tests {
                 ("hf_token", "hf_abc"),
                 ("pooling", "mean"),
                 ("max_seq_length", "512"),
+                ("truncate", "END"),
             ]),
             &empty_secrets(),
         )
@@ -171,6 +226,81 @@ mod tests {
         );
         assert_eq!(typed.pooling, Some(Pooling::Mean));
         assert_eq!(typed.max_seq_length, Some(512));
+        assert_eq!(typed.truncate, Some(Truncation::End));
+    }
+
+    #[tokio::test]
+    async fn huggingface_params_default_truncate_is_absent() {
+        // An omitted `truncate` stays `None`, which the call site resolves to
+        // the default `NONE` (no silent truncation, over-long inputs error).
+        let typed = huggingface::HuggingFaceEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("hf_token", "hf_abc")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(typed.truncate, None);
+        assert_eq!(typed.truncate.unwrap_or_default().direction(), None);
+    }
+
+    #[tokio::test]
+    async fn file_params_parse_truncate_enum() {
+        let typed = file::FileEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("truncate", "START")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("file params should deserialize");
+        assert_eq!(typed.truncate, Some(Truncation::Start));
+        assert_eq!(
+            typed.truncate.unwrap_or_default().direction(),
+            Some(TruncationDirection::Left)
+        );
+    }
+
+    #[tokio::test]
+    async fn file_params_reject_unknown_truncate() {
+        let Err(err) = file::FileEmbeddingParams::try_from_params(
+            "embedding test",
+            params(&[("truncate", "sometimes")]),
+            &empty_secrets(),
+        )
+        .await
+        else {
+            panic!("an unknown truncate value should error")
+        };
+        assert!(
+            err.to_string().contains("must be one of: NONE, END, START"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn truncation_from_str_round_trips_and_maps_to_direction() {
+        assert_eq!(Truncation::default(), Truncation::None);
+        assert_eq!(Truncation::None.direction(), None);
+        assert_eq!(
+            Truncation::End.direction(),
+            Some(TruncationDirection::Right)
+        );
+        assert_eq!(
+            Truncation::Start.direction(),
+            Some(TruncationDirection::Left)
+        );
+
+        for variant in [Truncation::None, Truncation::End, Truncation::Start] {
+            assert_eq!(
+                variant.as_str().parse::<Truncation>(),
+                Ok(variant),
+                "{variant:?} should round-trip through its string form"
+            );
+        }
+
+        "nonsense"
+            .parse::<Truncation>()
+            .expect_err("nonsense is not truncation");
     }
 
     #[tokio::test]
@@ -287,7 +417,7 @@ mod tests {
         assert_eq!(typed.max_concurrent_invocations, 10);
         assert_eq!(typed.dimensions, Some(1024));
         assert_eq!(typed.normalize, Some(true));
-        assert_eq!(typed.truncate_mode.as_deref(), Some("END"));
+        assert_eq!(typed.truncate_mode, Some(Truncation::End));
         assert!(typed.input_type.is_some());
     }
 }

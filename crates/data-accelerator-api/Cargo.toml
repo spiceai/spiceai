@@ -10,6 +10,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app = { path = "../app" }
+spicepod = { path = "../spicepod" }
 arrow.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
@@ -18,12 +20,16 @@ datafusion-table-providers = { workspace = true }
 futures.workspace = true
 linkme.workspace = true
 paste.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
 runtime-acceleration = { path = "../runtime-acceleration" }
+runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
+runtime-component = { path = "../runtime-component" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 secrecy.workspace = true
 snafu.workspace = true
+sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

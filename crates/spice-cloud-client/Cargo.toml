@@ -9,11 +9,18 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-reqwest.workspace = true
+futures.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+# Only to drive the async client from the redirect-policy tests. Their HTTP stub is a
+# blocking `std::net` listener on its own thread, because the workspace `tokio` carries
+# no `net` feature.
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -131,8 +131,8 @@ mod tests {
     use datafusion::logical_expr::{Volatility, create_udf};
     use datafusion_expr::LogicalPlan;
     use llms::embeddings::EmbeddingInput;
-    use runtime_datafusion_index::Index;
     use search::index::SearchIndex;
+    use spice_table::Index;
 
     fn noop_embed_udf() -> Arc<ScalarUDF> {
         Arc::new(create_udf(

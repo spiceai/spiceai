@@ -14,9 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Typed parameter structs for each model provider, deserialized from spicepod
+//! `params` via `#[derive(TypedParams)]`.
+//!
+//! Each provider declares only its provider-specific fields; the parameters
+//! common to every provider (runtime tunables + OpenAI-compatible chat
+//! overrides, including the legacy `openai_`-prefixed deprecated forms) are
+//! shared through the [`common`] passthrough tables via
+//! `#[params(passthrough = ...)]`. `#[params(emit_specs)]` regenerates the
+//! `ParameterSpec` list the schema generator consumes, keeping the struct the
+//! single source of truth for both runtime deserialization and schema.
+
 pub mod anthropic;
 pub mod azure;
 pub mod bedrock;
+pub mod common;
 pub mod databricks;
 pub mod file;
 pub mod google;
@@ -25,161 +37,186 @@ pub mod openai;
 pub mod spiceai;
 pub mod xai;
 
+use std::sync::LazyLock;
+
+pub(crate) use crate::parameters::ParameterSpec;
 use spicepod::component::model::ModelSource;
 
-pub use crate::parameters::ParameterSpec;
+macro_rules! source_specs {
+    ($name:ident, $ty:ty) => {
+        static $name: LazyLock<Vec<ParameterSpec>> = LazyLock::new(<$ty>::parameter_specs);
+    };
+}
 
-const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
+source_specs!(OPENAI_SPEC, openai::OpenAiModelParams);
+source_specs!(AZURE_SPEC, azure::AzureModelParams);
+source_specs!(FILE_SPEC, file::FileModelParams);
+source_specs!(DATABRICKS_SPEC, databricks::DatabricksModelParams);
+source_specs!(HUGGINGFACE_SPEC, huggingface::HuggingFaceModelParams);
+source_specs!(ANTHROPIC_SPEC, anthropic::AnthropicModelParams);
+source_specs!(XAI_SPEC, xai::XaiModelParams);
+source_specs!(BEDROCK_SPEC, bedrock::BedrockModelParams);
+source_specs!(SPICEAI_SPEC, spiceai::SpiceAiModelParams);
+source_specs!(GOOGLE_SPEC, google::GoogleModelParams);
 
-/// Returns the parameter specifications for a given model source.
-///
-/// This function is used by the schema generator to collect all model parameters.
+/// Returns the parameter specifications for a given model source, generated
+/// from that source's `#[derive(TypedParams)]` struct (the single source of
+/// truth for both runtime deserialization and schema). Used by the schema
+/// generator to collect all model parameters.
 #[must_use]
-pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]> {
+pub fn get_params_spec(source: &ModelSource) -> &'static [ParameterSpec] {
     match source {
-        ModelSource::OpenAi => Some(openai::PARAMETERS),
-        ModelSource::Azure => Some(azure::PARAMETERS),
-        ModelSource::File => Some(file::PARAMETERS),
-        ModelSource::Databricks => Some(databricks::PARAMETERS),
-        ModelSource::HuggingFace => Some(huggingface::PARAMETERS),
-        ModelSource::Anthropic => Some(anthropic::PARAMETERS),
-        ModelSource::Xai => Some(xai::PARAMETERS),
-        ModelSource::Bedrock => Some(bedrock::PARAMETERS),
-        ModelSource::SpiceAI => Some(spiceai::PARAMETERS),
-        ModelSource::Google => Some(google::PARAMETERS),
+        ModelSource::OpenAi => &OPENAI_SPEC,
+        ModelSource::Azure => &AZURE_SPEC,
+        ModelSource::File => &FILE_SPEC,
+        ModelSource::Databricks => &DATABRICKS_SPEC,
+        ModelSource::HuggingFace => &HUGGINGFACE_SPEC,
+        ModelSource::Anthropic => &ANTHROPIC_SPEC,
+        ModelSource::Xai => &XAI_SPEC,
+        ModelSource::Bedrock => &BEDROCK_SPEC,
+        ModelSource::SpiceAI => &SPICEAI_SPEC,
+        ModelSource::Google => &GOOGLE_SPEC,
     }
 }
 
-pub const PARAM_LEN: usize = 51;
-pub const PARAM_WITH_DEPRE_LEN: usize = 52;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_parameters::ParameterType;
+    use runtime_parameters_typed::TypedParams;
+    use secrecy::{ExposeSecret, SecretString};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
-// Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
-// OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
-pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
-    // Common parameters for all models
-    ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
-    ParameterSpec::runtime("tool_embedding_model")
-        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
-    ParameterSpec::runtime("system_prompt")
-        .description("An additional system prompt used for all chat completions to this model."),
-    ParameterSpec::runtime("parameterized_prompt"),
-    // Rate limiting parameters for concurrent inference
-    ParameterSpec::runtime("max_concurrency")
-        .description("Maximum number of concurrent requests for this model. Overrides provider defaults."),
-    ParameterSpec::runtime("requests_per_minute_limit")
-        .description("Maximum requests per minute for this model. Overrides provider defaults."),
-    // OpenAI compatible default override parameters for all models
-    ParameterSpec::runtime("frequency_penalty"),
-    ParameterSpec::runtime("logit_bias"),
-    ParameterSpec::runtime("logprobs"),
-    ParameterSpec::runtime("top_logprobs"),
-    ParameterSpec::runtime("max_completion_tokens"),
-    ParameterSpec::runtime("reasoning_effort"),
-    ParameterSpec::runtime("store"),
-    ParameterSpec::runtime("metadata"),
-    ParameterSpec::runtime("n"),
-    ParameterSpec::runtime("presence_penalty"),
-    ParameterSpec::runtime("response_format"),
-    ParameterSpec::runtime("seed"),
-    ParameterSpec::runtime("stop"),
-    ParameterSpec::runtime("stream"),
-    ParameterSpec::runtime("stream_options"),
-    ParameterSpec::runtime("temperature"),
-    ParameterSpec::runtime("top_p"),
-    ParameterSpec::runtime("tool_choice"),
-    ParameterSpec::runtime("parallel_tool_calls"),
-    ParameterSpec::runtime("prompt_cache_key"),
-    ParameterSpec::runtime("prompt_cache_retention"),
-    ParameterSpec::runtime("user"),
-    ParameterSpec::component("frequency_penalty").deprecated("Use 'frequency_penalty' without prefix"),
-    ParameterSpec::component("logit_bias").deprecated("Use 'logit_bias' without prefix"),
-    ParameterSpec::component("logprobs").deprecated("Use 'logprobs' without prefix"),
-    ParameterSpec::component("top_logprobs").deprecated("Use 'top_logprobs' without prefix"),
-    ParameterSpec::component("max_completion_tokens").deprecated("Use 'max_completion_tokens' without prefix"),
-    ParameterSpec::component("reasoning_effort").deprecated("Use 'reasoning_effort' without prefix"),
-    ParameterSpec::component("store").deprecated("Use 'store' without prefix"),
-    ParameterSpec::component("metadata").deprecated("Use 'metadata' without prefix"),
-    ParameterSpec::component("n").deprecated("Use 'n' without prefix"),
-    ParameterSpec::component("presence_penalty").deprecated("Use 'presence_penalty' without prefix"),
-    ParameterSpec::component("response_format").deprecated("Use 'response_format' without prefix"),
-    ParameterSpec::component("seed").deprecated("Use 'seed' without prefix"),
-    ParameterSpec::component("stop").deprecated("Use 'stop' without prefix"),
-    ParameterSpec::component("stream").deprecated("Use 'stream' without prefix"),
-    ParameterSpec::component("stream_options").deprecated("Use 'stream_options' without prefix"),
-    ParameterSpec::component("temperature").deprecated("Use 'temperature' without prefix"),
-    ParameterSpec::component("top_p").deprecated("Use 'top_p' without prefix"),
-    ParameterSpec::component("tools").deprecated("Use 'tools' without prefix"),
-    ParameterSpec::component("tool_choice").deprecated("Use 'tool_choice' without prefix"),
-    ParameterSpec::component("parallel_tool_calls").deprecated("Use 'parallel_tool_calls' without prefix"),
-    ParameterSpec::component("prompt_cache_key").deprecated("Use 'prompt_cache_key' without prefix"),
-    ParameterSpec::component("prompt_cache_retention").deprecated("Use 'prompt_cache_retention' without prefix"),
-    ParameterSpec::component("user").deprecated("Use 'user' without prefix"),
-];
+    fn params(entries: &[(&str, &str)]) -> HashMap<String, SecretString> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+            .collect()
+    }
 
-// Common model parameters that are used for all model providers except openai.
-pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DEPRE_LEN] = [
-    // Common parameters for all models
-    ParameterSpec::runtime("tools")
-        .description("Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery."),
-    ParameterSpec::runtime("tool_embedding_model")
-        .description("Embedding model name to use for searchable tool discovery. tools: search_registry requires a model configured in the embeddings section and uses it when only one embedding model is configured; tools: auto falls back to direct tools if embeddings are unavailable."),
-    ParameterSpec::runtime("system_prompt")
-        .description("An additional system prompt used for all chat completions to this model."),
-    ParameterSpec::runtime("parameterized_prompt"),
-    // Rate limiting parameters for concurrent inference
-    ParameterSpec::runtime("max_concurrency")
-        .description("Maximum number of concurrent requests for this model. Overrides provider defaults."),
-    ParameterSpec::runtime("requests_per_minute_limit")
-        .description("Maximum requests per minute for this model. Overrides provider defaults."),
-    // OpenAI compatible default override parameters for all models
-    ParameterSpec::component("frequency_penalty"),
-    ParameterSpec::component("logit_bias"),
-    ParameterSpec::component("logprobs"),
-    ParameterSpec::component("top_logprobs"),
-    ParameterSpec::component("max_completion_tokens"),
-    ParameterSpec::component("reasoning_effort"),
-    ParameterSpec::component("store"),
-    ParameterSpec::component("metadata"),
-    ParameterSpec::component("n"),
-    ParameterSpec::component("presence_penalty"),
-    ParameterSpec::component("response_format"),
-    ParameterSpec::component("seed"),
-    ParameterSpec::component("stop"),
-    ParameterSpec::component("stream"),
-    ParameterSpec::component("stream_options"),
-    ParameterSpec::component("temperature"),
-    ParameterSpec::component("top_p"),
-    ParameterSpec::component("tools"),
-    ParameterSpec::component("tool_choice"),
-    ParameterSpec::component("parallel_tool_calls"),
-    ParameterSpec::component("prompt_cache_key"),
-    ParameterSpec::component("prompt_cache_retention"),
-    ParameterSpec::component("user"),
-    // For model providers that are not OpenAI
-    // The default Override parameters start with `openai_` is deprecated and will be removed in a future release.
-    // Keep the `openai_` for backward compatibility, but recommend user using `<model_prefix>_<param>` instead.
-    ParameterSpec::runtime("openai_frequency_penalty").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_logit_bias").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_logprobs").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_top_logprobs").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_max_completion_tokens").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_reasoning_effort").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_store").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_metadata").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_n").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_presence_penalty").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_response_format").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_seed").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_stop").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_stream").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_stream_options").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_temperature").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_top_p").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_tools").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_tool_choice").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_parallel_tool_calls").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_prompt_cache_key").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_prompt_cache_retention").deprecated(DEPRECATED_MESSAGE),
-    ParameterSpec::runtime("openai_user").deprecated(DEPRECATED_MESSAGE),
-];
+    fn empty_secrets() -> Arc<RwLock<runtime_secrets::Secrets>> {
+        Arc::new(RwLock::new(runtime_secrets::Secrets::new()))
+    }
+
+    #[tokio::test]
+    async fn openai_defaults_and_overrides_are_accepted() {
+        // Common override params (temperature, prefixed and legacy openai_ forms)
+        // are passthrough: they must deserialize without tripping the unknown-key
+        // path, and the provider-specific defaults must apply.
+        let typed = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[
+                ("openai_api_key", "sk-1"),
+                ("temperature", "0.7"),
+                ("openai_top_p", "0.9"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("openai params should deserialize");
+        assert_eq!(typed.endpoint, "https://api.openai.com/v1");
+        assert_eq!(typed.usage_tier, llms::openai::UsageTier::Tier1);
+        assert_eq!(
+            typed.responses_api,
+            llms::openai::ChatBackend::ChatCompletions
+        );
+        assert_eq!(
+            typed.api_key.as_ref().map(ExposeSecret::expose_secret),
+            Some("sk-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_rejects_invalid_usage_tier() {
+        let err = openai::OpenAiModelParams::try_from_params(
+            "model openai",
+            params(&[("openai_usage_tier", "tier9")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect_err("an invalid usage_tier should be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid value for parameter 'openai_usage_tier'"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn huggingface_accepts_prefixed_token_and_runtime_model_type() {
+        let typed = huggingface::HuggingFaceModelParams::try_from_params(
+            "model huggingface",
+            params(&[("huggingface_token", "hf_abc"), ("model_type", "llama")]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("huggingface params should deserialize");
+        assert_eq!(
+            typed.token.as_ref().map(ExposeSecret::expose_secret),
+            Some("hf_abc")
+        );
+        assert_eq!(typed.model_type.as_deref(), Some("llama"));
+        assert_eq!(
+            typed.distributed_backend,
+            llms::chat::DistributedBackendSetting::None
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_reads_aws_credentials_into_runtime_params() {
+        let typed = bedrock::BedrockModelParams::try_from_params(
+            "model bedrock",
+            params(&[
+                ("aws_access_key_id", "AKIA"),
+                ("aws_secret_access_key", "secret"),
+                ("aws_region", "us-east-1"),
+                ("bedrock_trace", "enabled"),
+            ]),
+            &empty_secrets(),
+        )
+        .await
+        .expect("bedrock params should deserialize");
+        let runtime = typed.runtime_params();
+        assert_eq!(
+            runtime
+                .get("aws_access_key_id")
+                .map(ExposeSecret::expose_secret),
+            Some("AKIA")
+        );
+        assert_eq!(
+            runtime.get("aws_region").map(ExposeSecret::expose_secret),
+            Some("us-east-1")
+        );
+        assert_eq!(typed.trace, Some(bedrock::GuardrailTraceMode::Enabled));
+    }
+
+    #[test]
+    fn schema_specs_cover_provider_and_common_params() {
+        // The generated schema must include provider-specific keys and the shared
+        // common params (with the legacy openai_ deprecated forms).
+        let specs = get_params_spec(&ModelSource::OpenAi);
+        assert!(specs.iter().any(|s| s.name == "api_key"));
+        // OpenAI accepts `temperature` unprefixed (runtime) and the deprecated
+        // `openai_temperature` (component form, name "temperature", prefixed).
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.name == "temperature" && s.r#type == ParameterType::Runtime)
+        );
+        assert!(specs.iter().any(|s| s.name == "temperature"
+            && s.r#type == ParameterType::Component
+            && s.deprecation_message.is_some()));
+
+        let hf = get_params_spec(&ModelSource::HuggingFace);
+        assert!(hf.iter().any(|s| s.name == "model_type"));
+        // Non-OpenAI providers carry the prefixed component override forms plus the
+        // deprecated literal `openai_` forms.
+        assert!(hf.iter().any(|s| s.name == "temperature"));
+        assert!(
+            hf.iter()
+                .any(|s| s.name == "openai_temperature" && s.deprecation_message.is_some())
+        );
+    }
+}

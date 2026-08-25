@@ -16,6 +16,23 @@ limitations under the License.
 
 #![allow(dead_code, clippy::allow_attributes)]
 
+// Accelerator engines are their own crates and self-register through a linkme slice. A
+// dev-dependency alone does not put an entry in a test binary — the linker drops the
+// unreferenced static — and every integration binary links separately, so each one that
+// exercises an engine needs its own reference. `integration.rs`'s
+// `accelerator_crates_register_their_engines` guards the mechanism; this is where the
+// binaries that share these helpers get it.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
+
 use std::{
     fmt::Display,
     future::Future,
@@ -56,7 +73,33 @@ pub(crate) async fn runtime_ready_check(rt: &Runtime) {
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
-    assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
+    assert!(
+        wait_until_true(duration, || async { rt.status().is_ready() }).await,
+        "the runtime did not become ready within {duration:?} — {}",
+        describe_component_statuses(rt)
+    );
+}
+
+/// Name every registered component and the state it is in.
+///
+/// The readiness wait elapses identically whether a component failed to load, is
+/// still initializing, or was never registered at all, so on its own it says only
+/// that the runtime is not ready. `ComponentStatus::Error` carries the message that
+/// put the component in that state, so naming the states turns the timeout into the
+/// reason for it.
+fn describe_component_statuses(rt: &Runtime) -> String {
+    let statuses = rt.status().get_all_statuses();
+    if statuses.is_empty() {
+        return "no components were registered".to_string();
+    }
+
+    let mut described: Vec<String> = statuses
+        .iter()
+        .map(|(component, status)| format!("{component}: {status:?}"))
+        .collect();
+    // `get_all_statuses` returns a `HashMap`, so sort for a stable message.
+    described.sort();
+    described.join(", ")
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout_err(
@@ -107,7 +150,7 @@ pub(crate) fn time_till_second(nearest_second: u32, wait: Option<u32>) -> Durati
 }
 
 pub(crate) async fn verify_env_secret_exists(secret_name: &str) -> Result<(), String> {
-    let mut secrets = runtime::secrets::Secrets::new();
+    let mut secrets = runtime_secrets::Secrets::new();
     // Will automatically load `env` as the default
     secrets
         .load_from(&[])

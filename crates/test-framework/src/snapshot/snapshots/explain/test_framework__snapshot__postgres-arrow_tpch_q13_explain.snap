@@ -28,10 +28,9 @@ description: "Query: tpch_q13"
 |               |                 RepartitionExec: partitioning=Hash([c_custkey@0], 32), input_partitions=32                                                                                     |
 |               |                   AggregateExec: mode=Partial, gby=[c_custkey@0 as c_custkey], aggr=[count(orders.o_orderkey)]                                                                 |
 |               |                     HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1] |
-|               |                       CoalescePartitionsExec                                                                                                                                   |
-|               |                         SchemaCastScanExec                                                                                                                                     |
-|               |                           BytesProcessedExec                                                                                                                                   |
-|               |                             DataSourceExec: partitions=32, partition_sizes=[<redacted>]                                                                                        |
+|               |                       SchemaCastScanExec                                                                                                                                       |
+|               |                         BytesProcessedExec                                                                                                                                     |
+|               |                           DataSourceExec: partitions=1, partition_sizes=[<redacted>]                                                                                           |
 |               |                       FilterExec: o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]                                                              |
 |               |                         SchemaCastScanExec                                                                                                                                     |
 |               |                           BytesProcessedExec                                                                                                                                   |

@@ -83,8 +83,8 @@ use crate::cluster::{
 use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
-use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use telemetry::metrics_reader::MetricsReader;
 
 /// Handle for sending messages to a connected executor.
 struct ExecutorStreamHandle {
@@ -1293,6 +1293,12 @@ pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<Tabl
                             let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
                                 continue;
                             };
+                            // Listing the metadata catalog reaches tables the
+                            // catalog's include/exclude withheld, which the
+                            // schema provider itself never registered.
+                            if !cayenne_schema.selects_table(short_name) {
+                                continue;
+                            }
                             let key = (
                                 catalog_name.clone(),
                                 schema_name.clone(),
