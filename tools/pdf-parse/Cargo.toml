@@ -11,6 +11,7 @@ bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 document_parse = { path = "../../crates/document_parse" }
 pdf-inspector = "0.1.7"
+serde_json.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
 

@@ -14912,6 +14912,7 @@ dependencies = [
  "clap",
  "document_parse",
  "pdf-inspector",
+ "serde_json",
  "snafu",
  "tokio",
 ]

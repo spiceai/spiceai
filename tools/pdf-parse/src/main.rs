@@ -19,6 +19,7 @@ limitations under the License.
 //! `pdf-inspector` parser, or both, so a human can eyeball or `diff` the
 //! extracted text and judge fidelity before swapping backends.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::Instant;
@@ -42,6 +43,9 @@ pub enum Error {
     #[snafu(display("Failed to parse PDF with pdf-inspector: {source}"))]
     PdfInspector { source: pdf_inspector::PdfError },
 
+    #[snafu(display("Failed to parse PDF with pdf-inspector: worker task failed: {source}"))]
+    PdfInspectorTask { source: tokio::task::JoinError },
+
     #[snafu(display("Failed to read extracted liteparse text: {source}"))]
     LiteparseText { source: document_parse::Error },
 
@@ -56,6 +60,9 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+
+    #[snafu(display("Failed to serialize JSON output: {source}"))]
+    SerializeJson { source: serde_json::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -78,6 +85,8 @@ enum OutputFormat {
     Text,
     /// Markdown (pdf-inspector only; liteparse falls back to text).
     Markdown,
+    /// JSON object containing each backend's plain extracted text and timing.
+    Json,
 }
 
 impl OutputFormat {
@@ -86,6 +95,7 @@ impl OutputFormat {
         match self {
             OutputFormat::Text => "txt",
             OutputFormat::Markdown => "md",
+            OutputFormat::Json => "json",
         }
     }
 }
@@ -104,7 +114,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = ParserChoice::Both)]
     parser: ParserChoice,
 
-    /// Output format. `markdown` only affects pdf-inspector; liteparse always emits text.
+    /// Output format. `json` emits a single object keyed by parser name, with text and timing.
+    /// `markdown` only affects pdf-inspector; liteparse always emits text.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 
@@ -115,13 +126,16 @@ struct Args {
 
 /// The result of running one backend, for reporting.
 struct BackendOutput {
+    /// Stable JSON key for this parser.
+    key: &'static str,
     /// Human-readable backend label.
     label: &'static str,
     /// Format actually produced (may differ from the request, e.g. liteparse markdown -> text).
     format: OutputFormat,
     /// Extracted content.
     content: String,
-    /// Wall-clock parse duration in milliseconds (fractional, ~µs resolution).
+    /// Wall-clock duration from reading the input through materializing the
+    /// extracted content, in milliseconds (fractional, ~µs resolution).
     duration_ms: f64,
     /// A note to surface to the user (e.g. a format fallback), if any.
     note: Option<String>,
@@ -137,14 +151,6 @@ async fn main() {
 }
 
 async fn run(args: Args) -> Result<()> {
-    // Read the PDF bytes once and hand the same buffer to both backends, so
-    // neither backend's measured duration includes file I/O the other skips.
-    let raw = tokio::fs::read(&args.pdf_path)
-        .await
-        .context(ReadFileSnafu {
-            path: args.pdf_path.clone(),
-        })?;
-
     if let Some(dir) = &args.out {
         tokio::fs::create_dir_all(dir)
             .await
@@ -155,7 +161,7 @@ async fn run(args: Args) -> Result<()> {
     let mut had_backend_error = false;
 
     if matches!(args.parser, ParserChoice::Liteparse | ParserChoice::Both) {
-        match run_liteparse(&raw, args.format).await {
+        match run_liteparse(&args.pdf_path, args.format).await {
             Ok(output) => outputs.push(output),
             // In `both` mode, report this backend's failure but keep going so
             // the other backend still runs and its result is still reported.
@@ -168,7 +174,7 @@ async fn run(args: Args) -> Result<()> {
     }
 
     if matches!(args.parser, ParserChoice::PdfInspector | ParserChoice::Both) {
-        match run_pdf_inspector(&raw, args.format) {
+        match run_pdf_inspector(&args.pdf_path, args.format).await {
             Ok(output) => outputs.push(output),
             Err(e) if args.parser == ParserChoice::Both => {
                 eprintln!("{e}");
@@ -178,8 +184,12 @@ async fn run(args: Args) -> Result<()> {
         }
     }
 
-    for output in &outputs {
-        report(output, args.out.as_deref())?;
+    if args.format == OutputFormat::Json {
+        report_json(&outputs, args.out.as_deref())?;
+    } else {
+        for output in &outputs {
+            report(output, args.out.as_deref())?;
+        }
     }
 
     if had_backend_error {
@@ -191,22 +201,25 @@ async fn run(args: Args) -> Result<()> {
 
 /// Parse with the `liteparse`/`PDFium` backend, exactly as `crates/document_parse`
 /// configures it (via its public `PdfParser`), so the comparison reflects real
-/// runtime behavior — including the `PDFium` preload.
-async fn run_liteparse(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> {
+/// runtime behavior — including input I/O and the `PDFium` preload.
+async fn run_liteparse(path: &Path, format: OutputFormat) -> Result<BackendOutput> {
     let note = (format == OutputFormat::Markdown).then(|| {
         "liteparse only produces plain text; showing text output for the requested markdown format"
             .to_string()
     });
 
-    let bytes = Bytes::copy_from_slice(raw);
-    let parser = PdfParser::default();
-
     let start = Instant::now();
+    let raw = tokio::fs::read(path).await.context(ReadFileSnafu {
+        path: path.to_path_buf(),
+    })?;
+    let bytes = Bytes::from(raw);
+    let parser = PdfParser::default();
     let doc = parser.parse(&bytes).await.context(LiteparseSnafu)?;
     let content = doc.as_flat_utf8().context(LiteparseTextSnafu)?;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(BackendOutput {
+        key: "liteparse",
         label: "liteparse (PDFium)",
         format: OutputFormat::Text,
         content,
@@ -215,29 +228,32 @@ async fn run_liteparse(raw: &[u8], format: OutputFormat) -> Result<BackendOutput
     })
 }
 
-/// Parse with the candidate `pdf-inspector` backend, from the same buffered
-/// bytes read for liteparse (via the `_mem` entry points) so the timing
-/// comparison doesn't charge one backend for file I/O the other skips. For
-/// text we use `extract_text_mem`; for markdown we use `process_pdf_mem`,
-/// whose full pipeline populates `PdfProcessResult::markdown`.
-fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> {
+/// Parse with the candidate `pdf-inspector` backend. For text we use
+/// `extract_text`; for markdown we use `process_pdf`, whose full pipeline
+/// populates `PdfProcessResult::markdown`.
+async fn run_pdf_inspector(path: &Path, format: OutputFormat) -> Result<BackendOutput> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || run_pdf_inspector_blocking(&path, format))
+        .await
+        .context(PdfInspectorTaskSnafu)?
+}
+
+fn run_pdf_inspector_blocking(path: &Path, format: OutputFormat) -> Result<BackendOutput> {
     let start = Instant::now();
     let (content, actual_format, note) = match format {
-        OutputFormat::Text => {
-            let text =
-                pdf_inspector::extractor::extract_text_mem(raw).context(PdfInspectorSnafu)?;
+        OutputFormat::Text | OutputFormat::Json => {
+            let text = pdf_inspector::extract_text(path).context(PdfInspectorSnafu)?;
             (text, OutputFormat::Text, None)
         }
         OutputFormat::Markdown => {
-            let result = pdf_inspector::process_pdf_mem(raw).context(PdfInspectorSnafu)?;
+            let result = pdf_inspector::process_pdf(path).context(PdfInspectorSnafu)?;
             if let Some(md) = result.markdown {
                 (md, OutputFormat::Markdown, None)
             } else {
                 // The full pipeline did not produce markdown (e.g. a scanned
                 // page needing OCR); fall back to plain text so the run is
                 // still comparable rather than empty.
-                let text = pdf_inspector::extractor::extract_text_mem(raw)
-                    .context(PdfInspectorSnafu)?;
+                let text = pdf_inspector::extract_text(path).context(PdfInspectorSnafu)?;
                 (
                     text,
                     OutputFormat::Text,
@@ -252,6 +268,7 @@ fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(BackendOutput {
+        key: "pdf_inspector",
         label: "pdf-inspector (pure Rust)",
         format: actual_format,
         content,
@@ -260,15 +277,47 @@ fn run_pdf_inspector(raw: &[u8], format: OutputFormat) -> Result<BackendOutput> 
     })
 }
 
+/// Print a JSON object mapping parser names to their plain extracted text and timing.
+///
+/// JSON output intentionally omits display metadata so stdout can be consumed
+/// directly by a JSON parser.
+fn report_json(outputs: &[BackendOutput], out_dir: Option<&Path>) -> Result<()> {
+    let results_by_parser = outputs
+        .iter()
+        .map(|output| {
+            (
+                output.key,
+                serde_json::json!({
+                    "text": output.content,
+                    "duration_ms": output.duration_ms,
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let json = serde_json::to_string(&results_by_parser).context(SerializeJsonSnafu)?;
+
+    if let Some(dir) = out_dir {
+        let path = dir.join("pdf-parse.json");
+        std::fs::write(&path, &json).context(WriteOutSnafu { path })?;
+    }
+
+    println!("{json}");
+    Ok(())
+}
+
 /// Print a labeled header, the summary line, any note, and either the full
 /// content (to stdout) or a written-file confirmation when `--out` is set.
 fn report(output: &BackendOutput, out_dir: Option<&Path>) -> Result<()> {
     let chars = output.content.chars().count();
     let lines = output.content.lines().count();
 
-    println!("===== {} [{}] =====", output.label, format_name(output.format));
     println!(
-        "summary: {chars} chars, {lines} lines, parsed in {:.3} ms",
+        "===== {} [{}] =====",
+        output.label,
+        format_name(output.format)
+    );
+    println!(
+        "summary: {chars} chars, {lines} lines, processed end-to-end in {:.3} ms",
         output.duration_ms
     );
     if let Some(note) = &output.note {
@@ -293,6 +342,7 @@ fn format_name(format: OutputFormat) -> &'static str {
     match format {
         OutputFormat::Text => "text",
         OutputFormat::Markdown => "markdown",
+        OutputFormat::Json => "json",
     }
 }
 
