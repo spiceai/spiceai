@@ -99,6 +99,42 @@ fn slice_text(row: &[SliceValue], index: usize) -> Option<&str> {
     }
 }
 
+/// Resolve a path a slice declares against the snapshot's data anchor, refusing anything
+/// that lands outside it.
+///
+/// Load-bearing for verification rather than defensive. Verification asks whether the paths
+/// a slice names are present, and a path outside the anchor can be present on THIS host
+/// while never having been in the archive — `export_dataset` deliberately preserves an
+/// absolute path it cannot re-anchor, so a slice can name `/some/other/tree/x.vortex`. Left
+/// unchecked, verification passes because a file happens to exist there, the import then
+/// records metadata pointing at unrelated local files, and a restored query returns rows the
+/// snapshot never contained. Refusing is the only safe answer: an archive cannot contain a
+/// file that was never under the directories it walked.
+fn resolve_under_anchor(anchor: &Path, path: &str, is_relative: bool) -> Result<PathBuf, String> {
+    let candidate = if is_relative {
+        anchor.join(path)
+    } else {
+        PathBuf::from(path)
+    };
+    // Checked before `starts_with`, which a `..` component can otherwise walk straight
+    // through (`<anchor>/../elsewhere` is prefixed by `anchor` lexically).
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "the snapshot references '{path}', which walks out of the snapshot's data directory"
+        ));
+    }
+    if !candidate.starts_with(anchor) {
+        return Err(format!(
+            "the snapshot references '{path}', which is outside the snapshot's data directory {} — the archive cannot have contained it",
+            anchor.display()
+        ));
+    }
+    Ok(candidate)
+}
+
 /// Every data file the slice's **current** snapshot references, resolved to a local path
 /// under `anchor`.
 ///
@@ -139,12 +175,15 @@ fn referenced_data_files(
         return Ok(Vec::new());
     };
 
-    let table_root = if path_is_relative {
-        anchor.join(table_path)
-    } else {
-        PathBuf::from(table_path)
-    };
-    let snapshot_dir = table_root.join(table_id).join(current_snapshot_id);
+    let table_root = resolve_under_anchor(anchor, table_path, path_is_relative)?;
+    let snapshot_dir = resolve_under_anchor(
+        anchor,
+        &table_root
+            .join(table_id)
+            .join(current_snapshot_id)
+            .to_string_lossy(),
+        false,
+    )?;
 
     let snapshot_id_idx = idx("cayenne_snapshot_file", "snapshot_id")?;
     let file_path_idx = idx("cayenne_snapshot_file", "file_path")?;
@@ -157,8 +196,12 @@ fn referenced_data_files(
         .iter()
         .filter(|row| slice_text(row, snapshot_id_idx) == Some(current_snapshot_id))
         .filter_map(|row| slice_text(row, file_path_idx))
-        .map(|file| snapshot_dir.join(file))
-        .collect();
+        .map(|file| {
+            // A manifest entry is a bare file name, but nothing structurally prevents a
+            // crafted or corrupted slice from putting a path there.
+            resolve_under_anchor(anchor, &snapshot_dir.join(file).to_string_lossy(), false)
+        })
+        .collect::<Result<Vec<PathBuf>, String>>()?;
 
     // Deletion vectors too. A data file that comes back without the deletion vector that
     // hides its dead rows is worse than a missing data file: a missing KEY-based vector is
@@ -176,16 +219,15 @@ fn referenced_data_files(
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .filter_map(|row| {
-                let path = slice_text(row, delete_path_idx)?;
-                Some(
-                    if matches!(row.get(delete_relative_idx), Some(SliceValue::Bool(true))) {
-                        anchor.join(path)
-                    } else {
-                        PathBuf::from(path)
-                    },
+            .filter_map(|row| slice_text(row, delete_path_idx).map(|path| (row, path)))
+            .map(|(row, path)| {
+                resolve_under_anchor(
+                    anchor,
+                    path,
+                    matches!(row.get(delete_relative_idx), Some(SliceValue::Bool(true))),
                 )
-            }),
+            })
+            .collect::<Result<Vec<PathBuf>, String>>()?,
     );
 
     Ok(files)

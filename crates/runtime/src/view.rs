@@ -304,17 +304,52 @@ pub(crate) fn classify_view_read(plan: &LogicalPlan) -> ViewReadShape {
 /// about) terminates rather than recursing forever.
 #[must_use]
 pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &app::App) -> String {
+    /// Every relation the SQL names, wherever it appears.
+    ///
+    /// Uses `visit_relations` rather than [`get_dependent_table_names`], which walks only
+    /// `FROM` relations and CTEs. That is the right answer for ordering view loads, but not
+    /// for an identity: a dependency reached only through an expression subquery
+    /// (`WHERE id IN (SELECT id FROM inner)`) would be missed, leaving the fingerprint
+    /// unchanged when that view's definition changes and accepting an archive of the rows it
+    /// used to produce. A relation named in a position this walk reports but planning does
+    /// not actually read costs at most an extra dependency in the identity.
     fn dependencies_of(sql: &str) -> Vec<TableReference> {
+        use ::datafusion::sql::sqlparser::ast::visit_relations;
+        use std::ops::ControlFlow;
+
         let Ok(statements) = parser::DFParser::parse_sql_with_dialect(
             sql,
             &::datafusion::sql::sqlparser::dialect::PostgreSqlDialect {},
         ) else {
             return Vec::new();
         };
-        statements
-            .front()
-            .map(get_dependent_table_names)
-            .unwrap_or_default()
+        let Some(parser::Statement::Statement(statement)) = statements.front() else {
+            return Vec::new();
+        };
+
+        // A CTE name is not a dependency: it is defined by this very query, and its own
+        // body's relations are visited anyway.
+        let cte_names: HashSet<String> = {
+            let mut names = HashSet::new();
+            if let ast::Statement::Query(query) = statement.as_ref()
+                && let Some(with) = &query.with
+            {
+                for cte in &with.cte_tables {
+                    names.insert(cte.alias.name.value.to_lowercase());
+                }
+            }
+            names
+        };
+
+        let mut found = Vec::new();
+        let _ = visit_relations(statement.as_ref(), |relation| {
+            let name = relation.to_string();
+            if !cte_names.contains(&name.to_lowercase()) {
+                found.push(TableReference::parse_str(&name));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        found
     }
 
     // A Spicepod name and a name parsed out of SQL may spell the same table differently —
@@ -323,6 +358,13 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
     // an occasional extra dependency in the fingerprint (a snapshot refused that need not
     // have been); matching too narrowly drops a dependency, which is a snapshot ACCEPTED
     // under a definition that no longer produces its rows.
+    //
+    // Because a bare reference can match more than one declaration (`public.inner` and
+    // `sales.inner` both answer to `inner`), EVERY match is folded in rather than the first.
+    // Picking one would mean picking the wrong one half the time: planning resolves the
+    // bare name through the default catalog and schema, which this code cannot see, so a
+    // change to the view actually being read would leave the fingerprint untouched whenever
+    // the arbitrary first match was some other view.
     fn names_match(declared: &str, referenced: &TableReference) -> bool {
         let declared = TableReference::parse_str(declared);
         if declared.table() != referenced.table() {
@@ -344,11 +386,13 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             continue;
         }
 
-        if let Some(view) = app
+        let mut matched_any = false;
+        for view in app
             .views
             .iter()
-            .find(|candidate| names_match(&candidate.name, &dependency))
+            .filter(|candidate| names_match(&candidate.name, &dependency))
         {
+            matched_any = true;
             // `sql_ref` names a FILE. Hashing the path would leave the fingerprint
             // unchanged when the file's contents change, which is precisely the
             // substitution this identity exists to catch, so read it — the same way
@@ -365,8 +409,12 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             };
             if let Some(dependency_sql) = dependency_sql {
                 pending.extend(dependencies_of(&dependency_sql));
-                closure.insert(key, dependency_sql);
+                // Keyed by the DECLARED name, so two views answering the same bare
+                // reference occupy separate entries instead of overwriting each other.
+                closure.insert(view.name.clone(), dependency_sql);
             }
+        }
+        if matched_any {
             continue;
         }
 
@@ -374,10 +422,10 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
         // but it cannot speak for rows already baked into a view's archive: rebind
         // `orders` to a same-schema table and `SELECT * FROM orders` keeps identical SQL
         // while its materialized rows come from somewhere else entirely.
-        if let Some(dataset) = app
+        for dataset in app
             .datasets
             .iter()
-            .find(|candidate| names_match(&candidate.name, &dependency))
+            .filter(|candidate| names_match(&candidate.name, &dependency))
         {
             let params: BTreeMap<String, String> = dataset
                 .params
@@ -387,7 +435,7 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
                 .into_iter()
                 .collect();
             closure.insert(
-                key,
+                dataset.name.clone(),
                 dataset_definition_identity(
                     &dataset.from,
                     dataset
@@ -422,9 +470,16 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
 /// the same bytes — and getting that list wrong in the permissive direction accepts an
 /// archive whose rows answer a different question. Including a parameter that turns out not
 /// to shape rows (a timeout, a pool size) only costs a refused snapshot and a refresh from
-/// source. These are the Spicepod parameters, so a `${secrets:...}` reference is hashed as
-/// the reference, not as the resolved value — rotating a credential does not change the
-/// identity.
+/// source.
+///
+/// These are the Spicepod parameters, so a `${secrets:...}` value is hashed as the
+/// *reference*. That cuts both ways and the second half is a real limit, not a benefit:
+/// rotating a credential leaves the identity alone (good — the rows did not change), but a
+/// row-shaping parameter read from a secret, `json_pointer: ${secrets:pointer}`, can move
+/// from `/us` to `/eu` with the reference and therefore the identity unchanged, and a cold
+/// start would accept the old rows. Closing that needs an identity built from the RESOLVED
+/// values, which are only available where the connector is constructed
+/// (`get_params_with_secrets`) — not from this sync, secret-less context.
 ///
 /// Ordered by key so the string does not depend on map iteration order.
 #[must_use]
@@ -844,6 +899,49 @@ mod tests {
                 definition_fingerprint(&old),
                 definition_fingerprint(&new),
                 "rebinding a dataset the view reads must change the view's identity"
+            );
+        }
+
+        /// A dependency reached only through an expression subquery still counts: the outer
+        /// SQL is unchanged when the inner view's definition changes, so missing it would
+        /// accept an archive of the rows that view used to produce.
+        #[test]
+        fn closure_follows_a_dependency_in_an_expression_subquery() {
+            let outer = TableReference::bare("outer");
+            let us = view_definition_closure(
+                &outer,
+                "SELECT id FROM orders WHERE id IN (SELECT id FROM inner)",
+                &app_with(&[("inner", "SELECT id FROM t WHERE region = 'us'")], &[]),
+            );
+            let eu = view_definition_closure(
+                &outer,
+                "SELECT id FROM orders WHERE id IN (SELECT id FROM inner)",
+                &app_with(&[("inner", "SELECT id FROM t WHERE region = 'eu'")], &[]),
+            );
+            assert_ne!(
+                definition_fingerprint(&us),
+                definition_fingerprint(&eu),
+                "a view read only from inside a subquery is still a dependency"
+            );
+        }
+
+        /// A bare reference that two declarations answer to folds in BOTH, because planning
+        /// resolves it through a default catalog/schema this code cannot see. Picking one
+        /// would leave the fingerprint unchanged whenever the other is the one being read.
+        #[test]
+        fn closure_folds_in_every_candidate_for_a_bare_reference() {
+            let outer = TableReference::bare("outer");
+            let both = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("public.inner", "SELECT 1"), ("sales.inner", "SELECT 2")],
+                    &[],
+                ),
+            );
+            assert!(
+                both.contains("SELECT 1") && both.contains("SELECT 2"),
+                "both declarations must contribute: {both}"
             );
         }
 

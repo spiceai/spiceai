@@ -39,6 +39,7 @@ use tokio::sync::{Mutex, RwLock};
 use super::refresh::Refresh;
 use datafusion::{datasource::TableProvider, sql::TableReference};
 use opentelemetry::KeyValue;
+use runtime_component::dataset::acceleration::RefreshMode;
 use spicepod::metric::Metrics;
 
 pub struct RefreshTaskRunnerBuilder {
@@ -371,27 +372,40 @@ impl RefreshTaskRunner {
         &self.refresh_task
     }
 
-    /// Create a new [`Refresh`] based on defaults and overrides, and report whether this
-    /// run will produce the configured definition's rows.
+    /// Create a new [`Refresh`] based on defaults and overrides, and report what this run
+    /// would let us say about the accelerator's provenance if it succeeds.
     ///
     /// Also retracts the provenance mark, because from here the accelerator's rows are being
     /// replaced and describe nothing definite until the run finishes. Retracting up front is
     /// what makes every window safe: a snapshot that lands mid-refresh, or after a refresh
-    /// that failed, finds "not known configured" and declines. The caller re-asserts the
-    /// mark only once the run has actually succeeded.
+    /// that failed, finds "not known configured" and declines. The caller re-asserts the mark
+    /// only once the run has actually succeeded.
+    ///
+    /// A run can only *establish* provenance if it replaces the whole accelerator. An
+    /// incremental run (`Append`, `Changes`) adds to what is already there, so a clean
+    /// incremental refresh on top of rows an override appended leaves those rows in place —
+    /// re-asserting provenance there would stamp the next snapshot as the configured
+    /// definition's result while it still contains rows that definition never produced.
+    /// Incremental runs therefore carry the provenance they inherited forward at best, and
+    /// only a full replace can restore it.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
     ) -> (Refresh, bool) {
         let r = defaults.read().await.clone();
+        let inherited = r.materialization_is_configured();
         r.set_materialization_is_configured(false);
-        match overrides_opt {
+        let (request, overridden) = match overrides_opt {
             Some(overrides) => {
-                let configured = !overrides.changes_materialization();
-                (r.with_overrides(&overrides), configured)
+                let overridden = overrides.changes_materialization();
+                (r.with_overrides(&overrides), overridden)
             }
-            None => (r, true),
-        }
+            None => (r, false),
+        };
+        // `request.mode` is the mode this run will actually use, overrides applied.
+        let replaces_everything = matches!(request.mode, RefreshMode::Full);
+        let configured = !overridden && (replaces_everything || inherited);
+        (request, configured)
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
