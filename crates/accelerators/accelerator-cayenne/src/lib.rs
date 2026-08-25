@@ -1229,35 +1229,6 @@ fn is_metastore_file(file_name: &std::ffi::OsStr) -> bool {
 /// The walk is linear in the entries under `data_dir` — the work the `remove_dir_all`
 /// immediately after it was going to do regardless. A missing `data_dir` is not an error
 /// here, so the removal is left to report it.
-/// The metastore file directly inside the directory `link` resolves to, if `link` resolves
-/// to a directory holding one.
-///
-/// Deliberately not recursive and deliberately not part of the walk in
-/// [`metastore_file_under`]: this answers only "is this link an alias for a metadata
-/// directory", the shape that costs a catalog its name when the link is unlinked. A link
-/// resolving to a file, to nothing, or to a directory with no catalog in it is not one.
-async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>> {
-    match tokio::fs::metadata(link).await {
-        Ok(metadata) if metadata.is_dir() => {}
-        // A dangling link, or one naming a file, aliases no metadata directory.
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let mut entries = match tokio::fs::read_dir(link).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        if is_metastore_file(&entry.file_name()) {
-            return Ok(Some(entry.path()));
-        }
-    }
-    Ok(None)
-}
-
 async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     let root = match tokio::fs::symlink_metadata(data_dir).await {
         // A `data_dir` that is itself a link is dereferenced once and then walked. The
@@ -1309,6 +1280,35 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
         }
     }
 
+    Ok(None)
+}
+
+/// The metastore file directly inside the directory `link` resolves to, if `link` resolves
+/// to a directory holding one.
+///
+/// Deliberately not recursive and deliberately not part of the walk in
+/// [`metastore_file_under`]: this answers only "is this link an alias for a metadata
+/// directory", the shape that costs a catalog its name when the link is unlinked. A link
+/// resolving to a file, to nothing, or to a directory with no catalog in it is not one.
+async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>> {
+    match tokio::fs::metadata(link).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        // A dangling link, or one naming a file, aliases no metadata directory.
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let mut entries = match tokio::fs::read_dir(link).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if is_metastore_file(&entry.file_name()) {
+            return Ok(Some(entry.path()));
+        }
+    }
     Ok(None)
 }
 
