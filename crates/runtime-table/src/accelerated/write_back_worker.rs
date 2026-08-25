@@ -51,8 +51,8 @@ limitations under the License.
 //! worker does no compare-and-set against the source. Durable write-back is
 //! safe only when the accelerator is the sole writer of the rows it delivers.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef};
@@ -64,6 +64,7 @@ use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 use opentelemetry::KeyValue;
+use parking_lot::Mutex;
 use runtime_metrics::acceleration as metrics;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -77,6 +78,56 @@ const CLAIM_BATCH: usize = 1024;
 /// backoff must not grow on empty polls).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// A generation token for workers that publish the same dataset-labelled gauge.
+struct WriteBackGaugeOwner;
+
+/// Live write-back workers in spawn order for each dataset.
+///
+/// Hot reload starts a successor before aborting its predecessor. Both workers
+/// use the same metric labels, so only the newest live generation may publish;
+/// otherwise a delayed predecessor teardown can overwrite the successor's
+/// backlog with zero. Keeping the predecessor in the stack lets it resume
+/// ownership if a candidate replacement fails before installation.
+#[derive(Default)]
+struct WriteBackGaugeOwners {
+    by_dataset: HashMap<String, Vec<Weak<WriteBackGaugeOwner>>>,
+}
+
+impl WriteBackGaugeOwners {
+    fn register(&mut self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) {
+        let owners = self.by_dataset.entry(dataset_name.to_string()).or_default();
+        owners.retain(|candidate| candidate.strong_count() > 0);
+        owners.push(Arc::downgrade(owner));
+    }
+
+    fn is_current(&self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) -> bool {
+        self.by_dataset
+            .get(dataset_name)
+            .and_then(|owners| owners.last())
+            .is_some_and(|current| current.as_ptr() == Arc::as_ptr(owner))
+    }
+
+    /// Remove `owner`; return whether its teardown should zero the gauge.
+    fn unregister(&mut self, dataset_name: &str, owner: &Arc<WriteBackGaugeOwner>) -> bool {
+        let owner_ptr = Arc::as_ptr(owner);
+        let Some(owners) = self.by_dataset.get_mut(dataset_name) else {
+            return false;
+        };
+        let was_current = owners
+            .last()
+            .is_some_and(|current| current.as_ptr() == owner_ptr);
+        owners.retain(|candidate| candidate.as_ptr() != owner_ptr && candidate.strong_count() > 0);
+        let no_owner_remains = owners.is_empty();
+        if no_owner_remains {
+            self.by_dataset.remove(dataset_name);
+        }
+        was_current && no_owner_remains
+    }
+}
+
+static WRITE_BACK_GAUGE_OWNERS: LazyLock<Mutex<WriteBackGaugeOwners>> =
+    LazyLock::new(|| Mutex::new(WriteBackGaugeOwners::default()));
+
 pub(crate) struct WriteBackWorker {
     /// A write-clone of the durable-write-back Cayenne provider — shares the
     /// live table's catalog, listing fence, and keyset, so the marker CRUD and
@@ -88,6 +139,7 @@ pub(crate) struct WriteBackWorker {
     dataset_name: String,
     /// The backlog gauge's label set, built once.
     dataset_labels: [KeyValue; 1],
+    gauge_owner: Arc<WriteBackGaugeOwner>,
 }
 
 impl WriteBackWorker {
@@ -99,12 +151,17 @@ impl WriteBackWorker {
         dataset_name: String,
     ) -> JoinHandle<()> {
         let pk_columns = provider.pk_column_names();
+        let gauge_owner = Arc::new(WriteBackGaugeOwner);
+        WRITE_BACK_GAUGE_OWNERS
+            .lock()
+            .register(&dataset_name, &gauge_owner);
         let worker = Self {
             provider: Arc::new(provider),
             federated,
             pk_columns,
             dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
             dataset_name,
+            gauge_owner,
         };
         tokio::spawn(async move { worker.run().await })
     }
@@ -179,6 +236,10 @@ impl WriteBackWorker {
 
     /// Publish an already-known undelivered-marker backlog for this dataset.
     fn publish_backlog(&self, pending: i64) {
+        let owners = WRITE_BACK_GAUGE_OWNERS.lock();
+        if !owners.is_current(&self.dataset_name, &self.gauge_owner) {
+            return;
+        }
         metrics::WRITE_BACK_PENDING_KEYS.record(pending, &self.dataset_labels);
     }
 
@@ -318,6 +379,17 @@ impl WriteBackWorker {
     }
 }
 
+impl Drop for WriteBackWorker {
+    fn drop(&mut self) {
+        let mut owners = WRITE_BACK_GAUGE_OWNERS.lock();
+        if owners.unregister(&self.dataset_name, &self.gauge_owner) {
+            // No live worker owns these labels. Synchronous gauges retain their
+            // last value, so clear the removed dataset's stale backlog.
+            metrics::WRITE_BACK_PENDING_KEYS.record(0, &self.dataset_labels);
+        }
+    }
+}
+
 /// Build `pk_col IN (values…)` from a decoded primary-key array.
 fn pk_in_filter(pk_col: &str, values: &ArrayRef) -> DataFusionResult<Expr> {
     let mut list: Vec<Expr> = Vec::with_capacity(values.len());
@@ -367,4 +439,40 @@ fn absent_claimed_keys(
 )]
 fn to_df_err(e: cayenne::provider::Error) -> DataFusionError {
     DataFusionError::Execution(format!("durable write-back: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WriteBackGaugeOwner, WriteBackGaugeOwners};
+    use std::sync::Arc;
+
+    #[test]
+    fn gauge_ownership_returns_to_a_live_predecessor() {
+        let mut owners = WriteBackGaugeOwners::default();
+        let predecessor = Arc::new(WriteBackGaugeOwner);
+        let successor = Arc::new(WriteBackGaugeOwner);
+
+        owners.register("orders", &predecessor);
+        owners.register("orders", &successor);
+        assert!(!owners.is_current("orders", &predecessor));
+        assert!(owners.is_current("orders", &successor));
+
+        assert!(!owners.unregister("orders", &successor));
+        assert!(owners.is_current("orders", &predecessor));
+        assert!(owners.unregister("orders", &predecessor));
+    }
+
+    #[test]
+    fn stale_predecessor_teardown_cannot_zero_the_current_gauge() {
+        let mut owners = WriteBackGaugeOwners::default();
+        let predecessor = Arc::new(WriteBackGaugeOwner);
+        let successor = Arc::new(WriteBackGaugeOwner);
+
+        owners.register("orders", &predecessor);
+        owners.register("orders", &successor);
+
+        assert!(!owners.unregister("orders", &predecessor));
+        assert!(owners.is_current("orders", &successor));
+        assert!(owners.unregister("orders", &successor));
+    }
 }
