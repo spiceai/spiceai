@@ -294,6 +294,7 @@ impl CachedResponse {
             // Zero rather than the origin's age: the window carried here is
             // already what was left when the entry was admitted.
             response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: self.detected_format.unwrap_or_default(),
             response_date: self.response_date,
             response_status: self.response_status,
@@ -522,9 +523,12 @@ struct HttpFetchResult {
     /// What the origin's `Cache-Control` said. The retention decision is made by
     /// the caller, which is where a configured fallback is in scope.
     directives: CacheDirectives,
-    /// How long the response had already been alive when it reached us, from its
-    /// `Age` header. A response relayed by an intermediary arrives part-spent.
+    /// How long the response had already been alive when `age_measured_at` was
+    /// taken. A response relayed by an intermediary arrives part-spent.
     response_age: Option<Duration>,
+    /// When [`Self::response_age`] was taken, so a caller deciding retention
+    /// later can bring it forward rather than treat a stale figure as current.
+    age_measured_at: Instant,
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
@@ -1580,11 +1584,11 @@ impl HttpTableProvider {
                 .map(|value| value.to_str().ok()),
         );
 
-        // How much of the response's freshness was already spent before it
-        // reached us. Only `Age` is read: it is what an intermediary is required
-        // to add and it is a count of seconds, so unlike deriving the age from
-        // `Date` it does not turn a skewed origin clock into a cache that
-        // refuses everything.
+        // What the origin declared about how much of the response's freshness
+        // was already spent. Read beside the age its `Date` implies, further
+        // down: an intermediary is required to add `Age`, but one that does not
+        // still leaves the origin's `Date` behind, and taking only `Age` there
+        // would hand a full window to a response that is already spent.
         let header_age = response
             .headers()
             .get(reqwest::header::AGE)
@@ -1678,6 +1682,7 @@ impl HttpTableProvider {
             // otherwise overflow the addition and panic; saturating leaves no
             // freshness to retain, which is the right answer for an absurd age.
             response_age: Some(age_on_arrival.saturating_add(headers_received.elapsed())),
+            age_measured_at: Instant::now(),
             detected_format,
             response_date,
             response_status: status_code,
@@ -1766,11 +1771,23 @@ impl HttpTableProvider {
         // then fill the budget with responses the origin forbade storing and
         // evict the ones it was allowed to keep. The refusal has to be honoured
         // here, where it is unconditional.
-        if let Some(retain_for) = Self::effective_retention(
-            &fetch_result.directives,
-            self.cache_fallback_ttl,
-            fetch_result.response_age,
-        ) {
+        // The response's age brought forward to the moment it is asked for,
+        // rather than the figure taken when the response arrived.
+        let age_now = || {
+            fetch_result
+                .response_age
+                .map(|age| age.saturating_add(fetch_result.age_measured_at.elapsed()))
+        };
+        let retention_now = || {
+            Self::effective_retention(&fetch_result.directives, self.cache_fallback_ttl, age_now())
+        };
+
+        // Asked twice, and the first is only a gate: it decides whether copying
+        // the response is worth doing at all, so a refused response is never
+        // copied. The window actually granted is the second one, taken after the
+        // copy, because copying a large body spends real time and a window
+        // computed before it would grant freshness the response no longer has.
+        if retention_now().is_some() {
             // A body that cannot fit the budget on its own is turned away
             // before it is copied. Admitting it would clone the whole response
             // only for the cache to evict it again, and on the way it would
@@ -1783,13 +1800,26 @@ impl HttpTableProvider {
                 return Ok(fetch_result);
             }
 
+            let content = Arc::new(fetch_result.content.clone());
+            let response_headers = Arc::new(fetch_result.response_headers.clone());
+
+            // After the copy: what is left now is what the entry may be granted,
+            // and a response whose freshness the copy exhausted is not admitted.
+            let Some(retain_for) = retention_now() else {
+                tracing::debug!(
+                    "Not retaining {}: no freshness left by the time it could be stored",
+                    cache_key.redacted_label()
+                );
+                return Ok(fetch_result);
+            };
+
             let entry = CachedResponse {
-                content: Arc::new(fetch_result.content.clone()),
+                content,
                 max_age: retain_for,
                 detected_format: Some(fetch_result.detected_format.clone()),
                 response_date: fetch_result.response_date,
                 response_status: fetch_result.response_status,
-                response_headers: Arc::new(fetch_result.response_headers.clone()),
+                response_headers,
             };
             // An entry the budget cannot charge for is not admitted: it would be
             // billed less than it holds, which is how a byte bound stops binding.
@@ -5686,6 +5716,7 @@ mod tests {
                 shared_max_age: None,
             },
             response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -8110,6 +8141,7 @@ mod tests {
             content: String::new(),
             directives: CacheDirectives::default(),
             response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "application/json".to_string(),
             response_date: None,
             response_status: 200,
@@ -8558,6 +8590,7 @@ mod tests {
             content: String::new(),
             directives: CacheDirectives::default(),
             response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 201,
@@ -8632,6 +8665,7 @@ mod tests {
             content: String::new(),
             directives: CacheDirectives::default(),
             response_age: None,
+            age_measured_at: Instant::now(),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
