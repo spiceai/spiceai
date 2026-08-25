@@ -664,8 +664,11 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
          but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
          rather than applied lossily and the source keeps its position. \
          Under `mode: file_update`, restart Spice to apply it: the acceleration is dropped and recreated against the new schema. \
-         Under any other mode a restart refuses again — remove `partition_by` from the acceleration to allow evolution, \
-         or drop and recreate the dataset against the new source schema. \
+         Under any other mode a restart refuses again — drop and recreate the dataset against the new source schema, \
+         dropping `partition_by` in the same change if partitioning is no longer wanted. \
+         Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
+         the partition children the rows were written to, and changing that setting recreates nothing, so the acceleration \
+         would come back holding none of them. \
          See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
@@ -4336,8 +4339,14 @@ mod tests {
             "every other mode must be told a restart does not help, or the operator loops: {msg}"
         );
         assert!(
-            msg.contains("remove `partition_by`") && msg.contains("drop and recreate the dataset"),
-            "the manual remedies must survive alongside the restart one: {msg}"
+            msg.contains("drop and recreate the dataset"),
+            "the manual remedy must survive alongside the restart one: {msg}"
+        );
+        assert!(
+            msg.contains("Removing `partition_by` on its own does not recover it"),
+            "removing the setting alone opens the unpartitioned parent table while the rows stay in \
+             the partition children, and nothing recreates the acceleration, so the message must not \
+             offer it as a remedy by itself: {msg}"
         );
         assert!(
             msg.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
