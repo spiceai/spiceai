@@ -2027,6 +2027,86 @@ fn persist_login_values(
     if !cloud.is_empty() {
         save_credentials(output, "CLOUD", cloud)?;
     }
+
+    clear_login_shadows(output, spiceai, cloud)?;
+    Ok(())
+}
+
+/// Clear copies of the credentials this login wrote from the other store.
+///
+/// Credential reads prefer the keychain over the env file. Without clearing
+/// the same variables from the store not selected by `--output`, a stale
+/// keychain entry can outrank every later env-file login indefinitely.
+fn clear_login_shadows(
+    output: LoginOutput,
+    spiceai: &[(&str, &str)],
+    cloud: &[(&str, &str)],
+) -> Result<()> {
+    let vars: Vec<String> = spiceai
+        .iter()
+        .map(|(key, _)| format!("SPICE_SPICEAI_{key}"))
+        .chain(cloud.iter().map(|(key, _)| format!("SPICE_CLOUD_{key}")))
+        .collect();
+
+    match output {
+        LoginOutput::Env => {
+            let _ = remove_keychain_keys(&vars);
+            let failures: Vec<String> = vars
+                .iter()
+                .filter_map(|var| match crate::commands::login::keychain::inspect(var) {
+                    crate::commands::login::keychain::CredentialRead::Missing => None,
+                    crate::commands::login::keychain::CredentialRead::Found(_) => {
+                        Some(format!("`{var}` (credential remains)"))
+                    }
+                    crate::commands::login::keychain::CredentialRead::Unavailable(err) => {
+                        Some(format!("`{var}` ({err})"))
+                    }
+                })
+                .collect();
+            if !failures.is_empty() {
+                return Err(Error::cloud_with_hint(
+                    CloudErrorCode::InvalidRequest,
+                    format!(
+                        "Saved the new Spice Cloud credential, but failed to remove {} from the keychain, so later commands may still send the old credential.",
+                        failures.join(", ")
+                    ),
+                    "Delete those entries from the keychain, then run `spice login` again. See: https://spiceai.org/docs/spice-cloud",
+                ));
+            }
+        }
+        LoginOutput::Keychain => {
+            remove_env_file_keys(&vars)?;
+        }
+        LoginOutput::Json => {}
+    }
+
+    ensure_login_values_active(spiceai, cloud)
+}
+
+/// Verify that normal credential resolution returns every value just saved.
+fn ensure_login_values_active(spiceai: &[(&str, &str)], cloud: &[(&str, &str)]) -> Result<()> {
+    let inactive: Vec<String> = spiceai
+        .iter()
+        .map(|(key, value)| (format!("SPICE_SPICEAI_{key}"), *value))
+        .chain(
+            cloud
+                .iter()
+                .map(|(key, value)| (format!("SPICE_CLOUD_{key}"), *value)),
+        )
+        .filter(|(var, value)| org::read_credential(var).as_deref() != Some(*value))
+        .map(|(var, _)| format!("`{var}`"))
+        .collect();
+    if !inactive.is_empty() {
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "Saved the new Spice Cloud credential, but later commands would not read it from {}, so login cannot report success.",
+                inactive.join(", ")
+            ),
+            "Unset any listed shell variables and unlock the platform keychain, then run `spice login` again. See: https://spiceai.org/docs/spice-cloud",
+        ));
+    }
+
     Ok(())
 }
 
@@ -2295,10 +2375,6 @@ fn ensure_active_org_logout_is_isolated(org: &str, default_token_present: bool) 
 /// The keychain is cleared too: `read_credential` consults it before the env
 /// file, so clearing only the file leaves a working credential behind.
 fn remove_env_keys(keys: &[String]) -> Result<bool> {
-    use crate::commands::login::env_file_path;
-
-    let mut removed = false;
-
     // The keychain is consulted before the env file when reading a credential,
     // so clearing only the file would leave a working credential behind.
     //
@@ -2306,21 +2382,37 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
     // file too and leave more credentials live than before. Instead keep going
     // and report what could not be cleared, so the user never receives a false
     // successful logout.
-    let mut keychain_failures = Vec::new();
+    let (removed_from_keychain, keychain_failures) = remove_keychain_keys(keys);
+    let removed_from_env_file = remove_env_file_keys(keys)?;
+
+    ensure_keychain_credentials_removed(&keychain_failures)?;
+    Ok(removed_from_keychain || removed_from_env_file)
+}
+
+/// Drop `keys` from the platform keychain without stopping at the first error.
+fn remove_keychain_keys(keys: &[String]) -> (bool, Vec<String>) {
+    let mut removed = false;
+    let mut failures = Vec::new();
     for key in keys {
-        match keyring::Entry::new(key, "spice") {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) => removed = true,
-                Err(keyring::Error::NoEntry) => {}
-                Err(err) => keychain_failures.push(format!("{key} ({err})")),
-            },
-            Err(err) => keychain_failures.push(format!("{key} ({err})")),
+        match crate::commands::login::keychain::delete(key) {
+            Ok(true) => removed = true,
+            Ok(false) => {}
+            Err(err) => failures.push(format!("`{key}` ({err})")),
         }
     }
 
-    let path = std::path::Path::new(env_file_path());
+    (removed, failures)
+}
+
+/// Drop `keys` from the env file. Returns whether anything was removed.
+fn remove_env_file_keys(keys: &[String]) -> Result<bool> {
+    use crate::commands::login::env_file_path;
+
+    let mut removed = false;
+
+    let env_file = env_file_path();
+    let path = env_file.as_path();
     if !path.exists() {
-        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2356,7 +2448,6 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
             path: path.to_path_buf(),
             source: e,
         })?;
-        ensure_keychain_credentials_removed(&keychain_failures)?;
         return Ok(removed);
     }
 
@@ -2369,8 +2460,6 @@ fn remove_env_keys(keys: &[String]) -> Result<bool> {
         path: path.to_path_buf(),
         source: e,
     })?;
-
-    ensure_keychain_credentials_removed(&keychain_failures)?;
 
     Ok(removed)
 }
@@ -2408,6 +2497,20 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
 
     let context = match client.get_auth_context().await {
         Ok(ctx) => ctx,
+        Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => {
+            match client.list_projects().await {
+                Err(project_err)
+                    if project_err.cloud_code() == Some(CloudErrorCode::TokenExpired) =>
+                {
+                    return Err(rejected_user_credential_error(
+                        None,
+                        effective_org.as_deref(),
+                    ));
+                }
+                Ok(_) => return Err(no_user_identity_error(true)),
+                Err(_) => return Err(no_user_identity_error(false)),
+            }
+        }
         // Spice Cloud returned no user identity. That happens for a
         // service-account token (OAuth client credentials), which authenticates
         // API calls but has no user behind it, and when the endpoint has no
@@ -2419,18 +2522,7 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
             // second failure here would put the unusable original message back
             // in front of the user.
             let usable = client.list_projects().await.is_ok();
-            let detail = if usable {
-                "The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command."
-            } else {
-                "Whether the credential works for anything else is unknown: listing this organization's projects did not succeed either, which a missing role or scope would also explain."
-            };
-            return Err(Error::cloud_with_hint(
-                CloudErrorCode::Forbidden,
-                format!(
-                    "Spice Cloud returned no user identity for this credential, so there is no user or email to show. {detail}"
-                ),
-                "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
-            ));
+            return Err(no_user_identity_error(usable));
         }
         Err(err) => return Err(err),
     };
@@ -2473,6 +2565,21 @@ async fn execute_whoami(args: &WhoamiArgs, flag_org: Option<&str>) -> Result<()>
     }
 
     Ok(())
+}
+
+fn no_user_identity_error(credential_works: bool) -> Error {
+    let detail = if credential_works {
+        "The credential itself still authenticates: Spice Cloud accepted it for a project listing, so commands that do not need a user identity can still run. Each one is authorized on its own, so a missing role or scope can still refuse an individual command."
+    } else {
+        "Whether the credential works for anything else is unknown: listing this organization's projects did not succeed either, which a missing role or scope would also explain."
+    };
+    Error::cloud_with_hint(
+        CloudErrorCode::Forbidden,
+        format!(
+            "Spice Cloud returned no user identity for this credential, so there is no user or email to show. {detail}"
+        ),
+        "Run 'spice cloud login subscription' or 'spice cloud login token' to authenticate as a user, or continue using this credential for commands that do not need a user identity.",
+    )
 }
 
 async fn execute_orgs(args: &OrgsArgs, flag_org: Option<&str>) -> Result<()> {
@@ -2817,24 +2924,72 @@ async fn user_token_for_cloud_connect(
     command: &str,
 ) -> Result<String> {
     let candidates = client::user_credential_candidates(requested_org);
-    if candidates.is_empty() {
-        return Err(Error::cloud_with_hint(
-            CloudErrorCode::NotAuthenticated,
-            format!("{action} an enrolled instance requires a Spice Cloud user login."),
-            format!("Run `spice login`, then retry `spice cloud {command}`."),
-        ));
+    match client::first_user_credential(&candidates, endpoint, requested_org).await? {
+        client::UserCredentialSearch::Found(token) => Ok(token),
+        client::UserCredentialSearch::NoneStored => Err(no_user_login_error(action, command)),
+        client::UserCredentialSearch::AllRejected => {
+            Err(rejected_user_credential_error(Some(command), requested_org))
+        }
     }
+}
 
-    if let Some(token) = client::first_user_credential(&candidates, endpoint, requested_org).await?
-    {
-        return Ok(token);
-    }
-
-    Err(Error::cloud_with_hint(
+fn no_user_login_error(action: &str, command: &str) -> Error {
+    Error::cloud_with_hint(
         CloudErrorCode::NotAuthenticated,
         format!("{action} an enrolled instance requires a Spice Cloud user login."),
-        "Run `spice login` with a user account that can access the target organization.",
-    ))
+        format!(
+            "Run `spice login`, then retry `spice cloud {command}`. See: https://spiceai.org/docs/spice-cloud"
+        ),
+    )
+}
+
+/// An available credential Spice Cloud rejected is not a missing login.
+pub(crate) fn rejected_user_credential_error(
+    command: Option<&str>,
+    requested_org: Option<&str>,
+) -> Error {
+    let action = command.map_or_else(
+        || "the requested Spice Cloud command".to_string(),
+        |command| format!("`spice cloud {command}`"),
+    );
+    let retry = command.map_or_else(
+        || "retry the command".to_string(),
+        |command| format!("retry `spice cloud {command}`"),
+    );
+    let shell_vars = rejected_process_credential_vars(requested_org);
+    let unset = if shell_vars.is_empty() {
+        String::new()
+    } else {
+        format!("Unset {}, then ", shell_vars.join(", "))
+    };
+
+    Error::cloud_with_hint(
+        CloudErrorCode::TokenExpired,
+        format!(
+            "Spice Cloud rejected every available user credential, so {action} cannot authenticate. A credential may be expired, revoked, for a different account, or a machine credential with no user identity."
+        ),
+        format!(
+            "{unset}run `spice cloud logout --scope all`, then `spice login` with a user account that can access the target organization, then {retry}. See: https://spiceai.org/docs/spice-cloud"
+        ),
+    )
+}
+
+fn rejected_process_credential_vars(requested_org: Option<&str>) -> Vec<String> {
+    let mut vars = Vec::new();
+    if let Some(org) = requested_org {
+        vars.push(org::org_token_var(org));
+    }
+    vars.push(org::DEFAULT_TOKEN_VAR.to_string());
+    if let Ok(Some(active_org)) = org::active_org() {
+        let active_var = org::org_token_var(&active_org);
+        if !vars.contains(&active_var) {
+            vars.push(active_var);
+        }
+    }
+    vars.into_iter()
+        .filter(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
+        .map(|var| format!("`{var}`"))
+        .collect()
 }
 
 fn ensure_link_chooser_tty(is_terminal: bool) -> Result<()> {
@@ -6064,5 +6219,217 @@ mod tests {
             value.get("name").and_then(serde_json::Value::as_str),
             Some("ltd-mint")
         );
+    }
+
+    static CREDENTIAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Keeps credential tests off the developer's keychain, `.env`, and shell
+    /// credential variables.
+    struct CredentialStores {
+        _environment: std::sync::MutexGuard<'static, ()>,
+        saved_environment: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl CredentialStores {
+        fn empty() -> Self {
+            crate::commands::login::keychain::test_store::reset();
+            crate::commands::login::test_env_file::reset();
+            org::test_context_file::reset();
+            let environment = CREDENTIAL_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stores = Self {
+                _environment: environment,
+                saved_environment: Vec::new(),
+            };
+            stores.isolate_process_var(org::DEFAULT_TOKEN_VAR);
+            stores.isolate_process_var(org::DEFAULT_API_KEY_VAR);
+            stores
+        }
+
+        fn user_login(org: &str) -> Self {
+            let mut stores = Self::empty();
+            stores.isolate_process_var(&org::org_token_var(org));
+            stores.isolate_process_var(&org::org_api_key_var(org));
+            stores
+        }
+
+        fn isolate_process_var(&mut self, var: &str) {
+            if self.saved_environment.iter().any(|(saved, _)| saved == var) {
+                return;
+            }
+            self.saved_environment
+                .push((var.to_string(), std::env::var_os(var)));
+            // SAFETY: credential tests serialize access with
+            // `CREDENTIAL_ENV_LOCK` and restore every value on drop.
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    impl Drop for CredentialStores {
+        fn drop(&mut self) {
+            crate::commands::login::keychain::test_store::reset();
+            crate::commands::login::test_env_file::reset();
+            org::test_context_file::reset();
+            for (var, value) in &self.saved_environment {
+                // SAFETY: credential tests serialize access with
+                // `CREDENTIAL_ENV_LOCK` and restore every value before
+                // releasing it.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(var, value),
+                        None => std::env::remove_var(var),
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_user_login(output: LoginOutput, token: &str, org: &str) -> Result<()> {
+        let values = user_login_values(token, None, Some(org), None);
+        let refs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|(key, value)| (key.as_str(), *value))
+            .collect();
+        persist_login_values(output, &refs, &[], None)
+    }
+
+    /// Regression test for #13486: the keychain is read before the env file,
+    /// so a stale entry there used to outrank every later default login.
+    #[test]
+    fn an_env_login_clears_the_keychain_entries_it_replaces() {
+        let org = "credential-shadow-test";
+        let _stores = CredentialStores::user_login(org);
+        let org_var = org::org_token_var(org);
+        crate::commands::login::keychain::test_store::write(org::DEFAULT_TOKEN_VAR, "stale-token")
+            .expect("seed default keychain token");
+        crate::commands::login::keychain::test_store::write(&org_var, "stale-token")
+            .expect("seed org keychain token");
+
+        persist_user_login(LoginOutput::Env, "fresh-token", org).expect("persist fresh env login");
+
+        assert_eq!(
+            org::default_token().as_deref(),
+            Some("fresh-token"),
+            "the next command must read the token the login just wrote"
+        );
+        assert_eq!(
+            org::token_for_org(org).as_deref(),
+            Some("fresh-token"),
+            "the org-scoped copy written by the login must be fresh too"
+        );
+    }
+
+    /// Clearing is limited to the variables this login wrote; another
+    /// organization's stored credential is not part of this login.
+    #[test]
+    fn login_does_not_clear_another_organizations_credential() {
+        let _stores = CredentialStores::user_login("credential-shadow-test");
+        let other_var = org::org_token_var("another-credential-test-org");
+        crate::commands::login::keychain::test_store::write(&other_var, "other-token")
+            .expect("seed other org keychain token");
+
+        persist_user_login(LoginOutput::Env, "fresh-token", "credential-shadow-test")
+            .expect("persist fresh env login");
+
+        assert_eq!(
+            crate::commands::login::keychain::read(&other_var).as_deref(),
+            Some("other-token")
+        );
+    }
+
+    #[test]
+    fn an_env_login_fails_when_keychain_deletion_fails() {
+        let _stores = CredentialStores::user_login("credential-shadow-test");
+        crate::commands::login::keychain::test_store::write(org::DEFAULT_TOKEN_VAR, "stale-token")
+            .expect("seed default keychain token");
+        crate::commands::login::keychain::test_store::fail_delete(org::DEFAULT_TOKEN_VAR);
+
+        let err = persist_user_login(LoginOutput::Env, "fresh-token", "credential-shadow-test")
+            .expect_err("an undeletable keychain shadow must fail login");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+        assert!(err.to_string().contains(org::DEFAULT_TOKEN_VAR));
+        assert!(err.to_string().contains("failed to remove"));
+    }
+
+    /// An unreadable entry may become readable on the next command, so a
+    /// backend's ambiguous "missing" deletion result cannot prove it absent.
+    #[test]
+    fn an_env_login_fails_when_keychain_absence_cannot_be_verified() {
+        let _stores = CredentialStores::user_login("credential-shadow-test");
+        crate::commands::login::keychain::test_store::write(org::DEFAULT_TOKEN_VAR, "stale-token")
+            .expect("seed default keychain token");
+        crate::commands::login::keychain::test_store::make_unreadable(org::DEFAULT_TOKEN_VAR);
+        crate::commands::login::keychain::test_store::report_missing_on_delete(
+            org::DEFAULT_TOKEN_VAR,
+        );
+
+        let err = persist_user_login(LoginOutput::Env, "fresh-token", "credential-shadow-test")
+            .expect_err("an unreadable keychain shadow must fail login");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+        assert!(err.to_string().contains(org::DEFAULT_TOKEN_VAR));
+        assert!(err.to_string().contains("locked"));
+    }
+
+    #[test]
+    fn keychain_login_clears_the_env_file_entry_it_replaces() {
+        let _stores = CredentialStores::user_login("credential-shadow-test");
+        crate::commands::login::merge_auth_config("SPICEAI", &[("TOKEN", "stale-token")])
+            .expect("seed env token");
+
+        persist_user_login(
+            LoginOutput::Keychain,
+            "fresh-token",
+            "credential-shadow-test",
+        )
+        .expect("persist fresh keychain login");
+
+        assert_eq!(
+            crate::commands::login::read_env_var(org::DEFAULT_TOKEN_VAR),
+            None
+        );
+        assert_eq!(org::default_token().as_deref(), Some("fresh-token"));
+    }
+
+    #[test]
+    fn login_does_not_report_success_while_the_shell_uses_another_token() {
+        let _stores = CredentialStores::user_login("credential-shadow-test");
+        // SAFETY: `CredentialStores` serializes this mutation and restores the
+        // original environment value on drop.
+        unsafe { std::env::set_var(org::DEFAULT_TOKEN_VAR, "stale-shell-token") };
+
+        let err = persist_user_login(LoginOutput::Env, "fresh-token", "credential-shadow-test")
+            .expect_err("a shell credential that still wins must prevent success");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+        assert!(err.to_string().contains(org::DEFAULT_TOKEN_VAR));
+        assert!(err.to_string().contains("would not read"));
+
+        let rejected = rejected_user_credential_error(Some("link"), None);
+        assert!(rejected.to_string().contains("Unset"));
+        assert!(rejected.to_string().contains(org::DEFAULT_TOKEN_VAR));
+    }
+
+    #[test]
+    fn missing_and_rejected_user_credentials_have_different_messages() {
+        let missing = no_user_login_error("Linking", "link");
+        let rejected = rejected_user_credential_error(Some("link"), None);
+
+        assert_eq!(missing.cloud_code(), Some(CloudErrorCode::NotAuthenticated));
+        assert_eq!(rejected.cloud_code(), Some(CloudErrorCode::TokenExpired));
+        assert!(
+            rejected
+                .to_string()
+                .contains("rejected every available user credential")
+        );
+        assert!(rejected.to_string().contains("expired, revoked"));
+        assert!(
+            rejected
+                .to_string()
+                .contains("spice cloud logout --scope all")
+        );
+        assert_ne!(missing.to_string(), rejected.to_string());
     }
 }
