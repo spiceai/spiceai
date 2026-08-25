@@ -305,6 +305,14 @@ fn translate_is_null(schema: &EsFilterSchema, inner: &Expr, is_null: bool) -> Ou
     if !schema.supports_null_check(column) {
         return Outcome::Unsupported;
     }
+    // Elasticsearch's mapping carries no scalar-vs-array signal, so an unconfirmed field may hold
+    // multiple values: a row with a non-empty array is `exists: true` in Elasticsearch even though
+    // `hits_to_record_batch` decodes a numeric/boolean array into a scalar Arrow field as NULL.
+    // `must_not exists` (IS NULL) would then exclude that row from Elasticsearch's results
+    // entirely — a subset, not a superset — before DataFusion ever gets to re-check it.
+    if !schema.is_confirmed_scalar(column) {
+        return Outcome::Unsupported;
+    }
     let exists = json!({ "exists": { "field": column } });
     // SQL NULL semantics and Elasticsearch's "field has no non-null value" differ at the edges
     // (arrays, explicit JSON null), so these are re-checked above the scan.
@@ -771,6 +779,33 @@ mod tests {
         assert_eq!(
             classify_filter(&schema, &col("code").eq(lit("open"))),
             TableProviderFilterPushDown::Inexact
+        );
+    }
+
+    #[test]
+    fn is_null_on_unconfirmed_scalar_field_is_unsupported() {
+        // A mapping-derived field's cardinality is never confirmed scalar (see
+        // `EsFilterSchema::is_confirmed_scalar`): a non-empty array value is `exists: true` in
+        // Elasticsearch even though `hits_to_record_batch` decodes a numeric array into a scalar
+        // Arrow field as NULL, so `must_not exists` could wrongly exclude a row DataFusion
+        // considers `IS NULL`.
+        let info = crate::schema::EsMappingField {
+            field_type: "long".to_string(),
+            keyword_subfield: None,
+            keyword_ignore_above: None,
+            has_null_value: false,
+            indexed: true,
+            has_doc_values: true,
+            has_normalizer: false,
+        };
+        let schema = EsFilterSchema::from_mapping([("count", &info)]);
+        assert_eq!(
+            classify_filter(&schema, &col("count").is_null()),
+            TableProviderFilterPushDown::Unsupported
+        );
+        assert_eq!(
+            classify_filter(&schema, &col("count").is_not_null()),
+            TableProviderFilterPushDown::Unsupported
         );
     }
 
