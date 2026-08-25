@@ -4557,8 +4557,7 @@ impl CayenneTableProvider {
         // exactly the successfully absent objects after the physical sweep so
         // superseded generations cannot occupy the bounded segment cache, which
         // is process-wide: what they hold is taken from every other table too.
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if deleted > 0 || skipped_errors > 0 {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -4665,7 +4664,7 @@ impl CayenneTableProvider {
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
             let catalog = Arc::clone(&self.catalog);
             let snapshot_scan_refs = Arc::clone(&self.snapshot_scan_refs);
-            let file_format = Arc::clone(self.context.file_format());
+            let context = Arc::clone(&self.context);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -4686,7 +4685,7 @@ impl CayenneTableProvider {
                     current_snapshot,
                     protected_snapshot_ids,
                     catalog,
-                    file_format,
+                    context,
                 )
                 .await
                 {
@@ -4702,7 +4701,7 @@ impl CayenneTableProvider {
         current_snapshot: String,
         protected_snapshot_ids: HashSet<String>,
         catalog: Arc<dyn MetadataCatalog>,
-        file_format: Arc<VortexFormat>,
+        context: Arc<CayenneContext>,
     ) -> Result<()> {
         let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
             Ok(rows) => rows,
@@ -4739,7 +4738,10 @@ impl CayenneTableProvider {
         // The blocking cleanup has finished unlinking every reported path, so
         // no valid scan can insert another segment after this exact-key sweep.
         let paths = std::mem::take(&mut *retired_cache_paths.lock());
-        file_format.invalidate_segment_cache_paths(paths).await;
+        context
+            .file_format()
+            .invalidate_cached_paths(context.runtime_env(), &task_table, paths)
+            .await;
         cleanup_result
             .map_err(|source| Error::TaskPanicked {
                 table: task_table,
@@ -4775,7 +4777,7 @@ impl CayenneTableProvider {
             current_snapshot.to_string(),
             protected_snapshot_ids,
             Arc::clone(&self.catalog),
-            Arc::clone(self.context.file_format()),
+            Arc::clone(&self.context),
         )
         .await
     }
@@ -5177,7 +5179,9 @@ impl CayenneTableProvider {
                 // Physical cleanup is complete before exact-key invalidation;
                 // the same scan-ref gate above excludes a later cache reinsert.
                 let paths = std::mem::take(&mut *retired_cache_paths.lock());
-                file_format.invalidate_segment_cache_paths(paths).await;
+                file_format
+                    .invalidate_cached_paths(&runtime_env, &table_id, paths)
+                    .await;
                 match removed {
                     Ok(Ok(true)) => {
                         // Dir fully removed. Evict the cached listing AFTER the
@@ -5346,10 +5350,21 @@ impl CayenneTableProvider {
         Ok(Some(ObjectStorePath::from(path)))
     }
 
-    pub(crate) async fn invalidate_segment_cache_paths(&self, paths: HashSet<ObjectStorePath>) {
+    /// Releases everything the Vortex caches still hold for files this table has
+    /// retired: their decoded segments and their footers.
+    ///
+    /// Callers pass paths whose objects are confirmed absent. The footer cache
+    /// tracks the live file set only because retirement tells it to — nothing
+    /// else does, so a path that skips this call keeps its footer resident for
+    /// the life of the process.
+    pub(crate) async fn invalidate_retired_paths(&self, paths: HashSet<ObjectStorePath>) {
         self.context
             .file_format()
-            .invalidate_segment_cache_paths(paths)
+            .invalidate_cached_paths(
+                self.context.runtime_env(),
+                &self.table_metadata.table_id,
+                paths,
+            )
             .await;
     }
 
@@ -5391,8 +5406,7 @@ impl CayenneTableProvider {
                 Err(_) => {}
             }
         }
-        self.invalidate_segment_cache_paths(retired_cache_paths)
-            .await;
+        self.invalidate_retired_paths(retired_cache_paths).await;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -6471,7 +6485,7 @@ impl CayenneTableProvider {
         } else {
             cache_paths
         };
-        self.invalidate_segment_cache_paths(absent_paths).await;
+        self.invalidate_retired_paths(absent_paths).await;
         if let Some(source) = deletion_error {
             return Err(Error::IoError { source });
         }
@@ -44646,8 +44660,22 @@ mod tests {
         );
     }
 
+    /// Retirement releases both of the caches a Vortex file occupies, in one
+    /// call: its decoded segments and its footer. The footer cache has no TTL
+    /// and no invalidation of its own — an entry leaves only when another `put`
+    /// pushes it out under capacity pressure — and every Cayenne file is written
+    /// once under a fresh uuid7 directory, so a footer that outlives its file
+    /// can never be looked up again yet keeps a share of a budget that live
+    /// metadata for every other table on the same environment, Parquet
+    /// included, competes for.
+    ///
+    /// "on the same environment" is the sharing boundary, and it is narrower
+    /// than the process: the cache hangs off the `RuntimeEnv`. This test runs
+    /// against one environment, so it covers what a deployment without a
+    /// dedicated Cayenne compaction environment sees; the second cache such a
+    /// deployment has is spiceai/spiceai#13497.
     #[tokio::test]
-    async fn committed_compaction_invalidates_retired_segments_after_cleanup() {
+    async fn committed_compaction_invalidates_retired_segments_and_footers_after_cleanup() {
         use arrow::array::Int64Array;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -44663,6 +44691,18 @@ mod tests {
             ctx.runtime_env(),
         )
         .await;
+        // Footer-cache keys are the files' object-store locations, and a Cayenne
+        // file's location carries the id of the snapshot that wrote it, so the
+        // resident footers can be attributed to a snapshot by name.
+        let footers_under = |snapshot: &str| {
+            ctx.runtime_env()
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(snapshot))
+                .count()
+        };
         insert_batch(
             &provider,
             RecordBatch::try_new(
@@ -44691,6 +44731,10 @@ mod tests {
             "the source scan must populate the cache"
         );
         let old_snapshot = provider.get_current_snapshot_id();
+        assert!(
+            footers_under(&old_snapshot) > 0,
+            "the source scan must cache the written snapshot's footers"
+        );
 
         assert!(
             provider
@@ -44723,6 +44767,16 @@ mod tests {
         );
 
         let current_snapshot = provider.get_current_snapshot_id();
+        let retired_footers_before = footers_under(&old_snapshot);
+        assert!(
+            retired_footers_before > 0,
+            "the compaction inputs' footers are still resident before cleanup"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the replacement scan must cache the live snapshot's footers"
+        );
+
         provider.protected_snapshots.store(Arc::new(HashMap::new()));
         provider
             .snapshot_scan_refs
@@ -44742,6 +44796,11 @@ mod tests {
             "in-flight compaction inputs must remain cached"
         );
         assert_eq!(
+            footers_under(&old_snapshot),
+            retired_footers_before,
+            "a snapshot an in-flight scan still holds is not retired, so its footers must stay"
+        );
+        assert_eq!(
             provider.snapshot_scan_refs.lock().remove(&old_snapshot),
             Some(1),
             "the test must release the old snapshot's in-flight guard"
@@ -44759,6 +44818,15 @@ mod tests {
         assert!(
             entries_after_cleanup > 0 && entries_after_cleanup < entries_before_cleanup,
             "cleanup must remove retired compaction inputs while preserving the output cache"
+        );
+        assert_eq!(
+            footers_under(&old_snapshot),
+            0,
+            "retiring a file must drop its footer: the deleted snapshot's {retired_footers_before} footers are still pinned in the shared cache, and nothing else will ever release them"
+        );
+        assert!(
+            footers_under(&current_snapshot) > 0,
+            "the live snapshot's footers must survive cleanup"
         );
     }
 
