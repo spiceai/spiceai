@@ -817,6 +817,11 @@ impl RuntimeContext {
 /// take effect: resolution erroring, and the written file failing the runnable
 /// check so that nothing resolves at all. Silence on any of them is the worst
 /// outcome: the user has done the thing that was supposed to fix their problem.
+///
+/// A warning, not an error, so the caller still exits `0` — and `--machine`
+/// turns the tracing filter off, so those runs stay silent. Both are #13459;
+/// closing it needs `spice install` to fail on an unusable managed runtime,
+/// which is a change to its exit-code contract rather than to resolution.
 pub fn warn_if_install_will_not_run(ctx: &RuntimeContext) {
     if let Some(warning) = install_will_not_run_warning(&ctx.spiced_path(), &ctx.resolve_spiced()) {
         tracing::warn!("{warning}");
@@ -844,7 +849,7 @@ fn install_will_not_run_warning(
         Ok(Some(resolved)) => Some(shadowed_install_warning(installed, resolved)),
         // The install stands — the bytes are on disk — but no `spice run` can
         // reach them while resolution fails, and the caller has just reported
-        // success. This is the only place the user hears otherwise.
+        // success. This arm is the only account the user gets of that.
         Err(cause) => Some(unselectable_install_warning(installed, cause)),
     }
 }
