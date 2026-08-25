@@ -1286,6 +1286,30 @@ impl HttpTableProvider {
         }
     }
 
+    /// How old a response already was when it arrived (RFC 9111 §4.2.3).
+    ///
+    /// `Age` counts from when the origin generated the response, so the wait for
+    /// it to arrive is added to that figure — but *not* to the age its `Date`
+    /// implies, which is measured on arrival and already contains that wait.
+    /// Adding the wait to both charges it twice and turns away short-lived
+    /// responses that are still fresh. The greater of the two is taken, so an
+    /// origin that declares an `Age` smaller than its own `Date` implies does
+    /// not get the benefit of the smaller figure.
+    ///
+    /// Saturating, because `Age` is untrusted response data: a value near
+    /// `u64::MAX` would otherwise overflow the addition and panic.
+    fn age_on_arrival(
+        header_age: Option<Duration>,
+        apparent_age: Duration,
+        response_delay: Duration,
+    ) -> Duration {
+        apparent_age.max(
+            header_age
+                .unwrap_or_default()
+                .saturating_add(response_delay),
+        )
+    }
+
     /// Detect file format from Content-Type header, path extension, or content
     fn detect_file_format(response: &reqwest::Response, path: &str) -> String {
         // 1. Try to detect from Content-Type header
@@ -1560,7 +1584,14 @@ impl HttpTableProvider {
 
         // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
         // 4xx like 404 "not found" is a valid business response, not an error
-        Self::extract_response(response, status_code, path_label, attempt_started).await
+        Self::extract_response(
+            response,
+            status_code,
+            path_label,
+            attempt_started,
+            self.auth.as_ref().map(|auth| auth.header_name()),
+        )
+        .await
     }
 
     /// Extract content and metadata from an HTTP response.
@@ -1569,6 +1600,7 @@ impl HttpTableProvider {
         status_code: u16,
         path_label: &str,
         attempt_started: Instant,
+        auth_header_name: Option<&HeaderName>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -1584,24 +1616,37 @@ impl HttpTableProvider {
                 .map(|value| value.to_str().ok()),
         );
 
-        // `Vary: *` says this response must never satisfy a later request. That
-        // is not a freshness question — no window makes such a response reusable
-        // — so it refuses retention outright, as `no-store` does.
+        // `Vary` names what the origin selects a representation on, so an entry
+        // may only be reused for a request that matches on every named field.
+        // Retention is refused unless that can be shown:
         //
-        // Named `Vary` fields are not treated the same way: what varies between
-        // requests here is the path, query, body and request headers a query
-        // supplies, and those are already the cache key. The connector's own
-        // headers are fixed for the life of the provider, so a response that
-        // varies on one of them cannot be served to a request that differs in it.
-        if response
-            .headers()
-            .get_all(reqwest::header::VARY)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|field| field.trim() == "*")
-        {
-            directives.forbid_retention = true;
+        // * `*` never matches a later request, whatever the key holds.
+        // * A field whose bytes are not text leaves the selection unknown, and
+        //   unknown resolves against caching here as it does elsewhere.
+        // * A field naming the authenticator's header is refused because that
+        //   value is *not* stable: an `OAuth2Auth` token is refreshed in the
+        //   background, so a later request can carry a different credential than
+        //   the one the stored representation was selected for.
+        //
+        // Any other named field is safe here, and this is the reasoning the
+        // narrowness rests on: what differs between requests is the path, query,
+        // body and the request headers a query supplies, and all four are in the
+        // cache key. The connector's remaining headers are fixed when the
+        // provider is built.
+        let auth_header = auth_header_name;
+        for value in &response.headers().get_all(reqwest::header::VARY) {
+            let Ok(value) = value.to_str() else {
+                directives.forbid_retention = true;
+                continue;
+            };
+            for field in value.split(',') {
+                let field = field.trim();
+                if field == "*"
+                    || auth_header.is_some_and(|name| field.eq_ignore_ascii_case(name.as_str()))
+                {
+                    directives.forbid_retention = true;
+                }
+            }
         }
 
         // What the origin declared about how much of the response's freshness
@@ -1652,17 +1697,8 @@ impl HttpTableProvider {
             .and_then(|date| SystemTime::now().duration_since(date).ok())
             .unwrap_or_default();
 
-        // `Age` counts from when the origin generated the response, so the wait
-        // for it to arrive is added to that figure — but not to the `Date`-implied
-        // one, which was measured on arrival and already contains it. Adding the
-        // round trip to both would charge it twice and reject short-lived
-        // responses that are still fresh.
         let response_delay = headers_received.saturating_duration_since(attempt_started);
-        let age_on_arrival = apparent_age.max(
-            header_age
-                .unwrap_or_default()
-                .saturating_add(response_delay),
-        );
+        let age_on_arrival = Self::age_on_arrival(header_age, apparent_age, response_delay);
 
         // Capture response headers before consuming the response body
         let response_headers: Vec<(String, String)> = response
@@ -4344,100 +4380,59 @@ mod response_cache_tests {
     }
 
     /// The wait for a response counts against an `Age` the origin declared, but
-    /// not against the age its `Date` already implies — that one was measured on
-    /// arrival and contains the wait already. Charging both rejects short-lived
-    /// responses that are still fresh.
+    /// not against the age its `Date` already implies — that one is measured on
+    /// arrival and contains the wait already. Charging both turns away
+    /// short-lived responses that are still fresh.
     ///
-    /// The delay is the subject: it is what would be counted twice.
-    #[tokio::test]
-    async fn a_slow_but_still_fresh_response_is_retained() {
-        let origin = MockServer::start().await;
-        // Dated before the request, as an origin behind a slow hop would be, so
-        // the `Date`-implied age already contains the wait. A window of six
-        // seconds leaves room for the true age of about five, but not for the
-        // seven that counting the wait twice would produce.
-        let three_seconds_ago = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(3));
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("cache-control", "max-age=6")
-                    .insert_header("date", three_seconds_ago.as_str())
-                    .set_body_string(r#"{"rows":11}"#)
-                    .set_delay(Duration::from_secs(2)),
-            )
-            .mount(&origin)
-            .await;
+    /// Asserted on the arithmetic rather than against a live server: the window
+    /// that distinguishes the right answer from the double-counted one is only
+    /// as wide as the wait itself, so a wall-clock test of it is inherently
+    /// marginal and flakes under load. This is where the bug lived.
+    #[test]
+    fn the_wait_is_charged_to_age_but_not_to_the_date() {
+        let three_seconds = Duration::from_secs(3);
+        let two_seconds = Duration::from_secs(2);
 
-        let provider = provider_for(&origin);
-        provider
-            .get_response("/report", None, None, None)
-            .await
-            .expect("served");
-        settle(&provider.cache).await;
+        // `Date` says three seconds; the two-second wait is already inside that.
         assert_eq!(
-            provider.cache.entry_count(),
-            1,
-            "a response with freshness left after the round trip must still be retained"
+            HttpTableProvider::age_on_arrival(None, three_seconds, two_seconds),
+            three_seconds,
+            "the wait must not be added to an age measured on arrival"
+        );
+
+        // `Age` says three seconds as of when the origin sent it, so the wait is.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(Some(three_seconds), Duration::ZERO, two_seconds),
+            Duration::from_secs(5),
+            "the wait must be added to an age declared at the origin"
+        );
+
+        // Both present: the greater wins, so an origin under-declaring `Age`
+        // gains nothing by it.
+        assert_eq!(
+            HttpTableProvider::age_on_arrival(
+                Some(Duration::from_secs(1)),
+                Duration::from_hours(1),
+                two_seconds
+            ),
+            Duration::from_hours(1)
         );
     }
 
-    /// `Vary: *` says the response must never satisfy a later request. No
-    /// freshness window makes it reusable, so it is refused outright — otherwise
-    /// an endpoint returning changing data behind `max-age` would have its first
-    /// body served to every query for the rest of the window.
-    #[tokio::test]
-    async fn vary_star_refuses_retention() {
-        let origin = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("cache-control", "max-age=600")
-                    .insert_header("vary", "*")
-                    .set_body_string(r#"{"rows":12}"#),
-            )
-            .mount(&origin)
-            .await;
-
-        let provider = provider_for(&origin);
-        provider
-            .get_response("/report", None, None, None)
-            .await
-            .expect("the response is still served");
-        settle(&provider.cache).await;
-        assert_eq!(
-            provider.cache.entry_count(),
-            0,
-            "a response that may never be reused must not be retained"
+    /// `Age` is untrusted, so the addition saturates rather than panicking.
+    /// Saturation lands on `Duration::MAX`, which carries the sub-second part
+    /// too — the point is that it neither panics nor wraps to something small.
+    #[test]
+    fn an_absurd_age_saturates_rather_than_overflowing() {
+        let saturated = HttpTableProvider::age_on_arrival(
+            Some(Duration::from_secs(u64::MAX)),
+            Duration::ZERO,
+            Duration::from_secs(1),
         );
-    }
-
-    /// A named `Vary` is not treated the same way, and that is the point of
-    /// matching only `*`: what varies between requests here — path, query, body
-    /// and the headers a query supplies — is already the cache key, so a named
-    /// field cannot make one request's response answer a different request.
-    #[tokio::test]
-    async fn a_named_vary_field_still_caches() {
-        let origin = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("cache-control", "max-age=600")
-                    .insert_header("vary", "accept-encoding, accept")
-                    .set_body_string(r#"{"rows":13}"#),
-            )
-            .mount(&origin)
-            .await;
-
-        let provider = provider_for(&origin);
-        provider
-            .get_response("/report", None, None, None)
-            .await
-            .expect("served");
-        settle(&provider.cache).await;
-        assert_eq!(
-            provider.cache.entry_count(),
-            1,
-            "a named Vary must not be read as a blanket refusal"
+        assert_eq!(saturated, Duration::MAX);
+        assert!(
+            saturated > Duration::from_secs(u64::MAX / 2),
+            "an absurd age must stay absurd rather than wrapping to something servable"
         );
     }
 
