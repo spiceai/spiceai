@@ -262,16 +262,23 @@ where
     /// the two value types that reach it, `CachedQueryResult` and `CachedSearchResult`,
     /// answer `AsTableRefs` with an `Arc` clone.
     ///
-    /// The shard's *metadata* write lock is held across its walk, and that is what makes
-    /// the first half of the guarantee below true rather than aspirational. `get` expresses
-    /// a read as `remove` + re-`admit` under that shard's metadata *read* lock, so a scan
-    /// holding no metadata lock can land between the two, see a matching key as absent, and
-    /// leave the entry for the re-admit to restore — after which any lookup with no
-    /// invalidation-clock check of its own serves it. Excluding `get` costs that shard's
-    /// metadata readers (`len()`, `iter_keys()`, and hits) the length of the walk, on top of
-    /// the pingora-lru hold above. It introduces no new lock ordering: metadata shard first,
-    /// then the pingora-lru shard beneath `iter_for_each`, the order `insert` and `get`
-    /// already take, and eviction materialises its victims before taking either.
+    /// The shard's *metadata* read lock is held across its walk, and that is what makes the
+    /// first half of the guarantee below true rather than aspirational. `get` expresses a
+    /// read as `remove` + re-`admit`, so a scan holding no metadata lock can land between
+    /// the two, see a matching key as absent, and leave the entry for the re-admit to
+    /// restore — after which any lookup with no invalidation-clock check of its own serves
+    /// it.
+    ///
+    /// A *read* hold is what excluding that needs, and all it needs: `get` takes the shard
+    /// for **writing** across its pair, as does every other mutator of an entry (`insert`,
+    /// `remove`, `remove_if_expired`, `evict_to_weight_limit`, `clear`), so holding it
+    /// shared excludes all of them while leaving this shard's metadata-only readers —
+    /// `len()`, `iter_keys()` — running as they did before. Taking it exclusively would
+    /// exclude those too, for nothing: they cannot move an entry behind the walk.
+    ///
+    /// It introduces no new lock ordering: metadata shard first, then the pingora-lru shard
+    /// beneath `iter_for_each`, the order `insert` and `get` already take, and eviction
+    /// materialises its victims before taking either.
     ///
     /// So: an entry resident when its shard is reached is always seen; one admitted into a
     /// shard after that shard has been walked is not.
@@ -286,7 +293,7 @@ where
         // `0..self.cache.shards()` is what keeps that pairing an index the compiler
         // checks instead of an assumption.
         for (shard, metadata) in self.metadata_shards.iter().enumerate() {
-            let _metadata = metadata.write();
+            let _metadata = metadata.read();
             self.cache.iter_for_each(shard, |(entry, _weight)| {
                 if predicate(&entry.value) {
                     matched.push(entry.key);
