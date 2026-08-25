@@ -352,8 +352,13 @@ impl<S: BuildHasher> SchemaInterner<S> {
     /// Interning sweeps the shard it touches, which is enough while a shard
     /// keeps seeing traffic — but a shard that goes quiet after a burst would
     /// otherwise hold its dead rows indefinitely, since nothing else would ever
-    /// look at it. A periodic caller (the metrics reporter) drives this so the
-    /// pool shrinks when its holders disappear rather than when they return.
+    /// look at it. The runtime's cache-maintenance loop drives this on its own
+    /// schedule, so the pool shrinks when its holders disappear rather than
+    /// when they return.
+    ///
+    /// Deliberately not driven by anything that observes the pool: tying
+    /// reclamation to metrics collection would make the pool's memory depend on
+    /// whether telemetry is enabled.
     pub fn sweep(&self) {
         for shard in &self.shards {
             shard.lock().sweep();
@@ -624,8 +629,9 @@ mod tests {
             drop(interner.intern(schema_of(width)));
         }
 
-        // Read straight from the shards: `stats()` sweeps, so going through it
-        // here would measure the reclaimed state and never see the peak.
+        // Read straight from the shards to capture the peak: `stats()` counts
+        // only live rows, so it reports zero here whether or not the capacity
+        // behind them was ever given back.
         let retained = || -> usize {
             interner
                 .shards
@@ -665,7 +671,7 @@ mod tests {
 
     /// Interning only sweeps the shard it touches, so a pool that goes quiet
     /// after a burst would hold its dead rows until traffic returned. The
-    /// explicit sweep is what the periodic reporter drives.
+    /// explicit sweep is what the runtime's cache-maintenance loop drives.
     #[test]
     fn an_explicit_sweep_reclaims_without_further_interning() {
         let interner = SchemaInterner::new();
@@ -676,8 +682,8 @@ mod tests {
 
         interner.sweep();
 
-        // Counted without `stats()`, which sweeps of its own accord and would
-        // mask a `sweep()` that did nothing.
+        // Counted without `stats()`, which reports only live rows and so would
+        // read zero even if `sweep()` had reclaimed nothing.
         let live: usize = interner.shards.iter().map(|shard| shard.lock().rows).sum();
         assert_eq!(
             live, 0,
