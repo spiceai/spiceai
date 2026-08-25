@@ -97,6 +97,19 @@ use connector_smb as _;
 use connector_snowflake as _;
 #[cfg(feature = "spark")]
 use connector_spark as _;
+
+// Same force-linkage for accelerator engines, which self-register via
+// `register_data_accelerator!` into a linkme slice of their own.
+#[cfg(not(windows))]
+use accelerator_cayenne as _;
+#[cfg(feature = "duckdb")]
+use accelerator_duckdb as _;
+#[cfg(feature = "postgres-accel")]
+use accelerator_postgres as _;
+#[cfg(feature = "sqlite")]
+use accelerator_sqlite as _;
+#[cfg(feature = "turso")]
+use accelerator_turso as _;
 use connector_spiceai as _;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
@@ -1074,7 +1087,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // same reason as the compaction metrics above (bind to the real Prometheus
         // meter, not the early noop one). Localizes *which* valve is stalling the CDC
         // apply path when ingest falls behind.
-        runtime::dataaccelerator::cayenne::register_cayenne_telemetry();
+        // Gated like the dependency itself: `accelerator-cayenne` is a
+        // `cfg(not(windows))` target dependency, so on Windows the crate does not exist.
+        #[cfg(not(windows))]
+        accelerator_cayenne::register_cayenne_telemetry();
     }
 
     // The global meter provider is now final: either `init_metrics` replaced the

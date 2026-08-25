@@ -39,10 +39,12 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow_schema::{ArrowError, Field, FieldRef, Schema};
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::prelude::Expr;
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu, ensure};
-use spice_table::{Index, WriteWindow};
+use spice_table::{Index, WriteWindow, resolve_keys_matching_predicate};
 
 pub use search_index::CompoundSearchIndex;
 pub use vector_index::CompoundVectorIndex;
@@ -383,6 +385,48 @@ async fn compound_delete_by_keys(
     let (primary_result, secondary_result) = futures::join!(
         primary.delete_by_keys(keys.clone()),
         secondary.delete_by_keys(keys)
+    );
+    primary_result.and(secondary_result)
+}
+
+/// Resolve the delete keys for a compound index.
+///
+/// The split-resolve delete path (`SpiceTable::delete_from`) resolves once and
+/// then fans the single resulting batch to both halves' [`Index::delete_by_keys`],
+/// so the resolved batch must carry every key column *either* half needs. Resolve
+/// on the union of both halves' required columns (`required_columns`), exactly as
+/// the trait default does — a per-half resolve would produce two differently
+/// shaped batches that the single fan-out delete could not consume.
+async fn compound_resolve_delete_keys(
+    required_columns: Vec<String>,
+    table: &Arc<dyn TableProvider>,
+    session: &dyn Session,
+    filters: Vec<Expr>,
+) -> DataFusionResult<Option<RecordBatch>> {
+    let keys = resolve_keys_matching_predicate(table, session, filters, &required_columns).await?;
+    if keys.num_rows() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(keys))
+}
+
+/// Delete entries matching `filters` from both indexes.
+///
+/// Fans out to each half's own [`Index::delete_by_predicate`] so a half that
+/// overrides resolve/delete (e.g. a co-located index that skips the resolve scan)
+/// keeps its behavior, rather than being driven by the compound's union resolve.
+/// Both run concurrently and both are driven to completion even if one fails,
+/// matching [`compound_delete_by_keys`].
+async fn compound_delete_by_predicate(
+    primary: &dyn Index,
+    secondary: &dyn Index,
+    table: &Arc<dyn TableProvider>,
+    session: &dyn Session,
+    filters: Vec<Expr>,
+) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) = futures::join!(
+        primary.delete_by_predicate(table, session, filters.clone()),
+        secondary.delete_by_predicate(table, session, filters)
     );
     primary_result.and(secondary_result)
 }
