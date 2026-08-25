@@ -314,8 +314,10 @@ const NON_FINITE_SAMPLE_LIMIT: usize = 5;
 
 /// Report the rows an embedding builder could not index, if there were any.
 ///
-/// Every builder that nulls a defective embedding emits through here, so the emptiness
-/// check and the log level cannot drift apart between them.
+/// Every write path that meets a non-finite embedding emits through here — the ones that
+/// null the embedding and the ones that drop the record entirely — so the emptiness check,
+/// the log level and the wording cannot drift apart between them. The message states the
+/// consequence both share ("not indexed") rather than the storage outcome, which differs.
 pub fn warn_non_finite_embeddings(index_name: &str, affected_rows: &[usize], total_rows: usize) {
     if affected_rows.is_empty() {
         return;
@@ -345,7 +347,7 @@ pub fn non_finite_embedding_warning(
         ""
     };
     format!(
-        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are stored without an embedding and vector search will never return them (rows {sample}{ellipsis}). {NON_FINITE_EMBEDDING_REMEDY}",
+        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are not indexed and vector search will never return them (rows {sample}{ellipsis}). {NON_FINITE_EMBEDDING_REMEDY}",
         affected_rows.len()
     )
 }
@@ -710,11 +712,22 @@ mod tests {
 
     /// The warning is what a user gets to explain a row that vanished from search, so it
     /// must keep naming the index, the count, the consequence, and the docs link.
+    ///
+    /// The consequence has to be the one every caller produces. Some paths null the
+    /// embedding and keep the row; `memory`, `s3_vectors` and Elasticsearch's document
+    /// builder drop the record instead. "Not indexed" is true of all of them, so a reword
+    /// back to a storage outcome would make the single shared line wrong for three of the
+    /// four backends emitting it.
     #[test]
     fn non_finite_warning_names_index_consequence_and_docs() {
         let message = non_finite_embedding_warning("my_index", &[1, 4], 10);
         assert!(message.contains("'my_index'"), "{message}");
         assert!(message.contains("2 of 10"), "{message}");
+        assert!(message.contains("not indexed"), "{message}");
+        assert!(
+            !message.contains("stored without an embedding"),
+            "the shared line must not promise a storage outcome the record-dropping callers do not produce: {message}"
+        );
         assert!(
             message.contains("vector search will never return them"),
             "{message}"

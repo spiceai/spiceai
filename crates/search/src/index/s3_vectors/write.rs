@@ -267,14 +267,16 @@ pub fn extract_and_format_metadata(
 
 /// Filter out invalid embedding vectors where all values are either zero or NaN.
 ///
-/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs).
-/// A vector with any valid non-zero, non-NaN value is kept.
+/// This filters vectors that consist entirely of invalid values (zeros and/or NaNs), and
+/// vectors carrying any non-finite component at all — a single NaN or infinity poisons every
+/// score computed against the vector, so the whole record is dropped rather than indexed.
 /// For example:
 /// - `[0.0, 0.0]` -> filtered (all zeros)
 /// - `[NaN, NaN]` -> filtered (all NaN)
 /// - `[0.0, NaN]` -> filtered (all values are either zero or NaN)
-/// - `[1.0, 0.0]` -> kept (has a valid non-zero value)
-/// - `[1.0, NaN]` -> kept (has a valid non-NaN value)
+/// - `[1.0, NaN]` -> filtered (one non-finite component)
+/// - `[1.0, f32::INFINITY]` -> filtered (one non-finite component)
+/// - `[1.0, 0.0]` -> kept (finite, with a valid non-zero value)
 #[expect(clippy::type_complexity)]
 fn filter_zero_vectors(
     mut embeddings: Vec<Option<Vec<f32>>>,
@@ -304,14 +306,13 @@ fn filter_zero_vectors(
             .get(i)
             .and_then(|k| k.as_ref().map(String::as_str))
             .unwrap_or("unknown");
+        // Only the all-zero case is reported per record. A non-finite one is deliberately
+        // silent: `update_embedding_column_in_batch` runs before this filter and has already
+        // named every affected row in one batched warning, so warning again per row would
+        // turn one degraded embedding response into a line per record.
         if all_zero_or_nan {
             tracing::warn!(
                 "Skipping record '{key_str}' for S3 Vector index '{index_name}': Embedding vector is all zeroes or contains only invalid values"
-            );
-        } else {
-            tracing::warn!(
-                "Skipping record '{key_str}' for S3 Vector index '{index_name}': the embedding contains a NaN or infinite value, so the record is not indexed and vector search will never return it. {}",
-                write_util::NON_FINITE_EMBEDDING_REMEDY
             );
         }
 

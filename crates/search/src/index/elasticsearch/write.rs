@@ -256,8 +256,9 @@ fn build_documents(
     let mut null_pk_samples: Vec<usize> = Vec::new();
     let mut zero_or_nan_skips: usize = 0;
     let mut zero_or_nan_samples: Vec<usize> = Vec::new();
-    let mut non_finite_skips: usize = 0;
-    let mut non_finite_samples: Vec<usize> = Vec::new();
+    // Every affected row, not a truncated sample: `warn_non_finite_embeddings` does the
+    // truncation for display and needs the real count to report it.
+    let mut non_finite_rows: Vec<usize> = Vec::new();
     let mut missing_embedding_skips: usize = 0;
 
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
@@ -298,10 +299,7 @@ fn build_documents(
         }
 
         if first_non_finite(embedding).is_some() {
-            non_finite_skips += 1;
-            if non_finite_samples.len() < SAMPLE_LIMIT {
-                non_finite_samples.push(row);
-            }
+            non_finite_rows.push(row);
             continue;
         }
 
@@ -346,11 +344,10 @@ fn build_documents(
             "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
         );
     }
-    if non_finite_skips > 0 {
-        tracing::warn!(
-            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
-        );
-    }
+    // This is the one place a non-finite embedding is reported for Elasticsearch: the
+    // embedding-column builder below runs over the same rows on every write, so reporting
+    // there as well would double every line.
+    warn_non_finite_embeddings(es_index, &non_finite_rows, embedding_vectors.len());
     if missing_embedding_skips > 0 {
         tracing::debug!(
             "Skipped {missing_embedding_skips} record(s) for Elasticsearch index '{es_index}': no embedding generated (expected when embedded column is NULL)."
@@ -499,8 +496,8 @@ fn create_embedding_array(
         }
     }
 
-    warn_non_finite_embeddings(es_index, &non_finite_rows, embedding_vectors.len());
-
+    // Deliberately silent: `build_documents` runs first on every write path that reaches
+    // here and has already reported these rows once.
     Ok(Arc::new(builder.finish()))
 }
 

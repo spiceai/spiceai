@@ -212,16 +212,16 @@ impl MemoryVectorIndex {
                         // A single NaN or infinity poisons every score computed against the
                         // vector, so one bad component disqualifies the whole row too.
                         let non_finite = write_util::first_non_finite(vector).is_some();
+                        // Only the all-zero case is reported per record. A non-finite one is
+                        // deliberately silent: `update_embedding_column_in_batch` runs first on
+                        // this path and has already named every affected row in one batched
+                        // warning, so warning again per row would multiply one degraded
+                        // embedding response into a line per record.
                         if all_zero_or_nan {
                             tracing::warn!(
                                 "Skipping record '{key}' for memory vector index '{INDEX_NAME}': Embedding vector is all zeroes or contains only invalid values"
                             );
-                        } else if non_finite {
-                            tracing::warn!(
-                                "Skipping record '{key}' for memory vector index '{INDEX_NAME}': the embedding contains a NaN or infinite value, so the record is not indexed and vector search will never return it. {}",
-                                write_util::NON_FINITE_EMBEDDING_REMEDY
-                            );
-                        } else {
+                        } else if !non_finite {
                             keys.push(key.clone());
                         }
                         !all_zero_or_nan && !non_finite
