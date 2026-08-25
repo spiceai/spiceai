@@ -36,6 +36,7 @@ pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
+pub(crate) mod sizing;
 pub mod utils;
 
 pub mod encoding;
@@ -108,15 +109,27 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The memory a cached value holds, as the byte budget sees it.
+///
+/// This is what `max_size` is enforced against, so an implementation must
+/// account for everything the value reaches through a pointer — the weigher is
+/// handed the value and nothing else — **and** add
+/// `sizing::ENTRY_OVERHEAD_BYTES` for the store's own per-entry bookkeeping,
+/// which no implementation can see. The `sizing` module holds the deep-size
+/// helpers and states which imprecisions are deliberate.
+///
+/// Omitting any of it does not fail to compile; it silently makes `max_size`
+/// unable to bound a stream of that value, which is the defect
+/// <https://github.com/spiceai/spiceai/issues/12931> reported.
 pub trait Sizeable {
     fn get_memory_size(&self) -> usize;
 }
 
 impl Sizeable for Vec<Vec<f32>> {
     fn get_memory_size(&self) -> usize {
-        self.iter()
-            .map(|vec| vec.len() * std::mem::size_of::<f32>())
-            .sum()
+        std::mem::size_of::<Self>()
+            + sizing::f32_vectors_heap_size(self)
+            + sizing::ENTRY_OVERHEAD_BYTES
     }
 }
 

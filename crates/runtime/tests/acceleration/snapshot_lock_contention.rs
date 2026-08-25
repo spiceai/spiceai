@@ -725,7 +725,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let accelerator: Arc<dyn TableProvider> = match engine_type {
         #[cfg(feature = "duckdb")]
         EngineType::DuckDB => {
-            use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
+            use accelerator_duckdb::DuckDBAccelerator;
 
             let mut options = HashMap::new();
             options.insert("open".to_string(), db_file.display().to_string());
@@ -755,7 +755,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         }
         #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
-            use runtime::dataaccelerator::sqlite::SqliteAccelerator;
+            use accelerator_sqlite::SqliteAccelerator;
 
             let mut options = HashMap::new();
             options.insert("file".to_string(), db_file.display().to_string());

@@ -150,6 +150,16 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub org: String,
+    /// Which kind of project this is (`managed`, `standalone`, ...), as Spice
+    /// Cloud resolved it.
+    ///
+    /// Carried verbatim rather than parsed into a closed set: the kind is the
+    /// server's to decide, the set of kinds grows without a new CLI, and a
+    /// binary already in the field must still be able to read a project whose
+    /// kind it has never heard of. Absent when the control plane predates the
+    /// field.
+    #[serde(default)]
+    pub kind: Option<String>,
     pub description: Option<String>,
     pub visibility: Option<String>,
     pub created_at: Option<String>,
@@ -167,6 +177,22 @@ impl Project {
         } else {
             format!("{}/{}", self.org, self.name)
         }
+    }
+
+    /// The region whose data plane serves this project's instances.
+    ///
+    /// Spice Cloud reports a Spice-managed project's region at the top level
+    /// of the project record. A Cloud Connect project has no region of its
+    /// own at creation — it follows from where the attached instance
+    /// connects, and Spice Cloud records it only on the project config — so
+    /// consult both. `None` means no instance can be reached yet.
+    #[must_use]
+    pub fn data_plane_region(&self) -> Option<&str> {
+        self.region.as_deref().or_else(|| {
+            self.config
+                .as_ref()
+                .and_then(|config| config.region.as_deref())
+        })
     }
 }
 
@@ -628,6 +654,42 @@ mod tests {
             serde_json::from_str(r#"{"apps":[{"id":1,"name":"team-app","org":"spicehq"}]}"#)
                 .expect("legacy apps envelope should deserialize");
         assert_eq!(apps.into_projects()[0].name, "team-app");
+    }
+
+    #[test]
+    fn data_plane_region_consults_the_project_record_then_the_config() {
+        fn project(region: Option<&str>, config_region: Option<&str>) -> Project {
+            Project {
+                id: 1,
+                name: "team-app".to_string(),
+                org: "spicehq".to_string(),
+                kind: None,
+                description: None,
+                visibility: None,
+                created_at: None,
+                region: region.map(str::to_string),
+                production_branch: None,
+                config: config_region.map(|region| ProjectConfig {
+                    region: Some(region.to_string()),
+                    ..ProjectConfig::default()
+                }),
+            }
+        }
+
+        // A Spice-managed project reports its region on the project record.
+        assert_eq!(
+            project(Some("us-east-1-prod-aws-data"), Some("us-west-2")).data_plane_region(),
+            Some("us-east-1-prod-aws-data")
+        );
+        // A Cloud Connect project reports it only on the project config, once
+        // an instance is attached; commands that reach the data plane must
+        // resolve this shape too, or every health/logs/datasets read fails.
+        assert_eq!(
+            project(None, Some("us-west-2")).data_plane_region(),
+            Some("us-west-2")
+        );
+        // Neither set: there is no data-plane endpoint to derive.
+        assert_eq!(project(None, None).data_plane_region(), None);
     }
 
     #[test]

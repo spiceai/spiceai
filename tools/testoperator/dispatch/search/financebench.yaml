@@ -1,0 +1,11 @@
+tests:
+  search:
+    - spicepod_path: test/spicepods/search/financebench/full_text_search-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/financebench/model2vec[potion-multilingual-128M]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600
+    - spicepod_path: test/spicepods/search/financebench/hybrid[model2vec[potion-multilingual-128M]]-cayenne[file].yaml
+      runner_type: spiceai-dev-runners
+      ready_wait: 3600

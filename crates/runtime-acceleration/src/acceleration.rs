@@ -121,6 +121,38 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
     }
 }
 
+/// The refresh mode a dataset runs with when its `refresh_mode` is left unset, keyed
+/// by CONNECTOR NAME.
+///
+/// An unset mode is filled in by the *connector*
+/// (`DataConnector::resolve_refresh_mode`), not by a fixed default, and that result is
+/// never written back into [`Acceleration`] — so `acceleration.refresh_mode` stays
+/// `None` for a genuine `debezium:`/`cdc:` stream. A consumer that must know the mode
+/// a source will actually run with maps the source's connector name through here.
+/// Mirrors the three overrides that differ from the trait default; keep it in sync with
+/// them.
+///
+/// Getting this wrong in the `full` direction is the dangerous one — it would classify
+/// an unannotated CDC dataset as a whole-table replace and under-provision its memory —
+/// so an unrecognized connector resolves to `full` only because that IS the trait
+/// default, not as a guess.
+///
+/// Takes the parsed connector name, never a raw `from:` value: re-parsing an
+/// already-parsed name would be wrong, because `debezium` has no delimiter and a second
+/// parse would read it as the `spice.ai` connector. Parsing is the caller's job.
+#[must_use]
+pub fn unset_refresh_mode_for_connector(connector: &str) -> RefreshMode {
+    match connector {
+        // Both resolve an unset mode to `changes`.
+        "debezium" | "cdc" => RefreshMode::Changes,
+        // Resolves to `disabled`: no refresh runs, but rows arrive by `INSERT INTO`
+        // and accumulate, so files still need consolidating.
+        "sink" => RefreshMode::Disabled,
+        // `DataConnector::resolve_refresh_mode`'s default is `full`.
+        _ => RefreshMode::Full,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
     #[default]
@@ -1010,6 +1042,34 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    /// The three connectors that override `DataConnector::resolve_refresh_mode`, plus
+    /// the default. Asserted directly rather than only through a caller, because a
+    /// caller that classifies a pod *and* checks itself against this table would agree
+    /// with a wrong table.
+    #[test]
+    fn unset_refresh_mode_matches_the_connector_overrides() {
+        assert_eq!(
+            unset_refresh_mode_for_connector("debezium"),
+            RefreshMode::Changes
+        );
+        assert_eq!(
+            unset_refresh_mode_for_connector("cdc"),
+            RefreshMode::Changes
+        );
+        assert_eq!(
+            unset_refresh_mode_for_connector("sink"),
+            RefreshMode::Disabled
+        );
+        // Every other connector keeps the trait default.
+        for connector in ["postgres", "s3", "spice.ai", "mysql", ""] {
+            assert_eq!(
+                unset_refresh_mode_for_connector(connector),
+                RefreshMode::Full,
+                "connector '{connector}' should keep the `resolve_refresh_mode` default"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_federation_disabled_param() {

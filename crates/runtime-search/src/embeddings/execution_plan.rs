@@ -42,7 +42,7 @@ use llms::embeddings::Embed;
 use rayon::prelude::*;
 use snafu::ResultExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
@@ -276,13 +276,19 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
             ..
         } = cfg;
         tracing::trace!("Embedding column '{col}' with model {model_name}");
-        let read_guard = embedding_models.read().await;
-
-        let Some(model) = read_guard.get(model_name) else {
-            tracing::debug!(
-                "When embedding col='{col}', model {model_name} expected, but not found"
-            );
-            continue;
+        // Clone the model handle (a cheap Arc refcount bump) and drop the store
+        // read guard before embedding, so the potentially multi-second, network
+        // bound embed call does not hold the lock and stall model reloads.
+        let model = {
+            let read_guard = embedding_models.read().await;
+            if let Some(model) = read_guard.get(model_name) {
+                Arc::clone(model)
+            } else {
+                tracing::debug!(
+                    "When embedding col='{col}', model {model_name} expected, but not found"
+                );
+                continue;
+            }
         };
 
         let Some(raw_data) = rb.column_by_name(col) else {
@@ -307,14 +313,14 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
             };
 
             let list_array = if model.supports_sync_embeddings() {
-                let task_model = Arc::clone(model);
+                let task_model = Arc::clone(&model);
                 let vector_size = cfg.vector_size;
                 task::spawn_blocking(move || {
                     get_vectors_per_list_element_in_process(rows, &task_model, vector_size)
                 })
                 .await??
             } else {
-                get_vectors_per_list_element(rows, &**model, cfg.vector_size).await?
+                get_vectors_per_list_element(rows, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}' in multi-vector mode");
@@ -333,14 +339,14 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
 
         let list_array = if let Some(chunker) = chunker_opt {
             let (vectors, offsets) =
-                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(model)).await?;
+                get_vectors_with_chunker(arr_iter, Arc::clone(chunker), Arc::clone(&model)).await?;
             tracing::trace!("Successfully embedded column '{col}' with chunking");
             embed_arrays.insert(offset_col!(col), Arc::new(offsets) as ArrayRef);
 
             Arc::new(vectors) as ArrayRef
         } else {
             let fixed_size_array = if model.supports_sync_embeddings() {
-                let task_model = Arc::clone(model);
+                let task_model = Arc::clone(&model);
                 let batch: Vec<_> = arr_iter.map(|o| o.map(str::to_string)).collect();
                 let vector_size = cfg.vector_size;
 
@@ -349,7 +355,7 @@ pub async fn compute_additional_embedding_columns<S: std::hash::BuildHasher>(
                 })
                 .await??
             } else {
-                get_vectors(arr_iter, &**model, cfg.vector_size).await?
+                get_vectors(arr_iter, &*model, cfg.vector_size).await?
             };
 
             tracing::trace!("Successfully embedded column '{col}'");
@@ -944,16 +950,33 @@ async fn get_vectors_with_chunker(
     Ok((vectors, content_offsets))
 }
 
+/// Rayon thread pools reused across embedding batches, keyed by thread count.
+/// Building a pool spawns OS threads, so it must not happen once per record
+/// batch per column on the in-process embedding path.
+static EMBEDDING_POOLS: LazyLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn build_embedding_pool(
     model_parallelism: Option<usize>,
-) -> Result<ThreadPool, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Arc<ThreadPool>, Box<dyn std::error::Error + Send + Sync>> {
     let parallelism =
         model_parallelism.unwrap_or_else(|| cpu_budget::cpu_budget().embedding_pool_threads());
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(parallelism)
-        .build()
-        .map_err(Into::into)
+    let mut pools = EMBEDDING_POOLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+
+    if let Some(pool) = pools.get(&parallelism) {
+        return Ok(Arc::clone(pool));
+    }
+
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(parallelism)
+            .build()?,
+    );
+    pools.insert(parallelism, Arc::clone(&pool));
+    Ok(pool)
 }
 
 #[expect(clippy::float_cmp)]
