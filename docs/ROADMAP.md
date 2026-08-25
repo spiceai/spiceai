@@ -15,6 +15,17 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
+### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (July 2026)
+
+**Focus:** Schema Registry, Distributed Search & Event Processing.
+
+**DataFusion:** v55
+
+- **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
+- **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
+- **Write-Back Acceleration**: Eventually-consistent write-back, with full DML (UPDATE/DELETE) and `spice refresh`/`refresh_check_interval` on write-through accelerated tables.
+
 ### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (September 2026)
 
 **Focus:** Enterprise Security, Compliance, & Governance.
