@@ -45,6 +45,7 @@ default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+tokio.workspace = true
 
 [lints]
 workspace = true
