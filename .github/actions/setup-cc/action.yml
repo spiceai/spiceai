@@ -81,6 +81,21 @@ runs:
           exit 1
         fi
 
+        # `odbc-sys` takes its whole library search path from `brew --prefix`, so on a
+        # runner where brew cannot run it falls back to the DYLD defaults and the link
+        # dies far downstream as "ld: library 'odbc' not found" (#13475). clang expands
+        # LIBRARY_PATH into -L entries after those already on the command line, so this
+        # restores the search path without displacing anything a build script emitted,
+        # and it is not a cargo fingerprint input, so it costs no rebuild. Both the
+        # linked and the keg directory are listed: the probe above accepts a formula
+        # that is in the Cellar but unlinked.
+        library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/lib:$brew_prefix/opt/unixodbc/lib"
+        if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+          echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+          exit 1
+        fi
+        echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
+
     - name: Install cc (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
