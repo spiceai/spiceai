@@ -16,11 +16,19 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow::array::ArrayData;
+use arrow::error::ArrowError;
 use arrow_schema::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 
 /// A rewrite rule applied by [`apply_rules`] to every [`DataType`] node in a schema.
 ///
 /// Rules are applied post-order: children are rewritten before the parent sees them.
+///
+/// Two kinds of rule live here, and only one belongs in an engine's rule list. Most describe
+/// what a storage engine *can hold* — `DuckDB` has no Arrow Dictionary, no Null type — and are
+/// named in that engine's static list. [`MapEntriesNonNullable`] instead describes what a
+/// *source got wrong*, so it is applied where that source's data enters and belongs to no
+/// engine's list.
 ///
 /// `Debug` is required so a rule list can sit in a `#[derive(Debug)]` struct; the unit
 /// structs below satisfy it by name.
@@ -38,6 +46,31 @@ impl TypeRewriteRule for DictionaryUnwrap {
     fn rewrite(&self, dt: &DataType) -> Option<DataType> {
         match dt {
             DataType::Dictionary(_, value_type) => Some(value_type.as_ref().clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Rewrites `DataType::Map(entries, _)` so the `entries` field is non-nullable.
+///
+/// The Arrow specification requires it, and `MapArray::try_new` refuses a nullable
+/// `entries` field outright — so a map declared this way decodes from IPC without
+/// complaint and then fails in the first kernel that rebuilds it, reporting
+/// `MapArray entries cannot contain nulls` even when no null is involved. Nullability is
+/// part of the type and not of any buffer, so the correction is metadata-only — pair it with
+/// [`relabel_array_data`] to carry the arrays over unchanged.
+///
+/// This is a source-conformance rule, not an engine-capability one: do not add it to an
+/// accelerator's rule list by analogy with the rules above it.
+#[derive(Debug)]
+pub struct MapEntriesNonNullable;
+impl TypeRewriteRule for MapEntriesNonNullable {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Map(entries, sorted) if entries.is_nullable() => Some(DataType::Map(
+                Arc::new(entries.as_ref().clone().with_nullable(false)),
+                *sorted,
+            )),
             _ => None,
         }
     }
@@ -256,6 +289,83 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
         }
     }
     dt
+}
+
+/// Recursively rebuilds `data` so its (possibly nested) [`DataType`] becomes `target_type`,
+/// without changing any value, buffer or null mask.
+///
+/// This is the array-side counterpart to [`rewrite_data_type`]: that decides what a type
+/// should become, this carries the arrays across to it. Only the parts of a type that hold no
+/// data may differ — field names and nested nullability flags — and children are relabelled
+/// positionally, so `target_type` has to describe the layout `data` already has.
+///
+/// The result shares `data`'s buffers, but the call is not free: each rebuilt level goes back
+/// through [`ArrayData`] validation, which is `O(rows)` in its offsets and `O(bytes)` for a
+/// `Utf8` leaf. Only the levels whose type actually changes are rebuilt.
+///
+/// # Errors
+///
+/// Returns an `ArrowError` when `target_type` does not describe the layout `data` holds —
+/// validation refuses it rather than reinterpreting the buffers under a type that does not fit.
+pub fn relabel_array_data(
+    data: ArrayData,
+    target_type: &DataType,
+) -> Result<ArrayData, ArrowError> {
+    if data.data_type() == target_type {
+        return Ok(data);
+    }
+
+    let targets = target_child_types(target_type);
+
+    // Usually a flag changes at one level and every child below it is already correct, so the
+    // child spine is carried over by move instead of cloned. A child count that disagrees with
+    // the target is a layout disagreement, and `build` refuses it below rather than leaving a
+    // rebuilt parent over children still carrying the old type.
+    let children_change = targets.len() == data.child_data().len()
+        && data
+            .child_data()
+            .iter()
+            .zip(&targets)
+            .any(|(child, target)| child.data_type() != *target);
+
+    if !children_change {
+        return data.into_builder().data_type(target_type.clone()).build();
+    }
+
+    let children = data
+        .child_data()
+        .iter()
+        .zip(&targets)
+        .map(|(child, target)| relabel_array_data(child.clone(), target))
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+
+    data.into_builder()
+        .data_type(target_type.clone())
+        .child_data(children)
+        .build()
+}
+
+/// The types `target_type`'s children must carry, in the order [`ArrayData`] holds them.
+///
+/// This mirrors `ArrayData`'s own `validate_child_data`, and it has to cover every
+/// child-bearing type [`rewrite_data_type`] descends into: a type this misses is one whose
+/// parent gets rebuilt while its children keep the old type, which `build` then rejects.
+fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
+    match target_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::Map(field, _) => vec![field.data_type()],
+        DataType::Struct(fields) => fields.iter().map(|f| f.data_type()).collect(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, f)| f.data_type()).collect(),
+        DataType::RunEndEncoded(run_ends, values) => {
+            vec![run_ends.data_type(), values.data_type()]
+        }
+        DataType::Dictionary(_, value_type) => vec![value_type.as_ref()],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
