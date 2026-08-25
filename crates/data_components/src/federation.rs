@@ -806,10 +806,11 @@ mod tests {
         }
     }
 
-    /// A semi join whose build side carries `fetch`, and the same join without it.
-    /// Only the bound differs, so a guard can assert what the bound changes rather
+    /// The semi-join shape every bound guard below shares: a probe side, a build side
+    /// rendered as a correlated `EXISTS`, and an output projection. Only the build side
+    /// differs between them, so each guard can assert what its own bound changes rather
     /// than restating the whole rendering.
-    fn semi_join_with_build_side_fetch(fetch: Option<usize>) -> LogicalPlan {
+    fn semi_join_over_build(build: LogicalPlan) -> LogicalPlan {
         let probe = LogicalPlanBuilder::scan(
             "probe",
             table_source(vec![
@@ -821,16 +822,6 @@ mod tests {
         .expect("scan probe")
         .build()
         .expect("build probe");
-        let build = LogicalPlanBuilder::scan_with_filters_fetch(
-            "build",
-            table_source(vec![Field::new("c", DataType::Utf8, false)]),
-            None,
-            Vec::<Expr>::new(),
-            fetch,
-        )
-        .expect("scan build")
-        .build()
-        .expect("build build");
 
         LogicalPlanBuilder::from(probe)
             .join_on(
@@ -843,6 +834,39 @@ mod tests {
             .expect("output projection")
             .build()
             .expect("build join")
+    }
+
+    /// A build side bounded by `fetch`, and the same one without it.
+    fn semi_join_with_build_side_fetch(fetch: Option<usize>) -> LogicalPlan {
+        semi_join_over_build(
+            LogicalPlanBuilder::scan_with_filters_fetch(
+                "build",
+                table_source(vec![Field::new("c", DataType::Utf8, false)]),
+                None,
+                Vec::<Expr>::new(),
+                fetch,
+            )
+            .expect("scan build")
+            .build()
+            .expect("build build"),
+        )
+    }
+
+    /// A build side bounded by a skip and nothing else, which is a `Limit` node with
+    /// `fetch: None` — the shape a bound check that only looks for a row count misses.
+    fn semi_join_with_build_side_offset(skip: usize) -> LogicalPlan {
+        semi_join_over_build(
+            LogicalPlanBuilder::scan(
+                "build",
+                table_source(vec![Field::new("c", DataType::Utf8, false)]),
+                None,
+            )
+            .expect("scan build")
+            .limit(skip, None)
+            .expect("offset the build side")
+            .build()
+            .expect("build build"),
+        )
     }
 
     /// Regression test for the bounded-`EXISTS` scoping carried by fork PR #201: a
@@ -911,6 +935,120 @@ mod tests {
                 exists + 1,
                 "{dialect_name}: an unbounded build side has to stay in the EXISTS body's own FROM, \
                  not move behind a derived table that costs the join its pushdown: {sql}"
+            );
+        }
+    }
+
+    /// An **offset-only** build side, which is the same wrong-rows defect as the bounded
+    /// one and is reached by a different field: `fetch` is `None`, so a scoping decision
+    /// that keys on a row count alone leaves it beside the correlation. The skip then
+    /// applies after the `WHERE`, discarding rows the correlation matched instead of
+    /// choosing which rows it could see — so a semi or mark join reports no match on a
+    /// row that has one, and an anti join returns a row it should have dropped.
+    ///
+    /// It is a separate guard rather than another arm of the bounded one because the
+    /// fixture cannot produce it: `scan_with_filters_fetch` only carries `fetch`, so a
+    /// skip has to come from a `Limit` node above the scan.
+    #[test]
+    fn an_offset_only_exists_build_side_is_scoped_outside_the_correlation() {
+        let plan = semi_join_with_build_side_offset(3);
+
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+            let bound = first_offset_of(&sql, "OFFSET");
+            assert!(
+                bound < last_offset_of(&sql, "probe"),
+                "{dialect_name}: the skip is applied after the correlation, so it discards rows the \
+                 correlation matched rather than choosing which rows it can see: {sql}"
+            );
+
+            let exists = paren_depth_at(&sql, first_offset_of(&sql, "EXISTS"));
+            assert!(
+                paren_depth_at(&sql, bound) >= exists + 2,
+                "{dialect_name}: the skip has to sit in a derived table of its own inside the EXISTS \
+                 body, not directly in that body beside the correlation: {sql}"
+            );
+        }
+    }
+
+    /// The **grouped** outer aggregate, which is the shape the optimizer builds for
+    /// `a, count(DISTINCT b) GROUP BY a`. Fork PR #192 fixed this alongside the ungrouped
+    /// form, and it needs its own guard because it has a failure the ungrouped one cannot
+    /// have: once the inner aggregate becomes a derived table, the outer `GROUP BY` and
+    /// projection have to be requalified to that derived alias. Emitting them against the
+    /// base relation names a table that is out of scope outside the derived table, and the
+    /// statement fails to bind at the remote engine — while a guard that only checks the
+    /// inner grouping survived still passes.
+    #[test]
+    fn a_grouped_stacked_aggregate_binds_its_outer_clauses_through_the_derived_scope() {
+        let plan = LogicalPlanBuilder::scan(
+            "hits",
+            table_source(vec![
+                Field::new("user_id", DataType::Int32, false),
+                Field::new("region", DataType::Utf8, false),
+            ]),
+            None,
+        )
+        .expect("scan hits")
+        .aggregate(
+            vec![col("hits.region"), col("hits.user_id")],
+            Vec::<Expr>::new(),
+        )
+        .expect("inner aggregate")
+        .aggregate(vec![col("hits.region")], vec![count(col("hits.user_id"))])
+        .expect("outer aggregate")
+        .build()
+        .expect("build");
+
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+            // Two groupings, in two scopes: the inner one belongs to the derived table
+            // and the outer one to the enclosing SELECT, because one SELECT expresses
+            // one grouping.
+            let inner_grouping = first_offset_of(&sql, "GROUP BY");
+            let outer_grouping = last_offset_of(&sql, "GROUP BY");
+            assert!(
+                inner_grouping < outer_grouping,
+                "{dialect_name}: only one grouping survived, so this is no longer the stacked shape \
+                 and either the distinct-ness or the outer grouping has been lost: {sql}"
+            );
+            assert!(
+                paren_depth_at(&sql, inner_grouping) >= 1,
+                "{dialect_name}: the inner grouping has to be a scope of its own: {sql}"
+            );
+            assert_eq!(
+                paren_depth_at(&sql, outer_grouping),
+                0,
+                "{dialect_name}: the outer grouping belongs to the enclosing SELECT, not inside the \
+                 derived table: {sql}"
+            );
+
+            // The requalification. `hits` is reachable only inside the derived table, so
+            // naming it in either outer clause is a statement the remote engine refuses.
+            assert!(
+                !sql[outer_grouping..].contains("hits"),
+                "{dialect_name}: the outer GROUP BY names the base relation, which is out of scope \
+                 outside the derived table, so the statement cannot bind: {sql}"
+            );
+            let select_list = &sql[..first_offset_of(&sql, "FROM")];
+            assert!(
+                !select_list.contains("hits"),
+                "{dialect_name}: the outer projection names the base relation rather than the derived \
+                 alias, so the statement cannot bind: {sql}"
+            );
+            assert!(
+                select_list.contains("count("),
+                "{dialect_name}: the outer aggregate has to stay in the enclosing SELECT, over the \
+                 grouped scope: {sql}"
+            );
+            // Not satisfied by an outer `GROUP BY 1`: it has to group by the column the
+            // query grouped by, reached through the derived alias.
+            assert!(
+                sql[outer_grouping..].contains("region"),
+                "{dialect_name}: the outer grouping no longer groups by the column the query asked \
+                 for: {sql}"
             );
         }
     }
