@@ -313,3 +313,322 @@ fn absent_claimed_keys(
 fn to_df_err(e: cayenne::provider::Error) -> DataFusionError {
     DataFusionError::Execution(format!("durable write-back: {e}"))
 }
+
+/// End-to-end delivery for a `BIGINT` primary key (#13396).
+///
+/// The classifier tests above are pure; these drive the real chain a committed
+/// write travels — transactional commit on a durable-write-back Cayenne table,
+/// the markers that commit writes, the worker's decode and point scan, and the
+/// upsert that lands at the federated source — and assert the row arrives with
+/// the value that was committed.
+///
+/// A single `Int64` key is the shape that was broken: it runs the converter-free
+/// `Int64Pk` deletion strategy, so the provider stores no `pk_row_converter` and
+/// every delivery pass failed to decode its own markers. Nothing here needs a
+/// container: the federated side is an in-process provider that records what it
+/// is handed.
+#[cfg(test)]
+mod delivery_e2e_tests {
+    use super::{CLAIM_BATCH, WriteBackWorker};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
+    use async_trait::async_trait;
+    use cayenne::metadata::CreateTableOptions;
+    use cayenne::{
+        CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    };
+    use datafusion::catalog::Session;
+    use datafusion::datasource::{TableProvider, TableType};
+    use datafusion::error::Result as DataFusionResult;
+    use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion::logical_expr::dml::InsertOp;
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::physical_plan::metrics::MetricsSet;
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion_datasource::sink::{DataSink, DataSinkExec};
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
+    };
+    use futures::StreamExt;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    use crate::federated::FederatedTable;
+
+    /// The federated source, in process: every row the delivery worker upserts is
+    /// recorded, so a test can assert exactly what reached it.
+    #[derive(Debug)]
+    struct RecordingSource {
+        schema: SchemaRef,
+        delivered: Arc<Mutex<Vec<RecordBatch>>>,
+    }
+
+    impl RecordingSource {
+        fn new_arc(schema: SchemaRef) -> (Arc<dyn TableProvider>, Arc<Mutex<Vec<RecordBatch>>>) {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(Self {
+                schema,
+                delivered: Arc::clone(&delivered),
+            }) as Arc<dyn TableProvider>;
+            (provider, delivered)
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingSource {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(datafusion::error::DataFusionError::NotImplemented(
+                "the delivery worker never reads the federated source".to_string(),
+            ))
+        }
+        /// Accepts `Replace` directly, which is the native-upsert path delivery
+        /// prefers; answering `NotImplemented` here would silently exercise the
+        /// delete-then-insert fallback instead of the path under test.
+        async fn insert_into(
+            &self,
+            _state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            _insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let sink = Arc::new(RecordingSink {
+                schema: Arc::clone(&self.schema),
+                delivered: Arc::clone(&self.delivered),
+            });
+            Ok(Arc::new(DataSinkExec::new(input, sink, None)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSink {
+        schema: SchemaRef,
+        delivered: Arc<Mutex<Vec<RecordBatch>>>,
+    }
+
+    impl DisplayAs for RecordingSink {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "RecordingSink")
+        }
+    }
+
+    #[async_trait]
+    impl DataSink for RecordingSink {
+        fn metrics(&self) -> Option<MetricsSet> {
+            None
+        }
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+        async fn write_all(
+            &self,
+            mut data: SendableRecordBatchStream,
+            _context: &Arc<TaskContext>,
+        ) -> DataFusionResult<u64> {
+            let mut rows = 0u64;
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                rows += batch.num_rows() as u64;
+                self.delivered.lock().push(batch);
+            }
+            Ok(rows)
+        }
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]))
+    }
+
+    /// A durable-write-back Cayenne table with a single `BIGINT` primary key.
+    async fn bigint_keyed_table(
+        dir: &std::path::Path,
+        schema: &SchemaRef,
+    ) -> (CayenneTableProvider, Arc<CayenneCatalog>) {
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", dir.join("cayenne.db").display()))
+                .expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+
+        let data_path = dir.join("data");
+        std::fs::create_dir_all(&data_path).expect("data dir");
+
+        let ctx = SessionContext::new();
+        let options = CreateTableOptions {
+            table_name: "bigint_write_back".to_string(),
+            schema: Arc::clone(schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        };
+        let catalog_for_builder = Arc::clone(&catalog) as Arc<dyn cayenne::MetadataCatalog>;
+        let table = CayenneTableProviderBuilder::new(catalog_for_builder, ctx.runtime_env())
+            .with_durable_write_back(true)
+            .create(options)
+            .await
+            .expect("durable-write-back table");
+        (table, catalog)
+    }
+
+    /// Commit `rows` through a Cayenne transaction, which is the only path that
+    /// writes dirty-key markers — a non-transactional insert marks nothing, so a
+    /// test that skipped the transaction would have no markers to deliver.
+    async fn commit_in_transaction(table: &CayenneTableProvider, batch: RecordBatch) {
+        use runtime_request_context::{Protocol, RequestContextBuilder};
+
+        let token = table.transaction_write_token().await;
+        let txn = cayenne::CayenneTransaction::new();
+        txn.register(
+            table.table_id().to_string(),
+            token,
+            table.clone_for_write_operations(),
+        );
+
+        let request_context = Arc::new(RequestContextBuilder::new(Protocol::Internal).build());
+        request_context.insert_extension(txn.clone());
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_extension(Arc::clone(&request_context)),
+        );
+
+        let input = Arc::new(
+            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("input table"),
+        );
+        let plan = table
+            .insert_into(
+                &ctx.state(),
+                input
+                    .scan(&ctx.state(), None, &[], None)
+                    .await
+                    .expect("input scan"),
+                InsertOp::Append,
+            )
+            .await
+            .expect("stage the write");
+        datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("execute the staged write");
+
+        txn.commit().await.expect("commit the transaction");
+    }
+
+    fn delivered_rows(delivered: &Arc<Mutex<Vec<RecordBatch>>>) -> Vec<(i64, String)> {
+        let mut rows = Vec::new();
+        for batch in delivered.lock().iter() {
+            let ids = batch
+                .column_by_name("id")
+                .expect("delivered id column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let values = batch
+                .column_by_name("value")
+                .expect("delivered value column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("value is Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), values.value(row).to_string()));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The regression #13396 describes: on a `BIGINT`-keyed table every delivery
+    /// pass failed to decode its own markers, so acknowledged writes never
+    /// reached the source. Reverting `decode_pk_keys`' converter fallback makes
+    /// this fail with "requires a primary-key `RowConverter`" and nothing is
+    /// delivered.
+    #[tokio::test]
+    async fn a_committed_write_to_a_bigint_keyed_table_reaches_the_federated_source() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let schema = test_schema();
+        let (table, _catalog) = bigint_keyed_table(dir.path(), &schema).await;
+
+        // Boundary values whose `OwnedRow` encoding is order-preserving rather
+        // than a plain big-endian copy, so a decode that dropped the transform
+        // cannot pass by accident.
+        let ids: Vec<i64> = vec![i64::MIN, -1, 0, 42, i64::MAX];
+        let values: Vec<String> = ids.iter().map(|id| format!("row_{id}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(values.clone())),
+            ],
+        )
+        .expect("batch");
+        commit_in_transaction(&table, batch).await;
+
+        let markers = table.list_dirty_keys(CLAIM_BATCH).await.expect("markers");
+        assert_eq!(
+            markers.len(),
+            ids.len(),
+            "the commit must mark every key it wrote, or there is nothing to deliver"
+        );
+
+        let (federated, delivered) = RecordingSource::new_arc(Arc::clone(&schema));
+        let worker = WriteBackWorker {
+            pk_columns: table.pk_column_names(),
+            provider: Arc::new(table.clone_for_write_operations()),
+            federated: Arc::new(FederatedTable::Immediate(federated)),
+            dataset_name: "bigint_write_back".to_string(),
+        };
+
+        let delivered_count = worker
+            .deliver_batch()
+            .await
+            .expect("delivery pass succeeds");
+        assert_eq!(delivered_count, ids.len(), "every marker should be acked");
+
+        let expected: Vec<(i64, String)> = {
+            let mut rows: Vec<(i64, String)> = ids.iter().copied().zip(values).collect();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(
+            delivered_rows(&delivered),
+            expected,
+            "every committed row must reach the federated source with its committed value"
+        );
+
+        assert!(
+            table
+                .list_dirty_keys(CLAIM_BATCH)
+                .await
+                .expect("markers after delivery")
+                .is_empty(),
+            "delivered markers must be cleared, or the next pass redelivers them forever"
+        );
+    }
+}

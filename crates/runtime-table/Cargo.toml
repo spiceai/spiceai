@@ -75,6 +75,7 @@ openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
 
 [dev-dependencies]
 insta.workspace = true
+tempfile.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
 prometheus.workspace = true

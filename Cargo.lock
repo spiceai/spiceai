@@ -18090,6 +18090,7 @@ dependencies = [
  "spice-table",
  "spicepod",
  "telemetry",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
