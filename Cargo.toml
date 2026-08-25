@@ -270,7 +270,7 @@ datafusion-proto-common = "54.1.0"
 datafusion-pruning = "54.1.0"
 datafusion-spark = "54.1.0"
 datafusion-substrait = "54.1.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "beeecde18a72d2b6cad9d75aa44279398f084bce" } # spiceai-54
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "d304aa4f05dad76fd752b20595df273817626e3a" } # spiceai-54 + attachment-race fixes (temporary rev; repoint after spiceai/datafusion-table-providers#58 merges)
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
     "arrow-58",
