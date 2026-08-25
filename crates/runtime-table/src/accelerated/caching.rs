@@ -189,8 +189,12 @@ const CACHE_WRITE_FLUSH_INTERVAL_MS: u64 = 500;
 /// read-combine-overwrite pattern in `DuckDB` accelerator.
 #[derive(Debug)]
 pub struct CacheWriteRequest {
-    /// Batches to write to the accelerator
-    pub batches: Vec<RecordBatch>,
+    /// Batches to write to the accelerator.
+    ///
+    /// Not public, and only [`CacheWriteRequest::new`] can populate it, so the
+    /// schema interning that constructor performs cannot be bypassed by a
+    /// future call site building the struct literally.
+    batches: Vec<RecordBatch>,
     /// Filter expressions to identify the cache key (for upsert operations)
     pub filters: Vec<Expr>,
     /// If true, this is an upsert (expired data exists), otherwise insert (new data)
@@ -204,6 +208,34 @@ pub struct CacheWriteRequest {
     /// overwrite each other's rows for the same `(request_path, query, body)`
     /// key.
     pub namespace_id: Arc<str>,
+}
+
+impl CacheWriteRequest {
+    /// Builds a queued write, interning the batches' schemas.
+    ///
+    /// Requests sit in an unbounded buffer until the consumer's flush interval
+    /// elapses — and far longer when writes arrive faster than they flush — so
+    /// every batch queued would otherwise retain its own copy of one identical
+    /// schema for as long as it waits. Interning here rather than at the call
+    /// sites is what makes that unforgettable: [`Self::batches`] is private, so
+    /// this is the only way to build one.
+    #[must_use]
+    pub fn new(
+        mut batches: Vec<RecordBatch>,
+        filters: Vec<Expr>,
+        is_upsert: bool,
+        cache_key: String,
+        namespace_id: Arc<str>,
+    ) -> Self {
+        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
+        Self {
+            batches,
+            filters,
+            is_upsert,
+            cache_key,
+            namespace_id,
+        }
+    }
 }
 
 /// Sender half of the cache write channel
@@ -773,16 +805,13 @@ impl CacheRefreshHelper {
         let refreshed_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
         // Queue write through batched channel
-        let mut batches = batches;
-        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
-
-        let request = CacheWriteRequest {
+        let request = CacheWriteRequest::new(
             batches,
-            filters: filters.to_vec(),
-            is_upsert: true,
-            cache_key: cache_key.clone(),
-            namespace_id: namespace.storage_id().into(),
-        };
+            filters.to_vec(),
+            true,
+            cache_key.clone(),
+            namespace.storage_id().into(),
+        );
 
         batch_write_tx
             .send(request)
@@ -1504,16 +1533,13 @@ impl CacheRefreshHelper {
                         // can do the right thing based on the accelerator's
                         // actual storage schema (extended in real deployments,
                         // unextended in unit-test mocks).
-                        let mut queued_batches = batches.clone();
-                        arrow_tools::schema_intern::intern_batch_schemas(&mut queued_batches);
-
-                        let write_request = CacheWriteRequest {
-                            batches: queued_batches,
-                            filters: filters.to_vec(),
-                            is_upsert: is_expired,
+                        let write_request = CacheWriteRequest::new(
+                            batches.clone(),
+                            filters.to_vec(),
+                            is_expired,
                             cache_key,
-                            namespace_id: namespace.storage_id().into(),
-                        };
+                            namespace.storage_id().into(),
+                        );
                         if let Err(e) = batch_write_tx.send(write_request).await {
                             tracing::warn!(
                                 "Failed to enqueue cache write for dataset {dataset_name}: {e} (channel closed)"
@@ -2183,38 +2209,6 @@ mod cache_namespace_column_tests {
         assert_eq!(second.num_rows(), 1);
     }
 
-    /// Batches queued for the accelerator are buffered before they are flushed,
-    /// so each one otherwise holds its own copy of the same schema.
-    #[test]
-    fn queued_cache_write_batches_share_one_schema() {
-        use arrow::array::Int32Array;
-
-        let batch_of = |value: i32| {
-            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-            arrow::array::RecordBatch::try_new(
-                schema,
-                vec![Arc::new(Int32Array::from(vec![value])) as ArrayRef],
-            )
-            .expect("batch")
-        };
-
-        let mut batches = vec![batch_of(1), batch_of(2), batch_of(3)];
-        assert!(
-            !Arc::ptr_eq(batches[0].schema_ref(), batches[1].schema_ref()),
-            "the batches start out with distinct schema allocations"
-        );
-
-        arrow_tools::schema_intern::intern_batch_schemas(&mut batches);
-
-        for (i, batch) in batches.iter().enumerate() {
-            assert!(
-                Arc::ptr_eq(batch.schema_ref(), batches[0].schema_ref()),
-                "queued batch {i} must share one schema allocation"
-            );
-            assert_eq!(batch.num_rows(), 1, "interning must not disturb the rows");
-        }
-    }
-
     #[test]
     fn stamp_namespace_column_is_idempotent_when_already_present() {
         use arrow::array::{Int32Array, StringArray};
@@ -2363,6 +2357,137 @@ mod tests {
             last_updated_at,
         );
         (tx, handle)
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/12933> on
+    /// the `refresh_mode: caching` enqueue path.
+    ///
+    /// Requests sit in an unbounded buffer until the consumer flushes them, so
+    /// every queued batch would otherwise retain its own copy of one identical
+    /// schema for as long as it waits. Each refresh plans its own scan and so
+    /// arrives with a freshly-built schema; interning is what collapses them.
+    ///
+    /// Drives the production `refresh_entry` path and inspects what actually
+    /// reaches the channel — asserting on `intern_batch_schemas` directly would
+    /// pass even if the enqueue site stopped calling it.
+    #[tokio::test]
+    async fn queued_cache_writes_share_one_schema_across_refreshes() {
+        let federated: Arc<dyn TableProvider> = Arc::new(FreshSchemaPerScanSource);
+        let in_flight_revalidations: InFlightRevalidations =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // The consumer is deliberately not spawned, so the queued requests stay
+        // on the channel where this test can look at them.
+        let (tx, mut rx) = create_cache_write_channel();
+
+        for query in ["id=1", "id=2"] {
+            let filters = vec![
+                col("request_path").eq(lit("/api/users")),
+                col("request_query").eq(lit(query)),
+            ];
+            let queued = CacheRefreshHelper::refresh_entry(
+                Arc::clone(&federated),
+                "test_dataset",
+                &filters,
+                CacheNamespace::Public,
+                tx.clone(),
+                Arc::clone(&in_flight_revalidations),
+            )
+            .await
+            .expect("refresh_entry should queue a write");
+            assert!(queued > 0, "the refresh for {query} must produce rows");
+        }
+        drop(tx);
+
+        let mut schemas: Vec<SchemaRef> = Vec::new();
+        while let Some(request) = rx.recv().await {
+            schemas.extend(request.batches.iter().map(|b| Arc::clone(b.schema_ref())));
+        }
+
+        assert!(
+            schemas.len() >= 2,
+            "both refreshes must reach the channel, got {} batch(es)",
+            schemas.len()
+        );
+        for (i, schema) in schemas.iter().enumerate().skip(1) {
+            assert!(
+                Arc::ptr_eq(&schemas[0], schema),
+                "queued batch {i} must share one schema allocation across refreshes"
+            );
+        }
+    }
+
+    /// A source that builds a **fresh** `Schema` allocation for every scan, and
+    /// batches carrying it.
+    ///
+    /// [`MockHttpTableProvider`] hands out `Arc::clone` of one stored schema, so
+    /// every scan of it already shares an allocation and a schema-sharing
+    /// assertion over it would hold with no interning at all. A real source does
+    /// not behave that way — each plan builds its own schema — so a test that
+    /// means to exercise interning has to model that.
+    #[derive(Debug)]
+    struct FreshSchemaPerScanSource;
+
+    impl FreshSchemaPerScanSource {
+        fn fields() -> Vec<Field> {
+            vec![
+                Field::new("request_path", DataType::Utf8, true),
+                Field::new("request_query", DataType::Utf8, true),
+                Field::new("content", DataType::Utf8, true),
+                Field::new(RESPONSE_STATUS_COLUMN, DataType::UInt16, false),
+                Field::new(
+                    CACHE_REFRESHED_AT_COLUMN,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                ),
+            ]
+        }
+
+        /// A newly-allocated schema each call. Content-equal, never `ptr_eq`.
+        fn fresh_schema() -> SchemaRef {
+            Arc::new(Schema::new(Self::fields()))
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for FreshSchemaPerScanSource {
+        fn schema(&self) -> SchemaRef {
+            Self::fresh_schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let schema = Self::fresh_schema();
+            #[expect(clippy::cast_possible_truncation)]
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_nanos() as i64;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["/api/users"])),
+                    Arc::new(StringArray::from(vec!["id=1"])),
+                    Arc::new(StringArray::from(vec![r#"{"ok":true}"#])),
+                    Arc::new(UInt16Array::from(vec![200_u16])),
+                    Arc::new(TimestampNanosecondArray::from(vec![Some(now)])),
+                ],
+            )
+            .expect("to create batch");
+
+            Ok(Arc::new(DataSourceExec::new(Arc::new(
+                MemorySourceConfig::try_new(&[vec![batch]], schema, None)?,
+            ))))
+        }
     }
 
     #[async_trait]
