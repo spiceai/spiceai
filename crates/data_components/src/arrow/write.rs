@@ -1077,7 +1077,9 @@ fn constraint_identifiers(rb: &[&RecordBatch], constraint_idx: &[usize]) -> Resu
 ///
 /// This is one part of `InsertOp::Replace` functionality, and still requires the new rows (with conflicting PKs), to be added.
 ///
-/// This function modifies `existing_batches` in place.
+/// This function modifies `existing_batches` in place. All-or-nothing: on `Err` it still
+/// holds exactly the batches it held before the call, so an overwrite that cannot be applied
+/// does not take the rows it was filtering with it.
 ///
 /// # Visibility
 /// This function is public for benchmarking purposes.
@@ -1105,10 +1107,15 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
         None
     };
 
-    // Instead of concatenating, we can filter each batch individually
+    // Instead of concatenating, we can filter each batch individually.
+    //
+    // Read the batches rather than draining them: both steps below are fallible, and
+    // `existing_batches` is the table's only copy of these rows. Draining as we went would
+    // leave it empty on the error path, turning a failed overwrite into the loss of every
+    // row the table held.
     let mut filtered = Vec::with_capacity(existing_batches.len());
-    for batch in existing_batches.drain(..) {
-        let keys = extract_primary_keys_str(&batch, pk_indices_ordered)?;
+    for batch in existing_batches.iter() {
+        let keys = extract_primary_keys_str(batch, pk_indices_ordered)?;
 
         // Pre-allocate with exact capacity for better performance
         let mut keep_row_builder = BooleanBuilder::with_capacity(keys.len());
@@ -1127,12 +1134,13 @@ pub(crate) fn filter_existing<S: std::hash::BuildHasher>(
                 );
             }
         }
-        let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
+        let filtered_batch = filter_record_batch(batch, &keep_row_builder.finish())?;
         if filtered_batch.num_rows() > 0 {
             filtered.push(filtered_batch);
         }
     }
 
+    // Every fallible step is done, so the batches can be replaced without losing rows.
     *existing_batches = filtered;
     Ok(())
 }

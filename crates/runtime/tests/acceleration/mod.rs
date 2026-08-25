@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime::{
-    component::dataset::Dataset,
-    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
-};
+use runtime::{component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpointer};
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::{acceleration::Mode, param::Params};
 use std::sync::Arc;
 
@@ -41,6 +40,8 @@ mod checkpoint_turso;
 #[cfg(feature = "duckdb")]
 mod cron;
 #[cfg(feature = "duckdb")]
+mod file_create_duckdb;
+#[cfg(feature = "duckdb")]
 mod file_swap_duckdb;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
@@ -59,6 +60,8 @@ mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
+#[cfg(any(feature = "duckdb", feature = "sqlite", feature = "turso"))]
+mod reload_file_accelerated;
 mod retention_arrow;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
@@ -133,7 +136,14 @@ async fn wait_for_checkpoints(
     for dataset in datasets {
         let registry = dataset.runtime.accelerator_engine_registry();
         let check_future = async move {
-            match DatasetCheckpoint::try_new(&dataset, registry, OpenOption::OpenExisting).await {
+            match dataset_checkpointer(
+                &dataset,
+                registry,
+                OpenOption::OpenExisting,
+                SnapshotBehavior::Disabled,
+            )
+            .await
+            {
                 Ok(checkpoint) => {
                     while !checkpoint.exists().await {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

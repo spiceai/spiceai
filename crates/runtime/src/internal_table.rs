@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
@@ -23,15 +24,15 @@ use snafu::prelude::*;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
-use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
+use crate::accelerated::{AcceleratedTableBuilderError, Retention};
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::builder::DatasetBuilder;
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
-    accelerated_table::{AcceleratedTable, refresh::Refresh},
+    accelerated::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
 };
@@ -107,7 +108,7 @@ async fn get_local_table_provider(
     let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 
     let source_table_provider = data_connector
-        .read_write_provider(&dataset)
+        .read_write_provider(&RuntimeConnectorContext::for_dataset(&dataset), &dataset)
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateSourceTableProviderSnafu)?;

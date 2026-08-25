@@ -19,11 +19,11 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
-use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
 use tokio::sync::Semaphore;
@@ -53,8 +53,8 @@ pub struct IcebergCatalogProvider {
     catalog: Arc<dyn Catalog>,
     /// Optional root namespace to scope namespace discovery.
     root_namespace: Option<NamespaceIdent>,
-    /// Optional glob patterns for filtering tables.
-    include: Option<GlobSet>,
+    /// Which discovered tables the catalog registers.
+    selector: TableSelector,
     /// Optional hook to wrap each loaded table provider (see
     /// [`CatalogTableWrapper`]). Reapplied on every refresh.
     table_wrapper: Option<CatalogTableWrapper>,
@@ -85,17 +85,17 @@ impl IcebergCatalogProvider {
     /// # Arguments
     /// * `client` - The Iceberg catalog client
     /// * `root_namespace` - Optional root namespace to start from
-    /// * `includes` - Optional glob patterns for filtering tables
+    /// * `selector` - Which discovered tables the catalog registers
     pub async fn try_new(
         client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
-        includes: Option<&GlobSet>,
+        selector: &TableSelector,
         table_wrapper: Option<CatalogTableWrapper>,
     ) -> Result<Self> {
         let schemas = Self::load_schemas(
             Arc::clone(&client),
             root_namespace.as_ref(),
-            includes,
+            selector,
             table_wrapper.as_ref(),
         )
         .await?;
@@ -103,7 +103,7 @@ impl IcebergCatalogProvider {
         Ok(IcebergCatalogProvider {
             catalog: client,
             root_namespace,
-            include: includes.cloned(),
+            selector: selector.clone(),
             table_wrapper,
             schemas: RwLock::new(schemas),
         })
@@ -125,7 +125,7 @@ impl IcebergCatalogProvider {
     async fn load_schemas(
         client: Arc<dyn Catalog>,
         root_namespace: Option<&NamespaceIdent>,
-        includes: Option<&GlobSet>,
+        selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
     ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
         // Create the semaphore first, so we can use it in the closures below
@@ -162,7 +162,7 @@ impl IcebergCatalogProvider {
                 Arc::clone(&client),
                 NamespaceIdent::new(name.clone()),
                 semaphore_clone,
-                includes,
+                selector,
                 table_wrapper.cloned(),
             )
         }))
@@ -203,7 +203,7 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
         let new_schemas = Self::load_schemas(
             Arc::clone(&self.catalog),
             self.root_namespace.as_ref(),
-            self.include.as_ref(),
+            &self.selector,
             self.table_wrapper.as_ref(),
         )
         .await?;
@@ -248,19 +248,19 @@ impl IcebergSchemaProvider {
     /// * `client` - The Iceberg catalog client
     /// * `namespace` - The namespace containing the tables
     /// * `load_semaphore` - Semaphore to limit concurrent table loads
-    /// * `include` - Optional glob patterns for filtering tables
+    /// * `selector` - Which discovered tables the catalog registers
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
-        include: Option<&GlobSet>,
+        selector: &TableSelector,
         table_wrapper: Option<CatalogTableWrapper>,
     ) -> Result<Self> {
         let tables = Self::load_tables(
             Arc::clone(&client),
             &namespace,
             load_semaphore,
-            include,
+            selector,
             table_wrapper.as_ref(),
         )
         .await?;
@@ -308,7 +308,7 @@ impl IcebergSchemaProvider {
         client: Arc<dyn Catalog>,
         namespace: &NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
-        include: Option<&GlobSet>,
+        selector: &TableSelector,
         table_wrapper: Option<&CatalogTableWrapper>,
     ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
         let table_names: Vec<_> = client
@@ -316,15 +316,9 @@ impl IcebergSchemaProvider {
             .await
             .map_err(handle_iceberg_error)?
             .into_iter()
-            .filter(|table| {
-                // If include is None, we include all tables
-                if let Some(glob_set) = &include {
-                    // Check if the table name matches any of the glob patterns
-                    glob_set.is_match(table.to_string())
-                } else {
-                    true // Include all tables if no glob patterns are specified
-                }
-            })
+            // Iceberg matches against the fully qualified `TableIdent`, not
+            // `"{schema}.{table}"` -- both halves of the selector see that name.
+            .filter(|table| selector.selects(&table.to_string()))
             .collect();
 
         // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
@@ -387,13 +381,15 @@ impl IcebergSchemaProvider {
                     // Wrap in IcebergDeletionProvider so that
                     // catalog tables support DELETE FROM via equality delete files.
                     // Access control is handled by the SQL validator, not here.
+                    let inner: Arc<dyn TableProvider> = Arc::new(provider);
                     let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
                         Arc::clone(&catalog),
                         table_name.namespace().clone(),
                         table_name.name().to_string(),
-                        Arc::new(provider),
+                        Arc::clone(&inner),
                     );
-                    let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+                    let adapted: Arc<dyn TableProvider> =
+                        spice_table::SpiceTable::over(Arc::new(deletion_provider), inner);
 
                     // Wrap so catalog-sourced Iceberg scans can cross Ballista
                     // node boundaries. The schema name is the (single-level)

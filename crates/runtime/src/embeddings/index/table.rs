@@ -20,18 +20,8 @@ use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
 use datafusion::{prelude::SessionContext, sql::TableReference};
-// Only the s3_vectors / elasticsearch index wrappers below look the embed UDF up
-// by name, so the name is needed only when one of them is built.
-#[cfg(all(
-    feature = "models",
-    any(feature = "s3_vectors", feature = "elasticsearch")
-))]
-use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
-#[cfg(all(
-    not(feature = "models"),
-    any(feature = "s3_vectors", feature = "elasticsearch")
-))]
-const EMBED_UDF_NAME: &str = "embed";
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use runtime_datafusion_udfs::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -41,20 +31,18 @@ use spicepod::semantic::Column;
 #[cfg(feature = "duckdb")]
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 
-#[cfg(feature = "elasticsearch")]
-use search::metadata::MetadataColumns;
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::embeddings::construct_chunker,
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
-    runtime_datafusion_index::{Index, IndexedTableProvider},
     runtime_search::embeddings::warm_index::with_memory_warm_index,
     search::index::{
         SearchIndex, VectorIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
     },
     search::metadata::MetadataColumn,
     snafu::ResultExt,
+    spice_table::{Index, IndexLayer},
     spicepod::component::embeddings::EmbeddingChunkConfig,
     spicepod::semantic::MetadataType,
 };
@@ -234,12 +222,21 @@ async fn wrap_table_as_index_s3(
                 .map(|embed| (c.name.clone(), embed.clone()))
         })
         .collect();
-    let mut provider =
-        if let Some(indexed) = inner_table_provider.downcast_ref::<IndexedTableProvider>() {
-            indexed.clone()
-        } else {
-            IndexedTableProvider::new(Arc::clone(&inner_table_provider))
+    // Reuse an index layer already at the top of the stack so several indexes
+    // compose onto one layer rather than stacking a layer apiece.
+    let (mut provider, base_below) =
+        match inner_table_provider.downcast_ref::<spice_table::SpiceTable>() {
+            Some(table) if !table.indexes().is_empty() => (
+                IndexLayer::with_indexes(table.indexes().to_vec()),
+                Arc::clone(table.below()),
+            ),
+            _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
         };
+    // Every column's vector index is collected here and joined onto a single
+    // `VectorScanTableProvider` after the loop, rather than each column wrapping the
+    // previous column's layer in its own nested provider — see
+    // <https://github.com/spiceai/spiceai/issues/7020>.
+    let mut vector_indexes: Vec<Arc<dyn VectorIndex>> = Vec::new();
     for (column, config) in embedding_columns {
         let chunking = config.chunking.as_ref().filter(|cfg| cfg.enabled);
         let (columns, index_schema) = if chunking.is_some() {
@@ -290,7 +287,8 @@ async fn wrap_table_as_index_s3(
         );
 
         if let Some(chunking) = chunking {
-            provider = construct_chunked_vector_index(
+            let chunked_vector_index;
+            (provider, chunked_vector_index) = construct_chunked_vector_index(
                 provider,
                 embedding_models,
                 chunking,
@@ -299,32 +297,39 @@ async fn wrap_table_as_index_s3(
                 file_format,
             )
             .await?;
+            vector_indexes.extend(chunked_vector_index);
         } else {
-            provider.underlying = Arc::new(
-                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
-            ) as Arc<dyn TableProvider>;
-            provider = provider.add_index(vector_index as Arc<dyn Index>);
+            provider = provider.add_index(Arc::clone(&vector_index) as Arc<dyn Index>);
+            vector_indexes.push(vector_index);
         }
     }
+    let layer_below = if vector_indexes.is_empty() {
+        base_below
+    } else {
+        Arc::new(VectorScanTableProvider::try_new(base_below, &vector_indexes).boxed()?)
+            .into_table() as Arc<dyn TableProvider>
+    };
     tracing::info!(
         "S3 Vectors for table {tbl} initialized in {:?}",
         start.elapsed()
     );
-    Ok(Arc::new(provider))
+    Ok(spice_table::SpiceTable::over(Arc::new(provider), layer_below) as Arc<dyn TableProvider>)
 }
 
 /// Wrap `index` (whose primary key must already be augmented with the chunk key via
-/// [`ChunkedSearchIndex::augment_primary_key`]) in a [`ChunkedSearchIndex`] and attach
-/// it to `provider`.
+/// [`ChunkedSearchIndex::augment_primary_key`]) in a [`ChunkedSearchIndex`], attach
+/// it to `provider`, and return the [`VectorIndex`] side of it (when the chunked index
+/// supports vector search) for the caller to join onto its `VectorScanTableProvider`
+/// alongside every other column's index.
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 async fn construct_chunked_vector_index(
-    mut provider: IndexedTableProvider,
+    provider: IndexLayer,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     chunking: &EmbeddingChunkConfig,
     index: Arc<dyn SearchIndex>,
     model_name: &str,
     file_format: Option<&str>,
-) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(IndexLayer, Option<Arc<dyn VectorIndex>>), Box<dyn std::error::Error + Send + Sync>> {
     let chunker = construct_chunker(
         model_name,
         &ChunkingConfig {
@@ -339,13 +344,12 @@ async fn construct_chunked_vector_index(
     .boxed()?;
 
     let chunked_idx = Arc::new(ChunkedSearchIndex::new(index, chunker));
+    let vector_index = Arc::clone(&chunked_idx).as_vector_index();
 
-    if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
-        provider.underlying =
-            Arc::new(VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?)
-                as Arc<dyn TableProvider>;
-    }
-    Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>))
+    Ok((
+        provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>),
+        vector_index,
+    ))
 }
 
 /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
@@ -437,13 +441,21 @@ async fn wrap_table_as_index_elasticsearch(
         })
         .collect();
 
-    let mut provider = if let Some(indexed) =
-        inner_table_provider.downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
-    {
-        indexed.clone()
-    } else {
-        runtime_datafusion_index::IndexedTableProvider::new(Arc::clone(&inner_table_provider))
-    };
+    // Reuse an index layer already at the top of the stack so several indexes
+    // compose onto one layer rather than stacking a layer apiece.
+    let (mut provider, base_below) =
+        match inner_table_provider.downcast_ref::<spice_table::SpiceTable>() {
+            Some(table) if !table.indexes().is_empty() => (
+                IndexLayer::with_indexes(table.indexes().to_vec()),
+                Arc::clone(table.below()),
+            ),
+            _ => (IndexLayer::new(), Arc::clone(&inner_table_provider)),
+        };
+    // Every column's vector index is collected here and joined onto a single
+    // `VectorScanTableProvider` after the loop, rather than each column wrapping the
+    // previous column's layer in its own nested provider — see
+    // <https://github.com/spiceai/spiceai/issues/7020>.
+    let mut vector_indexes: Vec<Arc<dyn VectorIndex>> = Vec::new();
 
     let Some(embed_udf) = ctx.state().scalar_functions().get(EMBED_UDF_NAME).cloned() else {
         return Err(Box::from(format!(
@@ -458,7 +470,7 @@ async fn wrap_table_as_index_elasticsearch(
             None => (columns.to_vec(), inner_table_provider.schema()),
         };
 
-        let mut es_index = super::elasticsearch::try_from_table(
+        let es_index = super::elasticsearch::try_from_table(
             tbl,
             column.clone(),
             config.clone(),
@@ -471,53 +483,54 @@ async fn wrap_table_as_index_elasticsearch(
         )
         .await?;
 
-        provider = if let Some(chunking) = chunking {
-            tracing::debug!(
-                "[Elasticsearch][table={tbl}] Chunking column {}",
-                es_index.embedded_column
-            );
-            // The Elasticsearch chunked query plan omits the chunk key column, so the
-            // fallback projection from a warm in-memory index onto Elasticsearch results
-            // cannot be built — serve reads from Elasticsearch directly.
-            tracing::debug!(
-                "Not adding an in-memory warm vector index for table {tbl}: chunking is enabled on the Elasticsearch vector engine."
-            );
-            es_index.primary_key = ChunkedSearchIndex::augment_primary_key(es_index.primary_key);
+        // Elasticsearch now mirrors the S3 Vectors engine: its query and list plans expose
+        // the full (augmented, when chunked) primary key plus the metadata columns, so the
+        // in-memory warm index can fall back onto Elasticsearch for both chunked and
+        // non-chunked columns. The chunk-key augmentation happens inside `try_from_table`.
+        let metadata_columns = es_index.metadata_columns.clone();
+        let embedder = Arc::clone(&es_index.compute_query);
+        let similarity = es_index.similarity.clone();
+        let vector_index = with_memory_warm_index(
+            tbl,
+            Arc::new(es_index) as Arc<dyn VectorIndex>,
+            metadata_columns,
+            embedder,
+            &embed_udf,
+            &config.model,
+            similarity.as_str(),
+            on_zero_results,
+        );
 
-            construct_chunked_vector_index(
+        provider = if let Some(chunking) = chunking {
+            tracing::debug!("[Elasticsearch][table={tbl}] Chunking column {column}");
+            let (p, chunked_vector_index) = construct_chunked_vector_index(
                 provider,
                 embedding_models,
                 chunking,
-                Arc::new(es_index) as Arc<dyn SearchIndex>,
+                vector_index as Arc<dyn SearchIndex>,
                 config.model.as_str(),
                 file_format,
             )
-            .await?
+            .await?;
+            vector_indexes.extend(chunked_vector_index);
+            p
         } else {
-            // Unlike S3 Vectors, the Elasticsearch list & query plans do not expose
-            // metadata columns, so the warm index must not store any — otherwise the
-            // fallback projection onto the Elasticsearch results cannot be built.
-            let vector_index = with_memory_warm_index(
-                tbl,
-                Arc::new(es_index.clone()) as Arc<dyn VectorIndex>,
-                MetadataColumns::none(),
-                Arc::clone(&es_index.compute_query),
-                &embed_udf,
-                &config.model,
-                es_index.similarity.as_str(),
-                on_zero_results,
-            );
-
-            provider.underlying = Arc::new(
-                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
-            ) as Arc<dyn TableProvider>;
-            provider.add_index(vector_index as Arc<dyn Index>)
+            let provider = provider.add_index(Arc::clone(&vector_index) as Arc<dyn Index>);
+            vector_indexes.push(vector_index);
+            provider
         };
     }
+
+    let layer_below = if vector_indexes.is_empty() {
+        base_below
+    } else {
+        Arc::new(VectorScanTableProvider::try_new(base_below, &vector_indexes).boxed()?)
+            .into_table() as Arc<dyn TableProvider>
+    };
 
     tracing::info!(
         "Elasticsearch vector engine for table {tbl} initialized in {:?}",
         start.elapsed()
     );
-    Ok(Arc::new(provider))
+    Ok(spice_table::SpiceTable::over(Arc::new(provider), layer_below) as Arc<dyn TableProvider>)
 }

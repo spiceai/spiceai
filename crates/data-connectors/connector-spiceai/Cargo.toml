@@ -21,6 +21,7 @@ license-file.workspace = true
 description = "Spice.ai Cloud Platform data connector for Spice.ai runtime"
 
 [dependencies]
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 runtime = { path = "../../runtime" }
 

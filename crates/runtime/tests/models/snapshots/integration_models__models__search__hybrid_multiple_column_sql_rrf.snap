@@ -11,7 +11,7 @@ expression: resp?
   {
     "id": 772,
     "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$",
-    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.017
+    "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
   },
   {
     "id": 361,
@@ -19,8 +19,8 @@ expression: resp?
     "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
   },
   {
-    "id": 462,
-    "question": "How many groups of 2 are in 14?",
+    "id": 9,
+    "question": "A Mission Control Officer at Cape Canaveral makes the statement \"lift-off, T minus 50 seconds.\" How long is it before lift-off?",
     "trunc(rrf(vector_search(qs, Utf8(\"second\")), text_search(qs, Utf8(\"second\")))._fused_score,Int64(3))": 0.016
   }
 ]

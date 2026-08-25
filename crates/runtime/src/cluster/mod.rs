@@ -671,7 +671,7 @@ struct ClusterTlsConfigInner {
     /// `ArcSwap` swap inside the bundle.
     bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
     /// Drop-guard for the watcher. In the centralized path the binary
-    /// owns the [`crate::tls::TlsControl`] for the whole process; this
+    /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
     /// us if the caller drops their `TlsControl` first (notably the
     /// test path that constructs a transient one).
@@ -679,13 +679,13 @@ struct ClusterTlsConfigInner {
         dead_code,
         reason = "drop-guard only; never read, but extends the watcher dispatcher's lifetime to match this struct"
     )]
-    watcher_keepalive: Arc<crate::tls::CertWatcher>,
+    watcher_keepalive: Arc<runtime_tls::CertWatcher>,
 }
 
 impl ClusterTlsConfig {
     /// Creates a new `ClusterTlsConfig` by loading the CA, certificate, and key files,
     /// validating their lineage, and registering them for hot-reload on
-    /// the supplied process-wide [`crate::tls::TlsControl`].
+    /// the supplied process-wide [`runtime_tls::TlsControl`].
     ///
     /// # Errors
     ///
@@ -695,7 +695,7 @@ impl ClusterTlsConfig {
         ca_cert_path: &str,
         cert_path: &str,
         key_path: &str,
-        control: &crate::tls::TlsControl,
+        control: &runtime_tls::TlsControl,
     ) -> std::io::Result<Self> {
         let ca_path_buf = PathBuf::from(ca_cert_path);
         let cert_path_buf = PathBuf::from(cert_path);
@@ -807,13 +807,13 @@ impl ResolvedClusterConfig {
     }
 
     /// Like [`Self::try_new`] but takes the process-wide
-    /// [`crate::tls::TlsControl`] so cluster mTLS reload events flow
+    /// [`runtime_tls::TlsControl`] so cluster mTLS reload events flow
     /// through the same watcher as public TLS. Production callers
     /// should always go through this constructor; the no-arg
     /// `try_new` is preserved for tests that don't need centralization.
     pub fn try_new_with_tls(
         config: ClusterConfig,
-        control: Option<&crate::tls::TlsControl>,
+        control: Option<&runtime_tls::TlsControl>,
     ) -> std::io::Result<Self> {
         // Cluster mTLS configuration must be complete when provided
         let tls_config = match (
@@ -831,7 +831,7 @@ impl ResolvedClusterConfig {
                     c
                 } else {
                     owned_control =
-                        crate::tls::TlsControl::new().map_err(|e| io_other(e.to_string()))?;
+                        runtime_tls::TlsControl::new().map_err(|e| io_other(e.to_string()))?;
                     &owned_control
                 };
                 Some(ClusterTlsConfig::try_new(
@@ -2866,7 +2866,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
-        let control = crate::tls::TlsControl::new().expect("watcher");
+        let control = runtime_tls::TlsControl::new().expect("watcher");
         ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
@@ -2899,7 +2899,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
-        let control = crate::tls::TlsControl::new().expect("watcher");
+        let control = runtime_tls::TlsControl::new().expect("watcher");
         let err = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
@@ -2943,7 +2943,7 @@ mod tests {
         write_cert(&node_cert_path, &node_cert);
         write_key(&node_key_path, &node_key);
 
-        let control = crate::tls::TlsControl::new().expect("watcher");
+        let control = runtime_tls::TlsControl::new().expect("watcher");
         let err = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path

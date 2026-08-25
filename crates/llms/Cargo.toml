@@ -13,6 +13,9 @@ version.workspace = true
 snafu.workspace = true
 
 async-openai.workspace = true
+chat-api = { path = "../chat-api" }
+embed-api = { path = "../embed-api" }
+rerank-api = { path = "../rerank-api" }
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
@@ -63,7 +66,7 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "f1190f1f140105f0c5ac8335fbbac402051ab072", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -49,6 +49,24 @@ pub struct ReciprocalRankFusion;
 /// Default RRF smoothing parameter used across Spice hybrid search.
 pub const DEFAULT_RRF_K: f64 = 60.0;
 
+/// Multiplier for the number of candidates each RRF input must contribute.
+///
+/// RRF ranks and fuses this wider pool before applying the user-visible result
+/// limit. Keeping the pool wider than the final response preserves documents
+/// whose combined ranks make them relevant even when no individual leg ranks
+/// them in the final result set.
+pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
+
+/// Returns the number of candidates each RRF input should contribute for a
+/// user-visible result limit.
+///
+/// The multiplication saturates so an unrepresentable pool size still yields
+/// a valid limit rather than wrapping and silently truncating candidates.
+#[must_use]
+pub fn rrf_candidate_pool_size(limit: usize) -> usize {
+    limit.saturating_mul(RRF_CANDIDATE_POOL_FACTOR)
+}
+
 const USIZE_TO_F64_CHUNK_BITS: usize = 16;
 const USIZE_TO_F64_CHUNK_BASE: f64 = 65_536.0;
 const USIZE_TO_F64_CHUNK_MASK: usize = (1usize << USIZE_TO_F64_CHUNK_BITS) - 1;
@@ -96,6 +114,10 @@ where
 
 #[async_trait]
 impl CandidateAggregation for ReciprocalRankFusion {
+    fn candidate_pool_size(&self, limit: usize) -> usize {
+        rrf_candidate_pool_size(limit)
+    }
+
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
@@ -139,10 +161,11 @@ impl CandidateAggregation for ReciprocalRankFusion {
                 primary_key.as_slice(),
             ));
 
-            let data = collect_batches(stream).await.context(DatafusionSnafu)?;
+            let mut data = collect_batches(stream).await.context(DatafusionSnafu)?;
+            data.retain(|batch| batch.num_rows() > 0);
 
             // If data is empty, don't use.
-            if data.first().is_none_or(|rb| rb.num_rows() == 0) {
+            if data.is_empty() {
                 continue;
             }
 
@@ -512,6 +535,15 @@ mod tests {
         assert!(sql_score > table_schema_score);
     }
 
+    /// Regression test for #12242: both HTTP and SQL RRF use this policy to
+    /// fetch candidates before applying the final fused-result limit.
+    #[test]
+    fn rrf_candidate_pool_is_wider_than_final_result_limit() {
+        assert_eq!(rrf_candidate_pool_size(10), 40);
+        assert_eq!(rrf_candidate_pool_size(usize::MAX), usize::MAX);
+        assert_eq!(ReciprocalRankFusion.candidate_pool_size(10), 40);
+    }
+
     #[test]
     fn reciprocal_rank_score_decreases_past_u32_max_rank() {
         let u32_max_rank = usize::try_from(u32::MAX).expect("u32::MAX should fit in usize");
@@ -623,10 +655,17 @@ mod tests {
     }
 
     fn stream_from_batch(batch: RecordBatch) -> SendableRecordBatchStream {
-        let schema = batch.schema();
+        stream_from_batches(vec![batch])
+    }
+
+    fn stream_from_batches(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = batches
+            .first()
+            .expect("candidate stream should contain at least one batch")
+            .schema();
         Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            stream::iter(vec![Ok(batch)]),
+            stream::iter(batches.into_iter().map(Ok)),
         ))
     }
 
@@ -704,6 +743,66 @@ mod tests {
         assert!(
             b_row.contains("0.032786885245901"),
             "expected B's fused score ≈ 2/61, got:\n{b_row}"
+        );
+    }
+
+    /// Regression test for #12239: an empty batch must not discard later candidates from a stream.
+    #[tokio::test]
+    async fn reciprocal_rank_fusion_uses_candidates_after_an_empty_first_batch() {
+        let make_batch = |scores: Vec<f64>, values: Vec<&str>, ids: Vec<&str>| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    SEARCH_SCORE_COLUMN_NAME,
+                    Arc::new(arrow::array::Float64Array::from(scores)) as _,
+                ),
+                (
+                    SEARCH_VALUE_COLUMN_NAME,
+                    Arc::new(arrow::array::StringArray::from(values)) as _,
+                ),
+                ("id", Arc::new(arrow::array::StringArray::from(ids)) as _),
+            ])
+            .expect("valid record batch")
+        };
+
+        let stream_0 = VectorSearchGenerationResult {
+            data: stream_from_batch(make_batch(vec![10.0], vec!["A-from-s0"], vec!["A"])),
+            derived_from: "body".to_string(),
+        };
+        let stream_1 = VectorSearchGenerationResult {
+            data: stream_from_batches(vec![
+                make_batch(vec![], vec![], vec![]),
+                make_batch(
+                    vec![9.0, 8.0],
+                    vec!["A-from-s1", "B-from-s1"],
+                    vec!["A", "B"],
+                ),
+            ]),
+            derived_from: "body".to_string(),
+        };
+
+        let result = ReciprocalRankFusion
+            .aggregate(vec![stream_0, stream_1], vec![Column::from_name("id")], 10)
+            .await
+            .expect("rrf aggregation should succeed");
+
+        let batches = collect_batches(result.data)
+            .await
+            .expect("should collect fused batches");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("should format output")
+            .to_string();
+
+        assert!(
+            formatted.contains("| B  |"),
+            "expected candidate unique to the later batch, got:\n{formatted}"
+        );
+        let a_row = formatted
+            .lines()
+            .find(|line| line.contains("| A  |"))
+            .unwrap_or_else(|| panic!("expected A row in:\n{formatted}"));
+        assert!(
+            a_row.contains("0.032786885245901"),
+            "expected A's fused score ≈ 2/61, got:\n{a_row}"
         );
     }
 

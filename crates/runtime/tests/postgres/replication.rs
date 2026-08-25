@@ -32,10 +32,10 @@ use std::time::Duration;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use data_components::cdc::{ChangeEnvelope, ChangesStream};
+use data_components::cdc::{AccelerationContents, ChangeEnvelope, ChangesStream};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, config, start_replication_stream,
+    NoopAppliedLsnStore, PgOutputFormat, ReplicationMetricsCollector, ReplicationParams,
+    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -71,12 +71,18 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         publication_name: publication_name.into(),
         initial_snapshot: true,
         snapshot_on_resume: false,
+        ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
         shared: false,
         member_channel_capacity:
             data_components::postgres_replication::shared::DEFAULT_MEMBER_CHANNEL_CAPACITY,
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
         ready_lag: Duration::from_secs(2),
     }
 }
@@ -215,13 +221,14 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
 
     let mut stream = start_replication_stream(input);
 
     // --- 1. Bootstrap envelope: two rows, op="c" ---
     let envelope = next_envelope(&mut stream, "bootstrap envelope").await?;
-    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -326,10 +333,11 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
     let mut stream = start_replication_stream(input);
     let envelope = next_envelope(&mut stream, "forced resume snapshot").await?;
-    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
     assert_eq!(
         change_batch.record.num_rows(),
         2,
@@ -388,13 +396,14 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
         table_name: "repl_big".into(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
     let mut stream = start_replication_stream(input);
 
     // Bootstrap: the seed row arrives as a not-ready boundary; readiness is
     // lag-based and follows from the live/heartbeat path once caught up.
     let envelope = next_envelope(&mut stream, "bootstrap envelope").await?;
-    let (committer, change_batch, is_ready) = envelope.into_parts().expect("build change batch");
+    let (committer, change_batch, is_ready, _) = envelope.into_parts().expect("build change batch");
     assert_eq!(change_batch.record.num_rows(), 1);
     assert!(
         !is_ready,
@@ -467,7 +476,7 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
                     seen.len()
                 )
             })??;
-        let (committer, change_batch, _) = envelope.into_parts().expect("build change batch");
+        let (committer, change_batch, _, _) = envelope.into_parts().expect("build change batch");
         let data_struct = change_batch
             .record
             .column_by_name("data")
@@ -518,6 +527,7 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
 
     let mut stream_a = start_replication_stream(build_input(params_a));
@@ -693,6 +703,7 @@ async fn run_wide_types_scenario(
         table_name: table.clone(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
     let mut stream = start_replication_stream(input);
 
@@ -715,7 +726,7 @@ async fn run_wide_types_scenario(
         ))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("insert envelope ({tag})")).await?;
-    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -826,7 +837,7 @@ async fn run_wide_types_scenario(
         ))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("update envelope ({tag})")).await?;
-    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -878,7 +889,7 @@ async fn run_wide_types_scenario(
         .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
         .await?;
     let env = next_change_envelope(&mut stream, &format!("delete envelope ({tag})")).await?;
-    let (committer, batch, _) = env.into_parts().expect("build change batch");
+    let (committer, batch, _, _) = env.into_parts().expect("build change batch");
     assert_eq!(
         batch
             .record
@@ -921,6 +932,7 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
         table_name: "repl_users".into(),
         metrics: ReplicationMetricsCollector::new(),
         policy: SchemaEvolutionPolicy::Block,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
     };
 
     // Cold bootstrap, then let the caught-up source reach Ready. Committing the

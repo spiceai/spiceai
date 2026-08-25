@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -14,6 +16,7 @@ use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::GetExt;
 use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue;
 use datafusion_common::Statistics;
 use datafusion_common::config::ConfigField;
 use datafusion_common::config_namespace;
@@ -34,7 +37,6 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -48,6 +50,7 @@ use futures::TryStreamExt as _;
 use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use vortex::VortexSessionDefault;
 use vortex::arrow::ArrowSessionExt;
 use vortex::arrow::FromArrowType;
@@ -69,6 +72,8 @@ use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
+use super::cache::cache_footer;
+use super::segment_cache;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
@@ -179,6 +184,35 @@ impl Display for ScanConcurrency {
     }
 }
 
+impl FromStr for ScanConcurrency {
+    type Err = String;
+
+    /// Parses `auto`, `off` (also `disabled`/`none`/`0`), or a positive integer.
+    ///
+    /// The single parser for this setting: `ConfigField::set` delegates here, so a
+    /// caller reading the mode from its own configuration (e.g. a Spicepod
+    /// parameter) accepts exactly the spellings a `DataFusion` `OPTIONS(...)`
+    /// clause does.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "off" | "disabled" | "none" | "0" => Self::Off,
+            other => {
+                let concurrency = other.parse::<usize>().map_err(|err| {
+                    format!(
+                        "Invalid scan_concurrency value {other:?}; expected 'auto', 'off', or a positive integer: {err}"
+                    )
+                })?;
+                if concurrency == 0 {
+                    Self::Off
+                } else {
+                    Self::Explicit(concurrency)
+                }
+            }
+        })
+    }
+}
+
 impl ConfigField for ScanConcurrency {
     fn visit<V: datafusion_common::config::Visit>(
         &self,
@@ -196,22 +230,9 @@ impl ConfigField for ScanConcurrency {
             )));
         }
 
-        *self = match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Self::Auto,
-            "off" | "disabled" | "none" | "0" => Self::Off,
-            value => {
-                let concurrency = value.parse::<usize>().map_err(|err| {
-                    DataFusionError::Configuration(format!(
-                        "Invalid scan_concurrency value {value:?}; expected 'auto', 'off', or a positive integer: {err}"
-                    ))
-                })?;
-                if concurrency == 0 {
-                    Self::Off
-                } else {
-                    Self::Explicit(concurrency)
-                }
-            }
-        };
+        *self = value
+            .parse::<Self>()
+            .map_err(DataFusionError::Configuration)?;
 
         Ok(())
     }
@@ -242,8 +263,17 @@ pub struct WriteShardConfig {
     pub write_concurrency: usize,
     /// Optional key columns to hash-partition rows by (e.g. primary key or
     /// partition value), resolved by name against the write schema. Empty ⇒
-    /// round-robin distribution.
+    /// distribute whole batches instead of splitting them row-wise.
     pub shard_key_columns: Vec<String>,
+    /// Ascending split points that RANGE-partition rows on the single
+    /// `shard_key_columns` entry, giving each output file a disjoint, contiguous
+    /// slice of that key's domain so a predicate on it prunes. `None` ⇒ hash the
+    /// key instead, which spreads every key range across every file.
+    ///
+    /// Supply `write_concurrency - 1` bounds. Ignored unless exactly one shard
+    /// key column is set: ordering a composite key needs a lexicographic
+    /// comparison this does not implement, so a multi-column key hashes.
+    pub range_bounds: Option<Vec<ScalarValue>>,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -312,6 +342,9 @@ impl Eq for VortexTableOptions {}
 pub struct VortexFormatFactory {
     session: VortexSession,
     options: Option<VortexTableOptions>,
+    /// Names the segment cache a created format may size for itself, so its
+    /// metrics identify the table rather than a bare sequence number.
+    cache_name: Option<Arc<str>>,
 }
 
 impl GetExt for VortexFormatFactory {
@@ -331,6 +364,7 @@ impl VortexFormatFactory {
         Self {
             session: VortexSession::default(),
             options: None,
+            cache_name: None,
         }
     }
 
@@ -342,6 +376,7 @@ impl VortexFormatFactory {
         Self {
             session,
             options: Some(options),
+            cache_name: None,
         }
     }
 
@@ -356,6 +391,17 @@ impl VortexFormatFactory {
     #[must_use]
     pub fn with_options(mut self, options: VortexTableOptions) -> Self {
         self.options = Some(options);
+        self
+    }
+
+    /// Name the segment cache a created format may size for itself.
+    ///
+    /// Only reached when the table sets `segment_cache_size_bytes`; without a
+    /// name such a cache reports under a sequence number, which tells an operator
+    /// that a cache exists but not which table owns it.
+    #[must_use]
+    pub fn with_cache_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.cache_name = Some(name.into());
         self
     }
 }
@@ -375,14 +421,19 @@ impl FileFormatFactory for VortexFormatFactory {
             }
         }
 
-        Ok(Arc::new(VortexFormat::new_with_options(
+        Ok(Arc::new(VortexFormat::new_with_options_named(
             self.session.clone(),
             opts,
+            self.cache_name.clone(),
         )))
     }
 
     fn default(&self) -> Arc<dyn FileFormat> {
-        Arc::new(VortexFormat::new(self.session.clone()))
+        Arc::new(VortexFormat::new_with_options_named(
+            self.session.clone(),
+            self.options.clone().unwrap_or_default(),
+            self.cache_name.clone(),
+        ))
     }
 }
 
@@ -394,13 +445,31 @@ impl VortexFormat {
     }
 
     /// Creates a new instance with configured by a [`VortexTableOptions`].
+    ///
+    /// Scans cache segments only when `segment_cache_size_bytes` asks for it. The
+    /// process-wide cache is opt-in through [`Self::new_with_process_segment_cache`],
+    /// because caching is only sound for a caller whose file paths are immutable.
     #[must_use]
     pub fn new_with_options(session: VortexSession, opts: VortexTableOptions) -> Self {
+        Self::new_with_options_named(session, opts, None)
+    }
+
+    /// Like [`Self::new_with_options`], but a cache built from
+    /// `segment_cache_size_bytes` reports under `name` instead of a bare
+    /// sequence number. Callers that know which table they are opening — the
+    /// listing connector does — should pass it.
+    #[must_use]
+    pub fn new_with_options_named(
+        session: VortexSession,
+        opts: VortexTableOptions,
+        cache_name: Option<Arc<str>>,
+    ) -> Self {
+        let self_cache_name = cache_name;
         let segment_cache = opts
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
+            .map(|bytes| SharedSegmentCache::new_private(bytes, self_cache_name.clone()));
 
         Self {
             session,
@@ -415,6 +484,23 @@ impl VortexFormat {
     #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
         &self.opts
+    }
+
+    /// Invalidates cached Vortex segments for the exact object-store paths and
+    /// physically evicts them before returning.
+    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+        if let Some(cache) = self.segment_cache.as_ref() {
+            cache.invalidate_paths(paths).await;
+        }
+    }
+
+    /// Returns the current number of cached Vortex segments, or `None` when the
+    /// segment cache is disabled.
+    pub async fn segment_cache_entry_count(&self) -> Option<u64> {
+        match self.segment_cache.as_ref() {
+            Some(cache) => Some(cache.entry_count().await),
+            None => None,
+        }
     }
 
     /// Creates a format that attaches access plans and adjusts footer-derived
@@ -435,8 +521,10 @@ impl VortexFormat {
 
     /// Returns a format that fans writes across `config.write_concurrency`
     /// concurrent shard writers (clamped to the session `target_partitions`),
-    /// routing rows hashed by `config.shard_key_columns` (or round-robin when
-    /// empty). Used by the Cayenne accelerator to parallelize the Vortex encode.
+    /// routing rows by `config.shard_key_columns` — range-partitioned when
+    /// `config.range_bounds` supplies split points for a single key column,
+    /// hashed otherwise, and round-robin when no key is set. Used by the Cayenne
+    /// accelerator to parallelize the Vortex encode.
     #[must_use]
     pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
         Self {
@@ -448,26 +536,64 @@ impl VortexFormat {
         }
     }
 
-    /// Returns a format whose segment cache reports its right-sizing metrics
-    /// (hit rate, fill) under the given `dataset` label. Rebuilds the (empty)
-    /// segment cache to attach the label, so call once at construction before any
-    /// scans run. No-op label-wise when this format has no segment cache.
+    /// Serve this format's scans from the process-wide segment cache.
+    ///
+    /// **Opt-in, and only sound when this format's file paths are immutable.** The
+    /// segment cache has no read-time validation: a file overwritten in place
+    /// keeps serving the segments cached under its path. Cayenne qualifies —
+    /// every data file is `{uuid7}_p{shard}_{index}.vortex` beneath a uuid7
+    /// snapshot directory, so a path is written once and never reused, and
+    /// retirement invalidates it explicitly. A listing table over externally
+    /// managed files does not: those can be replaced under the same name at any
+    /// time, which is why they keep the private, opt-in cache above.
+    ///
+    /// Falls back to whatever this format already had when the process made no
+    /// caching decision (an embedded host that skips the runtime builder), and
+    /// caches nothing when the decision was to disable it.
     #[must_use]
-    pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
-        let dataset = dataset.into();
-        let segment_cache = self
-            .opts
-            .segment_cache_size_bytes
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
-        Self {
-            session: self.session.clone(),
-            opts: self.opts.clone(),
-            access_plan_provider: self.access_plan_provider.clone(),
-            segment_cache,
-            write_shard: self.write_shard.clone(),
+    pub fn new_with_process_segment_cache(
+        session: VortexSession,
+        opts: VortexTableOptions,
+    ) -> Self {
+        // Decide before constructing, so a caller that ends up on the shared
+        // cache never builds — and immediately discards — a private one.
+        if let Some(process) = segment_cache::process_segment_cache() {
+            let mut format = Self::new_with_options_named(
+                session,
+                VortexTableOptions {
+                    segment_cache_size_bytes: None,
+                    ..opts
+                },
+                None,
+            );
+            format.segment_cache = Some(Arc::clone(process));
+            return format;
         }
+        if segment_cache::segment_caching_disabled() {
+            return Self::new_with_options_named(
+                session,
+                VortexTableOptions {
+                    segment_cache_size_bytes: None,
+                    ..opts
+                },
+                None,
+            );
+        }
+        // No decision: an embedded host that skipped the runtime builder keeps
+        // the cache its own options asked for.
+        Self::new_with_options_named(session, opts, None)
+    }
+
+    /// Byte capacity of the segment cache backing this format's scans, or `None`
+    /// when scans run uncached.
+    ///
+    /// This is the whole cache's budget, not a share of it: the cache is
+    /// process-wide, so every format reports the same figure.
+    #[must_use]
+    pub fn segment_cache_capacity_bytes(&self) -> Option<u64> {
+        self.segment_cache
+            .as_ref()
+            .map(|cache| cache.capacity_bytes())
     }
 
     /// The configured intra-write shard config, if write sharding is enabled for
@@ -511,6 +637,19 @@ impl VortexFormat {
                 );
                 return ShardSpec::RoundRobin(partitions);
             }
+        }
+        // Range-partition when the caller supplied bounds for a single key
+        // column: same row-wise split as `Hash`, so every encoder is fed from
+        // the first batch, but the shards tile the key domain in order instead
+        // of scattering it, which is what lets a file's zone maps prune.
+        if let (Some(bounds), [expr]) = (write_shard.range_bounds.as_ref(), exprs.as_slice())
+            && !bounds.is_empty()
+        {
+            return ShardSpec::Range {
+                expr: Arc::clone(expr),
+                bounds: bounds.clone(),
+                partitions,
+            };
         }
         ShardSpec::Hash { exprs, partitions }
     }
@@ -593,8 +732,9 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema =
-                            session.arrow().to_arrow_schema(cached_vortex.footer().dtype())?;
+                        let inferred_schema = session
+                            .arrow()
+                            .to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -614,17 +754,7 @@ impl FileFormat for VortexFormat {
 
                     // Cache the metadata
                     let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
-                    // Footer-cache right-sizing telemetry: the accounted footer
-                    // size (what fills the FileMetadataCache budget) per file.
-                    tracing::debug!(
-                        target: "vortex::footer_cache",
-                        path = %object.location,
-                        footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached_metadata.as_ref()),
-                        src = "infer_schema",
-                        "footer cached",
-                    );
-                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
-                    cache.put(&object.location, entry);
+                    cache_footer(&cache, object.clone(), cached_metadata, "infer_schema");
 
                     let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -711,16 +841,7 @@ impl FileFormat for VortexFormat {
 
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                // Footer-cache right-sizing telemetry (see infer_schema above).
-                tracing::debug!(
-                    target: "vortex::footer_cache",
-                    path = %object.location,
-                    footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached.as_ref()),
-                    src = "infer_stats",
-                    "footer cached",
-                );
-                let entry = CachedFileMetadataEntry::new(object.clone(), cached);
-                file_metadata_cache.put(&object.location, entry);
+                cache_footer(&file_metadata_cache, object.clone(), cached, "infer_stats");
 
                 (
                     vxf.dtype().clone(),
@@ -1137,9 +1258,18 @@ mod tests {
     }
 
     fn shard_format(write_concurrency: usize, keys: &[&str]) -> VortexFormat {
+        shard_format_with_bounds(write_concurrency, keys, None)
+    }
+
+    fn shard_format_with_bounds(
+        write_concurrency: usize,
+        keys: &[&str],
+        range_bounds: Option<Vec<ScalarValue>>,
+    ) -> VortexFormat {
         VortexFormat::new(VortexSession::default()).with_write_shard(WriteShardConfig {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
+            range_bounds,
         })
     }
 
@@ -1179,6 +1309,49 @@ mod tests {
         assert!(matches!(
             shard_format(4, &[]).build_shard_spec(&schema, 8),
             ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    /// Bounds on a single key column select the range split, which tiles the
+    /// key domain in order instead of scattering it like a hash.
+    #[test]
+    fn build_shard_spec_bounds_select_range() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        let bounds = vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(20))];
+        match shard_format_with_bounds(3, &["k"], Some(bounds)).build_shard_spec(&schema, 8) {
+            ShardSpec::Range {
+                partitions, bounds, ..
+            } => {
+                assert_eq!(partitions, 3);
+                assert_eq!(bounds.len(), 2);
+            }
+            other => panic!("expected Range, got {other:?}"),
+        }
+    }
+
+    /// A composite key hashes: ordering it needs a lexicographic comparison the
+    /// range split does not implement.
+    #[test]
+    fn build_shard_spec_composite_key_with_bounds_still_hashes() {
+        let schema = schema_with(&[
+            ("k", arrow_schema::DataType::Int64),
+            ("j", arrow_schema::DataType::Int64),
+        ]);
+        let bounds = vec![ScalarValue::Int64(Some(10))];
+        assert!(matches!(
+            shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8),
+            ShardSpec::Hash { .. }
+        ));
+    }
+
+    /// Without bounds a keyed write hashes, which is the behavior that predates
+    /// range partitioning.
+    #[test]
+    fn build_shard_spec_key_without_bounds_hashes() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        assert!(matches!(
+            shard_format_with_bounds(4, &["k"], None).build_shard_spec(&schema, 8),
+            ShardSpec::Hash { .. }
         ));
     }
 

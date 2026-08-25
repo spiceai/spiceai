@@ -14,9 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod mteb_quora;
+mod dataset;
+mod harness;
+mod mteb;
+use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use test_framework::{
     TestType, anyhow,
@@ -28,7 +32,7 @@ use test_framework::{
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
-        search::{NotStarted, SearchRunMetric},
+        search::{NotStarted, RetrievalMetrics, SearchRunMetric},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
@@ -37,28 +41,22 @@ use test_framework::{
 use tokio::time::sleep;
 
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
+    let dataset = SearchDataset::from(args.benchmark_dataset);
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
 
-    match args.benchmark_dataset.as_deref() {
-        Some("quora_retrieval") => {
-            mteb_quora::prepare_dataset(
-                &args
-                    .common
-                    .data_dir
-                    .clone()
-                    .unwrap_or(start_request.get_tempdir_path()),
-            )
-            .await?;
-        }
-        Some(ds) => {
-            return Err(anyhow::anyhow!("Unsupported benchmark-dataset: {ds}"));
-        }
-        None => {
-            return Err(anyhow::anyhow!(
-                "Benchmark dataset is required, please specify --benchmark-dataset"
-            ));
-        }
+    if matches!(dataset, SearchDataset::Custom) {
+        validate_custom_spicepod(&app)?;
     }
+
+    dataset
+        .prepare(
+            &args
+                .common
+                .data_dir
+                .clone()
+                .unwrap_or(start_request.get_tempdir_path()),
+        )
+        .await?;
 
     let started_at = Instant::now();
 
@@ -87,12 +85,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
         KeyValue::new("config_name", app.name.clone()),
-        KeyValue::new(
-            "benchmark_dataset",
-            args.benchmark_dataset.clone().unwrap_or_default(),
-        ),
+        KeyValue::new("benchmark_dataset", dataset.name()),
     ];
-    search_attributes.extend(quora_mteb_attributes(&app));
+    search_attributes.extend(search_dataset_attributes(&app));
 
     let search_resource = Resource::builder_empty()
         .with_attributes(search_attributes)
@@ -110,11 +105,12 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search");
 
-    // Only QuoraRetrieval dataset is currently supported; no need to use `benchmark_dataset` function to determine what config to use.
-    let config = mteb_quora::init_search_config(&spiced_instance, Some(10)).await?;
+    let config = dataset
+        .init_search_config(&spiced_instance, Some(10))
+        .await?;
 
     // retrieve query relevance data
-    let qrels = mteb_quora::get_query_relevance_data(&spiced_instance).await?;
+    let qrels = dataset.query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = Instant::now();
 
@@ -142,9 +138,19 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let retrieval_metrics = test.calculate_search_score_metrics(&qrels, |results| {
-        mteb_quora::transform_search_results_for_eval(results)
-    })?;
+    let retrieval_metrics_at_all_k = test
+        .calculate_search_score_metrics_at_all_k(&qrels, |results| {
+            dataset.transform_results(results)
+        })?;
+
+    // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
+    // to the largest available k when fewer results were returned) for the fixed-schema run row.
+    print_retrieval_metrics_table(&retrieval_metrics_at_all_k);
+    let retrieval_metrics = retrieval_metrics_at_all_k
+        .get(&10)
+        .or_else(|| retrieval_metrics_at_all_k.values().next_back())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("No retrieval metrics were computed for any rank cutoff"))?;
 
     let metrics: QueryMetrics<_, _> =
         test.collect(TestType::Search)?
@@ -180,10 +186,15 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     crate::metrics::SEARCH_RPS.record(rps, &[]);
     crate::metrics::SEARCH_P95_RESPONSE_TIME.record(p95, &[]);
-    crate::metrics::SCORE.record(retrieval_metrics.ndcg, &[]);
-    crate::metrics::SEARCH_RECALL.record(retrieval_metrics.recall, &[]);
-    crate::metrics::SEARCH_MRR.record(retrieval_metrics.mrr, &[]);
-    crate::metrics::SEARCH_PRECISION.record(retrieval_metrics.precision, &[]);
+    // Emit each retrieval metric as a `k`-dimensioned series so the full metric-vs-k curve is
+    // recorded, not just the primary cutoff.
+    for (&k, metrics_at_k) in &retrieval_metrics_at_all_k {
+        let k_attr = [KeyValue::new("k", i64::try_from(k)?)];
+        crate::metrics::SCORE.record(metrics_at_k.ndcg, &k_attr);
+        crate::metrics::SEARCH_RECALL.record(metrics_at_k.recall, &k_attr);
+        crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
+        crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
+    }
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
@@ -204,7 +215,56 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn quora_mteb_attributes(app: &App) -> Vec<KeyValue> {
+/// Print the retrieval-quality metrics at every computed rank cutoff `k` as an aligned table.
+fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics>) {
+    if metrics_by_k.is_empty() {
+        println!("No retrieval metrics were computed (no query returned results).");
+        return;
+    }
+
+    println!("Retrieval metrics @k:");
+    println!(
+        "{:>4}  {:>8}  {:>8}  {:>8}  {:>9}",
+        "k", "ndcg", "recall", "mrr", "precision"
+    );
+    for (k, metrics) in metrics_by_k {
+        println!(
+            "{k:>4}  {:>8.4}  {:>8.4}  {:>8.4}  {:>9.4}",
+            metrics.ndcg, metrics.recall, metrics.mrr, metrics.precision
+        );
+    }
+}
+
+/// Fails fast with an actionable message when a custom run's spicepod is missing one of the fixed
+/// tables the harness queries. Each of `corpus`, `test_queries`, and `relevance_data` may be a
+/// dataset or a view. Without this check the run would fail later with a raw `table not found` from
+/// the harness SQL.
+fn validate_custom_spicepod(app: &App) -> anyhow::Result<()> {
+    let missing: Vec<&str> = ["corpus", "test_queries", "relevance_data"]
+        .into_iter()
+        .filter(|name| !spicepod_has_table(app, name))
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Failed to run custom search test ({}): spicepod is missing required table(s): {}. \
+            A custom search run (no --benchmark-dataset) must define `corpus`, `test_queries`, and \
+            `relevance_data` (each may be a dataset or a view). \
+            See: https://github.com/spiceai/spiceai/issues/12935",
+            app.name,
+            missing.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+/// Whether the spicepod defines a table with `name` as either a dataset or a view.
+fn spicepod_has_table(app: &App, name: &str) -> bool {
+    app.datasets.iter().any(|ds| ds.name == name) || app.views.iter().any(|v| v.name == name)
+}
+
+fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
     let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
         return vec![];
     };

@@ -749,7 +749,12 @@ impl PartitionedUnionExec {
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for PartitionedUnionExec {
     fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
-        None
+        // This node only gives partition-table unions a distinct display name;
+        // its execution and optimizer semantics are exactly those of UnionExec.
+        // Keep it transparent to downcast-based optimizer rules so sorting
+        // requirements are propagated into every union child before a
+        // SortPreservingMergeExec is introduced.
+        Some(self.inner_union.as_ref())
     }
 
     fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
@@ -1018,11 +1023,75 @@ mod tests {
             .await
             .expect("scan failed");
 
-        // With 2 partitions and no filters, should produce a UnionExec
+        // With 2 partitions and no filters, the displayed node remains a
+        // PartitionedUnionExec while its optimizer identity is UnionExec.
+        assert_eq!(plan.name(), "PartitionedUnionExec");
         assert!(
-            plan.is::<PartitionedUnionExec>(),
-            "Expected PartitionedUnionExec for multiple partitions"
+            plan.is::<UnionExec>(),
+            "Expected a UnionExec-compatible plan for multiple partitions"
         );
+    }
+
+    #[tokio::test]
+    async fn test_udf_order_by_over_multiple_partitions_plans() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let partitions_data = vec![
+            (
+                ScalarValue::Utf8(Some("us-east-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(
+                        Arc::clone(&schema),
+                        vec![vec![create_test_batch("us-east-1", vec![1, 2, 3])]],
+                    )
+                    .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+            (
+                ScalarValue::Utf8(Some("us-west-1".to_string())),
+                Arc::new(
+                    MemTable::try_new(
+                        Arc::clone(&schema),
+                        vec![vec![create_test_batch("us-west-1", vec![4, 5, 6])]],
+                    )
+                    .expect("failed to create MemTable"),
+                ) as Arc<dyn TableProvider>,
+            ),
+        ];
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+        let provider = PartitionTableProvider::new(
+            creator,
+            vec![PartitionedBy {
+                name: "region".to_string(),
+                expression: col("region"),
+            }],
+            Arc::clone(&schema),
+        )
+        .await
+        .expect("failed to create provider");
+
+        let context = datafusion::execution::context::SessionContext::new();
+        context.register_udf(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        context
+            .register_table("partitioned_table", Arc::new(provider))
+            .expect("register partitioned table");
+
+        context
+            .sql(
+                "SELECT id FROM partitioned_table \
+                 ORDER BY bucket(10, id) DESC",
+            )
+            .await
+            .expect("build logical plan")
+            .create_physical_plan()
+            .await
+            .expect("UDF ordering over a partitioned union must produce a valid physical plan");
     }
 
     #[tokio::test]

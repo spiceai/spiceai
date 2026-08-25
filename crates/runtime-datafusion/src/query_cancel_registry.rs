@@ -45,6 +45,11 @@ pub struct ActiveQueryInfo {
     pub sql_preview: Arc<str>,
     pub protocol: Protocol,
     pub started_at_ms: u64,
+    /// The scope that submitted the query: the storage id of the submitting
+    /// request's cache namespace. Listing and cancellation are restricted to
+    /// this scope, so one principal cannot read another's in-flight SQL or
+    /// stop its work.
+    pub owner: Arc<str>,
 }
 
 struct ActiveQueryEntry {
@@ -77,6 +82,7 @@ impl QueryCancelRegistry {
         query_id: Uuid,
         sql: &str,
         protocol: Protocol,
+        owner: Arc<str>,
         token: CancellationToken,
     ) -> ActiveQueryGuard {
         let started_at_ms = SystemTime::now()
@@ -93,6 +99,7 @@ impl QueryCancelRegistry {
                     sql_preview: Self::truncate_sql_preview(sql),
                     protocol,
                     started_at_ms,
+                    owner,
                 },
                 token,
             },
@@ -103,16 +110,21 @@ impl QueryCancelRegistry {
         }
     }
 
-    /// Cancels the active query with the given id, if present. Returns `true`
-    /// if an entry existed and was signalled.
+    /// Cancels the active query with the given id when `caller` submitted it.
+    /// Returns `true` if a matching entry existed and was signalled.
+    ///
+    /// A query submitted by another scope reports the same `false` as an id
+    /// that does not exist, so a caller cannot probe for other principals'
+    /// query ids.
     #[must_use]
-    pub fn cancel(&self, query_id: Uuid) -> bool {
-        if let Some(entry) = self.entries.get(&query_id) {
+    pub fn cancel_owned(&self, query_id: Uuid, caller: &str) -> bool {
+        if let Some(entry) = self.entries.get(&query_id)
+            && entry.info.owner.as_ref() == caller
+        {
             entry.token.cancel();
-            true
-        } else {
-            false
+            return true;
         }
+        false
     }
 
     /// Cancels every active query in this registry. Returns the number of
@@ -127,13 +139,26 @@ impl QueryCancelRegistry {
         cancelled
     }
 
-    /// Returns a snapshot of all active queries.
+    /// Returns a snapshot of the active queries `caller` submitted.
     #[must_use]
-    pub fn list(&self) -> Vec<ActiveQueryInfo> {
+    pub fn list_for(&self, caller: &str) -> Vec<ActiveQueryInfo> {
+        self.list_matching(|info| info.owner.as_ref() == caller)
+    }
+
+    /// Returns a snapshot of every active query regardless of who submitted
+    /// it. For internal callers only — request-facing surfaces use
+    /// [`Self::list_for`].
+    #[must_use]
+    pub fn list_all(&self) -> Vec<ActiveQueryInfo> {
+        self.list_matching(|_| true)
+    }
+
+    fn list_matching(&self, predicate: impl Fn(&ActiveQueryInfo) -> bool) -> Vec<ActiveQueryInfo> {
         let mut entries: Vec<ActiveQueryInfo> = self
             .entries
             .iter()
             .map(|e| e.value().info.clone())
+            .filter(|info| predicate(info))
             .collect();
         entries.sort_by(|left, right| {
             left.started_at_ms
@@ -212,16 +237,24 @@ impl Drop for ActiveQueryGuard {
 mod tests {
     use super::*;
 
+    const OWNER: &str = "apikey:0123456789abcdef";
+    const OTHER: &str = "apikey:fedcba9876543210";
+
+    fn owner() -> Arc<str> {
+        Arc::from(OWNER)
+    }
+
     #[test]
     fn register_and_cancel_roundtrip() {
         let registry = Arc::new(QueryCancelRegistry::new());
         let token = CancellationToken::new();
         let query_id = Uuid::new_v4();
 
-        let _guard = registry.register(query_id, "SELECT 1", Protocol::Http, token.clone());
+        let _guard =
+            registry.register(query_id, "SELECT 1", Protocol::Http, owner(), token.clone());
 
         assert_eq!(registry.len(), 1);
-        assert!(registry.cancel(query_id));
+        assert!(registry.cancel_owned(query_id, OWNER));
         assert!(token.is_cancelled());
     }
 
@@ -234,6 +267,7 @@ mod tests {
                 query_id,
                 "SELECT 1",
                 Protocol::Http,
+                owner(),
                 CancellationToken::new(),
             );
             assert_eq!(registry.len(), 1);
@@ -244,7 +278,7 @@ mod tests {
     #[test]
     fn cancel_missing_returns_false() {
         let registry = Arc::new(QueryCancelRegistry::new());
-        assert!(!registry.cancel(Uuid::new_v4()));
+        assert!(!registry.cancel_owned(Uuid::new_v4(), OWNER));
     }
 
     #[test]
@@ -253,10 +287,20 @@ mod tests {
         let first = CancellationToken::new();
         let second = CancellationToken::new();
 
-        let _first_guard =
-            registry.register(Uuid::new_v4(), "SELECT 1", Protocol::Http, first.clone());
-        let _second_guard =
-            registry.register(Uuid::new_v4(), "SELECT 2", Protocol::Flight, second.clone());
+        let _first_guard = registry.register(
+            Uuid::new_v4(),
+            "SELECT 1",
+            Protocol::Http,
+            owner(),
+            first.clone(),
+        );
+        let _second_guard = registry.register(
+            Uuid::new_v4(),
+            "SELECT 2",
+            Protocol::Flight,
+            owner(),
+            second.clone(),
+        );
 
         assert_eq!(registry.cancel_all(), 2);
         assert!(first.is_cancelled());
@@ -271,16 +315,18 @@ mod tests {
             Uuid::from_u128(2),
             "SELECT 2",
             Protocol::Http,
+            owner(),
             CancellationToken::new(),
         );
         let _second_guard = registry.register(
             Uuid::from_u128(1),
             "SELECT 1",
             Protocol::Http,
+            owner(),
             CancellationToken::new(),
         );
 
-        let listed = registry.list();
+        let listed = registry.list_all();
         assert!(listed.windows(2).all(|window| {
             let left = &window[0];
             let right = &window[1];
@@ -298,11 +344,12 @@ mod tests {
             Uuid::new_v4(),
             &long_sql,
             Protocol::Http,
+            owner(),
             CancellationToken::new(),
         );
 
         let preview = registry
-            .list()
+            .list_all()
             .pop()
             .expect("registered query should be listed")
             .sql_preview
@@ -310,5 +357,58 @@ mod tests {
         assert_eq!(preview.chars().count(), SQL_PREVIEW_MAX_CHARS);
         assert!(preview.ends_with(SQL_PREVIEW_ELLIPSIS));
         assert!(long_sql.starts_with(preview.trim_end_matches(SQL_PREVIEW_ELLIPSIS)));
+    }
+
+    #[test]
+    fn cancel_owned_refuses_a_query_another_scope_submitted() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+        let token = CancellationToken::new();
+        let query_id = Uuid::new_v4();
+        let _guard =
+            registry.register(query_id, "SELECT 1", Protocol::Http, owner(), token.clone());
+
+        assert!(
+            !registry.cancel_owned(query_id, OTHER),
+            "another scope must not cancel the query"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "a refused cancellation must leave the query running"
+        );
+        assert!(
+            registry.cancel_owned(query_id, OWNER),
+            "the submitting scope may cancel its own query"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn list_for_returns_only_the_callers_queries() {
+        let registry = Arc::new(QueryCancelRegistry::new());
+        let mine = Uuid::from_u128(1);
+        let theirs = Uuid::from_u128(2);
+        let _mine_guard = registry.register(
+            mine,
+            "SELECT mine",
+            Protocol::Http,
+            owner(),
+            CancellationToken::new(),
+        );
+        let _theirs_guard = registry.register(
+            theirs,
+            "SELECT theirs",
+            Protocol::Http,
+            Arc::from(OTHER),
+            CancellationToken::new(),
+        );
+
+        let listed = registry.list_for(OWNER);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].query_id, mine);
+        assert!(
+            !listed.iter().any(|q| q.sql_preview.contains("theirs")),
+            "another scope's SQL must not be disclosed"
+        );
+        assert_eq!(registry.list_all().len(), 2);
     }
 }

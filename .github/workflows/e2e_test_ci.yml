@@ -61,6 +61,11 @@ jobs:
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # Every job here is bounded, because on a `merge_group` run an unbounded one does not
+    # just waste a job: the queue candidate stays `AWAITING_CHECKS` for GitHub's 6-hour
+    # default and every entry behind it waits (#12717). A full-history checkout is the
+    # slow part of this one.
+    timeout-minutes: 10
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
@@ -76,6 +81,9 @@ jobs:
     name: Setup strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: spiceai-dev-runners
+    # One `github-script` step returning a literal, so anything past a minute is a stuck
+    # runner rather than slow work.
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -109,6 +117,13 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: [setup-matrix, check_changes]
     if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    # A backstop above the longest step bound below, leaving room for the artifact upload
+    # and the post steps. The compile steps carry their own tighter bounds so that a
+    # wedged one is cut while the `always()` diagnostics after it can still run — a hung
+    # compile is exactly when the sccache stats are worth having.
+    timeout-minutes: 200
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     strategy:
       matrix:
@@ -134,7 +149,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -149,8 +164,25 @@ jobs:
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
+      - name: Set up spiceio
+        if: matrix.target.builder == 'spiceai-macos' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@2ad4a874ff4813f8190117bc645af0dbb90b708c # v0.8.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+
       - name: Build spiced and spice CLI
         if: matrix.target.target_os != 'darwin'
+        # 65 minutes is the slowest this leg has taken across the last ten successful
+        # `merge_group` runs (44-65), so this is that worst case with room to spare. The
+        # spread is wide on a contended pool, and a bound tight enough to fail a
+        # legitimate build would be worse than the slow build it replaced.
+        timeout-minutes: 90
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel'
@@ -160,17 +192,46 @@ jobs:
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
+        # This is the step that wedged for over 4.5 hours and held four queue candidates
+        # behind it (#12717). 138 minutes is its slowest successful `merge_group` run of
+        # the last ten (74-138); the self-hosted macOS pool puts several runner instances
+        # on one host, which is where that factor-of-two spread comes from, so the bound
+        # sits well clear of it rather than close to the median.
+        timeout-minutes: 180
         uses: ./.github/actions/build-spiced
         with:
           features: 'tpc-extension,models,postgres-accel,metal'
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Show sccache stats
+        if: always() && matrix.target.builder == 'spiceai-macos' && env.SCCACHE_SETUP == 'true'
+        # `always()`: this is the one step that reports cache health, and without it
+        # it is skipped on exactly the failures it would explain (#12420). The `||`
+        # keeps a diagnostic from ever deciding a verdict — when the cache backend is
+        # gone `--show-stats` cannot answer either, and that is itself the finding.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
+      - name: Kill spiceio
+        if: always() && matrix.target.builder == 'spiceai-macos' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always() && matrix.target.builder == 'spiceai-macos'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-e2e-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
 
   setup-model-matrix:
     name: Setup model strategy matrix
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
@@ -199,7 +260,11 @@ jobs:
 
   test_openai_model:
     name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
-    timeout-minutes: 5
+    # A backstop for the whole job, so it has to clear this job's own setup — artifact
+    # download and CLI install on the self-hosted pool — before the steps' bounded waits
+    # (60s readiness, then 30s/30s/60s inside the expect scripts) can report anything.
+    # Matches `test_hf_model`, which has the same setup on the same runners (#12644).
+    timeout-minutes: 10
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -231,17 +296,24 @@ jobs:
           cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # This job runs on the self-hosted pool, where several runner instances
+      # share one host and therefore one network namespace, so spiced's default
+      # 8090/50051 cannot be assumed free (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '60'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -272,16 +344,7 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
-
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+        uses: ./.github/actions/stop-spice
 
   test_hf_model:
     name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -321,17 +384,137 @@ jobs:
           cp ./test/models/spicepod_hf.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      # The Hub credential lives where hf-hub looks for it, rather than being threaded
+      # through the spicepod as an `hf_token` param. Two reasons: it authenticates the
+      # chat model and the embedding model with one mechanism, and an unset secret
+      # leaves no file behind instead of setting an empty token, which the Hub answers
+      # with 401 — worse than no token at all.
+      - name: Authenticate the Hugging Face cache
+        env:
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          set -uo pipefail
+          umask 077
+
+          # hf-hub caches artifacts under $HOME/.cache/huggingface/hub and reads its
+          # credential from the sibling `token` file. $HOME persists between jobs on
+          # these self-hosted runners while the _work tree does not, so once the ~3B
+          # chat model and the embedding model are on disk, later runs need no Hub
+          # round-trip at all.
+          mkdir -p "${HOME}/.cache/huggingface/hub"
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # $HOME is shared by every job that lands on this host, and it outlives this
+          # one. So a token we write here must not be left behind for an unrelated job
+          # to read, and a token the host already owns must not be clobbered:
+          #   - file already present -> use it, touch nothing.
+          #   - absent + secret set  -> write it, and mark it for removal in cleanup.
+          #   - absent + no secret   -> warn; downloads are anonymous.
+          if [ -s "${token_file}" ]; then
+            echo "Using the Hugging Face token already present on this runner."
+          elif [ -n "${SPICE_HF_TOKEN:-}" ]; then
+            printf '%s' "${SPICE_HF_TOKEN}" > "${token_file}"
+            chmod 600 "${token_file}"
+            echo "SPICE_REMOVE_HF_TOKEN=${token_file}" >> "$GITHUB_ENV"
+            echo "Wrote a job-scoped Hugging Face token for hf-hub to pick up."
+          else
+            echo "::warning::No Hugging Face token available. Downloads will be anonymous, and anonymous requests share a per-IP quota across this whole runner pool — exhausting it surfaces as HTTP 401 on model config files."
+          fi
+
+      # Fail here, in seconds and by name, rather than as an unexplained five-minute
+      # readiness timeout. The retries ride out the transient per-IP 401/429 responses
+      # the pool draws from the Hub; this retries a *download*, never an assertion.
+      - name: Pre-flight the Hugging Face components
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+
+          repos="$(sed -n 's|^[[:space:]]*-\{0,1\}[[:space:]]*from:[[:space:]]*huggingface:huggingface\.co/\([^[:space:]]*\).*$|\1|p' ./spicepod.yaml)"
+          if [ -z "${repos}" ]; then
+            echo "No Hugging Face components in the spicepod; nothing to pre-flight."
+            exit 0
+          fi
+
+          token_file="${HOME}/.cache/huggingface/token"
+
+          # The token goes to curl through a config on stdin rather than an -H argument,
+          # so it never appears in this process's argv. `printf` is a shell builtin, so
+          # it spawns nothing that could carry it either. curl drops the header on a
+          # cross-host redirect by default, which is what keeps `-L` safe here.
+          probe() {
+            if [ -s "${token_file}" ]; then
+              printf 'header = "Authorization: Bearer %s"\n' "$(cat "${token_file}")" |
+                curl -K - -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            else
+              curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null
+            fi
+          }
+
+          rc=0
+          while IFS= read -r component; do
+            [ -n "${component}" ] || continue
+
+            # A spicepod pins a revision by joining it onto the repo id as
+            # `org/model:revision` — both `models` and `embeddings` do, and
+            # `split_hf_model_id` in crates/spicepod exists to undo that join before a
+            # loader talks to the Hub. The Hub has no repo under the joined name: a
+            # revision is a path segment, `<repo>/resolve/<revision>/…`. So probing the
+            # joined string asks for a repo that does not exist, which the Hub answers
+            # 404 with a token and 401 without — and both land in a branch below that
+            # blames the Hub or a quota rather than this URL. Undo the join here too.
+            repo_id="${component%%:*}"
+            revision="${component#*:}"
+            if [ "${revision}" = "${component}" ] || [ -z "${revision}" ]; then
+              revision=main
+            fi
+            url="https://huggingface.co/${repo_id}/resolve/${revision}/config.json"
+
+            code=""
+            for attempt in 1 2 3 4 5; do
+              code="$(probe "${url}")" || code="000"
+              if [ "${code}" -lt 400 ] 2>/dev/null; then
+                echo "  ok    ${component} @ ${revision} (HTTP ${code}, attempt ${attempt})"
+                break
+              fi
+              echo "  retry ${component} @ ${revision}: HTTP ${code} (attempt ${attempt}/5)"
+              sleep $((attempt * 3))
+            done
+
+            if ! { [ "${code}" -lt 400 ]; } 2>/dev/null; then
+              case "${code}" in
+                401|403)
+                  echo "::error::Hugging Face returned ${code} for ${component} after 5 attempts (${url}). This is a Hub access/quota failure, not a code failure in this branch — anonymous downloads share a per-IP quota across the whole self-hosted pool. Set the SPICE_SECRET_HF_TOKEN secret, or run 'huggingface-cli login' on the runner." ;;
+                429)
+                  echo "::error::Hugging Face rate-limited ${component} (429) after 5 attempts (${url}). Not a code failure in this branch." ;;
+                404)
+                  echo "::error::Hugging Face has no ${repo_id} at revision ${revision} (404, ${url}). Unlike the other codes here this one is about the spicepod: check the repo id and the pinned revision." ;;
+                *)
+                  echo "::error::Could not reach Hugging Face for ${component} (HTTP ${code}) after 5 attempts (${url}). Not a code failure in this branch." ;;
+              esac
+              rc=1
+            fi
+          # A here-string, not a pipe: a pipe would run the loop in a subshell and `rc`
+          # would never make it back out, so every failure would exit 0.
+          done <<< "${repos}"
+
+          exit "${rc}"
+
+      # Same shared-host constraint as the OpenAI model job above (#12419).
+      - name: Allocate Spice runtime ports
+        uses: ./.github/actions/allocate-spice-ports
+
       - name: Start spice runtime
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          spice run &> spice.log &
+          spice run --http-endpoint "${SPICE_HTTP_ENDPOINT}" --flight-endpoint "${SPICE_FLIGHT_ENDPOINT}" &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        timeout-minutes: 5
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
+          timeout: '300'
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -362,16 +545,16 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        run: |
-          if command -v pkill >/dev/null 2>&1; then
-            pkill -x spice || true
-          elif command -v killall >/dev/null 2>&1; then
-            killall spice || true
-          fi
+        uses: ./.github/actions/stop-spice
 
-          if [ -f spice.log ]; then
-            cat spice.log
-          fi
+      # Only fires when the step above wrote the token itself; a credential the runner
+      # already owned is left alone. Without this, a secret would outlive the job in a
+      # $HOME that every later job on this host can read.
+      - name: Remove the job-scoped Hugging Face token
+        if: always() && env.SPICE_REMOVE_HF_TOKEN != ''
+        run: |
+          rm -f "${SPICE_REMOVE_HF_TOKEN}"
+          echo "Removed the job-scoped Hugging Face token."
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -432,10 +615,10 @@ jobs:
           cat spicepod.yaml
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -443,11 +626,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_spiceai:
     name: 'Test Spice.ai quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -498,10 +680,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -509,11 +691,10 @@ jobs:
           name: taxi_trips
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_s3:
     name: 'Test S3 quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -593,10 +774,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -604,11 +785,10 @@ jobs:
           name: test_parquet_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
@@ -767,10 +947,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -976,10 +1156,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset1
         uses: ./.github/actions/verify-dataset
@@ -1089,10 +1269,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1100,11 +1280,10 @@ jobs:
           name: test_clickhouse_table
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_quickstart_duckdb:
     env:
@@ -1174,10 +1353,10 @@ jobs:
           sleep 5
 
       - name: Wait for dataset to be ready
-        working-directory: duckdb-app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: duckdb-app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1186,10 +1365,9 @@ jobs:
 
       - name: Stop spice and check logs
         if: always()
-        working-directory: duckdb-app
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: duckdb-app
 
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
@@ -1290,10 +1468,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Manually refresh dataset (no params)
         working-directory: test_app
@@ -1334,11 +1512,10 @@ jobs:
           expected-rows-count: 2
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   test_results_caching:
     name: 'Test results caching on ${{ matrix.target.name }}'
@@ -1400,10 +1577,10 @@ jobs:
           sleep 10
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run SQL query and check Miss cache header
         working-directory: test_app
@@ -1485,11 +1662,10 @@ jobs:
           fi
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   gh_connector_quickstart:
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
@@ -1583,10 +1759,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (issues)
         env:
@@ -1629,11 +1805,10 @@ jobs:
           query: 'select * from spiceai.stargazers limit 10;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
@@ -1722,10 +1897,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -1809,10 +1984,10 @@ jobs:
           sleep 20
 
       - name: Wait for dataset to be ready
-        working-directory: test_app
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
 
       - name: Run test query (tpch)
         env:
@@ -1831,11 +2006,10 @@ jobs:
           query: 'select * from db_uc.tpcds.store limit 1;'
 
       - name: Stop spice and check logs
-        working-directory: test_app
         if: always()
-        run: |
-          killall spice || true
-          cat spice.log
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
 
   graceful_shutdown_test_append:
     name: '${{ matrix.spicepod }} acceleration and graceful shutdown on ${{ matrix.target.name }}'
@@ -1947,10 +2121,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset is queryable
         uses: ./.github/actions/verify-dataset
@@ -1993,8 +2167,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           # Allow filesystem to sync after process exits
           sleep 2
 
@@ -2037,10 +2219,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 1
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '60'
 
       - name: Verify data_upsert dataset
         uses: ./.github/actions/verify-dataset
@@ -2128,10 +2310,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2143,8 +2325,16 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice || true
-          while pgrep -x spice > /dev/null; do sleep 1; done
+          # `spice run` spawns `spiced`, and `spiced` is the process that holds the
+          # ports and the data — SIGTERM to the CLI alone left it running, so the
+          # graceful-shutdown path under test never ran (#12058). Reuse the shared
+          # stopper so this signals both, and only processes belonging to this
+          # runner instance: several instances share one machine.
+          #
+          # A grace longer than the step timeout on purpose. This step exists to
+          # verify the runtime exits cleanly on SIGTERM, so one that does not must
+          # trip the step timeout rather than be SIGKILLed into looking healthy.
+          SPICE_STOP_GRACE=600 bash "$GITHUB_WORKSPACE/.github/actions/stop-spice/stop_spice.sh"
           sleep 2
 
       - name: Verify local DuckDB database
@@ -2182,10 +2372,10 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for dataset to be ready
-        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 3
-        run: |
-          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+          timeout: '180'
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -2207,6 +2397,10 @@ jobs:
     name: E2E Test CI
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
+    # The gate only reads the results it already has. Bounding it matters because it is
+    # the required check: a stuck gate blocks the queue even when every job it summarises
+    # has finished.
+    timeout-minutes: 5
     needs:
       - check_changes
       - setup-matrix
@@ -2230,11 +2424,57 @@ jobs:
       - graceful_shutdown_test_full
     steps:
       - name: Verify all E2E jobs succeeded
+        # Named rather than left to the runner default: this gate is the required
+        # merge-queue context, so the shell it reads `set -uo pipefail`, `command -v`
+        # and `$(…)` under must not depend on the image's default staying bash.
+        shell: bash
+        env:
+          # Read through the environment rather than interpolated into the script:
+          # the results are GitHub's own, but keeping workflow expressions out of
+          # `run:` bodies is the habit that stops the next one being attacker-
+          # controlled.
+          E2E_JOB_RESULTS: ${{ toJSON(needs) }}
         run: |
-          failure="${{ contains(needs.*.result, 'failure') }}"
-          cancelled="${{ contains(needs.*.result, 'cancelled') }}"
-          if [ "$failure" = "true" ] || [ "$cancelled" = "true" ]; then
-            echo "::error::One or more E2E Test CI jobs did not succeed"
+          set -uo pipefail
+
+          # `contains(needs.*.result, 'failure')` can answer only *whether*
+          # something went wrong, never which job it was, so this gate used to
+          # fail with a single line — "One or more E2E Test CI jobs did not
+          # succeed" — whichever of the jobs above it was. Since it is the required
+          # merge-queue context standing in for the whole matrix, that line is also
+          # the entire failure summary a dequeued PR gets: whoever triages it has
+          # to open the run and read down the job list to learn anything at all
+          # (#12643). Name the jobs instead. `toJSON(needs)` carries each one's
+          # result, so this needs no extra API call and no token.
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not available on this runner, so this gate cannot read the E2E job results. Failing closed rather than reporting a pass it did not verify."
             exit 1
           fi
+
+          # A `jq` that dies must not be mistaken for "nothing failed" — that
+          # would turn this gate into a rubber stamp on exactly the runs it exists
+          # to catch. Hence the explicit status check before the emptiness test.
+          # Allow-list the two results that pass rather than deny-listing the two
+          # that fail: an entry whose result were absent, or some state GitHub
+          # adds later, would be silently ignored by a deny-list and this gate
+          # would report a pass it had not established.
+          if ! not_succeeded="$(printf '%s' "$E2E_JOB_RESULTS" | jq -r '
+                to_entries
+                | map((.value.result // "missing") as $r
+                      | select($r != "success" and $r != "skipped")
+                      | "\(.key) (\($r))")
+                | join(", ")
+              ')"; then
+            echo "::error::Could not read the E2E job results, so this gate cannot tell whether the matrix passed. Failing closed."
+            exit 1
+          fi
+
+          if [ -n "$not_succeeded" ]; then
+            # `needs` keys are job ids, and a matrix job reports one result for
+            # the whole matrix — so this names the job to open, not the cell. That
+            # is still the difference between one click and twenty.
+            echo "::error::E2E Test CI jobs did not succeed: ${not_succeeded}"
+            exit 1
+          fi
+
           echo "All E2E Test CI jobs succeeded"

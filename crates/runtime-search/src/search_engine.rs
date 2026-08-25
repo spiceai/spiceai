@@ -22,8 +22,12 @@ use std::{collections::HashMap, sync::Arc};
 use super::embeddings::table::EmbeddingTable;
 use crate::candidate::vector::ChunkedNonIndexVectorGeneration;
 use crate::candidate::vector_udtf::VectorUDTFGeneration;
-use crate::error::{DataFusionSnafu, Error, FormattingSnafu, Result, SearchPipelineSnafu};
+use crate::error::{
+    AdditionalColumnNotFoundSnafu, CannotSearchDatasetSnafu, DataFusionSnafu, Error,
+    FormattingSnafu, Result, SearchPipelineSnafu,
+};
 use crate::table_provider_explorer::TableProviderExplorer;
+use snafu::ensure;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
@@ -111,19 +115,7 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
     async fn user_tables_that_can_search(&self) -> Result<Vec<TableReference>> {
         let mut searchable_tables = Vec::new();
         for t in self.df.get_user_table_names() {
-            if self
-                .embedding_columns_from_table(&t)
-                .await
-                .is_some_and(|cols| !cols.is_empty())
-            {
-                searchable_tables.push(t);
-                continue;
-            }
-            if self
-                .full_text_search_candidates(&t)
-                .await
-                .is_some_and(|fts_res| fts_res.is_ok_and(|c| !c.is_empty()))
-            {
+            if self.table_can_search(&t).await {
                 searchable_tables.push(t);
             }
         }
@@ -142,10 +134,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         let table_provider = self.df.get_table(tbl).await?;
         let mut embedding_columns: HashSet<String> = HashSet::default();
 
-        if let Some(embedding_table) = self
-            .explorer
-            .find_concrete::<EmbeddingTable>(&table_provider)
-        {
+        if let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+            table_provider.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) {
             for c in embedding_table.get_embedding_columns() {
                 embedding_columns.insert(c);
             }
@@ -207,17 +199,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         use crate::full_text::{
             as_compound_text_candidate_generations, as_es_text_candidate_generations,
         };
-        use runtime_datafusion_index::IndexedTableProvider;
         use search::generation::text_search::index::FullTextDatabaseIndex;
 
         let base_table_provider = self.df.get_table(tbl).await?;
-
-        let Some(indexed_table) = self
-            .explorer
-            .find_concrete::<IndexedTableProvider>(&base_table_provider)
-        else {
-            return Some(Ok(vec![]));
-        };
 
         // Compound (write-through) full-text index: a warm Tantivy primary paired with an
         // external Elasticsearch secondary. Registered instead of the concrete indexes for
@@ -227,10 +211,12 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::compound::CompoundSearchIndex;
-            if let Some(compound) = indexed_table
-                .get_indexes::<CompoundSearchIndex>()
-                .into_iter()
-                .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
+            if let Some((compounds, _)) = self
+                .explorer
+                .find_index::<CompoundSearchIndex>(&base_table_provider)
+                && let Some(compound) = compounds
+                    .into_iter()
+                    .find(|c| Arc::new((*c).clone()).as_vector_index().is_none())
             {
                 return Some(
                     as_compound_text_candidate_generations(
@@ -244,7 +230,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
             }
         }
 
-        if let Some(fts) = indexed_table.get_index::<FullTextDatabaseIndex>() {
+        if let Some((fts, _)) = self
+            .explorer
+            .find_index::<FullTextDatabaseIndex>(&base_table_provider)
+            && let Some(fts) = fts.first()
+        {
             return Some(
                 as_candidate_generations(
                     &fts.with_new_base(Arc::clone(&base_table_provider)),
@@ -259,8 +249,11 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         #[cfg(feature = "elasticsearch")]
         {
             use search::index::elasticsearch::ElasticsearchTextIndex;
-            let es_indexes = indexed_table.get_indexes::<ElasticsearchTextIndex>();
-            if !es_indexes.is_empty() {
+            if let Some((es_indexes, _)) = self
+                .explorer
+                .find_index::<ElasticsearchTextIndex>(&base_table_provider)
+                && !es_indexes.is_empty()
+            {
                 return Some(
                     as_es_text_candidate_generations(es_indexes, Arc::clone(&self.df), tbl.clone())
                         .await
@@ -270,6 +263,16 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
 
         Some(Ok(vec![]))
+    }
+
+    async fn table_can_search(&self, tbl: &TableReference) -> bool {
+        self.embedding_columns_from_table(tbl)
+            .await
+            .is_some_and(|cols| !cols.is_empty())
+            || self
+                .full_text_search_candidates(tbl)
+                .await
+                .is_some_and(|res| res.is_ok_and(|c| !c.is_empty()))
     }
 
     fn get_vector_index(
@@ -350,10 +353,10 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 is_chunked,
             )))
         } else {
-            let Some(embedding_table) = self
-                .explorer
-                .find_concrete::<EmbeddingTable>(&table_provider)
-            else {
+            let Some(embedding_table) = spice_table::find_layer::<EmbeddingTable>(
+                table_provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            ) else {
                 return Err(Error::CannotVectorSearchDataset {
                     data_source: tbl.clone(),
                 });
@@ -412,6 +415,61 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
                 )))
             }
         }
+    }
+
+    async fn validate_request(
+        &self,
+        tables: &[TableReference],
+        explicit_datasets_requested: bool,
+        additional_columns: &[Column],
+    ) -> Result<()> {
+        for tbl in tables {
+            let table_provider =
+                self.df
+                    .get_table(tbl)
+                    .await
+                    .ok_or_else(|| Error::DataSourcesNotFound {
+                        data_source: vec![tbl.clone()],
+                    })?;
+
+            if explicit_datasets_requested {
+                ensure!(
+                    self.table_can_search(tbl).await,
+                    CannotSearchDatasetSnafu {
+                        data_source: tbl.clone()
+                    }
+                );
+            }
+
+            let schema = table_provider.schema();
+            for col in additional_columns {
+                let col_applies = col.relation.as_ref().is_none_or(|rel| {
+                    tbl.clone()
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                        == rel
+                            .clone()
+                            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                });
+
+                if col_applies {
+                    ensure!(
+                        schema.column_with_name(&col.name).is_some(),
+                        AdditionalColumnNotFoundSnafu {
+                            column: col.name.clone(),
+                            data_source: tbl.clone(),
+                            available_columns: schema
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        }
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn search_with_cache(
@@ -519,6 +577,9 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         if tables.is_empty() {
             return Err(Error::NoTablesWithSearchFound {});
         }
+
+        self.validate_request(&tables, explicit_datasets_requested, additional_columns)
+            .await?;
 
         let span = match Span::current() {
             span if matches!(span.metadata(), Some(metadata) if metadata.name() == "search") => {
@@ -726,8 +787,21 @@ fn wrap_cache_to_result(
             while let Some(batch_result) = stream.next().await {
                 if records_size < cache_max_size
                     && let Ok(batch) = &batch_result {
-                        records.push(batch.clone());
-                        records_size += batch.get_array_memory_size();
+                        // Accumulate compacted batches: a top-k plan yields
+                        // zero-copy slices, so holding one keeps its whole scan
+                        // batch alive and bills the entry for it — which would
+                        // reject a small result whose parent happens to be
+                        // large. Measure first so the copy is only paid for a
+                        // result that can still be cached.
+                        records_size = records_size.saturating_add(
+                            arrow_tools::record_batch::compacted_memory_size(batch),
+                        );
+                        if records_size < cache_max_size {
+                            records.push(arrow_tools::record_batch::compact_retained_buffers(batch));
+                        } else {
+                            records.clear();
+                            records.shrink_to_fit();
+                        }
                     }
 
                 yield batch_result;
@@ -735,7 +809,7 @@ fn wrap_cache_to_result(
 
             if records_size < cache_max_size {
                 let cached_result = CachedAggregationResult::new(
-                    Arc::new(records),
+                    records,
                     cloned_primary_key,
                     cloned_data_columns,
                     cloned_matches,

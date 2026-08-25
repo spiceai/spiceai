@@ -34,7 +34,7 @@ use std::{
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
     download::{ST_CONFIG_NAMES, download_artifacts},
-    tokenization::EncodingInput,
+    tokenization::{EncodingInput, Tokenization},
 };
 
 use tempfile::tempdir;
@@ -71,6 +71,45 @@ pub(crate) fn load_config(model_root: &Path) -> Result<ModelConfig> {
     Ok(config)
 }
 
+/// Loads the tokenizer, config, and derives the [`Tokenization`] settings needed to build a TEI
+/// `Infer` pipeline from a directory of model artifacts. Shared by
+/// [`crate::embeddings::candle::tei::TeiEmbed::from_dir`] and
+/// [`crate::rerank::tei::TeiRerank::from_dir`], which both instantiate the same backend and would
+/// otherwise duplicate this setup.
+pub(crate) fn load_tokenization(
+    root: &Path,
+    max_seq_length_overwrite: Option<usize>,
+) -> Result<(Tokenizer, ModelConfig, Tokenization)> {
+    let tokenizer = load_tokenizer(root)?;
+    let config = load_config(root)?;
+    let position_offset = position_offset(&config);
+
+    let max_input_length = if let Some(max_seq_length) = max_seq_length_overwrite {
+        max_seq_length
+    } else {
+        match max_seq_length_from_st_config(root) {
+            Ok(max_seq_length_opt) => {
+                max_seq_length_opt.unwrap_or(config.max_position_embeddings - position_offset)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load max_seq_length from ST config: {e}");
+                config.max_position_embeddings - position_offset
+            }
+        }
+    };
+
+    let token = Tokenization::new(
+        1,
+        tokenizer.clone(),
+        max_input_length,
+        position_offset,
+        None,
+        None,
+    );
+
+    Ok((tokenizer, config, token))
+}
+
 pub(crate) fn position_offset(config: &ModelConfig) -> usize {
     // Position IDs offset. Used for Roberta and camembert.
     if config.model_type == "xlm-roberta"
@@ -99,10 +138,22 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     }
 }
 
-fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
-    let mut builder = ApiBuilder::new()
-        .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string));
+/// Builds a `HuggingFace` API client, honouring `HF_HUB_CACHE` and applying `hf_token`
+/// only when it actually carries a value.
+///
+/// `ApiBuilder::with_token` *overwrites* the builder's token, and `ApiBuilder::new`
+/// pre-populates it from the Hub's own credential file (`~/.cache/huggingface/token`,
+/// written by `huggingface-cli login`). Passing `None` through therefore discards a
+/// credential the machine already has, leaving every download anonymous and at the
+/// mercy of the Hub's unauthenticated access rules. An empty string is worse than
+/// `None`: it is sent as an empty bearer token and rejected with 401. So both are
+/// treated as "no token supplied — keep whatever the Hub cache provided".
+fn hf_api_builder(hf_token: Option<&str>) -> ApiBuilder {
+    let mut builder = ApiBuilder::new().with_progress(false);
+
+    if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
+        builder = builder.with_token(Some(token.to_string()));
+    }
 
     if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
         let cache_path: PathBuf = cache_dir.into();
@@ -117,7 +168,11 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
         }
     }
 
-    let api = builder
+    builder
+}
+
+fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
+    let api = hf_api_builder(hf_token)
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
@@ -139,11 +194,7 @@ pub async fn download_hf_file(
     file: &str,
     hf_token: Option<&str>,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let api = ApiBuilder::new()
-        .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string))
-        .build()
-        .boxed()?;
+    let api = hf_api_builder(hf_token).build().boxed()?;
 
     let repo_type = match repo_type_opt {
         Some("datasets") => RepoType::Dataset,
@@ -173,9 +224,17 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(Arc::clone(&api_repo))
-        .await
-        .context(FailedWithHFApiSnafu)?;
+    // Fallback to `pytorch_model.bin` if no safetensors.
+    // Supported by text-embedding-inference, but must be kept in sync manually (if new weight formats).
+    if download_safetensors(Arc::clone(&api_repo)).await.is_err() {
+        tracing::warn!(
+            "safetensors weights not found; falling back to `pytorch_model.bin`. Model loading is significantly slower."
+        );
+        api_repo
+            .get("pytorch_model.bin")
+            .await
+            .context(FailedWithHFApiSnafu)?;
+    }
 
     Ok(root_dir)
 }

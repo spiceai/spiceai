@@ -144,9 +144,52 @@ pub struct ReplConfig {
     /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
     #[arg(long, short = 'x', help_heading = "SQL REPL")]
     pub expanded: bool,
+
+    /// Set when the Flight endpoint was chosen on the command line and `http_endpoint` was not,
+    /// so nothing pointed the HTTP endpoint at the runtime the SQL queries go to — whether it
+    /// then holds a built-in default or a value derived from something else, such as a cloud
+    /// region. `nql` — the one REPL feature that speaks HTTP rather than Flight — says so
+    /// instead of answering from whatever that endpoint reaches. See #11005.
+    ///
+    /// Not a flag: only the caller that resolved both endpoints knows where each came from.
+    #[arg(skip)]
+    pub http_endpoint_may_be_another_runtime: bool,
 }
 
+/// Whether the REPL's HTTP endpoint may address a runtime other than the one SQL queries go to,
+/// given whether each endpoint was chosen on the command line.
+///
+/// This is a question about provenance, not about hosts. The Flight endpoint can be moved on
+/// its own — by `spice sql --endpoint` or `spiced --repl-flight-endpoint` — leaving the HTTP
+/// endpoint at whatever it already held, and comparing the two cannot settle whether they
+/// agree: a host and port say nothing about which runtime answers there. Two runtimes can both
+/// be on loopback, and one runtime can be reached at unrelated addresses through a tunnel.
+///
+/// So only endpoints that were chosen, or defaulted as a pair, are trusted:
+///
+/// - neither chosen — the built-in defaults, or a pair derived from a cloud region: trusted;
+/// - both chosen — the caller paired them, even if the HTTP one repeats the default: trusted;
+/// - Flight chosen alone — nothing pointed the HTTP endpoint at that runtime: not trusted.
+///
+/// Callers pass the result to [`ReplConfig::http_endpoint_may_be_another_runtime`]. See #11005.
+#[must_use]
+pub fn http_endpoint_unpaired(flight_chosen: bool, http_chosen: bool) -> bool {
+    flight_chosen && !http_chosen
+}
+
+/// How long `nql` waits with nothing arriving before it gives up on the runtime.
+///
+/// This bounds silence rather than the whole request, so a translation that is merely slow is
+/// not cut off. `spice nsql` applies the same deadline to the same endpoint.
+const NSQL_SILENCE_DEADLINE: std::time::Duration = std::time::Duration::from_mins(5);
+
 const NQL_LINE_PREFIX: &str = "nql ";
+
+/// The header the runtime's HTTP API reads an API key from.
+///
+/// The runtime accepts either this or `Authorization: Bearer`; this is the one every other
+/// CLI HTTP call site sends (`RuntimeContext::get_headers`), so `nql` sends it too.
+const API_KEY_HEADER: &str = "X-API-Key";
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -162,19 +205,26 @@ async fn send_nsql_request(
     query: String,
     runtime: LlmRuntime,
     user_agent: &str,
+    api_key: Option<&str>,
 ) -> Result<String, reqwest::Error> {
-    client
+    let mut request = client
         .post(format!("{base_url}/v1/nsql"))
         .header("Content-Type", "application/json")
         .header("User-Agent", user_agent)
         .json(&json!({
             "query": query,
             "model": runtime,
-        }))
-        .send()
-        .await?
-        .text()
-        .await
+        }));
+
+    // `nql` is the one REPL feature that goes over the runtime's HTTP API rather than Flight.
+    // Every Flight query in the same session authenticates with `ReplConfig::api_key`, so this
+    // request has to as well — otherwise it is refused wherever the session's SQL succeeds.
+    // See #12491.
+    if let Some(api_key) = api_key {
+        request = request.header(API_KEY_HEADER, api_key);
+    }
+
+    request.send().await?.text().await
 }
 
 const SPECIAL_COMMANDS: [&str; 12] = [
@@ -616,6 +666,15 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
             _ if lower.starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
+                if repl_config.http_endpoint_may_be_another_runtime {
+                    println!(
+                        "{} {}",
+                        Color::Red.paint("Error:"),
+                        nql_endpoint_mismatch_message(&repl_config)
+                    );
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
                 // `lower` and `line` have the same byte length, so slicing
                 // off the prefix on the original line yields the user's
                 // original-case question.
@@ -624,6 +683,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     repl_config.http_endpoint.clone(),
                     question,
                     &user_agent,
+                    repl_config.api_key.as_deref(),
                     expanded,
                 )
                 .await
@@ -793,6 +853,40 @@ fn format_flight_sql_status(status: &Status) -> String {
     )
 }
 
+/// Why `nql` will not run when nothing pointed the HTTP endpoint at the SQL target.
+///
+/// `nql` is the one REPL feature that goes over the runtime's HTTP API; everything else uses
+/// Flight. Answering it from an endpoint nobody chose, while this session's SQL goes somewhere
+/// chosen, would silently mix results from two runtimes — so state both endpoints, and the flag
+/// that settles which runtime `nql` should ask, without claiming to know what answers where.
+fn nql_endpoint_mismatch_message(repl_config: &ReplConfig) -> String {
+    let http_endpoint = &repl_config.http_endpoint;
+    let flight_endpoint = &repl_config.repl_flight_endpoint;
+
+    format!(
+        "`nql` uses the runtime's HTTP API at '{http_endpoint}', which nothing pointed at \
+         the runtime this session's SQL queries go to ('{flight_endpoint}'). Pass \
+         `--http-endpoint` for the runtime `nql` should ask — repeating the endpoint above \
+         is accepted, and confirms that is the one you mean."
+    )
+}
+
+/// Why the REPL could not open its Flight connection.
+///
+/// The endpoint is the runtime's **Arrow Flight (gRPC)** address, not its HTTP API, and the
+/// scheme (`http://`) hides that: pointing the REPL at an HTTP ingress, or at the HTTP port,
+/// fails here with a bare transport error. Say what the endpoint has to serve. See #11005.
+fn flight_connection_failed(flight_endpoint: &str, cause: &str) -> Box<dyn Error> {
+    Box::<dyn Error>::from(format!(
+        "Connection failed to spiced at '{flight_endpoint}': {cause}. This endpoint must \
+         serve the runtime's Arrow Flight (gRPC) API — its flight port, 50051 by default, \
+         reached through a gRPC-capable route if it is behind a proxy or ingress; the \
+         runtime's HTTP port will not answer here. Check that the Spice runtime is running, \
+         that the endpoint including port is correct, and that the TLS config (if used) is \
+         valid."
+    ))
+}
+
 async fn connect_flight_client(
     repl_config: &ReplConfig,
     user_agent: &str,
@@ -841,11 +935,7 @@ async fn connect_flight_client(
 
     let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
         .await
-        .map_err(|e| {
-        Box::<dyn Error>::from(format!(
-            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
-        ))
-    })?;
+        .map_err(|e| flight_connection_failed(&repl_flight_endpoint, &e.to_string()))?;
 
     Ok(FlightServiceClient::new(channel)
         .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
@@ -1038,24 +1128,46 @@ fn display_records(
     Ok(pretty_batches)
 }
 
-/// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
+/// Use the `POST /v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
+///
+/// `api_key` is the session's key — the same one every Flight query authenticates with. See
+/// #12491.
 async fn get_and_display_nql_records(
     endpoint: String,
     query: String,
     user_agent: &str,
+    api_key: Option<&str>,
     expanded: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
+    // `/v1/nsql` is a model round trip -- it builds context, invokes the model, and may retry
+    // generation before running the query it produced. A whole-request deadline therefore cuts
+    // off answers that are merely slow, so the deadline measures silence instead: this response
+    // is not streamed, so it bounds the wait for the answer without capping how long the model
+    // may take to produce one.
+    let mut client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(NSQL_SILENCE_DEADLINE);
+
+    // A request carrying the session's key must not follow a redirect. `reqwest` follows up to
+    // ten by default, and the sanitisation it applies when the origin changes drops
+    // `Authorization` and cookies but *not* custom headers — so a runtime or proxy answering
+    // `/v1/nsql` with a cross-origin `Location` would hand `X-API-Key` to whatever that names.
+    //
+    // Only the keyed request is constrained: without a key there is nothing to disclose, and
+    // leaving that case on the default policy means no setup that works today stops working.
+    if api_key.is_some() {
+        client = client.redirect(reqwest::redirect::Policy::none());
+    }
+
     let resp = send_nsql_request(
-        &Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?,
+        &client.build()?,
         endpoint,
         query,
         LlmRuntime::Openai,
         user_agent,
+        api_key,
     )
     .await
     .map_err(|e| {
@@ -1372,6 +1484,62 @@ mod tests {
         assert_eq!(default, cache_control::CacheControl::Cache);
     }
 
+    /// #11005: refusing `nql` is only useful if the message names both endpoints and the flag
+    /// that reconciles them — otherwise it reads as `nql` being broken.
+    #[test]
+    fn the_nql_mismatch_message_names_both_endpoints_and_the_flag() {
+        let config = ReplConfig::parse_from([
+            "repl",
+            "--http-endpoint",
+            "http://127.0.0.1:8090",
+            "--repl-flight-endpoint",
+            "http://remote:50051",
+        ]);
+
+        let message = nql_endpoint_mismatch_message(&config);
+
+        assert!(message.contains("http://127.0.0.1:8090"), "{message}");
+        assert!(message.contains("http://remote:50051"), "{message}");
+        assert!(message.contains("--http-endpoint"), "{message}");
+    }
+
+    /// #11005: the reporter pointed `--endpoint` at an HTTP ingress and got a bare transport
+    /// error, so the message has to say the endpoint serves Flight/gRPC on its own port.
+    #[test]
+    fn the_flight_connection_failure_says_the_endpoint_serves_grpc() {
+        let endpoint = "http://spice-test.127.0.0.1.nip.io";
+        let error = flight_connection_failed(endpoint, "transport error");
+        let message = error.to_string();
+
+        assert!(message.contains(endpoint), "{message}");
+        assert!(message.contains("transport error"), "{message}");
+        assert!(message.contains("gRPC"), "{message}");
+        assert!(message.contains("50051"), "{message}");
+    }
+
+    /// The guard is not a flag, and defaults off: a caller that does not resolve endpoint
+    /// provenance gets the previous behaviour rather than a REPL that refuses `nql`.
+    #[test]
+    fn the_nql_guard_defaults_off_when_parsed_from_flags() {
+        let config = ReplConfig::parse_from(["repl"]);
+
+        assert!(!config.http_endpoint_may_be_another_runtime);
+    }
+
+    /// #11005: moving the SQL target without saying where `nql` should go is the one case
+    /// nothing can vouch for. Defaulted pairs and chosen pairs both can.
+    #[test]
+    fn only_a_flight_endpoint_chosen_alone_is_unpaired() {
+        assert!(http_endpoint_unpaired(true, false));
+
+        // Both defaulted: the local pair, or a pair derived from a cloud region.
+        assert!(!http_endpoint_unpaired(false, false));
+        // Both chosen: the caller paired them, even if the HTTP one repeats its default.
+        assert!(!http_endpoint_unpaired(true, true));
+        // Only the HTTP endpoint moved, so SQL still goes to the default it belongs to.
+        assert!(!http_endpoint_unpaired(false, true));
+    }
+
     #[test]
     fn test_cache_control_equality() {
         assert_eq!(
@@ -1385,6 +1553,248 @@ mod tests {
         assert_ne!(
             cache_control::CacheControl::Cache,
             cache_control::CacheControl::NoCache
+        );
+    }
+
+    /// How long a stub server waits to be contacted, and then to be spoken to, before giving up.
+    const STUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Accept one connection, giving up after `STUB_TIMEOUT` rather than parking forever.
+    ///
+    /// Each stub below is joined only *after* the client call has returned, so a regression that
+    /// makes `get_and_display_nql_records` fail before it connects would leave a plain blocking
+    /// `accept()` waiting for a client that is never coming. The deadline turns that into a
+    /// prompt, named failure, and the matching read timeout does the same for a client that
+    /// connects but never finishes its request.
+    fn accept_one(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("set stub listener non-blocking");
+
+        let deadline = Instant::now() + STUB_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Back to blocking reads, but bounded, so `read_http_request` cannot stall.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("restore blocking stub stream");
+                    stream
+                        .set_read_timeout(Some(STUB_TIMEOUT))
+                        .expect("set stub read timeout");
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no client connected to the stub server within {STUB_TIMEOUT:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept on the stub server failed: {e}"),
+            }
+        }
+    }
+
+    /// Serve exactly one HTTP request on an ephemeral port from a plain-std thread, answering
+    /// with a one-row JSON array, and hand back the raw request text.
+    ///
+    /// Asserting on the bytes `nql` actually puts on the wire is the point: the defect in
+    /// #12491 was a header that never left the client, which no assertion on `ReplConfig`
+    /// would have caught. A std-thread listener keeps it hermetic — the workspace `tokio` has
+    /// no `net` feature and the crate has no HTTP-mock dev-dependency.
+    fn spawn_nsql_request_capture() -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind capture listener");
+        let addr = listener.local_addr().expect("capture listener addr");
+        let handle = std::thread::spawn(move || {
+            let mut stream = accept_one(&listener);
+            let request = read_http_request(&mut stream);
+
+            // A real row, so the response parses through schema inference the way a runtime's
+            // answer would rather than exercising an empty-result path.
+            let body = r#"[{"count":1}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write nsql response");
+
+            request
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Read one whole HTTP request — headers plus the body its `Content-Length` declares — and
+    /// return it as text, so a stub answers only once the client has finished sending and the
+    /// captured text is complete.
+    ///
+    /// Bounded by the read timeout `accept_one` installs: a client that connects and then goes
+    /// quiet fails here instead of stalling the thread.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .expect("read request from the stub server's client within the read timeout");
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// #12491: `nql` is the one REPL feature that goes over the runtime's HTTP API, and it sent
+    /// no credentials — so against any runtime that requires authentication it was refused while
+    /// plain SQL in the same session, which does send the key over Flight, worked.
+    #[tokio::test]
+    async fn the_nql_request_carries_the_session_api_key() {
+        let (endpoint, captured) = spawn_nsql_request_capture();
+
+        get_and_display_nql_records(
+            endpoint,
+            "how many rows are in taxi_trips".to_string(),
+            "spice/test",
+            Some("session-api-key"),
+            false,
+        )
+        .await
+        .expect("nql request against the capture server should succeed");
+
+        let request = captured.join().expect("capture thread should not panic");
+
+        // The header name is compared case-insensitively because reqwest lowercases names on the
+        // wire; the *value* is compared exactly, since an API key is case-sensitive and a
+        // regression that mangled its casing would otherwise pass. The literal is spelled out
+        // rather than read from `API_KEY_HEADER` so the test pins the wire format independently
+        // of the constant.
+        let sent_key = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("X-API-Key") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            sent_key,
+            Some("session-api-key"),
+            "the request should carry the session's API key verbatim: {request}"
+        );
+        // The header the fix adds must not displace the ones the path already sent.
+        assert!(request.contains("spice/test"), "{request}");
+        assert!(request.contains("/v1/nsql"), "{request}");
+    }
+
+    /// Serve one HTTP request answering with a cross-origin redirect to `location`.
+    fn spawn_redirect_to(location: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirect listener");
+        let addr = listener.local_addr().expect("redirect listener addr");
+        let location = location.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut stream = accept_one(&listener);
+            // Drained but not inspected: the response below is what this stub is for.
+            let _ = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write redirect response");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A request carrying the session's key must not follow a redirect: `reqwest`'s cross-origin
+    /// sanitisation drops `Authorization` and cookies but not custom headers, so following one
+    /// would hand `X-API-Key` to whatever the `Location` names.
+    ///
+    /// The redirect target is a port nothing listens on, which is what makes the two behaviours
+    /// distinguishable without a second capture server: not following returns the 302 itself and
+    /// fails in the response parser, while following would fail to connect. So the *parse* error
+    /// is the evidence that the key stayed put.
+    #[tokio::test]
+    async fn a_keyed_nql_request_does_not_follow_a_redirect() {
+        let unreachable_target = {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind throwaway listener");
+            let addr = listener.local_addr().expect("throwaway listener addr");
+            drop(listener);
+            format!("http://{addr}/v1/nsql")
+        };
+        let (endpoint, redirector) = spawn_redirect_to(&unreachable_target);
+
+        let error = get_and_display_nql_records(
+            endpoint,
+            "how many rows are in taxi_trips".to_string(),
+            "spice/test",
+            Some("session-api-key"),
+            false,
+        )
+        .await
+        .expect_err("a redirect that is not followed cannot produce records");
+
+        redirector.join().expect("redirect thread should not panic");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Response may be malformed"),
+            "the redirect should have been left unfollowed and failed in the parser, not \
+             chased to its target: {message}"
+        );
+    }
+
+    /// A session with no API key keeps sending no key — an unauthenticated runtime must not
+    /// start seeing an empty credential it then has to reject.
+    #[tokio::test]
+    async fn the_nql_request_omits_the_api_key_header_when_the_session_has_none() {
+        let (endpoint, captured) = spawn_nsql_request_capture();
+
+        get_and_display_nql_records(
+            endpoint,
+            "how many rows are in taxi_trips".to_string(),
+            "spice/test",
+            None,
+            false,
+        )
+        .await
+        .expect("nql request against the capture server should succeed");
+
+        let request = captured.join().expect("capture thread should not panic");
+
+        assert!(
+            !request.to_ascii_lowercase().contains("x-api-key"),
+            "a keyless session should send no API-key header: {request}"
         );
     }
 }

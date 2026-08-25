@@ -54,6 +54,16 @@ pub enum Error {
 
 #[async_trait]
 pub trait PartitionCreator: AsAny + Debug + Send + Sync {
+    /// Whether partitions this creator produces accept writes addressed to the
+    /// partition table itself, rather than only through the creating engine's
+    /// own insert path. Only such creators can be the target of a partitioned
+    /// dual-write.
+    ///
+    /// Defaults to `false`: a creator opts in, so a new implementation is never
+    /// silently treated as dual-writable.
+    fn accepts_direct_partition_writes(&self) -> bool {
+        false
+    }
     /// Create a new [`Partition`] using the given partition values.
     ///
     /// For single-column partitions, pass a single-element vector.

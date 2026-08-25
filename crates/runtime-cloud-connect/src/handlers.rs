@@ -31,6 +31,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use snafu::Snafu;
 
+use crate::identity::AppAttachment;
+use crate::sealed_secrets::DeliveredSecrets;
+
 /// Why a command did not succeed.
 ///
 /// Each variant maps onto exactly one wire `ResultCode`, so the control plane
@@ -56,6 +59,16 @@ pub enum CommandError {
     /// The instance hit a fault of its own while handling the command.
     #[snafu(display("{message}"))]
     Internal { message: String },
+
+    /// A command of this kind is already in flight and this one was refused
+    /// before any work started. Retryable once the first one finishes.
+    #[snafu(display("{message}"))]
+    Busy { message: String },
+
+    /// The command ran but its result exceeds what the control stream carries.
+    /// Never accompanied by a partial payload.
+    #[snafu(display("{message}"))]
+    ResultTooLarge { message: String },
 }
 
 impl CommandError {
@@ -86,6 +99,49 @@ impl CommandError {
             message: message.into(),
         }
     }
+
+    /// A command of this kind is already in flight.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy {
+            message: message.into(),
+        }
+    }
+
+    /// The result is too large to send on the control stream.
+    pub fn result_too_large(message: impl Into<String>) -> Self {
+        Self::ResultTooLarge {
+            message: message.into(),
+        }
+    }
+}
+
+/// Most rows a [`RuntimeHandle::execute_query`] result may carry.
+pub const MAX_QUERY_ROWS: u32 = 500;
+
+/// Most bytes the complete Arrow IPC stream of a [`RuntimeHandle::execute_query`]
+/// result may occupy on the control stream.
+pub const MAX_QUERY_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The row cap an `ExecuteQuery` actually gets: its own request bounded by
+/// [`MAX_QUERY_ROWS`], with zero meaning the full default.
+#[must_use]
+pub fn effective_max_rows(requested: u32) -> u32 {
+    if requested == 0 {
+        MAX_QUERY_ROWS
+    } else {
+        requested.min(MAX_QUERY_ROWS)
+    }
+}
+
+/// A bounded `ExecuteQuery` result.
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    /// A complete Arrow IPC stream — schema, record batches, end-of-stream —
+    /// never a fragment and never chunked across results.
+    pub arrow_ipc: Vec<u8>,
+    /// How many rows `arrow_ipc` carries. Reported in telemetry; the values
+    /// themselves are not.
+    pub row_count: u64,
 }
 
 /// An optional command a [`RuntimeHandle`] may or may not implement.
@@ -105,6 +161,8 @@ impl CommandError {
 pub enum Capability {
     /// Apply cloud-managed Spicepod YAML.
     ApplySpicepod,
+    /// Apply the control plane's current app attachment state.
+    AttachApp,
     /// Restart the runtime process.
     Restart,
     /// Upgrade the runtime in place.
@@ -113,12 +171,16 @@ pub enum Capability {
     GetLogs,
     /// Report runtime readiness.
     GetStatus,
+    /// Execute a bounded SQL query through the in-process runtime.
+    ExecuteQuery,
 }
 
 impl Capability {
     /// Every capability this client can advertise, in wire-name order.
     pub const ALL: &'static [Self] = &[
         Self::ApplySpicepod,
+        Self::AttachApp,
+        Self::ExecuteQuery,
         Self::GetLogs,
         Self::GetStatus,
         Self::Restart,
@@ -131,10 +193,12 @@ impl Capability {
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::ApplySpicepod => "apply_spicepod",
+            Self::AttachApp => "attach_app",
             Self::Restart => "restart",
             Self::UpgradeRuntime => "upgrade_runtime",
             Self::GetLogs => "get_logs",
             Self::GetStatus => "get_status",
+            Self::ExecuteQuery => "execute_query",
         }
     }
 }
@@ -183,6 +247,34 @@ impl RuntimePhase {
             Self::Failed => "Failed",
         }
     }
+}
+
+/// One deployment, as it reaches a [`RuntimeHandle`].
+///
+/// A struct rather than positional arguments: `apply_spicepod(dir, yaml, None)`
+/// reads as nothing at the call site, and a later field would be one more thing
+/// to thread through every implementation in the right order.
+pub struct SpicepodDeployment<'a> {
+    /// Where the cloud-managed spicepod lives.
+    pub config_dir: &'a Path,
+    /// The spicepod to apply, verbatim.
+    pub spicepod_yaml: &'a str,
+    /// App secrets that rode the same dispatch, already opened (see
+    /// [`crate::sealed_secrets`]). They arrive *with* the spicepod because a
+    /// component resolves its secrets as it loads: values that landed
+    /// afterwards would arrive after the components referencing them had
+    /// already tried.
+    ///
+    /// `None` means the deployment carried none, which is distinct from an
+    /// empty map — an app whose secrets were all removed.
+    pub delivered_secrets: Option<DeliveredSecrets>,
+    /// The app this instance's telemetry is attributed to. It rides the
+    /// deployment because the instance cannot derive it and the control plane
+    /// already knows it; a handle that exports metrics records it and stamps it
+    /// as `scp_app_id`.
+    ///
+    /// `None` when the control plane named no app.
+    pub app_id: Option<&'a str>,
 }
 
 /// Runtime readiness: the reply to `GetStatus`, and the source of the phase
@@ -248,14 +340,23 @@ pub trait RuntimeHandle: Send + Sync + 'static {
     /// The message returned when `capability` is dispatched anyway.
     ///
     /// The default merely names the command. Override it wherever the
-    /// instance can say something the operator can act on — "there is no
-    /// supervisor to restart this process" beats "not implemented".
+    /// instance can say something the operator can act on — "upgrade it the way
+    /// you installed it" beats "not implemented".
     fn unsupported_reason(&self, capability: Capability) -> String {
         format!(
             "{} is not supported by this instance",
             capability.wire_name()
         )
     }
+
+    /// Clear Cloud-delivered values still held by the runtime after a
+    /// cloud-dispatched `Remove` has durably cleared their persisted cache.
+    ///
+    /// Already-loaded components may retain values they resolved into their
+    /// own in-memory configuration; a standalone runtime deliberately keeps
+    /// serving after removal, so stopping or restarting those components
+    /// remains the local operator's decision.
+    async fn clear_cloud_delivered_secrets(&self);
 
     /// Number of active datasets currently loaded.
     async fn active_datasets(&self) -> u32 {
@@ -277,38 +378,58 @@ pub trait RuntimeHandle: Send + Sync + 'static {
         })
     }
 
-    /// Apply a cloud-managed spicepod to disk and trigger a reload.
+    /// Persist a cloud-managed spicepod as the configuration this instance
+    /// starts on, and put as much of it into effect as the handle can.
+    ///
+    /// An apply never ends or interrupts the process: it answers with the
+    /// document the control plane reads, and an implementation that cannot put
+    /// part of the deployment into effect says so in that document rather than
+    /// restarting to get there. Redelivering a deployment the instance is
+    /// already serving is a no-op that answers the same way.
     ///
     /// The default implementation writes the YAML to
     /// `config_dir/spicepod-cloud-managed.yml` via `tokio::fs` so the
-    /// filesystem write does not block the runtime worker thread. It
-    /// does NOT reload the spicepod into the running runtime — the
-    /// caller must restart spiced (or override this method) for the new
-    /// configuration to take effect.
+    /// filesystem write does not block the runtime worker thread. It cannot
+    /// apply anything to a running process, so it reports `applied: false`: the
+    /// file is on disk and the next start — whenever that is — picks it up.
     ///
-    /// The returned envelope therefore advertises `reload: "deferred"`
-    /// and `applied: false` so the control plane can surface that the
-    /// runtime is still serving the previous configuration. Adapters
-    /// that can hot-reload (or that synchronously trigger a restart)
-    /// should override this and return `applied: true`.
+    /// The default **refuses** a deployment that carries secrets rather than
+    /// writing the spicepod and dropping them: an adapter that cannot apply
+    /// secrets would otherwise report success and then fail every referencing
+    /// component with a missing-parameter error that names nothing.
+    ///
+    /// [`SpicepodDeployment::app_id`] is ignored by the default implementation,
+    /// which has no metrics pipeline to attribute.
     async fn apply_spicepod(
         &self,
-        config_dir: &Path,
-        spicepod_yaml: &str,
+        deployment: SpicepodDeployment<'_>,
     ) -> Result<serde_json::Value, CommandError> {
-        let path = config_dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
+        if deployment
+            .delivered_secrets
+            .is_some_and(|secrets| !secrets.is_empty())
+        {
+            // `Unsupported`, not `Failed`: this adapter will never be able to
+            // apply secrets, so a retry cannot help and the control plane should
+            // not schedule one.
+            return Err(CommandError::unsupported(
+                "this runtime adapter cannot apply control-plane-delivered secrets; the spicepod \
+                 was NOT written. Implement RuntimeHandle::apply_spicepod to accept them.",
+            ));
+        }
+        let path = deployment
+            .config_dir
+            .join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| CommandError::failed(format!("create config dir: {e}")))?;
         }
-        tokio::fs::write(&path, spicepod_yaml)
+        tokio::fs::write(&path, deployment.spicepod_yaml)
             .await
             .map_err(|e| CommandError::failed(format!("write spicepod: {e}")))?;
         Ok(serde_json::json!({
             "path": path.display().to_string(),
             "applied": false,
-            "reload": "deferred",
             "note": "spicepod written to disk; restart spiced (or implement RuntimeHandle::apply_spicepod) to take effect",
         }))
     }
@@ -364,6 +485,91 @@ pub trait RuntimeHandle: Send + Sync + 'static {
             "GetStatus is not implemented in this build",
         ))
     }
+
+    /// The configuration sections whose deployed value is not the one this
+    /// process is running with, sorted and deduplicated: what a restart would
+    /// put into effect. Stamped on every heartbeat.
+    ///
+    /// Not a [`Capability`]: the client pushes it with the heartbeat rather than
+    /// answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `None` and `Some` of an empty set are different answers, and the control
+    /// plane reads them as different states: `None` means this instance has no
+    /// restart-state source of truth and claims nothing, an empty `Some` means
+    /// it looked and nothing is pending. The default is `None` for that reason —
+    /// a handle with nothing to read must never send an empty set as a stand-in
+    /// for "unknown".
+    ///
+    /// An implementation answers from the same place its [`Self::status`]
+    /// document does, so the heartbeat and that document cannot disagree about
+    /// what is pending.
+    async fn restart_required(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The instance's current metrics, as a serialized OTLP
+    /// `ExportMetricsServiceRequest`.
+    ///
+    /// Not a [`Capability`]: the client pushes these on its own cadence rather
+    /// than answering a command, so there is nothing to advertise or dispatch.
+    ///
+    /// `Ok(None)` means this instance has nothing to report — either it does not
+    /// export metrics at all, which is the default, it has none yet, or it has not
+    /// been told which app to attribute them to (see [`Self::apply_spicepod`]). An
+    /// `Err` means collection was attempted and failed; the two are distinct so a
+    /// permanently broken collection cannot pass for an idle runtime.
+    async fn collect_metrics(&self) -> Result<Option<Vec<u8>>, CommandError> {
+        Ok(None)
+    }
+
+    /// Apply the control plane's current app attachment state: the attached
+    /// app plus the portal metadata that describes it, as one tuple.
+    ///
+    /// `None` means detached. A present attachment always carries a non-empty
+    /// `app_id`, and its optional members are non-empty when present; the
+    /// client rejects empty present values before invoking the handle. An
+    /// implementation persists the tuple as a unit — see
+    /// [`crate::IdentityStore::set_attachment`] for the detach semantics.
+    async fn attach_app(
+        &self,
+        _attachment: Option<&AppAttachment>,
+    ) -> Result<serde_json::Value, CommandError> {
+        Err(CommandError::unsupported(
+            "AttachApp is not implemented in this build",
+        ))
+    }
+
+    /// Execute `sql` through the in-process runtime and return at most
+    /// `max_rows` rows as a complete Arrow IPC stream.
+    ///
+    /// `max_rows` arrives already reduced by [`effective_max_rows`], so an
+    /// implementation caps at the value it is handed rather than re-deriving
+    /// the limit. Serialization must be bounded by
+    /// [`MAX_QUERY_RESULT_BYTES`]: a result that would exceed it returns
+    /// [`CommandError::ResultTooLarge`] rather than a truncated stream, and
+    /// the bytes are never materialized past the cap.
+    ///
+    /// Run it read-only. The command arrives from the control plane rather than
+    /// from someone holding the instance's own credentials, so an
+    /// implementation reads the instance and never changes it.
+    ///
+    /// `sql` and the values it returns are confidential: keep both out of logs,
+    /// traces, and metrics. The returned error message is the one exception —
+    /// it reaches the caller who wrote the query and nobody else, so it carries
+    /// the engine's diagnostic, which is the only thing that makes a rejected
+    /// statement fixable.
+    ///
+    /// The default reports the command as unsupported so a handle that cannot
+    /// query neither advertises `execute_query` nor fabricates a result.
+    async fn execute_query(
+        &self,
+        _sql: &str,
+        _max_rows: u32,
+    ) -> Result<QueryOutcome, CommandError> {
+        Err(CommandError::unsupported(
+            "ExecuteQuery is not implemented in this build",
+        ))
+    }
 }
 
 /// The capabilities `runtime` advertises, as the wire names carried in
@@ -390,6 +596,9 @@ impl RuntimeHandle for NoopRuntimeHandle {
     fn supports(&self, _capability: Capability) -> bool {
         false
     }
+
+    // This stand-in has no delivered-secret store to clear.
+    async fn clear_cloud_delivered_secrets(&self) {}
 }
 
 #[cfg(test)]
@@ -427,6 +636,125 @@ mod tests {
             h.status().await,
             Err(CommandError::Unsupported { .. })
         ));
+        assert!(matches!(
+            h.attach_app(Some(&AppAttachment {
+                app_id: "4002".to_string(),
+                org_name: None,
+                app_name: None,
+                monitor_url: None,
+            }))
+            .await,
+            Err(CommandError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            h.execute_query("SELECT 1", MAX_QUERY_ROWS).await,
+            Err(CommandError::Unsupported { .. })
+        ));
+    }
+
+    /// A handle that can query advertises `execute_query`; one that cannot must
+    /// not — the control plane rejects unsupported queries on the strength of
+    /// this list without a round trip, so a false advertisement is worse than
+    /// none.
+    #[test]
+    fn execute_query_is_advertised_only_by_a_handle_that_can_query() {
+        struct QueryingHandle;
+
+        #[async_trait]
+        impl RuntimeHandle for QueryingHandle {
+            fn supports(&self, capability: Capability) -> bool {
+                capability == Capability::ExecuteQuery
+            }
+
+            // This query-only test handle cannot hold delivered secrets.
+            async fn clear_cloud_delivered_secrets(&self) {}
+        }
+
+        assert_eq!(
+            advertised_capabilities(&QueryingHandle),
+            vec!["execute_query"]
+        );
+        assert!(
+            !advertised_capabilities(&NoopRuntimeHandle).contains(&"execute_query".to_string()),
+            "a handle that cannot query must not advertise execute_query"
+        );
+    }
+
+    #[test]
+    fn zero_requested_rows_means_the_default_cap() {
+        assert_eq!(effective_max_rows(0), MAX_QUERY_ROWS);
+    }
+
+    #[test]
+    fn requested_rows_are_clamped_to_the_cap() {
+        assert_eq!(effective_max_rows(1), 1);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS - 1), MAX_QUERY_ROWS - 1);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS), MAX_QUERY_ROWS);
+        assert_eq!(effective_max_rows(MAX_QUERY_ROWS + 1), MAX_QUERY_ROWS);
+        assert_eq!(effective_max_rows(u32::MAX), MAX_QUERY_ROWS);
+    }
+
+    /// The default apply persists the spicepod but cannot put it into effect,
+    /// and says so rather than reporting a deployment that is not serving.
+    #[tokio::test]
+    async fn default_apply_persists_without_claiming_to_be_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "spice-handlers-default-apply-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let outcome = NoopRuntimeHandle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: "version: v2\nkind: Spicepod\nname: default-apply\n",
+                delivered_secrets: None,
+                app_id: None,
+            })
+            .await
+            .expect("the default apply writes the spicepod");
+
+        assert_eq!(outcome["applied"], false);
+        let written = std::fs::read_to_string(dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE))
+            .expect("spicepod written");
+        assert!(written.contains("name: default-apply"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writing the spicepod and dropping the secrets it references would report
+    /// success and then fail every referencing component.
+    #[tokio::test]
+    async fn default_apply_refuses_delivered_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "spice-handlers-refuse-secrets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut secrets = crate::sealed_secrets::DeliveredSecrets::new();
+        secrets.insert(
+            "openai_key".to_string(),
+            zeroize::Zeroizing::new(b"value".to_vec()),
+        );
+
+        let err = NoopRuntimeHandle
+            .apply_spicepod(SpicepodDeployment {
+                config_dir: &dir,
+                spicepod_yaml: "version: v2\nkind: Spicepod\nname: refused\n",
+                delivered_secrets: Some(secrets),
+                app_id: None,
+            })
+            .await
+            .expect_err("a handle that cannot apply secrets must refuse the deployment");
+        assert!(matches!(err, CommandError::Unsupported { .. }));
+        assert!(
+            !dir.join(crate::config::CLOUD_MANAGED_SPICEPOD_FILE)
+                .exists(),
+            "the spicepod must not be written when its secrets were refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -443,10 +771,12 @@ mod tests {
         for capability in Capability::ALL {
             match capability {
                 Capability::ApplySpicepod
+                | Capability::AttachApp
                 | Capability::Restart
                 | Capability::UpgradeRuntime
                 | Capability::GetLogs
-                | Capability::GetStatus => {}
+                | Capability::GetStatus
+                | Capability::ExecuteQuery => {}
             }
         }
         let names: BTreeSet<&str> = Capability::ALL.iter().map(|c| c.wire_name()).collect();
@@ -459,6 +789,8 @@ mod tests {
             names,
             BTreeSet::from([
                 "apply_spicepod",
+                "attach_app",
+                "execute_query",
                 "get_logs",
                 "get_status",
                 "restart",

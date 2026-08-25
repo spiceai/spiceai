@@ -47,10 +47,10 @@ fn build_app(args: &spiced::Args) -> Option<std::sync::Arc<app::App>> {
         .enable_all()
         .build()
         .expect("builds the bootstrap runtime");
-    let (app, _) = bootstrap
+    bootstrap
         .block_on(spiced::build_app(args))
-        .expect("loads the spicepod");
-    app
+        .expect("loads the spicepod")
+        .app
 }
 
 fn configured_cores(app: Option<&app::App>) -> Option<String> {
@@ -87,6 +87,15 @@ fn spicepod_cores_size_the_runtime_pools() {
     // reports for each of them.
     let dedicated = runtime_async::ManagedTokioRuntime::try_new().expect("builds a pool");
     assert_eq!(dedicated.handle().metrics().num_workers(), 1);
+
+    // Installing the budget also declares it to Vortex. Like the budget, the
+    // declaration resolves once per process, so only the test that installs
+    // the budget can assert it.
+    #[cfg(not(windows))]
+    assert_eq!(
+        vortex_utils::parallelism::get_available_parallelism(),
+        Some(2)
+    );
 }
 
 /// `--set-runtime cpu.cores=4` reaches the typed field, so the override surface
