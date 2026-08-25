@@ -284,8 +284,8 @@ impl RefreshTaskRunner {
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<RefreshRunFuture> = None;
-            // Provenance of the run in `task_completion`, applied only once it succeeds.
-            let mut pending_overridden = false;
+            // Provenance of the run in `task_completion`, asserted only once it succeeds.
+            let mut pending_configured = false;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -295,11 +295,11 @@ impl RefreshTaskRunner {
                                 Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
                                     // Now, and only now, do the accelerator's rows come from
-                                    // this run — so this is when its provenance becomes the
-                                    // answer the snapshot path must use. A failed or panicked
-                                    // run leaves the previous rows, and with them the previous
-                                    // mark.
-                                    base_refresh.read().await.set_materialized_from_overrides(pending_overridden);
+                                    // this run, so this is when its provenance may be
+                                    // asserted. A failed or panicked run asserts nothing and
+                                    // leaves the mark retracted, which declines a publish of
+                                    // whatever rows survived it.
+                                    base_refresh.read().await.set_materialization_is_configured(pending_configured);
                                     if let Err(err) = notify_refresh_complete.send(Ok(())).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
@@ -332,16 +332,16 @@ impl RefreshTaskRunner {
                             }
                         },
                         Some(overrides_opt) = on_start_refresh.recv() => {
-                            let (request, overridden) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
-                            pending_overridden = overridden;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
                 } else {
                     select! {
                         Some(overrides_opt) = on_start_refresh.recv() => {
-                            let (request, overridden) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
-                            pending_overridden = overridden;
+                            let (request, configured) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_configured = configured;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -372,25 +372,25 @@ impl RefreshTaskRunner {
     }
 
     /// Create a new [`Refresh`] based on defaults and overrides, and report whether this
-    /// run will produce rows the configured definition does not describe.
+    /// run will produce the configured definition's rows.
     ///
-    /// The provenance is returned rather than recorded, because this runs when the refresh
-    /// is DEQUEUED and the mark describes the rows already in the accelerator. Writing it
-    /// here opens a window in which an interval-driven snapshot reads the new run's
-    /// provenance against the previous run's rows — publishing override-produced rows under
-    /// the configured definition's fingerprint. The caller records it once the refresh has
-    /// actually succeeded.
+    /// Also retracts the provenance mark, because from here the accelerator's rows are being
+    /// replaced and describe nothing definite until the run finishes. Retracting up front is
+    /// what makes every window safe: a snapshot that lands mid-refresh, or after a refresh
+    /// that failed, finds "not known configured" and declines. The caller re-asserts the
+    /// mark only once the run has actually succeeded.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
     ) -> (Refresh, bool) {
         let r = defaults.read().await.clone();
+        r.set_materialization_is_configured(false);
         match overrides_opt {
             Some(overrides) => {
-                let overridden = overrides.changes_materialization();
-                (r.with_overrides(&overrides), overridden)
+                let configured = !overrides.changes_materialization();
+                (r.with_overrides(&overrides), configured)
             }
-            None => (r, false),
+            None => (r, true),
         }
     }
 

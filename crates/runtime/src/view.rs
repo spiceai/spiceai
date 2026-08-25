@@ -379,16 +379,24 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             .iter()
             .find(|candidate| names_match(&candidate.name, &dependency))
         {
-            let mut identity = format!("from={}", dataset.from);
-            if let Some(refresh_sql) = dataset
-                .acceleration
+            let params: BTreeMap<String, String> = dataset
+                .params
                 .as_ref()
-                .and_then(|acceleration| acceleration.refresh_sql.as_deref())
-            {
-                identity.push_str("\nrefresh_sql=");
-                identity.push_str(refresh_sql.trim());
-            }
-            closure.insert(key, identity);
+                .map(spicepod::param::Params::as_string_map)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            closure.insert(
+                key,
+                dataset_definition_identity(
+                    &dataset.from,
+                    dataset
+                        .acceleration
+                        .as_ref()
+                        .and_then(|acceleration| acceleration.refresh_sql.as_deref()),
+                    &params,
+                ),
+            );
         }
     }
 
@@ -400,6 +408,43 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
         definition.push_str(dependency_sql.trim());
     }
     definition
+}
+
+/// The definition string a DATASET's snapshot identity is computed over: what it copies
+/// and everything that shapes which rows it copies.
+///
+/// Shared by the dataset's own identity and by a view's closure over a dataset it reads, so
+/// the two cannot disagree about what "the same dataset definition" means.
+///
+/// `params` is included in full rather than filtered to a known row-shaping subset. Which
+/// parameters select rows is connector-specific and unenumerable — `json_pointer` picks a
+/// different element of the same document, `file_format` and `csv_has_header` reinterpret
+/// the same bytes — and getting that list wrong in the permissive direction accepts an
+/// archive whose rows answer a different question. Including a parameter that turns out not
+/// to shape rows (a timeout, a pool size) only costs a refused snapshot and a refresh from
+/// source. These are the Spicepod parameters, so a `${secrets:...}` reference is hashed as
+/// the reference, not as the resolved value — rotating a credential does not change the
+/// identity.
+///
+/// Ordered by key so the string does not depend on map iteration order.
+#[must_use]
+pub(crate) fn dataset_definition_identity(
+    from: &str,
+    refresh_sql: Option<&str>,
+    params: &BTreeMap<String, String>,
+) -> String {
+    let mut identity = format!("from={from}");
+    if let Some(refresh_sql) = refresh_sql {
+        identity.push_str("\nrefresh_sql=");
+        identity.push_str(refresh_sql.trim());
+    }
+    for (key, value) in params {
+        identity.push_str("\nparam.");
+        identity.push_str(key);
+        identity.push('=');
+        identity.push_str(value);
+    }
+    identity
 }
 
 /// Stable hash of a definition string, recorded alongside a source's snapshots so a

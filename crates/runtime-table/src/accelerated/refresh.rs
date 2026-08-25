@@ -108,7 +108,20 @@ pub struct Refresh {
     /// the snapshot path — would otherwise describe rows it did not produce. The `Arc`
     /// makes the clone and its original point at one cell, so setting it on either is
     /// visible to both.
-    pub(crate) materialization_overridden: Arc<AtomicBool>,
+    /// Whether the rows currently in the accelerator are known to be the CONFIGURED
+    /// definition's result.
+    ///
+    /// Stated positively, and defaulting to `false`, so that every state this cell cannot
+    /// vouch for declines a publish instead of authorising one. The cases that matters for:
+    /// a fresh process (the rows on disk came from before the restart and nothing in memory
+    /// knows what produced them), a refresh in flight (the rows are mid-replacement), and a
+    /// refresh that failed or panicked (the rows are whatever survived). Under the opposite
+    /// polarity each of those reads as "not overridden" and publishes.
+    ///
+    /// Shared with every clone of this `Refresh`, which is what lets the refresh runner
+    /// record provenance where the rows are written and the snapshot path read it where the
+    /// rows are archived.
+    pub(crate) materialization_is_configured: Arc<AtomicBool>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -260,7 +273,7 @@ impl Refresh {
         // Deliberately does NOT record provenance. This runs when a refresh is dequeued,
         // and the mark describes the rows currently in the accelerator — which are still
         // the previous run's until this one finishes. `RefreshTaskRunner` publishes it on
-        // successful completion instead; see `set_materialized_from_overrides`.
+        // successful completion instead; see `set_materialization_is_configured`.
         if let Some(sql_str) = &overrides.sql {
             self.override_sql_raw = Some(sql_str.clone());
         }
@@ -273,22 +286,27 @@ impl Refresh {
         self
     }
 
-    /// Records whether the rows now in the accelerator came from request-scoped overrides.
+    /// Records whether the rows now in the accelerator are the configured definition's
+    /// result.
     ///
-    /// Called by `RefreshTaskRunner` after a refresh SUCCEEDS, never when one is dequeued.
-    /// The distinction is the whole point: clearing the mark up front would let an
-    /// interval-driven snapshot observe `false` and publish the previous, override-produced
-    /// rows stamped with the configured definition's identity.
-    pub fn set_materialized_from_overrides(&self, overridden: bool) {
-        self.materialization_overridden
-            .store(overridden, std::sync::atomic::Ordering::Release);
+    /// `RefreshTaskRunner` calls this twice per run: `false` when the refresh is dequeued,
+    /// because from that moment the rows are being replaced and no longer describe anything
+    /// definite, and then the run's actual provenance once it has succeeded. Both writes
+    /// move the cell in the safe direction first, so a snapshot landing anywhere in between
+    /// declines rather than publishing rows it cannot account for.
+    pub fn set_materialization_is_configured(&self, configured: bool) {
+        self.materialization_is_configured
+            .store(configured, std::sync::atomic::Ordering::Release);
     }
 
-    /// Whether the rows currently in the accelerator came from a refresh that ran with
-    /// request-scoped overrides, and so are not the configured definition's result.
+    /// Whether the rows currently in the accelerator are known to be the configured
+    /// definition's result, and so may be published under its identity.
+    ///
+    /// Read while holding the accelerator write mutex — see `create_checkpoint_and_snapshot`.
+    /// Read outside it, the answer can go stale between the check and the archive.
     #[must_use]
-    pub fn materialized_from_overrides(&self) -> bool {
-        self.materialization_overridden
+    pub fn materialization_is_configured(&self) -> bool {
+        self.materialization_is_configured
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -564,7 +582,7 @@ impl Default for Refresh {
             retry_max_attempts: None,
             caching_ttl: None,
             write_retention_sql_delete_expr: None,
-            materialization_overridden: Arc::new(AtomicBool::new(false)),
+            materialization_is_configured: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1059,16 +1077,13 @@ impl Refresher {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
-                        let (refresh_sql, overridden) = {
+                        let refresh_sql = {
                             let refresh = refresh_clone.read().await;
-                            (
-                                refresh.sql.as_ref().map(RefreshSQL::to_sql),
-                                refresh.materialized_from_overrides(),
-                            )
+                            refresh.sql.as_ref().map(RefreshSQL::to_sql)
                         };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
-                            snapshot_manager_clone.as_ref().filter(|_| !overridden),
+                            snapshot_manager_clone.as_ref(),
                             &checkpoint_schema_clone,
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
@@ -1079,6 +1094,7 @@ impl Refresher {
                             // start-time checkpoint schema is current.
                             None,
                             refresh_sql.as_deref(),
+                            Some(&refresh_clone),
                         )
                         .await;
                     }
@@ -1164,23 +1180,16 @@ impl Refresher {
                         }
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                            let (refresh_sql, overridden) = {
+                            let refresh_sql = {
                                 let refresh = refresh.read().await;
-                                (
-                                    refresh.sql.as_ref().map(RefreshSQL::to_sql),
-                                    refresh.materialized_from_overrides(),
-                                )
+                                refresh.sql.as_ref().map(RefreshSQL::to_sql)
                             };
-                            if overridden {
-                                tracing::warn!(
-                                    "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: this refresh ran with request-scoped overrides, whose result the configured definition does not describe"
-                                );
-                            }
                             create_checkpoint_and_snapshot(
                                 checkpointer,
                                 // Checkpoint either way; publish only what the configured
-                                // definition can honestly be said to describe.
-                                snapshot_manager.as_ref().filter(|_| !overridden),
+                                // definition can honestly be said to describe, which
+                                // `create_checkpoint_and_snapshot` decides under the lock.
+                                snapshot_manager.as_ref(),
                                 &checkpoint_schema,
                                 &snapshot_mutex,
                                 &dataset_name,
@@ -1189,6 +1198,7 @@ impl Refresher {
                                 Some(&accelerator),
                                 None,
                                 refresh_sql.as_deref(),
+                                Some(&refresh),
                             ).await;
                         }
 

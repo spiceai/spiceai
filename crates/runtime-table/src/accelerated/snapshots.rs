@@ -274,24 +274,17 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
-        let (refresh_sql, overridden) = {
+        let refresh_sql = {
             let refresh = refresh.read().await;
-            (
-                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
-                refresh.materialized_from_overrides(),
-            )
+            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
         };
-        if overridden {
-            tracing::warn!(
-                "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the acceleration was last refreshed with request-scoped overrides, whose result the configured definition does not describe"
-            );
-        }
         create_checkpoint_and_snapshot(
             &checkpointer,
-            // `None` still checkpoints, it just publishes nothing — which is what an
-            // overridden materialization warrants: the rows are real and worth recording
-            // locally, but no archive of them can carry the configured definition's identity.
-            (!overridden).then_some(&snapshot_manager),
+            // Always passed; `create_checkpoint_and_snapshot` withholds it under the write
+            // mutex if the rows are not known to be the configured definition's result. The
+            // checkpoint still happens either way: the rows are real and worth recording
+            // locally even when no archive of them can carry that identity.
+            Some(&snapshot_manager),
             &checkpoint_schema,
             &accelerator_write_mutex,
             &dataset_name,
@@ -304,6 +297,7 @@ pub fn spawn_snapshot_interval_task(
             accelerator.as_ref(),
             Some(&federated_schema),
             refresh_sql.as_deref(),
+            Some(&refresh),
         )
         .await;
 
@@ -315,16 +309,13 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
-            let (refresh_sql, overridden) = {
+            let refresh_sql = {
                 let refresh = refresh.read().await;
-                (
-                    refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
-                    refresh.materialized_from_overrides(),
-                )
+                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
             };
             create_checkpoint_and_snapshot(
                 &checkpointer,
-                (!overridden).then_some(&snapshot_manager),
+                Some(&snapshot_manager),
                 &checkpoint_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
@@ -333,6 +324,7 @@ pub fn spawn_snapshot_interval_task(
                 accelerator.as_ref(),
                 Some(&federated_schema),
                 refresh_sql.as_deref(),
+                Some(&refresh),
             )
             .await;
         }
@@ -389,16 +381,13 @@ pub fn create_periodic_snapshot_callback(
                     return;
                 }
                 if !bootstrap_status.is_bootstrapped() {
-                    let (refresh_sql, overridden) = {
+                    let refresh_sql = {
                         let refresh = refresh_clone.read().await;
-                        (
-                            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
-                            refresh.materialized_from_overrides(),
-                        )
+                        refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
                     };
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
-                        (!overridden).then_some(&snapshot_manager_clone),
+                        Some(&snapshot_manager_clone),
                         &checkpoint_schema_clone,
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
@@ -407,6 +396,7 @@ pub fn create_periodic_snapshot_callback(
                         accelerator_clone.as_ref(),
                         Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
+                        Some(&refresh_clone),
                     )
                     .await;
                 }
@@ -441,16 +431,13 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
-                        let (refresh_sql, overridden) = {
+                        let refresh_sql = {
                             let refresh = refresh.read().await;
-                            (
-                                refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql),
-                                refresh.materialized_from_overrides(),
-                            )
+                            refresh.sql.as_ref().map(super::refresh::RefreshSQL::to_sql)
                         };
                         create_checkpoint_and_snapshot(
                             &checkpointer,
-                            (!overridden).then_some(&snapshot_manager),
+                            Some(&snapshot_manager),
                             &checkpoint_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
@@ -459,6 +446,7 @@ pub fn create_periodic_snapshot_callback(
                             accelerator.as_ref(),
                             Some(&federated_schema),
                             refresh_sql.as_deref(),
+                            Some(&refresh),
                         )
                         .await;
                     }
@@ -484,8 +472,29 @@ pub async fn create_checkpoint_and_snapshot(
     accelerator: Option<&Arc<dyn TableProvider>>,
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
+    provenance: Option<&Arc<RwLock<Refresh>>>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+
+    // Asked HERE, under the write mutex, rather than by the caller before it: the mutex is
+    // what serialises this against the refresh that writes the rows, so inside it the rows
+    // and their provenance are one consistent pair. A caller that sampled the mark first
+    // could be overtaken by an overridden refresh and archive its rows under the configured
+    // definition's identity.
+    let publishable = match provenance {
+        Some(refresh) => refresh.read().await.materialization_is_configured(),
+        // No provenance to consult (a path with no refresher, e.g. a CDC-fed accelerator
+        // whose rows are never produced by a request-scoped refresh).
+        None => true,
+    };
+    let snapshot_manager = if publishable {
+        snapshot_manager
+    } else {
+        tracing::warn!(
+            "Skipped creating a snapshot of '{dataset_name}', so its snapshot series keeps the previously published contents: the rows now in the acceleration are not known to be this dataset's configured definition applied to its source"
+        );
+        None
+    };
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
     // in-place / live schema evolution (e.g. Cayenne CDC) that widened the

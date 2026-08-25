@@ -607,6 +607,19 @@ impl SnapshotEngine for CayenneSnapshotEngine {
                     self.data_dir_anchor.display()
                 );
             }
+            // The slice lives in the metadata directory, which is shared with every other
+            // Cayenne dataset in the pod, so it is removed by name rather than with the
+            // tree. Leaving it would outlast the archive it came from: extraction skips a
+            // path that already exists, so the NEXT archive's slice would not replace it
+            // and a later restore would verify and import this rejected archive's metadata
+            // against those newer files.
+            if let Err(cleanup) = fs::remove_file(&slice_path).await {
+                tracing::warn!(
+                    "Failed to remove the refused snapshot slice of '{}' at {}; delete it before restarting or the next restore will read this rejected archive's metadata instead of its own: {cleanup}",
+                    self.dataset_name,
+                    slice_path.display()
+                );
+            }
             return Err(SnapshotEngineError::from_display(format!(
                 "the snapshot of '{}' is incomplete, so it was not restored and the acceleration starts empty: {reason}",
                 self.dataset_name
