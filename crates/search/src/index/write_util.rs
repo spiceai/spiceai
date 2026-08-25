@@ -343,6 +343,15 @@ pub fn warn_non_finite_embeddings(index_name: &str, affected_rows: &[usize], tot
 
 /// One line explaining why some rows are not searchable, built in a pure function so a
 /// reword cannot quietly drop the index name, the consequence, or the docs link.
+///
+/// Callers disagree on **two** things, so the line may assert neither. They disagree on the
+/// storage outcome — `create_embedding_array` and the DuckDB builder null the embedding and
+/// keep the row, Elasticsearch's document builder drops it — and they disagree on what
+/// happens to a vector already indexed for that row: the two null-the-embedding callers
+/// overwrite it, so it stops matching, while the drop-the-record caller leaves it in place
+/// and searchable at its older value. "This write did not index those rows" is the only
+/// consequence all three deliver. Both an absolute ("will never return them") and a promise
+/// that the old vector survives would each be false for some caller.
 #[must_use]
 pub fn non_finite_embedding_warning(
     index_name: &str,
@@ -360,7 +369,7 @@ pub fn non_finite_embedding_warning(
         ""
     };
     format!(
-        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so those rows are not indexed and vector search will never return them (rows {sample}{ellipsis}). {EMBEDDING_REMEDY}",
+        "Index '{index_name}': {} of {total_rows} embeddings contain a NaN or infinite value, so this write did not index those rows and vector search will not match them on this write's data (rows {sample}{ellipsis}). {EMBEDDING_REMEDY}",
         affected_rows.len()
     )
 }
@@ -376,7 +385,7 @@ pub fn non_finite_embedding_warning(
 #[must_use]
 pub fn all_zero_embedding_warning(index_kind: &str, index_name: &str, key: &str) -> String {
     format!(
-        "Skipping record '{key}' for {index_kind} index '{index_name}': its embedding is all zeroes, which has no direction to compare against, so the record is not indexed and vector search will never return it. {EMBEDDING_REMEDY}"
+        "Skipping record '{key}' for {index_kind} index '{index_name}': its embedding is all zeroes, which has no direction to compare against, so this write did not index the record and any vector previously indexed for it stays searchable at that older value. {EMBEDDING_REMEDY}"
     )
 }
 
@@ -793,14 +802,22 @@ mod tests {
         let message = non_finite_embedding_warning("my_index", &[1, 4], 10);
         assert!(message.contains("'my_index'"), "{message}");
         assert!(message.contains("2 of 10"), "{message}");
-        assert!(message.contains("not indexed"), "{message}");
+        assert!(message.contains("did not index"), "{message}");
         assert!(
             !message.contains("stored without an embedding"),
             "the shared line must not promise a storage outcome the record-dropping callers do not produce: {message}"
         );
         assert!(
-            message.contains("vector search will never return them"),
+            message.contains("this write did not index those rows"),
             "{message}"
+        );
+        assert!(
+            !message.contains("never return"),
+            "an absolute one caller does not deliver — Elasticsearch's document builder leaves the previous document searchable at its older vector: {message}"
+        );
+        assert!(
+            !message.contains("stays searchable"),
+            "the mirror error: the two null-the-embedding callers overwrite the old vector, so the shared line cannot promise it survives either: {message}"
         );
         assert!(message.contains("rows 1, 4"), "{message}");
         assert!(
@@ -825,12 +842,20 @@ mod tests {
         );
         assert!(message.contains("all zeroes"), "{message}");
         assert!(
-            message.contains("not indexed"),
+            message.contains("this write did not index the record"),
             "the line must state the consequence, not only the cause: {message}"
         );
         assert!(
-            message.contains("vector search will never return it"),
+            message.contains("this write did not index the record"),
             "{message}"
+        );
+        assert!(
+            message.contains("stays searchable at that older value"),
+            "the line must not imply the record became unsearchable — a previously indexed vector survives a rejected rewrite: {message}"
+        );
+        assert!(
+            !message.contains("never return"),
+            "an absolute the write path does not deliver: a stale vector is still returned: {message}"
         );
         assert!(
             message.contains("Re-embed the affected rows"),
