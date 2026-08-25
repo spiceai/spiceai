@@ -10,4 +10,4 @@ tests:
     # so at the unthrottled rate the customer replication lag cannot drain and
     # the data-correctness gate times out. Throttle OLTP so the FTS apply keeps
     # pace and replication converges; raise once FTS apply throughput improves.
-    rate: 50
+    rate: 150
