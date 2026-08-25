@@ -496,9 +496,8 @@ impl SharedSegmentCache {
                 tracing::warn!(
                     target: "vortex::segment_cache",
                     stalled_paths,
-                    "Gave up after {timeout_secs}s waiting for in-flight cache writes on {stalled_paths} retiring file(s) — {paths} — so their segments may stay cached a moment longer than the retirement itself; queries are unaffected because those files are already deleted. Writes this slow mean the host cannot keep up with the work already queued on it.",
-                    timeout_secs = ACTIVE_PUT_DRAIN_TIMEOUT.as_secs(),
-                    paths = describe_paths(&stalled),
+                    "{}",
+                    drain_gave_up_warning(&stalled)
                 );
             }
         }
@@ -645,6 +644,29 @@ fn describe_paths(paths: &[&Path]) -> String {
     described
 }
 
+/// The warning [`SharedSegmentCache::invalidate_paths`] emits for the retiring paths whose
+/// in-flight writes did not drain inside the deadline.
+///
+/// Built here rather than inline so its text is asserted in a unit test: it is the only account an
+/// operator gets of why a retired file's segments are still occupying the shared cache, and it has
+/// to distinguish the two outcomes past the deadline. A write that finishes clears its own entry
+/// (`PathSegmentCache::put` re-checks `is_retired`), so that residency really is momentary; a write
+/// cancelled after inserting has no such second chance and its entry stays until capacity eviction
+/// — the case spiceai/spiceai#12963 tracks. Promising only the first would have an operator
+/// dismiss sustained cache pressure as transient.
+fn drain_gave_up_warning(stalled: &[&Path]) -> String {
+    format!(
+        "Gave up after {timeout_secs}s waiting for in-flight cache writes on {stalled_paths} \
+         retiring file(s) — {paths} — so their segments stay cached past the retirement: a write \
+         that finishes clears its own entry, but one cancelled after inserting leaves the segment \
+         until capacity eviction. Queries are unaffected because those files are already deleted. \
+         Writes this slow mean the host cannot keep up with the work already queued on it.",
+        timeout_secs = ACTIVE_PUT_DRAIN_TIMEOUT.as_secs(),
+        stalled_paths = stalled.len(),
+        paths = describe_paths(stalled),
+    )
+}
+
 struct PathSegmentCache {
     shared: Arc<SharedSegmentCache>,
     /// The store `path` is relative to. Part of every key this view forms.
@@ -775,9 +797,9 @@ impl SegmentCache for PathSegmentCache {
         // path's keys — the checks above narrow that window but cannot close it,
         // and by then nothing else will remove this entry. Removing it here is
         // what makes a straggler self-correcting, and so what makes the bounded
-        // drain in `invalidate_paths` safe: giving up on a put costs a moment of
-        // residency rather than a retired file's segment staying cached until
-        // capacity evicts it.
+        // drain in `invalidate_paths` safe: giving up on a put that goes on to
+        // finish costs a moment of residency rather than a retired file's
+        // segment staying cached until capacity evicts it.
         //
         // Reachable only once that drain has given up. While it is still
         // waiting, this put's guard holds it, so the enumeration follows the
@@ -829,6 +851,44 @@ mod tests {
     use prometheus::proto::MetricType;
 
     use super::*;
+
+    /// The give-up warning is the only account an operator gets of why a retired file's segments
+    /// are still resident, so it has to name both outcomes past the deadline: momentary for a write
+    /// that finishes, until capacity eviction for one cancelled after inserting. Asserted rather
+    /// than eyeballed because a reword that drops the second half would read as a transient blip.
+    #[test]
+    fn the_give_up_warning_states_both_retention_outcomes() {
+        let paths = [Path::from("a.vortex"), Path::from("b.vortex")];
+        let stalled: Vec<&Path> = paths.iter().collect();
+        let warning = drain_gave_up_warning(&stalled);
+
+        assert!(
+            warning.contains("capacity eviction"),
+            "the warning must say a cancelled write's segment stays until capacity eviction: \
+             {warning}"
+        );
+        assert!(
+            warning.contains("cancelled after inserting"),
+            "the warning must name which writes leave a lasting entry: {warning}"
+        );
+        assert!(
+            !warning.contains("a moment longer"),
+            "the warning must not promise only momentary residency: {warning}"
+        );
+        assert!(
+            warning.contains("'a.vortex'") && warning.contains("'b.vortex'"),
+            "the warning must name the retiring files it is about: {warning}"
+        );
+        assert!(
+            warning.contains("2 retiring file(s)"),
+            "the warning must count the files it is about: {warning}"
+        );
+        assert_eq!(
+            warning.lines().count(),
+            1,
+            "a log line must not span more than one record: {warning}"
+        );
+    }
 
     struct MetricsHarness {
         registry: prometheus::Registry,
