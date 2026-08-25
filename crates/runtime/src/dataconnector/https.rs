@@ -250,6 +250,7 @@ struct HttpProviderParams {
     max_request_partitions: Option<usize>,
     health_probe: Option<String>,
     pagination: Option<data_components::http::provider::PaginationConfig>,
+    error_response_action: data_components::http::provider::ErrorResponseAction,
 }
 
 impl Https {
@@ -271,6 +272,23 @@ impl Https {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(3);
+
+        // A misspelt action must not fall back to a different policy: silently reading
+        // `on_error_response: eror` as the default would leave the operator believing they
+        // had configured something they had not.
+        let error_response_action = match self.params.get("on_error_response").expose().ok() {
+            None => data_components::http::provider::ErrorResponseAction::default(),
+            Some(value) => value.parse().map_err(|()| {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "'{value}' is not a valid `on_error_response`. Expected one of: {}. See: https://spiceai.org/docs/components/data-connectors/https",
+                        data_components::http::provider::ErrorResponseAction::VARIANTS.join(", ")
+                    ),
+                }
+            })?,
+        };
 
         let backoff_method = self
             .params
@@ -528,6 +546,7 @@ impl Https {
             max_request_partitions,
             health_probe,
             pagination,
+            error_response_action,
         })
     }
 
@@ -1149,6 +1168,7 @@ impl Https {
             max_request_partitions,
             health_probe,
             pagination,
+            error_response_action,
         } = self.resolve_http_provider_params(dataset)?;
 
         let RequestFilterParams {
@@ -1173,6 +1193,7 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_max_request_partitions(max_request_partitions)
+        .with_error_response_action(error_response_action)
         .with_health_probe(health_probe)
         .map_err(|e| DataConnectorError::InvalidConfiguration {
             dataconnector: "https".to_string(),
@@ -1694,6 +1715,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers."),
+        ParameterSpec::runtime("on_error_response")
+            .description("What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. Defaults to 'error'."),
         ParameterSpec::runtime("max_retries")
             .description("Maximum number of retries for HTTP requests. Default: 3"),
         ParameterSpec::runtime("retry_backoff_method")

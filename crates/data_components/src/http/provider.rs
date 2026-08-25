@@ -67,9 +67,6 @@ pub enum Error {
     #[snafu(display("HTTP request failed: {source}"))]
     HttpRequest { source: reqwest::Error },
 
-    #[snafu(display("HTTP request failed with status code {status}"))]
-    HttpServerError { status: u16 },
-
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
@@ -101,9 +98,69 @@ pub enum Error {
 
     #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
     JsonNesting { source: super::json_nest::Error },
+
+    #[snafu(display(
+        "Failed to fetch {url}: the origin answered {status}, which `on_error_response` \
+        is set to treat as a failed request rather than as data. \
+        Fix the origin, or set `on_error_response: store` on this dataset to keep recording \
+        the response body as a row. \
+        See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    ErrorResponse { status: u16, url: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What the connector does with a response the origin did not mark as successful.
+///
+/// A non-2xx body is otherwise recorded as an ordinary row, and on a dataset with
+/// `refresh_mode: full` that row *replaces* the previously good contents — a transient
+/// origin failure substitutes error pages for data without the query result marking it
+/// (spiceai/spiceai#13515).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorResponseAction {
+    /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
+    #[default]
+    Error,
+    /// Record the response as a row, and warn that it happened.
+    Warn,
+    /// Record the response as a row, silently.
+    Store,
+}
+
+impl ErrorResponseAction {
+    /// The value that selects this variant in a dataset's `params`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorResponseAction::Error => "error",
+            ErrorResponseAction::Warn => "warn",
+            ErrorResponseAction::Store => "store",
+        }
+    }
+
+    /// Every accepted value, in the order they are listed to the user.
+    pub const VARIANTS: [&'static str; 3] = ["error", "warn", "store"];
+}
+
+impl std::fmt::Display for ErrorResponseAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ErrorResponseAction {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(ErrorResponseAction::Error),
+            "warn" => Ok(ErrorResponseAction::Warn),
+            "store" => Ok(ErrorResponseAction::Store),
+            _ => Err(()),
+        }
+    }
+}
 
 impl From<Error> for DataFusionError {
     fn from(err: Error) -> Self {
@@ -112,10 +169,11 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
-            // Server errors (5xx) are external errors
-            Error::HttpServerError { status } => DataFusionError::External(Box::new(
-                std::io::Error::other(format!("HTTP request failed with status code {status}")),
-            )),
+            // The origin answered, and said the answer was not a success. External, not a
+            // plan error: nothing about the query is wrong.
+            Error::ErrorResponse { .. } => {
+                DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
+            }
             // Retry exhaustion is an external error
             Error::AllRetriesFailed { max_retries, url } => {
                 DataFusionError::External(Box::new(std::io::Error::other(format!(
@@ -441,6 +499,7 @@ pub struct HttpTableProvider {
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
+    error_response_action: ErrorResponseAction,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -450,6 +509,7 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
+            .field("error_response_action", &self.error_response_action)
             .finish_non_exhaustive()
     }
 }
@@ -488,7 +548,16 @@ impl HttpTableProvider {
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
+            error_response_action: ErrorResponseAction::default(),
         }
+    }
+
+    /// Set what a response the origin did not mark successful becomes: a failed
+    /// request, or a row (with or without a warning). See [`ErrorResponseAction`].
+    #[must_use]
+    pub fn with_error_response_action(mut self, action: ErrorResponseAction) -> Self {
+        self.error_response_action = action;
+        self
     }
 
     #[must_use]
@@ -1150,18 +1219,22 @@ impl HttpTableProvider {
 
         // If retries exhausted due to transient errors (5xx/429), make one final attempt
         // and return whatever response we get - the response is still valid data.
-        // Don't retry on permanent errors (e.g., failed to read response body).
-        if let Ok(fetch_result) = result {
-            Ok(fetch_result)
-        } else {
-            tracing::debug!(
-                "Retries exhausted for {url}, making final attempt accepting any status"
-            );
-            self.perform_single_request(&url, body, request_headers, path_label, true)
-                .await
-                .map_err(|e| match e {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                })
+        match result {
+            Ok(fetch_result) => Ok(fetch_result),
+            // That final attempt exists only to turn an exhausted retry into a row. Under
+            // `error` there is no row to make, so it would spend one more request on an
+            // origin that has already failed and arrive at this same error regardless.
+            Err(err) if self.error_response_action == ErrorResponseAction::Error => Err(err),
+            Err(_) => {
+                tracing::debug!(
+                    "Retries exhausted for {url}, making final attempt accepting any status"
+                );
+                self.perform_single_request(&url, body, request_headers, path_label, true)
+                    .await
+                    .map_err(|e| match e {
+                        RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+                    })
+            }
         }
     }
 
@@ -1228,21 +1301,41 @@ impl HttpTableProvider {
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
 
-        // 5xx/429: retry with backoff (transient server issue or rate limiting)
-        // After retries exhausted, we'll accept the response as valid data.
+        // 5xx/429: retry with backoff (transient server issue or rate limiting).
+        // Carries the same error the accepting pass below would raise, so exhausting the
+        // ladder and being handed the status directly read the same way to the operator.
         if !accept_retryable && Self::is_retryable_status(status_code) {
             tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            if let Err(e) = response.error_for_status() {
-                return Err(RetryError::transient(Error::HttpRequest { source: e }));
-            }
-            // Defensive: should never reach here since 4xx and 5xx always produce error_for_status Err
-            return Err(RetryError::transient(Error::HttpServerError {
+            return Err(RetryError::transient(Error::ErrorResponse {
                 status: status_code,
+                url: url.to_string(),
             }));
         }
 
-        // 2xx, 3xx, 4xx (and 5xx/429 when accept_retryable=true): valid response
-        // 4xx like 404 "not found" is a valid business response, not an error
+        // Everything the origin did not mark successful reaches here: 4xx always (a 404
+        // "not found" can be a business fact for an API-shaped dataset), and 5xx/429 once
+        // retries are exhausted. `error_response_action` decides whether such a body is
+        // data. Anything but `Store` has to answer here rather than downstream of the row:
+        // the row is what a full refresh writes over good data with.
+        if !(200..300).contains(&status_code) {
+            match self.error_response_action {
+                ErrorResponseAction::Error => {
+                    // Permanent: the retry ladder above already spent its attempts on the
+                    // statuses worth retrying, so retrying here would only repeat them.
+                    return Err(RetryError::Permanent(Error::ErrorResponse {
+                        status: status_code,
+                        url: url.to_string(),
+                    }));
+                }
+                ErrorResponseAction::Warn => {
+                    tracing::warn!(
+                        "The request to {url} answered {status_code}, and that response body is being recorded as a row, so a full refresh replaces this dataset's previous contents with it. Set `on_error_response: error` to fail the refresh and keep the previous contents instead. See: https://spiceai.org/docs/components/data-connectors/https"
+                    );
+                }
+                ErrorResponseAction::Store => {}
+            }
+        }
+
         Self::extract_response(response, status_code, path_label).await
     }
 
@@ -6041,6 +6134,199 @@ mod tests {
             request_count.load(Ordering::SeqCst) > DEFAULT_PAGINATION_MAX_PAGES,
             "execution should request pages beyond the old safety limit"
         );
+    }
+
+    /// Serve `status` with `body` on every request, counting them, and return the URL to
+    /// point a provider at. Kept off `wiremock` so the request count is observed the same
+    /// way the sibling pagination server does it.
+    async fn start_status_server(status: u16, body: &'static str) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    fn status_provider(base_url: Url, action: ErrorResponseAction) -> HttpTableProvider {
+        HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            // The ladder is not what these assert, and every retry is a real sleep.
+            .with_max_retries(0)
+            .with_error_response_action(action)
+    }
+
+    /// Run `SELECT content, response_status` against a provider serving one status.
+    async fn scan_status_dataset(
+        base_url: Url,
+        action: ErrorResponseAction,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(status_provider(base_url, action)))
+            .expect("table should register");
+        ctx.sql("SELECT content, response_status FROM items")
+            .await?
+            .collect()
+            .await
+    }
+
+    #[test]
+    fn error_response_action_reads_every_documented_value() {
+        for value in ErrorResponseAction::VARIANTS {
+            let parsed: ErrorResponseAction = value
+                .parse()
+                .unwrap_or_else(|()| panic!("'{value}' is documented and must parse"));
+            assert_eq!(
+                parsed.as_str(),
+                value,
+                "'{value}' must round-trip through as_str"
+            );
+        }
+
+        // Case and surrounding whitespace are the operator's, not the parser's.
+        assert_eq!(
+            "  ERROR ".parse::<ErrorResponseAction>(),
+            Ok(ErrorResponseAction::Error)
+        );
+
+        // A value that is not one of them must not fall back to a policy: the connector
+        // reports it, and the operator learns their setting did not take.
+        for rejected in ["", "fail", "retain", "eror", "true"] {
+            assert!(
+                rejected.parse::<ErrorResponseAction>().is_err(),
+                "'{rejected}' is not a documented action and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn error_response_action_defaults_to_refusing() {
+        // The default decides whether an origin failure can replace an accelerated
+        // table's contents with error bodies (#13515), so it is asserted rather than
+        // left to the derive.
+        assert_eq!(ErrorResponseAction::default(), ErrorResponseAction::Error);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_response_does_not_become_a_row() {
+        use std::sync::atomic::Ordering;
+
+        let (base_url, request_count) =
+            start_status_server(503, r#"{"error":"unavailable"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 503 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("503"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        assert!(
+            message.contains("on_error_response"),
+            "the failure must name the parameter that decides this: {message}"
+        );
+        assert!(
+            message.contains("spiceai.org/docs/components/data-connectors/https"),
+            "the failure must link the connector's docs: {message}"
+        );
+
+        // The extra request that existed only to turn an exhausted retry into a row is
+        // not worth spending on an origin that has already failed.
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "refusing must not cost a second request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_error_response_does_not_become_a_row() {
+        // 404 is never retried, so it reaches the decision on the first response rather
+        // than through the exhausted ladder — a separate route to the same substitution.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        assert!(
+            error.to_string().contains("404"),
+            "the failure must name the status the origin gave: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_keeps_recording_an_error_response_as_a_row() {
+        // The 404-as-a-business-fact dataset this connector already serves: `store` is
+        // the setting that keeps it working, so it is what makes the default a choice
+        // rather than a removal.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+            let batches = scan_status_dataset(base_url, action)
+                .await
+                .unwrap_or_else(|e| panic!("{action} must answer with the response body: {e}"));
+
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 1, "{action} must record the response as a row");
+
+            let statuses = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                statuses.value(0),
+                404,
+                "{action} must record the status the origin gave"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refusing_an_error_response_leaves_a_successful_one_alone() {
+        // The control for the two refusal tests: the guard must decide on the status,
+        // not on every response reaching it.
+        let (base_url, _) = start_status_server(200, r#"{"id":1}"#).await;
+
+        let batches = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect("a 200 must still be answered with rows");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "a successful response is still data");
     }
 
     #[test]
