@@ -1185,50 +1185,48 @@ impl HttpTableProvider {
                 continue;
             };
             for directive in header.split(',') {
-                let directive = directive.trim();
-                if let Some(seconds) = directive
-                    .strip_prefix("max-age=")
-                    .or_else(|| directive.strip_prefix("max-age ="))
-                    .map(str::trim)
-                {
-                    match seconds.parse::<u64>() {
-                        // A second `max-age` makes the response's freshness
-                        // ambiguous, and letting the later one win would let
-                        // `max-age=0, max-age=600` be retained for ten minutes
-                        // when the origin also said not to reuse it at all.
-                        // Ambiguous is treated as refused, as elsewhere here.
-                        Ok(_) if directives.max_age.is_some() => {
+                // Directive *names* are case-insensitive, so they are compared
+                // that way; splitting name from value also absorbs whitespace
+                // around the `=` without a second prefix to try.
+                let (name, value) = match directive.split_once('=') {
+                    Some((name, value)) => (name.trim(), Some(value.trim())),
+                    None => (directive.trim(), None),
+                };
+
+                // A freshness directive is usable only if it carries a value we
+                // can read and has not already been given. A missing value, an
+                // unreadable one, or a second one leaves the origin's intent
+                // ambiguous, and ambiguity refuses: `max-age=0, max-age=600`
+                // must not be resolved in favour of ten minutes, and leaving it
+                // simply unset would let a configured fallback stand in for a
+                // directive the origin did send.
+                if name.eq_ignore_ascii_case("max-age") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.max_age.is_none() => {
+                            directives.max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
                             directives.max_age = None;
                             directives.forbid_retention = true;
                         }
-                        Ok(seconds) => directives.max_age = Some(Duration::from_secs(seconds)),
-                        // A `max-age` we cannot read is not the same as no
-                        // `max-age`: leaving it unset would let a configured
-                        // fallback stand in for a directive the origin did send.
-                        Err(_) => directives.forbid_retention = true,
                     }
-                } else if let Some(seconds) = directive
-                    .strip_prefix("s-maxage=")
-                    .or_else(|| directive.strip_prefix("s-maxage ="))
-                    .map(str::trim)
-                {
-                    match seconds.parse::<u64>() {
-                        Ok(_) if directives.shared_max_age.is_some() => {
+                } else if name.eq_ignore_ascii_case("s-maxage") {
+                    match value.and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) if directives.shared_max_age.is_none() => {
+                            directives.shared_max_age = Some(Duration::from_secs(seconds));
+                        }
+                        _ => {
                             directives.shared_max_age = None;
                             directives.forbid_retention = true;
                         }
-                        Ok(seconds) => {
-                            directives.shared_max_age = Some(Duration::from_secs(seconds));
-                        }
-                        Err(_) => directives.forbid_retention = true,
                     }
-                } else if directive.eq_ignore_ascii_case("no-store")
-                    || directive.eq_ignore_ascii_case("no-cache")
+                } else if name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
                     // `private` marks a response as belonging to one end user.
                     // This cache is keyed by request shape and serves whichever
                     // query asks next, which is exactly the reuse `private`
                     // exists to forbid.
-                    || directive.eq_ignore_ascii_case("private")
+                    || name.eq_ignore_ascii_case("private")
                 {
                     directives.forbid_retention = true;
                 }
@@ -1616,14 +1614,31 @@ impl HttpTableProvider {
                 httpdate::parse_http_date(date_str).ok()
             });
 
-        // What the response's own `Date` implies about its age. Clamped at zero,
-        // so an origin clock running ahead of ours reads as "brand new" rather
-        // than as negative age; an origin clock running behind makes us cache
-        // less, which is the safe direction. This is the age an intermediary
-        // that relayed the response without adding `Age` leaves behind.
+        // The response is now in hand, headers and all. Everything after this
+        // point is time the entry spends with us rather than time in flight.
+        let headers_received = Instant::now();
+
+        // What the response's own `Date` implies about its age, measured against
+        // the moment it arrived. Clamped at zero, so an origin clock running
+        // ahead of ours reads as "brand new" rather than as negative age; an
+        // origin clock running behind makes us cache less, which is the safe
+        // direction. This is the age an intermediary that relayed the response
+        // without adding `Age` leaves behind.
         let apparent_age = response_date
             .and_then(|date| SystemTime::now().duration_since(date).ok())
             .unwrap_or_default();
+
+        // `Age` counts from when the origin generated the response, so the wait
+        // for it to arrive is added to that figure — but not to the `Date`-implied
+        // one, which was measured on arrival and already contains it. Adding the
+        // round trip to both would charge it twice and reject short-lived
+        // responses that are still fresh.
+        let response_delay = headers_received.saturating_duration_since(attempt_started);
+        let age_on_arrival = apparent_age.max(
+            header_age
+                .unwrap_or_default()
+                .saturating_add(response_delay),
+        );
 
         // Capture response headers before consuming the response body
         let response_headers: Vec<(String, String)> = response
@@ -1657,21 +1672,12 @@ impl HttpTableProvider {
         Ok(HttpFetchResult {
             content,
             directives,
-            // The greater of what the origin declared and what its own `Date`
-            // implies, plus the round trip. An origin behind a cache that did
-            // not add `Age` still dates the response, and taking only `Age`
-            // there would hand back a full window to something already spent.
-            //
-            // Saturating throughout: `Age` is untrusted response data, and a
-            // value near `u64::MAX` would otherwise overflow the addition and
-            // panic. Saturating leaves no freshness to retain, which is the
-            // right answer for an absurd age.
-            response_age: Some(
-                header_age
-                    .unwrap_or_default()
-                    .max(apparent_age)
-                    .saturating_add(attempt_started.elapsed()),
-            ),
+            // The age on arrival plus the time spent here since — reading the
+            // body and getting to admission. Saturating throughout, because
+            // `Age` is untrusted response data and a value near `u64::MAX` would
+            // otherwise overflow the addition and panic; saturating leaves no
+            // freshness to retain, which is the right answer for an absurd age.
+            response_age: Some(age_on_arrival.saturating_add(headers_received.elapsed())),
             detected_format,
             response_date,
             response_status: status_code,
@@ -4239,6 +4245,89 @@ mod response_cache_tests {
             provider.cache.entry_count(),
             1,
             "a clock ahead of ours must not read as negative age"
+        );
+    }
+
+    /// Directive *names* are case-insensitive. Matching them exactly let
+    /// `S-MaxAge=0` slip past the shared-cache refusal and keep the response for
+    /// the ten minutes `max-age` granted.
+    #[test]
+    fn directive_names_are_matched_case_insensitively() {
+        let shouted = HttpTableProvider::parse_cache_control(Some("S-MaxAge=0, max-age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&shouted, None, None),
+            None,
+            "a shared-cache refusal binds however it is spelled"
+        );
+
+        for spelling in ["NO-STORE", "No-Cache", "PRIVATE"] {
+            let directives = HttpTableProvider::parse_cache_control(Some(spelling));
+            assert_eq!(
+                HttpTableProvider::effective_retention(
+                    &directives,
+                    Some(Duration::from_mins(1)),
+                    None
+                ),
+                None,
+                "{spelling} must refuse retention"
+            );
+        }
+
+        let mixed = HttpTableProvider::parse_cache_control(Some("Max-Age=600"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&mixed, None, None),
+            Some(Duration::from_mins(10)),
+            "a freshness directive is honoured however it is spelled"
+        );
+    }
+
+    /// A `max-age` sent with no value at all is not a usable freshness, and must
+    /// not fall through to a configured fallback as though the origin had said
+    /// nothing.
+    #[test]
+    fn a_valueless_max_age_refuses_retention() {
+        let directives = HttpTableProvider::parse_cache_control(Some("max-age"));
+        assert_eq!(
+            HttpTableProvider::effective_retention(&directives, Some(Duration::from_mins(1)), None),
+            None
+        );
+    }
+
+    /// The wait for a response counts against an `Age` the origin declared, but
+    /// not against the age its `Date` already implies — that one was measured on
+    /// arrival and contains the wait already. Charging both rejects short-lived
+    /// responses that are still fresh.
+    ///
+    /// The delay is the subject: it is what would be counted twice.
+    #[tokio::test]
+    async fn a_slow_but_still_fresh_response_is_retained() {
+        let origin = MockServer::start().await;
+        // Dated before the request, as an origin behind a slow hop would be, so
+        // the `Date`-implied age already contains the wait. A window of six
+        // seconds leaves room for the true age of about five, but not for the
+        // seven that counting the wait twice would produce.
+        let three_seconds_ago = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(3));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=6")
+                    .insert_header("date", three_seconds_ago.as_str())
+                    .set_body_string(r#"{"rows":11}"#)
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a response with freshness left after the round trip must still be retained"
         );
     }
 
