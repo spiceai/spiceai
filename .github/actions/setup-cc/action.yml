@@ -39,10 +39,18 @@ runs:
           [ -d "$brew_prefix/opt/$formula" ] || missing+=("$formula")
         done
         # cmake and pkg-config are invoked by bare name from build scripts, so being in
-        # the Cellar is not sufficient — they also have to resolve on PATH. Treating an
-        # installed-but-unlinked tool as missing routes it into the `brew link` below.
+        # the Cellar is not sufficient — the name also has to resolve to *this* Homebrew.
+        # Requiring the resolved path to sit under the prefix catches both an unlinked
+        # keg and a foreign copy earlier on PATH shadowing it; either way the tool routes
+        # into the `brew link --overwrite` below, which is what puts the keg back in
+        # front. Matching on the prefix rather than a fixed path keeps this correct on an
+        # Intel runner, where Homebrew itself lives under /usr/local.
         for tool in cmake pkg-config; do
-          command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          resolved="$(command -v "$tool" 2>/dev/null || true)"
+          case "$resolved" in
+            "$brew_prefix"/*) ;;
+            *) missing+=("$tool") ;;
+          esac
         done
         if [ ${#missing[@]} -ne 0 ]; then
           echo "cc toolchain incomplete on this runner (${missing[*]}); installing."
@@ -59,14 +67,17 @@ runs:
         else
           echo "cc toolchain already present under $brew_prefix; skipping 'brew install'."
         fi
-        # Assert unconditionally, so a runner we skipped still fails here with a named
-        # cause rather than deep inside a build script.
+        # Assert unconditionally, so a runner whose install was skipped still fails here
+        # with a named cause rather than deep inside a build script. This asserts only
+        # that the name resolves at all — deliberately not that it resolves to
+        # $brew_prefix — so a runner that builds today against a tool from elsewhere on
+        # PATH keeps working instead of newly failing here.
         unresolved=()
         for tool in cmake pkg-config; do
           command -v "$tool" >/dev/null 2>&1 || unresolved+=("$tool")
         done
         if [ ${#unresolved[@]} -ne 0 ]; then
-          echo "::error::Installed but not on PATH: ${unresolved[*]}. Run 'brew link --overwrite ${unresolved[*]}' on this runner."
+          echo "::error::Not on PATH: ${unresolved[*]}. Run 'brew link --overwrite ${unresolved[*]}' on this runner."
           exit 1
         fi
 
