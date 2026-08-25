@@ -17,7 +17,7 @@ limitations under the License.
 //! Level-triggered "a refresh finished" signal for an accelerated table.
 //!
 //! Callers ask two different questions of a refresh, and both are answered from
-//! the same monotonic generation counter:
+//! the same count of completed refreshes:
 //!
 //! * *"has the initial load landed?"* — [`RefreshCompletion::any`], satisfied by
 //!   a refresh that finished before the caller asked.
@@ -30,10 +30,20 @@ limitations under the License.
 //! completion that lands before the caller polls its future leaves the caller
 //! waiting for a refresh that already happened.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use tokio::sync::watch;
+
+/// What every waiter is decided against. Held in one `watch` value so a
+/// completion and a close are each a single atomic transition that also wakes
+/// the waiters already registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletionState {
+    /// Refreshes recorded so far. Wrapping, because a waiter is decided by the
+    /// `watch` version it subscribed at rather than by comparing this value.
+    completions: u64,
+    /// Set once no further refresh can be recorded here, so a waiter taken
+    /// afterwards resolves instead of blocking on one that cannot arrive.
+    closed: bool,
+}
 
 /// Records refresh completions for one accelerated table and hands out waiters
 /// for them.
@@ -41,12 +51,7 @@ use tokio::sync::watch;
 /// Cloning shares the underlying signal.
 #[derive(Debug, Clone)]
 pub struct RefreshCompletion {
-    /// Number of refreshes recorded so far. Monotonic, so a waiter can compare
-    /// the value it was taken at against the current one.
-    generation: watch::Sender<u64>,
-    /// Set once no further refresh can be recorded, so waiters taken after that
-    /// point resolve rather than blocking on a completion that cannot arrive.
-    closed: Arc<AtomicBool>,
+    state: watch::Sender<CompletionState>,
 }
 
 impl Default for RefreshCompletion {
@@ -59,15 +64,17 @@ impl RefreshCompletion {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            generation: watch::Sender::new(0),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: watch::Sender::new(CompletionState {
+                completions: 0,
+                closed: false,
+            }),
         }
     }
 
     /// Records a completed refresh, resolving every waiter taken before it.
     pub fn record(&self) {
-        self.generation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.state
+            .send_modify(|state| state.completions = state.completions.wrapping_add(1));
     }
 
     /// Records that no refresh will ever run for this table in this process, so
@@ -76,10 +83,7 @@ impl RefreshCompletion {
     /// A cluster scheduler holds accelerated tables it never refreshes locally;
     /// without this, a caller waiting on one waits for the life of the process.
     pub fn close(&self) {
-        // Ordered so a waiter woken by the bump below observes the flag: the
-        // bump releases live waiters, the flag releases later ones.
-        self.closed.store(true, Ordering::Release);
-        self.record();
+        self.state.send_modify(|state| state.closed = true);
     }
 
     /// Takes a waiter for the first refresh recorded *after* this call.
@@ -89,13 +93,7 @@ impl RefreshCompletion {
     /// refresh it triggered.
     #[must_use]
     pub fn next(&self) -> RefreshCompletionWaiter {
-        RefreshCompletionWaiter {
-            // `subscribe` marks the receiver as having seen the current
-            // generation, so it resolves on the next one.
-            receiver: self.generation.subscribe(),
-            closed: Arc::clone(&self.closed),
-            satisfied: false,
-        }
+        self.waiter(false)
     }
 
     /// Takes a waiter for the first refresh recorded since the table was built,
@@ -105,34 +103,42 @@ impl RefreshCompletion {
     /// cannot miss the load by asking late.
     #[must_use]
     pub fn any(&self) -> RefreshCompletionWaiter {
-        let satisfied = *self.generation.borrow() > 0;
-        RefreshCompletionWaiter {
-            receiver: self.generation.subscribe(),
-            closed: Arc::clone(&self.closed),
-            satisfied,
+        self.waiter(true)
+    }
+
+    /// `accept_earlier` selects between the two questions above: whether a
+    /// refresh recorded before this call already answers it.
+    fn waiter(&self, accept_earlier: bool) -> RefreshCompletionWaiter {
+        // `subscribe` marks the receiver as having seen the value current now,
+        // so it resolves on the next transition. The state is then read back
+        // through the receiver rather than the sender: a completion landing
+        // between the two is either seen here or wakes the receiver, never
+        // dropped between them.
+        let mut receiver = self.state.subscribe();
+        let state = *receiver.borrow();
+        if state.closed || (accept_earlier && state.completions > 0) {
+            // Already answered — resolve on the first poll instead of waiting
+            // for a transition that has happened, or can never happen.
+            receiver.mark_changed();
         }
+        RefreshCompletionWaiter { receiver }
     }
 }
 
 /// A pending wait for a refresh completion, taken from a [`RefreshCompletion`].
 #[derive(Debug)]
 pub struct RefreshCompletionWaiter {
-    receiver: watch::Receiver<u64>,
-    closed: Arc<AtomicBool>,
-    satisfied: bool,
+    receiver: watch::Receiver<CompletionState>,
 }
 
 impl RefreshCompletionWaiter {
     /// Waits for the completion this waiter was taken for.
     ///
-    /// Returns immediately when the waiter was already satisfied when taken,
-    /// when no further refresh can be recorded, or when the table that records
-    /// them is gone — in each case the completion is never coming, and blocking
-    /// would strand the caller rather than inform it.
+    /// Returns without waiting when the question was already answered when the
+    /// waiter was taken, and returns early when the table that records
+    /// completions is gone — in both cases nothing is coming, and blocking would
+    /// strand the caller rather than inform it.
     pub async fn wait(mut self) {
-        if self.satisfied || self.closed.load(Ordering::Acquire) {
-            return;
-        }
         let _ = self.receiver.changed().await;
     }
 }
@@ -265,12 +271,15 @@ mod tests {
         }
     }
 
-    /// The counter is monotonic and wrapping; a waiter compares against the
-    /// value it was taken at, so a wrap cannot strand it.
+    /// The completion count wraps rather than saturating, and a waiter is
+    /// decided by the `watch` version it subscribed at, so a wrap cannot strand
+    /// it.
     #[tokio::test]
     async fn a_waiter_resolves_across_a_generation_wrap() {
         let completion = RefreshCompletion::new();
-        completion.generation.send_modify(|g| *g = u64::MAX);
+        completion
+            .state
+            .send_modify(|state| state.completions = u64::MAX);
 
         let waiter = completion.next();
         completion.record();
