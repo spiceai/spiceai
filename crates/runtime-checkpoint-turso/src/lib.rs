@@ -14,149 +14,120 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Per-dataset **blob** checkpoint store backed by a `Turso` accelerator.
+//! The `spice_sys_*` sidecar tables as stored by a `Turso` accelerator.
 //!
-//! Persists one opaque `String` payload keyed by `dataset_name` into a
-//! `(dataset_name PK, checkpoint_data TEXT, created_at, updated_at)` sidecar table
-//! whose name the caller chooses. Implements
-//! [`runtime_checkpoint_api::BlobCheckpointStore`]; the `runtime` crate resolves a
-//! dataset's accelerator connection and constructs it.
+//! One module per checkpoint shape, each implementing the matching
+//! `runtime-checkpoint-api` trait against a [`TursoConnectionPool`].
+//!
+//! [`TursoSidecar`] binds a pool to a dataset name and hands out those stores; the
+//! `Turso` accelerator returns one from `DataAccelerator::sidecar`, which is how the
+//! runtime reaches this engine's sidecar tables without naming the engine.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_components::turso::TursoConnectionPool;
-use runtime_checkpoint_api::{BlobCheckpoint, BlobCheckpointStore, CheckpointError};
+use runtime_acceleration::{
+    dataset_checkpoint::DatasetCheckpointer,
+    sidecar::{AcceleratorSidecar, unsupported_sidecar},
+    snapshot::SnapshotBehavior,
+};
+use runtime_checkpoint_api::{
+    BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+};
 
-/// Blob checkpoint store backed by a `Turso` accelerator.
-pub struct TursoBlobCheckpointStore {
-    pool: Arc<TursoConnectionPool>,
-    dataset_name: String,
-    table_name: &'static str,
+mod blob;
+mod dataset_checkpoint;
+mod debezium;
+mod kafka;
+mod mongodb;
+mod mysql_binlog;
+
+pub use blob::TursoBlobCheckpointStore;
+pub use dataset_checkpoint::TursoDatasetCheckpointer;
+pub use debezium::TursoDebeziumCheckpointStore;
+pub use kafka::TursoKafkaCheckpointStore;
+pub use mongodb::TursoMongoCheckpointStore;
+pub use mysql_binlog::TursoMySqlBinlogStore;
+
+/// Wraps an engine-level failure as a store failure.
+pub(crate) fn store_error(
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> CheckpointError {
+    CheckpointError::Store {
+        source: source.into(),
+    }
 }
 
-impl TursoBlobCheckpointStore {
+/// One dataset's sidecar tables inside a `Turso` accelerator.
+pub struct TursoSidecar {
+    pool: Arc<TursoConnectionPool>,
+    dataset_name: String,
+}
+
+impl TursoSidecar {
     #[must_use]
-    pub fn new(
-        pool: Arc<TursoConnectionPool>,
-        dataset_name: String,
-        table_name: &'static str,
-    ) -> Self {
-        Self {
-            pool,
-            dataset_name,
-            table_name,
-        }
+    pub fn new(pool: Arc<TursoConnectionPool>, dataset_name: String) -> Self {
+        Self { pool, dataset_name }
     }
 }
 
 #[async_trait]
-impl BlobCheckpointStore for TursoBlobCheckpointStore {
-    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
-        let dataset_name = self.dataset_name.clone();
-        let conn = self
-            .pool
-            .connect()
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        let table = self.table_name;
-
-        // Ensure the sidecar table exists so a fresh accelerator reads as "no
-        // checkpoint yet" (Ok(None)) rather than a missing-table store error.
-        {
-            let _schema_guard = self.pool.acquire_schema_write_lock().await;
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (
-                    dataset_name TEXT PRIMARY KEY,
-                    checkpoint_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-            );
-            conn.execute(&create_table, ())
-                .await
-                .map_err(|source| CheckpointError::Store {
-                    source: Box::new(source),
-                })?;
-        }
-
-        let _schema_guard = self.pool.acquire_schema_read_lock().await;
-        let query = format!(
-            "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
-        );
-
-        let mut rows = conn
-            .query(&query, turso::params![dataset_name])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        let Some(row) = rows.next().await.map_err(|source| CheckpointError::Store {
-            source: Box::new(source),
-        })?
-        else {
-            return Ok(None);
-        };
-
-        let data = row
-            .get::<String>(0)
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        let updated_at_epoch: Option<i64> = row.get::<i64>(1).ok();
-        let updated_at = updated_at_epoch.and_then(|epoch| {
-            u64::try_from(epoch)
-                .ok()
-                .and_then(|e| std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(e)))
-        });
-        Ok(Some(BlobCheckpoint { data, updated_at }))
+impl AcceleratorSidecar for TursoSidecar {
+    fn blob_checkpoint_store(
+        &self,
+        table_name: &'static str,
+    ) -> Result<Arc<dyn BlobCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(TursoBlobCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+            table_name,
+        )))
     }
 
-    async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
-        let dataset_name = self.dataset_name.clone();
-        let checkpoint_data = data.to_string();
-        let table = self.table_name;
+    fn kafka_checkpoint_store(&self) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(TursoKafkaCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        let conn = self
-            .pool
-            .connect()
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
+    fn debezium_checkpoint_store(
+        &self,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(TursoDebeziumCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        {
-            let _schema_guard = self.pool.acquire_schema_write_lock().await;
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (
-                    dataset_name TEXT PRIMARY KEY,
-                    checkpoint_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-            );
-            conn.execute(&create_table, ())
-                .await
-                .map_err(|source| CheckpointError::Store {
-                    source: Box::new(source),
-                })?;
-        }
+    fn mysql_binlog_store(&self) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
+        Ok(Arc::new(TursoMySqlBinlogStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        let _schema_guard = self.pool.acquire_schema_read_lock().await;
-        let upsert = format!(
-            "INSERT INTO {table} (dataset_name, checkpoint_data, updated_at)
-             VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT (dataset_name) DO UPDATE SET
-                checkpoint_data = ?2,
-                updated_at = CURRENT_TIMESTAMP"
-        );
-        conn.execute(&upsert, turso::params![dataset_name, checkpoint_data])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        Ok(())
+    fn mongo_checkpoint_store(&self) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(TursoMongoCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
+
+    async fn dataset_checkpointer(
+        &self,
+        _snapshot_behavior: SnapshotBehavior,
+    ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError> {
+        // `Turso` has no snapshot support, so the behavior is not consulted.
+        Ok(Arc::new(
+            TursoDatasetCheckpointer::try_new(Arc::clone(&self.pool), self.dataset_name.clone())
+                .await?,
+        ))
+    }
+
+    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError> {
+        Err(unsupported_sidecar("turso", "caching-engine"))
     }
 }

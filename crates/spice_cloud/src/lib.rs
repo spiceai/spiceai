@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use data_accelerator_api::AcceleratorEngineRegistry;
 use data_connector_api::DataConnectorError;
 use runtime::dataconnector::parameters::RuntimeConnectorContext;
 use std::{sync::Arc, time::Duration};
@@ -36,7 +37,6 @@ use runtime::{
             replication::Replication,
         },
     },
-    dataaccelerator::{self, AcceleratorEngineRegistry},
     dataconnector::{create_new_connector, parameters::ConnectorParamsBuilder},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated::FederatedTable,
@@ -69,7 +69,7 @@ pub enum Error {
     UnableToCreateSourceTableProvider { source: DataConnectorError },
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
-    UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+    UnableToCreateAcceleratedTableProvider { source: data_accelerator_api::Error },
 
     #[snafu(display("Unable to get Spice Cloud secret: {source}"))]
     UnableToGetSpiceSecret {
