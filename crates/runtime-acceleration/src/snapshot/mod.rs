@@ -4053,8 +4053,7 @@ mod tests {
             crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:abc123".to_string(),
                 accept_unstamped: false,
-                materialization:
-                    crate::acceleration_source::MaterializationSource::PlannedQuery,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             },
         );
 
@@ -4112,8 +4111,7 @@ mod tests {
             .with_source_definition(crate::acceleration_source::SourceDefinition {
                 fingerprint: "sha256:current".to_string(),
                 accept_unstamped: false,
-                materialization:
-                    crate::acceleration_source::MaterializationSource::PlannedQuery,
+                materialization: crate::acceleration_source::MaterializationSource::PlannedQuery,
             });
 
         assert!(
