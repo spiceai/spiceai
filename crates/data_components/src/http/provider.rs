@@ -5308,6 +5308,9 @@ mod tests {
         // Use an invalid route that returns 404 with JSON error body
         let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
         let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            // What this asserts is that the connector can record an error response as a
+            // row, which is `store` rather than the default.
+            .with_error_response_action(ErrorResponseAction::Store)
             .with_allowed_paths(vec!["/search/invalid_404".to_string()])
             .expect("allowed paths");
 
@@ -5362,6 +5365,8 @@ mod tests {
         // httpbin.org provides endpoints that return specific HTTP status codes
         let url = Url::parse("https://httpbin.org").expect("valid URL");
         let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            // As above: recording the error response as a row is what `store` selects.
+            .with_error_response_action(ErrorResponseAction::Store)
             .with_allowed_paths(vec!["/status/500".to_string()])
             .expect("allowed paths");
 
