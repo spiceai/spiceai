@@ -219,7 +219,7 @@ impl Https {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "`on_error_response` is not supported for structured HTTP file datasets that use the listing connector. Remove it, or use a dynamic JSON HTTP API dataset. See: https://spiceai.org/docs/components/data-connectors/https".to_string(),
+                message: "`on_error_response` is not supported for structured HTTP file datasets that use the listing connector. Those datasets already fail a request the origin did not answer successfully, so remove the parameter; set it on a dynamic JSON HTTP API dataset if you need to choose that behaviour. See: https://spiceai.org/docs/components/data-connectors/https".to_string(),
             });
         }
 
@@ -307,7 +307,7 @@ impl Https {
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
                         "'{value}' is not a valid `on_error_response`. Expected one of: {}. See: https://spiceai.org/docs/components/data-connectors/https",
-                        data_components::http::provider::ErrorResponseAction::VARIANTS.join(", ")
+                        data_components::http::provider::ErrorResponseAction::accepted_values()
                     ),
                 }
             })?,
@@ -2602,6 +2602,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                     assert!(
                         message.contains("dynamic JSON HTTP API dataset"),
                         "expected dynamic JSON guidance for '{value}', got: {message}"
+                    );
+                    assert!(
+                        message.contains("already fail a request"),
+                        "the refusal must say what this route already does, got: {message}"
                     );
                 }
                 other => {

@@ -161,8 +161,19 @@ impl ErrorResponseAction {
         }
     }
 
-    /// Every accepted value, in the order they are listed to the user.
-    pub const VARIANTS: [&'static str; 3] = ["error", "warn", "store"];
+    /// Every action, in the order they are listed to the user. Holds the variants
+    /// rather than their spellings so the list and [`Self::as_str`] cannot disagree.
+    pub const VARIANTS: [Self; 3] = [Self::Error, Self::Warn, Self::Store];
+
+    /// The accepted values, joined for a message that has to list them.
+    #[must_use]
+    pub fn accepted_values() -> String {
+        Self::VARIANTS
+            .iter()
+            .map(|action| action.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl std::fmt::Display for ErrorResponseAction {
@@ -199,10 +210,11 @@ impl From<Error> for DataFusionError {
             // re-asking are the ones the request ladder already retries, so both read the
             // same predicate rather than two taxonomies that can drift apart.
             Error::ErrorResponse { status, .. } => {
+                let message = err.to_string();
                 if HttpTableProvider::is_retryable_status(status) {
-                    DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
+                    DataFusionError::External(Box::new(std::io::Error::other(message)))
                 } else {
-                    DataFusionError::Plan(err.to_string())
+                    DataFusionError::Plan(message)
                 }
             }
             // Retry exhaustion is an external error
@@ -6318,14 +6330,18 @@ mod tests {
 
     #[test]
     fn error_response_action_reads_every_documented_value() {
-        for value in ErrorResponseAction::VARIANTS {
-            let parsed: ErrorResponseAction = value
+        for action in ErrorResponseAction::VARIANTS {
+            let spelling = action.as_str();
+            let parsed: ErrorResponseAction = spelling
                 .parse()
-                .unwrap_or_else(|()| panic!("'{value}' is documented and must parse"));
+                .unwrap_or_else(|()| panic!("'{spelling}' is documented and must parse"));
             assert_eq!(
-                parsed.as_str(),
-                value,
-                "'{value}' must round-trip through as_str"
+                parsed, action,
+                "'{spelling}' must round-trip through as_str"
+            );
+            assert!(
+                ErrorResponseAction::accepted_values().contains(spelling),
+                "'{spelling}' must be listed to the user"
             );
         }
 
