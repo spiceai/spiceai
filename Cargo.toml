@@ -111,6 +111,7 @@ members = [
     "tools/testoperator",
     "tools/chbench-driver",
     "tools/parsley",
+    "tools/pdf-parse",
     "tools/pdf-split",
     "tools/pr-builds",
     "crates/vendor/ttf-parser",
