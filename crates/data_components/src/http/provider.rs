@@ -336,6 +336,34 @@ pub const DEFAULT_HTTP_CACHE_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// `moka` supplies both properties directly: a weigher for the byte budget, and
 /// per-entry expiry driven by each response's own retention window.
+///
+/// # Sharing boundary
+///
+/// This cache is shared across *queries* but not across *principals*, and the
+/// distinction is what keeps it clear of RFC 9111 §3.2 — the rule that a shared
+/// cache must not reuse a response to an authenticated request unless the origin
+/// permitted it with `public`, `s-maxage` or `must-revalidate`.
+///
+/// That rule exists to stop one user's authenticated response being served to
+/// another. Here there is only ever one: credentials belong to the provider,
+/// set once through [`HttpTableProvider::with_auth`], and a query cannot
+/// introduce different ones — a `request_headers` filter naming the
+/// authenticator's header is refused at planning time rather than merged into
+/// the request (see `request_headers_filter_rejects_configured_auth_header_name`).
+/// The cache's sharing boundary and the credential's scope are therefore the
+/// same object, so every entry can only be served to a request carrying the
+/// credentials that produced it.
+///
+/// A rotated `OAuth2Auth` token does not break this: it is the same principal
+/// re-authenticating. For a token's *value* to select a different
+/// representation the origin would have to say so with `Vary`, which is
+/// honoured separately and refuses retention when it names the auth header.
+///
+/// **This is a premise, not a property of the cache.** It holds only while
+/// credentials stay provider-scoped and query-time headers cannot reach the
+/// auth header. If either changes — per-request credentials, or that guard
+/// relaxed — admission has to start consulting `public` / `s-maxage` /
+/// `must-revalidate` before retaining an authenticated response.
 type ResponseCache = moka::future::Cache<CacheKey, CachedResponse>;
 
 /// Per-entry expiry taken from the retention resolved at admission.
