@@ -2544,8 +2544,13 @@ mod tests {
     /// #12862: it was untimed, and `apply_app_lock` is held across it.
     mod hot_reload_initial_refresh {
         use super::*;
-        use tokio::sync::Notify;
+        use crate::accelerated::refresh_completion::RefreshCompletion;
         use tokio_util::sync::CancellationToken;
+
+        /// A completion signal no refresh ever reports on.
+        fn silent() -> RefreshCompletionWaiter {
+            RefreshCompletion::new().any()
+        }
 
         /// The production bound, so these arms cannot drift from it. A paused
         /// clock makes its size irrelevant to how long they take.
@@ -2563,12 +2568,12 @@ mod tests {
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| true,
-                &Notify::new(),
+                silent(),
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a table that has already loaded needs no notification");
+            .expect("a table that has already loaded needs no completion");
 
             assert_eq!(
                 started.elapsed(),
@@ -2577,30 +2582,83 @@ mod tests {
             );
         }
 
-        /// The ordinary case: the refresh completes and notifies.
+        /// The ordinary case: the refresh completes and reports it.
         #[tokio::test(start_paused = true)]
-        async fn a_completion_notification_ends_the_wait() {
-            let notifier = Arc::new(Notify::new());
-            let notify_from = Arc::clone(&notifier);
+        async fn a_reported_completion_ends_the_wait() {
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                notify_from.notify_waiters();
+                completion.record();
             });
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| false,
-                &notifier,
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a notified refresh completes the wait");
+            .expect("a reported refresh completes the wait");
 
             assert!(
                 started.elapsed() < TIMEOUT,
-                "the wait must end on the notification, not on the bound"
+                "the wait must end on the completion, not on the bound"
+            );
+        }
+
+        /// Regression test for #13086. A refresh that finished before the reload
+        /// reached this wait must end it at once. The edge-triggered signal this
+        /// replaced had nothing left to report by then, so the reload spent the
+        /// whole bound and then discarded a table that was loaded.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_that_predates_the_wait_ends_it_immediately() {
+            let completion = RefreshCompletion::new();
+            completion.record();
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a refresh that already completed must end the wait");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a completion recorded before the wait must be observed, not waited out"
+            );
+        }
+
+        /// Regression test for #13086. A cluster scheduler runs no refresh
+        /// locally and closes the table's completion signal instead, which must
+        /// end the wait rather than spend the bound on every hot reload.
+        #[tokio::test(start_paused = true)]
+        async fn a_closed_completion_signal_ends_the_wait() {
+            let completion = RefreshCompletion::new();
+            completion.close();
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                completion.any(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a signal that will never report again must end the wait");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a closed signal must be recognised immediately, not at the bound"
             );
         }
 
@@ -2613,7 +2671,7 @@ mod tests {
             let err = await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| false,
-                &Notify::new(),
+                silent(),
                 &CancellationToken::new(),
                 TIMEOUT,
             )
@@ -2631,58 +2689,55 @@ mod tests {
             );
         }
 
-        /// A completion landing between the `Notified`'s construction and the
-        /// `select!` must still wake the wait, which is why the future is built
-        /// before the loaded-check rather than after it. Build it after and this
-        /// notification is dropped, costing the whole bound. The closure is the
-        /// seam: it runs in exactly that window.
+        /// A completion landing between the loaded-check and the `select!` must
+        /// still end the wait. The closure is the seam: it runs in exactly that
+        /// window.
         #[tokio::test(start_paused = true)]
         async fn a_completion_racing_the_loaded_check_is_not_missed() {
-            let notifier = Arc::new(Notify::new());
-            let notify_from = Arc::clone(&notifier);
-            let notifies_then_reports_unloaded = move || {
-                notify_from.notify_waiters();
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
+            let records_then_reports_unloaded = move || {
+                completion.record();
                 false
             };
 
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
-                &notifies_then_reports_unloaded,
-                &notifier,
+                &records_then_reports_unloaded,
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a completion racing the wait setup must wake it, not be missed");
+            .expect("a completion racing the wait setup must end it, not be missed");
 
             assert_eq!(
                 started.elapsed(),
                 Duration::ZERO,
-                "a registered waiter must be woken immediately, not at the bound"
+                "a waiter must be released immediately, not at the bound"
             );
         }
 
-        /// `Notify::notify_waiters` stores no permit, so a completion landing
-        /// before the waiter is registered is lost. The table is loaded
-        /// regardless, and must not be discarded.
+        /// The bound and the completion can become ready together, and
+        /// `select!` picks between ready branches at random. The table is loaded
+        /// either way, so the backstop check must not let the bound discard it.
         #[tokio::test(start_paused = true)]
-        async fn a_lost_wakeup_resolves_as_loaded_at_the_bound() {
+        async fn a_load_landing_at_the_bound_is_not_discarded() {
             // False for the pre-wait check, true for the backstop check: the
-            // refresh completed while nothing was subscribed, and the refresher
-            // sets the flag just after it notifies.
+            // refresh completed while the wait was outstanding.
             let checks = AtomicUsize::new(0);
             let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
 
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &loaded,
-                &Notify::new(),
+                silent(),
                 &CancellationToken::new(),
                 TIMEOUT,
             )
             .await
-            .expect("a wakeup lost before the wait must not discard a loaded table");
+            .expect("a load that lands at the bound must not discard the table");
         }
 
         /// Shutdown ends the wait without reporting a reload failure.
@@ -2696,15 +2751,9 @@ mod tests {
             });
 
             let started = tokio::time::Instant::now();
-            await_hot_reload_initial_refresh(
-                &reloading(),
-                &|| false,
-                &Notify::new(),
-                &token,
-                TIMEOUT,
-            )
-            .await
-            .expect("a runtime shutting down is not a failed reload");
+            await_hot_reload_initial_refresh(&reloading(), &|| false, silent(), &token, TIMEOUT)
+                .await
+                .expect("a runtime shutting down is not a failed reload");
 
             assert!(
                 started.elapsed() < TIMEOUT,
