@@ -20,7 +20,11 @@ limitations under the License.
 //! constructor logic (base URL selection, token resolution) and converts errors
 //! into the CLI error type.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+};
 
 use crate::error::{CloudErrorCode, Error, InvalidResponseSnafu, Result};
 
@@ -142,10 +146,8 @@ impl CloudClient {
                 confirm_org_access(&probe, org).await?;
                 Self::with_token_for_org(default, Some(org))
             }
-            // A rejected credential has no user membership to spend on another
-            // organization: it is a machine token, which stays org-bound.
             Err(err) if err.cloud_code() == Some(CloudErrorCode::TokenExpired) => {
-                Err(org_credential_missing(org))
+                Err(super::rejected_user_credential_error(None, Some(org)))
             }
             // No identity came back, so whether this is a user token — usable
             // for every member org — is unknown. Declining would refuse a
@@ -253,13 +255,11 @@ impl CloudClient {
 
     /// Returns user auth context when Spice Cloud describes one.
     ///
-    /// `None` means the identity endpoint did not describe a user, which
-    /// covers two different situations and does not distinguish them: it
-    /// rejected the credential (401 — a service-account token, which has no
-    /// user identity), or it had no user to return (404). A caller that must
-    /// tell those apart — because one proves the credential unusable and the
-    /// other proves nothing — should call [`Self::get_auth_context`] and match
-    /// the error itself.
+    /// `None` means the identity endpoint did not describe a user. A 401 may
+    /// identify a valid machine credential, but may instead mean the
+    /// credential expired or was revoked; a 404 proves only that no user was
+    /// described. A caller that must tell those cases apart should call
+    /// [`Self::get_auth_context`] and match the error itself.
     pub async fn optional_user_auth_context(&self) -> Result<Option<AuthContext>> {
         match self.get_auth_context().await {
             Ok(ctx) => Ok(Some(ctx)),
@@ -1044,7 +1044,7 @@ fn build_executor(
 /// What an identity-endpoint failure proves about a credential.
 #[derive(Debug, PartialEq, Eq)]
 enum IdentityFailure {
-    /// Spice Cloud rejected it: a machine token, with no user identity to spend.
+    /// Spice Cloud rejected it: expired, revoked, or not a user credential.
     Rejected,
     /// Spice Cloud had no user to describe. The credential may still be a
     /// perfectly good user token — this says nothing either way.
@@ -1093,7 +1093,7 @@ pub fn user_credential_candidates(requested: Option<&str>) -> Vec<String> {
 /// project listing renders its own as `Forbidden`. Both say the same thing —
 /// *this* credential may not act there — which is a fact about the credential,
 /// not about the request, so another credential is still worth trying.
-fn is_org_refusal(err: &crate::error::Error) -> bool {
+pub(crate) fn is_org_refusal(err: &crate::error::Error) -> bool {
     matches!(
         err.cloud_code(),
         Some(CloudErrorCode::OrgForbidden | CloudErrorCode::Forbidden)
@@ -1141,34 +1141,76 @@ pub async fn confirm_org_access(client: &CloudClient, org: &str) -> Result<()> {
     }
 }
 
-/// The first credential in `candidates` that can act as a user, if any.
+/// What searching the stored credentials for a user credential found.
+#[derive(PartialEq, Eq)]
+pub enum UserCredentialSearch {
+    /// A credential Spice Cloud accepts as a user.
+    Found(String),
+    /// Credentials were stored, and Spice Cloud rejected every one.
+    AllRejected,
+    /// No credential was stored to try.
+    NoneStored,
+}
+
+/// Redact the live credential carried by [`UserCredentialSearch::Found`].
+impl std::fmt::Debug for UserCredentialSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found(_) => f.write_str("Found(<redacted>)"),
+            Self::AllRejected => f.write_str("AllRejected"),
+            Self::NoneStored => f.write_str("NoneStored"),
+        }
+    }
+}
+
+/// The first credential in `candidates` that can act as a user.
 ///
 /// Both Cloud Connect entry points — the `spice cloud link` preflight and the
 /// enrollment transaction — choose a credential this way, and they must agree:
 /// one accepting a credential the other rejects strands a link half-done.
 ///
-/// A credential the identity endpoint *rejects* has no user identity to spend
-/// (a machine token), so it is skipped. One it merely cannot *describe* is
-/// unknown rather than unusable, and is kept as a fallback behind any
-/// credential that does describe a user.
+/// A credential the identity endpoint *rejects* cannot provide a user identity,
+/// so it is skipped. One the endpoint merely cannot *describe* is unknown
+/// rather than unusable, and is kept as a fallback behind any credential that
+/// does describe a user.
 pub async fn first_user_credential(
     candidates: &[String],
     endpoint: &str,
     org: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<UserCredentialSearch> {
+    first_user_credential_with_probe(candidates, endpoint, org, identity_probe).await
+}
+
+type IdentityProbeFuture<'a> = Pin<Box<dyn Future<Output = Result<AuthContext>> + Send + 'a>>;
+type IdentityProbe = for<'a> fn(&'a CloudClient) -> IdentityProbeFuture<'a>;
+
+fn identity_probe(client: &CloudClient) -> IdentityProbeFuture<'_> {
+    Box::pin(client.get_auth_context())
+}
+
+async fn first_user_credential_with_probe(
+    candidates: &[String],
+    endpoint: &str,
+    org: Option<&str>,
+    probe: IdentityProbe,
+) -> Result<UserCredentialSearch> {
     // A credential Spice Cloud describes wins, but only among those that may
     // actually act on the organization: a refusal is a fact about one
     // credential, so it disqualifies that candidate rather than the search.
     let mut fallback: Option<&String> = None;
     let mut refusal: Option<crate::error::Error> = None;
+    let mut rejected = 0;
 
     for token in candidates {
         let client = CloudClient::with_token_for_org_at(token.clone(), None, endpoint)?;
 
-        let described = match client.get_auth_context().await {
+        let described = match probe(&client).await {
             Ok(_) => true,
             Err(err) => match classify_identity_failure(&err) {
-                IdentityFailure::Rejected => continue,
+                IdentityFailure::Rejected => {
+                    rejected += 1;
+                    continue;
+                }
                 IdentityFailure::Fatal => return Err(err),
                 IdentityFailure::Undescribed => {
                     tracing::debug!(
@@ -1193,13 +1235,13 @@ pub async fn first_user_credential(
         }
 
         if described {
-            return Ok(Some(token.clone()));
+            return Ok(UserCredentialSearch::Found(token.clone()));
         }
         fallback.get_or_insert(token);
     }
 
     if let Some(token) = fallback {
-        return Ok(Some(token.clone()));
+        return Ok(UserCredentialSearch::Found(token.clone()));
     }
 
     // Nothing was usable. A refusal explains that far better than the caller's
@@ -1208,7 +1250,15 @@ pub async fn first_user_credential(
         return Err(err);
     }
 
-    Ok(None)
+    Ok(exhausted_user_credential_search(rejected))
+}
+
+fn exhausted_user_credential_search(rejected: usize) -> UserCredentialSearch {
+    if rejected == 0 {
+        UserCredentialSearch::NoneStored
+    } else {
+        UserCredentialSearch::AllRejected
+    }
 }
 
 /// The auth-context endpoint did not describe a user for this credential.
@@ -1647,5 +1697,59 @@ mod tests {
 
         assert_eq!(err.cloud_code(), Some(CloudErrorCode::NotFound));
         assert!(is_absent_user_identity_error(&err));
+    }
+
+    /// Regression test for #13487: no candidates and candidates rejected with
+    /// 401 are distinct terminal states, so callers cannot render both as a
+    /// missing login.
+    #[test]
+    fn rejected_candidates_are_not_reported_as_none_stored() {
+        let rejected = map_cloud_error(None)(spice_cloud_client::error::Error::Unauthorized {
+            message: "invalid or expired token".to_string(),
+        });
+        assert_eq!(
+            classify_identity_failure(&rejected),
+            IdentityFailure::Rejected
+        );
+
+        let no_candidates = exhausted_user_credential_search(0);
+        let one_rejected = exhausted_user_credential_search(1);
+        assert_eq!(no_candidates, UserCredentialSearch::NoneStored);
+        assert_eq!(one_rejected, UserCredentialSearch::AllRejected);
+    }
+
+    #[tokio::test]
+    async fn an_empty_candidate_list_reports_none_stored_without_a_request() {
+        let outcome = first_user_credential(&[], "https://cloud.invalid", None)
+            .await
+            .expect("an empty candidate list needs no request");
+
+        assert_eq!(outcome, UserCredentialSearch::NoneStored);
+    }
+
+    /// Regression test for #13487: a stored credential rejected with 401 must
+    /// reach callers as rejected, not as an absent login.
+    #[tokio::test]
+    async fn a_rejected_stored_credential_reports_all_rejected() {
+        fn rejected_identity_probe(_: &CloudClient) -> IdentityProbeFuture<'_> {
+            Box::pin(async {
+                Err(map_cloud_error(None)(
+                    spice_cloud_client::error::Error::Unauthorized {
+                        message: "invalid or expired token".to_string(),
+                    },
+                ))
+            })
+        }
+
+        let outcome = first_user_credential_with_probe(
+            &["rejected-token".to_string()],
+            "https://cloud.invalid",
+            None,
+            rejected_identity_probe,
+        )
+        .await
+        .expect("a rejected credential is a terminal search outcome");
+
+        assert_eq!(outcome, UserCredentialSearch::AllRejected);
     }
 }
