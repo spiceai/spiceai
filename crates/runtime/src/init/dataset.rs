@@ -2547,9 +2547,14 @@ mod tests {
         use crate::accelerated::refresh_completion::RefreshCompletion;
         use tokio_util::sync::CancellationToken;
 
-        /// A completion signal no refresh ever reports on.
-        fn silent() -> RefreshCompletionWaiter {
-            RefreshCompletion::new().any()
+        /// A completion signal no refresh ever reports on. The recorder comes
+        /// back with the waiter and has to be held for the length of the wait:
+        /// dropping it releases the waiter, which is the opposite of what these
+        /// arms are asking for.
+        fn silent() -> (RefreshCompletion, RefreshCompletionWaiter) {
+            let completion = RefreshCompletion::new();
+            let waiter = completion.any();
+            (completion, waiter)
         }
 
         /// The production bound, so these arms cannot drift from it. A paused
@@ -2564,11 +2569,12 @@ mod tests {
         /// the refresh finished before the reload got here.
         #[tokio::test(start_paused = true)]
         async fn an_already_loaded_table_does_not_wait() {
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| true,
-                silent(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
@@ -2663,15 +2669,16 @@ mod tests {
         }
 
         /// A `refresh_mode: changes` stream that never produces a ready envelope
-        /// never fires the notifier. Before #12862 this held the apply lock for
-        /// the life of the process.
+        /// never reports a completion. Before #12862 this held the apply lock
+        /// for the life of the process.
         #[tokio::test(start_paused = true)]
         async fn a_refresh_that_never_completes_gives_up_at_the_bound() {
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
             let err = await_hot_reload_initial_refresh(
                 &reloading(),
                 &|| false,
-                silent(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
@@ -2729,10 +2736,11 @@ mod tests {
             let checks = AtomicUsize::new(0);
             let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
 
+            let (_recorder, waiter) = silent();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &loaded,
-                silent(),
+                waiter,
                 &CancellationToken::new(),
                 TIMEOUT,
             )
@@ -2750,8 +2758,9 @@ mod tests {
                 cancel.cancel();
             });
 
+            let (_recorder, waiter) = silent();
             let started = tokio::time::Instant::now();
-            await_hot_reload_initial_refresh(&reloading(), &|| false, silent(), &token, TIMEOUT)
+            await_hot_reload_initial_refresh(&reloading(), &|| false, waiter, &token, TIMEOUT)
                 .await
                 .expect("a runtime shutting down is not a failed reload");
 
