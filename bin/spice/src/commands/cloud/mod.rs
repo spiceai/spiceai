@@ -2034,18 +2034,22 @@ fn persist_login_values(
     }
 
     clear_login_shadows(output, spiceai, cloud)?;
-    select_login_org(login_org)?;
+    select_login_org(login_org, spiceai)?;
     Ok(())
 }
 
 /// Make later commands select the organization authenticated by this login.
-fn select_login_org(login_org: Option<&str>) -> Result<()> {
+fn select_login_org(login_org: Option<&str>, spiceai: &[(&str, &str)]) -> Result<()> {
     if let Ok(active_override) = std::env::var(org::ACTIVE_ORG_VAR)
         && !active_override.is_empty()
     {
         org::validate_org_name(&active_override)?;
-        if login_org.is_some_and(|login_org| active_override.eq_ignore_ascii_case(login_org)) {
-            return org::set_active_org(&active_override);
+        let override_var = org::org_token_var(&active_override);
+        let override_was_written = spiceai
+            .iter()
+            .any(|(key, _)| format!("SPICE_SPICEAI_{key}") == override_var);
+        if override_was_written {
+            return Ok(());
         }
 
         let destination = login_org.map_or_else(
@@ -6617,6 +6621,9 @@ mod tests {
         crate::commands::login::keychain::test_store::write(&selected_var, "expired-token")
             .expect("seed selected-org credential");
         org::set_active_org(selected_org).expect("select organization");
+        // SAFETY: `CredentialStores` serializes this mutation and restores the
+        // original environment value on drop.
+        unsafe { std::env::set_var(org::ACTIVE_ORG_VAR, "personal-org") };
 
         let values = user_login_values(
             "fresh-token",
@@ -6633,15 +6640,22 @@ mod tests {
             .expect("persist login while preserving selected organization");
 
         assert_eq!(
-            org::active_org()
-                .expect("read active organization")
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
                 .as_deref(),
-            Some(selected_org)
+            Some(selected_org),
+            "a refreshed process override must not replace the persisted selection"
         );
         assert_eq!(
             org::token_for_org(selected_org).as_deref(),
             Some("fresh-token"),
             "the preserved selection must use the fresh token"
+        );
+        assert_eq!(
+            org::token_for_org("personal-org").as_deref(),
+            Some("fresh-token"),
+            "the process override must resolve to a token this login refreshed"
         );
     }
 
@@ -6705,7 +6719,7 @@ mod tests {
         // original environment value on drop.
         unsafe { std::env::set_var(org::ACTIVE_ORG_VAR, "shell-org") };
 
-        let err = select_login_org(None)
+        let err = select_login_org(None, &[])
             .expect_err("an unnamed login cannot override an active-org environment variable");
 
         assert!(err.to_string().contains("spice cloud org unset"));
