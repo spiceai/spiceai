@@ -38,13 +38,13 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
 use spice_table::{Index, WriteWindow};
 use tokio::sync::Mutex;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
-use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
 use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
@@ -502,7 +502,10 @@ impl Index for ElasticsearchIndex {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))
         });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
     }
 
     async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
@@ -793,7 +796,10 @@ impl Index for ElasticsearchTextIndex {
         let futs = batches
             .into_iter()
             .map(|rb| async move { self.write(rb).await.map_err(DataFusionError::External) });
-        try_join_all(futs).await
+        futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_INDEX_WRITES)
+            .try_collect()
+            .await
     }
 
     async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {

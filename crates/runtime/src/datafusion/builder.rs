@@ -805,7 +805,7 @@ impl DataFusionBuilder {
         let mem_tier_budget_bytes = cayenne_cdc_active.then(|| {
             let total_memory = crate::resource_monitor::get_total_memory();
             let external_reservation_bytes =
-                crate::accelerator_memory_budget::duckdb_total_reservation_bytes();
+                runtime_acceleration::memory_budget::duckdb_total_reservation_bytes();
             let budget = coordinated_mem_tier_budget(
                 total_memory,
                 query_memory_pool_bytes,
@@ -1630,7 +1630,7 @@ pub(crate) fn effective_query_memory_limit(
 
         // Coordinated DuckDB cap: when DuckDB file accelerators are present the
         // Runtime builder computes a reduced query-pool ceiling (see
-        // `accelerator_memory_budget`) that leaves room for each DuckDB instance's
+        // `runtime_acceleration::memory_budget`) that leaves room for each DuckDB instance's
         // own `memory_limit`, so the query pool + DuckDB ceilings can't over-commit
         // host RAM. It only ever LOWERS the default (an explicit
         // `runtime.query.memory_limit` short-circuits above and is never reduced).
@@ -1710,7 +1710,7 @@ pub(crate) fn coordinated_mem_tier_budget(
     let floor = (total_memory / MEM_TIER_FLOOR_FRACTION).min(base_ceiling);
     // Memory reserved OUTSIDE the query and compaction pools by other subsystems —
     // today a co-resident DuckDB accelerator's aggregate ceiling (see
-    // `accelerator_memory_budget`), and any future external consumer — carved from
+    // `runtime_acceleration::memory_budget`), and any future external consumer — carved from
     // the same host RAM by the coordinated budget. Subtract it here so the tier,
     // and especially its query-light float below, can't reclaim room already
     // reserved elsewhere. `0` when nothing external is reserved.

@@ -42,9 +42,7 @@ use crate::{
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
-    dataaccelerator::{
-        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
-    },
+    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -106,7 +104,7 @@ impl Runtime {
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -1736,7 +1734,7 @@ impl Runtime {
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }

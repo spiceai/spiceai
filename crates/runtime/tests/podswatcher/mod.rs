@@ -24,7 +24,8 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
 };
 
-use runtime::{Runtime, auth::EndpointAuth, config::Config, podswatcher::PodsWatcher};
+use podswatcher::PodsWatcher;
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 
 // Define a static constant for the properly formatted YAML content
 static YAML_CONTENT_BEFORE: &str = "version: v1
