@@ -5358,6 +5358,49 @@ mod tests {
     use crate::metadata::DeletionType;
     use std::sync::Arc;
 
+    /// A table root of this test's own, and the `base_path` string to hand to
+    /// [`CreateTableOptions`].
+    ///
+    /// `base_path` is a real filesystem location, not a label: for every non-S3,
+    /// non-memory-mode table `create_table` creates `<base_path>/<table_id>/<snapshot_id>`.
+    /// A root pinned under `/tmp` is therefore shared with every other account on the
+    /// machine — where these tests also run under CI, that account owns the directory
+    /// already and `create_dir_all` fails with `PermissionDenied`, which `/tmp`'s sticky
+    /// bit leaves unfixable for everyone else (#13527). Concurrent runs collide there too.
+    ///
+    /// Bind the returned [`tempfile::TempDir`] for the whole test: dropping it removes
+    /// the tree, so a test that keeps only the `String` deletes its own table root.
+    fn test_table_root() -> (tempfile::TempDir, String) {
+        let root = tempfile::tempdir().expect("create a temporary table root");
+        let base_path = root.path().to_string_lossy().into_owned();
+        (root, base_path)
+    }
+
+    /// Every table root these tests create must come from [`test_table_root`].
+    ///
+    /// The guard is textual because what it prevents is environmental: a pinned
+    /// `/tmp` root passes wherever the running account happens to own the directory
+    /// and fails everywhere else, so no run of the suite can be trusted to catch a
+    /// new one being added (#13527).
+    #[test]
+    fn no_table_root_is_pinned_under_tmp() {
+        let pinned: Vec<String> = include_str!("cayenne_catalog.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let line = line.trim_start();
+                (line.starts_with("base_path:") || line.starts_with("let base_path ="))
+                    && line.contains("\"/tmp/")
+            })
+            .map(|(index, line)| format!("line {}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            pinned.is_empty(),
+            "these table roots are pinned under /tmp, which another account may already own; \
+             call test_table_root() instead: {pinned:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_catalog_creation() {
         let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
@@ -5370,6 +5413,7 @@ mod tests {
     /// `None` (the legacy / over-cap fallback the keyset rebuild relies on).
     #[tokio::test]
     async fn cold_tier_file_pk_bloom_round_trips() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_cold_bloom_{}.db", uuid::Uuid::now_v7());
         let catalog = Arc::new(CayenneCatalog::new(&test_db).expect("Failed to create catalog"));
         catalog.init().await.expect("Failed to initialize catalog");
@@ -5384,7 +5428,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test_cold_bloom".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5467,7 +5511,7 @@ mod tests {
         ]));
 
         let table_name = "test_concurrent_table";
-        let base_path = "/tmp/cayenne_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Spawn multiple tasks that all try to create the same table concurrently
         let mut handles = vec![];
@@ -5529,6 +5573,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_partition_creation() {
         // Create a unique test database to avoid conflicts with other tests
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_partition_{}.db",
             uuid::Uuid::now_v7()
@@ -5549,7 +5594,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test_partition".to_string(),
+            base_path: base_path.clone(),
             partition_column: Some("date".to_string()),
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5621,6 +5666,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_delete_file_creation() {
         // Create a unique test database to avoid conflicts with other tests
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_delete_file_{}.db",
             uuid::Uuid::now_v7()
@@ -5641,7 +5687,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5714,6 +5760,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_delete_file_creation_is_idempotent_for_same_path() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_concurrent_delete_file_same_path_{}.db",
             uuid::Uuid::now_v7()
@@ -5732,7 +5779,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -5800,6 +5847,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_delete_file_path_rejects_conflicting_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_conflicting_delete_file_same_path_{}.db",
             uuid::Uuid::now_v7()
@@ -5818,7 +5866,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6067,6 +6115,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_is_idempotent_for_same_delete_file() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_idempotent_{}.db",
             uuid::Uuid::now_v7()
@@ -6085,7 +6134,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6152,6 +6201,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_rejects_conflicting_delete_file_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_conflict_{}.db",
             uuid::Uuid::now_v7()
@@ -6170,7 +6220,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6270,6 +6320,7 @@ mod tests {
         // Exercises the batched multi-VALUES INSERT path: multiple distinct
         // delete files committed in a single transaction must all be visible
         // afterward and produce a single row per (table_id, path).
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_batched_{}.db",
             uuid::Uuid::now_v7()
@@ -6288,7 +6339,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6357,6 +6408,7 @@ mod tests {
         // protected-snapshot sequence + the Option-D inline tombstone must all be
         // committed by a single call, and the tombstone must land
         // `published = false` (inert) with the returned id.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_with_tombstone_fold_{}.db",
             uuid::Uuid::now_v7()
@@ -6374,7 +6426,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6490,6 +6542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apply_prepared_on_conflict_inline_tombstone_replay() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_prepared_inline_replay_{}.db",
             uuid::Uuid::now_v7()
@@ -6506,7 +6559,7 @@ mod tests {
                 )])),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6590,6 +6643,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_combined_delete_and_inline_rewrite_rolls_back_on_missing_inline_row() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_combined_delete_rewrite_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -6606,7 +6660,7 @@ mod tests {
                 )])),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6683,6 +6737,7 @@ mod tests {
         // `… inlined_id IN (…)` UPDATE is exactly equivalent to the prior per-row
         // loop. Stage several inert tombstones, then ride their ids as
         // `pending_durable_flips` on a later commit and assert every one flips.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_tombstone_flip_batch_{}.db",
             uuid::Uuid::now_v7()
@@ -6701,7 +6756,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -6813,6 +6868,7 @@ mod tests {
     async fn test_commit_on_conflict_deletions_with_tombstone_none_returns_none() {
         // With no tombstone, the fold behaves exactly like
         // `commit_on_conflict_deletions` and returns `Ok(None)`.
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_on_conflict_with_tombstone_none_{}.db",
             uuid::Uuid::now_v7()
@@ -6830,7 +6886,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -6888,6 +6944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_sequence_reservations_do_not_overlap() {
+        let (_table_root, base_path) = test_table_root();
         const TASK_COUNT: usize = 16;
         const BLOCK_SIZE: u32 = 2;
 
@@ -6909,7 +6966,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7012,7 +7069,7 @@ mod tests {
         ]));
 
         let table_name = "test_shutdown_table";
-        let base_path = "/tmp/cayenne_shutdown_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Phase 1: Create catalog, add data, shutdown
         let table_id;
@@ -7026,7 +7083,7 @@ mod tests {
                 schema: Arc::clone(&schema),
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: base_path.to_string(),
+                base_path: base_path.clone(),
                 partition_column: Some("name".to_string()),
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7155,7 +7212,7 @@ mod tests {
         )]));
 
         let table_name = "cycle_test_table";
-        let base_path = "/tmp/cayenne_cycle_test";
+        let (_table_root, base_path) = test_table_root();
 
         // Cycle 1: Create table
         let table_id;
@@ -7168,7 +7225,7 @@ mod tests {
                 schema: Arc::clone(&schema),
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: base_path.to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7267,6 +7324,7 @@ mod tests {
     /// Test that data persists even without explicit shutdown (WAL should still be readable).
     #[tokio::test]
     async fn test_data_persists_without_explicit_shutdown() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_no_shutdown_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
@@ -7289,7 +7347,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/no_shutdown_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7337,6 +7395,7 @@ mod tests {
     /// Test insert records persist across shutdown/reload.
     #[tokio::test]
     async fn test_insert_records_persist_across_restart() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_insert_records_{}.db",
             uuid::Uuid::now_v7()
@@ -7360,7 +7419,7 @@ mod tests {
                 schema,
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/insert_record_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7437,6 +7496,7 @@ mod tests {
     /// so the 16-byte encoding path (not the non-UUID fallback) is taken.
     #[tokio::test]
     async fn test_insert_record_delete_reinsert_visibility_roundtrip_blob_key() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_insert_record_vis_{}.db",
             uuid::Uuid::now_v7()
@@ -7458,7 +7518,7 @@ mod tests {
                 schema,
                 primary_key: vec!["id".to_string()],
                 on_conflict: None,
-                base_path: "/tmp/vis_roundtrip".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -7548,6 +7608,7 @@ mod tests {
     /// Test snapshot sequences persist across restart.
     #[tokio::test]
     async fn test_snapshot_sequences_persist_across_restart() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_snapshot_seq_{}.db", uuid::Uuid::now_v7());
         let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
 
@@ -7572,7 +7633,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/snapshot_seq_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             };
@@ -7637,6 +7698,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_falls_back_on_config_change() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7652,7 +7714,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7676,7 +7738,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7703,7 +7765,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_config_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7724,6 +7786,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_falls_back_on_sort_columns_change() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7739,7 +7802,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_sort_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7758,7 +7821,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_sort_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config,
         };
@@ -7780,6 +7843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_cache_change_does_not_recreate() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_cache_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -7796,7 +7860,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_cache_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -7819,7 +7883,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_cache_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config,
         };
@@ -7842,6 +7906,7 @@ mod tests {
     /// snapshot sequences, and updates the active snapshot pointer.
     #[tokio::test]
     async fn test_commit_compaction_clears_metadata() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_commit_compaction_{}.db",
             uuid::Uuid::now_v7()
@@ -7861,7 +7926,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_compaction_test".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8006,6 +8071,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replace_snapshot_files_rejects_invalid_row_without_mutation() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_manifest_replacement_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -8022,7 +8088,7 @@ mod tests {
                 )])),
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/cayenne_manifest_rollback".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8079,6 +8145,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_inlined_data_and_deletes_clears_both_tables() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_clear_inline_metadata_{}.db",
             uuid::Uuid::now_v7()
@@ -8097,7 +8164,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/clear_inline_metadata".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8173,6 +8240,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_on_conflict_deletions_and_clear_inlined_publishes_sequence_atomically() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_commit_inline_checkpoint_{}.db",
             uuid::Uuid::now_v7()
@@ -8191,7 +8259,7 @@ mod tests {
                 schema,
                 primary_key: vec![],
                 on_conflict: None,
-                base_path: "/tmp/commit_inline_checkpoint".to_string(),
+                base_path: base_path.clone(),
                 partition_column: None,
                 vortex_config: crate::metadata::VortexConfig::default(),
             })
@@ -8269,12 +8337,17 @@ mod tests {
     /// `commit_compaction`: snapshot pointer advances, delete files cleared.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_single_partition_parity() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_in_txn_parity_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "in_txn_parity", "/tmp/in_txn_parity").await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "in_txn_parity",
+            &format!("{base_path}/in_txn_parity"),
+        )
+        .await;
 
         // Sanity: delete file exists before the in_txn call.
         let before = catalog
@@ -8333,6 +8406,7 @@ mod tests {
     /// folded in — and deleting that row here loses its rows durably.
     #[tokio::test]
     async fn test_commit_compaction_fenced_unbounded_cutoff_retains_unfolded_snapshots() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_fenced_unbounded_{}.db",
             uuid::Uuid::now_v7()
@@ -8340,9 +8414,12 @@ mod tests {
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "fenced_unbounded", "/tmp/fenced_unbounded")
-                .await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "fenced_unbounded",
+            &format!("{base_path}/fenced_unbounded"),
+        )
+        .await;
 
         // Two protected snapshots the rewrite folded in, and one published after
         // its scan (the racing checkpoint).
@@ -8426,6 +8503,7 @@ mod tests {
     /// pointers have advanced together.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_cross_partition_atomicity() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_in_txn_cross_atomic_{}.db",
             uuid::Uuid::now_v7()
@@ -8435,8 +8513,18 @@ mod tests {
 
         // Two "partitions": independent tables, treated as a single atomic
         // commit unit by the (future) cross-partition coordinator.
-        let table_a = setup_table_with_delete_file(&catalog, "partition_a", "/tmp/p_a").await;
-        let table_b = setup_table_with_delete_file(&catalog, "partition_b", "/tmp/p_b").await;
+        let table_a = setup_table_with_delete_file(
+            &catalog,
+            "partition_a",
+            &format!("{base_path}/partition_a"),
+        )
+        .await;
+        let table_b = setup_table_with_delete_file(
+            &catalog,
+            "partition_b",
+            &format!("{base_path}/partition_b"),
+        )
+        .await;
 
         let snap_a = uuid::Uuid::now_v7().to_string();
         let snap_b = uuid::Uuid::now_v7().to_string();
@@ -8473,6 +8561,7 @@ mod tests {
     /// is left exactly as it was before the transaction opened.
     #[tokio::test]
     async fn test_commit_compaction_in_txn_rolls_back_on_drop() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_in_txn_rollback_{}.db",
             uuid::Uuid::now_v7()
@@ -8480,8 +8569,12 @@ mod tests {
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let table_id =
-            setup_table_with_delete_file(&catalog, "in_txn_rollback", "/tmp/in_txn_rb").await;
+        let table_id = setup_table_with_delete_file(
+            &catalog,
+            "in_txn_rollback",
+            &format!("{base_path}/in_txn_rollback"),
+        )
+        .await;
 
         // Capture pre-commit state.
         let before = catalog.get_table("in_txn_rollback").await.expect("get");
@@ -8652,7 +8745,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8661,7 +8754,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8682,7 +8775,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8691,7 +8784,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8713,7 +8806,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8722,7 +8815,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8743,7 +8836,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8756,7 +8849,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: changed_vortex,
         };
@@ -8777,7 +8870,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/old_path",
+            "table-root-old",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8786,7 +8879,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/new_path".to_string(),
+            base_path: "table-root-new".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8807,7 +8900,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8816,7 +8909,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8836,7 +8929,7 @@ mod tests {
             vec!["id".to_string()],
             None,
             None,
-            "/tmp/test",
+            "table-root",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8845,7 +8938,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/test".to_string(),
+            base_path: "table-root".to_string(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8865,7 +8958,7 @@ mod tests {
             vec![],
             None,
             None,
-            "/tmp/old",
+            "table-root-old",
             crate::metadata::VortexConfig::default(),
             Arc::clone(&schema),
         );
@@ -8878,7 +8971,7 @@ mod tests {
             schema,
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/new".to_string(),
+            base_path: "table-root-new".to_string(),
             partition_column: Some("region".to_string()),
             vortex_config: changed_vortex,
         };
@@ -8888,6 +8981,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_on_conflict_change_falls_back() {
+        let (_table_root, base_path) = test_table_root();
         use datafusion_table_providers::util::on_conflict::OnConflict;
         let test_db = format!(
             "sqlite://./.test_on_conflict_change_{}.db",
@@ -8907,7 +9001,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_oc_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8922,7 +9016,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "/tmp/cayenne_oc_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8954,6 +9048,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_existing_table_configuration_returns_error_on_mismatch() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_validate_mismatch_{}.db",
             uuid::Uuid::now_v7()
@@ -8973,7 +9068,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -8988,7 +9083,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec!["id".to_string()],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -9006,7 +9101,7 @@ mod tests {
             schema,
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
@@ -9027,6 +9122,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_existing_table_configuration_allows_configured_footer_cache_drift() {
+        let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_footer_cache_validate_{}.db",
             uuid::Uuid::now_v7()
@@ -9045,7 +9141,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig {
                 footer_cache_mb: Some(128),
@@ -9062,7 +9158,7 @@ mod tests {
             schema: Arc::clone(&schema),
             primary_key: vec![],
             on_conflict: None,
-            base_path: "/tmp/cayenne_footer_cache_validate_test".to_string(),
+            base_path: base_path.clone(),
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig {
                 footer_cache_mb: Some(256),
