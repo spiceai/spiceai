@@ -117,6 +117,16 @@ jobs:
           esac
           echo "SOURCE_TYPE=${SOURCE_TYPE}" >> $GITHUB_OUTPUT
           echo "Derived source_type=${SOURCE_TYPE} from spicepod $(basename "${SPICEPOD_PATH}")"
+          # Derive the query set from the spicepod filename so it always matches the
+          # pod under test. An `-fts` variant configures full_text_search columns and
+          # runs `chbench-fts` (the analytical queries plus `text_search` UDTFs); every
+          # other pod runs plain `chbench`.
+          case "$(basename "${SPICEPOD_PATH}")" in
+            *-fts.yaml) QUERY_SET=chbench-fts ;;
+            *)          QUERY_SET=chbench ;;
+          esac
+          echo "QUERY_SET=${QUERY_SET}" >> $GITHUB_OUTPUT
+          echo "Derived query_set=${QUERY_SET} from spicepod $(basename "${SPICEPOD_PATH}")"
 
       - name: Validate spicepod file exists
         run: |
@@ -341,7 +351,7 @@ jobs:
             -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --source-type ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE }} \
-            --query-set chbench \
+            --query-set ${{ steps.set_spicepod_path.outputs.QUERY_SET }} \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
             ${{ github.event.inputs.rate && format('--rate {0}', github.event.inputs.rate) || '' }} \
