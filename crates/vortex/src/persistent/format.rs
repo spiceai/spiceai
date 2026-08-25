@@ -538,12 +538,20 @@ impl VortexFormat {
             cache.invalidate_paths(paths).await;
         }
 
-        // The footer cache is process-wide, its lock is taken by every format's
-        // `get`/`put`, and dropping an entry deallocates a parsed footer — so a
-        // retirement spanning thousands of files would hold a runtime worker for
-        // milliseconds against a lock every other table's scans need. Same
-        // reasoning as the segment key scan, which is on the blocking pool for
-        // it.
+        // This cache is shared by every table on the environment it belongs to,
+        // its lock is taken by every format's `get`/`put`, and dropping an entry
+        // deallocates a parsed footer — so a retirement spanning thousands of
+        // files would hold a runtime worker for milliseconds against a lock every
+        // other table's scans need. Same reasoning as the segment key scan, which
+        // is on the blocking pool for it.
+        //
+        // "the environment it belongs to" is load-bearing: the cache hangs off
+        // the `RuntimeEnv`, not the process. A deployment that carves a dedicated
+        // Cayenne compaction environment has a second one, which compaction fills
+        // and this sweep never reaches, because every retirement caller passes the
+        // table context's query environment. Tracked in
+        // spiceai/spiceai#13497 — the fix is in how the two environments are built,
+        // not here.
         let footer_cache = runtime_env.cache_manager.get_file_metadata_cache();
         if let Err(error) = tokio::task::spawn_blocking(move || {
             for path in &footer_paths {
