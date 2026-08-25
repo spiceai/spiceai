@@ -662,7 +662,8 @@ fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
     format!(
         "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
          but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
-         rather than applied lossily and the source keeps its position. \
+         rather than applied lossily. No part of the batch was applied and the source keeps its position, \
+         so the acceleration still holds every row it held before it. \
          Under `mode: file_update`, restart Spice to apply it: the acceleration is dropped and recreated against the new schema. \
          Under any other mode a restart refuses again — drop and recreate the dataset against the new source schema, \
          dropping `partition_by` in the same change if partitioning is no longer wanted. \
@@ -2428,6 +2429,39 @@ impl RefreshTask {
             sub_batches.len()
         );
 
+        // Mid-stream schema evolution (policy != block) is a whole-burst
+        // decision, so it is settled here — before any sub-batch is applied —
+        // rather than at the first upsert. `group_into_sub_batches` emits a
+        // `Delete` ahead of an `Upsert` for a key deleted and recreated in one
+        // burst, and flushes a `Truncate` as a barrier, so deciding at the
+        // upsert lets those destructive halves commit and then refuses the
+        // replacement. The source keeps its position and redelivers, the same
+        // split re-applies the same destructive half, and the refusal fires
+        // again: the rows the burst was replacing never come back, however many
+        // times it is retried. Refusing up front leaves the acceleration
+        // untouched, so the redelivered burst is still whole and the operator's
+        // recovery runs against an intact table.
+        //
+        // Gated on the burst carrying an upsert. A delete-only or truncate-only
+        // burst never reads the incoming data schema (`process_delete_batch` and
+        // `process_truncate` work from the primary keys alone), so a widening it
+        // does not carry into the acceleration is not its refusal to raise —
+        // classifying it would stall replication for a burst that applies
+        // cleanly. Those bursts do not reach the classifier today either, so
+        // this preserves their behavior rather than changing it.
+        //
+        // One call per burst replaces one per upsert sub-batch. The input is
+        // `change_batch.data_batch().schema()` either way — a burst-wide value
+        // that does not vary with the sub-batch — so the decision is unchanged
+        // and a multi-upsert burst classifies once instead of repeatedly.
+        if sub_batches
+            .iter()
+            .any(|(op_type, _)| matches!(op_type, ChangeOperationType::Upsert))
+        {
+            self.maybe_evolve_schema_for_cdc(&change_batch.data_batch().schema())
+                .await?;
+        }
+
         let mut had_change = false;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         // Highest in-memory CDC tier epoch across this coalesced write's upsert
@@ -2537,12 +2571,11 @@ impl RefreshTask {
     ) -> crate::accelerated::Result<UpsertOutcome> {
         let data_batch = change_batch.data_batch();
 
-        // Mid-stream schema evolution (policy != block): evolve Cayenne live,
-        // or surface the detected change loudly for engines that need a
-        // restart, BEFORE the narrowing cast below silently drops the change.
-        self.maybe_evolve_schema_for_cdc(&data_batch.schema())
-            .await?;
-
+        // Schema evolution for this burst — evolving Cayenne live, or surfacing
+        // the detected change loudly for engines that need a restart — has
+        // already run in `write_change_with_context`, ahead of every sub-batch,
+        // so it is settled before the narrowing cast below can silently drop the
+        // change and before any destructive sub-batch of the same burst commits.
         let target_schema = self.accelerator.schema();
 
         let selected_batch = select_rows(&data_batch, row_indices)?;
@@ -4334,6 +4367,17 @@ mod tests {
         assert!(
             msg.contains("the source keeps its position"),
             "the operator has to know the change was not lost: {msg}"
+        );
+        // Load-bearing, not reassurance: the refusal is preflighted over the whole
+        // burst, so an operator reading this can act on an intact table. While it was
+        // raised from the first upsert instead, a `DELETE k, INSERT k` burst had already
+        // committed its delete by the time the message appeared, and this sentence would
+        // have been false exactly when it mattered most (#13455).
+        assert!(
+            msg.contains("No part of the batch was applied")
+                && msg.contains("still holds every row it held before it"),
+            "the operator has to know the acceleration was left intact, which is what makes \
+             'the source keeps its position' a safe outcome rather than a partial mutation: {msg}"
         );
         assert!(
             msg.contains("`mode: file_update`") && msg.contains("restart Spice to apply it"),
@@ -6686,19 +6730,34 @@ mod tests {
     /// shape the `postgres_replication` source emits after adopting a mid-stream
     /// ADD COLUMN.
     fn create_widened_change_batch(id: i32, age: i32) -> ChangeBatch {
+        create_widened_change_batch_ops(&["c"], &[id], age)
+    }
+
+    /// A CDC burst under the `age`-widened data schema carrying one row per entry
+    /// of `ops` (Debezium op codes: `c` create, `d` delete, `t` truncate).
+    ///
+    /// The widening is a property of the burst's schema, not of any one row, so
+    /// every op in the burst arrives under it — which is what makes a mixed burst
+    /// able to commit its destructive half before the widening is ever judged.
+    fn create_widened_change_batch_ops(ops: &[&str], ids: &[i32], age: i32) -> ChangeBatch {
+        assert_eq!(ops.len(), ids.len(), "ops and ids must have same length");
+
         let data_schema = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("age", DataType::Int32, true),
         ]);
         let schema = changes_schema(&data_schema);
-        let op_array: ArrayRef = Arc::new(StringArray::from(vec!["c"]));
+        let op_array: ArrayRef = Arc::new(StringArray::from(ops.to_vec()));
         let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+        // One primary-key entry (`id`) per row.
+        let pk_offsets: Vec<i32> =
+            (0..=i32::try_from(ops.len()).expect("op count fits in i32")).collect();
         let pk_array: ArrayRef = Arc::new(
             ListArray::try_new(
                 pk_field,
-                arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into()),
-                Arc::new(StringArray::from(vec!["id"])),
+                arrow::buffer::OffsetBuffer::new(pk_offsets.into()),
+                Arc::new(StringArray::from(vec!["id"; ops.len()])),
                 None,
             )
             .expect("pk list"),
@@ -6706,15 +6765,15 @@ mod tests {
         let data_fields = vec![
             (
                 Arc::new(Field::new("id", DataType::Int32, false)),
-                Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+                Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("name", DataType::Utf8, true)),
-                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("row"); ops.len()])) as ArrayRef,
             ),
             (
                 Arc::new(Field::new("age", DataType::Int32, true)),
-                Arc::new(Int32Array::from(vec![age])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![age; ops.len()])) as ArrayRef,
             ),
         ];
         let data_array: ArrayRef = Arc::new(StructArray::from(data_fields));
@@ -7102,13 +7161,63 @@ mod tests {
         SpiceTable::over(Arc::new(IndexLayer::new()), poly) as Arc<dyn TableProvider>
     }
 
-    /// Apply one widened CDC envelope under `on_schema_change:
+    /// The `id` values the acceleration currently holds, ascending.
+    ///
+    /// Reads through the whole provider stack the CDC apply writes to, so it sees
+    /// what a query against the dataset would see.
+    #[cfg(not(windows))]
+    async fn accelerator_row_ids(accelerator: &Arc<dyn TableProvider>) -> Vec<i32> {
+        let ctx = SessionContext::new();
+        let scan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scanning the acceleration should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("collecting the acceleration should succeed");
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the acceleration carries an id column");
+                column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<i32>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Apply one widened single-upsert CDC envelope under `on_schema_change:
     /// append_new_columns`, and report `(run applied, committed envelope ids,
     /// dataset status is error)`.
     #[cfg(not(windows))]
     async fn apply_widened_envelope(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
+    ) -> (bool, Vec<i32>, bool) {
+        apply_widened_burst(name, accelerator, create_widened_change_batch(1, 30), None).await
+    }
+
+    /// Apply one widened CDC burst under `on_schema_change: append_new_columns`,
+    /// optionally seeding the acceleration with `seed` first, and report
+    /// `(run applied, committed envelope ids, dataset status is error)`.
+    ///
+    /// `seed` is applied through the ordinary CDC write path rather than written
+    /// behind it, so a test asserting the acceleration is unmutated is asserting
+    /// against rows the apply loop itself put there.
+    #[cfg(not(windows))]
+    async fn apply_widened_burst(
+        name: &str,
+        accelerator: Arc<dyn TableProvider>,
+        burst: ChangeBatch,
+        seed: Option<ChangeBatch>,
     ) -> (bool, Vec<i32>, bool) {
         let dataset_name = TableReference::bare(name.to_string());
         let metric_labels = DatasetMetricLabels::new(&dataset_name);
@@ -7121,6 +7230,22 @@ mod tests {
         );
 
         let task = make_refresh_task_named(name, accelerator);
+
+        // Seeded through the same apply path the burst under test uses, and before
+        // the widening policy can refuse anything: a seed that silently failed to
+        // land would leave the "acceleration is unmutated" assertion vacuously
+        // true, so it is applied here where its own error still surfaces.
+        if let Some(seed) = seed {
+            task.write_change(seed)
+                .await
+                .expect("seeding the acceleration must succeed");
+            assert!(
+                !accelerator_row_ids(&task.accelerator).await.is_empty(),
+                "the seed must be readable before the burst runs, or an assertion that the \
+                 acceleration is unmutated holds for the wrong reason"
+            );
+        }
+
         let log = CommitLog::new();
         let initial_load_completed = Arc::new(AtomicBool::new(false));
         let mut pending_finalize = None;
@@ -7147,7 +7272,15 @@ mod tests {
         let applied = task
             .apply_envelope_run(
                 &mut context,
-                vec![make_widened_tracked_envelope(1, Arc::clone(&log))],
+                vec![ChangeEnvelope::new(
+                    Box::new(TrackingCommitter {
+                        id: 1,
+                        log: Arc::clone(&log),
+                        outcome: Ok(()),
+                    }),
+                    burst,
+                    false,
+                )],
             )
             .await;
 
@@ -7198,6 +7331,117 @@ mod tests {
                 status_is_error,
                 "dedup={dedup}: refusing the widening must surface as a dataset error, not a silent skip"
             );
+        }
+    }
+
+    /// Regression test for #13455. A refused widening must leave the acceleration
+    /// exactly as it found it.
+    ///
+    /// `group_into_sub_batches` splits a burst by operation and dispatches the
+    /// pieces in order, putting a `Delete` ahead of the `Upsert` that recreates
+    /// the same key and flushing a `Truncate` as a barrier. While the refusal was
+    /// raised from inside `process_upsert_batch`, both of those destructive halves
+    /// had already committed by the time it fired — and because the refusal stops
+    /// the run without acknowledging, the source redelivered the same burst, which
+    /// re-applied the same destructive half and was refused again. The rows the
+    /// burst was replacing were gone for good while the acceleration stayed
+    /// queryable, so queries returned wrong results indefinitely.
+    ///
+    /// Both burst shapes come off real sources: `DELETE k, INSERT k` is how
+    /// Debezium/Postgres reports an ordinary primary-key update, and `TRUNCATE,
+    /// INSERT` is a reload.
+    ///
+    /// The non-acknowledgement assertions alone do not catch this — they were
+    /// satisfied by the broken behavior, since a burst that refuses mid-way
+    /// acknowledges nothing either. The row-level assertion is the one that fails
+    /// without the preflight.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_refused_widening_burst_leaves_the_partitioned_acceleration_intact() {
+        for (case, ops) in [
+            ("delete_then_insert", ["d", "c"]),
+            ("truncate_then_insert", ["t", "c"]),
+        ] {
+            let accelerator = partitioned_accelerator(false, true).await;
+            let (applied, committed, status_is_error) = apply_widened_burst(
+                &format!("schema_evo_partitioned_burst_{case}"),
+                Arc::clone(&accelerator),
+                create_widened_change_batch_ops(&ops, &[7, 7], 30),
+                // Seeded under the pre-widening schema, in the partition the
+                // burst's own rows land in, so the destructive half of the burst
+                // has something of the operator's to destroy.
+                Some(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![7],
+                    vec![Some("row")],
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                accelerator_row_ids(&accelerator).await,
+                vec![7],
+                "{case}: a refused burst must not have applied its destructive half — the source \
+                 redelivers this burst unchanged, so anything it committed here is re-committed \
+                 on every retry and the rows it deleted never come back"
+            );
+            assert_eq!(
+                committed,
+                Vec::<i32>::new(),
+                "{case}: the source position must not advance past a widening the acceleration \
+                 cannot apply"
+            );
+            assert!(
+                !applied,
+                "{case}: the run must stop rather than continue past an uncommitted gap"
+            );
+            assert!(
+                status_is_error,
+                "{case}: refusing the widening must surface as a dataset error, not a silent skip"
+            );
+        }
+    }
+
+    /// A widened burst carrying no upsert keeps applying: `process_delete_batch`
+    /// and `process_truncate` work from the primary keys alone and never write the
+    /// incoming data schema into the acceleration, so there is nothing for the
+    /// widening to be refused over — and refusing anyway would stall replication
+    /// on a burst that applies cleanly.
+    ///
+    /// This is the boundary of the preflight above rather than incidental: the
+    /// preflight is reached by every burst, so without the upsert gate a
+    /// delete-only burst would start classifying, which no burst shape did before.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_widened_delete_only_burst_still_applies_to_a_partitioned_cayenne() {
+        for (case, ops) in [("delete_only", ["d"]), ("truncate_only", ["t"])] {
+            let accelerator = partitioned_accelerator(false, true).await;
+            let (applied, committed, status_is_error) = apply_widened_burst(
+                &format!("schema_evo_partitioned_destructive_only_{case}"),
+                Arc::clone(&accelerator),
+                create_widened_change_batch_ops(&ops, &[7], 30),
+                Some(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![7],
+                    vec![Some("row")],
+                )),
+            )
+            .await;
+
+            assert_eq!(
+                accelerator_row_ids(&accelerator).await,
+                Vec::<i32>::new(),
+                "{case}: the burst applies, so the seeded row is removed"
+            );
+            assert_eq!(
+                committed,
+                vec![1],
+                "{case}: a burst that applied in full must acknowledge its source"
+            );
+            assert!(applied, "{case}: the run must continue");
+            assert!(!status_is_error, "{case}: the dataset must not be errored");
         }
     }
 
