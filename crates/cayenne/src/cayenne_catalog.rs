@@ -5370,9 +5370,18 @@ mod tests {
     ///
     /// Bind the returned [`tempfile::TempDir`] for the whole test: dropping it removes
     /// the tree, so a test that keeps only the `String` deletes its own table root.
+    ///
+    /// The path must be UTF-8 rather than lossily converted, because `base_path` is a
+    /// `String` that Cayenne turns back into a path: a lossy conversion would build the
+    /// table tree at the replacement-character path while the guard deletes the real one,
+    /// which is the isolation this helper exists to provide.
     fn test_table_root() -> (tempfile::TempDir, String) {
         let root = tempfile::tempdir().expect("create a temporary table root");
-        let base_path = root.path().to_string_lossy().into_owned();
+        let base_path = root
+            .path()
+            .to_str()
+            .expect("the temporary table root is a UTF-8 path")
+            .to_owned();
         (root, base_path)
     }
 
