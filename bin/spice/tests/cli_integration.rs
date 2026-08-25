@@ -54,12 +54,18 @@ mod version {
             .stdout(predicate::str::contains("CLI version:"));
     }
 
-    /// A `SPICED_PATH` naming a file no runtime can be run from. Returned with
-    /// its `TempDir`, which has to outlive the command under test.
+    /// A `SPICED_PATH` naming something no runtime can be run from. Returned
+    /// with its `TempDir`, which has to outlive the command under test.
+    ///
+    /// A directory, not a file missing its execute bit: Windows carries no
+    /// execute bit, so a plain file is runnable there and the CLI would probe
+    /// it, report its version as unavailable and exit successfully — passing
+    /// the pin through the resolver these tests are asserting it is rejected
+    /// by. Being a directory fails `is_runnable_binary` on every platform.
     fn unrunnable_pin() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().expect("create tempdir");
         let pin = dir.path().join("spiced");
-        fs::write(&pin, "not a runtime").expect("write the pin");
+        fs::create_dir(&pin).expect("create the pin");
         (dir, pin)
     }
 

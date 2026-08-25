@@ -848,7 +848,7 @@ fn machine_error_code(error: &spice::error::Error) -> &'static str {
 fn is_json_output(cmd: &mut Commands) -> bool {
     // Explicit for the same reason `apply_machine_mode` is: the two answer for
     // the same command tree, and a wildcard here lets them disagree silently.
-    // `version` is where that bit: it reports a runtime it cannot resolve, and
+    // `version` is where that bit us: it reports a runtime it cannot resolve, and
     // a command absent from this list writes that report into the document its
     // caller is parsing.
     match cmd {
