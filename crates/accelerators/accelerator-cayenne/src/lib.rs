@@ -133,9 +133,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to recreate dataset {table_name} (cayenne): The acceleration data directory '{data_dir}' holds a Cayenne metastore at '{metastore_path}'. \
+        "Failed to recreate dataset '{table_name}' (cayenne): The acceleration data directory '{data_dir}' holds a Cayenne metastore at '{metastore_path}'. \
         Recreating this dataset deletes its data directory, which would take that catalog — and every Cayenne dataset recorded in it — with it. \
-        Move the metastore out of the data directory, or set 'cayenne_file_path' for this dataset to a directory that does not contain one. \
+        Move the metastore out of the data directory, or set `cayenne_file_path` for this dataset to a directory that does not contain one. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
     MetastoreFileInsideDataDir {
@@ -145,9 +145,9 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to recreate dataset {table_name} (cayenne): Could not read the acceleration data directory '{data_dir}' to check it for a Cayenne metastore ({source}). \
+        "Failed to recreate dataset '{table_name}' (cayenne): Could not read the acceleration data directory '{data_dir}' to check it for a Cayenne metastore ({source}). \
         Recreating this dataset deletes that directory, and Spice will not do that without first proving no metastore is inside it. \
-        Restore read permission on '{data_dir}', or set 'cayenne_file_path' to a directory Spice can read. \
+        Restore read permission on '{data_dir}', or set `cayenne_file_path` to a directory Spice can read. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
     MetastoreScanFailed {
@@ -157,7 +157,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to recreate dataset {table_name} (cayenne): Could not delete the acceleration data directory '{data_dir}' ({source}). \
+        "Failed to recreate dataset '{table_name}' (cayenne): Could not delete the acceleration data directory '{data_dir}' ({source}). \
         This dataset's rows are already out of the Cayenne metastore and '{data_dir}' may be partly deleted, so the acceleration serves no data until a recreate completes — retrying it is safe and resumes from here. \
         Check that Spice can write to '{data_dir}' and that nothing else is holding files open in it. \
         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
@@ -1311,7 +1311,22 @@ async fn catalog_directly_inside(link: &Path) -> std::io::Result<Option<PathBuf>
         Err(error) => return Err(error),
     };
     while let Some(entry) = entries.next_entry().await? {
-        if is_metastore_file(&entry.file_name()) {
+        if !is_metastore_file(&entry.file_name()) {
+            continue;
+        }
+        // Reports on the entry itself, as the main walk's does; an entry that vanished
+        // mid-read is nothing to protect.
+        let file_type = match entry.file_type().await {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        // The name is not sufficient on its own: a *directory* of that name is not a
+        // database `SQLite` could open, so reporting it would refuse a teardown over a
+        // catalog that cannot exist — the same asymmetry the main walk avoids by testing
+        // `is_dir()` first. A regular file or a link occupying the name still counts, since
+        // both are openable.
+        if !file_type.is_dir() {
             return Ok(Some(entry.path()));
         }
     }
@@ -3568,9 +3583,22 @@ impl DataAccelerator for CayenneAccelerator {
         // Fail here rather than at teardown, when the operator is already committed and
         // the delete has nothing left to protect — and before the recreate drops this
         // dataset's catalog rows, so a refusal never leaves them gone with the files
-        // still on disk.
+        // still on disk. This one reasons about the configured paths, so it costs a
+        // `canonicalize` and runs for every dataset.
         Self::ensure_metastore_outside_data_dir(source, &dir_path).await?;
-        Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
+        // The on-disk walk is the expensive half — linear in the entries under the data
+        // directory — so it runs only where this call is about to delete that directory.
+        // `mode: file_update` reaches its teardown through `drop_table`, which runs both
+        // proofs unconditionally, so gating here costs it the *early* notice and none of
+        // the protection; walking every file-backed dataset's tree at every startup to
+        // deliver that notice is not a trade worth making. `Mode::FileCreate` is checked
+        // here rather than deeper because the deletion below is under the same condition.
+        if source
+            .acceleration()
+            .is_some_and(|acceleration| acceleration.mode == Mode::FileCreate)
+        {
+            Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
+        }
 
         let is_s3_express = s3::is_s3_express_data_path(source);
 
@@ -3752,8 +3780,8 @@ impl DataAccelerator for CayenneAccelerator {
                 // check above had nothing to canonicalize.
                 Self::remove_acceleration_data_dir(source, &dir_path).await?;
                 tracing::warn!(
-                    "Cayenne acceleration mode is 'file_create', removed existing directory: {}",
-                    dir_path
+                    "Deleted the acceleration data directory '{dir_path}' of dataset '{dataset}' (cayenne), so everything it had accelerated is gone and the dataset reloads empty. `mode: file_create` recreates the acceleration from the source on every load; set `mode: file_update` to keep the existing data across loads. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    dataset = source.name(),
                 );
             }
         }
@@ -6302,6 +6330,160 @@ mod tests {
         assert!(
             rendered.contains("https://spiceai.org/docs/components/data-accelerators/cayenne"),
             "the message must keep its docs link; got: {rendered}"
+        );
+    }
+
+    /// The mirror of [`a_symlink_occupying_the_metastore_name_refuses_the_teardown`], one
+    /// level down. Behind an aliased metadata directory the name is not sufficient either:
+    /// a *directory* called `cayenne.db` is not a database `SQLite` can open, so reporting
+    /// it would refuse a teardown over a catalog that cannot exist — a false refusal on a
+    /// directory Spice was asked to recreate, and one an operator cannot act on because
+    /// there is nothing to move.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_named_like_the_metastore_behind_a_link_does_not_block_the_teardown() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let outside = base.path().join("elsewhere");
+        // A directory of that name, not a file: the shape the name check alone accepts.
+        std::fs::create_dir_all(outside.join("cayenne.db")).expect("directory of that name");
+
+        let data_dir = base.path().join("orders");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        std::os::unix::fs::symlink(&outside, data_dir.join("catalog")).expect("symlink");
+
+        CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+            .await
+            .expect("a directory of that name holds no catalog, so it must not refuse");
+
+        assert!(
+            !data_dir.exists(),
+            "the data directory must be deleted, links and all"
+        );
+        assert!(
+            outside.join("cayenne.db").exists(),
+            "unlinking the alias must leave what it pointed at alone"
+        );
+    }
+
+    /// The other half of the type test one level down: a *link* occupying the metastore
+    /// name inside an aliased metadata directory is still a database `SQLite` opens, so it
+    /// still refuses. Without this the type test could be tightened to regular files only
+    /// and nothing would notice — and that tightening reopens the orphaning this guard
+    /// exists for, since the alias dies with the data directory either way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_occupying_the_metastore_name_inside_an_aliased_directory_refuses() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let real = base.path().join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let real_catalog = real.join("cayenne.db");
+        std::fs::write(&real_catalog, b"catalog").expect("catalog file");
+
+        // The metadata directory the alias points at holds the database only by a link.
+        let aliased = base.path().join("meta");
+        std::fs::create_dir_all(&aliased).expect("aliased dir");
+        std::os::unix::fs::symlink(&real_catalog, aliased.join("cayenne.db")).expect("inner link");
+
+        let data_dir = base.path().join("orders");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let alias = data_dir.join("catalog");
+        std::os::unix::fs::symlink(&aliased, &alias).expect("outer link");
+
+        let err =
+            CayenneAccelerator::remove_acceleration_data_dir(&dataset, &data_dir.to_string_lossy())
+                .await
+                .expect_err("a link occupying the metastore name behind an alias must refuse");
+
+        assert!(
+            real_catalog.exists() && data_dir.exists(),
+            "nothing may be deleted by a refused teardown"
+        );
+        assert!(
+            err.to_string()
+                .contains(&alias.join("cayenne.db").to_string_lossy().into_owned()),
+            "the error must name the catalog reached through the alias; got: {err}"
+        );
+    }
+
+    /// The on-disk walk is linear in the entries under the data directory, and `init` runs
+    /// for every file-backed dataset at every load — so it is gated to the mode whose
+    /// bootstrap actually deletes that directory. `mode: file_update` reaches its teardown
+    /// through `drop_table`, which runs both proofs unconditionally
+    /// ([`a_rebuild_refuses_a_nested_metastore_before_the_data_directory_exists`] and
+    /// [`drop_table_refuses_a_metastore_no_parameter_of_this_dataset_names`] pin that), so
+    /// the gate costs it the early notice and none of the protection.
+    ///
+    /// The contrast is the assertion: this is the same on-disk layout that
+    /// [`init_refuses_a_metastore_no_parameter_of_this_dataset_names`] refuses under
+    /// `file_create`. Written as the absence of *that* refusal rather than as success,
+    /// because a unit-test `init` has other reasons to fail and none of them are the
+    /// subject here.
+    #[tokio::test]
+    async fn a_file_update_bootstrap_does_not_walk_the_data_directory() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+
+        let mut dataset = TestAccelerationSource::new("q").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::FileUpdate,
+            params: [(
+                "cayenne_file_path".to_string(),
+                base.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let foreign_metastore = base.path().join("q").join("catalog");
+        std::fs::create_dir_all(&foreign_metastore).expect("foreign metastore dir");
+        let catalog_file = foreign_metastore.join("cayenne.db");
+        std::fs::write(&catalog_file, b"catalog").expect("catalog file");
+
+        let outcome = CayenneAccelerator::new().init(&dataset).await;
+        if let Err(error) = outcome {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains("holds a Cayenne metastore"),
+                "a file_update bootstrap deletes nothing, so it must not walk the tree and \
+                 refuse over what it finds; got: {rendered}"
+            );
+        }
+
+        assert!(
+            catalog_file.exists(),
+            "nothing on this path deletes, so the metastore must be untouched either way"
         );
     }
 
