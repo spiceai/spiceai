@@ -20,23 +20,53 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install cmake pkg-config openssl unixodbc llvm libnfs
-        # `brew install` only warns — and still exits 0 — when a formula is already in
-        # the Cellar but unlinked, so its binaries never reach PATH. The failure then
-        # surfaces an hour later inside an unrelated crate, as a build script dying with
-        # "is `cmake` not installed?" and no error[EXXXX] to point at. Link the tools
-        # that build scripts invoke by bare name, then assert they resolve, so a stale
-        # runner fails here with a named cause. openssl and llvm are keg-only and are
-        # deliberately left unlinked; the build locates them via `brew --prefix`.
-        for tool in cmake pkg-config; do
-          brew link --overwrite "$tool" || true
-        done
+        # Probe before installing. These runners are long-lived and already carry the
+        # toolchain, so `brew install` is normally a no-op — but it still has to take
+        # Homebrew's global lock first, and when that lock is not writable the install
+        # aborts before doing any work. Every macOS job on the pool then fails here over
+        # a toolchain that is already present (spiceai#13463). Probing the Cellar and
+        # PATH directly costs no `brew` invocation, so a runner that needs nothing is
+        # unaffected by the state of the lock.
+        brew_bin="$(command -v brew || true)"
+        if [ -z "$brew_bin" ]; then
+          echo "::error::'brew' is not on PATH, so the cc toolchain cannot be installed or verified on this runner."
+          exit 1
+        fi
+        brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+        formulas=(cmake pkg-config openssl unixodbc llvm libnfs)
         missing=()
+        for formula in "${formulas[@]}"; do
+          [ -d "$brew_prefix/opt/$formula" ] || missing+=("$formula")
+        done
+        # cmake and pkg-config are invoked by bare name from build scripts, so being in
+        # the Cellar is not sufficient — they also have to resolve on PATH. Treating an
+        # installed-but-unlinked tool as missing routes it into the `brew link` below.
         for tool in cmake pkg-config; do
           command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
         done
         if [ ${#missing[@]} -ne 0 ]; then
-          echo "::error::Not on PATH after 'brew install': ${missing[*]}. Run 'brew link --overwrite ${missing[*]}' on this runner."
+          echo "cc toolchain incomplete on this runner (${missing[*]}); installing."
+          brew install cmake pkg-config openssl unixodbc llvm libnfs
+          # `brew install` only warns — and still exits 0 — when a formula is already in
+          # the Cellar but unlinked, so its binaries never reach PATH. The failure then
+          # surfaces an hour later inside an unrelated crate, as a build script dying with
+          # "is `cmake` not installed?" and no error[EXXXX] to point at. Link the tools
+          # that build scripts invoke by bare name. openssl and llvm are keg-only and are
+          # deliberately left unlinked; the build locates them via `brew --prefix`.
+          for tool in cmake pkg-config; do
+            brew link --overwrite "$tool" || true
+          done
+        else
+          echo "cc toolchain already present under $brew_prefix; skipping 'brew install'."
+        fi
+        # Assert unconditionally, so a runner we skipped still fails here with a named
+        # cause rather than deep inside a build script.
+        unresolved=()
+        for tool in cmake pkg-config; do
+          command -v "$tool" >/dev/null 2>&1 || unresolved+=("$tool")
+        done
+        if [ ${#unresolved[@]} -ne 0 ]; then
+          echo "::error::Installed but not on PATH: ${unresolved[*]}. Run 'brew link --overwrite ${unresolved[*]}' on this runner."
           exit 1
         fi
 
