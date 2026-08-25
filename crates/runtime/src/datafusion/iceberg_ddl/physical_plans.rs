@@ -177,6 +177,10 @@ impl AccelerationSource for IcebergDdlAccelerationSource {
         })
     }
 
+    fn component_label(&self) -> &'static str {
+        "table"
+    }
+
     fn definition_fingerprint(
         &self,
     ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {

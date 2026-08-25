@@ -3443,8 +3443,9 @@ impl DataAccelerator for CayenneAccelerator {
             {
                 return Err(Box::new(Error::InvalidConfiguration {
                     detail: Arc::from(format!(
-                        "Failed to register dataset {} (cayenne accelerator): acceleration snapshots are not supported for S3 Express One Zone storage, because the data lives in the bucket rather than in a local directory a snapshot can capture. Set `snapshots: disabled` on this dataset, or move the acceleration to local storage by removing `cayenne_s3_zone_ids` and the S3 Express `cayenne_file_path`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots",
-                        source.name()
+                        "Failed to register {component} {} (cayenne accelerator): acceleration snapshots are not supported for S3 Express One Zone storage, because the data lives in the bucket rather than in a local directory a snapshot can capture. Set `snapshots: disabled` on this {component}, or move the acceleration to local storage by removing `cayenne_s3_zone_ids` and the S3 Express `cayenne_file_path`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots",
+                        source.name(),
+                        component = source.component_label()
                     )),
                 }));
             }
@@ -3557,9 +3558,25 @@ impl DataAccelerator for CayenneAccelerator {
                 .get("cayenne_metastore")
                 .map_or("sqlite", String::as_str)
                 .to_string();
-            let catalog = self
+            // No fallback to the default snapshot engine if this fails. A Cayenne archive
+            // carries its metastore as a JSON slice and only `CayenneSnapshotEngine`
+            // imports that slice after extraction, so restoring with any other engine
+            // leaves a table whose metastore knows nothing of the files just written — and
+            // a scan whose manifest is empty for its own snapshot falls back to listing the
+            // data directory, which is wrong rows rather than an error.
+            let catalog = match self
                 .get_or_create_catalog(&metadata_dir.to_string_lossy(), &metastore_type)
-                .await;
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to open the Cayenne metastore for '{}', so no snapshot is restored and the acceleration is loaded from its source instead. Cause: {err}",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
+            };
 
             // An acceleration already exists if the METASTORE knows this table, not merely
             // if the configured directory has contents. The two disagree exactly when the
@@ -3568,31 +3585,35 @@ impl DataAccelerator for CayenneAccelerator {
             // while live — possibly newer — data sits under the old one. Bootstrapping on
             // the directory alone would import an older slice, and the import replaces this
             // dataset's metastore rows wholesale, orphaning the live files behind it.
-            if let Ok(catalog) = catalog.as_ref()
-                && catalog.get_table(&source.name().to_string()).await.is_ok()
-            {
-                tracing::info!(
-                    "Acceleration for '{}' is already registered in the Cayenne metastore, so no snapshot is restored over it",
-                    source.name()
-                );
-                return Ok(BootstrapStatus::none());
+            match catalog.get_table(&source.name().to_string()).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Acceleration for '{}' is already registered in the Cayenne metastore, so no snapshot is restored over it",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
+                // Only a definite absence clears the way. Any other failure means the
+                // metastore could not answer the question, and treating "could not answer"
+                // as "not there" is exactly how a restore lands on top of live data.
+                Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to determine whether a Cayenne acceleration for '{}' already exists, so no snapshot is restored over it and the acceleration is loaded from its source instead. Cause: {err}",
+                        source.name()
+                    );
+                    return Ok(BootstrapStatus::none());
+                }
             }
 
-            let snapshot_engine = match catalog {
-                Ok(catalog) => Some(Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
+            let snapshot_engine = Some(
+                Arc::new(crate::snapshot_engine::CayenneSnapshotEngine::new(
                     catalog,
                     source.name().to_string(),
                     path_buf.clone(),
                 ))
-                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to build CayenneSnapshotEngine for snapshot bootstrap, \
-                         falling back to default engine: {err}"
-                    );
-                    None
-                }
-            };
+                    as Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>,
+            );
             Ok(download_snapshot_if_needed(
                 acceleration,
                 source,

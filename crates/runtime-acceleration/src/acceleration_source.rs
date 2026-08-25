@@ -21,6 +21,23 @@ use runtime_secrets::Secrets;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::RwLock;
 
+/// What produced the rows a snapshot of a source would contain.
+///
+/// Distinguishes the two questions a caller may need to answer about a definition-bearing
+/// source: *did the definition change* (every source answers that with a fingerprint) and
+/// *can this caller establish the rows came from a single consistent read* (only a caller
+/// holding the compiled plan can, and only for a query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationSource {
+    /// A copy of a named source table. The rows on disk stand on their own, so any caller
+    /// that can see them may publish them.
+    SourceTable,
+    /// The result of a query. Whether the rows came from a single consistent read of the
+    /// query's sources is only answerable with the compiled plan in hand, so a caller
+    /// without one must not publish them — see `snapshot_before_recreate`.
+    PlannedQuery,
+}
+
 /// Identity of the definition a source's rows were materialized from, and how to treat a
 /// snapshot that records no definition at all.
 #[derive(Debug, Clone)]
@@ -40,6 +57,10 @@ pub struct SourceDefinition {
     /// possible hole. Accepting them still refuses every *mismatch*, so the protection
     /// applies in full to everything published from here on.
     pub accept_unstamped: bool,
+    /// What produced these rows. A fingerprint alone cannot answer this: every
+    /// definition-bearing source has one, but only a query's rows need a compiled plan
+    /// before they may be published.
+    pub materialization: MaterializationSource,
 }
 
 pub type InitializedSourcesFuture<'a> =
@@ -139,12 +160,24 @@ pub trait AccelerationSource: Send + Sync {
         snapshot_behavior: crate::snapshot::SnapshotBehavior,
     ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
+    /// How to name this source in a user-facing message — `"dataset"`, `"view"`, `"table"`.
+    ///
+    /// The snapshot paths are shared by datasets and views, so a message that hardcodes
+    /// "dataset" tells an operator to go fix a component that does not exist. Only the
+    /// source knows what it is.
+    ///
+    /// Deliberately has NO default implementation, for the same reason as
+    /// [`Self::connector_name`]: a default would silently mislabel a new source in every
+    /// error it can raise.
+    fn component_label(&self) -> &'static str;
+
     /// Stable identity of the definition whose result this source's rows are, or `None`
     /// for a source whose rows are not a function of one.
     ///
-    /// A dataset answers `None`: its rows are a copy of a named source table, and a
-    /// snapshot of them is meaningful against any later run of the same dataset. A view
-    /// answers with its SQL's fingerprint, because its rows are that query's *result* —
+    /// A dataset answers with its `from:` and `refresh_sql`, which together decide which
+    /// rows it copies and how they are filtered — rebinding `from:` to a same-schema table
+    /// changes what the rows mean while leaving the schema identical. A view answers with
+    /// its whole definition closure, because its rows are that query's *result* —
     /// change the query and the archived rows answer a question nobody is asking any
     /// more. The schema check cannot stand in for it: `WHERE region = 'us'` and `WHERE
     /// region = 'eu'` share a schema and share nothing else.

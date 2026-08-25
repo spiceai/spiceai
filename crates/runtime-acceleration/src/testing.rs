@@ -204,6 +204,10 @@ impl AccelerationSource for TestAccelerationSource {
         })
     }
 
+    fn component_label(&self) -> &'static str {
+        "dataset"
+    }
+
     fn definition_fingerprint(&self) -> Option<crate::acceleration_source::SourceDefinition> {
         // The test source stands in for a dataset: no definition behind its rows.
         None

@@ -41,6 +41,13 @@ use crate::{
 
 const SOURCE_CSV: &str = "id,region\n1,us\n2,eu\n3,us\n";
 
+/// Written over the source *after* the snapshot is published. Same schema, different
+/// answer: all three rows are now `us`, so the view's query returns 3 from the file and 2
+/// from the published snapshot. That difference is what makes the round trip falsifiable —
+/// with the original file still in place, a consumer that ignored the snapshot entirely and
+/// simply refreshed would produce the same 2 rows and the assertion could not fail.
+const SOURCE_CSV_DIVERGED: &str = "id,region\n1,us\n2,us\n3,us\n";
+
 /// Poll `condition` until it holds, so the test waits on the state it needs rather than a
 /// fixed sleep.
 async fn wait_until<F>(what: &str, timeout: Duration, mut condition: F) -> anyhow::Result<()>
@@ -174,6 +181,11 @@ async fn accelerated_view_snapshot_round_trips() -> anyhow::Result<()> {
             .await?;
             drop(publisher);
 
+            // Diverge the source so the two paths give different answers. From here, 2 rows
+            // can only mean the snapshot was restored; 3 means the view was rebuilt from the
+            // file and the bootstrap did nothing.
+            std::fs::write(&csv_path, SOURCE_CSV_DIVERGED).expect("diverge source csv");
+
             // --- bootstrap ---------------------------------------------------------
             // A different acceleration file, so nothing local can satisfy the read: the
             // rows can only come from the snapshot just published.
@@ -210,7 +222,11 @@ async fn accelerated_view_snapshot_round_trips() -> anyhow::Result<()> {
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum();
-            assert_eq!(rows, 2, "the view filters to the two 'us' rows");
+            assert_eq!(
+                rows, 2,
+                "expected the 2 rows captured in the snapshot; 3 would mean the view was \
+                 rebuilt from the diverged source instead of restored from the snapshot"
+            );
 
             Ok(())
         })

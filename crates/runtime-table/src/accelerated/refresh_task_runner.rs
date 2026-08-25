@@ -284,6 +284,8 @@ impl RefreshTaskRunner {
 
         self.task = Some(tokio::spawn(async move {
             let mut task_completion: Option<RefreshRunFuture> = None;
+            // Provenance of the run in `task_completion`, applied only once it succeeds.
+            let mut pending_overridden = false;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -292,6 +294,12 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(())) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully");
+                                    // Now, and only now, do the accelerator's rows come from
+                                    // this run — so this is when its provenance becomes the
+                                    // answer the snapshot path must use. A failed or panicked
+                                    // run leaves the previous rows, and with them the previous
+                                    // mark.
+                                    base_refresh.read().await.set_materialized_from_overrides(pending_overridden);
                                     if let Err(err) = notify_refresh_complete.send(Ok(())).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
@@ -324,14 +332,16 @@ impl RefreshTaskRunner {
                             }
                         },
                         Some(overrides_opt) = on_start_refresh.recv() => {
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, overridden) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_overridden = overridden;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
                 } else {
                     select! {
                         Some(overrides_opt) = on_start_refresh.recv() => {
-                            let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            let (request, overridden) = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            pending_overridden = overridden;
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -361,20 +371,26 @@ impl RefreshTaskRunner {
         &self.refresh_task
     }
 
-    /// Create a new [`Refresh`] based on defaults and overrides.
+    /// Create a new [`Refresh`] based on defaults and overrides, and report whether this
+    /// run will produce rows the configured definition does not describe.
+    ///
+    /// The provenance is returned rather than recorded, because this runs when the refresh
+    /// is DEQUEUED and the mark describes the rows already in the accelerator. Writing it
+    /// here opens a window in which an interval-driven snapshot reads the new run's
+    /// provenance against the previous run's rows — publishing override-produced rows under
+    /// the configured definition's fingerprint. The caller records it once the refresh has
+    /// actually succeeded.
     async fn create_refresh_from_overrides(
         defaults: Arc<RwLock<Refresh>>,
         overrides_opt: Option<RefreshOverrides>,
-    ) -> Refresh {
+    ) -> (Refresh, bool) {
         let r = defaults.read().await.clone();
-        // Clear first: the cell is shared with the configured `Refresh` and survives across
-        // runs, so an ordinary refresh after an overridden one must retract the mark or the
-        // snapshot path would keep declining to publish forever.
-        r.materialization_overridden
-            .store(false, std::sync::atomic::Ordering::Release);
         match overrides_opt {
-            Some(overrides) => r.with_overrides(&overrides),
-            None => r,
+            Some(overrides) => {
+                let overridden = overrides.changes_materialization();
+                (r.with_overrides(&overrides), overridden)
+            }
+            None => (r, false),
         }
     }
 

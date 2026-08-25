@@ -535,13 +535,28 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to enable acceleration snapshots for dataset '{name}': snapshots of a \
+        "Failed to enable acceleration snapshots for {component} '{name}': snapshots of a \
          partitioned Cayenne acceleration are not supported, because the archive would omit \
          the partitions' metadata and could not be restored. Set `snapshots: disabled`, or \
          remove `partition_by` from the acceleration. \
          See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
     ))]
-    SnapshotsUnsupportedForPartitionedCayenne { name: String },
+    SnapshotsUnsupportedForPartitionedCayenne {
+        component: &'static str,
+        name: String,
+    },
+
+    #[snafu(display(
+        "Failed to enable acceleration snapshots for {component} '{name}': its Cayenne \
+         metastore could not be opened, so an archive could not carry the metadata a restore \
+         needs. Check that the acceleration's metastore directory is readable and writable, \
+         or set `snapshots: disabled`. \
+         See: https://spiceai.org/docs/components/data-accelerators/cayenne#snapshots"
+    ))]
+    SnapshotsCayenneMetastoreUnavailable {
+        component: &'static str,
+        name: String,
+    },
 
     #[snafu(display(
         "Failed to enable acceleration snapshots for view '{view_name}': {reason}. \
@@ -614,6 +629,7 @@ impl Error {
                 // Snapshots asked for where they cannot work.
                 | Self::SnapshotsRequireFileAcceleration { .. }
                 | Self::SnapshotsUnsupportedForPartitionedCayenne { .. }
+                | Self::SnapshotsCayenneMetastoreUnavailable { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -3113,6 +3129,7 @@ impl DataFusion {
                 acceleration_settings.engine != Engine::Cayenne
                     || acceleration_settings.partition_by.is_empty(),
                 SnapshotsUnsupportedForPartitionedCayenneSnafu {
+                    component: "dataset",
                     name: dataset.name.to_string(),
                 }
             );
@@ -4706,6 +4723,7 @@ impl DataFusion {
                         || acceleration.engine != Engine::Cayenne
                         || acceleration.partition_by.is_empty(),
                     SnapshotsUnsupportedForPartitionedCayenneSnafu {
+                        component: "view",
                         name: table.to_string(),
                     }
                 );
@@ -5573,14 +5591,19 @@ async fn build_snapshot_creation_config(
     // raw `cayenne.db` with no slice, and nothing can restore that — while still becoming the
     // store's `current-snapshot-id` and displacing a snapshot that could be restored.
     // `snapshot_before_recreate` already refuses this; so must the periodic path.
+    //
+    // Raised as a load error rather than a warning: returning `Ok(None)` here would accept
+    // `snapshots: enabled` and then never publish, which is the false-backup behaviour this
+    // path rejects everywhere else — an operator would discover it only when a restore they
+    // were relying on found nothing to restore.
     #[cfg(not(windows))]
-    if acceleration_settings.engine == Engine::Cayenne && snapshot_engine_override.is_none() {
-        tracing::warn!(
-            "Snapshot creation is disabled for '{}': its Cayenne metastore catalog is unavailable, so an archive could not carry the metadata a restore needs",
-            source.name()
-        );
-        return Ok(None);
-    }
+    ensure!(
+        acceleration_settings.engine != Engine::Cayenne || snapshot_engine_override.is_some(),
+        SnapshotsCayenneMetastoreUnavailableSnafu {
+            component: source.component_label(),
+            name: source.name().to_string(),
+        }
+    );
 
     #[cfg(any(
         feature = "duckdb",

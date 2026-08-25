@@ -44,8 +44,17 @@ use std::{
 /// operator can act on, but it cannot be the whole answer: the compiled plan follows
 /// catalog state, statistics and federation pushdown, so a view that reads once at
 /// registration can read twice later without its SQL changing. This gate re-asks against
-/// the plan that would actually run, immediately before each publish, and is what makes
-/// the decision binding.
+/// the plan that would run now, immediately before each publish.
+///
+/// What it does and does not establish is worth being exact about. It runs *after* the
+/// refresh has materialized its rows, so it does not prove the plan that produced them was
+/// single-read — a shape that was multi-read during materialization and is single-read by
+/// the time the gate asks would be approved. What it does is deny publication to any view
+/// whose query is multi-read at publish time, which is the shape that persists rather than
+/// flickers: the ones this catches (a self-join, a CTE used twice, a partitioned scan) are
+/// properties of the plan, not of a moment. Closing the gap properly means recording the
+/// classified shape from the plan the refresh actually executed and consuming that here,
+/// which is a change to the refresh path rather than to this gate.
 ///
 /// Refusing skips one publish; it does not fail the view or the refresh. The accelerated
 /// table stays correct and keeps serving — it just does not add a snapshot this cycle,
@@ -308,6 +317,23 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
             .unwrap_or_default()
     }
 
+    // A Spicepod name and a name parsed out of SQL may spell the same table differently —
+    // `public.inner` declared, `inner` referenced. Compare the parsed forms, and treat a
+    // qualifier only as a constraint when BOTH sides state it. Matching too widely costs
+    // an occasional extra dependency in the fingerprint (a snapshot refused that need not
+    // have been); matching too narrowly drops a dependency, which is a snapshot ACCEPTED
+    // under a definition that no longer produces its rows.
+    fn names_match(declared: &str, referenced: &TableReference) -> bool {
+        let declared = TableReference::parse_str(declared);
+        if declared.table() != referenced.table() {
+            return false;
+        }
+        match (declared.schema(), referenced.schema()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+
     let mut closure: BTreeMap<String, String> = BTreeMap::new();
     let mut pending = dependencies_of(sql);
     let mut seen: HashSet<String> = HashSet::from([name.to_string()]);
@@ -317,16 +343,53 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
         if !seen.insert(key.clone()) {
             continue;
         }
-        // Only views contribute: a dataset's own identity is checked by its own snapshot
-        // series, and its `from:`/`refresh_sql` are not readable from here.
-        let Some(view) = app.views.iter().find(|candidate| candidate.name == key) else {
+
+        if let Some(view) = app
+            .views
+            .iter()
+            .find(|candidate| names_match(&candidate.name, &dependency))
+        {
+            // `sql_ref` names a FILE. Hashing the path would leave the fingerprint
+            // unchanged when the file's contents change, which is precisely the
+            // substitution this identity exists to catch, so read it — the same way
+            // `ViewBuilder` does for the root view. An unreadable file is recorded as
+            // such rather than skipped: skipping would silently restore the outer view's
+            // old archive, whereas a marker simply fails the match and declines.
+            let dependency_sql = match (&view.sql, &view.sql_ref) {
+                (Some(inline), _) => Some(inline.clone()),
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(path)
+                        .unwrap_or_else(|e| format!("-- unreadable sql_ref {path}: {e}")),
+                ),
+                (None, None) => None,
+            };
+            if let Some(dependency_sql) = dependency_sql {
+                pending.extend(dependencies_of(&dependency_sql));
+                closure.insert(key, dependency_sql);
+            }
             continue;
-        };
-        let Some(dependency_sql) = view.sql.clone().or_else(|| view.sql_ref.clone()) else {
-            continue;
-        };
-        pending.extend(dependencies_of(&dependency_sql));
-        closure.insert(key, dependency_sql);
+        }
+
+        // Datasets contribute too. A dataset's own snapshot series validates ITS archives,
+        // but it cannot speak for rows already baked into a view's archive: rebind
+        // `orders` to a same-schema table and `SELECT * FROM orders` keeps identical SQL
+        // while its materialized rows come from somewhere else entirely.
+        if let Some(dataset) = app
+            .datasets
+            .iter()
+            .find(|candidate| names_match(&candidate.name, &dependency))
+        {
+            let mut identity = format!("from={}", dataset.from);
+            if let Some(refresh_sql) = dataset
+                .acceleration
+                .as_ref()
+                .and_then(|acceleration| acceleration.refresh_sql.as_deref())
+            {
+                identity.push_str("\nrefresh_sql=");
+                identity.push_str(refresh_sql.trim());
+            }
+            closure.insert(key, identity);
+        }
     }
 
     let mut definition = String::from(sql.trim());
@@ -339,12 +402,13 @@ pub(crate) fn view_definition_closure(name: &TableReference, sql: &str, app: &ap
     definition
 }
 
-/// Stable identity of a view definition, recorded alongside its snapshots so a bootstrap
-/// can refuse an archive materialized from a different one. A schema check cannot stand
-/// in for this: `SELECT a, b FROM t WHERE region = 'us'` and the same query with
-/// `region = 'eu'` have identical schemas and completely different contents.
-/// Stable hash of any definition string. Shared so a dataset's identity (its `from:` plus
-/// `refresh_sql`) and a view's (its SQL) cannot drift into different hash schemes.
+/// Stable hash of a definition string, recorded alongside a source's snapshots so a
+/// bootstrap can refuse an archive materialized from a different definition. A schema
+/// check cannot stand in for this: `SELECT a, b FROM t WHERE region = 'us'` and the same
+/// query with `region = 'eu'` have identical schemas and completely different contents.
+///
+/// Shared by both source kinds so a dataset's identity (its `from:` plus `refresh_sql`)
+/// and a view's (its definition closure) cannot drift into different hash schemes.
 #[must_use]
 pub(crate) fn definition_fingerprint(definition: &str) -> String {
     let mut hasher = Sha256::new();
@@ -668,6 +732,89 @@ mod tests {
             assert!(
                 shape.refusal_reason().is_none(),
                 "a fully pushed-down plan reads once"
+            );
+        }
+
+        /// Build an app holding one view and one dataset, to exercise the closure.
+        fn app_with(views: &[(&str, &str)], datasets: &[(&str, &str)]) -> app::App {
+            let mut builder = app::AppBuilder::new("closure_test");
+            for (name, sql) in views {
+                let mut view = spicepod::component::view::View::new((*name).to_string());
+                view.sql = Some((*sql).to_string());
+                builder = builder.with_view(view);
+            }
+            for (name, from) in datasets {
+                builder = builder.with_dataset(spicepod::component::dataset::Dataset::new(
+                    (*from).to_string(),
+                    (*name).to_string(),
+                ));
+            }
+            builder.build()
+        }
+
+        /// A view's rows are the result of its dependencies, so changing a view it reads
+        /// must change its identity even though its own SQL is byte-identical.
+        #[test]
+        fn closure_follows_a_dependency_view() {
+            let outer = TableReference::bare("outer");
+            let us = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("inner", "SELECT id FROM orders WHERE region = 'us'")],
+                    &[],
+                ),
+            );
+            let eu = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(
+                    &[("inner", "SELECT id FROM orders WHERE region = 'eu'")],
+                    &[],
+                ),
+            );
+            assert_ne!(
+                definition_fingerprint(&us),
+                definition_fingerprint(&eu),
+                "the outer view's identity must follow the inner view's definition"
+            );
+        }
+
+        /// A dataset dependency counts too: the view's archive embeds the dataset's rows,
+        /// and the dataset's own snapshot series cannot vouch for rows already baked in.
+        #[test]
+        fn closure_follows_a_dependency_dataset() {
+            let v = TableReference::bare("v");
+            let old = view_definition_closure(
+                &v,
+                "SELECT * FROM orders",
+                &app_with(&[], &[("orders", "postgres:old_orders")]),
+            );
+            let new = view_definition_closure(
+                &v,
+                "SELECT * FROM orders",
+                &app_with(&[], &[("orders", "postgres:new_orders")]),
+            );
+            assert_ne!(
+                definition_fingerprint(&old),
+                definition_fingerprint(&new),
+                "rebinding a dataset the view reads must change the view's identity"
+            );
+        }
+
+        /// A Spicepod may declare `public.inner` while the SQL says `inner`. Missing that
+        /// match would drop the dependency and accept an archive of the old definition.
+        #[test]
+        fn closure_matches_a_qualified_declaration() {
+            let outer = TableReference::bare("outer");
+            let matched = view_definition_closure(
+                &outer,
+                "SELECT * FROM inner",
+                &app_with(&[("public.inner", "SELECT 1")], &[]),
+            );
+            assert!(
+                matched.contains("SELECT 1"),
+                "a qualified declaration must still match a bare reference: {matched}"
             );
         }
 

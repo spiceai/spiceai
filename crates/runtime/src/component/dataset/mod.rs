@@ -255,6 +255,10 @@ impl AccelerationSource for Dataset {
         )
     }
 
+    fn component_label(&self) -> &'static str {
+        "dataset"
+    }
+
     fn definition_fingerprint(
         &self,
     ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
@@ -281,6 +285,8 @@ impl AccelerationSource for Dataset {
             runtime_acceleration::acceleration_source::SourceDefinition {
                 fingerprint: crate::view::definition_fingerprint(&identity),
                 accept_unstamped: true,
+                materialization:
+                    runtime_acceleration::acceleration_source::MaterializationSource::SourceTable,
             },
         )
     }

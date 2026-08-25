@@ -116,6 +116,21 @@ impl Runtime {
             return;
         }
 
+        // Also before any accelerator opens: this refuses two snapshot-enabled sources that
+        // share one acceleration file, and both `init` paths below can bootstrap or recreate
+        // that file. Checking afterwards would name a collision that had already happened.
+        // `acceleration_file_path` resolves from configuration and the engine registry, so it
+        // does not need an initialized accelerator to answer.
+        if let Err(err) = validate_snapshot_paths(
+            acceleration_sources.clone(),
+            &self.accelerator_engine_registry,
+        )
+        .await
+        {
+            tracing::error!("{err}");
+            return;
+        }
+
         // Views' accelerators initialize before the datasets load: acceleration
         // federation needs them in place for some engines (e.g. `DuckDB`).
         self.initialize_views_accelerators(&valid_views).await;
@@ -123,20 +138,6 @@ impl Runtime {
         let init_results = self
             .initialize_datasets_accelerators(&startup_datasets)
             .await;
-
-        // Validate that no datasets with snapshots share acceleration files
-        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = startup_datasets
-            .iter()
-            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
-            .map(|ds| ds.clone_arc())
-            .chain(valid_views.iter().map(|vv| vv.view.clone_arc()))
-            .collect();
-        if let Err(err) =
-            validate_snapshot_paths(initialized_sources, &self.accelerator_engine_registry).await
-        {
-            tracing::error!("{err}");
-            return;
-        }
 
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();

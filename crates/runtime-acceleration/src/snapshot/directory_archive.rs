@@ -361,12 +361,6 @@ where
     Ok(total_bytes)
 }
 
-/// Archive directories directly into a filesystem file without materializing
-/// the tar payload in memory.
-///
-/// # Errors
-/// Returns an error when the destination file or any archive input cannot be
-/// read or written.
 /// What an archive run produced: its size, and the set of paths actually written into it.
 ///
 /// The member set is what lets a caller verify the archive it is about to publish, rather

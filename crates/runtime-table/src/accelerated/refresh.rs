@@ -112,7 +112,7 @@ pub struct Refresh {
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RefreshOverrides {
     /// The SQL statement used for this refresh. Defaults to the `refresh_sql` specified in the spicepod, if any.
@@ -131,6 +131,21 @@ pub struct RefreshOverrides {
     )]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "10s"))]
     pub max_jitter: Option<Duration>,
+}
+
+impl RefreshOverrides {
+    /// Whether these overrides change WHICH ROWS a refresh lands in the accelerator, and
+    /// so make the result something the configured definition does not describe.
+    ///
+    /// `sql` filters and projects the rows and `mode` decides whether they replace or
+    /// accumulate; `max_jitter` only moves when the refresh starts. An empty request body
+    /// changes nothing at all. Treating a timing-only override as definition-changing
+    /// would suspend snapshots until some later plain refresh — indefinitely for a
+    /// manually refreshed dataset.
+    #[must_use]
+    pub fn changes_materialization(&self) -> bool {
+        self.sql.is_some() || self.mode.is_some()
+    }
 }
 
 fn parse_max_jitter<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -242,12 +257,10 @@ impl Refresh {
     /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
-        // Record that this run is not the configured definition's result, for the snapshot
-        // path: an archive of these rows could not be described by the configured
-        // definition, and stamping it with that identity would be a lie a cold node then
-        // restores.
-        self.materialization_overridden
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Deliberately does NOT record provenance. This runs when a refresh is dequeued,
+        // and the mark describes the rows currently in the accelerator — which are still
+        // the previous run's until this one finishes. `RefreshTaskRunner` publishes it on
+        // successful completion instead; see `set_materialized_from_overrides`.
         if let Some(sql_str) = &overrides.sql {
             self.override_sql_raw = Some(sql_str.clone());
         }
@@ -260,8 +273,19 @@ impl Refresh {
         self
     }
 
-    /// Whether the most recent refresh ran with request-scoped overrides, and so produced
-    /// rows the configured definition does not describe.
+    /// Records whether the rows now in the accelerator came from request-scoped overrides.
+    ///
+    /// Called by `RefreshTaskRunner` after a refresh SUCCEEDS, never when one is dequeued.
+    /// The distinction is the whole point: clearing the mark up front would let an
+    /// interval-driven snapshot observe `false` and publish the previous, override-produced
+    /// rows stamped with the configured definition's identity.
+    pub fn set_materialized_from_overrides(&self, overridden: bool) {
+        self.materialization_overridden
+            .store(overridden, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the rows currently in the accelerator came from a refresh that ran with
+    /// request-scoped overrides, and so are not the configured definition's result.
     #[must_use]
     pub fn materialized_from_overrides(&self) -> bool {
         self.materialization_overridden
@@ -1320,6 +1344,47 @@ async fn notify_refresh_done(
 
 #[cfg(test)]
 mod tests {
+    /// Only the overrides that decide WHICH ROWS land in the accelerator suspend snapshot
+    /// publication. A timing-only override that counted would disable snapshots until some
+    /// later plain refresh — indefinitely for a manually refreshed dataset.
+    #[test]
+    fn only_row_shaping_overrides_change_the_materialization() {
+        use super::RefreshOverrides;
+
+        let empty = RefreshOverrides::default();
+        assert!(
+            !empty.changes_materialization(),
+            "an empty request body changes nothing"
+        );
+
+        let jitter_only = RefreshOverrides {
+            max_jitter: Some(Duration::from_secs(5)),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            !jitter_only.changes_materialization(),
+            "jitter moves when a refresh starts, not which rows it produces"
+        );
+
+        let sql = RefreshOverrides {
+            sql: Some("SELECT 1".to_string()),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            sql.changes_materialization(),
+            "refresh_sql filters the rows"
+        );
+
+        let mode = RefreshOverrides {
+            mode: Some(RefreshMode::Append),
+            ..RefreshOverrides::default()
+        };
+        assert!(
+            mode.changes_materialization(),
+            "refresh_mode decides whether rows replace or accumulate"
+        );
+    }
+
     use arrow::{
         array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
         datatypes::{DataType, Field, Fields, Schema},

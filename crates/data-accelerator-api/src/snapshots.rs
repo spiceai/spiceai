@@ -27,7 +27,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use runtime_acceleration::BootstrapStatus;
 use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
-use runtime_acceleration::acceleration_source::AccelerationSource;
+use runtime_acceleration::acceleration_source::{AccelerationSource, MaterializationSource};
 use runtime_acceleration::snapshot::engine::SnapshotEngine;
 use runtime_acceleration::snapshot::{
     AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager, metrics,
@@ -169,14 +169,21 @@ pub async fn snapshot_before_recreate(
 
     let dataset_name = source.name().to_string();
 
-    // A source whose rows are the result of a definition (a view's SQL) cannot publish
-    // from here. This runs inside the accelerator's `init`, before the runtime has
-    // planned the definition, so there is no way to establish that the outgoing
-    // materialization came from a single read — and publishing makes whatever it holds
-    // the store's current snapshot. The live publish path decides that question with the
-    // compiled plan in hand; this one would be guessing, and the cost of guessing wrong
-    // is a durable wrong answer rather than a missing backup.
-    if source.definition_fingerprint().is_some() {
+    // A source whose rows are the result of a query cannot publish from here. This runs
+    // inside the accelerator's `init`, before the runtime has planned the definition, so
+    // there is no way to establish that the outgoing materialization came from a single
+    // read — and publishing makes whatever it holds the store's current snapshot. The live
+    // publish path decides that question with the compiled plan in hand; this one would be
+    // guessing, and the cost of guessing wrong is a durable wrong answer rather than a
+    // missing backup.
+    //
+    // Asks what produced the rows rather than whether a fingerprint exists: a dataset also
+    // carries one (its `from:` and `refresh_sql`), and treating that as "cannot publish"
+    // would silently drop the pre-recreation backup for every dataset.
+    if source
+        .definition_fingerprint()
+        .is_some_and(|definition| definition.materialization == MaterializationSource::PlannedQuery)
+    {
         tracing::warn!(
             "Skipped snapshotting the outgoing acceleration of '{dataset_name}' before recreating it, so the snapshot series keeps its previously published contents: Spice cannot confirm from here that those rows came from a single consistent read of this view's sources"
         );
@@ -308,7 +315,8 @@ pub async fn validate_snapshot_paths(
             }
             Err(err) => {
                 tracing::warn!(
-                    "Unable to determine acceleration file path for dataset {} while validating snapshot configuration: {err}",
+                    "Failed to resolve the acceleration file path of {} '{}', so Spice cannot check whether it shares that file with another snapshot-enabled component. Cause: {err}",
+                    source.component_label(),
                     source.name()
                 );
             }

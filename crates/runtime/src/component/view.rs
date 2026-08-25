@@ -318,6 +318,10 @@ impl AccelerationSource for View {
         )
     }
 
+    fn component_label(&self) -> &'static str {
+        "view"
+    }
+
     fn definition_fingerprint(
         &self,
     ) -> Option<runtime_acceleration::acceleration_source::SourceDefinition> {
@@ -332,6 +336,8 @@ impl AccelerationSource for View {
                     &crate::view::view_definition_closure(&self.name, &self.sql, &self.app),
                 ),
                 accept_unstamped: false,
+                materialization:
+                    runtime_acceleration::acceleration_source::MaterializationSource::PlannedQuery,
             },
         )
     }
