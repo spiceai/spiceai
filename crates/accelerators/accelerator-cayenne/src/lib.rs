@@ -1278,10 +1278,10 @@ async fn metastore_file_under(data_dir: &Path) -> std::io::Result<Option<PathBuf
                 // `catalog_directly_inside` instead would answer `None` for it, that
                 // helper's subject being a link to a metadata *directory*.
                 return Ok(Some(entry.path()));
-            } else if file_type.is_symlink() {
-                if let Some(aliased) = catalog_directly_inside(&entry.path()).await? {
-                    return Ok(Some(aliased));
-                }
+            } else if file_type.is_symlink()
+                && let Some(aliased) = catalog_directly_inside(&entry.path()).await?
+            {
+                return Ok(Some(aliased));
             }
         }
     }
