@@ -33,7 +33,6 @@ runs:
         SPICEIO_ENDPOINT: ${{ inputs.spiceio_endpoint }}
       run: |
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
-        echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
@@ -42,14 +41,38 @@ runs:
         # daemon port 4226 are shared. A sibling job's spiceio auto-increments
         # onto the next port, overwrites that file, and this job's sccache then
         # probes a Connection-refused endpoint (see run 32895059022).
+        #
+        # A hashed TCP port is not job-unique (20k values) and sccache v0.9.1
+        # attaches to whatever daemon already holds that port — `--zero-stats`
+        # then succeeds against the stale job's config. Unix gets a socket
+        # under RUNNER_TEMP instead; Windows (no UDS) gets an ephemeral TCP
+        # port. Both use a finite idle timeout: a unique listen address plus
+        # IDLE_TIMEOUT=0 would leak one immortal daemon per job.
         conf_dir="${RUNNER_TEMP}/sccache"
         mkdir -p "$conf_dir"
         echo "SCCACHE_CONF=${conf_dir}/config" >> "$GITHUB_ENV"
-        ident="${GITHUB_RUN_ID:-0}:${GITHUB_JOB:-job}:${GITHUB_RUN_ATTEMPT:-1}:${RUNNER_NAME:-}"
-        hash=$(printf '%s' "$ident" | cksum | awk '{print $1}')
-        port=$((42000 + hash % 20000))
-        echo "SCCACHE_SERVER_PORT=${port}" >> "$GITHUB_ENV"
-        echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_PORT=${port}"
+        echo "SCCACHE_IDLE_TIMEOUT=7200" >> "$GITHUB_ENV"
+
+        if [[ "${RUNNER_OS}" != "Windows" ]]; then
+          sock="${conf_dir}/sccache.sock"
+          rm -f "$sock"
+          echo "SCCACHE_SERVER_UDS=${sock}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_UDS=${sock}"
+        else
+          port=""
+          if command -v python3 >/dev/null 2>&1; then
+            port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          elif command -v python >/dev/null 2>&1; then
+            port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') || port=""
+          fi
+          if [[ -z "${port}" ]]; then
+            ident="${GITHUB_RUN_ID:-0}:${GITHUB_JOB:-job}:${GITHUB_RUN_ATTEMPT:-1}:${RUNNER_NAME:-}"
+            hash=$(printf '%s' "$ident" | cksum | awk '{print $1}')
+            port=$((42000 + hash % 20000))
+          fi
+          echo "SCCACHE_SERVER_PORT=${port}" >> "$GITHUB_ENV"
+          echo "sccache isolated: SCCACHE_CONF=${conf_dir}/config SCCACHE_SERVER_PORT=${port}"
+        fi
 
         # Credentials have to be in the environment from here on -- before the cache config
         # is written and before the pre-flight signs its probe request -- and not in
