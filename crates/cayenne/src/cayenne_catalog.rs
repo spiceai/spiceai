@@ -5376,7 +5376,7 @@ mod tests {
         (root, base_path)
     }
 
-    /// Every table root these tests create must come from [`test_table_root`].
+    /// Every table root named in this file must come from [`test_table_root`].
     ///
     /// The guard is textual because what it prevents is environmental: a pinned
     /// `/tmp` root passes wherever the running account happens to own the directory
@@ -5387,17 +5387,17 @@ mod tests {
         let pinned: Vec<String> = include_str!("cayenne_catalog.rs")
             .lines()
             .enumerate()
-            .filter(|(_, line)| {
-                let line = line.trim_start();
-                (line.starts_with("base_path:") || line.starts_with("let base_path ="))
-                    && line.contains("\"/tmp/")
+            .filter_map(|(index, line)| {
+                let line = line.trim();
+                ((line.starts_with("base_path:") || line.starts_with("let base_path ="))
+                    && line.contains("\"/tmp/"))
+                .then(|| format!("line {}: {line}", index + 1))
             })
-            .map(|(index, line)| format!("line {}: {}", index + 1, line.trim()))
             .collect();
         assert!(
             pinned.is_empty(),
-            "these table roots are pinned under /tmp, which another account may already own; \
-             call test_table_root() instead: {pinned:#?}"
+            "cayenne_catalog.rs pins these table roots under /tmp, which another account may \
+             already own; call test_table_root() instead: {pinned:#?}"
         );
     }
 
