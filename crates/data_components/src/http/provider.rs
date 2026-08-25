@@ -4436,6 +4436,150 @@ mod response_cache_tests {
         );
     }
 
+    /// `Vary: *` says the response must never satisfy a later request. No
+    /// freshness window makes it reusable, so it is refused outright — otherwise
+    /// an endpoint returning changing data behind `max-age` would have its first
+    /// body served to every query for the rest of the window.
+    #[tokio::test]
+    async fn vary_star_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "*")
+                    .set_body_string(r#"{"rows":12}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response that may never be reused must not be retained"
+        );
+    }
+
+    /// A named `Vary` is not treated the same way, and that is the point of
+    /// matching only `*`: what varies between requests here — path, query, body
+    /// and the headers a query supplies — is already the cache key, so a named
+    /// field cannot make one request's response answer a different request.
+    #[tokio::test]
+    async fn a_named_vary_field_still_caches() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "accept-encoding, accept")
+                    .set_body_string(r#"{"rows":13}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a named Vary must not be read as a blanket refusal"
+        );
+    }
+
+    /// `Vary` naming the authenticator's header is refused, because that value
+    /// is the one connector header that is *not* stable: an OAuth token is
+    /// refreshed in the background, so a later request can carry a different
+    /// credential than the stored representation was selected for.
+    #[tokio::test]
+    async fn vary_on_the_auth_header_refuses_retention() {
+        #[derive(Debug)]
+        struct RotatingAuth;
+        impl super::super::auth::HttpAuthenticator for RotatingAuth {
+            fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+                builder.header(reqwest::header::AUTHORIZATION, "Bearer whatever")
+            }
+            fn header_name(&self) -> &reqwest::header::HeaderName {
+                &reqwest::header::AUTHORIZATION
+            }
+        }
+
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "authorization")
+                    .set_body_string(r#"{"rows":14}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        // Without the authenticator the same response is cacheable, which is
+        // what makes this about the rotating credential rather than about
+        // `Vary` naming anything at all.
+        let unauthenticated = provider_for(&origin);
+        unauthenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&unauthenticated.cache).await;
+        assert_eq!(unauthenticated.cache.entry_count(), 1);
+
+        let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
+        authenticated
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&authenticated.cache).await;
+        assert_eq!(
+            authenticated.cache.entry_count(),
+            0,
+            "a representation selected on a credential that rotates must not be retained"
+        );
+    }
+
+    /// An unreadable `Vary` leaves the selection unknown, and unknown resolves
+    /// against caching here as it does for `Cache-Control` and `Age`.
+    #[tokio::test]
+    async fn an_unreadable_vary_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header(
+                        "vary",
+                        reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe])
+                            .expect("bytes are a legal header value even though they are not text"),
+                    )
+                    .set_body_string(r#"{"rows":15}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a Vary we cannot read must not be treated as no Vary at all"
+        );
+    }
+
     /// The positive control: a response the origin *does* allow to be cached is
     /// admitted, and the next identical request is served without reaching the
     /// origin again. Without this, a cache that admitted nothing at all would
