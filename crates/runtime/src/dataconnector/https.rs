@@ -1726,7 +1726,7 @@ const HTTP_CACHE_METRIC_SPECS: &[MetricSpec] = &[
         MetricType::ObservableGaugeU64,
     )
     .description(
-        "Bytes retained by the HTTP connector's response cache, counting response bodies and the request keys they are held under.",
+        "Bytes retained by the HTTP connector's response cache, counting response bodies, their headers and the request keys they are held under. Excludes the cache's own per-entry bookkeeping.",
     )
     .unit("By")
     .auto_register(),
