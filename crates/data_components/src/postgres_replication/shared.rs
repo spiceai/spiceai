@@ -1656,6 +1656,13 @@ struct SharedSource {
     /// later must snapshot even if their table already sat in the publication:
     /// a fresh slot has no history for anyone.
     slot_created_fresh: AtomicBool,
+    /// How many times the slot behind this source has been replaced, so an actor
+    /// holding an observation of the *previous* slot can tell that it is stale.
+    ///
+    /// Only the pump reads it, and only to decide whether the refusal it is about
+    /// to act on still describes the slot that is there — see
+    /// [`recover_unusable_slot`].
+    slot_generation: AtomicU64,
     /// Tables whose member detached during this pump's lifetime; a rejoin is
     /// resumed via held-floor replay instead of a snapshot.
     detached: Mutex<HashSet<MemberKey>>,
@@ -1696,6 +1703,7 @@ impl SharedSource {
             watermark_notify: Arc::new(Notify::new()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
+            slot_generation: AtomicU64::new(0),
             detached: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
             retention_posture: Mutex::new(None),
@@ -2052,6 +2060,54 @@ fn get_or_create_source(key: &SourceKey, params: &ReplicationParams) -> Arc<Shar
     source
 }
 
+/// Take on, for the source as a whole, what this member's slot setup established.
+///
+/// Runs before the joining member is registered, so everything here describes the
+/// source as it was *without* it: the members already attached, and the floors
+/// already held.
+///
+/// Callers must hold [`SharedSource::setup_lock`] — `attach_member` does, which is
+/// also what keeps the replacement handling below from racing the pump's own
+/// recovery of the same slot.
+async fn apply_slot_setup(
+    source: &Arc<SharedSource>,
+    setup: &slot::SharedMemberSetup,
+    metrics: &ReplicationMetricsCollector,
+) {
+    // Whichever member set the slot up read this; keep it for the shutdown
+    // message, which has no connection of its own to ask on.
+    *lock(&source.retention_posture) = Some(setup.slot.retention_posture);
+    if setup.slot.created_fresh {
+        source.slot_created_fresh.store(true, Ordering::Release);
+    }
+    if setup.slot.consistent_lsn > 0 {
+        source.ack.seed(setup.slot.consistent_lsn);
+        metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
+    }
+    // Did this setup put a different slot under the members already streaming here?
+    // Their positions were measured against the one that was there before, and a
+    // slot created at the current WAL position cannot reach them.
+    let replaced = match setup.slot.history {
+        slot::SlotHistory::ReplacedInvalidated => true,
+        // Nothing existed to create a replacement *of* until this source has a
+        // member: the first one to arrive is what creates the slot in the ordinary
+        // case, and there is no history behind it.
+        slot::SlotHistory::CreatedFromAbsent => !source.live_members().is_empty(),
+        // `FastForwarded` discards history for every member too, but keying on it
+        // needs to be measured against two held-floor tests (#12609) that this
+        // cannot run — tracked in #13305.
+        slot::SlotHistory::Kept | slot::SlotHistory::FastForwarded => false,
+    };
+    if replaced {
+        install_replacement_slot(source, setup.slot.consistent_lsn).await;
+    }
+    // Before anything can be credited on this source, pin the floor for the
+    // published tables whose datasets have not joined yet — including, when
+    // this member is the first to arrive on a resuming slot, the ones that will
+    // join after it.
+    source.install_reservations(setup);
+}
+
 /// Register one member on the source (caller holds the setup lock):
 /// validate + publication ADD TABLE + slot create-if-first, decide whether a
 /// snapshot is needed, wire the routing channel, and start the pump if this is
@@ -2137,21 +2193,7 @@ async fn attach_member(
 
     // Slot + publication DDL (idempotent, retried on transient errors).
     let setup = slot::setup_shared_member(&source.params, &schema_name, &table_name).await?;
-    // Whichever member set the slot up read this; keep it for the shutdown
-    // message, which has no connection of its own to ask on.
-    *lock(&source.retention_posture) = Some(setup.slot.retention_posture);
-    if setup.slot.created_fresh {
-        source.slot_created_fresh.store(true, Ordering::Release);
-    }
-    if setup.slot.consistent_lsn > 0 {
-        source.ack.seed(setup.slot.consistent_lsn);
-        metrics.set_confirmed_flush_lsn(setup.slot.consistent_lsn);
-    }
-    // Before anything can be credited on this source, pin the floor for the
-    // published tables whose datasets have not joined yet — including, when
-    // this member is the first to arrive on a resuming slot, the ones that will
-    // join after it.
-    source.install_reservations(&setup);
+    apply_slot_setup(source, &setup, &metrics).await;
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
@@ -2610,6 +2652,56 @@ impl SlotReplacementBudget {
 /// path relies on for a rebuild decided at startup — back-pressure in the member
 /// mailbox, not a wait here.
 ///
+/// What the members are then owed — a rebuild each, held until its contents are
+/// durable — is [`install_replacement_slot`]'s, which the join path shares.
+///
+/// On failure returns a message describing what could not be done, for the caller
+/// to surface.
+async fn recover_unusable_slot(
+    source: &Arc<SharedSource>,
+    refused_generation: u64,
+) -> std::result::Result<(), String> {
+    // The same lock `attach_member` holds for slot DDL, which is what makes the
+    // member set stable across `install_replacement_slot` (see there) and what
+    // serializes this against a join replacing the same slot. Safe to take from the
+    // pump: `attach_member` holds it only across synchronous setup and never waits
+    // on the pump, and the pump already takes it in `try_finish_if_empty`.
+    let _setup = source.setup_lock.lock().await;
+    // The refusal describes the slot as it was when this connection ended, and a
+    // join can replace an invalidated slot during the reconnect backoff that
+    // follows — the only window in which it can, since `PostgreSQL` refuses to drop
+    // a slot an active walsender holds. That join adopts its replacement through
+    // the same path below, so replacing again would drop a healthy slot and leave
+    // every member holding *two* rebuild requests against one
+    // [`AckSlot::rebuild_pending`] flag: the first to commit would clear the hold
+    // the second still needs, and the member would be credited and its position
+    // recorded for contents that rebuild has not delivered.
+    if source.slot_generation.load(Ordering::Acquire) != refused_generation {
+        tracing::info!(
+            slot = %source.key.slot_name,
+            "the replication slot was replaced while this stream was reconnecting, and every acceleration on it was already asked to rebuild; streaming resumes on the replacement"
+        );
+        return Ok(());
+    }
+    let new_lsn = slot::replace_unusable_slot(&source.params)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    install_replacement_slot(source, new_lsn).await;
+    Ok(())
+}
+
+/// Take on a slot that replaced the one this source's positions were measured
+/// against, and which starts at `new_lsn` carrying no history.
+///
+/// Two paths put a replacement under a live source, and both owe it everything
+/// here: the pump's recovery from a stream the slot refused, and a joining member
+/// whose setup found the slot invalidated and recreated it. One function is what
+/// keeps them from drifting, because a replacement adopted without this leaves the
+/// members already streaming resuming from a position it cannot reach — and a row
+/// deleted at the source in between has no change event left to carry the
+/// deletion, so it survives in the acceleration and in every later query (#13229).
+///
 /// Each member is *held* before its request is enqueued — not routed to, never
 /// credited, floor pinned — and released only when the consumer commits the
 /// rebuild. That is load-bearing rather than tidy. [`AckTable::credit_idle`]
@@ -2618,29 +2710,15 @@ impl SlotReplacementBudget {
 /// member left streaming would be credited past the replacement's start while its
 /// rebuild was still sitting in its mailbox. [`publish_idle_positions`] would then
 /// *record* that position, and a crash in the window would resume on a watermark
-/// describing contents the acceleration never received — every row deleted while
-/// the slot was gone surviving for good, which is the failure this whole path
-/// exists to prevent.
+/// describing contents the acceleration never received.
 ///
 /// Members' `committed` floors are otherwise left where they are. The recorded
 /// position only moves forward through the rebuild's own committer, which runs
 /// after the consumer has made those contents durable.
 ///
-/// On failure returns a message describing what could not be done, for the caller
-/// to surface.
-async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Result<(), String> {
-    // The same lock `attach_member` holds for slot DDL. Without it a member can
-    // register between `request_rebuild_of_attached_members`'s snapshot of the
-    // member set and `reseat_held_floors` below, and that member is then neither
-    // asked to rebuild nor reseated — it resumes on a watermark the replacement
-    // cannot reach, with every change since it missing for good. Safe to take from
-    // the pump: `attach_member` holds it only across synchronous setup and never
-    // waits on the pump, and the pump already takes it in `try_finish_if_empty`.
-    let _setup = source.setup_lock.lock().await;
-    let new_lsn = slot::replace_unusable_slot(&source.params)
-        .await
-        .map_err(|e| e.to_string())?;
-
+/// Callers must hold [`SharedSource::setup_lock`], so the member set is stable
+/// across the walk below — see [`request_rebuild_of_attached_members`].
+async fn install_replacement_slot(source: &Arc<SharedSource>, new_lsn: u64) {
     // The replacement carries no history, so a member joining after this cannot
     // resume either — it snapshots, exactly as it would on a slot this process had
     // just created.
@@ -2652,19 +2730,23 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
 
     request_rebuild_of_attached_members(source, new_lsn).await;
     source.ack.reseat_held_floors(new_lsn);
-    Ok(())
+    // Last, so this reads as adopted only once every member has been asked to
+    // rebuild: the join reaches here from a stream future the consumer can drop, and
+    // publishing the new generation first would let a cancellation leave members
+    // unasked while [`recover_unusable_slot`] skipped the recovery that would have
+    // asked them.
+    source.slot_generation.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Ask every already-attached member to rebuild from the source, because the slot
 /// their recorded positions were measured against has been replaced by one that
 /// starts at `new_lsn` and carries no history.
 ///
-/// Callers must hold [`SharedSource::setup_lock`]. Both call sites replace the slot
-/// — the pump's recovery, and a joining member whose `ensure_slot` found the slot
-/// gone — and each needs the set of attached members to be stable across the walk:
-/// a member registering between the snapshot below and the caller's follow-up would
-/// be neither asked to rebuild nor reseated, and would then resume on a watermark
-/// the replacement cannot reach.
+/// Callers must hold [`SharedSource::setup_lock`], and reach this through
+/// [`install_replacement_slot`], which needs the set of attached members to be stable
+/// across the walk: a member registering between the snapshot below and the reseat
+/// that follows would be neither asked to rebuild nor reseated, and would then
+/// resume on a watermark the replacement cannot reach.
 ///
 /// Ordering is carried by the member mailbox rather than by waiting here. Changes
 /// already staged for a member sit *ahead* of its request and are applied first,
@@ -2672,16 +2754,22 @@ async fn recover_unusable_slot(source: &Arc<SharedSource>) -> std::result::Resul
 /// a staged insert applied *after* the rebuild would resurrect a row the source has
 /// since deleted, and the replacement slot has no delete event left to correct it.
 async fn request_rebuild_of_attached_members(source: &Arc<SharedSource>, new_lsn: u64) {
-    for (member_key, member) in source.live_members() {
-        // Hold before enqueueing, so the member is never routable with its rebuild
-        // still queued. `AckTable::credit_idle` advances a streaming member's floor
-        // to the WAL head whenever it has nothing in flight, and a queued control
-        // envelope does not count as in flight — so a member left streaming would be
-        // credited, and then recorded, past contents its rebuild had not delivered.
-        source.ack.register(&member_key, true);
+    let members = source.live_members();
+    // Every member is held before *any* request is enqueued, and without an await in
+    // between. `AckTable::credit_idle` advances a streaming member's floor to the WAL
+    // head whenever it has nothing in flight, and a queued control envelope does not
+    // count as in flight — so a member still streaming would be credited, and then
+    // recorded, past contents its rebuild had not delivered. The send below can park
+    // on a full mailbox, and the pump reconnects without taking `setup_lock`, so
+    // holding as each member's turn came would leave the ones later in the walk
+    // promotable and creditable for the length of that park.
+    for (member_key, _) in &members {
+        source.ack.register(member_key, true);
         // Claim the hold as the rebuild's, so the member's own initial-snapshot
         // completion cannot release it out from under the rebuild.
-        source.ack.mark_rebuild_pending(&member_key);
+        source.ack.mark_rebuild_pending(member_key);
+    }
+    for (member_key, member) in members {
         let envelope = rebuild_request_envelope(source, &member_key, &member, new_lsn);
         if member.sender.send_control(envelope).await.is_some() {
             // The consumer is gone, so there is no acceleration left to rebuild.
@@ -2996,9 +3084,14 @@ async fn run_pump(source: Arc<SharedSource>) {
     // Declared outside the reconnect loop so the bound is over the pump's life,
     // not per attempt.
     let mut slot_replacements = SlotReplacementBudget::new();
-    // Set when a connection reports the slot unusable, and acted on at the top of
-    // the reconnect loop — see there for why the two are separated.
-    let mut slot_unusable = false;
+    // Set to the slot generation *this connection* was streaming when it reports the
+    // slot unusable, and acted on at the top of the reconnect loop — see there for
+    // why the two are separated, and `recover_unusable_slot` for why the generation
+    // rather than a bare flag. Read at connect rather than when the refusal is
+    // dequeued: the error can sit in the client's queue while a join replaces the
+    // slot, and tagging it with the generation of the replacement would make a stale
+    // refusal look current and drop a healthy slot.
+    let mut unusable_slot_generation: Option<u64> = None;
     // Throttle idle-heartbeat fan-out: keepalives arrive in bursts (one per
     // chunk of filtered/unrelated WAL the slot decodes), so emit at most one
     // heartbeat round per `heartbeat_every`. The per-keepalive `credit_idle`
@@ -3045,10 +3138,14 @@ async fn run_pump(source: Arc<SharedSource>) {
         // connection still live. `PostgreSQL` refuses to drop a slot an active
         // walsender holds, and the client is dropped when the recv loop exits, so
         // this is the first point at which the drop can succeed.
-        if std::mem::take(&mut slot_unusable) {
+        if let Some(refused_generation) = unusable_slot_generation.take() {
             disconnect_at.get_or_insert_with(std::time::Instant::now);
+            // The budget counts slot replacements *observed* in the window, not the
+            // ones this path performed: a refusal `recover_unusable_slot` skips is
+            // one a join already replaced the slot for, and a source burning through
+            // replacements is the condition the budget exists to stop either way.
             if slot_replacements.admit(std::time::Instant::now()) {
-                if let Err(reason) = recover_unusable_slot(&source).await {
+                if let Err(reason) = recover_unusable_slot(&source, refused_generation).await {
                     fatal_broadcast(
                         &source,
                         format!(
@@ -3088,6 +3185,10 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Joins that happened before this (re)connect are picked up by it.
         source.restart_requested.store(false, Ordering::Release);
 
+        // The slot epoch this connection streams, read before the config is built
+        // from it: a replacement installed after this point is one this connection
+        // never saw, and a refusal it reports must not be attributed to it.
+        let connection_generation = source.slot_generation.load(Ordering::Acquire);
         let config = client::build_replication_config(
             &params,
             &slot_name,
@@ -3293,7 +3394,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     // dropped when this loop exits. Reconnecting without replacing
                     // would ask the same dead slot for changes forever.
                     if resilience::is_slot_unusable(&e) {
-                        slot_unusable = true;
+                        unusable_slot_generation = Some(connection_generation);
                         source.for_each_member_metrics(ReplicationMetricsCollector::inc_reconnect);
                         break 'recv;
                     }
@@ -4322,6 +4423,7 @@ mod tests {
                 consistent_lsn,
                 snapshot_name: None,
                 created_fresh,
+                history: slot::SlotHistory::Kept,
                 generated_columns: vec![],
                 retention_posture: retention::SlotRetentionPosture {
                     server_version_num: 170_000,
@@ -4529,7 +4631,9 @@ mod tests {
     ) -> (Arc<SharedSource>, Vec<MemberProbe>) {
         let source_key = SourceKey::from_params(&test_params());
         let source = Arc::new(SharedSource::new(source_key, test_params()));
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
+        // One column rather than none: a zero-row envelope carries a struct array,
+        // which cannot be built over zero fields. See [`TINY_SCHEMA`].
+        let schema = tiny_schema();
         let mut probes = Vec::with_capacity(n);
         for i in 0..n {
             let member_key = key(&format!("t{i}"));
@@ -5858,6 +5962,228 @@ mod tests {
             source
                 .take_expired_reservations(std::time::Duration::ZERO)
                 .is_empty()
+        );
+    }
+
+    /// Two datasets share a slot. The server invalidates it, and the *second*
+    /// dataset's join is what notices — its setup drops the invalidated slot and
+    /// creates a replacement at the current WAL position.
+    ///
+    /// The first dataset is still attached, and its recorded position was measured
+    /// against the slot that just went away. Nothing in the replacement reaches it:
+    /// a row deleted at the source in between has no change event left to carry the
+    /// deletion, so an acceleration allowed to resume keeps that row in every later
+    /// query. The join owes it exactly what the pump's own recovery owes it — a
+    /// rebuild from the source, and a hold until that rebuild is durable (#13229).
+    #[tokio::test]
+    async fn a_join_that_replaced_the_slot_rebuilds_the_members_already_attached() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+        // A published table whose dataset has not joined, holding the floor at the
+        // point the old slot resumed from.
+        source.ack.reserve(&key("unjoined"), 100);
+
+        let mut setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
+        setup.slot.history = slot::SlotHistory::ReplacedInvalidated;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        // The pump's next connect promotes whatever is ready. The members asked to
+        // rebuild must not be among them: a promoted member is credited to the WAL
+        // head by `credit_idle` and recorded there, for contents its rebuild has not
+        // delivered.
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            // The request is enqueued before the join returns, so it is already
+            // there — polled rather than awaited so a missing one fails here
+            // instead of hanging on a wait that can never finish.
+            let envelope = futures::FutureExt::now_or_never(rx.next())
+                .expect("each attached member is asked to rebuild before the join returns")
+                .expect("the member's mailbox is open")
+                .expect("a valid rebuild request");
+            assert!(
+                envelope.history_unavailable(),
+                "the member must be asked to replace its contents from the source, not to apply \
+                 anything onto them"
+            );
+            assert!(
+                !source.ack.is_streaming(member_key),
+                "a member with a rebuild outstanding must stay held, so nothing credits it past \
+                 contents the rebuild has not delivered"
+            );
+            assert_eq!(
+                source.ack.committed(member_key),
+                100,
+                "an attached member's floor moves only through its rebuild's own committer"
+            );
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "one rebuild per member: a second request would re-read the whole table"
+            );
+        }
+
+        assert_eq!(
+            source.ack.committed(&key("unjoined")),
+            500,
+            "the replacement has no changes below its own start for an unjoined table to be owed, \
+             so a held floor left below it would pin the slot's acknowledgement there for good"
+        );
+        assert_eq!(
+            source.ack.flush_lsn(),
+            500,
+            "the slot acks the replacement's start"
+        );
+        assert!(
+            source.slot_created_fresh.load(Ordering::Acquire),
+            "a dataset joining after this cannot resume from the replacement either"
+        );
+    }
+
+    /// The counterpart: a slot that kept its history must leave the members already
+    /// attached alone, and `created_fresh` cannot be the signal that tells the two
+    /// apart — it is also true where nothing was discarded (a slot that exists but
+    /// has never been acknowledged, and the fast-forward for a re-bootstrap).
+    ///
+    /// Rebuilding on it moves floors that are still owed their changes: it regressed
+    /// `a_bootstrap_lost_before_it_was_durable_is_reloaded_not_resumed` and
+    /// `a_dataset_re_added_after_its_reservation_lapsed_does_not_silently_skip_changes`
+    /// (#12609) when it was tried. This differs from the test above by the discard
+    /// signal alone.
+    #[tokio::test]
+    async fn a_join_on_a_slot_that_kept_its_history_leaves_attached_members_alone() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+        source.ack.reserve(&key("unjoined"), 100);
+
+        let setup = shared_setup(500, true, &["t0", "t1", "unjoined"]);
+        assert!(
+            setup.slot.created_fresh && setup.slot.history == slot::SlotHistory::Kept,
+            "the outcome under test is a fresh-looking slot that discarded nothing"
+        );
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "nothing was discarded, so no attached member is owed a rebuild"
+            );
+            assert!(
+                source.ack.is_streaming(member_key),
+                "an attached member must keep streaming when the slot kept its history"
+            );
+            assert_eq!(source.ack.committed(member_key), 100);
+        }
+        assert_eq!(
+            source.ack.committed(&key("unjoined")),
+            100,
+            "the hold for an unjoined table still covers changes nobody has consumed"
+        );
+    }
+
+    /// The same replacement by a different route: an operator drops the slot while
+    /// the pump is between connections — the only time `PostgreSQL` lets them — and
+    /// the next dataset to join finds no slot and creates one.
+    ///
+    /// Nothing about that outcome says "invalidated", but the members already
+    /// streaming are in exactly the position they are after an invalidated slot is
+    /// replaced: their recorded positions were measured against a slot that is gone,
+    /// and the one created in its place starts at the current WAL position.
+    #[tokio::test]
+    async fn a_join_that_created_a_slot_under_members_already_attached_rebuilds_them() {
+        let (source, mut probes) = test_source_with_members(2);
+        for (member_key, _, _) in &probes {
+            source.ack.register(member_key, false);
+            source.ack.commit(member_key, 100);
+        }
+        source.ack.promote_ready_members();
+
+        let mut setup = shared_setup(500, true, &["t0", "t1"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        source.ack.promote_ready_members();
+        for (member_key, _, rx) in &mut probes {
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_some(),
+                "a member streaming from the slot that was replaced must be rebuilt"
+            );
+            assert!(!source.ack.is_streaming(member_key));
+        }
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            1,
+            "the slot under this source was replaced, so observations of the old one are stale"
+        );
+    }
+
+    /// The ordinary first start, which reaches the same outcome and must do none of
+    /// it: creating a slot because none existed replaces nothing when nobody was
+    /// streaming from one.
+    #[tokio::test]
+    async fn the_first_member_to_create_a_slot_replaces_nothing() {
+        let (source, _) = test_source_with_members(0);
+
+        let mut setup = shared_setup(500, true, &["t0"]);
+        setup.slot.history = slot::SlotHistory::CreatedFromAbsent;
+        apply_slot_setup(&source, &setup, &ReplicationMetricsCollector::new()).await;
+
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            0,
+            "no slot was replaced, so nothing any actor observed has been retired"
+        );
+    }
+
+    /// The pump latches a refusal against the slot it was streaming, then waits out
+    /// its reconnect backoff — the one window in which a joining dataset can replace
+    /// that slot, because `PostgreSQL` will not drop one an active walsender holds.
+    ///
+    /// By the time the pump acts, the slot its refusal describes is gone and every
+    /// member has already been asked to rebuild. Replacing again would drop a
+    /// healthy slot and leave each member holding two rebuild requests against one
+    /// `rebuild_pending` flag, so the first to commit would release the hold the
+    /// second still needs — crediting the member, and recording its position, for
+    /// contents that rebuild has not delivered.
+    #[tokio::test]
+    async fn a_refusal_of_an_already_replaced_slot_does_not_replace_it_again() {
+        let (source, mut probes) = test_source_with_members(1);
+        let (member_key, _, rx) = &mut probes[0];
+        source.ack.register(member_key, false);
+        source.ack.commit(member_key, 100);
+        source.ack.promote_ready_members();
+
+        // What the pump holds: the slot generation as of the connection that was
+        // refused.
+        let refused_generation = source.slot_generation.load(Ordering::Acquire);
+
+        // A join replaces the slot and adopts the replacement, which is what asks
+        // this member to rebuild.
+        install_replacement_slot(&source, 500).await;
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_some(),
+            "the join's replacement is what asks the member to rebuild"
+        );
+
+        recover_unusable_slot(&source, refused_generation)
+            .await
+            .expect("a refusal of a slot that is already gone is not a failure");
+
+        assert!(
+            futures::FutureExt::now_or_never(rx.next()).is_none(),
+            "the member must not be asked to rebuild a second time for one replacement"
+        );
+        assert_eq!(
+            source.slot_generation.load(Ordering::Acquire),
+            refused_generation + 1,
+            "one replacement happened, so the generation moved exactly once"
         );
     }
 
