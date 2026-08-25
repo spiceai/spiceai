@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -503,12 +504,15 @@ macro_rules! append_value {
 ///
 /// A key present on both wins for the data point: the point's own attribute is the more specific
 /// description of that measurement, and a resource attribute must never overwrite it.
-fn merge_resource_attributes(
-    resource_attrs: &[KeyValue],
-    data_point_attrs: &[KeyValue],
-) -> Vec<KeyValue> {
+///
+/// An export carrying no resource attributes borrows the data point's own attributes, so the
+/// common case adds no allocation and no per-attribute copy to the export path.
+fn merge_resource_attributes<'a>(
+    resource_attrs: &'a [KeyValue],
+    data_point_attrs: &'a [KeyValue],
+) -> Cow<'a, [KeyValue]> {
     if resource_attrs.is_empty() {
-        return data_point_attrs.to_vec();
+        return Cow::Borrowed(data_point_attrs);
     }
     let mut merged: Vec<KeyValue> = resource_attrs
         .iter()
@@ -520,7 +524,7 @@ fn merge_resource_attributes(
         .cloned()
         .collect();
     merged.extend(data_point_attrs.iter().cloned());
-    merged
+    Cow::Owned(merged)
 }
 
 fn number_data_points_to_record_batch(
@@ -637,7 +641,10 @@ fn number_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        &attributes
+            .iter()
+            .map(Cow::as_ref)
+            .collect::<Vec<&[KeyValue]>>(),
         existing_schema,
         NUMBER_VALUE_COLUMN_NAMES,
     );
@@ -750,7 +757,10 @@ fn histogram_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) = attributes_to_fields_and_columns(
         metric,
-        &attributes.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        &attributes
+            .iter()
+            .map(Cow::as_ref)
+            .collect::<Vec<&[KeyValue]>>(),
         existing_schema,
         HISTOGRAM_VALUE_COLUMN_NAMES,
     );
