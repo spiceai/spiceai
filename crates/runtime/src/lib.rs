@@ -246,6 +246,14 @@ pub enum Error {
     ))]
     OdbcNotInstalled,
 
+    #[snafu(display(
+        "This build of Spice.ai does not include the {data_connector} data connector. Build Spice.ai OSS with the `{feature}` feature enabled, or use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise"
+    ))]
+    DataConnectorNotInBuild {
+        data_connector: String,
+        feature: String,
+    },
+
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 

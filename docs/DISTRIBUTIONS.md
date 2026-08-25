@@ -28,6 +28,7 @@ The Spice open source project provides multiple distribution variants to support
 | CUDA (Linux)            | Nightly only     | ✅           | ✅          |
 | Allocator variants      | Nightly only     | ✅           | ✅          |
 | ODBC connector          | Local build only | ✅           | ✅          |
+| ScyllaDB connector      | Local build only | ✅           | ✅          |
 | Acceleration snapshots  | Local build only | ✅           | ✅          |
 | HTTP function servers   | Local build only | ✅           | ✅          |
 | WASM user functions     | Local build only | ✅           | ✅          |
@@ -48,6 +49,7 @@ The default distribution includes the standard data and AI/ML feature set. This 
 
 **Not included by default:**
 
+- ScyllaDB data connector (`scylladb` feature)
 - Acceleration snapshots (`snapshots` feature)
 - HTTP-backed function servers (`http-functions` feature)
 - WebAssembly user-defined functions (`wasm-functions` feature; Rust source compilation additionally requires `wasm-functions-compile`)
@@ -76,7 +78,7 @@ The data distribution excludes AI/ML model support, resulting in a smaller binar
 
 **Included Features:**
 
-- All data connectors
+- All data connectors except ScyllaDB, which local open source builds can enable with the `scylladb` feature
 - All data accelerators
 - Acceleration snapshots in Cloud Platform and Enterprise distributions; local open source builds can enable this with the `snapshots` feature
 - Default memory allocator (snmalloc)
@@ -230,14 +232,16 @@ docker pull ghcr.io/spiceai/spiceai-nightly:latest-sysalloc
 
 ## Additional Connectors
 
-Some connectors require additional dependencies and are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
+Some connectors are outside the default distribution and are available with the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise):
 
 - **ODBC** - Connect to any ODBC-compatible data source
+- **ScyllaDB** - Query ScyllaDB keyspaces over CQL
 
-These can be built locally for development and testing:
+Either can be built locally for development and testing:
 
 ```bash
-make install-odbc
+make install-odbc      # ODBC
+make install-scylladb  # ScyllaDB
 ```
 
 ## Enterprise Features
@@ -283,6 +287,9 @@ SPICED_NON_DEFAULT_FEATURES="snapshots" make install
 
 # Build with globally persisted HTTP rate-control state
 SPICED_NON_DEFAULT_FEATURES="rate-control" make install
+
+# Build with the ScyllaDB data connector
+SPICED_NON_DEFAULT_FEATURES="scylladb" make install
 
 # Build with non-default features added to defaults
 SPICED_NON_DEFAULT_FEATURES="odbc" make install

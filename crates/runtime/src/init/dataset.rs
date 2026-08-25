@@ -29,11 +29,11 @@ use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
-    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
-    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    AcceleratorInitializationFailedSnafu, DataConnectorNotInBuildSnafu,
+    DrasiWithoutChangeStreamSnafu, DurableWriteBackCompositePrimaryKeySnafu,
+    DurableWriteBackUnsupportedBySourceSnafu, Error, FullTextSearchRequiresAccelerationSnafu,
+    HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
+    Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
     UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     accelerated::AcceleratedTable,
@@ -44,7 +44,8 @@ use crate::{
     },
     dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
-        self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR, SCYLLADB_DATACONNECTOR,
+        SCYLLADB_FEATURE,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
@@ -2088,6 +2089,7 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         // The Spicepod names a connector this build cannot provide.
         Error::UnknownDataConnector { .. }
         | Error::OdbcNotInstalled
+        | Error::DataConnectorNotInBuild { .. }
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithOnConflict { .. }
@@ -2141,12 +2143,20 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
 /// The error for a `from:` naming a connector this build does not register: the closest
 /// registered name plus the full list, so the message names a fix.
 ///
-/// ODBC is the exception. It is a real connector that this build may simply not have been
-/// compiled with, so it gets the build-with-`odbc` instruction instead of a "did you mean"
-/// over the connectors that happen to be present.
+/// ODBC and ScyllaDB are the exceptions. They are real connectors that this build may simply
+/// not have been compiled with, so they get the build instruction for their feature instead of
+/// a "did you mean" over the connectors that happen to be present.
 async fn unknown_data_connector(source: &str) -> Error {
     if source == ODBC_DATACONNECTOR {
         return OdbcNotInstalledSnafu.build();
+    }
+
+    if source == SCYLLADB_DATACONNECTOR {
+        return DataConnectorNotInBuildSnafu {
+            data_connector: source,
+            feature: SCYLLADB_FEATURE,
+        }
+        .build();
     }
 
     UnknownDataConnectorSnafu {
@@ -2389,6 +2399,58 @@ mod tests {
         assert!(
             matches!(err, Error::OdbcNotInstalled),
             "expected OdbcNotInstalled, got: {err}"
+        );
+    }
+
+    /// ScyllaDB is not in the default build either, so a `from: scylladb:` earns the same
+    /// build-or-Enterprise instruction rather than a "did you mean" over what is registered.
+    #[tokio::test]
+    async fn an_unregistered_scylladb_connector_reports_the_missing_build() {
+        let err = unknown_data_connector(SCYLLADB_DATACONNECTOR).await;
+
+        assert!(
+            matches!(err, Error::DataConnectorNotInBuild { .. }),
+            "expected DataConnectorNotInBuild, got: {err}"
+        );
+
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "This build of Spice.ai does not include the scylladb data connector. \
+Build Spice.ai OSS with the `scylladb` feature enabled, or use the Enterprise distribution of \
+Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise",
+            "the message must keep the connector, the feature to build, and the Enterprise link"
+        );
+    }
+
+    /// `ConnectorParamsBuilder` resolves the factory itself, so it carries the same message for
+    /// the callers that reach it without first checking the registry.
+    #[tokio::test]
+    async fn scylladb_params_report_the_missing_build() {
+        let app = app::AppBuilder::new("scylladb_not_built").build();
+        let runtime = crate::Runtime::builder().build().await;
+
+        let dataset = DatasetBuilder::try_new("scylladb:orders".to_string(), "orders")
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let secrets = Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::default()));
+        let Err(err) = ConnectorParamsBuilder::for_dataset(SCYLLADB_DATACONNECTOR.into(), &dataset)
+            .build(secrets, tokio::runtime::Handle::current())
+            .await
+        else {
+            panic!("a scylladb dataset must fail on a build without the connector")
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Failed to initialize the dataset orders (scylladb). This build of Spice.ai does not \
+include the scylladb data connector. Build Spice.ai OSS with the `scylladb` feature enabled, or \
+use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise",
+            "the message must name the dataset, the feature to build, and the Enterprise link"
         );
     }
 

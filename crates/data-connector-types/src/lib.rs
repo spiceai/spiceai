@@ -269,6 +269,15 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
+        "Failed to initialize the {connector_component} ({dataconnector}). This build of Spice.ai does not include the {dataconnector} data connector. Build Spice.ai OSS with the `{feature}` feature enabled, or use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai/docs/enterprise"
+    ))]
+    ConnectorNotInBuild {
+        dataconnector: String,
+        feature: String,
+        connector_component: ConnectorComponent,
+    },
+
+    #[snafu(display(
         "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
     SchemaMismatch {
@@ -315,6 +324,7 @@ impl DataConnectorError {
                 | Self::UnsupportedTypeAction { .. }
                 | Self::UnsupportedDataType { .. }
                 | Self::OdbcNotInstalled { .. }
+                | Self::ConnectorNotInBuild { .. }
                 | Self::UseOfProtectedKeyword { .. }
         )
     }
