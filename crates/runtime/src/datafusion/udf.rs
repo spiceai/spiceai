@@ -1056,25 +1056,31 @@ mod tests {
 
     #[test]
     fn duckdb_deny_list_allows_dialect_native_functions() {
-        // The DuckDB unparser dialect rewrites these into native DuckDB SQL
-        // (inner_product -> array_inner_product, rand -> random()), so they must
-        // federate rather than be denied. Note `rand` is allowed purely by virtue
-        // of being in the dialect — no manual carve-out.
+        // The DuckDB unparser dialect rewrites this into native DuckDB SQL
+        // (rand -> random()), so it must federate rather than be denied. Note
+        // `rand` is allowed purely by virtue of being in the dialect — no manual
+        // carve-out.
         let support = deny_spice_functions_for_duckdb();
-        for name in [INNER_PRODUCT_UDF_NAME, "rand"] {
+        for name in ["rand"] {
             assert!(
                 support.supports(&make_named_expr(name)),
                 "{name} has a native DuckDB equivalent and should be pushed down"
             );
         }
-        // No *equivalent* DuckDB function — must stay denied. `cosine_distance`
-        // is here rather than above because DuckDB does have a similarly-named
-        // `array_cosine_distance` and it returns a differently-scaled distance:
-        // `1 - cosine_similarity` over [0, 2] against this UDF's
-        // `(1 - cosine_similarity) / 2` over [0, 1] (#13088). A name is not an
-        // equivalence.
+        // No *equivalent* DuckDB function — must stay denied. The two vector UDFs
+        // are here rather than above even though DuckDB has similarly-named
+        // functions, because neither answers what the UDF answers (#13088):
+        // `array_cosine_distance` returns `1 - cosine_similarity` over [0, 2]
+        // against this UDF's `(1 - cosine_similarity) / 2` over [0, 1], and
+        // `array_inner_product` raises on a NULL array element where the UDF
+        // answers NULL. A name is not an equivalence.
         let json_name = json_get_str_udf().name().to_string();
-        for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
+        for name in [
+            EMBED_UDF_NAME,
+            COSINE_DISTANCE_UDF_NAME,
+            INNER_PRODUCT_UDF_NAME,
+            json_name.as_str(),
+        ] {
             assert!(
                 !support.supports(&make_named_expr(name)),
                 "{name} has no equivalent DuckDB function and must stay denied"
@@ -1139,11 +1145,10 @@ mod tests {
         // can/can't partition explicit: if a dialect change makes another Spice
         // function pushable (or stops one), this test must be updated on purpose.
         //
-        // `inner_product` -> array_inner_product, `rand` -> random(). (Note: l2
-        // distance federates via the non-deny-listed `array_distance` UDF, so it
-        // isn't part of this deny-list carve-out.) `cosine_distance` is
-        // deliberately not in this set — see #13088 and
-        // `duckdb_deny_list_allows_dialect_native_functions` above.
+        // Only `rand` -> random() remains. (Note: l2 distance federates via the
+        // non-deny-listed `array_distance` UDF, so it isn't part of this
+        // deny-list carve-out.) Both vector UDFs are deliberately absent — see
+        // #13088 and `duckdb_deny_list_allows_dialect_native_functions` above.
         use std::collections::BTreeSet;
         let support = deny_spice_functions_for_duckdb();
         let denied_names = builtin_denied_names();
@@ -1154,7 +1159,7 @@ mod tests {
             .collect();
         assert_eq!(
             pushable,
-            BTreeSet::from([INNER_PRODUCT_UDF_NAME, "rand"]),
+            BTreeSet::from(["rand"]),
             "unexpected change to the set of Spice functions pushable to DuckDB"
         );
     }

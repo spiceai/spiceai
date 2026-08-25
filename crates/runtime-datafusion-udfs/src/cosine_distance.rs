@@ -40,7 +40,10 @@ limitations under the License.
 //! `array_cosine_distance` returns `1 - cosine_similarity` over `[0, 2]`, twice
 //! the distance above, and answers `2.0` both for a zero-magnitude vector (0.5
 //! here) and for a non-finite element (NULL here). A backend earns a pushdown by
-//! matching this contract, not by having a function of the same name.
+//! matching this contract, not by having a function of the same name — and
+//! matching it is harder than it looks: `inner_product`'s `DuckDB` counterpart
+//! agrees on every dense finite vector and was still withdrawn, because it raises
+//! on a NULL array element.
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Float64Builder, GenericListArray, LargeListArray, ListArray,

@@ -26,6 +26,10 @@ default = []
 
 [dev-dependencies]
 runtime = { path = "../../runtime" }
+# Test-only: `ducklake_denies_spice_udf_pushdown` needs a real Spice UDF to build
+# the filter whose pushdown must be refused.
+runtime-datafusion-udfs = { path = "../../runtime-datafusion-udfs" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

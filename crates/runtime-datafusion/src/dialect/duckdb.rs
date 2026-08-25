@@ -28,169 +28,6 @@ pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
-/// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
-/// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
-/// `array_inner_product`, `array_distance`).
-///
-///  - replaces the `make_array` constructor with a `DuckDB` array literal
-///    (`make_array` is not supported in `DuckDB`)
-///  - applies the required `::FLOAT[N]` cast to array operands (only FLOAT
-///    embeddings are currently supported)
-///  - emits a call to `duckdb_fn`
-fn spice_array_fn_to_sql(
-    unparser: &datafusion::sql::unparser::Unparser,
-    args: &[Expr],
-    duckdb_fn: &str,
-) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    let ast_args: Vec<ast::Expr> = args
-        .iter()
-        .map(|arg| match arg {
-            // embeddings array is wrapped in a make_array function, unwrap it
-            Expr::ScalarFunction(scalar_func)
-                if scalar_func.name().to_lowercase() == "make_array" =>
-            {
-                let num_elements = scalar_func.args.len() as u64;
-
-                let array = ast::Expr::Array(ast::Array {
-                    elem: scalar_func
-                        .args
-                        .iter()
-                        .map(|x| unparser.expr_to_sql(x))
-                        .try_collect()?,
-                    named: false,
-                });
-
-                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are currently supported
-                Ok(ast::Expr::Cast {
-                    expr: Box::new(array),
-                    data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
-                        Some(num_elements),
-                    )),
-                    kind: ast::CastKind::DoubleColon,
-                    array: false,
-                    format: None,
-                })
-            }
-            Expr::Literal(ScalarValue::FixedSizeList(array), None) => {
-                let num_elements = u64::try_from(array.value_length()).map_err(|e| {
-                    DataFusionError::Execution(format!("Cannot cast array length to u64 {e}"))
-                })?;
-                let array = unparser.expr_to_sql(arg)?;
-
-                // Apply required ::FLOAT[] casting. Only FLOAT embeddings are curently supported
-                Ok(ast::Expr::Cast {
-                    expr: Box::new(array),
-                    data_type: ast::DataType::Array(ast::ArrayElemTypeDef::SquareBracket(
-                        Box::new(ast::DataType::Float(ast::ExactNumberInfo::None)),
-                        Some(num_elements),
-                    )),
-                    kind: ast::CastKind::DoubleColon,
-                    array: false,
-                    format: None,
-                })
-            }
-            // For all other expressions, directly convert them to SQL
-            _ => unparser.expr_to_sql(arg),
-        })
-        .try_collect()?;
-
-    let ast_fn = ast::Expr::Function(Function {
-        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
-        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-            duplicate_treatment: None,
-            args: ast_args
-                .into_iter()
-                .map(|x| ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(x)))
-                .collect(),
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-        parameters: ast::FunctionArguments::None,
-        uses_odbc_syntax: false,
-    });
-
-    Ok(Some(ast_fn))
-}
-
-/// Wraps `expr` so a non-finite result becomes `NULL`, the way the Spice vector
-/// kernels do.
-///
-/// The kernels return `NULL` when a distance is not defined rather than a
-/// fabricated number, because `_score` is `1 - distance` and any number at all
-/// competes with real matches (see `runtime_datafusion_udfs::vector_simd`). A
-/// pushed-down call has to carry that contract too, or the same row scores
-/// differently depending only on whether the table federated.
-///
-/// `nullif` rather than `CASE WHEN isfinite(..)`: `DuckDB` compares `NaN` equal
-/// to `NaN` and each infinity equal to itself, so the chain below reaches every
-/// non-finite value while naming `expr` once. `CASE` would have to repeat the
-/// whole call — operands included — in both arms.
-///
-/// Measured against `DuckDB` v1.5.5: the chain returns `NULL` for `NaN`, `inf`
-/// and `-inf`, passes finite values through unchanged, and leaves the result's
-/// `FLOAT` type alone (a `DOUBLE` sentinel would widen it).
-///
-/// This screens the *result*, so it only reaches an engine function that lets a
-/// non-finite input reach its output. `array_inner_product` accumulates its
-/// operands directly and does propagate — the same reason
-/// `Kernel::hides_non_finite_input` is `false` for `Dot`. A function that
-/// normalizes, and so answers a finite number for a non-finite input, cannot be
-/// repaired this way and does not belong in the pushdown list at all.
-fn null_if_not_finite(expr: ast::Expr) -> ast::Expr {
-    ["nan", "inf", "-inf"]
-        .into_iter()
-        .fold(expr, |acc, sentinel| {
-            ast::Expr::Function(Function {
-                name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("nullif"))]),
-                args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                    duplicate_treatment: None,
-                    args: vec![
-                        ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(acc)),
-                        ast::FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Cast {
-                            expr: Box::new(ast::Expr::Value(ValueWithSpan {
-                                value: ast::Value::SingleQuotedString(sentinel.to_string()),
-                                span: sqlparser::tokenizer::Span::empty(),
-                            })),
-                            data_type: ast::DataType::Float(ast::ExactNumberInfo::None),
-                            kind: ast::CastKind::DoubleColon,
-                            array: false,
-                            format: None,
-                        })),
-                    ],
-                    clauses: vec![],
-                }),
-                filter: None,
-                null_treatment: None,
-                over: None,
-                within_group: vec![],
-                parameters: ast::FunctionArguments::None,
-                uses_odbc_syntax: false,
-            })
-        })
-}
-
-/// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
-/// product, `sum(a[i] * b[i])`), screened so a non-finite result is `NULL`.
-///
-/// The two compute the same value for finite operands, which is what makes the
-/// pushdown sound. They disagreed on a non-finite one — the UDF answers `NULL`,
-/// `DuckDB` propagated the `NaN` or infinity — so [`null_if_not_finite`] closes
-/// that. Numeric precision is a separate axis and unchanged: `DuckDB`
-/// accumulates in `FLOAT` where `simsimd` accumulates wider, so a dot product
-/// that overflows `FLOAT` alone now federates to `NULL` rather than to `inf`,
-/// which is the same direction the local output check takes.
-/// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
-pub(crate) fn inner_product_to_sql(
-    unparser: &datafusion::sql::unparser::Unparser,
-    args: &[Expr],
-) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
-    Ok(spice_array_fn_to_sql(unparser, args, "array_inner_product")?.map(null_if_not_finite))
-}
-
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
 /// `::FLOAT[N]` casts on both arguments.
 ///
@@ -481,9 +318,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use datafusion::{
         common::{Column, Spans},
-        functions_nested::make_array::make_array_udf,
-        logical_expr::expr::ScalarFunction,
-        prelude::{Expr, lit},
+        prelude::Expr,
         scalar::ScalarValue,
         sql::{TableReference, unparser::Unparser},
     };
@@ -520,94 +355,19 @@ mod tests {
     }
 
     #[test]
-    fn test_inner_product_to_sql_column_and_scalar() {
-        // inner_product(column, [4,5,6]) must unparse to DuckDB's native
-        // array_inner_product with the ::FLOAT[N] casts the array functions need.
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            Expr::Column(Column {
-                relation: Some(TableReference::from("table_name")),
-                name: "embedding".to_string(),
-                spans: Spans::new(),
-            }),
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![
-                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
-                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
-                ],
-            )),
-        ];
-
-        let result = inner_product_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression");
-        // The nullif chain is the NULL-for-non-finite contract the local kernel
-        // holds, carried into the pushed-down SQL (#13088). The operands appear
-        // once: `CASE WHEN isfinite(..)` would have to repeat the whole call.
-        let expected = r#"nullif(nullif(nullif(array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3]), 'nan'::FLOAT), 'inf'::FLOAT), '-inf'::FLOAT)"#;
-        assert_eq!(result.to_string(), expected);
-    }
-
-    #[test]
-    fn inner_product_screen_names_its_operands_once() {
-        // The screen must not duplicate the operands: a repeated column is
-        // harmless, but a repeated *literal* embedding doubles the size of every
-        // pushed-down vector filter, and a repeated volatile sub-expression would
-        // be evaluated twice.
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            Expr::Column(Column {
-                relation: Some(TableReference::from("t")),
-                name: "embedding".to_string(),
-                spans: Spans::new(),
-            }),
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![lit(4.0), lit(5.0), lit(6.0)],
-            )),
-        ];
-        let rendered = inner_product_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression")
-            .to_string();
-        assert_eq!(
-            rendered.matches("array_inner_product").count(),
-            1,
-            "the screened rendering must call array_inner_product once, got {rendered}"
+    fn inner_product_is_not_pushed_down_to_duckdb() {
+        // Regression test for #13088. `array_inner_product` agrees with this UDF
+        // on dense finite vectors, which is why it was carved out — but a NULL
+        // element in either operand makes DuckDB *raise* where the UDF answers
+        // NULL, so the pushdown turned a NULL row into a failed query. An
+        // exception cannot be screened by an expression wrapping the call, which
+        // is what rules out repairing this in the rendering.
+        assert!(
+            !crate::dialect::duckdb_native_function_names()
+                .contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
+            "inner_product must stay denied so DataFusion evaluates it locally; \
+             array_inner_product rejects a NULL array element"
         );
-    }
-
-    #[test]
-    fn inner_product_screen_covers_every_non_finite_value() {
-        // Each of the three non-finite values needs its own sentinel: DuckDB
-        // compares NaN equal to NaN and each infinity equal to itself, but an
-        // infinity is not equal to a NaN, so one nullif cannot reach all three.
-        let dialect = new_duckdb_dialect();
-        let unparser = Unparser::new(dialect.as_ref());
-        let args = vec![
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![lit(1.0), lit(2.0)],
-            )),
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                make_array_udf(),
-                vec![lit(3.0), lit(4.0)],
-            )),
-        ];
-        let rendered = inner_product_to_sql(&unparser, &args)
-            .expect("should execute successfully")
-            .expect("should return expression")
-            .to_string();
-        for sentinel in ["'nan'::FLOAT", "'inf'::FLOAT", "'-inf'::FLOAT"] {
-            assert!(
-                rendered.contains(sentinel),
-                "screened rendering must nullif against {sentinel}, got {rendered}"
-            );
-        }
     }
 
     #[test]
@@ -665,17 +425,12 @@ mod tests {
 
     #[test]
     fn duckdb_native_function_names_advertises_denylisted_pushables() {
-        // The federation deny-list relies on these names to let `inner_product`
-        // and `rand` push down to DuckDB, so the dialect must advertise them.
-        // `cosine_distance` used to be asserted here too; it is now asserted
-        // *absent* by `cosine_distance_is_not_pushed_down_to_duckdb`, because
-        // DuckDB's `array_cosine_distance` answers a differently-scaled distance
-        // (#13088).
+        // The federation deny-list relies on this name to let `rand` push down to
+        // DuckDB, so the dialect must advertise it. `cosine_distance` and
+        // `inner_product` used to be asserted here too; both are now asserted
+        // *absent* by the two tests above, because neither DuckDB counterpart
+        // answers what the UDF answers (#13088).
         let names = crate::dialect::duckdb_native_function_names();
-        assert!(
-            names.contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
-            "duckdb_native_function_names() missing inner_product; got {names:?}"
-        );
         assert!(
             names.contains(&"rand"),
             "duckdb_native_function_names() missing rand; got {names:?}"

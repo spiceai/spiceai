@@ -38,6 +38,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use duckdb::AccessMode;
 use runtime_component::dataset::DatasetSpec;
 use runtime_datafusion::dialect::new_duckdb_dialect;
+use runtime_datafusion::function_support::deny_spice_functions_for_duckdb_table_providers;
 use runtime_parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -258,8 +259,29 @@ fn create_ducklake_factory(
             source: Box::new(e),
         })?;
 
-    let factory = DuckDBTableFactory::new(Arc::clone(&pool)).with_dialect(new_duckdb_dialect());
+    let factory = configure_ducklake_factory(Arc::clone(&pool));
     Ok((factory, pool, catalog_name.to_string()))
+}
+
+/// Builds the `DuckDB` table factory `DuckLake` reads through.
+///
+/// The deny-list is what makes `DataFusion` evaluate a Spice UDF locally instead
+/// of pushing it into `DuckLake`'s SQL. Without it the factory's
+/// `function_support` is `None`; the pushdown check is
+/// `is_some_and(..)`, so it is skipped entirely and every filter falls through to
+/// whatever the unparser can render. The unparser can render *any* function call,
+/// so a Spice function the dialect does not rewrite is emitted under its own name
+/// — which `DuckDB` does not have, and the query fails with an unknown function.
+/// `DuckDB`'s own factory has installed this since #10703; this path was missed,
+/// which began to matter as soon as a vector UDF stopped being rewritten (#13088).
+///
+/// A named function rather than a chain inline above, so
+/// `ducklake_denies_spice_udf_pushdown` can assert the policy on the value
+/// production actually builds.
+fn configure_ducklake_factory(pool: Arc<DuckDbConnectionPool>) -> DuckDBTableFactory {
+    DuckDBTableFactory::new(pool)
+        .with_dialect(new_duckdb_dialect())
+        .with_function_support(deny_spice_functions_for_duckdb_table_providers())
 }
 
 impl DataConnectorFactory for DuckLakeFactory {
@@ -424,7 +446,13 @@ data_connector_api::register_data_connector!(
 
 #[cfg(test)]
 mod tests {
-    use super::PARAMETERS;
+    use std::sync::Arc;
+
+    use datafusion::logical_expr::{Expr, ScalarUDF, TableProviderFilterPushDown};
+    use datafusion::prelude::{col, lit};
+    use datafusion::sql::TableReference;
+
+    use super::{DuckDbConnection, DuckDbConnectionPool, PARAMETERS, configure_ducklake_factory};
 
     /// The S3 secret built for `DuckDB` only carries `SESSION_TOKEN` when the parameter is
     /// declared here — otherwise `Parameters::try_new` strips it and temporary (STS)
@@ -436,6 +464,58 @@ mod tests {
                 .iter()
                 .any(|parameter| parameter.name == "aws_session_token"),
             "missing DuckLake data connector parameter aws_session_token"
+        );
+    }
+
+    /// A Spice UDF must not be pushed into `DuckLake`'s SQL.
+    ///
+    /// Regression test for #13088. `DuckLake` builds its own
+    /// `DuckDBTableFactory`, and it was the one that never had the deny-list
+    /// installed. That went unnoticed while the dialect rewrote `cosine_distance`
+    /// into a function `DuckDB` really has — wrong-valued, but it ran. The moment
+    /// the rewrite was removed, the same filter federated under its own name and
+    /// `DuckDB` failed the query with an unknown function, so this asserts the
+    /// policy rather than the rewrite.
+    ///
+    /// It drives `configure_ducklake_factory`, the function production calls, so
+    /// dropping `with_function_support` there fails here.
+    #[tokio::test]
+    async fn ducklake_denies_spice_udf_pushdown() {
+        let pool = Arc::new(DuckDbConnectionPool::new_memory().expect("in-memory DuckDB pool"));
+        {
+            let mut conn = Arc::clone(&pool).connect_sync().expect("sync connection");
+            let duckdb = conn
+                .as_any_mut()
+                .downcast_mut::<DuckDbConnection>()
+                .expect("a DuckDB connection");
+            duckdb
+                .get_underlying_conn_mut()
+                .execute_batch("CREATE TABLE vectors (id INTEGER, embedding FLOAT[2]);")
+                .expect("table creates");
+        }
+
+        let provider = configure_ducklake_factory(Arc::clone(&pool))
+            .table_provider(TableReference::bare("vectors"))
+            .await
+            .expect("table provider builds for the created table");
+
+        let distance =
+            Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                Arc::new(ScalarUDF::from(
+                    runtime_datafusion_udfs::cosine_distance::CosineDistance::new(),
+                )),
+                vec![col("embedding"), col("embedding")],
+            ));
+        let filter = distance.lt(lit(0.3));
+
+        let pushdown = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown is classifiable");
+        assert_eq!(
+            pushdown,
+            vec![TableProviderFilterPushDown::Unsupported],
+            "a cosine_distance filter must stay in DataFusion; pushing it into DuckLake's SQL \
+             emits a function DuckDB does not have and fails the query (#13088)"
         );
     }
 }

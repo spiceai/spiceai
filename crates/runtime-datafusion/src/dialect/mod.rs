@@ -18,8 +18,6 @@ use std::sync::Arc;
 
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
-use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
-
 mod duckdb;
 
 const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
@@ -52,18 +50,26 @@ const REGEXP_COUNT_NAME: &str = "regexp_count";
 /// `DuckDB` for every vector UDF listed here.
 fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
     vec![
-        // `cosine_distance` is deliberately absent. `DuckDB`'s
-        // `array_cosine_distance` returns `1 - cosine_similarity` over `[0, 2]`,
-        // while this UDF returns `(1 - cosine_similarity) / 2` over `[0, 1]`, so
-        // the rewrite reported twice the distance for every non-identical pair.
-        // It also answers `2.0` where the UDF answers `0.5` for a zero-magnitude
-        // vector and `NULL` for a non-finite element — and `2.0` is
-        // simultaneously the legitimate value for opposite vectors, so no screen
-        // over the result can tell the three apart. See issue #13088.
-        (
-            INNER_PRODUCT_UDF_NAME,
-            Box::new(duckdb::inner_product_to_sql) as ScalarFnToSqlHandler,
-        ),
+        // No Spice vector UDF is listed here, and both absences are measured
+        // rather than assumed (see issue #13088 and
+        // `duckdb_vector_udf_pushdown_matches_local`):
+        //
+        // `cosine_distance` — `DuckDB`'s `array_cosine_distance` returns
+        // `1 - cosine_similarity` over `[0, 2]` where the UDF returns
+        // `(1 - cosine_similarity) / 2` over `[0, 1]`, so the rewrite reported
+        // twice the distance for every non-identical pair. It also answers `2.0`
+        // where the UDF answers `0.5` (a zero-magnitude vector) and `NULL` (a
+        // non-finite element) — and `2.0` is simultaneously the legitimate value
+        // for opposite vectors, so no screen over the result can separate them.
+        //
+        // `inner_product` — `array_inner_product` agrees on dense finite vectors,
+        // and a `nullif` chain over its result can even reproduce the
+        // NULL-for-non-finite contract. But a NULL *element* inside either
+        // operand makes it raise `Invalid Input Error: array_inner_product: left
+        // argument can not contain NULL values`, where the UDF answers NULL
+        // (`compute_fsl_f32` treats a null child slot as a null row). An
+        // exception cannot be screened by an expression wrapping the call, so the
+        // pushdown turned a NULL row into a failed query.
         (
             "array_distance",
             Box::new(duckdb::array_distance_to_sql) as ScalarFnToSqlHandler,

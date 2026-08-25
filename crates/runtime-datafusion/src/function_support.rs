@@ -30,9 +30,9 @@ use runtime_udfs_api::{
 };
 
 /// The [`FunctionSupport`] for `DuckDB` connectors and accelerators: allows
-/// every function the `DuckDB` dialect can rewrite into native SQL that returns
-/// the same value (e.g. `inner_product` → `array_inner_product`, `rand` →
-/// `random()`), derived from the dialect so it tracks it automatically.
+/// every function the `DuckDB` dialect can rewrite into native SQL that answers
+/// identically (e.g. `rand` → `random()`), derived from the dialect so it tracks
+/// it automatically.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
     deny_spice_specific_functions_excluding(&crate::dialect::duckdb_native_function_names())

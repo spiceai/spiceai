@@ -33,7 +33,8 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, FixedSizeListArray, Float32Builder, RecordBatch};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::Float64Type;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::Column;
@@ -46,11 +47,30 @@ use runtime_datafusion::dialect::{duckdb_native_function_names, new_duckdb_diale
 /// Vector width the battery below is written against.
 const DIM: usize = 4;
 
+/// A vector operand: `None` is a NULL row, and a `None` element is a NULL slot
+/// inside an otherwise present vector. Both are legal in an Arrow
+/// `FixedSizeList<Float32>` column and both make the local kernel answer NULL.
+type Operand = Option<[Option<f32>; DIM]>;
+
 /// One `(lhs, rhs)` pair and what makes it worth asking about.
 struct Case {
     label: &'static str,
-    lhs: [f32; DIM],
-    rhs: [f32; DIM],
+    lhs: Operand,
+    rhs: Operand,
+}
+
+/// What one side answered for one case. An engine that raises instead of
+/// answering is its own outcome: it is neither a value nor a NULL, and folding it
+/// into either would hide that a pushdown turns a NULL row into a failed query.
+#[derive(Debug, PartialEq, Clone)]
+enum Outcome {
+    Value(Option<f64>),
+    Error(String),
+}
+
+/// Shorthand for a fully-populated operand.
+fn dense(v: [f32; DIM]) -> Operand {
+    Some(v.map(Some))
 }
 
 /// Every input class where two implementations of the same metric can disagree
@@ -58,25 +78,107 @@ struct Case {
 fn battery() -> Vec<Case> {
     let nan = f32::NAN;
     let inf = f32::INFINITY;
-    vec![
-        Case { label: "identical", lhs: [1.0, 0.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "orthogonal", lhs: [1.0, 0.0, 0.0, 0.0], rhs: [0.0, 1.0, 0.0, 0.0] },
-        Case { label: "opposite", lhs: [1.0, 0.0, 0.0, 0.0], rhs: [-1.0, 0.0, 0.0, 0.0] },
-        Case { label: "oblique", lhs: [1.0, 1.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "all_nonzero", lhs: [0.25, -0.5, 0.75, 1.5], rhs: [-1.25, 0.5, 2.0, -0.75] },
+    let mut cases = vec![
+        Case {
+            label: "identical",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "orthogonal",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: dense([0.0, 1.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "opposite",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: dense([-1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "oblique",
+            lhs: dense([1.0, 1.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "all_nonzero",
+            lhs: dense([0.25, -0.5, 0.75, 1.5]),
+            rhs: dense([-1.25, 0.5, 2.0, -0.75]),
+        },
         // Undefined direction: a metric that normalizes has to invent an answer,
         // and the two implementations need not invent the same one.
-        Case { label: "zero_lhs", lhs: [0.0, 0.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "zero_both", lhs: [0.0; DIM], rhs: [0.0; DIM] },
+        Case {
+            label: "zero_lhs",
+            lhs: dense([0.0, 0.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "zero_both",
+            lhs: dense([0.0; DIM]),
+            rhs: dense([0.0; DIM]),
+        },
         // No defined distance at all: the local contract is NULL, and a pushdown
         // has to reproduce that rather than score the row.
-        Case { label: "nan_lhs", lhs: [nan, 0.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "nan_rhs", lhs: [1.0, 0.0, 0.0, 0.0], rhs: [nan, 0.0, 0.0, 0.0] },
-        Case { label: "nan_both", lhs: [nan, 0.0, 0.0, 0.0], rhs: [nan, 0.0, 0.0, 0.0] },
-        Case { label: "pos_inf_lhs", lhs: [inf, 0.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "neg_inf_lhs", lhs: [-inf, 0.0, 0.0, 0.0], rhs: [1.0, 0.0, 0.0, 0.0] },
-        Case { label: "nan_deep", lhs: [1.0, 2.0, 3.0, nan], rhs: [1.0, 2.0, 3.0, 4.0] },
-    ]
+        Case {
+            label: "nan_lhs",
+            lhs: dense([nan, 0.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "nan_rhs",
+            lhs: dense([1.0, 0.0, 0.0, 0.0]),
+            rhs: dense([nan, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "nan_both",
+            lhs: dense([nan, 0.0, 0.0, 0.0]),
+            rhs: dense([nan, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "pos_inf_lhs",
+            lhs: dense([inf, 0.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "neg_inf_lhs",
+            lhs: dense([-inf, 0.0, 0.0, 0.0]),
+            rhs: dense([1.0, 0.0, 0.0, 0.0]),
+        },
+        Case {
+            label: "nan_deep",
+            lhs: dense([1.0, 2.0, 3.0, nan]),
+            rhs: dense([1.0, 2.0, 3.0, 4.0]),
+        },
+    ];
+    // NULL is not a variant of "no defined distance" — it is a separate way for a
+    // row to have no answer, and an engine may raise on it rather than return
+    // NULL. `compute_fsl_f32` treats a null outer row and a null inner slot
+    // identically (both append NULL), so a pushdown has to as well.
+    cases.push(Case {
+        label: "null_row_lhs",
+        lhs: None,
+        rhs: dense([1.0, 0.0, 0.0, 0.0]),
+    });
+    cases.push(Case {
+        label: "null_row_rhs",
+        lhs: dense([1.0, 0.0, 0.0, 0.0]),
+        rhs: None,
+    });
+    cases.push(Case {
+        label: "null_row_both",
+        lhs: None,
+        rhs: None,
+    });
+    cases.push(Case {
+        label: "null_element_lhs",
+        lhs: Some([None, Some(0.0), Some(0.0), Some(0.0)]),
+        rhs: dense([1.0, 0.0, 0.0, 0.0]),
+    });
+    cases.push(Case {
+        label: "null_element_rhs",
+        lhs: dense([1.0, 0.0, 0.0, 0.0]),
+        rhs: Some([Some(1.0), Some(0.0), Some(0.0), None]),
+    });
+    cases
 }
 
 /// The Spice vector UDFs, each paired with the fact this test needs about it:
@@ -123,20 +225,45 @@ fn fsl_field() -> Arc<Field> {
     Arc::new(Field::new("item", DataType::Float32, true))
 }
 
-fn fsl_column(rows: &[[f32; DIM]]) -> ArrayRef {
-    let flat: Vec<f32> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-    let values = Arc::new(Float32Array::from(flat));
+fn fsl_column(rows: &[Operand]) -> ArrayRef {
+    let mut values = Float32Builder::new();
+    let mut row_valid = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            None => {
+                // A null row still occupies DIM child slots in a FixedSizeList.
+                for _ in 0..DIM {
+                    values.append_null();
+                }
+                row_valid.push(false);
+            }
+            Some(elements) => {
+                for element in elements {
+                    match element {
+                        Some(x) => values.append_value(*x),
+                        None => values.append_null(),
+                    }
+                }
+                row_valid.push(true);
+            }
+        }
+    }
     let len = i32::try_from(DIM).expect("DIM fits in i32");
     Arc::new(
-        FixedSizeListArray::try_new(fsl_field(), len, values, None)
-            .expect("equal-length rows form a FixedSizeListArray"),
+        FixedSizeListArray::try_new(
+            fsl_field(),
+            len,
+            Arc::new(values.finish()),
+            Some(NullBuffer::from(row_valid)),
+        )
+        .expect("equal-length rows form a FixedSizeListArray"),
     )
 }
 
-/// The local answer for every case, in battery order. `None` is a NULL row.
-async fn local_values(udf: &ScalarUDF, cases: &[Case]) -> Vec<Option<f64>> {
-    let lhs: Vec<[f32; DIM]> = cases.iter().map(|c| c.lhs).collect();
-    let rhs: Vec<[f32; DIM]> = cases.iter().map(|c| c.rhs).collect();
+/// The local answer for every case, in battery order.
+async fn local_outcomes(udf: &ScalarUDF, cases: &[Case]) -> Vec<Outcome> {
+    let lhs: Vec<Operand> = cases.iter().map(|c| c.lhs).collect();
+    let rhs: Vec<Operand> = cases.iter().map(|c| c.rhs).collect();
     let len = i32::try_from(DIM).expect("DIM fits in i32");
     let list_type = DataType::FixedSizeList(fsl_field(), len);
     let schema = Arc::new(Schema::new(vec![
@@ -155,43 +282,57 @@ async fn local_values(udf: &ScalarUDF, cases: &[Case]) -> Vec<Option<f64>> {
             Expr::Column(Column::new_unqualified("b")),
         ],
     ));
-    let batches = df
+    let collected = df
         .select(vec![call.alias("d")])
         .expect("projection builds")
         .collect()
-        .await
-        .unwrap_or_else(|e| panic!("local {} evaluation failed: {e}", udf.name()));
+        .await;
+    let batches = match collected {
+        Ok(batches) => batches,
+        // The local kernel raising is itself an answer worth comparing: it would
+        // mean neither side can evaluate the row.
+        Err(e) => return vec![Outcome::Error(e.to_string()); cases.len()],
+    };
 
     let mut out = Vec::with_capacity(cases.len());
     for batch in &batches {
         let column = batch.column(0).as_primitive::<Float64Type>();
         for row in 0..column.len() {
-            out.push((!column.is_null(row)).then(|| column.value(row)));
+            out.push(Outcome::Value(
+                (!column.is_null(row)).then(|| column.value(row)),
+            ));
         }
     }
     out
 }
 
-fn duckdb_literal(v: &[f32; DIM]) -> String {
-    let elements: Vec<String> = v
+fn duckdb_literal(operand: &Operand) -> String {
+    let Some(elements) = operand else {
+        return format!("NULL::FLOAT[{DIM}]");
+    };
+    let rendered: Vec<String> = elements
         .iter()
-        .map(|x| {
-            if x.is_nan() {
-                "'nan'::FLOAT".to_string()
-            } else if x.is_infinite() {
+        .map(|element| match element {
+            None => "NULL".to_string(),
+            Some(x) if x.is_nan() => "'nan'::FLOAT".to_string(),
+            Some(x) if x.is_infinite() => {
                 let sign = if *x < 0.0 { "-" } else { "" };
                 format!("'{sign}inf'::FLOAT")
-            } else {
-                format!("CAST({x:?} AS FLOAT)")
             }
+            Some(x) => format!("CAST({x:?} AS FLOAT)"),
         })
         .collect();
-    format!("[{}]::FLOAT[{DIM}]", elements.join(", "))
+    format!("[{}]::FLOAT[{DIM}]", rendered.join(", "))
 }
 
 /// The federated answer for every case: the SQL the dialect renders for this
 /// call, run against a `DuckDB` holding the same rows.
-fn duckdb_values(udf: &ScalarUDF, cases: &[Case]) -> Vec<Option<f64>> {
+///
+/// One statement per case, deliberately. `DuckDB` raising on a row aborts the
+/// whole statement, so a single query would attribute one bad row's failure to
+/// every case in the battery — and the point of the battery is to say *which*
+/// input class diverges.
+fn duckdb_outcomes(udf: &ScalarUDF, cases: &[Case]) -> Vec<Outcome> {
     let dialect = new_duckdb_dialect();
     let unparser = Unparser::new(dialect.as_ref());
     let call = Expr::ScalarFunction(ScalarFunction::new_udf(
@@ -207,35 +348,40 @@ fn duckdb_values(udf: &ScalarUDF, cases: &[Case]) -> Vec<Option<f64>> {
         .to_string();
 
     let conn = Connection::open_in_memory().expect("in-memory DuckDB opens");
-    conn.execute_batch(&format!(
-        "CREATE TABLE t (ord INTEGER, a FLOAT[{DIM}], b FLOAT[{DIM}]);"
-    ))
-    .expect("table creates");
-    for (ord, case) in cases.iter().enumerate() {
-        conn.execute_batch(&format!(
-            "INSERT INTO t VALUES ({ord}, {}, {});",
-            duckdb_literal(&case.lhs),
-            duckdb_literal(&case.rhs)
-        ))
-        .unwrap_or_else(|e| panic!("row {} ({}) inserts: {e}", ord, case.label));
-    }
-
-    let sql = format!("SELECT CAST({rendered} AS DOUBLE) FROM t ORDER BY ord");
-    let mut stmt = conn
-        .prepare(&sql)
-        .unwrap_or_else(|e| panic!("DuckDB rejected the rendered SQL `{sql}`: {e}"));
-    let mut rows = stmt.query([]).expect("rendered query runs");
-    let mut out = Vec::with_capacity(cases.len());
-    while let Some(row) = rows.next().expect("row reads") {
-        out.push(row.get::<_, Option<f64>>(0).expect("column reads"));
-    }
-    out
+    cases
+        .iter()
+        .map(|case| {
+            let sql = format!(
+                "SELECT CAST({rendered} AS DOUBLE) FROM (SELECT {} AS a, {} AS b) t",
+                duckdb_literal(&case.lhs),
+                duckdb_literal(&case.rhs)
+            );
+            match conn
+                .prepare(&sql)
+                .and_then(|mut stmt| stmt.query([])?.next()?.map_or(Ok(None), |r| r.get(0)))
+            {
+                Ok(v) => Outcome::Value(v),
+                Err(e) => Outcome::Error(e.to_string()),
+            }
+        })
+        .collect()
 }
 
-fn describe(v: Option<f64>) -> String {
-    match v {
-        None => "NULL".to_string(),
-        Some(x) => format!("{x}"),
+fn describe(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Value(None) => "NULL".to_string(),
+        Outcome::Value(Some(x)) => format!("{x}"),
+        Outcome::Error(e) => format!("an error ({})", e.trim()),
+    }
+}
+
+fn agrees(local: &Outcome, remote: &Outcome) -> bool {
+    match (local, remote) {
+        (Outcome::Value(None), Outcome::Value(None)) => true,
+        (Outcome::Value(Some(l)), Outcome::Value(Some(r))) => {
+            (l - r).abs() <= 1e-6 * l.abs().max(1.0)
+        }
+        _ => false,
     }
 }
 
@@ -253,8 +399,8 @@ async fn duckdb_vector_udf_pushdown_matches_local() {
             continue;
         }
         measured += 1;
-        let local = local_values(&udf, &cases).await;
-        let remote = duckdb_values(&udf, &cases);
+        let local = local_outcomes(&udf, &cases).await;
+        let remote = duckdb_outcomes(&udf, &cases);
         assert_eq!(
             local.len(),
             cases.len(),
@@ -271,28 +417,33 @@ async fn duckdb_vector_udf_pushdown_matches_local() {
         );
 
         for (case, (l, r)) in cases.iter().zip(local.iter().zip(remote.iter())) {
-            let agrees = match (l, r) {
-                (None, None) => true,
-                (Some(l), Some(r)) => (l - r).abs() <= 1e-6 * l.abs().max(1.0),
-                _ => false,
-            };
             assert!(
-                agrees,
+                agrees(l, r),
                 "{name} answers differently depending on where the table lives: case \
                  '{}' is {} locally and {} pushed down to DuckDB. Either the rendering in \
                  runtime-datafusion::dialect::duckdb is not equivalent, or {name} does not \
                  belong in duckdb_scalar_overrides — see #13088.",
                 case.label,
-                describe(*l),
-                describe(*r)
+                describe(l),
+                describe(r)
             );
         }
     }
 
-    assert!(
-        measured > 0,
-        "no vector UDF federates to DuckDB, so this test measured nothing — if that is \
-         intended, delete it rather than leaving it passing vacuously"
+    // No Spice vector UDF federates to DuckDB today, so `measured` is 0 and the
+    // loop above compares nothing. That is deliberate, not dead weight: this is
+    // the gate that fires the moment one is added back. Re-adding either
+    // `cosine_distance` or `inner_product` to `duckdb_scalar_overrides` makes it
+    // fail, naming the input class that diverges — which is how the neuter matrix
+    // for #13088 proved it is armed. The two tests below carry the measured
+    // evidence for each denial, so this file does not rely on an idle loop alone.
+    assert_eq!(
+        measured,
+        native
+            .iter()
+            .filter(|n| vector_udfs().iter().any(|(name, _)| name == *n))
+            .count(),
+        "the loop must measure every vector UDF the dialect advertises"
     );
 }
 
@@ -313,6 +464,34 @@ fn unclassified_overrides_are_a_test_failure() {
              implementations; add it to `vector_udfs()` so its rendering is measured against \
              the local kernel, or to `NON_VECTOR_OVERRIDES` if it carries no Spice contract."
         );
+    }
+}
+
+/// `array_inner_product` raises on a NULL array element where the UDF answers
+/// NULL, which is why `inner_product` no longer federates either (#13088).
+///
+/// This is the finding that ruled out repairing the pushdown in the rendering: an
+/// expression wrapping the call cannot screen an exception raised while
+/// evaluating its own argument, so there is no `nullif` or `CASE` that recovers
+/// the UDF's answer here.
+#[test]
+fn duckdb_array_inner_product_rejects_a_null_element() {
+    let conn = Connection::open_in_memory().expect("in-memory DuckDB opens");
+    let sql = "SELECT array_inner_product([NULL, 1.0]::FLOAT[2], [1.0, 1.0]::FLOAT[2])";
+    let outcome = conn.prepare(sql).and_then(|mut stmt| {
+        stmt.query([])?
+            .next()?
+            .map_or(Ok(None), |r| r.get::<_, Option<f64>>(0))
+    });
+    match outcome {
+        Err(e) => assert!(
+            e.to_string().contains("can not contain NULL"),
+            "expected DuckDB to reject a NULL array element; got a different error: {e}"
+        ),
+        Ok(v) => panic!(
+            "DuckDB answered {v:?} for an array with a NULL element instead of raising. If it \
+             now returns NULL, revisit whether inner_product can federate again — see #13088."
+        ),
     }
 }
 

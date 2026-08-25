@@ -4608,6 +4608,7 @@ dependencies = [
  "runtime",
  "runtime-component",
  "runtime-datafusion",
+ "runtime-datafusion-udfs",
  "runtime-parameters",
  "snafu",
  "tokio",
