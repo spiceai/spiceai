@@ -30,7 +30,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cache::{CacheBackend, PingoraBackend, Sizeable};
+use cache::{CacheBackend, CacheMetrics, EvictionReason, PingoraBackend, Sizeable};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 const OPERATIONS_PER_THREAD: usize = 2_000;
@@ -47,6 +47,22 @@ impl Sizeable for BenchValue {
     fn get_memory_size(&self) -> usize {
         std::mem::size_of::<u64>()
     }
+}
+
+// `PingoraBackend` requires `V: CacheMetrics` so it can count the removals it
+// performs itself. A bench value publishes nothing -- the telemetry is not what
+// is being timed, and emitting it would add OpenTelemetry work to the hot loop.
+impl CacheMetrics for BenchValue {
+    fn record_hit() {}
+    fn record_miss() {}
+    fn record_request() {}
+    fn record_item_count(_count: u64) {}
+    fn record_size(_size: u64) {}
+    fn record_max_size(_size: u64) {}
+    fn record_eviction(_reason: EvictionReason) {}
+    fn record_stale_rejection() {}
+    fn update_hit_ratio(_hits: u64, _total: u64) {}
+    fn publish_counters_at_zero() {}
 }
 
 fn create_bench_runtime() -> tokio::runtime::Runtime {

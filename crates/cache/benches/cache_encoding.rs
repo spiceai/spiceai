@@ -56,9 +56,19 @@ fn bench_encode_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_result_encoding");
     group.throughput(Throughput::Bytes(byte_len as u64));
 
+    // The compression each level buys, printed once, so the timings below have a
+    // trade-off attached rather than only a cost. Level 6 is what `get_encoder`
+    // ships (`ZstdEncoder::default()`); the rest are unreachable today.
+    eprintln!("uncompressed (get_array_memory_size): {byte_len} B");
+
     for level in [1, 3, 6, 12, 19] {
         let encoder = ZstdEncoder::new(level);
         let encoded = rt.block_on(encoder.encode(&batches)).expect("encode");
+        eprintln!(
+            "zstd level {level:>2}: {:>7} B  ({:.2}x smaller)",
+            encoded.len(),
+            byte_len as f64 / encoded.len() as f64
+        );
 
         group.bench_function(BenchmarkId::new("encode", level), |b| {
             b.iter(|| black_box(rt.block_on(encoder.encode(&batches)).expect("encode")));
