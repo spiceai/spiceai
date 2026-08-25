@@ -19,6 +19,66 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b5ace29ee3216de37c0546865ad08edef58b0f9e76838ed8959a84a990e58c5"
 
 [[package]]
+name = "accelerator-cayenne"
+version = "2.2.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-credential-bridge",
+ "aws-sdk-s3",
+ "byte-unit",
+ "bytes",
+ "cayenne",
+ "cpu-budget",
+ "data-accelerator-api",
+ "data_components",
+ "datafusion",
+ "datafusion-datasource",
+ "datafusion-expr",
+ "datafusion-table-providers",
+ "fundu",
+ "futures",
+ "insta",
+ "itertools 0.14.0",
+ "linkme",
+ "object_store 0.13.2",
+ "opentelemetry",
+ "paste",
+ "runtime-acceleration",
+ "runtime-checkpoint-api",
+ "runtime-checkpoint-sqlite",
+ "runtime-checkpoint-turso",
+ "runtime-datafusion",
+ "runtime-object-store",
+ "runtime-parameters",
+ "runtime-resources",
+ "runtime-secrets",
+ "runtime-table",
+ "runtime-table-partition",
+ "rusqlite",
+ "search",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "spice-table",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "turso-shared",
+ "url",
+ "util",
+ "uuid 1.23.2",
+ "vortex-datafusion",
+]
+
+[[package]]
 name = "accelerator-duckdb"
 version = "2.2.0-unstable"
 dependencies = [
@@ -5033,6 +5093,7 @@ dependencies = [
  "runtime-parameters",
  "scylla",
  "snafu",
+ "tokio",
  "tracing",
 ]
 
@@ -6200,6 +6261,7 @@ dependencies = [
  "runtime-table-partition",
  "secrecy",
  "snafu",
+ "spicepod",
  "sysinfo 0.38.4",
  "tokio",
  "tracing",
@@ -17111,6 +17173,7 @@ dependencies = [
 name = "runtime"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
@@ -19864,6 +19927,7 @@ dependencies = [
 name = "spiced"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",
@@ -19995,6 +20059,7 @@ dependencies = [
 name = "spicepodschema"
 version = "2.2.0-unstable"
 dependencies = [
+ "accelerator-cayenne",
  "accelerator-duckdb",
  "accelerator-postgres",
  "accelerator-sqlite",

@@ -43,7 +43,7 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tar = "0.4"
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
 url.workspace = true
