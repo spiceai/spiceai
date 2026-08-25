@@ -1058,8 +1058,8 @@ impl Runtime {
             // case here would leave the dataset stuck in `Refreshing`.
             let table_name = table.to_string();
             tokio::spawn(async move {
-                if let Some(n) = notifier {
-                    n.notified().await;
+                if let Some(completion) = notifier {
+                    completion.wait().await;
                 }
                 // Statistics flow via the periodic ExecutorStatistics reporter, not
                 // this readiness ack.

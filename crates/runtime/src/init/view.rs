@@ -341,8 +341,8 @@ impl Runtime {
             let view_name = view.name.clone();
             let notifier = register_task.await;
             match notifier {
-                Ok(Some(notifier)) => {
-                    notifier.notified().await;
+                Ok(Some(completion)) => {
+                    completion.wait().await;
                     if let Err(e) = runtime.create_dataset_or_view_schedule(view).await {
                         tracing::error!(
                             "Failed to create refresh schedule for accelerated view '{view_name}': {e}."

@@ -40,9 +40,9 @@ impl ScheduledTask for ViewRefreshTask {
             let runtime = Arc::clone(&view.runtime);
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    if let Some(completion) = completion {
+                        completion.wait().await;
                     }
                     Ok(())
                 }

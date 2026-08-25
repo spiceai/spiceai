@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
@@ -1339,14 +1340,13 @@ impl Runtime {
         );
 
         let refresher = accelerated_table.refresher();
-        let notifier = refresher.on_complete_notification();
 
         // wait for accelerated table to be ready
-        if let Some(notifier) = notifier {
+        if let Some(completion) = refresher.refresh_completion() {
             await_hot_reload_initial_refresh(
                 &ds.name,
                 &|| refresher.initial_load_completed(),
-                &notifier,
+                completion.any(),
                 &self.status.shutdown_token(),
                 HOT_RELOAD_INITIAL_REFRESH_TIMEOUT,
             )
@@ -1657,10 +1657,10 @@ impl Runtime {
                 crate::datafusion::SPICE_DEFAULT_SCHEMA,
             );
             tokio::task::spawn(async move {
-                // Wait for the dataset's status to reach `Ready` rather than
-                // relying on the `Notify`-based completion handle (which is
-                // edge-triggered and can race with this spawn for fast
-                // initial refreshes).
+                // Gate on the dataset's status reaching `Ready` rather than on
+                // the refresh completion: the ack reports the partitions this
+                // executor serves, and the dataset is only servable once its
+                // status has been published.
                 // A shutdown before the dataset became ready means the initial
                 // load never finished: there is no partition state worth acking.
                 if runtime_status
@@ -2007,27 +2007,19 @@ pub struct RegisterDatasetContext {
 /// loaded yet.
 ///
 /// The wait is bounded because `apply_app` holds `apply_app_lock` across it, and
-/// three shapes never deliver a notification the caller can see:
+/// one shape never delivers a completion at all: a `refresh_mode: changes` stream
+/// that never produces a ready envelope, since the completion is recorded only
+/// when one is applied.
 ///
-/// - a `refresh_mode: changes` stream that never produces a ready envelope — the
-///   notifier fires only when one is applied;
-/// - a refresh completing before this wait is entered at all.
-///   [`tokio::sync::Notify::notify_waiters`] stores no permit, so that wakeup is
-///   gone, and a `RefreshMode::Full` dataset with no `check_interval` never fires
-///   a second one;
-/// - a cluster scheduler, which notifies waiters from inside the builder —
-///   before any caller holds the notifier — precisely because it runs no refresh.
+/// A refresh that finished before this call is not that shape. The waiter is
+/// level-triggered and satisfied by a completion recorded before it was taken, and
+/// `initial_load_completed` — stored before the completion is recorded — is read
+/// both before the bound and after it, so a load that lands either side of the
+/// wait resolves as success instead of discarding a table that is loaded.
 ///
-/// Only the second is recoverable here, and only via `initial_load_completed`:
-/// the refresher sets that flag just *after* it notifies (`Refresher::start`), so
-/// the flag is what remains once the edge is gone. It is read after the bound as
-/// well as before it, so a wakeup that predates this call resolves as success
-/// instead of discarding a table that is loaded.
-///
-/// The scheduler shape is not recoverable here — nothing local ever sets the flag
-/// on a scheduler — so it spends the bound and then takes the full reload. That is
-/// still strictly better than the unbounded wait it replaces, which never
-/// returned at all; removing the edge at its source is #13086.
+/// On a cluster scheduler no refresh runs locally, so the table's completion
+/// signal is closed when it is built and the waiter resolves at once rather than
+/// spending the bound.
 ///
 /// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
 /// [`Error::HotReloadRefreshTimedOut`] when the bound expires with the table
@@ -2035,31 +2027,26 @@ pub struct RegisterDatasetContext {
 async fn await_hot_reload_initial_refresh(
     dataset_name: &TableReference,
     initial_load_completed: &(dyn Fn() -> bool + Sync),
-    notifier: &tokio::sync::Notify,
+    completion: RefreshCompletionWaiter,
     shutdown_token: &tokio_util::sync::CancellationToken,
     timeout: Duration,
 ) -> Result<()> {
-    // Built before the check below, not after: a `Notified` "is guaranteed to
-    // receive wakeups from `notify_waiters()` as soon as it has been created,
-    // even if it has not yet been polled" (`tokio::sync::Notify::notified`), and
-    // `notify_waiters` is what both producers call. So a refresh completing
-    // between here and the `select!` still wakes this wait; constructing after
-    // the check would drop it and cost the whole bound.
-    let refresh_notified = notifier.notified();
-
     if initial_load_completed() {
         return Ok(());
     }
 
     tokio::select! {
-        () = refresh_notified => return Ok(()),
+        // A `RefreshCompletionWaiter` for any completion is satisfied by a
+        // refresh that finished before this wait began, so the load cannot be
+        // missed by arriving here late.
+        () = completion.wait() => return Ok(()),
         () = shutdown_token.cancelled() => return Ok(()),
         () = tokio::time::sleep(timeout) => {}
     }
 
-    // The bound is a backstop, not the verdict: a wakeup that fired before this
-    // wait was even entered leaves a table that is loaded and must not be
-    // discarded.
+    // The bound is a backstop, not the verdict: the flag is stored before the
+    // completion is recorded, so a load that finished as the bound expired
+    // leaves a table that must not be discarded.
     if initial_load_completed() {
         return Ok(());
     }

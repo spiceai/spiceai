@@ -43,9 +43,9 @@ impl ScheduledTask for DatasetRefreshTask {
                 .refresh_table(&dataset.name, None)
                 .await
             {
-                Ok(notifier) => {
-                    if let Some(notifier) = notifier {
-                        notifier.notified().await;
+                Ok(completion) => {
+                    if let Some(completion) = completion {
+                        completion.wait().await;
                     }
                     Ok(())
                 }
