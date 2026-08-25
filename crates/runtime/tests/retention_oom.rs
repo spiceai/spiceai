@@ -453,8 +453,8 @@ async fn build_image_from_host_binary(
 
     stage_test_binary(host_test_binary, &staged_binary).await?;
 
-    // The staged size is what the build context costs, and this step has previously run out
-    // of budget transferring and exporting it rather than running the workload, so report it.
+    // The staged size is what the build context costs: an oversized one spends the step's
+    // budget transferring and exporting it rather than running the workload, so report it.
     if let Ok(metadata) = std::fs::metadata(&staged_binary) {
         eprintln!(
             "Staged test binary for the image build context: {} MiB",
