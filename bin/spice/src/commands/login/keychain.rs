@@ -46,8 +46,6 @@ pub fn inspect(account: &str) -> CredentialRead {
     {
         let entry = match keyring::Entry::new(account, KEYCHAIN_USER) {
             Ok(entry) => entry,
-            // No configured platform store cannot later shadow the env file.
-            Err(keyring::Error::NoStorageAccess(_)) => return CredentialRead::Missing,
             Err(err) => return CredentialRead::Unavailable(err.to_string()),
         };
         match entry.get_password() {
@@ -79,9 +77,6 @@ pub fn delete(account: &str) -> Result<bool, String> {
     {
         let entry = match keyring::Entry::new(account, KEYCHAIN_USER) {
             Ok(entry) => entry,
-            // A platform without a configured credential store has nothing
-            // that can later outrank an env-file login.
-            Err(keyring::Error::NoStorageAccess(_)) => return Ok(false),
             Err(err) => return Err(err.to_string()),
         };
         match entry.delete_credential() {

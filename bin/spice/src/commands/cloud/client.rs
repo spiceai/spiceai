@@ -1180,7 +1180,7 @@ pub fn user_credential_candidates(requested: Option<&str>) -> Vec<String> {
 /// project listing renders its own as `Forbidden`. Both say the same thing —
 /// *this* credential may not act there — which is a fact about the credential,
 /// not about the request, so another credential is still worth trying.
-fn is_org_refusal(err: &crate::error::Error) -> bool {
+pub(crate) fn is_org_refusal(err: &crate::error::Error) -> bool {
     matches!(
         err.cloud_code(),
         Some(CloudErrorCode::OrgForbidden | CloudErrorCode::Forbidden)

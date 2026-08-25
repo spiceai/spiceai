@@ -27,7 +27,7 @@ use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
 use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
-use std::{collections::BTreeSet, fmt, io::IsTerminal};
+use std::{collections::BTreeSet, fmt, future::Future, io::IsTerminal, pin::Pin};
 
 pub use client::{
     CloudClient, ProjectTarget, is_device_authorization_denied_error, parse_org_project,
@@ -1913,21 +1913,25 @@ fn api_key_credential_key(org: Option<&str>) -> String {
 /// Build the credential writes for a user login.
 ///
 /// User management tokens are membership-wide, so the default token and every
-/// verified organization receive a copy. A data-plane API key belongs to the
-/// organization returned with the authenticated user context; an explicit
-/// login for another member organization must not relabel that key or replace
-/// the default data-plane key.
+/// verified or selected organization receive a copy. A data-plane API key
+/// belongs to the organization returned with the authenticated user context;
+/// an explicit login for another member organization must not relabel that key
+/// or replace the default data-plane key.
 fn user_login_values<'a>(
     token: &'a str,
     api_key: Option<&'a str>,
     token_org: Option<&str>,
     store_org: Option<&str>,
+    selected_org: Option<&str>,
 ) -> Vec<(String, &'a str)> {
     let mut credential_orgs = BTreeSet::new();
     if let Some(org) = token_org {
         credential_orgs.insert(org.to_string());
     }
     if let Some(org) = store_org {
+        credential_orgs.insert(org.to_string());
+    }
+    if let Some(org) = selected_org {
         credential_orgs.insert(org.to_string());
     }
 
@@ -1989,6 +1993,7 @@ fn persist_login_values(
     spiceai: &[(&str, &str)],
     cloud: &[(&str, &str)],
     context: Option<&spice_cloud_client::types::AuthContext>,
+    login_org: Option<&str>,
 ) -> Result<()> {
     use crate::commands::login::save_credentials;
 
@@ -2029,7 +2034,126 @@ fn persist_login_values(
     }
 
     clear_login_shadows(output, spiceai, cloud)?;
+    select_login_org(login_org)?;
     Ok(())
+}
+
+/// Make later commands select the organization authenticated by this login.
+fn select_login_org(login_org: Option<&str>) -> Result<()> {
+    if let Ok(active_override) = std::env::var(org::ACTIVE_ORG_VAR)
+        && !active_override.is_empty()
+    {
+        org::validate_org_name(&active_override)?;
+        if login_org.is_some_and(|login_org| active_override.eq_ignore_ascii_case(login_org)) {
+            return org::set_active_org(&active_override);
+        }
+
+        let destination = login_org.map_or_else(
+            || "the credential's default organization".to_string(),
+            |login_org| format!("organization '{login_org}'"),
+        );
+        return Err(Error::cloud_with_hint(
+            CloudErrorCode::InvalidRequest,
+            format!(
+                "Saved the new Spice Cloud credential for {destination}, but `{}` still selects organization '{active_override}', so later commands may use an older credential.",
+                org::ACTIVE_ORG_VAR
+            ),
+            active_org_override_hint(login_org),
+        ));
+    }
+
+    match login_org {
+        Some(login_org) => org::set_active_org(login_org),
+        None => org::clear_active_org(),
+    }
+}
+
+fn active_org_override_hint(login_org: Option<&str>) -> String {
+    let reconcile = login_org.map_or_else(
+        || "run `spice cloud org unset`".to_string(),
+        |login_org| format!("run `spice cloud org use {login_org}`"),
+    );
+    format!(
+        "Unset `{}`, then {reconcile} before retrying the Spice Cloud command; the new credential is already saved. See: https://spiceai.org/docs/spice-cloud",
+        org::ACTIVE_ORG_VAR
+    )
+}
+
+fn preferred_user_login_org(
+    requested_org: Option<&str>,
+    token_org: Option<&str>,
+    active_org: Option<&str>,
+    active_org_accessible: bool,
+) -> Option<String> {
+    requested_org
+        .or_else(|| active_org.filter(|_| active_org_accessible))
+        .or(token_org)
+        .map(str::to_string)
+}
+
+/// Keep an intentional `org use` selection only when the fresh token can use it.
+async fn user_login_org(
+    client: &CloudClient,
+    requested_org: Option<&str>,
+    token_org: Option<&str>,
+) -> Result<Option<String>> {
+    user_login_org_with_probe(client, requested_org, token_org, login_org_access_probe).await
+}
+
+type LoginOrgAccessProbeFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type LoginOrgAccessProbe = for<'a> fn(&'a CloudClient, &'a str) -> LoginOrgAccessProbeFuture<'a>;
+
+fn login_org_access_probe<'a>(
+    client: &'a CloudClient,
+    active_org: &'a str,
+) -> LoginOrgAccessProbeFuture<'a> {
+    Box::pin(client::confirm_org_access(client, active_org))
+}
+
+async fn user_login_org_with_probe(
+    client: &CloudClient,
+    requested_org: Option<&str>,
+    token_org: Option<&str>,
+    probe: LoginOrgAccessProbe,
+) -> Result<Option<String>> {
+    if requested_org.is_some() {
+        return Ok(preferred_user_login_org(
+            requested_org,
+            token_org,
+            None,
+            false,
+        ));
+    }
+
+    let active_org = org::load_context()?.active_org;
+    if let Some(active_org) = active_org.as_deref() {
+        org::validate_org_name(active_org)?;
+    }
+    let active_org_accessible = if let Some(active_org) = active_org.as_deref() {
+        if token_org.is_some_and(|token_org| token_org.eq_ignore_ascii_case(active_org)) {
+            true
+        } else {
+            match probe(client, active_org).await {
+                Ok(()) => true,
+                Err(err) if client::is_org_refusal(&err) => {
+                    tracing::debug!(
+                        "Spice Cloud rejected the new credential for active organization '{active_org}', so login will select the credential organization instead: {err}"
+                    );
+                    false
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok(preferred_user_login_org(
+        None,
+        token_org,
+        active_org.as_deref(),
+        active_org_accessible,
+    ))
 }
 
 /// Clear copies of the credentials this login wrote from the other store.
@@ -2129,7 +2253,18 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
         .as_ref()
         .ok()
         .and_then(|context| context.app_api_key.as_deref());
-    let values = user_login_values(token, api_key, token_org.as_deref(), store_org.as_deref());
+    let selected_org = if target.output == LoginOutput::Json {
+        preferred_user_login_org(store_org.as_deref(), token_org.as_deref(), None, false)
+    } else {
+        user_login_org(&authed_client, store_org.as_deref(), token_org.as_deref()).await?
+    };
+    let values = user_login_values(
+        token,
+        api_key,
+        token_org.as_deref(),
+        store_org.as_deref(),
+        selected_org.as_deref(),
+    );
     let value_refs: Vec<(&str, &str)> = values
         .iter()
         .map(|(key, value)| (key.as_str(), *value))
@@ -2139,6 +2274,7 @@ async fn save_token_and_print_login_result(token: &str, target: &LoginTarget<'_>
         &value_refs,
         &[],
         auth_context_result.as_ref().ok(),
+        selected_org.as_deref(),
     )?;
 
     if target.output == LoginOutput::Json {
@@ -2188,6 +2324,7 @@ async fn save_api_credentials_and_print_login_result(
         &value_refs,
         &[("CLIENT_ID", client_id), ("CLIENT_SECRET", client_secret)],
         None,
+        store_org.as_deref(),
     )?;
     if target.output == LoginOutput::Json {
         return Ok(());
@@ -2218,12 +2355,6 @@ async fn print_post_login_org_context(
     stored_org: Option<&str>,
 ) {
     if let Some(org) = stored_org {
-        if let Err(err) = org::set_active_org(org) {
-            tracing::warn!(
-                "Logged in, but could not record '{org}' as the active organization: {err}"
-            );
-            return;
-        }
         println!("Active org: {org}");
         return;
     }
@@ -2966,7 +3097,7 @@ pub(crate) fn rejected_user_credential_error(
     Error::cloud_with_hint(
         CloudErrorCode::TokenExpired,
         format!(
-            "Spice Cloud rejected every available user credential, so {action} cannot authenticate. A credential may be expired, revoked, for a different account, or a machine credential with no user identity."
+            "Spice Cloud rejected each user credential this command tried, so {action} cannot authenticate. A credential may be expired, revoked, for a different account, or a machine credential with no user identity."
         ),
         format!(
             "{unset}run `spice cloud logout --scope all`, then `spice login` with a user account that can access the target organization, then {retry}. See: https://spiceai.org/docs/spice-cloud"
@@ -5708,11 +5839,110 @@ mod tests {
     }
 
     #[test]
+    fn user_login_org_preserves_only_an_accessible_active_org() {
+        assert_eq!(
+            preferred_user_login_org(None, Some("personal"), Some("prod"), true).as_deref(),
+            Some("prod"),
+            "a fresh token that can access the selected org should preserve `org use`"
+        );
+        assert_eq!(
+            preferred_user_login_org(None, Some("personal"), Some("old-account"), false).as_deref(),
+            Some("personal"),
+            "an inaccessible old selection must yield to the fresh credential org"
+        );
+        assert_eq!(
+            preferred_user_login_org(Some("requested"), Some("personal"), Some("prod"), true)
+                .as_deref(),
+            Some("requested"),
+            "an explicit login org must win"
+        );
+    }
+
+    fn allow_login_org_probe<'a>(
+        _client: &'a CloudClient,
+        _org: &'a str,
+    ) -> LoginOrgAccessProbeFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn refuse_login_org_probe<'a>(
+        _client: &'a CloudClient,
+        _org: &'a str,
+    ) -> LoginOrgAccessProbeFuture<'a> {
+        Box::pin(async {
+            Err(Error::cloud_with_hint(
+                CloudErrorCode::OrgForbidden,
+                "credential is not a member",
+                "use another credential",
+            ))
+        })
+    }
+
+    fn fail_login_org_probe<'a>(
+        _client: &'a CloudClient,
+        _org: &'a str,
+    ) -> LoginOrgAccessProbeFuture<'a> {
+        Box::pin(async {
+            Err(Error::cloud_with_hint(
+                CloudErrorCode::ApiError,
+                "organization probe timed out",
+                "retry later",
+            ))
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_login_org_uses_persisted_selection_and_classifies_probe_failures() {
+        let _stores = CredentialStores::empty();
+        org::set_active_org("prod").expect("seed persisted active org");
+        // SAFETY: `CredentialStores` serializes this mutation and restores the
+        // original environment value on drop.
+        unsafe { std::env::set_var(org::ACTIVE_ORG_VAR, "personal") };
+        let client =
+            CloudClient::with_token_for_org_at("fresh-token", None, "https://api.spice.ai")
+                .expect("build test client");
+
+        let preserved =
+            user_login_org_with_probe(&client, None, Some("personal"), allow_login_org_probe)
+                .await
+                .expect("an accessible persisted org should be preserved");
+        assert_eq!(preserved.as_deref(), Some("prod"));
+        assert_eq!(
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
+                .as_deref(),
+            Some("prod"),
+            "a process override must not become the persisted selection"
+        );
+
+        let refused =
+            user_login_org_with_probe(&client, None, Some("personal"), refuse_login_org_probe)
+                .await
+                .expect("a membership refusal should fall back to the token org");
+        assert_eq!(refused.as_deref(), Some("personal"));
+
+        let err = user_login_org_with_probe(&client, None, Some("personal"), fail_login_org_probe)
+            .await
+            .expect_err("an inconclusive probe failure must stop login");
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::ApiError));
+        assert_eq!(
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
+                .as_deref(),
+            Some("prod"),
+            "a failed probe must not change the persisted selection"
+        );
+    }
+
+    #[test]
     fn keychain_login_indexes_every_per_org_token_and_no_other_credential() {
         let values = user_login_values(
             "user-token",
             Some("personal-api-key"),
             Some("personal"),
+            Some("acme"),
             Some("acme"),
         );
         let value_refs: Vec<(&str, &str)> = values
@@ -5728,7 +5958,13 @@ mod tests {
 
     #[test]
     fn a_user_login_without_an_app_key_does_not_clear_data_plane_credentials() {
-        let values = user_login_values("user-token", None, Some("personal"), Some("acme"));
+        let values = user_login_values(
+            "user-token",
+            None,
+            Some("personal"),
+            Some("acme"),
+            Some("acme"),
+        );
 
         assert!(
             values.iter().all(|(key, _)| !key.contains("API_KEY")),
@@ -5742,6 +5978,7 @@ mod tests {
             "user-token",
             Some("personal-api-key"),
             Some("personal"),
+            Some("acme"),
             Some("acme"),
         );
         let keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
@@ -6244,6 +6481,7 @@ mod tests {
             };
             stores.isolate_process_var(org::DEFAULT_TOKEN_VAR);
             stores.isolate_process_var(org::DEFAULT_API_KEY_VAR);
+            stores.isolate_process_var(org::ACTIVE_ORG_VAR);
             stores
         }
 
@@ -6286,12 +6524,12 @@ mod tests {
     }
 
     fn persist_user_login(output: LoginOutput, token: &str, org: &str) -> Result<()> {
-        let values = user_login_values(token, None, Some(org), None);
+        let values = user_login_values(token, None, Some(org), None, Some(org));
         let refs: Vec<(&str, &str)> = values
             .iter()
             .map(|(key, value)| (key.as_str(), *value))
             .collect();
-        persist_login_values(output, &refs, &[], None)
+        persist_login_values(output, &refs, &[], None, Some(org))
     }
 
     /// Regression test for #13486: the keychain is read before the env file,
@@ -6335,6 +6573,177 @@ mod tests {
         assert_eq!(
             crate::commands::login::keychain::read(&other_var).as_deref(),
             Some("other-token")
+        );
+    }
+
+    /// Regression test for #13486: a persisted active organization must not
+    /// keep selecting an older credential after login switches accounts.
+    #[test]
+    fn login_selects_the_organization_authenticated_by_the_new_credential() {
+        let mut stores = CredentialStores::user_login("new-account-org");
+        let old_org = "old-account-org";
+        let old_org_var = org::org_token_var(old_org);
+        stores.isolate_process_var(&old_org_var);
+        crate::commands::login::keychain::test_store::write(&old_org_var, "stale-token")
+            .expect("seed old active-org credential");
+        org::set_active_org(old_org).expect("select old active organization");
+
+        persist_user_login(LoginOutput::Env, "fresh-token", "new-account-org")
+            .expect("persist fresh login");
+
+        assert_eq!(
+            org::active_org()
+                .expect("read active organization")
+                .as_deref(),
+            Some("new-account-org")
+        );
+        assert_eq!(
+            org::token_for_org("new-account-org").as_deref(),
+            Some("fresh-token")
+        );
+        assert_eq!(
+            crate::commands::login::keychain::read(&old_org_var).as_deref(),
+            Some("stale-token"),
+            "switching the active org must not delete another org's credential"
+        );
+    }
+
+    #[test]
+    fn same_account_login_refreshes_and_preserves_the_selected_org() {
+        let mut stores = CredentialStores::user_login("personal-org");
+        let selected_org = "selected-org";
+        let selected_var = org::org_token_var(selected_org);
+        stores.isolate_process_var(&selected_var);
+        crate::commands::login::keychain::test_store::write(&selected_var, "expired-token")
+            .expect("seed selected-org credential");
+        org::set_active_org(selected_org).expect("select organization");
+
+        let values = user_login_values(
+            "fresh-token",
+            None,
+            Some("personal-org"),
+            None,
+            Some(selected_org),
+        );
+        let refs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|(key, value)| (key.as_str(), *value))
+            .collect();
+        persist_login_values(LoginOutput::Env, &refs, &[], None, Some(selected_org))
+            .expect("persist login while preserving selected organization");
+
+        assert_eq!(
+            org::active_org()
+                .expect("read active organization")
+                .as_deref(),
+            Some(selected_org)
+        );
+        assert_eq!(
+            org::token_for_org(selected_org).as_deref(),
+            Some("fresh-token"),
+            "the preserved selection must use the fresh token"
+        );
+    }
+
+    #[test]
+    fn unnamed_machine_login_clears_an_old_active_org() {
+        let mut stores = CredentialStores::empty();
+        let old_org = "old-machine-login-org";
+        let old_var = org::org_token_var(old_org);
+        stores.isolate_process_var(&old_var);
+        crate::commands::login::keychain::test_store::write(&old_var, "old-token")
+            .expect("seed old org credential");
+        org::set_active_org(old_org).expect("select old organization");
+        let values = machine_login_values("fresh-machine-token", None);
+        let refs: Vec<(&str, &str)> = values
+            .iter()
+            .map(|(key, value)| (key.as_str(), *value))
+            .collect();
+
+        persist_login_values(LoginOutput::Env, &refs, &[], None, None)
+            .expect("persist unnamed machine login");
+
+        assert_eq!(org::active_org().expect("read active organization"), None);
+        assert_eq!(org::default_token().as_deref(), Some("fresh-machine-token"));
+        assert_eq!(
+            crate::commands::login::keychain::read(&old_var).as_deref(),
+            Some("old-token"),
+            "clearing the selection must not delete another org's credential"
+        );
+    }
+
+    #[test]
+    fn active_org_environment_disagreement_does_not_rewrite_persisted_context() {
+        let _stores = CredentialStores::user_login("new-org");
+        org::set_active_org("persisted-org").expect("seed persisted active org");
+        // SAFETY: `CredentialStores` serializes this mutation and restores the
+        // original environment value on drop.
+        unsafe { std::env::set_var(org::ACTIVE_ORG_VAR, "shell-org") };
+
+        let err = persist_user_login(LoginOutput::Env, "fresh-token", "new-org")
+            .expect_err("a conflicting active-org environment variable must fail login");
+
+        assert_eq!(err.cloud_code(), Some(CloudErrorCode::InvalidRequest));
+        assert!(err.to_string().contains(org::ACTIVE_ORG_VAR));
+        assert!(err.to_string().contains("already saved"));
+        assert!(err.to_string().contains("spice cloud org use new-org"));
+        assert_eq!(
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
+                .as_deref(),
+            Some("persisted-org"),
+            "the shell override must be checked before changing persisted context"
+        );
+    }
+
+    #[test]
+    fn unnamed_login_with_an_active_org_override_says_to_clear_the_selection() {
+        let _stores = CredentialStores::empty();
+        org::set_active_org("persisted-org").expect("seed persisted active org");
+        // SAFETY: `CredentialStores` serializes this mutation and restores the
+        // original environment value on drop.
+        unsafe { std::env::set_var(org::ACTIVE_ORG_VAR, "shell-org") };
+
+        let err = select_login_org(None)
+            .expect_err("an unnamed login cannot override an active-org environment variable");
+
+        assert!(err.to_string().contains("spice cloud org unset"));
+        assert_eq!(
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
+                .as_deref(),
+            Some("persisted-org")
+        );
+    }
+
+    #[test]
+    fn json_login_does_not_mutate_credential_or_context_stores() {
+        let _stores = CredentialStores::empty();
+        crate::commands::login::keychain::test_store::write(org::DEFAULT_TOKEN_VAR, "stored-token")
+            .expect("seed keychain token");
+        org::set_active_org("stored-org").expect("seed active org");
+
+        persist_login_values(
+            LoginOutput::Json,
+            &[("TOKEN", "json-token")],
+            &[],
+            None,
+            Some("json-org"),
+        )
+        .expect("render JSON login");
+
+        assert_eq!(
+            crate::commands::login::keychain::read(org::DEFAULT_TOKEN_VAR).as_deref(),
+            Some("stored-token")
+        );
+        assert_eq!(
+            org::load_context()
+                .expect("read persisted context")
+                .active_org
+                .as_deref(),
+            Some("stored-org")
         );
     }
 
@@ -6422,7 +6831,7 @@ mod tests {
         assert!(
             rejected
                 .to_string()
-                .contains("rejected every available user credential")
+                .contains("rejected each user credential this command tried")
         );
         assert!(rejected.to_string().contains("expired, revoked"));
         assert!(
