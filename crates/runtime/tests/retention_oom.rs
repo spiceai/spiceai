@@ -393,6 +393,57 @@ async fn build_image_from_source(
     Ok(())
 }
 
+/// Stage the test binary for the image without its debug info.
+///
+/// The staged copy becomes the entire Docker build context, so every byte is transferred to
+/// the daemon and then written again as an exported layer. An unstripped debug build of this
+/// test target is several gigabytes, nearly all of it DWARF the container never reads — it
+/// only executes the binary. `strip --strip-debug` writes the stripped output directly, so
+/// the oversized copy is never materialized at all, and it keeps the ELF symbol table so a
+/// panic inside the container still symbolizes.
+///
+/// Only the ELF path reaches here, so `strip` is GNU binutils and `--strip-debug` is the
+/// flag it takes; Apple's `strip` spells this `-S` and rejects the long form outright. That
+/// difference costs nothing rather than needing a second spelling, because `strip` is not
+/// guaranteed to be on the host at all: any absence, rejected flag, or failure falls back to
+/// a plain copy. A slower build is a far better outcome than a test that cannot run.
+async fn stage_test_binary(
+    host_test_binary: &Path,
+    staged_binary: &Path,
+) -> Result<(), anyhow::Error> {
+    let stripped = Command::new("strip")
+        .arg("--strip-debug")
+        .arg("-o")
+        .arg(staged_binary)
+        .arg(host_test_binary)
+        .status()
+        .await;
+
+    match stripped {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => eprintln!(
+            "strip --strip-debug exited {}, staging the unstripped binary instead",
+            status.code().unwrap_or_default()
+        ),
+        Err(error) => {
+            eprintln!("could not run strip ({error}), staging the unstripped binary instead");
+        }
+    }
+
+    // `strip -o` may have left a partial file behind before failing.
+    let _ = std::fs::remove_file(staged_binary);
+
+    std::fs::copy(host_test_binary, staged_binary).with_context(|| {
+        format!(
+            "failed to copy host test binary from {} to {}",
+            host_test_binary.display(),
+            staged_binary.display()
+        )
+    })?;
+
+    Ok(())
+}
+
 async fn build_image_from_host_binary(
     image_tag: &str,
     host_test_binary: &Path,
@@ -401,13 +452,16 @@ async fn build_image_from_host_binary(
     let dockerfile_path = temp_dir.path().join("Dockerfile.retention-oom");
     let staged_binary = temp_dir.path().join("retention_oom");
 
-    std::fs::copy(host_test_binary, &staged_binary).with_context(|| {
-        format!(
-            "failed to copy host test binary from {} to {}",
-            host_test_binary.display(),
-            staged_binary.display()
-        )
-    })?;
+    stage_test_binary(host_test_binary, &staged_binary).await?;
+
+    // The staged size is what the build context costs, and this step has previously run out
+    // of budget transferring and exporting it rather than running the workload, so report it.
+    if let Ok(metadata) = std::fs::metadata(&staged_binary) {
+        eprintln!(
+            "Staged test binary for the image build context: {} MiB",
+            metadata.len() / (1024 * 1024)
+        );
+    }
 
     std::fs::write(&dockerfile_path, dockerfile_for_host_binary())?;
 
