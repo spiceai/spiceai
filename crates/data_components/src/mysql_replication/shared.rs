@@ -1089,6 +1089,12 @@ impl MemberStart {
     /// so recording it up front would let a crash mid-load resume past base
     /// rows that never arrived. A member that loads nothing has no such
     /// committer, and its head has to be recorded for the next start.
+    ///
+    /// That makes it the complement of [`Self::is_loading`] over today's three
+    /// starts, and it is still stated separately: the two answer different
+    /// questions — whether the ack floor is held, and who owns the checkpoint
+    /// write — so a start added later has to answer both rather than inherit
+    /// one from the other.
     const fn persists_head_before_loading(self) -> bool {
         // Exhaustive over the closed enum rather than a `matches!`: a start
         // added later has to state which side it is on here, instead of

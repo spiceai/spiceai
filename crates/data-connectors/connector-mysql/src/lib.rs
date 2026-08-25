@@ -162,10 +162,9 @@ const PARAMETERS: &[ParameterSpec] = &[
              snapshots when no resumable binlog position exists and resumes without a snapshot \
              when one does; 'disabled' streams changes only; 'always' re-snapshots on every \
              start, discarding any persisted position. 'disabled' governs the first load only: \
-             an acceleration that already holds rows is still rebuilt when its recorded position \
-             can no longer be resumed from and \
-             `mysql_replication_invalid_checkpoint_behavior` is 'restart', because otherwise it \
-             would keep serving rows the source deleted while its history was gone. \
+             an acceleration that already holds rows is still re-read when its recorded position \
+             can no longer be resumed from and `mysql_replication_invalid_checkpoint_behavior` \
+             is 'restart', which would otherwise leave it serving rows the source deleted. \
              Default: auto.",
         )
         .default("auto")
