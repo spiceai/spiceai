@@ -1292,6 +1292,7 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 |-----------|---------|---------|
 | `cayenne_metastore` | `sqlite` (default) or `turso` | `sqlite` |
 | `cayenne_file_path` | data path (local or `s3://…--x-s3/…`) | `{spice_data}/{dataset}/` |
+| `cayenne_metadata_dir` | directory holding the metastore (`cayenne.db`). Must not sit inside any acceleration's data directory: that directory is deleted wholesale on a `file_create` bootstrap and on a schema recreate, and one metastore is the catalog for every Cayenne dataset in the instance. A layout this dataset's own parameters place inside its data directory is refused at load; a metastore found on disk under the directory about to be deleted — whoever configured it — refuses the teardown | `{cayenne_file_path}/metadata` when it is local, else `{spice_data}/metadata` |
 | `cayenne_pk_conflict_detection` | `auto` (resolve upserts) or `none` (blind append) | `auto` |
 | `cayenne_deletion_mode` | `auto` / `key` / `position` (`auto` ⇒ key for `changes` PK tables) | `auto` |
 | `cayenne_cdc_durability` | `memory` (default, eligibility-gated) or `file` | `memory` |
