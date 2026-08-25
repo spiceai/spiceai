@@ -26,6 +26,8 @@ use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
+mod snapshot;
+
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
