@@ -1584,6 +1584,26 @@ impl HttpTableProvider {
                 .map(|value| value.to_str().ok()),
         );
 
+        // `Vary: *` says this response must never satisfy a later request. That
+        // is not a freshness question — no window makes such a response reusable
+        // — so it refuses retention outright, as `no-store` does.
+        //
+        // Named `Vary` fields are not treated the same way: what varies between
+        // requests here is the path, query, body and request headers a query
+        // supplies, and those are already the cache key. The connector's own
+        // headers are fixed for the life of the provider, so a response that
+        // varies on one of them cannot be served to a request that differs in it.
+        if response
+            .headers()
+            .get_all(reqwest::header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|field| field.trim() == "*")
+        {
+            directives.forbid_retention = true;
+        }
+
         // What the origin declared about how much of the response's freshness
         // was already spent. Read beside the age its `Date` implies, further
         // down: an intermediary is required to add `Age`, but one that does not
@@ -4358,6 +4378,66 @@ mod response_cache_tests {
             provider.cache.entry_count(),
             1,
             "a response with freshness left after the round trip must still be retained"
+        );
+    }
+
+    /// `Vary: *` says the response must never satisfy a later request. No
+    /// freshness window makes it reusable, so it is refused outright — otherwise
+    /// an endpoint returning changing data behind `max-age` would have its first
+    /// body served to every query for the rest of the window.
+    #[tokio::test]
+    async fn vary_star_refuses_retention() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "*")
+                    .set_body_string(r#"{"rows":12}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("the response is still served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            0,
+            "a response that may never be reused must not be retained"
+        );
+    }
+
+    /// A named `Vary` is not treated the same way, and that is the point of
+    /// matching only `*`: what varies between requests here — path, query, body
+    /// and the headers a query supplies — is already the cache key, so a named
+    /// field cannot make one request's response answer a different request.
+    #[tokio::test]
+    async fn a_named_vary_field_still_caches() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "max-age=600")
+                    .insert_header("vary", "accept-encoding, accept")
+                    .set_body_string(r#"{"rows":13}"#),
+            )
+            .mount(&origin)
+            .await;
+
+        let provider = provider_for(&origin);
+        provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("served");
+        settle(&provider.cache).await;
+        assert_eq!(
+            provider.cache.entry_count(),
+            1,
+            "a named Vary must not be read as a blanket refusal"
         );
     }
 
