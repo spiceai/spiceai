@@ -128,8 +128,7 @@ rewrite jumps recursion so federation handles the injected subtree afterward.
 
 File: `crates/runtime/src/cluster/datafusion/distributed_search.rs`.
 
-Note: at the time of writing, the physical operator file is under development. This
-section describes the intended operator from the analyzer rule and its types.
+The physical operator implements the execution strategy produced by the analyzer rule.
 
 `DistributedSearchNode` is the logical extension node. Its parameters
 (`DistributedSearchParams`) are the source table SQL, the query, the column, the
