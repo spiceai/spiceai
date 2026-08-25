@@ -48,7 +48,10 @@ use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::error::find_datafusion_root;
 
 #[derive(Debug)]
-pub(crate) struct MultiSink {
+// `pub`, not `pub(crate)`: `AccelerationSink` is re-exported publicly
+// (`accelerated::AccelerationSink`, for `benches/sink_replay.rs`), and an
+// enum variant can't wrap a type more private than the enum itself.
+pub struct MultiSink {
     original_table_provider: Arc<dyn TableProvider>,
     synchronized_tables: Vec<SynchronizedTable>,
     sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,

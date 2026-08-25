@@ -72,6 +72,7 @@ model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55f
 anyhow.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 dotenv.workspace = true
 insta = {workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
@@ -127,3 +128,8 @@ default = ["local_llm", "local_embed"]
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "model2vec_embed"
+required-features = ["local_embed"]

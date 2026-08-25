@@ -450,6 +450,18 @@ name = "cdc_cayenne_inline"
 harness = false
 name = "cdc_delete_burst"
 
+[[bench]]
+harness = false
+name = "refresh_pipeline_stage_latency"
+
+[[bench]]
+harness = false
+name = "flight_encode"
+
+[[bench]]
+harness = false
+name = "startup_dataset_load"
+
 [lints]
 workspace = true
 

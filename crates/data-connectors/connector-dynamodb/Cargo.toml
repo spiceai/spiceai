@@ -57,6 +57,7 @@ util = { path = "../../util" }
 [dev-dependencies]
 runtime = { path = "../../runtime" }
 app = { path = "../../app" }
+criterion = { version = "0.7", features = ["html_reports"] }
 spicepod = { path = "../../spicepod" }
 
 [features]
@@ -64,3 +65,7 @@ default = []
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "stream_decode"

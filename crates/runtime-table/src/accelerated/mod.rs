@@ -80,6 +80,7 @@ pub mod write_back_worker;
 pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
+pub use sink::AccelerationSink;
 pub use snapshots::SnapshotCreationConfig;
 
 #[derive(Debug, Snafu)]

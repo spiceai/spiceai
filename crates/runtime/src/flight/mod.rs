@@ -472,7 +472,11 @@ const FLIGHT_ENCODE_CHANNEL_CAPACITY: usize = 2;
 /// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
 /// advertised schema was expanded.
-fn encode_flight_batch(
+///
+/// `pub` (not `pub(crate)`) so `benches/flight_encode.rs` can exercise this
+/// exact encode path — a `[[bench]]` target compiles as its own crate and
+/// only sees fully-public items of the library it links against.
+pub fn encode_flight_batch(
     batch: RecordBatch,
     needs_view_cast: bool,
     schema: &Arc<Schema>,

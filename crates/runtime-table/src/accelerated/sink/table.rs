@@ -184,7 +184,10 @@ fn warn_on_narrowing_schema_cast(
 }
 
 #[derive(Debug)]
-pub(crate) struct TableSink {
+// `pub`, not `pub(crate)`: `AccelerationSink` is re-exported publicly
+// (`accelerated::AccelerationSink`, for `benches/sink_replay.rs`), and an
+// enum variant can't wrap a type more private than the enum itself.
+pub struct TableSink {
     pub(super) table_provider: Arc<dyn TableProvider>,
     /// Additional indexes that receive write lifecycle hooks (`on_write_start`,
     /// `on_write_failed`, `on_write_complete`) but are **not** stored in the

@@ -52,9 +52,15 @@ s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors", "llms"]
 text_search = ["dep:tantivy", "dep:tantivy_datafusion_filter"]
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 insta = { workspace = true, features = ["json"] }
 tempfile.workspace = true
 tokio.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "index_write"
+required-features = ["llms"]

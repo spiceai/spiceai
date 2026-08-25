@@ -74,10 +74,16 @@ kafka = ["data_components/kafka"]
 openapi = ["dep:utoipa", "runtime-acceleration/openapi"]
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 insta.workspace = true
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
 prometheus.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "sink_replay"

@@ -55,5 +55,14 @@ name = "cache_throughput"
 harness = false
 name = "hash_algorithms"
 
+[[bench]]
+harness = false
+name = "pingora_shard_contention"
+required-features = ["pingora"]
+
+[[bench]]
+harness = false
+name = "cache_encoding"
+
 [lints]
 workspace = true

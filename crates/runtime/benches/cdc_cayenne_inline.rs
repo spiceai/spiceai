@@ -17,22 +17,38 @@ limitations under the License.
 //! End-to-end throughput benchmark for the CDC apply pipeline writing into a
 //! Cayenne accelerator via the data-inlining write path.
 //!
-//! Each iteration builds a synthetic `ChangesStream` of N create-op envelopes,
-//! runs them through `RefreshTask::start_changes_stream` (which creates the
-//! bounded prefetch channel internally), and times the full apply+commit loop
-//! end to end. Throughput is reported in envelopes/sec via
-//! `criterion::Throughput::Elements`.
+//! Two benchmark groups:
+//!
+//! 1. **`cdc_cayenne_inline`** — each iteration builds a synthetic
+//!    `ChangesStream` of N create-op envelopes, runs them through
+//!    `RefreshTask::start_changes_stream` (which creates the bounded
+//!    prefetch channel internally), and times the full apply+commit loop
+//!    end to end. Throughput is reported in envelopes/sec via
+//!    `criterion::Throughput::Elements`.
+//! 2. **`cdc_fixture_replay`** — the same apply pipeline, but replaying a
+//!    *recorded* changeset instead of synthesizing one: an Arrow IPC file of
+//!    `changes_schema`-shaped batches (columns `op`/`primary_keys`/`data`),
+//!    e.g. produced once from a captured MySQL binlog (see
+//!    `data_components::mysql_replication` for the decode side) or any other
+//!    CDC source. This is what makes the group above's uniform create-only
+//!    workload comparable against a real op-mix/table-shape capture. The
+//!    fixture is intentionally not committed (large, source-specific);
+//!    point `CDC_FIXTURE_FILE` at one — without it this group prints
+//!    capture instructions and exits successfully, so it is safe under
+//!    `cargo bench` in CI.
 
 #![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use arrow::array::{ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::FileReader;
 use async_trait::async_trait;
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
@@ -121,7 +137,7 @@ struct CayenneFixture {
     table_name: String,
 }
 
-async fn make_cayenne_fixture(table_name: &str) -> CayenneFixture {
+async fn make_cayenne_fixture_for_schema(table_name: &str, schema: Arc<Schema>) -> CayenneFixture {
     let temp = TempDir::new().expect("temp dir");
     let data_path = temp.path().join("data");
     tokio::fs::create_dir_all(&data_path)
@@ -133,7 +149,6 @@ async fn make_cayenne_fixture(table_name: &str) -> CayenneFixture {
     let catalog = Arc::new(CayenneCatalog::new(conn).expect("CayenneCatalog::new"));
     catalog.init().await.expect("catalog init");
 
-    let schema = data_schema();
     let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
@@ -156,6 +171,65 @@ async fn make_cayenne_fixture(table_name: &str) -> CayenneFixture {
         table: Arc::new(table),
         table_name: table_name.to_string(),
     }
+}
+
+async fn make_cayenne_fixture(table_name: &str) -> CayenneFixture {
+    make_cayenne_fixture_for_schema(table_name, data_schema()).await
+}
+
+/// Reads a changeset fixture: an Arrow IPC file of `changes_schema`-shaped
+/// batches, one batch per recorded change.
+fn read_fixture_batches(path: &Path) -> Vec<RecordBatch> {
+    let file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("failed to open {path:?}: {e}"));
+    let reader = FileReader::try_new(file, None).expect("valid Arrow IPC file");
+    reader
+        .collect::<Result<Vec<RecordBatch>, _>>()
+        .expect("valid Arrow IPC batches")
+}
+
+/// Recovers the dataset's own schema (pre-CDC-wrapping) from a single
+/// wrapper batch's `data` struct column, so the Cayenne table can be created
+/// with a schema matching the fixture, whatever that schema is.
+fn data_schema_from_wrapper(record: &RecordBatch) -> Arc<Schema> {
+    let data_field = record
+        .schema()
+        .field_with_name("data")
+        .expect("wrapper batch has a 'data' column")
+        .clone();
+    match data_field.data_type() {
+        DataType::Struct(fields) => Arc::new(Schema::new(fields.clone())),
+        other => panic!("expected 'data' column to be a Struct, found {other:?}"),
+    }
+}
+
+fn make_fixture_stream(batches: Vec<RecordBatch>) -> ChangesStream {
+    let envelopes: Vec<Result<ChangeEnvelope, StreamError>> = batches
+        .into_iter()
+        .map(|record| {
+            let batch = ChangeBatch::try_new(record).expect("ChangeBatch");
+            Ok(ChangeEnvelope::new(Box::new(NoopCommitter), batch, false))
+        })
+        .collect();
+    fstream::iter(envelopes).boxed()
+}
+
+fn print_fixture_instructions(reason: &str) {
+    println!(
+        "cdc_fixture_replay: skipped ({reason}).\n\
+         \n\
+         This bench replays a recorded changeset instead of a synthetic\n\
+         stream. To produce one, capture a real source's ChangesStream and\n\
+         serialize the `ChangeBatch::record` of each envelope to an Arrow IPC\n\
+         file (`arrow::ipc::writer::FileWriter`, one `write()` call per\n\
+         batch, then `finish()`) — every batch must share the\n\
+         `data_components::cdc::changes_schema` wrapper shape\n\
+         (op/primary_keys/data columns).\n\
+         \n\
+         Then run:\n\
+            CDC_FIXTURE_FILE=/path/to/changeset.arrows \\\n\
+              cargo bench -p runtime --bench cdc_cayenne_inline -- fixture_replay"
+    );
 }
 
 fn make_refresh_task(fixture: &CayenneFixture) -> RefreshTask {
@@ -216,5 +290,58 @@ fn bench_cdc_into_cayenne_inline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cdc_into_cayenne_inline);
+fn bench_cdc_fixture_replay(c: &mut Criterion) {
+    let Some(path) = std::env::var_os("CDC_FIXTURE_FILE") else {
+        print_fixture_instructions("CDC_FIXTURE_FILE is not set");
+        return;
+    };
+    let batches = read_fixture_batches(Path::new(&path));
+    if batches.is_empty() {
+        print_fixture_instructions("fixture file contained zero batches");
+        return;
+    }
+    let schema = data_schema_from_wrapper(&batches[0]);
+    let n = batches.len();
+
+    let rt = TokioRuntime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("cdc_fixture_replay");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(n as u64));
+
+    group.bench_function("fixture_replay", |b| {
+        b.iter_batched(
+            || {
+                let table_name = format!("bench_fixture_{}", uuid::Uuid::now_v7());
+                let fixture =
+                    rt.block_on(make_cayenne_fixture_for_schema(&table_name, Arc::clone(&schema)));
+                (fixture, batches.clone())
+            },
+            |(fixture, batches)| {
+                rt.block_on(async {
+                    let task = make_refresh_task(&fixture);
+                    let stream = make_fixture_stream(batches);
+                    let refresh = Arc::new(RwLock::new(Refresh::default()));
+                    task.start_changes_stream(
+                        refresh,
+                        stream,
+                        None,
+                        None,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                    .expect("start_changes_stream");
+                    black_box(fixture);
+                });
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_cdc_into_cayenne_inline,
+    bench_cdc_fixture_replay
+);
 criterion_main!(benches);
