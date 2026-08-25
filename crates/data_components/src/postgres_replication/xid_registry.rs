@@ -555,10 +555,27 @@ impl XidRegistry {
     ///    was never persisted and whose echo was suppressed server-side. It emits a
     ///    user-facing `warn!`.
     ///
-    /// `statuses` maps each entry's full `xid8` to its resolved [`XactStatus`]; an
-    /// entry absent from the map is treated as [`XactStatus::Unknown`]. The registry
-    /// stays connection-free: the connector resolves these and `current_xid8` (the
-    /// snapshot xmax) from a live connection and passes them in.
+    /// `statuses` maps each entry's full `xid8` to its resolved [`XactStatus`], and
+    /// its key set is exactly the `xid8`s [`outstanding_xid8s`](Self::outstanding_xid8s)
+    /// returned when the connector took its reconciliation snapshot — an entry with a
+    /// resolved-but-unknown status (older than the server's tracked range, or a failed
+    /// lookup) is still a key, mapped to [`XactStatus::Unknown`]. Rules 3 and 4 infer
+    /// staleness purely from comparing `xid8` against the snapshot's `current_xid8`,
+    /// with no per-entry signal of their own, so they only fire for a `xid8` that was
+    /// actually a member of that snapshot: a `xid8` **absent** from `statuses` was
+    /// registered after the snapshot was taken (concurrently with this reconciliation
+    /// pass), was never resolved against `current_xid8`, and is left untouched this
+    /// round — without this restriction, a delivery registered between the snapshot
+    /// and this call is at or above the (now-stale) `current_xid8` purely because it
+    /// is new, and rule 3 would wrongly discard it as a rewound-source phantom before
+    /// its `COMMIT` even runs, permanently unsuppressing its echo. It is picked up
+    /// correctly on a later pass, once it either commits and reaches
+    /// [`prune_acked`](Self::prune_acked) or is itself part of a subsequent snapshot.
+    /// Rules 1 and 2 are keyed on per-entry data actually observed for that `xid8`
+    /// (its resolved status, or its own recorded LSNs), not on snapshot membership, so
+    /// they apply regardless of whether `xid8` is a key in `statuses`. The registry
+    /// stays connection-free: the connector resolves `statuses` and `current_xid8`
+    /// (the snapshot xmax) from a live connection and passes them in.
     pub async fn gc(
         &self,
         statuses: &HashMap<u64, XactStatus>,
@@ -571,6 +588,11 @@ impl XidRegistry {
         let mut safety_valve: Vec<u64> = Vec::new();
         let mut rewound: Vec<u64> = Vec::new();
         for (&xid8, entry) in &guard.entries {
+            // Rules 3 and 4 below infer staleness purely from comparing `xid8`
+            // against this pass's `current_xid8` snapshot, with no per-entry signal
+            // of their own, so they must only fire for a `xid8` that was actually a
+            // member of the reconciliation snapshot `statuses` was resolved from.
+            let in_snapshot = statuses.contains_key(&xid8);
             let aborted = matches!(statuses.get(&xid8), Some(XactStatus::Aborted));
             let consumed = entry
                 .observed_commit_lsn
@@ -580,8 +602,9 @@ impl XidRegistry {
                     .is_some_and(|upper_bound| applied_lsn >= upper_bound);
             // `current_xid8` is the first as-yet-unassigned id (snapshot xmax), so
             // an id at or above it was never assigned in this server history.
-            let ahead_of_current = xid8 >= current_xid8;
-            let too_far_behind = current_xid8.saturating_sub(xid8) > XID_WRAPAROUND_SAFETY_DISTANCE;
+            let ahead_of_current = in_snapshot && xid8 >= current_xid8;
+            let too_far_behind =
+                in_snapshot && current_xid8.saturating_sub(xid8) > XID_WRAPAROUND_SAFETY_DISTANCE;
 
             if aborted || consumed {
                 to_remove.push(xid8);
@@ -1085,7 +1108,13 @@ mod tests {
         registry.register(1500).await.expect("register ahead");
         registry.register(999).await.expect("register just behind");
 
-        let statuses = std::collections::HashMap::new();
+        // All three entries were part of the reconciliation snapshot rules 3 and 4
+        // are restricted to (see `gc`'s doc comment); their statuses are otherwise
+        // irrelevant to rule 3, so `Unknown` (an unresolvable lookup) is enough.
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert(1000u64, XactStatus::Unknown);
+        statuses.insert(1500u64, XactStatus::Unknown);
+        statuses.insert(999u64, XactStatus::Unknown);
         registry.gc(&statuses, current_xid8, 0).await;
 
         assert!(
@@ -1129,7 +1158,11 @@ mod tests {
             .await
             .expect("register boundary");
 
-        let statuses = std::collections::HashMap::new();
+        // Both entries were part of the reconciliation snapshot rule 4 is
+        // restricted to (see `gc`'s doc comment).
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert(far_behind_xid, XactStatus::Unknown);
+        statuses.insert(boundary_xid, XactStatus::Unknown);
         registry.gc(&statuses, current_xid8, 0).await;
 
         assert!(
@@ -1139,6 +1172,49 @@ mod tests {
         assert!(
             registry.contains(low32(boundary_xid)),
             "an entry exactly at the 2^31 boundary distance is retained"
+        );
+    }
+
+    /// Regression test for the race between periodic reconciliation and a live
+    /// `register`: the connector snapshots `outstanding_xid8s()` and resolves each
+    /// of those xids into `statuses` *before* calling `gc`, so a delivery
+    /// registered afterwards — but before this `gc` call actually runs — is a live
+    /// entry that is not a key in `statuses`. The old code inferred rule 3 purely
+    /// from `xid8 >= current_xid8`, which is true of any brand-new transaction, so
+    /// it wrongly swept the entry as a "rewound source" phantom before its
+    /// `COMMIT` even ran — permanently unsuppressing its echo. The entry must
+    /// survive this pass because it was never part of the reconciled snapshot.
+    #[tokio::test]
+    async fn gc_leaves_entry_registered_after_the_snapshot_untouched() {
+        let store = FakeBlobStore::arc();
+        let registry = empty_registry(Arc::clone(&store)).await;
+
+        // Simulate `reconcile_registry`: take the snapshot (empty, nothing
+        // outstanding yet) and resolve it into `statuses` — still empty.
+        let outstanding_at_snapshot_time = registry.outstanding_xid8s().await;
+        assert!(outstanding_at_snapshot_time.is_empty());
+        let statuses = std::collections::HashMap::new();
+
+        // A new write-back registers concurrently, after the snapshot was taken
+        // but before `gc` runs below.
+        let new_xid8: u64 = 5000;
+        registry
+            .register(new_xid8)
+            .await
+            .expect("concurrent register succeeds");
+
+        // `current_xid8` resolved at snapshot time is stale relative to the new
+        // entry: it is at or below the new xid, which would have tripped the old
+        // "ahead of current" rule.
+        let current_xid8_at_snapshot_time = new_xid8;
+        registry
+            .gc(&statuses, current_xid8_at_snapshot_time, 0)
+            .await;
+
+        assert!(
+            registry.contains(low32(new_xid8)),
+            "an entry registered after the reconciliation snapshot was taken must \
+             not be swept by a rule inferred from that stale snapshot"
         );
     }
 
