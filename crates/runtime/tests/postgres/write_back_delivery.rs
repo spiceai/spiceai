@@ -84,6 +84,22 @@ async fn exec(client: &Client, sql: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Terminate the walsender backend serving `slot`, forcing the still-running
+/// pump to reconnect and resume from the slot's held `confirmed_flush` — the
+/// same resume path a network blip takes, which replays every transaction the
+/// ack floor had not yet passed (including an un-acked echo of our own
+/// delivery).
+async fn force_stream_reconnect(client: &Client, slot: &str) -> Result<(), anyhow::Error> {
+    client
+        .execute(
+            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+             WHERE slot_name = $1 AND active_pid IS NOT NULL",
+            &[&slot],
+        )
+        .await?;
+    Ok(())
+}
+
 /// A single `int4` column from the source, or `None` when no row matched.
 async fn source_value(client: &Client, sql: &str) -> Result<Option<i64>, anyhow::Error> {
     let rows = client
@@ -274,13 +290,20 @@ fn tracing_filter() -> &'static str {
 
 // ── UPDATE delivery ─────────────────────────────────────────────────────────
 
-/// An UPDATE committed through Spice reaches the source.
+/// An UPDATE committed through Spice reaches the source, and a subsequent
+/// write-back INSERT is not double-applied across a forced reconnect.
 ///
 /// The write path for an update is its own code (`update_write_back`) and the
 /// delivery worker reconciles it by upserting the row's *current* committed
 /// value, so an update exercises a different pair of legs than the insert and
-/// delete the echo suite drives. This asserts the value the source ends up
-/// holding, and — after the barrier — that the accelerator still holds it once.
+/// delete the echo suite drives. But that same upsert-by-primary-key apply
+/// makes a leaked UPDATE echo unobservable: replaying `amount = 99` a second
+/// time writes the identical value, so no row count or sum assertion over the
+/// update alone can tell "echo dropped" from "echo re-applied". The INSERT of
+/// a brand-new key below is the part of this test that actually exercises the
+/// double-apply guarantee, because a leaked echo of a new row is a genuine
+/// duplicate, not a no-op upsert — and it is driven across a forced walsender
+/// reconnect so a replayed (not just a live) echo is covered too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(tracing_filter()));
@@ -290,6 +313,7 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
             let port = common::get_random_port()?;
             let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
             let source = connect(port).await?;
+            let slot = "spice_wb_update_slot";
             exec(
                 &source,
                 "CREATE TABLE public.wb_update (id int PRIMARY KEY, amount int NOT NULL)",
@@ -304,12 +328,7 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
             let accel = tempfile::tempdir()?;
             let rt = build_runtime(
                 "write_back_update",
-                vec![write_back_dataset(
-                    port,
-                    "wb_update",
-                    "spice_wb_update_slot",
-                    accel.path(),
-                )],
+                vec![write_back_dataset(port, "wb_update", slot, accel.path())],
             )
             .await?;
             wait_for("the bootstrap snapshot", Some(2), || {
@@ -322,6 +341,20 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
             run_query(&rt, "UPDATE wb_update SET amount = 99 WHERE id = 2").await?;
             wait_for("the updated row at the source", Some(99), || {
                 source_value(&source, "SELECT amount FROM public.wb_update WHERE id = 2")
+            })
+            .await?;
+
+            // Force the pump to reconnect and resume from the slot's held
+            // confirmed_flush, replaying whatever the ack floor had not yet
+            // passed — including a still-un-acked echo of the UPDATE above.
+            force_stream_reconnect(&source, slot).await?;
+
+            // A write-back INSERT of a brand-new key: unlike the UPDATE above,
+            // a leaked echo of this event is a genuine duplicate row, so it can
+            // actually distinguish suppression from re-application.
+            run_query(&rt, "INSERT INTO wb_update (id, amount) VALUES (101, 13)").await?;
+            wait_for("the inserted row at the source", Some(101), || {
+                source_value(&source, "SELECT id FROM public.wb_update WHERE id = 101")
             })
             .await?;
 
@@ -343,21 +376,21 @@ async fn a_write_back_update_reaches_the_source() -> Result<(), anyhow::Error> {
             assert_accel(
                 &rt,
                 "SELECT count(*) FROM wb_update",
-                3,
-                "the update must not have added a row",
+                4,
+                "a leaked echo of the new-key insert would add a duplicate row",
             )
             .await?;
             assert_accel(
                 &rt,
                 "SELECT sum(amount) FROM wb_update",
-                116,
-                "10 + 99 + 7: a re-applied update would double-count",
+                129,
+                "10 + 99 + 13 + 7: a re-applied insert echo would double-count",
             )
             .await?;
             // The source agrees, so nothing was delivered twice or lost.
             let source_sum =
                 source_count(&source, "SELECT sum(amount)::int8 FROM public.wb_update").await?;
-            assert_eq!(source_sum, 116, "the source holds the same total");
+            assert_eq!(source_sum, 129, "the source holds the same total");
 
             rt.shutdown().await;
             Ok(())

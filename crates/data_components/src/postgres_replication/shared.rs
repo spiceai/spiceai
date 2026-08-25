@@ -2459,10 +2459,11 @@ async fn attach_member(
     let rebuild_via_consumer = rebuild_cause.is_some();
     // A rebuild is a full re-read nobody asked for, and which cause fired is what
     // says whether to look at the source, the configuration, or the slot — so it
-    // is reported as a label rather than left to be recovered from log text.
-    if let Some(cause) = rebuild_cause {
-        metrics.set_rebuild_cause(cause.label());
-    }
+    // is reported as a label rather than left to be recovered from log text. Set
+    // unconditionally (not only inside `if let Some`): the collector is reused
+    // across reattaches, so a clean resume must clear a cause an earlier attach
+    // left set, or the metric would keep exporting it as if this attach rebuilt.
+    metrics.set_rebuild_cause(rebuild_cause.map(super::RebuildCause::label));
 
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.

@@ -171,16 +171,20 @@ impl MetricsCollector {
         *guard = Some(slot);
     }
 
-    /// Record why this dataset's acceleration is being rebuilt rather than
-    /// resumed. Called once at attach, only on the rebuild path.
-    pub fn set_rebuild_cause(&self, cause: &'static str) {
+    /// Record why this dataset's acceleration is being rebuilt, or clear the
+    /// cause on a resume. Called once per attach, with `None` on every path but
+    /// a rebuild — a collector is reused across reattaches, so a cause left set
+    /// from an earlier attach would otherwise keep exporting a stale
+    /// `replication_acceleration_rebuilt{cause=...}` after a later attach
+    /// resumes cleanly.
+    pub fn set_rebuild_cause(&self, cause: Option<&'static str>) {
         // Recover through poisoning, as `set_slot_name` does: an unrelated panic must
         // not leave a rebuild unattributed in the analysis.
         let mut guard = self
             .rebuild_cause
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(cause);
+        *guard = cause;
     }
 
     pub fn inc_insert(&self) {
