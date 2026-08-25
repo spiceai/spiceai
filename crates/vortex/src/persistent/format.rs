@@ -493,10 +493,20 @@ impl VortexFormat {
     /// and for the search that finds their cached keys — are bounded, so a host
     /// too saturated to finish them gives up rather than holding this caller.
     /// Returning therefore means the wait is over, not always that every segment
-    /// is gone. Giving up on the in-flight writes costs only a moment of
-    /// residency; giving up on the search is what leaves segments cached until
-    /// capacity evicts them. Neither can serve stale data, because every caller
-    /// has already deleted the underlying file.
+    /// is gone. Which segments stay has three outcomes, not two:
+    ///
+    /// - giving up on the search leaves every key it would have found cached
+    ///   until capacity evicts them;
+    /// - giving up on an in-flight write whose put then **completes** costs only a
+    ///   moment of residency, because that put removes its own entry once it sees
+    ///   the path retired — that self-removal is what makes the bounded drain safe;
+    /// - giving up on one that is then **cancelled between its insert and that
+    ///   self-removal** leaves the entry cached until capacity evicts it, exactly
+    ///   as the search case does. Closing that window needs the retirement
+    ///   tombstone tracked in spiceai/spiceai#12963.
+    ///
+    /// None of them can serve stale data, because every caller has already deleted
+    /// the underlying file.
     pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
         if let Some(cache) = self.segment_cache.as_ref() {
             cache.invalidate_paths(paths).await;

@@ -80,8 +80,16 @@ const DESCRIBED_PATHS_MAX: usize = 5;
 /// A budget of its own rather than a share of [`ACTIVE_PUT_DRAIN_TIMEOUT`]: with
 /// one deadline for both, a batch that spent it draining would then skip the
 /// invalidation entirely, which is the worse of the two outcomes. The price is
-/// that a wedged host can hold `invalidate_paths` for the sum of the two before
-/// it gives up on both.
+/// that a wedged host can hold `invalidate_paths` in its two *waits* for the sum
+/// of the two before it gives up on both.
+///
+/// The sum bounds the waits, not the call. What follows a scan that did return —
+/// removing each found key, then `run_pending_tasks()` — carries no deadline. The
+/// removals are proportional to the keys the scan found and are map operations
+/// rather than I/O, but `run_pending_tasks()` drains the cache's maintenance
+/// queue, whose depth is not a function of this batch. That phase is unmeasured
+/// rather than known-small; spiceai/spiceai#13490 tracks measuring it and giving
+/// it a deadline of its own if it needs one.
 #[cfg(not(test))]
 const INVALIDATION_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Shortened under test, because the one test that reaches this deadline needs a
