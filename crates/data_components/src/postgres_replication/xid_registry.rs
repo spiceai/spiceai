@@ -62,13 +62,6 @@ limitations under the License.
 //!   entry removed at commit-observation would re-admit the replayed echo.
 //! - [`prune_acked`](XidRegistry::prune_acked) — remove an entry only once the
 //!   durable applied position has advanced past the echo's observed commit LSN.
-//!   Runs on the applied-position writer's hot path (once per acked commit), as
-//!   does `mark_commit_observed`; both debounce their whole-blob persist rather
-//!   than reserializing the registry on every call (see
-//!   `BEST_EFFORT_PERSIST_DEBOUNCE`) — the in-memory entry set and the pump's
-//!   membership mirror still update immediately, only the durable write is
-//!   deferred, and [`gc`](XidRegistry::gc) re-derives and persists the same state
-//!   from the same rules if a deferred write is lost to a crash.
 //! - [`gc`](XidRegistry::gc) — safety net for entries that will never be pruned
 //!   normally (aborted delivery, lost unregister, slot far behind, rewound
 //!   source). Runs at startup and periodically thereafter, driven by the
@@ -76,14 +69,12 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::RwLock as SyncRwLock;
 use runtime_checkpoint_api::BlobCheckpointStore;
 use rustc_hash::{FxHashMap, FxHashSet};
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
-use tokio::time::Instant;
 use tracing::warn;
 
 /// Payload schema version for the persisted registry blob. Bump only on an
@@ -96,16 +87,6 @@ const REGISTRY_VERSION: u32 = 1;
 /// beyond the point where its 32-bit stream projection could still be told apart
 /// from a fresh transaction, so keeping it risks suppressing an unrelated change.
 const XID_WRAPAROUND_SAFETY_DISTANCE: u64 = 1 << 31;
-
-/// Minimum spacing between full-registry persists triggered by the best-effort,
-/// pump-hot-path mutation paths ([`XidRegistry::prune_acked`] and
-/// [`XidRegistry::mark_commit_observed`]). Those two can each run once per
-/// acked commit; persisting the whole blob at that rate would reserialize and
-/// rewrite the entire outstanding set on every call. Skipping a persist here
-/// never loses correctness: [`XidRegistry::gc`]'s periodic pass re-derives and
-/// persists exactly the same state from the same rules (see its rule 2), so an
-/// un-persisted change is at worst redone once, after a crash, rather than lost.
-const BEST_EFFORT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Project a 64-bit epoch-qualified `xid8` onto the 32-bit `xid` the pgoutput
 /// stream carries. The stream's `Begin.xid` is exactly the low 32 bits of the
@@ -199,28 +180,19 @@ struct XidState {
     /// Keyed by the full `xid8` so a re-registration of the same transaction is a
     /// no-op and GC / `set_upper_bound` can look up by the exact id.
     entries: FxHashMap<u64, XidEntry>,
-    /// When the best-effort, pump-hot-path mutation paths last actually persisted
-    /// the whole blob. `None` until the first one does. See
-    /// [`BEST_EFFORT_PERSIST_DEBOUNCE`].
-    last_best_effort_persist: Option<Instant>,
 }
 
 /// The single owner of the durable outstanding-write-back-xid set for one dataset.
 ///
 /// Every mutation flows through [`state`](Self::state) (an async read-write lock)
 /// and persists the whole blob *inside* that lock, so the delivery path, the pump,
-/// and the applied-position writer never race on the persisted JSON. A concurrent
-/// map (for example `dashmap`, already a dependency elsewhere in this crate) would
-/// not remove that requirement — the store's contract is one consistent JSON blob
-/// per write, so every mutation still has to serialize the whole entry set under
-/// some lock regardless of the map's own internal sharding. What the lock type
-/// *can* buy is letting non-mutating callers avoid queueing behind writers, which
-/// the read-write lock does directly; see [`register`](Self::register) and
-/// [`prune_acked`](Self::prune_acked)/[`mark_commit_observed`](Self::mark_commit_observed)
-/// (the latter two debounce the persist itself, not just the lock). The pump's
-/// hot-path [`contains`](Self::contains) reads a separate lock-free-ish
-/// [`mirror`](Self::mirror) of the low-32-bit keys, so it never blocks on a
-/// persistence round trip.
+/// and the applied-position writer never race on the persisted JSON. The lock is a
+/// read-write lock rather than a plain mutex so a pure membership check (the
+/// [`register`](Self::register) duplicate-xid fast path, [`outstanding_xid8s`](Self::outstanding_xid8s))
+/// can take a shared read lock and run concurrently with other readers instead of
+/// queueing behind every writer. The pump's hot-path [`contains`](Self::contains)
+/// reads a separate lock-free-ish [`mirror`](Self::mirror) of the low-32-bit keys,
+/// so it never blocks on a persistence round trip.
 pub struct XidRegistry {
     store: Arc<dyn BlobCheckpointStore>,
     /// Identity of the source these xids belong to (endpoint/database/table), as in
@@ -247,32 +219,6 @@ struct StoredXidRegistry {
     #[serde(default)]
     source: Option<String>,
     entries: Vec<XidEntry>,
-}
-
-/// Undoes [`XidRegistry::register`]'s direct insert unless [`committed`](Self::committed)
-/// is set before this drops. Exists so cancelling `register` mid-persist (dropping
-/// its future while the `upsert` await is pending) leaves `entries` exactly as it
-/// was: `Drop` runs on future-cancellation the same as on a normal early return, so
-/// a rollback expressed this way covers both without duplicating the removal at
-/// every fallible step in between.
-struct RegisterRollback<'a> {
-    entries: &'a mut FxHashMap<u64, XidEntry>,
-    xid8: u64,
-    committed: bool,
-}
-
-impl RegisterRollback<'_> {
-    fn committed(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for RegisterRollback<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.entries.remove(&self.xid8);
-        }
-    }
 }
 
 impl XidRegistry {
@@ -337,10 +283,7 @@ impl XidRegistry {
             store,
             source: source_identity,
             dataset: dataset_name,
-            state: RwLock::new(XidState {
-                entries,
-                last_best_effort_persist: None,
-            }),
+            state: RwLock::new(XidState { entries }),
             mirror: SyncRwLock::new(mirror),
         }))
     }
@@ -355,13 +298,7 @@ impl XidRegistry {
     /// Takes a shared read lock first for the (common, cheap) case of an
     /// already-registered xid — for example a caller retrying a delivery after a
     /// transient failure — so concurrent duplicate checks don't queue behind each
-    /// other. Only a genuinely new xid takes the exclusive write lock, and even then
-    /// it is inserted directly rather than via a clone of the whole map; a
-    /// [`RegisterRollback`] guard undoes that insert if this future is cancelled
-    /// mid-persist or persistence fails, so a retry's `contains_key` check never
-    /// sees a false positive from a half-registered entry (the same
-    /// cancellation-safety property the previous clone-before-publish approach gave,
-    /// at the cost of an O(1) insert/remove instead of an O(n) clone).
+    /// other or pay the cost of the write path below.
     ///
     /// # Errors
     ///
@@ -380,7 +317,13 @@ impl XidRegistry {
             return Ok(());
         }
 
-        guard.entries.insert(
+        // Mutate a candidate map, not `guard.entries`, and only publish it (map and
+        // mirror) after `upsert` succeeds. If this call is cancelled while the await
+        // below is pending, dropping the future releases the lock without touching
+        // `guard.entries` or the mirror, so a retry starts from the untouched state
+        // instead of skipping persistence on a `contains_key` false positive.
+        let mut candidate = guard.entries.clone();
+        candidate.insert(
             xid8,
             XidEntry {
                 xid8,
@@ -388,21 +331,14 @@ impl XidRegistry {
                 observed_commit_lsn: None,
             },
         );
-        let mut rollback = RegisterRollback {
-            entries: &mut guard.entries,
-            xid8,
-            committed: false,
-        };
-
-        let payload = self.serialize(rollback.entries)?;
+        let payload = self.serialize(&candidate)?;
 
         self.store.upsert(&payload).await.context(PersistSnafu {
             dataset: self.dataset.clone(),
         })?;
 
-        rollback.committed();
-        drop(rollback);
-        self.rebuild_mirror(&guard.entries);
+        self.rebuild_mirror(&candidate);
+        guard.entries = candidate;
         Ok(())
     }
 
@@ -466,12 +402,8 @@ impl XidRegistry {
     /// Matches on the low 32 bits (the stream's `xid` width). The entry is **not**
     /// removed here: unregistration is gated on the durable ack floor
     /// ([`prune_acked`](Self::prune_acked)), because the slot replays everything after
-    /// `confirmed_flush` on any reconnect. Best-effort and **debounced**: this runs
-    /// on the pump hot path (once per observed commit), so persistence is skipped
-    /// when the last best-effort persist was within
-    /// [`BEST_EFFORT_PERSIST_DEBOUNCE`] — see that constant for why deferring it is
-    /// safe. On failure, or when debounced, the commit is simply re-observed (or
-    /// re-derived by GC) after a restart.
+    /// `confirmed_flush` on any reconnect. Best-effort persistence — on failure the
+    /// commit is simply re-observed after a restart.
     pub async fn mark_commit_observed(&self, stream_xid: u32, commit_lsn: u64) {
         let mut guard = self.state.write().await;
         let mut changed = false;
@@ -482,7 +414,7 @@ impl XidRegistry {
             }
         }
         if changed {
-            self.persist_best_effort_debounced(&mut guard).await;
+            self.persist_or_warn(&guard.entries).await;
         }
     }
 
@@ -501,15 +433,9 @@ impl XidRegistry {
     ///    risking a 32-bit xid-wraparound collision on a long-lived process.
     ///
     /// An entry with neither field set is left untouched — nothing here says
-    /// whether its echo is still pending. Best-effort and **debounced**
-    /// persistence: this runs on the applied-position writer's hot path (once per
-    /// acked commit), so the whole-blob persist is skipped when the last
-    /// best-effort persist was within [`BEST_EFFORT_PERSIST_DEBOUNCE`] — see that
-    /// constant for why deferring it is safe. The mirror (and therefore
-    /// [`contains`](Self::contains)) is updated immediately regardless — a pruned
-    /// entry's echo is, by definition, already consumed, so there is nothing left
-    /// to suppress and no correctness reason to keep it in the membership test
-    /// just because its persist was deferred.
+    /// whether its echo is still pending. Best-effort persistence: a
+    /// persistence failure leaves the entry on disk to be re-pruned (it is
+    /// already consumed, so no echo re-arrives).
     pub async fn prune_acked(&self, durably_applied_lsn: u64) {
         let mut guard = self.state.write().await;
         let before = guard.entries.len();
@@ -524,7 +450,7 @@ impl XidRegistry {
         });
         if guard.entries.len() != before {
             self.rebuild_mirror(&guard.entries);
-            self.persist_best_effort_debounced(&mut guard).await;
+            self.persist_or_warn(&guard.entries).await;
         }
     }
 
@@ -689,26 +615,6 @@ impl XidRegistry {
         }
     }
 
-    /// Persist the entry set from a best-effort, pump-hot-path mutation
-    /// ([`prune_acked`](Self::prune_acked), [`mark_commit_observed`](Self::mark_commit_observed)),
-    /// but no more often than once per [`BEST_EFFORT_PERSIST_DEBOUNCE`]. Those two
-    /// can each fire once per acked commit; persisting the whole blob at that rate
-    /// would reserialize and rewrite the entire outstanding set on every call. A
-    /// skipped persist here never loses correctness — see the constant's doc — so
-    /// this simply tracks "was the last one recent" rather than counting or
-    /// coalescing individual changes.
-    async fn persist_best_effort_debounced(&self, state: &mut XidState) {
-        let now = Instant::now();
-        let due = state
-            .last_best_effort_persist
-            .is_none_or(|last| now.duration_since(last) >= BEST_EFFORT_PERSIST_DEBOUNCE);
-        if !due {
-            return;
-        }
-        state.last_best_effort_persist = Some(now);
-        self.persist_or_warn(&state.entries).await;
-    }
-
     /// Replace the hot-path mirror with the low-32-bit projection of the current
     /// entry set. Cheap: the outstanding set is bounded by the number of
     /// delivered-but-not-yet-durably-acked transactions.
@@ -721,15 +627,11 @@ impl XidRegistry {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use parking_lot::Mutex as SyncMutex;
     use runtime_checkpoint_api::{BlobCheckpoint, BlobCheckpointStore, CheckpointError};
 
-    use super::{
-        BEST_EFFORT_PERSIST_DEBOUNCE, XID_WRAPAROUND_SAFETY_DISTANCE, XactStatus, XidRegistry,
-        low32,
-    };
+    use super::{XID_WRAPAROUND_SAFETY_DISTANCE, XactStatus, XidRegistry, low32};
 
     /// In-memory [`BlobCheckpointStore`] for the registry state-machine tests. Holds
     /// the single persisted blob and can be armed to fail the next `upsert`, so the
@@ -1331,67 +1233,6 @@ mod tests {
             store.upsert_count(),
             after_first,
             "re-registering an already-present xid must never persist"
-        );
-    }
-
-    /// A burst of `prune_acked` calls in quick succession (as happens once per acked
-    /// commit on the applied-position writer's hot path) must not reserialize and
-    /// persist the whole registry on every call: the debounce collapses the burst
-    /// into a single whole-blob persist. The in-memory entry set and the pump's
-    /// membership mirror must still reflect every removal immediately, regardless
-    /// of how many of the persists were skipped.
-    #[tokio::test]
-    async fn prune_acked_debounces_persist_across_a_burst() {
-        let store = FakeBlobStore::arc();
-        let registry = empty_registry(Arc::clone(&store)).await;
-
-        const N: u64 = 5;
-        for xid8 in 1..=N {
-            registry.register(xid8).await.expect("register");
-            registry.mark_commit_observed(low32(xid8), xid8 * 100).await;
-        }
-        // Each `register` above persists once (5); `mark_commit_observed` runs the
-        // debounced path so at most one more persist could have landed there.
-        let before_prunes = store.upsert_count();
-
-        // Back-to-back prunes, each removing exactly one more entry, with no delay
-        // between them — well inside `BEST_EFFORT_PERSIST_DEBOUNCE`.
-        for xid8 in 1..=N {
-            registry.prune_acked(xid8 * 100).await;
-            assert!(
-                !registry.contains(low32(xid8)),
-                "the in-memory mirror reflects a prune immediately, even when its \
-                 persist is debounced"
-            );
-        }
-
-        let after_prunes = store.upsert_count();
-        assert_eq!(
-            after_prunes,
-            before_prunes + 1,
-            "a burst of prune_acked calls inside the debounce window collapses into \
-             a single whole-registry persist, instead of one per call"
-        );
-
-        {
-            let state = registry.state.read().await;
-            assert!(
-                state.entries.is_empty(),
-                "every entry was pruned from the authoritative map, regardless of \
-                 how many persists were skipped"
-            );
-        }
-
-        // Past the debounce window, a further prune (even a no-op one, since every
-        // entry is already gone) is allowed to persist again.
-        tokio::time::sleep(BEST_EFFORT_PERSIST_DEBOUNCE + Duration::from_millis(50)).await;
-        registry.register(N + 1).await.expect("register");
-        registry.mark_commit_observed(low32(N + 1), 1).await;
-        registry.prune_acked(1).await;
-        assert!(
-            store.upsert_count() > after_prunes + 1,
-            "once the debounce window has elapsed, a subsequent best-effort mutation \
-             persists again"
         );
     }
 }
