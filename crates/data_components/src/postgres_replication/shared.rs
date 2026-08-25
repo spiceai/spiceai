@@ -2315,26 +2315,12 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
 
-    // Is there a gap this slot cannot supply?
-    //
-    // Computed, not inferred. The watermark records the LSN the acceleration's
-    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
-    // still stream from. A watermark older than that is a gap no stream can fill:
-    // a row deleted at the source in that window has no change event left to
-    // replay, so appending snapshot rows over the survivors would leave the
-    // deletion applied at the source and never here, in every later query.
-    //
-    // The three outcomes:
-    //
-    //   * no watermark -> this acceleration has never been loaded. A first
-    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
-    //     also every ephemeral accelerator (their store records nothing, since
-    //     they boot empty and re-snapshot every start).
-    //   * watermark, and the slot still reaches it -> resume; the WAL between the
-    //     two is still there to replay.
-    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
-    //     to the consumer, which owns the accelerator and can replace its
-    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    // How far a previous process advanced this acceleration. Whether that is a gap
+    // this slot cannot supply — and what to tell the operator when it is — is
+    // `super::rebuild_cause`'s, computed once the member is seated below. A gap
+    // the stream cannot fill is handed to the consumer, which owns the accelerator
+    // and can replace its contents atomically (see
+    // `cdc::ChangeEnvelope::history_unavailable`).
     let watermark = match applied_lsn_store.load().await {
         Ok(watermark) => watermark,
         Err(e) => {
@@ -2411,70 +2397,30 @@ async fn attach_member(
     source.claim_reservation(&member_key);
     let ack_slot = source.ack.slot(&member_key);
 
-    // The earliest position this member can actually be supplied from, which is *not*
-    // the earliest the slot still retains. Two distinct limits, and the later one
-    // binds:
-    //
-    //   * Postgres forwards a `START_REPLICATION` position below the slot's
-    //     `confirmed_flush_lsn` up to it ("has been already streamed, forwarding to
-    //     ..." in `CreateDecodingContext`), so once the slot has acknowledged past a
-    //     change no client can ask for it again — the WAL may still be on disk under
-    //     `restart_lsn`, but it is unreachable through this slot.
-    //   * this member's own seated floor, which a slot-mate's traffic may have
-    //     carried past the snapshot above.
-    //
-    // Comparing against `restart_lsn` alone would call an unfillable gap resumable
-    // and skip the difference silently.
-    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
-    let earliest_streamable_lsn = setup
-        .slot_restart_lsn
-        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
-    // A durable acceleration that has recorded no position is rebuilt, because a
-    // missing watermark cannot be told apart from one whose write failed — except
-    // when the acceleration is observed to hold no rows at all, which is proof
-    // enough on its own: nothing is present that could be stale, and no deletion
-    // can be missing.
-    //
-    // Gated on `snapshotting`, because emptiness only licenses skipping the
-    // rebuild when something *else* is going to load the table. When no snapshot
-    // runs — a pre-existing slot whose publication already carries this table, so
-    // none of `need_snapshot`'s conditions hold, or snapshots disabled outright —
-    // the rebuild is the only thing that would populate the acceleration, and
-    // skipping it would resume from the slot's position and leave every row that
-    // predates it missing for good.
+    // Emptiness licenses skipping the rebuild only when something *else* is going
+    // to load the table, hence the `snapshotting` gate. When no snapshot runs — a
+    // pre-existing slot whose publication already carries this table, or snapshots
+    // disabled outright — the rebuild is the only thing that would populate the
+    // acceleration, and skipping it would resume from the slot's position and
+    // leave every row that predates it missing for good.
     let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
-    let rebuild_via_consumer = super::needs_rebuild(
+    // The floor passed here is the one the member was *actually* seated at above,
+    // not the snapshot `setup` was built from — see the registration comment for
+    // why the difference is a silent skip rather than a rounding error.
+    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
+    let rebuild_cause = super::rebuild_cause(
         &watermark,
-        earliest_streamable_lsn,
+        setup.slot_restart_lsn,
+        setup.slot.consistent_lsn.max(seated_floor),
         !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
     );
-
-    // Why the rebuild, in the terms the operator can act on. The causes are
-    // genuinely different situations, and the acknowledged-past one is the easiest to
-    // mistake for a retention problem: the WAL is still on disk, but a slot cannot
-    // re-stream what it has already acknowledged.
-    let rebuild_reason = match &watermark {
-        super::RecordedPosition::Absent => {
-            "it has no recorded position, so any rows it already holds cannot be shown to be current"
-        }
-        super::RecordedPosition::Unusable(super::UnusableReason::ForeignSource) => {
-            "the position it recorded belongs to a different source, so it does not describe these rows"
-        }
-        super::RecordedPosition::Unusable(super::UnusableReason::Unreadable) => {
-            "the position it recorded could not be read, so any rows it already holds cannot be shown to be current"
-        }
-        super::RecordedPosition::Unusable(super::UnusableReason::RewoundSource) => {
-            "the position it recorded as applied is ahead of the source's current WAL position, so the source was restored or rewound after it was recorded and its contents do not describe the source's current history"
-        }
-        super::RecordedPosition::At(watermark)
-            if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
-        {
-            "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
-        }
-        super::RecordedPosition::At(_) => {
-            "the slot no longer retains the changes following the position it recorded as applied"
-        }
-    };
+    let rebuild_via_consumer = rebuild_cause.is_some();
+    // A rebuild is a full re-read nobody asked for, and which cause fired is what
+    // says whether to look at the source, the configuration, or the slot — so it
+    // is reported as a label rather than left to be recovered from log text.
+    if let Some(cause) = rebuild_cause {
+        metrics.set_rebuild_cause(cause.label());
+    }
 
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
@@ -2612,7 +2558,9 @@ async fn attach_member(
                 _ => "none".to_string(),
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
-            "this acceleration will be rebuilt from the source before changes are applied: {rebuild_reason}"
+            rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
+            "this acceleration will be rebuilt from the source before changes are applied: {}",
+            rebuild_cause.map_or("", super::RebuildCause::reason)
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
