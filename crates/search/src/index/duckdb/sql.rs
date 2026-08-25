@@ -44,12 +44,17 @@ pub(super) const EMPTY_PROJECTION_ROW_COLUMN: &str = "__spice_empty_projection_r
 /// a render site holding the filters alone renders a timezone-aware timestamp through
 /// `EPOCH_MS`, which truncates it to whole milliseconds and moves which rows a comparison inside
 /// that millisecond selects.
+#[derive(Clone, Copy)]
 pub(super) struct ScopedFilters<'a> {
     pub(super) filters: &'a [Expr],
     pub(super) schema: &'a SchemaRef,
 }
 
 impl ScopedFilters<'_> {
+    fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+
     fn render(&self) -> DataFusionResult<Vec<String>> {
         self.filters
             .iter()
@@ -86,14 +91,14 @@ pub(super) fn duckdb_vector_sql(
     table_name: &str,
     embedding_column: &str,
     projected_columns: &[String],
-    filters: &ScopedFilters<'_>,
+    filters: ScopedFilters<'_>,
     limit: Option<usize>,
     hnsw: &DuckDBHnswOptions,
     vector_literal: &str,
 ) -> DataFusionResult<String> {
     let limit = limit.unwrap_or(DEFAULT_DUCKDB_VECTOR_SEARCH_LIMIT);
 
-    if filters.filters.is_empty() {
+    if filters.is_empty() {
         // CTE path — activates HNSW index scan
         Ok(duckdb_vector_sql_cte(
             table_name,
@@ -153,7 +158,7 @@ fn duckdb_vector_sql_flat(
     table_name: &str,
     embedding_column: &str,
     projected_columns: &[String],
-    filters: &ScopedFilters<'_>,
+    filters: ScopedFilters<'_>,
     limit: usize,
     hnsw: &DuckDBHnswOptions,
     vector_literal: &str,
@@ -263,7 +268,7 @@ mod tests {
             "docs",
             "body_embedding",
             &["id".to_string()],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: std::slice::from_ref(filter),
                 schema,
             },
@@ -280,7 +285,7 @@ mod tests {
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &[],
                 schema: &schema,
             },
@@ -310,7 +315,7 @@ mod tests {
             "docs",
             "body_embedding",
             &[],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &[],
                 schema: &schema,
             },
@@ -375,7 +380,7 @@ mod tests {
             "docs",
             "body_embedding",
             &["id".to_string()],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &[],
                 schema: &schema,
             },
@@ -396,7 +401,7 @@ mod tests {
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &filters,
                 schema: &schema,
             },
@@ -422,7 +427,7 @@ mod tests {
             "docs",
             "body_embedding",
             &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &[],
                 schema: &schema,
             },
@@ -448,7 +453,8 @@ mod tests {
     /// regression test for #13144: a search filter on a timezone-aware timestamp column used to be
     /// rendered `TO_TIMESTAMP(EPOCH_MS("ts") / 1000)`, which truncates the column to whole
     /// milliseconds, so a comparison inside a millisecond selected a different set of rows than the
-    /// caller asked for.
+    /// caller asked for. `flat_sql` projects `id` alone, so this also covers a filter on a column
+    /// the projection drops.
     #[test]
     fn a_timezone_aware_timestamp_filter_is_rendered_without_the_millisecond_truncation() {
         let schema = docs_schema(vec![Field::new(
@@ -456,21 +462,9 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         )]);
-        let filters = vec![col("ts").gt(micros_literal(1_767_225_600_000_999))];
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
-        let sql = duckdb_vector_sql(
-            "docs",
-            "body_embedding",
-            &["id".to_string()],
-            &ScopedFilters {
-                filters: &filters,
-                schema: &schema,
-            },
-            Some(10),
-            &DuckDBHnswOptions::default(),
-            "[1.0, 0.0]::FLOAT[2]",
-        )
-        .expect("SQL should build");
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
 
         assert!(
             !sql.contains("EPOCH_MS"),
@@ -495,58 +489,13 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]);
-        let filters = vec![col("ts").gt(micros_literal(1_767_225_600_000_999))];
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
-        let sql = duckdb_vector_sql(
-            "docs",
-            "body_embedding",
-            &["id".to_string()],
-            &ScopedFilters {
-                filters: &filters,
-                schema: &schema,
-            },
-            Some(10),
-            &DuckDBHnswOptions::default(),
-            "[1.0, 0.0]::FLOAT[2]",
-        )
-        .expect("SQL should build");
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
 
         assert!(
             sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("ts") / 1000)"#),
             "a naive column still has to be pinned to UTC to compare with the literal: {sql}"
-        );
-    }
-
-    /// A filter may reference a column the projection drops, so the schema the filters are rendered
-    /// against is the whole table's — a projected schema would leave the column unresolved and
-    /// normalize it back to whole milliseconds.
-    #[test]
-    fn a_filter_column_outside_the_projection_is_still_resolved() {
-        let schema = docs_schema(vec![Field::new(
-            "ts",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]);
-        let filters = vec![col("ts").gt(micros_literal(1_767_225_600_000_999))];
-
-        let sql = duckdb_vector_sql(
-            "docs",
-            "body_embedding",
-            // `ts` is deliberately absent from the projection.
-            &["id".to_string(), SEARCH_SCORE_COLUMN_NAME.to_string()],
-            &ScopedFilters {
-                filters: &filters,
-                schema: &schema,
-            },
-            Some(10),
-            &DuckDBHnswOptions::default(),
-            "[1.0, 0.0]::FLOAT[2]",
-        )
-        .expect("SQL should build");
-
-        assert!(
-            !sql.contains("EPOCH_MS"),
-            "the filter's column resolves in the table schema even when the projection drops it: {sql}"
         );
     }
 
@@ -555,21 +504,9 @@ mod tests {
     #[test]
     fn an_unresolved_filter_column_keeps_the_normalization() {
         let schema = docs_schema(vec![]);
-        let filters = vec![col("ts").gt(micros_literal(1_767_225_600_000_999))];
+        let filter = col("ts").gt(micros_literal(1_767_225_600_000_999));
 
-        let sql = duckdb_vector_sql(
-            "docs",
-            "body_embedding",
-            &["id".to_string()],
-            &ScopedFilters {
-                filters: &filters,
-                schema: &schema,
-            },
-            Some(10),
-            &DuckDBHnswOptions::default(),
-            "[1.0, 0.0]::FLOAT[2]",
-        )
-        .expect("SQL should build");
+        let sql = flat_sql(&schema, &filter).expect("SQL should build");
 
         assert!(
             sql.contains(r#"TO_TIMESTAMP(EPOCH_MS("ts") / 1000)"#),

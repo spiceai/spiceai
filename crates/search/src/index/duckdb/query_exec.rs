@@ -77,7 +77,7 @@ impl DuckDBVectorQueryExec {
             table_name,
             &self.embedded_column,
             &self.projected_columns,
-            &ScopedFilters {
+            ScopedFilters {
                 filters: &self.filters,
                 schema: &self.table_schema,
             },
