@@ -202,22 +202,38 @@ pub struct AppliedLsn {
     pub lsn: u64,
 }
 
-/// Whether the acceleration must be rebuilt from the source rather than resumed.
+/// Why the acceleration must be rebuilt from the source, or `None` to resume.
 ///
-/// The whole gap decision, as arithmetic rather than inference:
+/// The whole gap decision *and* which [`RebuildCause`] it is, together, so the
+/// comparison that settles it is written once — deciding in one place and
+/// explaining in another leaves two encodings of one rule, free to drift.
 ///
-/// * `watermark` — the LSN the acceleration's contents are complete as of, or
-///   `None` when none has been recorded.
-/// * `slot_earliest_streamable_lsn` — the earliest LSN the slot can still stream
-///   from, or `None` when the slot does not exist. This is the later of its
-///   `restart_lsn` and its `confirmed_flush_lsn`, not `restart_lsn` alone:
-///   Postgres forwards a start position below `confirmed_flush_lsn` up to it, so
-///   an acknowledged change cannot be re-streamed even while its WAL is retained.
+/// * `position` — what the local record says, see [`RecordedPosition`].
+/// * `slot_restart_lsn` — the earliest LSN the slot still retains, or `None`
+///   when the slot does not exist.
+/// * `slot_acknowledged_lsn` — the later of the slot's `confirmed_flush_lsn` and
+///   this member's own seated floor. Retention is not reachability: Postgres
+///   forwards a start position below `confirmed_flush_lsn` up to it ("has been
+///   already streamed, forwarding to ..." in `CreateDecodingContext`), so once a
+///   slot has acknowledged past a change no client can ask for it again — the WAL
+///   may still be on disk under `restart_lsn`, but it is unreachable through this
+///   slot. A slot-mate's traffic can carry this member's own floor past the
+///   slot's snapshot the same way. Comparing against retention alone calls an
+///   unfillable gap resumable and skips the difference silently (#11289).
 /// * `absence_implies_gap` — whether a *missing* watermark is evidence of one.
 ///   True when the acceleration survives restarts (so it can hold rows this
 ///   process did not load), a position could have been recorded (so absence is
 ///   informative rather than permanent), and the acceleration is not known to be
 ///   empty (see below).
+///
+/// This is also where an ordinary backup or point-in-time restore is caught, in
+/// two halves depending on when the process comes back. Reconnect before the
+/// restored source has written anything and the stale position sits above its
+/// WAL head, which [`recorded_position_is_ahead_of_source`] turns into
+/// [`UnusableReason::RewoundSource`] before this is called. Reconnect later and
+/// the check here does it instead: a restore leaves no logical slot behind, so
+/// the one created on the next start takes `slot_acknowledged_lsn` from the WAL
+/// head, above any pre-restore position. The two partition the comparison.
 ///
 /// A watermark the slot cannot reach is a gap nothing can fill: the changes in
 /// between are gone from the source's log, so a row deleted there would never be
@@ -264,45 +280,190 @@ pub struct AppliedLsn {
 /// re-read wins. Revisit only if a post-load fatal can make the table refuse a
 /// scan (#13218); until then this arm is deliberate, not inherited.
 #[must_use]
-pub fn needs_rebuild(
+pub fn rebuild_cause(
     position: &RecordedPosition,
-    slot_earliest_streamable_lsn: Option<u64>,
+    slot_restart_lsn: Option<u64>,
+    slot_acknowledged_lsn: u64,
     absence_implies_gap: bool,
-) -> bool {
+) -> Option<RebuildCause> {
     match position {
         // Nothing recorded: a gap only when absence is informative — see
         // `absence_implies_gap`.
-        RecordedPosition::Absent => absence_implies_gap,
-        // Recorded against a different source. Whatever the acceleration holds
-        // came from somewhere else, and the LSN is not even comparable — a small
-        // LSN from the new source would otherwise read as "already covered" and
-        // leave the old source's rows in place while never loading the new
-        // source's.
-        RecordedPosition::ForeignSource => true,
-        // A gap when there is no slot at all, or when the slot can no longer
-        // stream from as far back as the watermark.
-        RecordedPosition::At(watermark) => {
-            slot_earliest_streamable_lsn.is_none_or(|earliest| earliest > watermark.lsn)
+        RecordedPosition::Absent => absence_implies_gap.then_some(RebuildCause::NoRecord),
+        // The record cannot be compared against this slot at all. Whatever the
+        // acceleration holds is unproven, and the LSN is not usable as a
+        // position: a small one would otherwise read as "already covered" and
+        // leave stale rows in place while never loading the current ones.
+        RecordedPosition::Unusable(UnusableReason::ForeignSource) => {
+            Some(RebuildCause::ForeignSource)
+        }
+        RecordedPosition::Unusable(UnusableReason::Unreadable) => Some(RebuildCause::Unreadable),
+        RecordedPosition::Unusable(UnusableReason::RewoundSource) => {
+            Some(RebuildCause::RewoundSource)
+        }
+        // Acknowledgement before retention: it is the tighter limit and the more
+        // misleading one, easily mistaken for a retention problem when the WAL is
+        // still on disk.
+        RecordedPosition::At(watermark) if slot_acknowledged_lsn > watermark.lsn => {
+            Some(RebuildCause::AcknowledgedPast)
+        }
+        // No slot at all retains nothing, and a slot retaining only past the
+        // position cannot replay the changes that follow it.
+        RecordedPosition::At(watermark)
+            if slot_restart_lsn.is_none_or(|restart_lsn| restart_lsn > watermark.lsn) =>
+        {
+            Some(RebuildCause::RetentionLost)
+        }
+        RecordedPosition::At(_) => None,
+    }
+}
+
+/// Why an acceleration was rebuilt from the source rather than resumed.
+///
+/// The causes are genuinely different situations calling for different
+/// responses — a restored source, a repointed endpoint, a broken sidecar, a slot
+/// lifecycle problem — so they are reported separately rather than as one
+/// "rebuilt" event, in the log line and on the member's metrics alike.
+///
+/// Two accessors, deliberately: [`Self::label`] is an identifier that dashboards
+/// and log queries match on and must stay stable, while [`Self::reason`] is prose
+/// written for whoever reads the warning and is free to be reworded. One string
+/// cannot be both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildCause {
+    /// No position was recorded, and its absence is informative — see
+    /// `absence_implies_gap` on [`rebuild_cause`].
+    NoRecord,
+    /// The record names a different source than this dataset streams from now.
+    ForeignSource,
+    /// The record could not be read or parsed, so nothing about it is proven.
+    Unreadable,
+    /// The record names a position the source's history no longer contains,
+    /// because it was restored or rewound afterwards.
+    ///
+    /// Worth alerting on rather than only counting, because one rewind escapes
+    /// detection entirely: a slot that survived it still valid and at a
+    /// pre-rewind position (a block-level snapshot of `PGDATA` restored as crash
+    /// recovery), once the WAL has grown back past the recorded position.
+    /// Catching that needs the last observed `confirmed_flush_lsn` persisted
+    /// alongside the position — it only advances in normal operation, so a lower
+    /// value on restart is proof the source went backwards. Timeline and system
+    /// identifier do not settle it, since crash recovery neither promotes nor
+    /// changes the identifier. So a dataset reporting this cause is reason to
+    /// check whether others on the same source resumed when they should not have.
+    RewoundSource,
+    /// The slot acknowledged past the recorded position, so it can no longer be
+    /// streamed from — even though its WAL may still be on disk.
+    AcknowledgedPast,
+    /// The slot no longer retains the WAL following the recorded position.
+    RetentionLost,
+}
+
+impl RebuildCause {
+    /// Stable identifier for metrics and log queries. Never reworded — renaming
+    /// one breaks every dashboard and saved search that selects on it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoRecord => "no_record",
+            Self::ForeignSource => "foreign_source",
+            Self::Unreadable => "unreadable",
+            Self::RewoundSource => "rewound_source",
+            Self::AcknowledgedPast => "acknowledged_past",
+            Self::RetentionLost => "retention_lost",
+        }
+    }
+
+    /// The operator-facing clause, phrased to complete "this acceleration will be
+    /// rebuilt from the source before changes are applied: ...".
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NoRecord => {
+                "it has no recorded position, so any rows it already holds cannot be shown to be current"
+            }
+            Self::ForeignSource => {
+                "the position it recorded belongs to a different source, so it does not describe these rows"
+            }
+            Self::Unreadable => {
+                "the position it recorded could not be read, so any rows it already holds cannot be shown to be current"
+            }
+            Self::RewoundSource => {
+                "the position it recorded as applied is ahead of the source's current WAL position, so the source was restored or rewound after it was recorded and its contents do not describe the source's current history"
+            }
+            Self::AcknowledgedPast => {
+                "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
+            }
+            Self::RetentionLost => {
+                "the slot no longer retains the changes following the position it recorded as applied"
+            }
         }
     }
 }
 
+/// Whether a recorded position lies ahead of the source's current WAL position.
+///
+/// Impossible within one server history: an applied position only ever comes
+/// from a commit the server itself streamed, so its WAL can never sit behind
+/// one. A position ahead of it identifies a source restored or rewound after the
+/// position was recorded, and callers must downgrade such a record to
+/// [`UnusableReason::RewoundSource`] — resuming on it keeps pre-restore rows, and
+/// seating it as a replay floor would suppress post-restore changes below it.
+///
+/// Strictly greater, never equal: the last streamed commit's end LSN equals the
+/// WAL position of a source that has been idle since, and that is a normal
+/// resume.
+///
+/// This catches a restore only while the source has not written past the
+/// recorded position yet; [`rebuild_cause`] documents the other half, and
+/// [`RebuildCause::RewoundSource`] the rewind neither half sees.
+#[must_use]
+pub fn recorded_position_is_ahead_of_source(
+    position: &RecordedPosition,
+    current_wal_lsn: u64,
+) -> bool {
+    matches!(position, RecordedPosition::At(recorded) if recorded.lsn > current_wal_lsn)
+}
+
 /// What the local record says about an acceleration's position.
 ///
-/// Three outcomes rather than `Option`, because "recorded against a different
-/// source" is neither "no record" nor a usable position: LSNs are only
-/// comparable within one source's history, so a watermark carried over to a
-/// different server, database, or table describes contents that have nothing to
-/// do with what this dataset now streams.
+/// Three outcomes rather than `Option`, because "a record exists but cannot be
+/// used" is neither "no record" nor a usable position: LSNs are only comparable
+/// within one source's history, so a record that cannot be tied to the history
+/// this dataset now streams describes contents that have nothing to do with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordedPosition {
     /// Nothing recorded.
     Absent,
-    /// A position exists, but for a different source than this dataset streams
-    /// from now. Its LSN cannot be compared and its contents cannot be trusted.
-    ForeignSource,
-    /// A position recorded against this same source.
+    /// A record exists but its position cannot be used — see [`UnusableReason`]
+    /// for which. Never resumed on, and never seated as a replay-suppression
+    /// floor.
+    Unusable(UnusableReason),
+    /// A position recorded against this same source, on a history the source
+    /// still has.
     At(AppliedLsn),
+}
+
+/// Why a record's position cannot be used.
+///
+/// Carried on [`RecordedPosition::Unusable`] rather than collapsed into one
+/// variant because all three rebuild for genuinely different reasons, and the
+/// message that explains the rebuild has to name the right one — an operator
+/// told their watermark "belongs to a different source" when it merely failed
+/// to parse will go looking for the wrong problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnusableReason {
+    /// Recorded against a different source than this dataset streams from now
+    /// (a different server, database, or table), so its LSN is not comparable
+    /// and its contents describe something else.
+    ForeignSource,
+    /// The record could not be read or parsed, so nothing about it is proven —
+    /// including whether the acceleration is missing deletions.
+    Unreadable,
+    /// Recorded on a history the source no longer has: the position is ahead of
+    /// the source's current WAL position, which only a restore or rewind can
+    /// produce (see [`recorded_position_is_ahead_of_source`]).
+    RewoundSource,
 }
 
 /// Durable, client-side record of how far a dataset's acceleration has been
@@ -495,7 +656,25 @@ pub(crate) fn err_to_stream(err: Error) -> StreamError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppliedLsn, RecordedPosition, needs_rebuild};
+    use super::{
+        AppliedLsn, RebuildCause, RecordedPosition, UnusableReason, rebuild_cause,
+        recorded_position_is_ahead_of_source,
+    };
+
+    /// A slot that reaches everything, so a case varies only what it is about.
+    fn needs_rebuild(
+        position: &RecordedPosition,
+        slot_earliest_streamable_lsn: Option<u64>,
+        absence_implies_gap: bool,
+    ) -> bool {
+        rebuild_cause(
+            position,
+            slot_earliest_streamable_lsn,
+            0,
+            absence_implies_gap,
+        )
+        .is_some()
+    }
 
     /// The gap decision is the correctness hinge of the rebuild path: a wrong
     /// `false` resumes over rows the source has deleted (silent divergence, the
@@ -526,20 +705,25 @@ mod tests {
         assert!(needs_rebuild(&RecordedPosition::Absent, Some(100), true));
         assert!(needs_rebuild(&RecordedPosition::Absent, None, true));
 
-        // A position recorded against another source is never usable, whatever
-        // the slot says and whatever the acceleration's durability: its LSN is
-        // not comparable and its contents describe a different table.
-        assert!(needs_rebuild(
-            &RecordedPosition::ForeignSource,
-            Some(0),
-            true
-        ));
-        assert!(needs_rebuild(
-            &RecordedPosition::ForeignSource,
-            Some(0),
-            false
-        ));
-        assert!(needs_rebuild(&RecordedPosition::ForeignSource, None, false));
+        // A record whose position cannot be used is never usable, whatever the
+        // slot says and whatever the acceleration's durability — and each way it
+        // happens is reported as its own cause, because they call for different
+        // responses.
+        for (reason, expected) in [
+            (UnusableReason::ForeignSource, RebuildCause::ForeignSource),
+            (UnusableReason::Unreadable, RebuildCause::Unreadable),
+            (UnusableReason::RewoundSource, RebuildCause::RewoundSource),
+        ] {
+            let unusable = RecordedPosition::Unusable(reason);
+            assert!(needs_rebuild(&unusable, Some(0), true), "{reason:?}");
+            assert!(needs_rebuild(&unusable, Some(0), false), "{reason:?}");
+            assert!(needs_rebuild(&unusable, None, false), "{reason:?}");
+            assert_eq!(
+                rebuild_cause(&unusable, Some(0), 0, true),
+                Some(expected),
+                "{reason:?} must not be reported as another cause"
+            );
+        }
 
         // The slot still holds WAL from at or before the watermark, so the gap is
         // replayable: resume.
@@ -599,16 +783,104 @@ mod tests {
     fn an_acknowledged_change_is_a_gap_even_while_its_wal_is_retained() {
         let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
         // A slot retaining from 40 but acknowledged to 200 cannot supply a
-        // watermark of 100, even though 100 sits inside the retained range.
+        // watermark of 100, even though 100 sits inside the retained range — and
+        // it must say so, because "acknowledged past" reads like a retention
+        // failure and is not one.
         let restart_lsn: u64 = 40;
         let confirmed_flush_lsn: u64 = 200;
-        assert!(
-            needs_rebuild(&at(100), Some(restart_lsn.max(confirmed_flush_lsn)), true),
-            "a watermark behind the acknowledged position is unreachable"
+        assert_eq!(
+            rebuild_cause(&at(100), Some(restart_lsn), confirmed_flush_lsn, true),
+            Some(RebuildCause::AcknowledgedPast),
+            "the acknowledged limit must not be reported as lost retention"
         );
-        assert!(
-            !needs_rebuild(&at(100), Some(restart_lsn), true),
+        assert_eq!(
+            rebuild_cause(&at(100), Some(restart_lsn), 0, true),
+            None,
             "control: comparing against retention alone calls the same gap resumable"
         );
+    }
+
+    /// `label` is matched on by dashboards and log queries, so two causes sharing
+    /// one would silently merge unrelated incidents; `reason` is all an operator
+    /// reads, so two sharing one sends them after the wrong problem. Neither may
+    /// collide, and neither may be empty.
+    #[test]
+    fn every_rebuild_cause_is_distinguishable_to_a_query_and_to_a_person() {
+        let causes = [
+            RebuildCause::NoRecord,
+            RebuildCause::ForeignSource,
+            RebuildCause::Unreadable,
+            RebuildCause::RewoundSource,
+            RebuildCause::AcknowledgedPast,
+            RebuildCause::RetentionLost,
+        ];
+        for (i, cause) in causes.iter().enumerate() {
+            assert!(!cause.label().is_empty(), "{cause:?} has no label");
+            assert!(!cause.reason().is_empty(), "{cause:?} has no reason");
+            // Labels are identifiers, not prose: whitespace means someone reworded
+            // one into a sentence and broke every query selecting on it.
+            assert!(
+                cause
+                    .label()
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{cause:?} label is not a stable identifier: {}",
+                cause.label()
+            );
+            for other in &causes[i + 1..] {
+                assert_ne!(
+                    cause.label(),
+                    other.label(),
+                    "{cause:?} and {other:?} share a label, so a query cannot separate them"
+                );
+                assert_ne!(
+                    cause.reason(),
+                    other.reason(),
+                    "{cause:?} and {other:?} read identically to an operator"
+                );
+            }
+        }
+    }
+
+    /// A recorded position ahead of the source's current WAL position identifies
+    /// a source restored or rewound since the position was recorded — its history
+    /// no longer contains the recorded position. `attach_member` downgrades such
+    /// a record to [`UnusableReason::RewoundSource`], which always rebuilds and
+    /// is never seated as a replay-suppression floor; without the downgrade,
+    /// `needs_rebuild` alone reads the rewind as resumable (the slot's earliest
+    /// position sits below the watermark) and the seated floor would silently
+    /// suppress every legitimate post-restore change at or below it.
+    #[test]
+    fn a_watermark_ahead_of_the_source_wal_identifies_a_rewound_source() {
+        let at = |lsn| RecordedPosition::At(AppliedLsn { lsn });
+
+        // Ahead of the current WAL position: only a rewind can produce this.
+        assert!(recorded_position_is_ahead_of_source(&at(900), 800));
+        // Equal is a normal resume of an idle source: the last streamed commit's
+        // end LSN is exactly the WAL position when nothing has happened since.
+        assert!(!recorded_position_is_ahead_of_source(&at(800), 800));
+        // Behind is the ordinary case.
+        assert!(!recorded_position_is_ahead_of_source(&at(700), 800));
+        // Positions that are not comparable are never "ahead" — they are already
+        // handled as unusable in their own right.
+        assert!(!recorded_position_is_ahead_of_source(
+            &RecordedPosition::Absent,
+            800
+        ));
+        assert!(!recorded_position_is_ahead_of_source(
+            &RecordedPosition::Unusable(UnusableReason::ForeignSource),
+            800
+        ));
+
+        // The trap the downgrade closes: a fresh post-restore slot sits below the
+        // stale watermark, so `needs_rebuild` on its own would resume...
+        assert!(!needs_rebuild(&at(900), Some(500), true));
+        // ...while the downgraded record rebuilds, and — being no longer `At` —
+        // can never be seated as a replay floor.
+        assert!(needs_rebuild(
+            &RecordedPosition::Unusable(UnusableReason::RewoundSource),
+            Some(500),
+            true
+        ));
     }
 }

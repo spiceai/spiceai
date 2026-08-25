@@ -646,6 +646,33 @@ impl AckSlot {
         advance_monotonic(&self.pending, lsn);
     }
 
+    /// Seat a member resuming on a position a previous process durably recorded
+    /// as applied. A recorded position means "everything at or below this LSN is
+    /// durably in the acceleration" (see [`Self::recorded`]), which makes it two
+    /// things at once:
+    ///
+    ///   * **recordable** — the idle carry-forward may extend it
+    ///     ([`publish_idle_positions`]), hence `note_recorded`/`note_pending`;
+    ///   * **the replay-suppression floor** — a reconnect replay must not
+    ///     re-deliver anything at or below it ([`Self::already_committed`]),
+    ///     hence `committed`/`delivered`.
+    ///
+    /// Seeding only the first half loses writes for a durable write-back dataset:
+    /// its echo registry prunes entries against this same recorded position, so a
+    /// crash while the slot's `confirmed_flush_lsn` lags it replays echoes whose
+    /// entries are already pruned — re-applied as ordinary changes, they regress
+    /// the acceleration to a stale echo image, and the next write-back delivery
+    /// then regresses the source too (#13368).
+    ///
+    /// `committed` before `delivered`, per the torn-read invariant on
+    /// [`AckTable::credit_idle`].
+    fn seat_recorded(&self, lsn: u64) {
+        self.note_recorded(lsn);
+        self.note_pending(lsn);
+        advance_monotonic(&self.committed, lsn);
+        advance_monotonic(&self.delivered, lsn);
+    }
+
     /// Advance this member's committed floor (monotonic). Called lock-free from
     /// the consumer commit path via [`SharedLsnCommitter`].
     fn commit(&self, lsn: u64) {
@@ -2288,39 +2315,46 @@ async fn attach_member(
 
     let snapshotting = need_snapshot && params.initial_snapshot;
 
-    // Is there a gap this slot cannot supply?
-    //
-    // Computed, not inferred. The watermark records the LSN the acceleration's
-    // contents are complete as of; `restart_lsn` is the earliest LSN the slot can
-    // still stream from. A watermark older than that is a gap no stream can fill:
-    // a row deleted at the source in that window has no change event left to
-    // replay, so appending snapshot rows over the survivors would leave the
-    // deletion applied at the source and never here, in every later query.
-    //
-    // The three outcomes:
-    //
-    //   * no watermark -> this acceleration has never been loaded. A first
-    //     bootstrap, not a gap: snapshot-and-append is exactly right, and this is
-    //     also every ephemeral accelerator (their store records nothing, since
-    //     they boot empty and re-snapshot every start).
-    //   * watermark, and the slot still reaches it -> resume; the WAL between the
-    //     two is still there to replay.
-    //   * watermark the slot cannot reach (or no slot at all) -> hand the reload
-    //     to the consumer, which owns the accelerator and can replace its
-    //     contents atomically (see `cdc::ChangeEnvelope::history_unavailable`).
+    // How far a previous process advanced this acceleration. Whether that is a gap
+    // this slot cannot supply — and what to tell the operator when it is — is
+    // `super::rebuild_cause`'s, computed once the member is seated below. A gap
+    // the stream cannot fill is handed to the consumer, which owns the accelerator
+    // and can replace its contents atomically (see
+    // `cdc::ChangeEnvelope::history_unavailable`).
     let watermark = match applied_lsn_store.load().await {
         Ok(watermark) => watermark,
         Err(e) => {
-            // Reading it failed, so we cannot prove the gap is fillable. Treat it
-            // the same as a position belonging to another source — unusable — so
-            // the acceleration is rebuilt: a needless rebuild costs a re-read,
-            // while a wrong resume silently keeps rows the source has deleted.
+            // Reading it failed, so we cannot prove the gap is fillable — the
+            // acceleration is rebuilt: a needless rebuild costs a re-read, while a
+            // wrong resume silently keeps rows the source has deleted.
             tracing::warn!(
                 dataset = %dataset_name,
                 "could not read how far this acceleration has been advanced, so it will be rebuilt from the source rather than resumed on an unproven position: {e}"
             );
-            super::RecordedPosition::ForeignSource
+            super::RecordedPosition::Unusable(super::UnusableReason::Unreadable)
         }
+    };
+    // A recorded position ahead of the source's current WAL position cannot
+    // belong to this server's history — the source was restored or rewound since
+    // it was recorded (see `recorded_position_is_ahead_of_source`). Downgrade it
+    // BEFORE classification and seating: resuming on it would keep pre-restore
+    // rows, and seating it as the replay floor would silently suppress every
+    // legitimate post-restore change at or below it.
+    let watermark = if super::recorded_position_is_ahead_of_source(
+        &watermark,
+        setup.current_wal_lsn,
+    ) {
+        if let super::RecordedPosition::At(recorded) = &watermark {
+            tracing::warn!(
+                dataset = %dataset_name,
+                recorded_lsn = recorded.lsn,
+                current_wal_lsn = setup.current_wal_lsn,
+                "Dataset '{dataset_name}' recorded its acceleration as applied up to a position ahead of the source's current WAL position, which means the source was restored or rewound (for example from a backup or point-in-time recovery) after the position was recorded, so the acceleration will be rebuilt from the source rather than resumed — resuming would keep pre-restore rows and skip post-restore changes. See: https://spiceai.org/docs/components/data-connectors/postgres"
+            );
+        }
+        super::RecordedPosition::Unusable(super::UnusableReason::RewoundSource)
+    } else {
+        watermark
     };
     // Absence of a watermark is evidence of a gap only when the acceleration
     // could be holding rows this process did not load AND a position could have
@@ -2363,74 +2397,43 @@ async fn attach_member(
     source.claim_reservation(&member_key);
     let ack_slot = source.ack.slot(&member_key);
 
-    // The earliest position this member can actually be supplied from, which is *not*
-    // the earliest the slot still retains. Two distinct limits, and the later one
-    // binds:
-    //
-    //   * Postgres forwards a `START_REPLICATION` position below the slot's
-    //     `confirmed_flush_lsn` up to it ("has been already streamed, forwarding to
-    //     ..." in `CreateDecodingContext`), so once the slot has acknowledged past a
-    //     change no client can ask for it again — the WAL may still be on disk under
-    //     `restart_lsn`, but it is unreachable through this slot.
-    //   * this member's own seated floor, which a slot-mate's traffic may have
-    //     carried past the snapshot above.
-    //
-    // Comparing against `restart_lsn` alone would call an unfillable gap resumable
-    // and skip the difference silently.
-    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
-    let earliest_streamable_lsn = setup
-        .slot_restart_lsn
-        .map(|restart_lsn| restart_lsn.max(setup.slot.consistent_lsn).max(seated_floor));
-    // A durable acceleration that has recorded no position is rebuilt, because a
-    // missing watermark cannot be told apart from one whose write failed — except
-    // when the acceleration is observed to hold no rows at all, which is proof
-    // enough on its own: nothing is present that could be stale, and no deletion
-    // can be missing.
-    //
-    // Gated on `snapshotting`, because emptiness only licenses skipping the
-    // rebuild when something *else* is going to load the table. When no snapshot
-    // runs — a pre-existing slot whose publication already carries this table, so
-    // none of `need_snapshot`'s conditions hold, or snapshots disabled outright —
-    // the rebuild is the only thing that would populate the acceleration, and
-    // skipping it would resume from the slot's position and leave every row that
-    // predates it missing for good.
+    // Emptiness licenses skipping the rebuild only when something *else* is going
+    // to load the table, hence the `snapshotting` gate. When no snapshot runs — a
+    // pre-existing slot whose publication already carries this table, or snapshots
+    // disabled outright — the rebuild is the only thing that would populate the
+    // acceleration, and skipping it would resume from the slot's position and
+    // leave every row that predates it missing for good.
     let load_runs_without_rebuild = params.acceleration.is_provably_empty() && snapshotting;
-    let rebuild_via_consumer = super::needs_rebuild(
+    // The floor passed here is the one the member was *actually* seated at above,
+    // not the snapshot `setup` was built from — see the registration comment for
+    // why the difference is a silent skip rather than a rounding error.
+    let seated_floor = ack_slot.as_ref().map_or(0, |slot| slot.committed());
+    let rebuild_cause = super::rebuild_cause(
         &watermark,
-        earliest_streamable_lsn,
+        setup.slot_restart_lsn,
+        setup.slot.consistent_lsn.max(seated_floor),
         !params.ephemeral_accelerator && tracks_positions && !load_runs_without_rebuild,
     );
-
-    // Why the rebuild, in the terms the operator can act on. The four causes are
-    // genuinely different situations, and the acknowledged-past one is the easiest to
-    // mistake for a retention problem: the WAL is still on disk, but a slot cannot
-    // re-stream what it has already acknowledged.
-    let rebuild_reason = match &watermark {
-        super::RecordedPosition::Absent => {
-            "it has no recorded position, so any rows it already holds cannot be shown to be current"
-        }
-        super::RecordedPosition::ForeignSource => {
-            "the position it recorded belongs to a different source, so it does not describe these rows"
-        }
-        super::RecordedPosition::At(watermark)
-            if setup.slot.consistent_lsn.max(seated_floor) > watermark.lsn =>
-        {
-            "the slot has been acknowledged past the position it recorded as applied, so the changes in between can no longer be streamed from it"
-        }
-        super::RecordedPosition::At(_) => {
-            "the slot no longer retains the changes following the position it recorded as applied"
-        }
-    };
+    let rebuild_via_consumer = rebuild_cause.is_some();
+    // A rebuild is a full re-read nobody asked for, and which cause fired is what
+    // says whether to look at the source, the configuration, or the slot — so it
+    // is reported as a label rather than left to be recovered from log text.
+    if let Some(cause) = rebuild_cause {
+        metrics.set_rebuild_cause(cause.label());
+    }
 
     // A member resuming on a position a previous process recorded already has a
     // durable position, even though nothing has been committed in *this* process.
     // Seeding it lets an idle member carry that position forward (see
-    // `flush_idle_watermarks`) instead of waiting for a change that may never come.
+    // `flush_idle_watermarks`) instead of waiting for a change that may never come
+    // — and, through the member's `committed` floor, keeps the coming reconnect
+    // replay from re-delivering commits the acceleration durably holds (see
+    // `AckSlot::seat_recorded` for why re-delivery loses writes on a durable
+    // write-back dataset).
     if let (Some(slot), super::RecordedPosition::At(resumed)) = (&ack_slot, &watermark)
         && !rebuild_via_consumer
     {
-        slot.note_recorded(resumed.lsn);
-        slot.note_pending(resumed.lsn);
+        slot.seat_recorded(resumed.lsn);
     }
     lock(&source.members).insert(
         member_key.clone(),
@@ -2555,7 +2558,9 @@ async fn attach_member(
                 _ => "none".to_string(),
             },
             slot_acknowledged_position = %slot::format_lsn(setup.slot.consistent_lsn),
-            "this acceleration will be rebuilt from the source before changes are applied: {rebuild_reason}"
+            rebuild_cause = rebuild_cause.map_or("", super::RebuildCause::label),
+            "this acceleration will be rebuilt from the source before changes are applied: {}",
+            rebuild_cause.map_or("", super::RebuildCause::reason)
         );
         // No snapshot runs on this path — the consumer's reload replaces it — so
         // the gauge's documented "finished, or skipped" state is reached here.
@@ -4502,6 +4507,9 @@ mod tests {
     ) -> slot::SharedMemberSetup {
         slot::SharedMemberSetup {
             slot_restart_lsn: Some(0),
+            // Far ahead of every LSN these tests use, so no test watermark ever
+            // reads as a rewound source (see `recorded_position_is_ahead_of_source`).
+            current_wal_lsn: u64::MAX,
             slot: slot::SlotInfo {
                 slot_name: "slot".to_string(),
                 publication_name: "pub".to_string(),
@@ -7078,6 +7086,70 @@ mod tests {
             second.num_rows_hint(),
             0,
             "the echo is dropped again on reconnect replay, never re-applied"
+        );
+    }
+
+    /// Restart replay must not re-deliver commits at or below the position a
+    /// member durably recorded as applied. The echo registry prunes its entries
+    /// against that same recorded position, so a replayed echo below it arrives
+    /// unregistered — re-applying it as an ordinary change regresses the
+    /// acceleration to the stale echo image, silently losing acknowledged
+    /// writes (regression test for #13368). `seat_recorded` is exactly what
+    /// `attach_member` runs for a member resuming without a rebuild.
+    #[tokio::test]
+    async fn resumed_member_suppresses_replay_below_recorded_position() {
+        let (source, decoder, routes, mut receivers) = echo_scenario(None);
+        let recorded = 900u64;
+        let t0_slot = source.ack.slot(&key("t0")).expect("t0 slot");
+        t0_slot.seat_recorded(recorded);
+
+        // Replay of a commit at the recorded position: its registry entry was
+        // pruned before the restart, so only the seated floor protects it.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "72"), (101, "72")]),
+            recorded,
+            Some(4242),
+        )
+        .await;
+
+        // t1 never recorded a position — the replay is delivered to it as usual.
+        let t1 = receivers[1]
+            .next()
+            .await
+            .expect("t1 envelope")
+            .expect("not an error");
+        assert_eq!(t1.num_rows_hint(), 1, "an unseated member gets the replay");
+
+        // t0 durably holds everything at or below `recorded`: nothing may be
+        // delivered, not even a zero-row ack (its floor already covers the LSN).
+        assert_eq!(
+            t0_slot.delivered(),
+            recorded,
+            "no envelope was staged for the seated member"
+        );
+
+        // A genuinely new commit above the recorded position flows normally.
+        deliver_one_commit(
+            &source,
+            &decoder,
+            &routes,
+            txn_with(&[(100, "79")]),
+            recorded + 1,
+            Some(4243),
+        )
+        .await;
+        let t0 = receivers[0]
+            .next()
+            .await
+            .expect("t0 envelope for the new commit")
+            .expect("not an error");
+        assert_eq!(
+            t0.num_rows_hint(),
+            1,
+            "commits above the recorded position are delivered"
         );
     }
 }

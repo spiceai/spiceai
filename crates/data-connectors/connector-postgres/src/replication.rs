@@ -32,7 +32,8 @@ use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotM
 use data_components::postgres_replication::{
     AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    SchemaEvolutionPolicy, XactStatus, XidRegistry, config, start_replication_stream,
+    SchemaEvolutionPolicy, UnusableReason, XactStatus, XidRegistry, config,
+    start_replication_stream,
 };
 use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
@@ -143,7 +144,7 @@ impl AppliedLsnStore for SidecarAppliedLsnStore {
                 streaming_from = %self.identity,
                 "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
             );
-            return Ok(RecordedPosition::ForeignSource);
+            return Ok(RecordedPosition::Unusable(UnusableReason::ForeignSource));
         }
         Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
     }
@@ -842,6 +843,24 @@ const METRICS: &[MetricSpec] = &[
     )
     .auto_register(),
     MetricSpec::new(
+        "replication_acceleration_rebuilt",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 while this dataset's acceleration was rebuilt from the source on its last \
+         attach instead of resuming from the position it had recorded. A rebuild re-reads \
+         the whole table without anyone asking for it, and the `cause` label says where to \
+         look: `rewound_source` means the source was restored or rewound (check whether \
+         other datasets on it resumed when they should not have), `foreign_source` means \
+         it is streaming from a different server, database, or table than it recorded, \
+         `unreadable` means its recorded position could not be read, `acknowledged_past` \
+         means the slot acknowledged past that position (NOT a WAL retention problem — the \
+         WAL may still be on disk), `retention_lost` means the source discarded the WAL \
+         after it, and `no_record` means it had never recorded one. Datasets that resumed \
+         report no series.",
+    )
+    .auto_register(),
+    MetricSpec::new(
         "replication_member_send_wait_micros_total",
         MetricType::ObservableCounterU64,
     )
@@ -1054,6 +1073,18 @@ impl MetricsProvider for PostgresMetricsProvider {
                             attrs.push(KeyValue::new("slot", slot));
                         }
                         instrument.observe(v, &attrs);
+                    }
+                })))
+            }
+            "replication_acceleration_rebuilt" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    // Observe only for a dataset that actually rebuilt (`Some`), so a
+                    // resumed one reports no series rather than a constant 0 that would
+                    // need a `cause` label it does not have.
+                    if let Some(cause) = m.rebuild_cause() {
+                        let mut attrs = attributes.clone();
+                        attrs.push(KeyValue::new("cause", cause));
+                        instrument.observe(1, &attrs);
                     }
                 })))
             }
