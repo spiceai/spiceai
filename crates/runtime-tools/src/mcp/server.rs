@@ -48,6 +48,23 @@ struct ResolvedTool {
     catalog: Option<String>,
 }
 
+impl ResolvedTool {
+    /// The `task_history` labels for a call on this tool: the `task` override,
+    /// and the MCP server to attribute the call to.
+    ///
+    /// `mcp_server` names the server a call was proxied to, so it is reported
+    /// only when the resolve found a catalog. A top-level tool came from none,
+    /// and labelling one with its own name would report a server that does not
+    /// exist — the `__` in a name like `top__level` makes it look qualified by a
+    /// catalog even though nothing served it.
+    fn task_history_labels(&self) -> (String, Option<&str>) {
+        (
+            task_name_for_exposed_tool(&self.exposed_name),
+            self.catalog.as_deref(),
+        )
+    }
+}
+
 impl RuntimeServer {
     pub fn new(tools: Arc<RwLock<HashMap<String, Tooling>>>) -> Self {
         Self { tools }
@@ -203,10 +220,12 @@ impl ServerHandler for RuntimeServer {
                 // Labelled from the canonical identity `get_tool` resolved, never
                 // the requested spelling — see `get_tool`.
                 let exposed_name = &resolved.exposed_name;
-                let task_name = task_name_for_exposed_tool(exposed_name);
-                let mcp_server = resolved.catalog.as_deref().unwrap_or(exposed_name);
+                let (task_name, mcp_server) = resolved.task_history_labels();
                 let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
-                tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %mcp_server, "labels");
+                tracing::info!(target: "task_history", parent: &span, task_override = %task_name, "labels");
+                if let Some(mcp_server) = mcp_server {
+                    tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
+                }
 
                 return match mcp_proxy
                     .call_tool(arguments)
@@ -377,13 +396,11 @@ mod tests {
                 resolved.exposed_name, canonical,
                 "request {requested} was not canonicalized"
             );
-            assert_eq!(
-                task_name_for_exposed_tool(&resolved.exposed_name),
-                "tool_use::srv__tool_-_name",
-            );
-            // The catalog is reported from the resolve, not re-derived by
+            let (task_name, mcp_server) = resolved.task_history_labels();
+            assert_eq!(task_name, "tool_use::srv__tool_-_name");
+            // The server is reported from the resolve, not re-derived by
             // decoding the canonical name a second time.
-            assert_eq!(resolved.catalog.as_deref(), Some("srv"));
+            assert_eq!(mcp_server, Some("srv"));
         }
     }
 
@@ -403,8 +420,12 @@ mod tests {
             .await
             .expect("a top-level tool resolves by its own name");
         assert_eq!(resolved.exposed_name, "top__level");
-        // It belongs to no catalog, however much the `__` in its name looks like
-        // one — so `mcp_server` must not report a phantom `top`.
-        assert_eq!(resolved.catalog, None);
+
+        let (task_name, mcp_server) = resolved.task_history_labels();
+        assert_eq!(task_name, "tool_use::top__level");
+        // It came from no catalog, however much the `__` in its name looks like
+        // one — so the call carries no `mcp_server` label at all, rather than a
+        // phantom `top` or a server named after the tool itself.
+        assert_eq!(mcp_server, None);
     }
 }
