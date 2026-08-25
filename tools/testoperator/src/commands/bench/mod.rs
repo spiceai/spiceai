@@ -88,7 +88,11 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
 
         // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
         let query_set = args.load_query_set()?;
-        if query_set == test_framework::queries::QuerySet::ChBench {
+        if matches!(
+            query_set,
+            test_framework::queries::QuerySet::ChBench
+                | test_framework::queries::QuerySet::ChBenchFts
+        ) {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;

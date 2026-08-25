@@ -223,6 +223,9 @@ pub enum QuerySetArg {
     #[value(name = "chbench")]
     #[serde(rename = "chbench")]
     ChBench,
+    #[value(name = "chbench-fts")]
+    #[serde(rename = "chbench-fts")]
+    ChBenchFts,
     #[value(name = "tpch[parameterized]")]
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
@@ -317,6 +320,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
             QuerySetArg::ChBench => QuerySet::ChBench,
+            QuerySetArg::ChBenchFts => QuerySet::ChBenchFts,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
             QuerySetArg::Scenario => {
                 // This should never be reached - callers must use DatasetTestArgs::load_query_set()
@@ -337,6 +341,7 @@ impl PartialEq<QuerySet> for QuerySetArg {
                 | (QuerySetArg::Tpcds, QuerySet::Tpcds)
                 | (QuerySetArg::Clickbench, QuerySet::Clickbench)
                 | (QuerySetArg::ChBench, QuerySet::ChBench)
+                | (QuerySetArg::ChBenchFts, QuerySet::ChBenchFts)
                 | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
                 | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
         )

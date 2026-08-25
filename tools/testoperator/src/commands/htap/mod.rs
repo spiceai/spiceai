@@ -65,9 +65,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
 
     let query_set = test_args.load_query_set()?;
-    if !matches!(query_set, QuerySet::ChBench) {
+    if !matches!(query_set, QuerySet::ChBench | QuerySet::ChBenchFts) {
         anyhow::bail!(
-            "HTAP command requires the 'chbench' query set, but got '{query_set}'. \
+            "HTAP command requires the 'chbench' or 'chbench-fts' query set, but got '{query_set}'. \
              Use '--query-set chbench' or run 'testoperator run bench' for other query sets."
         );
     }

@@ -170,6 +170,20 @@ macro_rules! generate_chbench_queries {
     }
 }
 
+macro_rules! generate_chbench_fts_queries {
+    ( $( $i:literal ),* ) => {
+        vec![
+            $(
+                Query::new(
+                    concat!("chbench_fts", stringify!($i)).into(),
+                    include_str!(concat!("./chbench_fts/fts", stringify!($i), ".sql")).into(),
+                    false
+                )
+            ),*
+        ]
+    }
+}
+
 macro_rules! remove_chbench_query {
     ( $queries:expr, $( $i:literal ),* ) => {
         {
@@ -432,6 +446,10 @@ pub enum QuerySet {
     Tpcds,
     Clickbench,
     ChBench,
+    /// CH-benCH analytical queries plus `text_search` full-text queries. Requires
+    /// a spicepod whose `customer`/`nation`/`region` datasets configure
+    /// `full_text_search` (see `mysql-cayenne[file]-fts`).
+    ChBenchFts,
     ParameterizedTpch,
     /// Scenario query set loaded from a file
     Scenario {
@@ -482,6 +500,7 @@ impl QuerySet {
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides, scale_factor)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
             QuerySet::ChBench => Ok(get_chbench_test_queries(overrides)),
+            QuerySet::ChBenchFts => Ok(get_chbench_fts_test_queries(overrides)),
             QuerySet::Scenario { queries, .. } => Ok(queries.clone()),
             QuerySet::ParameterizedTpch => {
                 let queries = generate_tpch_queries_override!(
@@ -562,7 +581,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithRowCount::from)
                 .collect(),
-            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
+            QuerySet::Scenario { .. } | QuerySet::ChBench | QuerySet::ChBenchFts => vec![],
         }
     }
 
@@ -615,7 +634,7 @@ impl QuerySet {
                 .iter()
                 .map(TableWithTimeColumn::from)
                 .collect(),
-            QuerySet::Scenario { .. } | QuerySet::ChBench => vec![],
+            QuerySet::Scenario { .. } | QuerySet::ChBench | QuerySet::ChBenchFts => vec![],
         }
     }
 
@@ -707,10 +726,10 @@ impl QuerySet {
                     "clickbench_q43",
                 ]
             }
-            QuerySet::ChBench => {
+            QuerySet::ChBench | QuerySet::ChBenchFts => {
                 // CH-benCH results are non-deterministic under concurrent OLTP load;
                 // skip row count validation for all queries
-                vec![
+                let mut skip = vec![
                     "chbench_q1",
                     "chbench_q2",
                     "chbench_q3",
@@ -733,7 +752,14 @@ impl QuerySet {
                     "chbench_q20",
                     "chbench_q21",
                     "chbench_q22",
-                ]
+                ];
+                if matches!(self, QuerySet::ChBenchFts) {
+                    // The full-text queries match a variable row set: nation/region
+                    // hits are fixed, but customer.c_data only becomes searchable as
+                    // the OLTP workload rewrites it over the CDC changes stream.
+                    skip.extend_from_slice(&["chbench_fts1", "chbench_fts2", "chbench_fts3"]);
+                }
+                skip
             }
             QuerySet::Scenario { .. } => vec![],
         }
@@ -747,6 +773,7 @@ impl Display for QuerySet {
             QuerySet::Tpcds => write!(f, "tpcds"),
             QuerySet::Clickbench => write!(f, "clickbench"),
             QuerySet::ChBench => write!(f, "chbench"),
+            QuerySet::ChBenchFts => write!(f, "chbench-fts"),
             QuerySet::ParameterizedTpch => write!(f, "tpch[parameterized]"),
             QuerySet::Scenario { scenario_set, .. } => {
                 if let Some(name) = &scenario_set.name {
@@ -1362,6 +1389,16 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
         Some(QueryOverrides::ChbenchSkipSlow) => remove_chbench_query!(queries, 10, 18),
         Some(_) | None => queries,
     }
+}
+
+/// CH-benCH analytical queries plus the `text_search` full-text queries. Only for
+/// spicepods that configure `full_text_search` on `customer`/`nation`/`region`
+/// (e.g. `mysql-cayenne[file]-fts`); the UDTF queries fail on a dataset with no
+/// full-text index.
+pub fn get_chbench_fts_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
+    let mut queries = get_chbench_test_queries(overrides);
+    queries.extend(generate_chbench_fts_queries!(1, 2, 3));
+    queries
 }
 
 #[cfg(test)]
