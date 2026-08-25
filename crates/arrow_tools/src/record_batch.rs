@@ -46,13 +46,6 @@ pub enum Error {
 
     #[snafu(display("Field is not nullable: {field}"))]
     FieldNotNullable { field: String },
-
-    #[snafu(display(
-        "Failed to align column '{column}': the target schema declares '{path}' non-nullable, but the column holds nulls there. \
-        Declare '{path}' nullable in the target schema, or stop the source emitting nulls for it. \
-        See: https://spiceai.org/docs/reference/spicepod/datasets"
-    ))]
-    NullsUnderNonNullableField { column: String, path: String },
 }
 
 impl From<Error> for DataFusionError {
@@ -61,7 +54,7 @@ impl From<Error> for DataFusionError {
             Error::UnableToConvertRecordBatch {
                 source: arrow_error,
             } => DataFusionError::ArrowError(Box::new(arrow_error), None),
-            Error::FieldNotNullable { .. } | Error::NullsUnderNonNullableField { .. } => {
+            Error::FieldNotNullable { .. } => {
                 DataFusionError::ArrowError(Box::new(ArrowError::SchemaError(e.to_string())), None)
             }
         }
@@ -184,7 +177,7 @@ fn cast_column(
     target_field: &Field,
     strict_options: &CastOptions,
 ) -> Result<ArrayRef> {
-    if is_nullability_only_relabel(source_type, target_field.data_type()) {
+    if is_nullability_relaxing_relabel(source_type, target_field.data_type()) {
         return relabel_nullability(column, target_field);
     }
 
@@ -219,7 +212,14 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 }
 
 /// Whether `target` can be reached from `source` by relabelling alone: the two describe the same
-/// values in the same buffers, and differ only in the nullability flags of nested fields.
+/// values in the same buffers, and `target` only ever *relaxes* a nested field's nullability.
+///
+/// Narrowing is deliberately excluded and left to `arrow_cast::cast`. Whether a non-nullable field
+/// may hold nulls is not the simple question it looks like — Arrow requires a non-nullable struct
+/// child's nulls to be a *subset of its parent's*, not absent, so a masked null is legal — and the
+/// reachability rule differs again for a list-like parent, whose offsets decide which child slots
+/// are addressed at all. `cast` already implements those rules; a second, stricter transcription of
+/// them here would refuse arrays Arrow considers valid.
 ///
 /// `arrow_cast::cast` has no path for such a pair. For a `Map` it hands the target `entries` field
 /// straight to `MapArray::try_new`, which refuses a nullable one, so two `Map` types differing only
@@ -234,25 +234,25 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// Field names and metadata have to match. A rename is a different question from a nullability
 /// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
 /// from a pair of renames, which positional pairing would then carry across transposed.
-fn is_nullability_only_relabel(source: &DataType, target: &DataType) -> bool {
+fn is_nullability_relaxing_relabel(source: &DataType, target: &DataType) -> bool {
     match (source, target) {
         (DataType::List(source_item), DataType::List(target_item))
         | (DataType::LargeList(source_item), DataType::LargeList(target_item))
         | (DataType::ListView(source_item), DataType::ListView(target_item))
         | (DataType::LargeListView(source_item), DataType::LargeListView(target_item)) => {
-            is_field_nullability_only_relabel(source_item, target_item)
+            is_field_nullability_relaxing_relabel(source_item, target_item)
         }
         (
             DataType::FixedSizeList(source_item, source_len),
             DataType::FixedSizeList(target_item, target_len),
         ) if source_len == target_len => {
-            is_field_nullability_only_relabel(source_item, target_item)
+            is_field_nullability_relaxing_relabel(source_item, target_item)
         }
         (
             DataType::Map(source_entries, source_sorted),
             DataType::Map(target_entries, target_sorted),
         ) if source_sorted == target_sorted => {
-            is_field_nullability_only_relabel(source_entries, target_entries)
+            is_field_nullability_relaxing_relabel(source_entries, target_entries)
         }
         (DataType::Struct(source_fields), DataType::Struct(target_fields))
             if source_fields.len() == target_fields.len() =>
@@ -261,79 +261,31 @@ fn is_nullability_only_relabel(source: &DataType, target: &DataType) -> bool {
                 .iter()
                 .zip(target_fields)
                 .all(|(source_field, target_field)| {
-                    is_field_nullability_only_relabel(source_field, target_field)
+                    is_field_nullability_relaxing_relabel(source_field, target_field)
                 })
         }
         _ => source == target,
     }
 }
 
-/// The [`is_nullability_only_relabel`] test for one field pair.
-fn is_field_nullability_only_relabel(source: &FieldRef, target: &FieldRef) -> bool {
+/// The [`is_nullability_relaxing_relabel`] test for one field pair.
+fn is_field_nullability_relaxing_relabel(source: &FieldRef, target: &FieldRef) -> bool {
     source.name() == target.name()
         && source.metadata() == target.metadata()
         && source.dict_is_ordered() == target.dict_is_ordered()
-        && is_nullability_only_relabel(source.data_type(), target.data_type())
+        // At least as permissive: a nullable source under a non-nullable target is a narrowing.
+        && (target.is_nullable() || !source.is_nullable())
+        && is_nullability_relaxing_relabel(source.data_type(), target.data_type())
 }
 
 /// Carries `column` to `target_field`'s type by relabelling its declaration, sharing every buffer —
 /// values, offsets and validity — with the original.
 ///
-/// Only called for a pair [`is_nullability_only_relabel`] accepts, so no value changes meaning.
+/// Only called for a pair [`is_nullability_relaxing_relabel`] accepts, so no value changes meaning.
 fn relabel_nullability(column: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
-    let data = column.to_data();
-
-    if let Some(path) =
-        narrowed_field_holding_nulls(&data, target_field.data_type(), target_field.name())
-    {
-        return NullsUnderNonNullableFieldSnafu {
-            column: target_field.name(),
-            path,
-        }
-        .fail();
-    }
-
-    relabel_array_data(data, target_field.data_type())
+    relabel_array_data(column.to_data(), target_field.data_type())
         .map(make_array)
         .context(UnableToConvertRecordBatchSnafu)
-}
-
-/// The path to the first nested field `target` declares non-nullable where `data` holds nulls.
-///
-/// Relabelling carries the validity buffers across untouched, so narrowing a field the data
-/// actually leaves null would hand on an array whose declaration contradicts its own null mask —
-/// which every later kernel is entitled to trust. Such a pair is reported against the field it
-/// disagrees on instead.
-///
-/// `data`'s type and `target` satisfy [`is_nullability_only_relabel`], so the child counts line up
-/// at every level walked here; `zip` truncates rather than indexing, so a disagreement cannot panic.
-fn narrowed_field_holding_nulls(data: &ArrayData, target: &DataType, path: &str) -> Option<String> {
-    let children: Vec<(&ArrayData, &FieldRef)> = match target {
-        DataType::List(item)
-        | DataType::LargeList(item)
-        | DataType::ListView(item)
-        | DataType::LargeListView(item)
-        | DataType::FixedSizeList(item, _)
-        | DataType::Map(item, _) => data
-            .child_data()
-            .iter()
-            .zip(std::iter::once(item))
-            .collect(),
-        DataType::Struct(fields) => data.child_data().iter().zip(fields.iter()).collect(),
-        _ => return None,
-    };
-
-    for (child, field) in children {
-        let child_path = format!("{path}.{}", field.name());
-        if !field.is_nullable() && child.null_count() > 0 {
-            return Some(child_path);
-        }
-        if let Some(found) = narrowed_field_holding_nulls(child, field.data_type(), &child_path) {
-            return Some(found);
-        }
-    }
-
-    None
 }
 
 /// Flattens a list of struct types with a single field into a list of primitive types.
@@ -2215,34 +2167,55 @@ mod nullability_alignment_tests {
         assert_eq!(aligned.num_rows(), 1);
     }
 
-    /// The one shape a relabel cannot carry: the entries array really does hold nulls, so
-    /// narrowing the field would hand on an array whose declaration contradicts its own null
-    /// mask. It is refused, and the refusal names the column and the field rather than
-    /// reporting Arrow's `MapArray entries cannot contain nulls` against neither.
+    /// Narrowing is not a relabel, and the boundary is load-bearing rather than tidy. Whether a
+    /// non-nullable field may hold nulls depends on its parent: Arrow requires a non-nullable
+    /// struct child's nulls to be a *subset of its parent's* rather than absent, so a masked null
+    /// is legal, and a list-like parent's offsets decide which child slots are addressed at all.
+    /// `arrow_cast::cast` already implements those rules — and already serves this direction — so
+    /// the narrowing pair keeps that path instead of a second, stricter transcription here.
     #[test]
-    fn nulls_under_a_narrowed_field_are_refused_by_name() {
+    fn a_narrowed_nested_field_is_not_relabelled() {
+        assert!(
+            !is_nullability_relaxing_relabel(&map_type(true), &map_type(false)),
+            "a nullable source under a non-nullable target is a narrowing"
+        );
+        assert!(
+            is_nullability_relaxing_relabel(&map_type(false), &map_type(true)),
+            "the relaxing direction is what a relabel carries"
+        );
+    }
+
+    /// The narrowing direction still aligns end to end, through the cast path. Arrow performs it,
+    /// so restricting the relabel must not have taken it away.
+    ///
+    /// Deliberately not killed by any neuter in this module: it pins behaviour this change leaves
+    /// alone, so it is a positive control on Arrow rather than a guard on the logic above.
+    #[test]
+    fn a_narrowed_nested_field_still_aligns_through_the_cast_path() {
         let column = Arc::new(map_from_parts(
             true,
-            Some(NullBuffer::from(vec![true, false])),
+            None,
             &[0, 2],
             vec!["a", "b"],
-            vec![Some("1"), Some("2")],
+            vec![Some("1"), None],
         )) as ArrayRef;
 
-        let error = try_cast_to(
+        let aligned = try_cast_to(
             batch_of("col_map", column),
             schema_of("col_map", map_type(false)),
         )
-        .expect_err("entry nulls cannot be relabelled away");
+        .expect("arrow_cast serves the narrowing direction");
 
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("col_map") && rendered.contains("col_map.entries"),
-            "the refusal has to name the column and the field it disagrees on, got: {rendered}"
+        assert_eq!(
+            aligned.schema().field(0).data_type(),
+            aligned.column(0).data_type()
         );
-        assert!(
-            rendered.contains("holds nulls"),
-            "the refusal has to say what is wrong with the data, got: {rendered}"
+        assert_eq!(
+            map_pairs(&aligned),
+            vec![
+                ("a".to_string(), Some("1".to_string())),
+                ("b".to_string(), None),
+            ]
         );
     }
 
@@ -2255,14 +2228,20 @@ mod nullability_alignment_tests {
             Arc::new(Field::new(
                 "key_value",
                 DataType::Struct(entry_fields()),
-                false,
+                true,
             )),
             false,
         );
 
+        // Both pairs relax `entries` from non-nullable to nullable, so the name is the only
+        // thing that can decide them.
         assert!(
-            !is_nullability_only_relabel(&map_type(true), &renamed_entries),
-            "a renamed entries field is not a nullability-only difference"
+            !is_nullability_relaxing_relabel(&map_type(false), &renamed_entries),
+            "a renamed entries field is not a nullability difference"
+        );
+        assert!(
+            is_nullability_relaxing_relabel(&map_type(false), &map_type(true)),
+            "the same pair under the original name is a relabel"
         );
     }
 
@@ -2274,13 +2253,17 @@ mod nullability_alignment_tests {
             Arc::new(Field::new(
                 "entries",
                 DataType::Struct(entry_fields()),
-                false,
+                true,
             )),
             true,
         );
 
-        assert!(!is_nullability_only_relabel(&map_type(true), &sorted));
-        assert!(!is_nullability_only_relabel(&map_type(false), &sorted));
+        // Differs from the accepted `map_type(false)` -> `map_type(true)` pair only in `sorted`.
+        assert!(!is_nullability_relaxing_relabel(&map_type(false), &sorted));
+        assert!(is_nullability_relaxing_relabel(
+            &map_type(false),
+            &map_type(true)
+        ));
     }
 
     /// A `FixedSizeList`'s length is how many values each row owns, so a pair differing there
@@ -2294,13 +2277,14 @@ mod nullability_alignment_tests {
             )
         };
 
-        assert!(!is_nullability_only_relabel(
-            &fixed(2, true),
-            &fixed(3, false)
+        // The two differ in exactly one thing — the length — so only that can decide them.
+        assert!(!is_nullability_relaxing_relabel(
+            &fixed(2, false),
+            &fixed(3, true)
         ));
-        assert!(is_nullability_only_relabel(
-            &fixed(2, true),
-            &fixed(2, false)
+        assert!(is_nullability_relaxing_relabel(
+            &fixed(2, false),
+            &fixed(2, true)
         ));
     }
 
@@ -2311,7 +2295,7 @@ mod nullability_alignment_tests {
         let source = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(true)));
         let target = DataType::Dictionary(Box::new(DataType::Int32), Box::new(map_type(false)));
 
-        assert!(!is_nullability_only_relabel(&source, &target));
+        assert!(!is_nullability_relaxing_relabel(&source, &target));
     }
 
     /// An extension type lives in a field's metadata and renames what its storage buffers mean,
@@ -2328,7 +2312,7 @@ mod nullability_alignment_tests {
             )
         };
 
-        assert!(!is_nullability_only_relabel(
+        assert!(!is_nullability_relaxing_relabel(
             &DataType::List(extension("arrow.uuid")),
             &DataType::List(extension("arrow.opaque")),
         ));
