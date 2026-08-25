@@ -75,12 +75,13 @@ use crate::provider::scan::{
     CayenneAccelerationExec, SnapshotScanRef, round_robin_repartition_if_needed,
 };
 use crate::provider::sink::CayenneDataSink;
-use crate::provider::{Error, Result};
+use crate::provider::{Error, InternalSnafu, Result};
 use crate::resource_starvation::ResourceStarvationTracker;
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef};
 use hash_index::PrehashedBuildHasher;
+use snafu::ensure;
 
 use crate::row_converter::{OwnedRow, RowConverter, SortField};
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
@@ -1547,7 +1548,12 @@ pub struct CayenneTableProvider {
     /// Contains the deletion caches specific to each strategy variant.
     pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
     /// `RowConverter` for converting primary key columns to byte representation.
-    /// Only set for tables with composite or non-integer primary keys.
+    ///
+    /// `None` is load-bearing for the single-`Int64` strategy: deletion-vector
+    /// tombstone keys use raw big-endian encoding there, while every
+    /// `RowConverterBased` strategy uses `OwnedRow` encoding. Callers that need
+    /// marker encoding rather than deletion-vector decoding must construct a
+    /// separate converter.
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
@@ -7317,16 +7323,23 @@ impl CayenneTableProvider {
     /// point-scan filter and the source delivery key.
     ///
     /// # Errors
-    /// Returns an error if the table has no PK converter or the bytes are
+    /// Returns an error if the table has no primary key, or if the bytes are
     /// malformed for its key schema.
     pub fn decode_pk_keys(&self, pk_bytes: &[Vec<u8>]) -> Result<Vec<ArrayRef>> {
-        let converter = self
-            .pk_row_converter
-            .as_ref()
-            .ok_or_else(|| Error::Internal {
+        ensure!(
+            !self.pk_column_indices.is_empty(),
+            InternalSnafu {
                 table: self.table_name().to_string(),
-                message: "decode_pk_keys requires a primary-key RowConverter".to_string(),
-            })?;
+                message: "decode_pk_keys requires a primary key".to_string(),
+            }
+        );
+        let converter = self.pk_row_converter.as_ref().map_or_else(
+            || {
+                self.build_pk_converter(&self.pk_column_indices)
+                    .map(Arc::new)
+            },
+            |converter| Ok(Arc::clone(converter)),
+        )?;
         let rows = pk_bytes
             .iter()
             .map(|bytes| crate::row_converter::Row::from_encoded(bytes));
@@ -44153,8 +44166,29 @@ mod tests {
         vortex_config: VortexConfig,
         on_conflict: OnConflict,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            schema,
+            vec!["id".to_string()],
+            vortex_config,
+            on_conflict,
+        )
+        .await
+    }
 
+    async fn create_cdc_table_with_schema(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        schema: SchemaRef,
+        primary_key: Vec<String>,
+        vortex_config: VortexConfig,
+        on_conflict: OnConflict,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
         let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
@@ -44165,15 +44199,10 @@ mod tests {
             as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema,
-            primary_key: vec!["id".to_string()],
+            primary_key,
             on_conflict: Some(on_conflict),
             base_path: data_dir,
             partition_column: None,
@@ -44185,6 +44214,109 @@ mod tests {
             .await
             .expect("table created");
         (provider, catalog, temp_dir)
+    }
+
+    /// Build an upsert table keyed by `pk_columns` (name, type), in key order.
+    async fn create_table_with_pk_columns(
+        table_name: &str,
+        pk_columns: &[(&str, DataType)],
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, TempDir) {
+        let key_names: Vec<String> = pk_columns
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        let mut fields: Vec<Field> = pk_columns
+            .iter()
+            .map(|(name, data_type)| Field::new(*name, data_type.clone(), false))
+            .collect();
+        fields.push(Field::new("value", DataType::Int64, false));
+
+        let on_conflict = OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                key_names.clone(),
+            ),
+        );
+        let (provider, _catalog, temp_dir) = create_cdc_table_with_schema(
+            table_name,
+            runtime_env,
+            Arc::new(Schema::new(fields)),
+            key_names,
+            VortexConfig::default(),
+            on_conflict,
+        )
+        .await;
+        (provider, temp_dir)
+    }
+
+    /// Whether `pk_row_converter` is cached is the deletion-vector key-encoding
+    /// discriminator: an `Int64Pk` table's tombstone keys are raw big-endian,
+    /// every other shape's are `RowConverter` `OwnedRow` encodings (see
+    /// `partition_cold_manifest_for_promotion`). Caching a converter for a
+    /// single-`Int64` primary key would decode those raw-BE keys through a
+    /// `RowConverter`, corrupting carry-forward classification and cold-file
+    /// partitioning — so pin which shape caches one.
+    #[tokio::test]
+    async fn pk_row_converter_is_none_exactly_for_the_int64_pk_strategy() {
+        let ctx = SessionContext::new();
+
+        let (int64_pk, _tmp_int64) = create_table_with_pk_columns(
+            "pk_guard_int64",
+            &[("id", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int64_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::Int64Pk { .. }
+            ),
+            "a single-Int64 primary key selects the Int64Pk deletion strategy"
+        );
+        assert!(
+            int64_pk.pk_row_converter.is_none(),
+            "the Int64Pk strategy must cache no RowConverter: its deletion-vector \
+             tombstone keys are raw big-endian, not OwnedRow encodings"
+        );
+
+        let (int32_pk, _tmp_int32) = create_table_with_pk_columns(
+            "pk_guard_int32",
+            &[("id", DataType::Int32)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                int32_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "an Int32 primary key selects the RowConverterBased deletion strategy"
+        );
+        assert!(
+            int32_pk.pk_row_converter.is_some(),
+            "the RowConverterBased strategy must cache its RowConverter"
+        );
+
+        // `Int64Pk` is selected only for one Int64 column; a composite of two
+        // uses `RowConverterBased` and caches a converter.
+        let (composite_pk, _tmp_composite) = create_table_with_pk_columns(
+            "pk_guard_composite",
+            &[("id", DataType::Int64), ("part", DataType::Int64)],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(
+            matches!(
+                composite_pk.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "a composite primary key selects the RowConverterBased deletion strategy \
+             even when every column is Int64"
+        );
+        assert!(
+            composite_pk.pk_row_converter.is_some(),
+            "a composite Int64 primary key must cache its RowConverter"
+        );
     }
 
     fn id_value_batch(schema: SchemaRef, ids: &[i64], values: &[i64]) -> RecordBatch {

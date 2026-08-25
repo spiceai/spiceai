@@ -53,7 +53,7 @@ limitations under the License.
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
@@ -63,6 +63,8 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
+use opentelemetry::KeyValue;
+use runtime_metrics::acceleration as metrics;
 use tokio::task::JoinHandle;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
@@ -84,6 +86,8 @@ pub(crate) struct WriteBackWorker {
     /// Primary-key column names, in key order.
     pk_columns: Vec<String>,
     dataset_name: String,
+    /// The backlog gauge's label set, built once.
+    dataset_labels: [KeyValue; 1],
 }
 
 impl WriteBackWorker {
@@ -99,6 +103,7 @@ impl WriteBackWorker {
             provider: Arc::new(provider),
             federated,
             pk_columns,
+            dataset_labels: [KeyValue::new("dataset", dataset_name.clone())],
             dataset_name,
         };
         tokio::spawn(async move { worker.run().await })
@@ -124,8 +129,17 @@ impl WriteBackWorker {
         // transient failure never leaves us stuck at a long delay, and never
         // advanced by an empty poll (an empty dirty set is not a failure).
         let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+        let mut last_backlog_sample = None;
         loop {
             match self.deliver_batch().await {
+                Ok(0) => {
+                    // Nothing was claimed, which proves the dirty set is empty —
+                    // publish that without paying for a count.
+                    backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+                    self.publish_backlog(0);
+                    last_backlog_sample = Some(Instant::now());
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
                 Ok(delivered) => {
                     // Success — reset the error backoff.
                     backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
@@ -133,10 +147,19 @@ impl WriteBackWorker {
                         // Dirty set drained (fewer than a full batch remained);
                         // idle-poll for the next commit — NOT an error, so the
                         // backoff stays reset.
+                        if self.count_and_publish_backlog().await {
+                            last_backlog_sample = Some(Instant::now());
+                        }
                         tokio::time::sleep(POLL_INTERVAL).await;
+                    } else if last_backlog_sample
+                        .is_none_or(|sampled_at| sampled_at.elapsed() >= POLL_INTERVAL)
+                    {
+                        // A count scans the remaining dirty set, so sample at
+                        // most once per poll interval while full batches drain.
+                        if self.count_and_publish_backlog().await {
+                            last_backlog_sample = Some(Instant::now());
+                        }
                     }
-                    // Else a full batch was claimed — more may remain; loop
-                    // immediately to keep draining.
                 }
                 Err(e) => {
                     let delay = backoff.next_duration().unwrap_or(POLL_INTERVAL);
@@ -145,8 +168,38 @@ impl WriteBackWorker {
                         error = %e,
                         "durable write-back delivery failed; retrying in {delay:?}"
                     );
+                    if self.count_and_publish_backlog().await {
+                        last_backlog_sample = Some(Instant::now());
+                    }
                     tokio::time::sleep(delay).await;
                 }
+            }
+        }
+    }
+
+    /// Publish an already-known undelivered-marker backlog for this dataset.
+    fn publish_backlog(&self, pending: i64) {
+        metrics::WRITE_BACK_PENDING_KEYS.record(pending, &self.dataset_labels);
+    }
+
+    /// Count this dataset's undelivered markers and publish them.
+    ///
+    /// A delivery that can never succeed surfaces only as a backlog that never
+    /// falls, so the failing pass has to publish it too — that is the state the
+    /// gauge exists to make visible.
+    async fn count_and_publish_backlog(&self) -> bool {
+        match self.provider.dirty_key_count().await {
+            Ok(pending) => {
+                self.publish_backlog(pending);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    dataset = %self.dataset_name,
+                    error = %e,
+                    "durable write-back: could not read the undelivered-marker backlog for the gauge"
+                );
+                false
             }
         }
     }
@@ -165,9 +218,11 @@ impl WriteBackWorker {
 
         let pk_bytes: Vec<Vec<u8>> = claimed.iter().map(|(bytes, _)| bytes.clone()).collect();
         let pk_arrays = self.provider.decode_pk_keys(&pk_bytes).map_err(to_df_err)?;
-        let Some(pk_values) = pk_arrays.into_iter().next() else {
-            return Ok(0);
-        };
+        let pk_values = pk_arrays.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal(
+                "durable write-back marker decode returned no primary-key column".to_string(),
+            )
+        })?;
         let filter = pk_in_filter(&self.pk_columns[0], &pk_values)?;
 
         // Read the claimed keys' current committed values from the accelerator,
