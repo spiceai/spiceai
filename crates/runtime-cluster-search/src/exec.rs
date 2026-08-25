@@ -62,7 +62,9 @@ use flight_client::cookie::CookieStore;
 use futures::{TryStreamExt, future::try_join_all, stream};
 use search::{
     SEARCH_SCORE_COLUMN_NAME,
-    generation::text_search::{GlobalBm25Stats, bm25_stats::STATS_GENERATION_COLUMN},
+    generation::text_search::{
+        DEFAULT_LIMIT_MAXIMUM, GlobalBm25Stats, bm25_stats::STATS_GENERATION_COLUMN,
+    },
 };
 
 use crate::node::DistributedSearchNode;
@@ -564,7 +566,16 @@ impl ExecutionPlan for DistributedSearchExec {
                 }
             }
 
-            let effective_fetch = params.fetch.map(|n| n + params.skip);
+            // Unlike the per-executor query (which passes `fetch` through
+            // unmodified — `None` lets each executor fall back to its own
+            // local `DEFAULT_LIMIT_MAXIMUM`), the merge must itself cap an
+            // omitted `fetch` at `DEFAULT_LIMIT_MAXIMUM`. Otherwise every
+            // executor's up-to-`DEFAULT_LIMIT_MAXIMUM` rows are concatenated
+            // with no final trim, so the merged result can hold up to
+            // `DEFAULT_LIMIT_MAXIMUM * executors.len()` rows instead of the
+            // single-node maximum.
+            let merge_fetch = params.fetch.unwrap_or(DEFAULT_LIMIT_MAXIMUM);
+            let effective_fetch = Some(merge_fetch + params.skip);
             let indices = lexsort_to_indices(&sort_columns, effective_fetch)
                 .map_err(|e: ArrowError| DataFusionError::ArrowError(Box::new(e), None))?;
             let sorted_columns: Vec<ArrayRef> = combined
@@ -578,10 +589,7 @@ impl ExecutionPlan for DistributedSearchExec {
 
             let num_rows = sorted.num_rows();
             let start = params.skip.min(num_rows);
-            let mut length = num_rows - start;
-            if let Some(fetch) = params.fetch {
-                length = length.min(fetch);
-            }
+            let length = (num_rows - start).min(merge_fetch);
             let windowed = sorted.slice(start, length);
 
             // 6. Emit a single batch in the declared output schema's column order.

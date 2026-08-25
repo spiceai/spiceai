@@ -310,7 +310,15 @@ impl AnalyzerRule for DistributedSearchRewrite {
             if let LogicalPlan::Filter(filter) = &plan
                 && let LogicalPlan::TableScan(scan) = filter.input.as_ref()
             {
-                return match self.rewrite_scan(scan, Some(&filter.predicate))? {
+                // The filter's column references are qualified with the scan's
+                // own table reference (e.g. `"text_search(...)".subject`), but
+                // the rewritten plan's source is a different literal
+                // `text_search(..., global_stats => ...)` call — unqualify
+                // before splitting/unparsing so a pushed conjunct resolves
+                // against it, exactly as the `SubqueryAlias` branch below does.
+                let unqualified_predicate =
+                    unqualify_column_refs(&filter.predicate, &scan.table_name)?;
+                return match self.rewrite_scan(scan, Some(&unqualified_predicate))? {
                     Some(rewritten) => Ok(Transformed::new(
                         rewrap_remaining_filter(rewritten)?,
                         true,
