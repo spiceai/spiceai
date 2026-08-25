@@ -1321,7 +1321,8 @@ async fn resolve_start_position(
 }
 
 /// Apply `invalid_checkpoint_behavior` for one member: `Error` fails the
-/// member's stream; `Restart` clears its saved position so it re-snapshots.
+/// member's stream; `Restart` accepts the rebuild, leaving the unusable position
+/// in place for [`rebootstrap_member`]'s boundary committer to replace.
 fn apply_invalid_checkpoint(
     params: &ReplicationParams,
     dataset_name: &str,

@@ -106,7 +106,7 @@ as the Postgres connector's snapshot/WAL boundary.
 | `mysql_replication_initial_snapshot` | `auto` | When existing rows load: `auto` snapshots when no resumable position exists; `disabled` streams changes only; `always` re-snapshots on every start. `disabled` governs the *first* load — see [position recovery](#when-the-position-is-purged) for the one case that reloads regardless. |
 | `mysql_replication_checkpoint_interval` | `10s` | How often the committed position persists to the sidecar. Bounds crash-replay volume. |
 | `mysql_replication_bootstrap_batch_size` | `8192` | Rows per emitted snapshot batch (max `1048576`). |
-| `mysql_replication_invalid_checkpoint_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `restart` (drop the position and rebuild the acceleration from the source, whatever `mysql_replication_initial_snapshot` is set to). |
+| `mysql_replication_invalid_checkpoint_behavior` | `error` | What to do when the persisted position was purged from the source: `error` or `restart` (rebuild the acceleration from the source, whatever `mysql_replication_initial_snapshot` is set to). |
 | `mysql_replication_ready_lag` | `2s` | For `refresh_mode: changes`, the dataset is marked Ready once its replication lag (now minus the newest applied change's source-commit time) falls below this — it stays not-ready while snapshotting or draining a backlog, so it never serves stale or incomplete data. Accepts any [fundu](https://docs.rs/fundu) duration string. |
 
 The runtime-level CDC apply tunables (`cdc_prefetch_buffer`,
@@ -126,7 +126,7 @@ params:
   mysql_replication_invalid_checkpoint_behavior: restart
 ```
 
-to instead drop the stale position and rebuild the acceleration from the
+to instead ignore the stale position and rebuild the acceleration from the
 source automatically.
 
 The rebuild replaces the acceleration's contents in one atomic swap, so
@@ -134,6 +134,16 @@ queries issued while it runs are answered from the pre-rebuild contents until
 the replacement completes — never from an empty or partially loaded table.
 Change streaming resumes on top of the replacement; the overlap between the
 captured position and the re-read replays idempotently.
+
+The stale position is not deleted when the rebuild starts; it is replaced with
+the rebuild's own position only once the accelerator has durably applied the
+replacement. While it sits there it is the only durable record that the
+acceleration holds rows no position explains, so a crash mid-rebuild costs at
+most one repeated rebuild — the next start re-detects the position as unusable
+and rebuilds again. Deleting it up front and then crashing would instead leave a
+populated acceleration with no position at all, which the next start reads as a
+first load, and a first load empties the table before refilling it from a
+snapshot — the very window this behavior exists to close.
 
 `mysql_replication_initial_snapshot: disabled` does **not** suppress this
 rebuild. That setting governs the first load — whether existing rows are read
