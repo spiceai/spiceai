@@ -20,25 +20,88 @@ runs:
       if: runner.os == 'macOS'
       shell: bash
       run: |
-        brew install cmake pkg-config openssl unixodbc llvm libnfs
-        # `brew install` only warns — and still exits 0 — when a formula is already in
-        # the Cellar but unlinked, so its binaries never reach PATH. The failure then
-        # surfaces an hour later inside an unrelated crate, as a build script dying with
-        # "is `cmake` not installed?" and no error[EXXXX] to point at. Link the tools
-        # that build scripts invoke by bare name, then assert they resolve, so a stale
-        # runner fails here with a named cause. openssl and llvm are keg-only and are
-        # deliberately left unlinked; the build locates them via `brew --prefix`.
-        for tool in cmake pkg-config; do
-          brew link --overwrite "$tool" || true
-        done
-        missing=()
-        for tool in cmake pkg-config; do
-          command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
-        done
-        if [ ${#missing[@]} -ne 0 ]; then
-          echo "::error::Not on PATH after 'brew install': ${missing[*]}. Run 'brew link --overwrite ${missing[*]}' on this runner."
+        # Probe before installing. These runners are long-lived and already carry the
+        # toolchain, so `brew install` is normally a no-op — but it still has to take
+        # Homebrew's global lock first, and when that lock is not writable the install
+        # aborts before doing any work. Every macOS job on the pool then fails here over
+        # a toolchain that is already present (spiceai#13463). Probing the Cellar and
+        # PATH directly costs no `brew` invocation, so a runner that needs nothing is
+        # unaffected by the state of the lock.
+        brew_bin="$(command -v brew || true)"
+        if [ -z "$brew_bin" ]; then
+          echo "::error::'brew' is not on PATH, so the cc toolchain cannot be installed or verified on this runner."
           exit 1
         fi
+        brew_prefix="$(dirname "$(dirname "$brew_bin")")"
+        formulas=(cmake pkg-config openssl unixodbc llvm libnfs)
+        missing=()
+        for formula in "${formulas[@]}"; do
+          [ -d "$brew_prefix/opt/$formula" ] || missing+=("$formula")
+        done
+        # cmake and pkg-config are invoked by bare name from build scripts, so being in
+        # the Cellar is not sufficient — the name also has to resolve to *this* Homebrew.
+        # Requiring the resolved path to sit under the prefix catches both an unlinked
+        # keg and a foreign copy earlier on PATH shadowing it; either way the tool routes
+        # into the `brew link --overwrite` below, which is what puts the keg back in
+        # front. Matching on the prefix rather than a fixed path keeps this correct on an
+        # Intel runner, where Homebrew itself lives under /usr/local.
+        for tool in cmake pkg-config; do
+          resolved="$(command -v "$tool" 2>/dev/null || true)"
+          case "$resolved" in
+            "$brew_prefix"/*) ;;
+            *) missing+=("$tool") ;;
+          esac
+        done
+        if [ ${#missing[@]} -ne 0 ]; then
+          echo "cc toolchain incomplete on this runner (${missing[*]}); installing."
+          brew install cmake pkg-config openssl unixodbc llvm libnfs
+          # `brew install` only warns — and still exits 0 — when a formula is already in
+          # the Cellar but unlinked, so its binaries never reach PATH. The failure then
+          # surfaces an hour later inside an unrelated crate, as a build script dying with
+          # "is `cmake` not installed?" and no error[EXXXX] to point at. Link the tools
+          # that build scripts invoke by bare name. openssl and llvm are keg-only and are
+          # deliberately left unlinked; the build locates them via `brew --prefix`.
+          for tool in cmake pkg-config; do
+            brew link --overwrite "$tool" || true
+          done
+        else
+          echo "cc toolchain already present under $brew_prefix; skipping 'brew install'."
+        fi
+        # Assert unconditionally, so a runner whose install was skipped still fails here
+        # with a named cause rather than deep inside a build script. This asserts only
+        # that the name resolves at all — deliberately not that it resolves to
+        # $brew_prefix — so a runner that builds today against a tool from elsewhere on
+        # PATH keeps working instead of newly failing here.
+        unresolved=()
+        for tool in cmake pkg-config; do
+          command -v "$tool" >/dev/null 2>&1 || unresolved+=("$tool")
+        done
+        if [ ${#unresolved[@]} -ne 0 ]; then
+          echo "::error::Not on PATH: ${unresolved[*]}. Run 'brew link --overwrite ${unresolved[*]}' on this runner."
+          exit 1
+        fi
+
+        # `odbc-sys` takes its whole library search path from `brew --prefix`, so on a
+        # runner where brew cannot run it falls back to the DYLD defaults and the link
+        # dies far downstream as "ld: library 'odbc' not found" (#13475). clang expands
+        # LIBRARY_PATH into -L entries after those already on the command line, so this
+        # restores the search path without displacing anything a build script emitted,
+        # and it is not a cargo fingerprint input, so it costs no rebuild.
+        #
+        # Only the unixodbc keg goes on the path, never $brew_prefix/lib. The keg holds
+        # just the libodbc* families; the linked directory holds a few hundred dylibs,
+        # and measured with `cc -l<name> -Wl,-t`, publishing it newly satisfies -lcrypto,
+        # -lssl and -lzstd, none of which resolve without it. A crate whose build script
+        # emits one of those names (openssl-sys, libssh2-sys, zstd-sys) would then link a
+        # second, differently-built copy on every macOS job in the repo. The keg path is
+        # also what covers the unlinked-formula case the probe above accepts, so the
+        # linked directory would contribute nothing but that blast radius.
+        library_path="${LIBRARY_PATH:+$LIBRARY_PATH:}$brew_prefix/opt/unixodbc/lib"
+        if [ "$(printf '%s' "$library_path" | wc -l | tr -d ' ')" != "0" ]; then
+          echo "::error::Refusing to export a multi-line LIBRARY_PATH built from '$brew_prefix'."
+          exit 1
+        fi
+        echo "LIBRARY_PATH=$library_path" >> "$GITHUB_ENV"
 
     - name: Install cc (Windows)
       if: runner.os == 'Windows'

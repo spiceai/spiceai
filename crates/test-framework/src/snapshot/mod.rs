@@ -17,6 +17,10 @@ limitations under the License.
 use std::{panic, sync::Arc};
 
 use crate::{flight::query_to_batches, queries::Query, utils::sanitize_record_batches};
+use arrow::{
+    array::{ArrayRef, AsArray, Float32Array, Float64Array, RecordBatch},
+    datatypes::{DataType, Float32Type, Float64Type},
+};
 use spiceai::Client as SpiceClient;
 
 pub const CAYENNE_PATH_FILTER_PATTERN: &str =
@@ -59,6 +63,17 @@ const CONNECTION_CONTEXT_FILTER_REPLACEMENT: &str = "compute_context=<CONNECTION
 const ENDPOINT_CONTEXT_FILTER_PATTERN: &str = r"compute_context=(?:url=|sc://)\S+";
 const ENDPOINT_CONTEXT_FILTER_REPLACEMENT: &str = CONNECTION_CONTEXT_FILTER_REPLACEMENT;
 
+/// Redact the scan counters `CayenneAccelerationExec` surfaces in its plan display.
+/// `snapshots_scanned`/`files_scanned` report read amplification, which depends on
+/// ingestion batching and how far compaction has progressed when the query runs —
+/// state that varies run to run, not plan structure. Left in the snapshot, the
+/// explain check fails whenever the accelerator happens to hold a different file
+/// count (e.g. `files_scanned=30` vs `=35`) even though the plan is identical.
+const CAYENNE_SCAN_COUNTERS_FILTER_PATTERN: &str =
+    r"CayenneAccelerationExec: snapshots_scanned=\d+, files_scanned=\d+";
+const CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT: &str =
+    "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+
 /// Queries temporarily excluded from explain-plan snapshot validation because their
 /// plans are not yet stable enough to snapshot deterministically.
 const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
@@ -86,6 +101,10 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
             ENDPOINT_CONTEXT_FILTER_PATTERN.to_string(),
             ENDPOINT_CONTEXT_FILTER_REPLACEMENT,
         ),
+        (
+            CAYENNE_SCAN_COUNTERS_FILTER_PATTERN.to_string(),
+            CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT,
+        ),
         (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
         (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
         (r"file_groups=\{(\d+ groups?): [^}]+\}".to_string(), "file_groups={$1: [<redacted>]}"),
@@ -98,6 +117,117 @@ fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static st
             "<GROUPING_PAIR>",
         ),
     ]
+}
+
+/// How a query's results are recorded into an insta snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotMode {
+    /// Assert the exact rendered results.
+    Exact,
+    /// Round float columns to [`SNAPSHOT_FLOAT_SIGNIFICANT_DIGITS`] significant
+    /// digits before asserting. For scenarios whose data sources surface numeric
+    /// columns as floats: their aggregates sum floats across partitions, float
+    /// addition is not associative, and the combine order follows the partition
+    /// count and completion order — so the exact low bits differ per machine.
+    RoundedFloats,
+    /// Do not snapshot this query's results.
+    Skip,
+}
+
+/// Decides per (scenario name, query name) how results are snapshotted.
+pub type ResultsSnapshotPredicate = fn(&str, &str) -> SnapshotMode;
+
+/// Number of significant digits a float column keeps in a
+/// [`SnapshotMode::RoundedFloats`] results snapshot.
+///
+/// Observed cross-machine drift on float-source TPC-H aggregates is ~1e-15
+/// relative, so the 1e-9..1e-10 relative quantum of ten significant digits sits
+/// ~1e5 above the noise — equal results always render equal — while keeping
+/// sensitivity to real drift: a single dropped row in a scale-factor-1 aggregate
+/// shifts the result by ~1e-7 relative, well above the quantum.
+const SNAPSHOT_FLOAT_SIGNIFICANT_DIGITS: i32 = 10;
+
+/// Round a finite value to [`SNAPSHOT_FLOAT_SIGNIFICANT_DIGITS`] significant
+/// digits. Zero (either sign), NaN, and infinities pass through (negative zero
+/// normalizes to positive so a `-0.0`/`0.0` split between runs renders equal);
+/// values whose scaling would overflow (subnormals) are returned unrounded.
+fn round_to_significant_digits(value: f64) -> f64 {
+    if value == 0.0 {
+        return 0.0;
+    }
+    if !value.is_finite() {
+        return value;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "log10 of a finite non-zero f64 is within [-324, 309]"
+    )]
+    let magnitude = value.abs().log10().floor() as i32;
+    // Scale with a positive power of ten in both directions: 10^k is exactly
+    // representable for k <= 22, so multiplying back (or dividing back) by it
+    // reproduces clean values like 56586600000.0 instead of ...99999.999996,
+    // which dividing by an inexact negative power (1e-5) would yield.
+    let exponent = SNAPSHOT_FLOAT_SIGNIFICANT_DIGITS - 1 - magnitude;
+    if exponent >= 0 {
+        let factor = 10f64.powi(exponent);
+        let scaled = value * factor;
+        if scaled.is_finite() {
+            scaled.round() / factor
+        } else {
+            value
+        }
+    } else {
+        let factor = 10f64.powi(-exponent);
+        (value / factor).round() * factor
+    }
+}
+
+fn round_f32_to_significant_digits(value: f32) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "narrowing back to the column's own f32 precision is the point"
+    )]
+    let rounded = round_to_significant_digits(f64::from(value)) as f32;
+    rounded
+}
+
+/// Round every top-level `Float64`/`Float32` column to
+/// [`SNAPSHOT_FLOAT_SIGNIFICANT_DIGITS`] significant digits so results snapshots
+/// don't record the machine-dependent low bits of float aggregates. All other
+/// column types — in particular `Decimal128`, which is exact — pass through
+/// untouched, as do nulls.
+pub fn round_float_columns(
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
+    batches
+        .iter()
+        .map(|batch| {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| match column.data_type() {
+                    DataType::Float64 => {
+                        let rounded: Float64Array = column
+                            .as_primitive::<Float64Type>()
+                            .iter()
+                            .map(|value| value.map(round_to_significant_digits))
+                            .collect();
+                        Arc::new(rounded) as ArrayRef
+                    }
+                    DataType::Float32 => {
+                        let rounded: Float32Array = column
+                            .as_primitive::<Float32Type>()
+                            .iter()
+                            .map(|value| value.map(round_f32_to_significant_digits))
+                            .collect();
+                        Arc::new(rounded) as ArrayRef
+                    }
+                    _ => Arc::clone(column),
+                })
+                .collect();
+            RecordBatch::try_new(batch.schema(), columns)
+        })
+        .collect()
 }
 
 pub async fn record_explain_plan(
@@ -268,6 +398,108 @@ fn get_indent_level(line: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Array, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::{round_float_columns, round_to_significant_digits};
+
+    /// The property the rounding exists for: the same aggregate computed with a
+    /// different partial-sum combine order must render identically. Inputs are
+    /// real value pairs from flapping `dynamodb`/`glue`/`iceberg` TPC-H snapshots.
+    #[test]
+    fn float_noise_collapses_to_equal_values() {
+        let noisy_pairs = [
+            (56_586_554_400.730_125, 56_586_554_400.729_97), // tpch_q1 sum_base_price
+            (38_273.129_734_621_754, 38_273.129_734_621_65), // tpch_q1 avg_price
+            (0.049_996_586_053_729_28, 0.049_996_586_053_729_36), // tpch_q1 avg_disc
+            (53_741_292_684.603_99, 53_741_292_684.603_935), // tpch_q1 sum_disc_price
+        ];
+        for (a, b) in noisy_pairs {
+            assert_eq!(
+                round_to_significant_digits(a).to_bits(),
+                round_to_significant_digits(b).to_bits(),
+                "noise pair ({a}, {b}) must round to the same value"
+            );
+        }
+    }
+
+    /// Asserts the rounded value is bit-identical to the expected double —
+    /// snapshot text is the shortest-roundtrip rendering of the bits, so
+    /// bit equality is exactly "renders as the same string".
+    fn assert_rounds_to(input: f64, expected: f64) {
+        let rounded = round_to_significant_digits(input);
+        assert_eq!(
+            rounded.to_bits(),
+            expected.to_bits(),
+            "{input} rounded to {rounded}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn rounds_to_ten_significant_digits_across_magnitudes() {
+        assert_rounds_to(38_273.129_734_621_754, 38_273.129_73);
+        assert_rounds_to(0.049_985_295_838_382_654, 0.049_985_295_84);
+        assert_rounds_to(-38_273.129_734_621_754, -38_273.129_73);
+        assert_rounds_to(100.0, 100.0);
+        assert_rounds_to(99.999_999_999_99, 100.0);
+        assert_rounds_to(1_478_493_123_456.0, 1_478_493_123_000.0);
+        // Values with <= 10 significant digits render exactly as before.
+        assert_rounds_to(1_478_493.0, 1_478_493.0);
+        assert_rounds_to(3.21, 3.21);
+    }
+
+    #[test]
+    fn preserves_non_roundable_values() {
+        assert_rounds_to(0.0, 0.0);
+        // Negative zero normalizes so a -0.0/0.0 split between runs renders equal.
+        assert_rounds_to(-0.0, 0.0);
+        assert!(round_to_significant_digits(f64::NAN).is_nan());
+        assert_rounds_to(f64::INFINITY, f64::INFINITY);
+        assert_rounds_to(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        // Subnormal: scaling overflows, the raw value passes through.
+        let subnormal = f64::MIN_POSITIVE / 2.0;
+        assert_rounds_to(subnormal, subnormal);
+    }
+
+    #[test]
+    fn rounds_only_float_columns_and_keeps_nulls() -> Result<(), arrow::error::ArrowError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f64", DataType::Float64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("count", DataType::Int64, false),
+            Field::new("flag", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(56_586_554_400.730_125), None])),
+                Arc::new(Float32Array::from(vec![Some(38_273.13_f32), None])),
+                Arc::new(Int64Array::from(vec![1_478_493_i64, 38_854])),
+                Arc::new(StringArray::from(vec!["A", "N"])),
+            ],
+        )?;
+
+        let rounded = round_float_columns(std::slice::from_ref(&batch))?;
+        assert_eq!(rounded.len(), 1);
+
+        let f64_col = rounded[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| arrow::error::ArrowError::CastError("f64 column".into()))?;
+        assert_eq!(f64_col.value(0).to_bits(), 56_586_554_400.0f64.to_bits());
+        assert!(f64_col.is_null(1), "null must survive rounding");
+
+        // Non-float columns must be the same arrays, not copies.
+        assert!(Arc::ptr_eq(batch.column(2), rounded[0].column(2)));
+        assert!(Arc::ptr_eq(batch.column(3), rounded[0].column(3)));
+        Ok(())
+    }
+
     #[test]
     fn test_temp_dir_regex_pattern() -> Result<(), String> {
         let test_cases = [
@@ -544,6 +776,37 @@ mod tests {
         // The `host=` form stays the other pattern's job; this one must not half-match
         // it and leave a partially-redacted context behind.
         let input = "VirtualExecutionPlan name=mysql compute_context=host=db,port=3306,db=tpch,user=root base_sql=SELECT 1";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cayenne_scan_counters_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(super::CAYENNE_SCAN_COUNTERS_FILTER_PATTERN)
+            .map_err(|e| format!("{e}"))?;
+        let replacement = super::CAYENNE_SCAN_COUNTERS_FILTER_REPLACEMENT;
+
+        // Different file counts must redact to the identical token.
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=30   |";
+        let expected = "|               |   CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        let input = "|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=35   |";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // A not-yet-refreshed accelerator reports zero for both counters.
+        let input = "CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0";
+        let expected = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Idempotent: an already-redacted snapshot is left unchanged.
+        let input = "CayenneAccelerationExec: snapshots_scanned=<N>, files_scanned=<N>";
+        assert_eq!(regex.replace_all(input, replacement), input);
+
+        // Other operators' counters are not this filter's job.
+        let input =
+            "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
         assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())

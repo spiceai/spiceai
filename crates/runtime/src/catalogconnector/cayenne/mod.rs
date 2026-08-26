@@ -21,7 +21,9 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
     parameters::Parameters,
 };
 use async_trait::async_trait;
@@ -43,8 +45,7 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         "Local directory for Cayenne SQLite metadata. Defaults to spice data directory.",
     ),
     ParameterSpec::component("segment_cache_mb")
-        .description("Vortex segment cache size in MB. Default: 256.")
-        .default("256"),
+        .description("Ignored: the Vortex segment cache is now one budget shared by every Cayenne table rather than a cache per catalog, so a per-catalog size no longer has anything to size. Set runtime.params.cayenne_segment_cache_mb instead (in MB; 0 disables caching). A value set here is reported at startup and otherwise has no effect."),
     ParameterSpec::component("target_file_size_mb")
         .description("Target Vortex file size in MB. Default: 256.")
         .default("256"),
@@ -131,12 +132,21 @@ impl CayenneCatalogConnector {
             .ok()
             .map(ToOwned::to_owned);
 
+        // The segment cache is process-wide, so a per-catalog size has nothing to
+        // size. Report it the same way the per-dataset parameter is reported,
+        // rather than discarding it silently — a catalog that set `0` to disable
+        // caching would otherwise be given a cache with no indication why.
         let segment_cache_mb = self
             .params
             .get("segment_cache_mb")
             .expose()
             .ok()
             .and_then(|v| parse_num_param::<usize>(v, "segment_cache_mb"));
+        if self.params.get("segment_cache_mb").expose().ok().is_some() {
+            tracing::warn!(
+                "catalog.params.cayenne_segment_cache_mb is ignored. The Vortex segment cache is now a single budget shared by every Cayenne table instead of one cache per catalog. To control it, set runtime.params.cayenne_segment_cache_mb (in MB; 0 disables caching). See: https://spiceai.org/docs/components/catalogs/cayenne"
+            );
+        }
         let target_file_size_mb = self
             .params
             .get("target_file_size_mb")
@@ -231,27 +241,58 @@ impl CayenneCatalogConnector {
         // path, the catalog path has no schema inference, so `adaptive` is seeded
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
-        let tuning_mode = self
-            .params
-            .get("tuning")
-            .expose()
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase());
-        if let Some(mode) = &tuning_mode
-            && mode != "auto"
-            && mode != "adaptive"
-        {
+        let raw_tuning = self.params.get("tuning").expose().ok();
+
+        // Probe under the resolved data/metadata dirs, falling back to the data base path.
+        let base = crate::spice_data_base_path();
+        let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
+        let metastore_path = metadata_dir.clone().unwrap_or(base);
+
+        // The engine owns both the `tuning` vocabulary and the hardware probe: a catalog
+        // has no schema inference, so the seed comes from the host alone, and the
+        // controller anchors its bounds to `[floor, 4x seed]` — a seed that ignored the
+        // host would leave it riding the wrong window. Asked through the registration
+        // slice rather than by naming the engine crate.
+        let tuning = data_accelerator_api::DATA_ACCELERATOR_REGISTRATIONS
+            .iter()
+            .find(|registration| registration.engine == runtime_acceleration::Engine::Cayenne)
+            .map(|registration| (registration.constructor)());
+        let outcome = if let Some(engine) = tuning {
+            engine
+                .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
+                .await
+        } else {
+            // This catalog builds its provider from the `cayenne` library, so it works in a
+            // binary that links no Cayenne *accelerator* — but only the engine can seed the
+            // controller, so `adaptive` cannot be honoured here. Say so rather than quietly
+            // serving a statically-tuned catalog, which is the same configuration an
+            // operator would get by asking for `auto`.
+            //
+            // The engine owns the `tuning` vocabulary; the two names are recognized here
+            // only to decide which warning a build that cannot ask should emit, so that a
+            // typo is still reported rather than passing as a valid mode.
+            let value = raw_tuning.map(str::trim).unwrap_or_default();
+            if value.eq_ignore_ascii_case("adaptive") {
+                tracing::warn!(
+                    "Cayenne catalog parameter `tuning` is 'adaptive', but this build links no Cayenne accelerator to size the controller, so the catalog runs with static tuning ('auto') instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
+                );
+            }
+            data_accelerator_api::AdaptiveTuningOutcome {
+                tuning_value_invalid: !value.is_empty()
+                    && !value.eq_ignore_ascii_case("auto")
+                    && !value.eq_ignore_ascii_case("adaptive"),
+                seeds: None,
+            }
+        };
+
+        if outcome.tuning_value_invalid {
             tracing::warn!(
-                "Invalid Cayenne catalog parameter `tuning` value `{mode}`; expected `auto` or `adaptive`, defaulting to `auto`."
+                "Invalid Cayenne catalog parameter `tuning` value `{}`; expected `auto` or `adaptive`, defaulting to `auto`",
+                raw_tuning.unwrap_or_default().trim()
             );
         }
-        let dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+        let dynamic_tuning = outcome.seeds.is_some();
 
-        // Seed the adaptive-tunable knobs from the host hardware profile (only
-        // when adaptive is requested — `auto` keeps the engine defaults so the
-        // static path is byte-identical to prior behavior). The seed values are
-        // ONLY applied where the operator did not pin the knob explicitly, so an
-        // explicit `cayenne_*` value still wins.
         let (
             seed_compaction_background_interval_ms,
             seed_compaction_trigger_files,
@@ -259,36 +300,16 @@ impl CayenneCatalogConnector {
             seed_inline_flush_max_segments,
             seed_inline_flush_max_bytes,
             seed_write_concurrency,
-        ) = if dynamic_tuning {
-            use crate::dataaccelerator::cayenne::autotune::{HardwareProfile, WorkloadProfile};
-            // Probe storage under the resolved data/metadata dirs (falling back to
-            // the spice data base path), mirroring the accelerator's detection.
-            let base = crate::spice_data_base_path();
-            let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
-            let metastore_path = metadata_dir.clone().unwrap_or(base);
-            // No StorageProfile override is plumbed on the catalog path; auto-detect.
-            let hw = HardwareProfile::detect(
-                crate::component::dataset::acceleration::StorageProfile::Auto,
-                &data_path,
-                &metastore_path,
-            )
-            .await;
-            // Hardware-only workload profile (no inferred row_count / row width).
-            let wl = WorkloadProfile::default();
-            let caps = hw.inline_flush_caps(&wl);
-            (
-                // Small-write/CDC cadence so the controller has a tick to ride.
-                Some(10_000_u64),
-                Some(4_usize),
-                Some(caps.max_rows),
-                Some(caps.max_segments),
-                Some(caps.max_bytes),
-                // Seed write concurrency to the CPU budget's core count so the
-                // controller's [1, cores] window matches the entitlement.
-                Some(hw.cores),
-            )
-        } else {
-            (None, None, None, None, None, None)
+        ) = match outcome.seeds {
+            Some(seeds) => (
+                Some(seeds.compaction_background_interval_ms),
+                Some(seeds.compaction_trigger_files),
+                Some(seeds.inline_flush_max_rows),
+                Some(seeds.inline_flush_max_segments),
+                Some(seeds.inline_flush_max_bytes),
+                Some(seeds.write_concurrency),
+            ),
+            None => (None, None, None, None, None, None),
         };
 
         // The seed only applies where the operator did not set the knob; an
@@ -353,7 +374,7 @@ impl CatalogConnector for CayenneCatalogConnector {
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self.parse_provider_config().await;
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(provider_config, runtime_env)
+            CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),

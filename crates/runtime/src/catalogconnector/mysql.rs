@@ -20,7 +20,11 @@ limitations under the License.
 //! discovery via `information_schema` queries.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
+use crate::{
+    Runtime,
+    component::catalog::{Catalog, table_selector},
+    dataconnector::parameters::ConnectorParams,
+};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use data_components::mysql::provider::MySQLCatalogProvider;
@@ -101,7 +105,7 @@ impl CatalogConnector for MySQLCatalog {
         let catalog_provider = Arc::new(MySQLCatalogProvider::new(
             metadata_pool,
             table_factory,
-            catalog.include.clone(),
+            table_selector(catalog),
         ));
 
         catalog_provider
@@ -285,7 +289,6 @@ mod tests {
             ),
             unsupported_type_action: None,
             component: ConnectorComponent::from(&dataset),
-            context: None,
             io_runtime: Handle::current(),
         }
     }

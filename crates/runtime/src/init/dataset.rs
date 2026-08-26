@@ -14,31 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
+use crate::dataconnector::parameters::RuntimeConnectorContext;
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
-use crate::dataaccelerator::spice_sys::is_shutdown_cancellation;
+use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::{
     AcceleratedTableInvalidChangesSnafu, AcceleratorEngineNotAvailableSnafu,
-    AcceleratorInitializationFailedSnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
-    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
-    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
-    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
-    UnknownDataConnectorSnafu,
-    accelerated_table::AcceleratedTable,
+    AcceleratorInitializationFailedSnafu, DrasiWithoutChangeStreamSnafu,
+    DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackUnsupportedBySourceSnafu, Error,
+    FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshTimedOutSnafu, LogErrors,
+    OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu, Result, Runtime,
+    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
+    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
+    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    accelerated::AcceleratedTable,
     component::dataset::{
         Dataset,
         acceleration::{Acceleration, RefreshMode},
         builder::DatasetBuilder,
     },
-    dataaccelerator::{
-        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
-    },
+    dataaccelerator::{AccelerationSource, validate_snapshot_consistency, validate_snapshot_paths},
     dataconnector::{
         self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -46,22 +50,36 @@ use crate::{
         parameters::ConnectorParamsBuilder,
     },
     embeddings::connector::EmbeddingConnector,
-    error_spaced,
-    federated_table::FederatedTable,
+    federated::FederatedTable,
     search::full_text::connector::FullTextConnector,
     status,
     tracing_util::dataset_registered_trace,
-    warn_spaced,
 };
 use app::App;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
+use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
+use util::{error_spaced, warn_spaced};
+
+/// How long a hot reload waits for the accelerated table it just recreated to
+/// complete its first refresh before abandoning the in-place swap and reloading
+/// the dataset from scratch.
+///
+/// Sized to cover an ordinary reload of a non-file acceleration — file
+/// accelerations do not take this path at all
+/// (`accelerated_dataset_supports_hot_reload`) — while still recovering without a
+/// process restart when the refresh never completes.
+///
+/// This bounds one dataset, not one apply: `apply_dataset_diff` updates changed
+/// datasets sequentially, so an apply changing several of them can spend this
+/// bound once per dataset.
+const HOT_RELOAD_INITIAL_REFRESH_TIMEOUT: Duration = Duration::from_mins(5);
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
@@ -86,7 +104,7 @@ impl Runtime {
         // snapshot configuration (either all enabled or all disabled).
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
             startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
@@ -324,6 +342,24 @@ impl Runtime {
         self.df
             .evolve_and_rebind_accelerated_schema(&dataset, self.secrets(), target_schema)
             .await
+    }
+
+    /// The acceleration checkpoint schema for the dataset named `table_ref`, or `None` when
+    /// there is no such dataset or no persisted checkpoint. The OpenTelemetry ingest uses this
+    /// to build a metric batch against the stored (wide) schema when the dataset is not yet
+    /// registered — e.g. a `sink` dataset parked until its first write after a restart — so a
+    /// data point that omits a NULL dimension still materializes every stored column instead
+    /// of a narrower batch the write would reject.
+    pub async fn accelerated_checkpoint_schema(
+        self: &Arc<Self>,
+        table_ref: &TableReference,
+    ) -> Option<arrow_schema::SchemaRef> {
+        let app = self.read_app().await?;
+        let dataset = Arc::clone(self)
+            .get_valid_datasets(&app, LogErrors(false))
+            .into_iter()
+            .find(|ds| &ds.name == table_ref)?;
+        crate::dataconnector::sink::accelerated_checkpoint_schema(&dataset).await
     }
 
     #[expect(clippy::result_large_err)]
@@ -794,6 +830,42 @@ impl Runtime {
             return Err(err);
         }
 
+        // A `drasi` block only takes effect through the change stream, so a
+        // dataset without one forwards nothing. Silently publishing no changes
+        // to a configured Drasi source is worse than refusing the dataset: the
+        // continuous queries downstream would simply never fire, with nothing to
+        // point at.
+        if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
+            let refresh_mode = ds
+                .acceleration
+                .as_ref()
+                .map(|a| data_connector.resolve_refresh_mode(a.refresh_mode));
+
+            let reason = match refresh_mode {
+                None => Some("not accelerated".to_string()),
+                // Lowercased to match the value as it is spelled in the
+                // Spicepod, which is what the operator has to change.
+                Some(mode) if mode != RefreshMode::Changes => Some(format!(
+                    "accelerated with 'refresh_mode: {}'",
+                    format!("{mode:?}").to_lowercase()
+                )),
+                Some(_) if !data_connector.supports_changes_stream() => Some(format!(
+                    "backed by the {source} connector, which does not support change data capture"
+                )),
+                Some(_) => None,
+            };
+
+            if let Some(reason) = reason {
+                let err = DrasiWithoutChangeStreamSnafu {
+                    dataset_name: ds.name.to_string(),
+                    reason,
+                }
+                .build();
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                return Err(err);
+            }
+        }
+
         // Durable write-back delivers each committed row to the source. Unless
         // the connector can do that atomically, delivery has to emulate an
         // upsert as a standalone delete plus a separate insert — and because the
@@ -808,6 +880,29 @@ impl Runtime {
             let err = DurableWriteBackUnsupportedBySourceSnafu {
                 dataset_name: ds.name.to_string(),
                 connector: source.clone(),
+            }
+            .build();
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return Err(err);
+        }
+
+        // The delivery worker keys each committed row on a SINGLE primary-key
+        // column (`write_back_worker.rs` returns early for `pk_columns.len() != 1`,
+        // because a composite key can't be turned into the `pk IN (...)` filter it
+        // delivers with). A composite-key dataset would otherwise register and
+        // then silently never deliver — the markers accumulate undelivered. Reject
+        // it here so the limitation surfaces as a loud, actionable error instead of
+        // silent data non-delivery.
+        if let Some(acceleration) = &ds.acceleration
+            && acceleration.resolves_to_durable_write_back()
+            && let Some(primary_key) = &acceleration.primary_key
+            && primary_key.columns.len() > 1
+        {
+            let err = DurableWriteBackCompositePrimaryKeySnafu {
+                dataset_name: ds.name.to_string(),
+                connector: source.clone(),
+                primary_key: primary_key.columns.join(", "),
+                pk_columns: primary_key.columns.len(),
             }
             .build();
             warn_spaced!(spaced_tracer, "{}{err}", "");
@@ -839,7 +934,10 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector.read_provider(&ds).await {
+        let federated_table = match data_connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+        {
             Ok(provider) => {
                 // Gap-fill acceleration settings from schema inference (a no-op when
                 // the connector emitted no inferred metadata) before the dataset
@@ -848,9 +946,9 @@ impl Runtime {
                     .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
                 ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
                 FederatedTable::new(
-                    Arc::clone(&ds),
+                    Arc::new(ds.spec.clone()),
                     provider,
-                    Arc::clone(&data_connector),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                     allow_schema_mismatch,
                 )
@@ -860,8 +958,8 @@ impl Runtime {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
                 if let Some(federated_table) = FederatedTable::new_deferred(
-                    Arc::clone(&ds),
-                    Arc::clone(&data_connector),
+                    Arc::new(ds.spec.clone()),
+                    ConnectorRefreshSource::new_arc(Arc::clone(&data_connector), Arc::clone(&ds)),
                     self.status.shutdown_token(),
                 )
                 .await
@@ -1016,7 +1114,7 @@ impl Runtime {
 
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
-        crate::accelerated_table::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+        crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1057,20 +1155,23 @@ impl Runtime {
                 // File accelerated datasets don't support hot reload.
                 if Self::accelerated_dataset_supports_hot_reload(&ds, &*connector) {
                     tracing::info!("Accelerated Dataset {} updating...", &ds.name);
-                    if matches!(
-                        Arc::clone(&self)
-                            .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
-                            .await,
-                        Ok(())
-                    ) {
-                        self.status
-                            .update_dataset(&ds.name, status::ComponentStatus::Ready);
-                        return;
+                    match Arc::clone(&self)
+                        .reload_accelerated_dataset(Arc::clone(&ds), Arc::clone(&connector))
+                        .await
+                    {
+                        Ok(()) => {
+                            self.status
+                                .update_dataset(&ds.name, status::ComponentStatus::Ready);
+                            return;
+                        }
+                        // The reason is the only thing that distinguishes a swap
+                        // that could not be built from one whose acceleration
+                        // never finished loading, and the fallback hides both.
+                        Err(err) => tracing::warn!(
+                            "Falling back to a full reload of dataset {}: {err}",
+                            ds.name
+                        ),
                     }
-                    tracing::debug!(
-                        "Failed to create accelerated table for dataset {}, falling back to full dataset reload",
-                        ds.name
-                    );
                 }
 
                 Arc::clone(&self)
@@ -1182,12 +1283,15 @@ impl Runtime {
         ds: Arc<Dataset>,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let read_table = connector.read_provider(&ds).await.map_err(|_| {
-            UnableToLoadDatasetConnectorSnafu {
-                dataset: ds.name.clone(),
-            }
-            .build()
-        })?;
+        let read_table = connector
+            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
+            .await
+            .map_err(|_| {
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .build()
+            })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -1199,9 +1303,9 @@ impl Runtime {
             )
         });
         let federated_table = FederatedTable::new(
-            Arc::clone(&ds),
+            Arc::new(ds.spec.clone()),
             read_table,
-            Arc::clone(&connector),
+            ConnectorRefreshSource::new_arc(Arc::clone(&connector), Arc::clone(&ds)),
             self.status.shutdown_token(),
             allow_schema_mismatch,
         )
@@ -1234,11 +1338,19 @@ impl Runtime {
                 })?,
         );
 
-        let notifier = accelerated_table.refresher().on_complete_notification();
+        let refresher = accelerated_table.refresher();
+        let notifier = refresher.on_complete_notification();
 
         // wait for accelerated table to be ready
         if let Some(notifier) = notifier {
-            notifier.notified().await;
+            await_hot_reload_initial_refresh(
+                &ds.name,
+                &|| refresher.initial_load_completed(),
+                &notifier,
+                &self.status.shutdown_token(),
+                HOT_RELOAD_INITIAL_REFRESH_TIMEOUT,
+            )
+            .await?;
         }
 
         // recreate the scheduler, which also recreates with any updated parameters
@@ -1332,14 +1444,40 @@ impl Runtime {
             return Ok(Arc::new(LocalPodConnector::new(Arc::clone(&self.df))));
         }
 
-        let mut data_connector =
-            if let Some(dc) = dataconnector::create_new_connector(source, params).await {
-                dc.context(UnableToInitializeDataConnectorSnafu {})?
-            } else {
-                // Only reachable if the connector is deregistered between the check above and
-                // this lookup; report the same error rather than a second, blunter one.
-                return Err(unknown_data_connector(source).await);
-            };
+        let mut data_connector = if let Some(dc) = dataconnector::create_new_connector(
+            source,
+            params,
+            &RuntimeConnectorContext::for_dataset(&ds),
+        )
+        .await
+        {
+            dc.context(UnableToInitializeDataConnectorSnafu {})?
+        } else {
+            // Only reachable if the connector is deregistered between the check above and
+            // this lookup; report the same error rather than a second, blunter one.
+            return Err(unknown_data_connector(source).await);
+        };
+
+        // Innermost of the stream decorators, so the properties Drasi receives
+        // are the source table's own columns. Wrapping outside the embedding
+        // decorator would instead publish every computed embedding vector as a
+        // node property.
+        if let Some(drasi) = ds.drasi.clone().filter(is_drasi_forwarding) {
+            tracing::warn!(
+                "Drasi change forwarding (Alpha) is in preview and should not be used in production."
+            );
+
+            let delivery = crate::drasi::sink_for_dataset(&ds, &drasi)
+                .await
+                .map_err(|e| crate::Error::UnableToInitializeDataConnector {
+                    source: Box::new(e),
+                })?;
+
+            data_connector = Arc::new(crate::drasi::connector::DrasiConnector::new(
+                data_connector,
+                delivery,
+            ));
+        }
 
         if ds.has_embeddings() {
             data_connector = Arc::new(EmbeddingConnector::new(
@@ -1592,22 +1730,59 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
-        let startup_datasets = valid_datasets;
 
         // Validate Cayenne snapshot consistency before initializing accelerators.
         let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
-            startup_datasets.iter().map(|ds| ds.clone_arc()).collect();
-        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        if let Err(err) = validate_snapshot_consistency(&acceleration_sources) {
             tracing::error!("{err}");
             return;
         }
 
-        let init_results = self
-            .initialize_datasets_accelerators(&startup_datasets)
-            .await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
-        for ds in &startup_datasets {
+        // Only the datasets this diff loads or updates are initialized: `mode: file_create`
+        // deletes the acceleration state on init, and an unchanged dataset keeps serving from
+        // the `AcceleratedTable` it already has.
+        let datasets_to_apply: Vec<Arc<Dataset>> = valid_datasets
+            .into_iter()
+            .filter(|ds| {
+                existing_datasets
+                    .iter()
+                    .find(|current| current.name == ds.name)
+                    .is_none_or(|current| current != ds)
+            })
+            .collect();
+
+        let init_results = self
+            .initialize_datasets_accelerators(&datasets_to_apply)
+            .await;
+
+        // Added datasets are loaded on spawned tasks rather than awaited inline:
+        // `load_dataset` retries a transient failure with unbounded Fibonacci
+        // backoff, and `apply_app` holds `apply_app_lock` across this whole
+        // function, so awaiting one unreachable source parks this apply and every
+        // apply queued behind it until the process restarts. A dataset that cannot
+        // load lands in an error state reported through `status`; a transient
+        // failure keeps retrying inside its own spawned task, while a permanent one
+        // is re-attempted only when the dataset's configuration changes — an
+        // identically-configured dataset is filtered out of `datasets_to_apply`
+        // above, so a later apply schedules no fresh load for it. Tracked in #13098.
+        //
+        // Built here and spawned below so a localpod dataset can be chained behind
+        // the dataset it reads from, exactly as `load_datasets` does at startup:
+        // `LocalPodConnector::read_provider` raises `InvalidTableName` when its
+        // parent is not registered yet, and that is classified permanent, so a
+        // child racing its parent would fail for good rather than retry.
+        let mut added_futures: HashMap<TableReference, Pin<Box<dyn Future<Output = ()> + Send>>> =
+            HashMap::new();
+        // Keyed by parent so several localpod datasets reading from one newly added
+        // dataset all chain behind the same load, rather than the first one
+        // consuming it and the rest racing it.
+        let mut localpod_by_parent: HashMap<TableReference, Vec<(Arc<Dataset>, BootstrapStatus)>> =
+            HashMap::new();
+
+        for ds in &datasets_to_apply {
             let bootstrap_status = match init_results.get(&ds.name) {
                 Some(Ok(status)) => status.clone(),
                 Some(Err(_)) => {
@@ -1620,21 +1795,61 @@ impl Runtime {
                 }
             };
 
-            if let Some(current_ds) = existing_datasets.iter().find(|d| d.name == ds.name) {
-                if ds != current_ds {
-                    Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
-                }
-            } else {
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                Arc::clone(&self)
-                    .load_dataset(
-                        Arc::clone(ds),
-                        bootstrap_status,
-                        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
-                    )
-                    .await;
+            if existing_datasets.iter().any(|d| d.name == ds.name) {
+                Arc::clone(&self).update_dataset(Arc::clone(ds)).await;
+                continue;
             }
+
+            self.status
+                .update_dataset(&ds.name, status::ComponentStatus::Initializing);
+
+            if ds.source() == LOCALPOD_DATACONNECTOR {
+                localpod_by_parent
+                    .entry(TableReference::parse_str(ds.path()))
+                    .or_default()
+                    .push((Arc::clone(ds), bootstrap_status));
+                continue;
+            }
+
+            // The runtime's shared semaphore is what keeps these loads inside the
+            // `runtime.dataset_load_parallelism` budget.
+            let runtime = Arc::clone(&self);
+            let ds_clone = Arc::clone(ds);
+            let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+            added_futures.insert(
+                ds.name.clone(),
+                Box::pin(async move {
+                    runtime
+                        .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                        .await;
+                }),
+            );
+        }
+
+        for (parent, children) in localpod_by_parent {
+            // Chain behind the parent only when this same diff adds it. A parent
+            // that is unchanged, or that was updated in the loop above, is already
+            // registered.
+            let parent_future = added_futures.remove(&parent);
+            let runtime = Arc::clone(&self);
+            let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
+            tokio::spawn(async move {
+                if let Some(parent_future) = parent_future {
+                    parent_future.await;
+                }
+                join_all(children.into_iter().map(|(ds, bootstrap_status)| {
+                    Arc::clone(&runtime).load_dataset(
+                        ds,
+                        bootstrap_status,
+                        Arc::clone(&load_semaphore),
+                    )
+                }))
+                .await;
+            });
+        }
+
+        for load in added_futures.into_values() {
+            tokio::spawn(load);
         }
 
         // Remove datasets that are no longer in the app
@@ -1720,12 +1935,11 @@ impl Runtime {
                     }
                 };
 
-                match accelerator
-                    .init(ds.as_ref(), Arc::clone(&accelerator_engine_registry))
-                    .await
-                    .context(AcceleratorInitializationFailedSnafu {
+                match accelerator.init(ds.as_ref()).await.context(
+                    AcceleratorInitializationFailedSnafu {
                         name: acceleration_settings.engine.to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(bootstrap_status) => {
                         if bootstrap_status.is_bootstrapped() {
                             update_cached_dataset_timestamps(ds.as_ref()).await;
@@ -1786,6 +2000,75 @@ pub struct RegisterDatasetContext {
     source: String,
     accelerated_table: Option<Arc<AcceleratedTable>>,
     bootstrap_status: BootstrapStatus,
+}
+
+/// Wait for the accelerated table a hot reload just recreated to complete its
+/// first refresh, so the in-place swap does not register a table that has not
+/// loaded yet.
+///
+/// The wait is bounded because `apply_app` holds `apply_app_lock` across it, and
+/// three shapes never deliver a notification the caller can see:
+///
+/// - a `refresh_mode: changes` stream that never produces a ready envelope — the
+///   notifier fires only when one is applied;
+/// - a refresh completing before this wait is entered at all.
+///   [`tokio::sync::Notify::notify_waiters`] stores no permit, so that wakeup is
+///   gone, and a `RefreshMode::Full` dataset with no `check_interval` never fires
+///   a second one;
+/// - a cluster scheduler, which notifies waiters from inside the builder —
+///   before any caller holds the notifier — precisely because it runs no refresh.
+///
+/// Only the second is recoverable here, and only via `initial_load_completed`:
+/// the refresher sets that flag just *after* it notifies (`Refresher::start`), so
+/// the flag is what remains once the edge is gone. It is read after the bound as
+/// well as before it, so a wakeup that predates this call resolves as success
+/// instead of discarding a table that is loaded.
+///
+/// The scheduler shape is not recoverable here — nothing local ever sets the flag
+/// on a scheduler — so it spends the bound and then takes the full reload. That is
+/// still strictly better than the unbounded wait it replaces, which never
+/// returned at all; removing the edge at its source is #13086.
+///
+/// Returns `Ok(())` when the table loaded (or the runtime is shutting down), and
+/// [`Error::HotReloadRefreshTimedOut`] when the bound expires with the table
+/// still unloaded, which drops the in-place swap in favour of a full reload.
+async fn await_hot_reload_initial_refresh(
+    dataset_name: &TableReference,
+    initial_load_completed: &(dyn Fn() -> bool + Sync),
+    notifier: &tokio::sync::Notify,
+    shutdown_token: &tokio_util::sync::CancellationToken,
+    timeout: Duration,
+) -> Result<()> {
+    // Built before the check below, not after: a `Notified` "is guaranteed to
+    // receive wakeups from `notify_waiters()` as soon as it has been created,
+    // even if it has not yet been polled" (`tokio::sync::Notify::notified`), and
+    // `notify_waiters` is what both producers call. So a refresh completing
+    // between here and the `select!` still wakes this wait; constructing after
+    // the check would drop it and cost the whole bound.
+    let refresh_notified = notifier.notified();
+
+    if initial_load_completed() {
+        return Ok(());
+    }
+
+    tokio::select! {
+        () = refresh_notified => return Ok(()),
+        () = shutdown_token.cancelled() => return Ok(()),
+        () = tokio::time::sleep(timeout) => {}
+    }
+
+    // The bound is a backstop, not the verdict: a wakeup that fired before this
+    // wait was even entered leaves a table that is loaded and must not be
+    // discarded.
+    if initial_load_completed() {
+        return Ok(());
+    }
+
+    HotReloadRefreshTimedOutSnafu {
+        dataset: dataset_name.clone(),
+        timeout_secs: timeout.as_secs(),
+    }
+    .fail()
 }
 
 /// Returns `true` when a dataset load failure cannot be cleared by retrying it.
@@ -1896,39 +2179,37 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         return;
     }
 
-    match CachingEngineSys::try_new(dataset, OpenOption::OpenExisting).await {
-        Ok(caching_sys) => {
-            if let Err(e) = caching_sys.update_fetched_at().await {
-                if is_shutdown_cancellation(&e) {
-                    tracing::debug!(
-                        "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
-                        dataset.name
-                    );
-                } else {
-                    tracing::warn!(
-                        "Failed to update _fetched_at for cached dataset {}: {e}",
-                        dataset.name
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "Updated _fetched_at for all records in cached dataset {}",
-                    dataset.name
-                );
-            }
+    match crate::dataaccelerator::spice_sys::update_caching_engine_fetched_at(dataset).await {
+        Ok(()) => {
+            tracing::info!(
+                "Updated _fetched_at for all records in cached dataset {}",
+                dataset.name
+            );
+        }
+        Err(e) if is_shutdown_cancellation(&e) => {
+            tracing::debug!(
+                "Did not update _fetched_at for cached dataset {}: the runtime is shutting down ({e})",
+                dataset.name
+            );
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to initialize caching engine for {}: {e}",
+                "Failed to update _fetched_at for cached dataset {}: {e}",
                 dataset.name
             );
         }
     }
 }
 
+/// Whether a dataset's `drasi:` block is live.
+fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
+    drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::dataset::DatasetSpec;
     use crate::dataconnector::{
         ConnectorParams, DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
         register_connector_factory,
@@ -1950,10 +2231,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             let creates = Arc::clone(&self.creates);
             Box::pin(async move {
                 creates.fetch_add(1, Ordering::SeqCst);
@@ -1972,7 +2254,7 @@ mod tests {
         fn static_schema(
             &self,
             _params: &ConnectorParams,
-            dataset: &crate::component::dataset::Dataset,
+            dataset: &DatasetSpec,
         ) -> Option<arrow_schema::SchemaRef> {
             crate::component::dataset::declared_schema::declared_schema_for(dataset)
                 .ok()
@@ -1991,7 +2273,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             unimplemented!("on-demand startup should not create or read from this connector")
         }
@@ -2116,10 +2399,11 @@ mod tests {
             self
         }
 
-        fn create(
-            &self,
+        fn create<'a>(
+            &'a self,
             _params: ConnectorParams,
-        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
             Box::pin(async { Ok(Arc::new(SchemaOnlyConnector) as Arc<dyn DataConnector>) })
         }
 
@@ -2143,7 +2427,8 @@ mod tests {
 
         async fn read_provider(
             &self,
-            _dataset: &Dataset,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            _dataset: &DatasetSpec,
         ) -> DataConnectorResult<Arc<dyn TableProvider>> {
             let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
                 "id",
@@ -2153,6 +2438,291 @@ mod tests {
             let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
                 .expect("empty MemTable with a single column");
             Ok(Arc::new(table) as Arc<dyn TableProvider>)
+        }
+    }
+
+    /// A connector whose construction never completes — a source that accepts
+    /// the connection attempt and never answers.
+    ///
+    /// The other shape of the same hazard is a construction that fails
+    /// *transiently*, which `load_dataset` retries with unbounded backoff. Both
+    /// leave an inline await with nothing to come back from, and the fix is one
+    /// `tokio::spawn` that does not care which it was, so one fixture covers it.
+    /// This one is preferred because it writes no metrics: a failing load
+    /// increments the process-wide `dataset_load_errors` counter that
+    /// `a_dataset_connector_failure_counts_one_load_error` reads as a delta.
+    struct UnreachableConnectorFactory;
+
+    impl DataConnectorFactory for UnreachableConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn prefix(&self) -> &'static str {
+            "never_reachable"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    fn spicepod_dataset(from: &str, name: &str) -> spicepod::component::dataset::Dataset {
+        spicepod::component::dataset::Dataset::new(from, name)
+    }
+
+    /// Regression test for #12862: `apply_dataset_diff` awaited each added
+    /// dataset's `load_dataset` inline, and a load that does not complete — a
+    /// source that never answers, or a transient failure retried with unbounded
+    /// Fibonacci backoff — therefore parked that apply. `apply_app` holds
+    /// `apply_app_lock` across the whole diff, so every apply queued behind it
+    /// was parked too, until the process restarted.
+    ///
+    /// The bound here is wall-clock on purpose: the failure it guards against is
+    /// an apply that never returns, so the assertion has to be "returns at all".
+    #[tokio::test]
+    async fn an_unreachable_added_dataset_does_not_block_the_apply() {
+        register_connector_factory("never_reachable", Arc::new(UnreachableConnectorFactory)).await;
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let runtime = Arc::new(
+            crate::Runtime::builder()
+                .with_app(app::AppBuilder::new("bounded_apply").build())
+                .build()
+                .await,
+        );
+
+        let reloaded = Arc::new(
+            app::AppBuilder::new("bounded_apply")
+                .with_dataset(spicepod_dataset("never_reachable:any", "unreachable"))
+                .with_dataset(spicepod_dataset("schema_only:any", "healthy"))
+                .build(),
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                Arc::clone(&runtime).apply_app(reloaded)
+            )
+            .await
+            .expect("an added dataset that cannot load must not hold the apply lock"),
+            "the reloaded spicepod differs from the booted one, so it must apply"
+        );
+
+        let healthy = TableReference::parse_str("healthy");
+        assert!(
+            test_framework::utils::wait_until_true(Duration::from_secs(30), || async {
+                matches!(
+                    runtime.status().get_dataset_statuses().get(&healthy),
+                    Some(status::ComponentStatus::Ready | status::ComponentStatus::Refreshing)
+                )
+            })
+            .await,
+            "the dataset alongside the unreachable one must still become queryable"
+        );
+
+        // The lock is only proven released by a second apply completing while the
+        // first apply's dataset is still stuck in the background.
+        let third = Arc::new(
+            app::AppBuilder::new("bounded_apply")
+                .with_dataset(spicepod_dataset("never_reachable:any", "unreachable"))
+                .with_dataset(spicepod_dataset("schema_only:any", "healthy"))
+                .with_dataset(spicepod_dataset("schema_only:any", "healthy_too"))
+                .build(),
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                Arc::clone(&runtime).apply_app(third)
+            )
+            .await
+            .expect("a later apply must not inherit the earlier apply's wait"),
+            "the third spicepod adds a dataset, so it must apply"
+        );
+
+        // The stuck load's task outlives the test holding its own `Arc<Runtime>`;
+        // marking shutdown will not unstick a connector already inside `create`,
+        // but it stops the runtime the remaining assertions no longer need.
+        runtime.status.mark_shutdown();
+    }
+
+    /// The wait a hot reload performs on the recreated table's first refresh.
+    /// #12862: it was untimed, and `apply_app_lock` is held across it.
+    mod hot_reload_initial_refresh {
+        use super::*;
+        use tokio::sync::Notify;
+        use tokio_util::sync::CancellationToken;
+
+        /// The production bound, so these arms cannot drift from it. A paused
+        /// clock makes its size irrelevant to how long they take.
+        const TIMEOUT: Duration = HOT_RELOAD_INITIAL_REFRESH_TIMEOUT;
+
+        fn reloading() -> TableReference {
+            TableReference::bare("reloading")
+        }
+
+        /// A table already loaded when the wait begins must not wait at all —
+        /// the refresh finished before the reload got here.
+        #[tokio::test(start_paused = true)]
+        async fn an_already_loaded_table_does_not_wait() {
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| true,
+                &Notify::new(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a table that has already loaded needs no notification");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a loaded table must be recognised before the wait, not after it"
+            );
+        }
+
+        /// The ordinary case: the refresh completes and notifies.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_notification_ends_the_wait() {
+            let notifier = Arc::new(Notify::new());
+            let notify_from = Arc::clone(&notifier);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                notify_from.notify_waiters();
+            });
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                &notifier,
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a notified refresh completes the wait");
+
+            assert!(
+                started.elapsed() < TIMEOUT,
+                "the wait must end on the notification, not on the bound"
+            );
+        }
+
+        /// A `refresh_mode: changes` stream that never produces a ready envelope
+        /// never fires the notifier. Before #12862 this held the apply lock for
+        /// the life of the process.
+        #[tokio::test(start_paused = true)]
+        async fn a_refresh_that_never_completes_gives_up_at_the_bound() {
+            let started = tokio::time::Instant::now();
+            let err = await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                &Notify::new(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect_err("a refresh that never completes must not wait forever");
+
+            assert!(
+                matches!(err, Error::HotReloadRefreshTimedOut { .. }),
+                "expected the hot-reload bound to be reported, got: {err}"
+            );
+            assert_eq!(
+                started.elapsed(),
+                TIMEOUT,
+                "the wait must last exactly the bound it was given"
+            );
+        }
+
+        /// A completion landing between the `Notified`'s construction and the
+        /// `select!` must still wake the wait, which is why the future is built
+        /// before the loaded-check rather than after it. Build it after and this
+        /// notification is dropped, costing the whole bound. The closure is the
+        /// seam: it runs in exactly that window.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_racing_the_loaded_check_is_not_missed() {
+            let notifier = Arc::new(Notify::new());
+            let notify_from = Arc::clone(&notifier);
+            let notifies_then_reports_unloaded = move || {
+                notify_from.notify_waiters();
+                false
+            };
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &notifies_then_reports_unloaded,
+                &notifier,
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a completion racing the wait setup must wake it, not be missed");
+
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a registered waiter must be woken immediately, not at the bound"
+            );
+        }
+
+        /// `Notify::notify_waiters` stores no permit, so a completion landing
+        /// before the waiter is registered is lost. The table is loaded
+        /// regardless, and must not be discarded.
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_wakeup_resolves_as_loaded_at_the_bound() {
+            // False for the pre-wait check, true for the backstop check: the
+            // refresh completed while nothing was subscribed, and the refresher
+            // sets the flag just after it notifies.
+            let checks = AtomicUsize::new(0);
+            let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
+
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &loaded,
+                &Notify::new(),
+                &CancellationToken::new(),
+                TIMEOUT,
+            )
+            .await
+            .expect("a wakeup lost before the wait must not discard a loaded table");
+        }
+
+        /// Shutdown ends the wait without reporting a reload failure.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_ends_the_wait() {
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                cancel.cancel();
+            });
+
+            let started = tokio::time::Instant::now();
+            await_hot_reload_initial_refresh(
+                &reloading(),
+                &|| false,
+                &Notify::new(),
+                &token,
+                TIMEOUT,
+            )
+            .await
+            .expect("a runtime shutting down is not a failed reload");
+
+            assert!(
+                started.elapsed() < TIMEOUT,
+                "shutdown must not wait out the bound"
+            );
         }
     }
 
@@ -2299,22 +2869,15 @@ mod tests {
     /// when they are first touched, and that binding survives a later
     /// `set_meter_provider`. So this rewires the meter for the whole process and only
     /// the first caller in it wins -- keep it to a single test, as
-    /// `tests/query_failure_err_code.rs` does.
+    /// `tests/metrics.rs` does.
     fn install_prometheus_meter_provider() -> prometheus::Registry {
         let registry = prometheus::Registry::new();
 
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .without_scope_info()
-            .without_units()
-            .without_counter_suffixes()
-            .without_target_info()
-            .build()
-            .expect("to build the prometheus exporter");
-
         let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_resource(opentelemetry_sdk::Resource::builder().build())
-            .with_reader(exporter)
+            .with_reader(
+                crate::prometheus_reader(registry.clone()).expect("to build the prometheus reader"),
+            )
             .build();
         opentelemetry::global::set_meter_provider(provider);
 

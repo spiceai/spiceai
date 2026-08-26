@@ -23,10 +23,9 @@ limitations under the License.
 use std::collections::HashMap;
 
 use crate::{
-    accelerated_table::AcceleratedTable,
+    accelerated::AcceleratedTable,
     cluster::partition::{Error, PartitionDiscoverySnafu, PartitionValue, Result},
     datafusion::DataFusion,
-    search::util::find_concrete_table_provider,
 };
 use datafusion::common::ToDFSchema;
 use datafusion::sql::sqlparser::{
@@ -156,7 +155,7 @@ async fn execute_partition_discovery_query(
     // unwrapping helper to handle all known wrapper types.
     let table_opt = df.get_table(table).await;
     let Some(acc) = table_opt.as_ref().and_then(|t| {
-        find_concrete_table_provider::<AcceleratedTable>(t)
+        spice_table::find_layer::<AcceleratedTable>(t.as_ref(), spice_table::LayerWalk::Read)
             .map(AcceleratedTable::get_federated_table)
     }) else {
         return Err(Error::NotAcceleratedTable {

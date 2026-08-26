@@ -16,13 +16,10 @@ limitations under the License.
 
 use crate::Runtime;
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
-use crate::execution_plan::{IcebergScanExec, UdtfExec};
-use crate::search::util::find_concrete_table_provider;
 use arrow_schema::Schema;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 #[cfg(not(windows))]
 use cayenne::provider::CayenneAccelerationExec;
-use data_components::iceberg::delete::IcebergDeletionProvider;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result, TableReference, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
@@ -42,6 +39,7 @@ use iceberg_datafusion::IcebergTableProvider;
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
+use runtime_execution_plans::{IcebergScanExec, UdtfExec};
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_proto::{
     BytesProcessedExecNode, CayenneAccelerationExecNode, IcebergHashColumn, IcebergPartitioning,
@@ -206,12 +204,13 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 })?;
                 // Locate the cluster provider through ALL known runtime wrappers
                 // (FederatedTableProviderAdaptor, MetadataEnrichedTableProvider,
-                // EmbeddingTable, IndexedTableProvider, AcceleratedTable, …), not
+                // EmbeddingTable, IndexLayer, AcceleratedTable, …), not
                 // just the federation/metadata pair — an Iceberg dataset with
                 // embeddings or a search index is wrapped further.
-                let Some(cluster) =
-                    find_concrete_table_provider::<IcebergClusterTableProvider>(&provider)
-                else {
+                let Some(cluster) = spice_table::find_layer::<IcebergClusterTableProvider>(
+                    provider.as_ref(),
+                    spice_table::LayerWalk::Read,
+                ) else {
                     return exec_err!(
                         "registered provider for {table_ref} is not an IcebergClusterTableProvider; \
                          distributed Iceberg scans require the Iceberg data connector"
@@ -384,9 +383,7 @@ fn concrete_iceberg_provider(inner: &Arc<dyn TableProvider>) -> Option<&IcebergT
     if let Some(p) = inner.downcast_ref::<IcebergTableProvider>() {
         return Some(p);
     }
-    inner
-        .downcast_ref::<IcebergDeletionProvider>()
-        .and_then(|d| d.inner().downcast_ref::<IcebergTableProvider>())
+    spice_table::find_concrete::<IcebergTableProvider>(inner.as_ref(), spice_table::LayerWalk::Read)
 }
 
 /// Serializes a scan's output [`Partitioning`] into its wire form, so the

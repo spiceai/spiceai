@@ -17,7 +17,7 @@ limitations under the License.
 //! Glue between Spice's connector params and the `postgres_replication` module.
 //!
 //! Responsibilities:
-//!   - Parse connection & replication params out of `runtime::parameters::Parameters`.
+//!   - Parse connection & replication params out of `runtime_parameters::Parameters`.
 //!   - Fall back to sensible per-replica defaults for slot & publication names.
 //!   - Look up the source table schema (via the federated table) and hand everything
 //!     off to `data_components::postgres_replication::start_replication_stream`.
@@ -26,19 +26,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::try_stream;
-use data_components::cdc::{ChangesStream, InitialSnapshotMode, StreamError};
+use data_components::cdc::{AccelerationContents, ChangesStream, InitialSnapshotMode, StreamError};
 use data_components::postgres_replication::{
-    PgOutputFormat, ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, SchemaEvolutionPolicy, config, start_replication_stream,
+    AppliedLsn, AppliedLsnStore, NoopAppliedLsnStore, PgOutputFormat, RecordedPosition,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    SchemaEvolutionPolicy, config, start_replication_stream,
 };
+use data_connector_api::federated::FederatedTableProvider;
+use data_connector_api::parameters::ConnectorContext;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
-use runtime::federated_table::FederatedTable;
-use runtime::parameters::{ExposedParamLookup, Parameters};
 use runtime_api_types::v1::ComponentType;
+use runtime_checkpoint_api::BlobCheckpointStore;
+use runtime_component::dataset::DatasetSpec;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime_parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
 
 // Standby status feedback cadence. Kept well below Postgres's default
@@ -54,11 +57,125 @@ const MAX_BOOTSTRAP_BATCH_SIZE: usize = 1_048_576;
 // front of the accelerator prefetch, not an unbounded buffer.
 const MAX_MEMBER_CHANNEL_CAPACITY: usize = 1_048_576;
 
-pub fn build_changes_stream(
+/// Sidecar table, in the dataset's own accelerator, holding the serialized applied-LSN
+/// watermark.
+const WATERMARK_TABLE: &str = "spice_sys_postgres_replication";
+
+/// Resolve the applied-LSN watermark store over the dataset's own accelerator.
+///
+/// `None` means nothing durable can record a position — there is no usable accelerator
+/// connection. The caller treats that as "never loaded", which is correct: an
+/// acceleration that cannot persist a watermark cannot have persisted rows for one to
+/// describe.
+async fn resolve_watermark_store(
+    context: &dyn ConnectorContext,
+    dataset: &DatasetSpec,
+) -> Option<Arc<dyn BlobCheckpointStore>> {
+    context
+        .blob_checkpoint_store(dataset, WATERMARK_TABLE)
+        .await
+}
+
+/// [`AppliedLsnStore`] over the accelerator's `spice_sys_postgres_replication`
+/// sidecar.
+///
+/// The payload is a single `{"lsn": <u64>}` object rather than the bare number,
+/// so the record can gain fields (a slot identity, a snapshot as-of marker)
+/// without a migration.
+struct SidecarAppliedLsnStore {
+    blobs: Arc<dyn BlobCheckpointStore>,
+    /// Which source the recorded position belongs to (see [`source_identity`]).
+    ///
+    /// LSNs are only comparable within one source's history. Without this, a
+    /// dataset repointed to another server, database, or table while keeping its
+    /// acceleration files would compare the new source's LSNs against a
+    /// watermark describing the old one's contents — and a low new LSN reads as
+    /// "already covered", leaving the old rows in place and never loading the
+    /// new source's.
+    identity: String,
+}
+
+/// Identity of the source a watermark was recorded against: endpoint, database,
+/// and table.
+///
+/// Deliberately not the slot name — a different slot on the same server shares
+/// its LSN space, so slot changes stay comparable. Note this does not detect a
+/// same-endpoint cluster restored from a backup or rewound by PITR, whose LSNs
+/// can move backwards; the resume-position clamp in `postgres_replication` is
+/// what keeps that from silently skipping changes.
+fn source_identity(params: &ReplicationParams, schema: &str, table: &str) -> String {
+    format!(
+        "{}:{}/{}/{}.{}",
+        params.host, params.port, params.database, schema, table
+    )
+}
+
+/// Serialized form of [`AppliedLsn`] in the sidecar.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAppliedLsn {
+    lsn: u64,
+    /// The source this position was recorded against. Absent in records written
+    /// before the field existed, which are treated as belonging to a different
+    /// source — the conservative reading, since they cannot be verified.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl AppliedLsnStore for SidecarAppliedLsnStore {
+    async fn load(
+        &self,
+    ) -> std::result::Result<RecordedPosition, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(checkpoint) = self.blobs.get().await? else {
+            return Ok(RecordedPosition::Absent);
+        };
+        // A row that exists but cannot be parsed is surfaced, not swallowed:
+        // treating corruption as "no watermark" would silently resume as if this
+        // were a first load, and the caller's fallback for an unreadable
+        // watermark is a rebuild — the safe direction.
+        let stored: StoredAppliedLsn = serde_json::from_str(&checkpoint.data)?;
+        if stored.source.as_deref() != Some(self.identity.as_str()) {
+            tracing::warn!(
+                recorded_for = stored.source.as_deref().unwrap_or("an unrecorded source"),
+                streaming_from = %self.identity,
+                "this acceleration's recorded position belongs to a different source, so its contents cannot be resumed against this one; it will be rebuilt from the source"
+            );
+            return Ok(RecordedPosition::ForeignSource);
+        }
+        Ok(RecordedPosition::At(AppliedLsn { lsn: stored.lsn }))
+    }
+
+    async fn save(
+        &self,
+        applied: AppliedLsn,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let payload = serde_json::to_string(&StoredAppliedLsn {
+            lsn: applied.lsn,
+            source: Some(self.identity.clone()),
+        })?;
+        self.blobs.upsert(&payload).await?;
+        Ok(())
+    }
+
+    async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // The sidecar exposes upsert-only semantics, so "forget" is recorded as a
+        // zero watermark: it precedes every real LSN, so the comparison against
+        // what the slot can supply resolves to a rebuild, which is what clearing
+        // is for.
+        self.save(AppliedLsn { lsn: 0 }).await
+    }
+}
+
+/// `async` so the watermark store is resolved here, before the stream is built: the
+/// generator then holds only the resolved store, which owns a connection pool and no
+/// runtime and so cannot pin the runtime for as long as the stream lives.
+pub async fn build_changes_stream(
     params: &Parameters,
-    dataset: &Dataset,
-    federated_table: Arc<FederatedTable>,
+    dataset: &DatasetSpec,
+    context: &dyn ConnectorContext,
+    federated_table: Arc<dyn FederatedTableProvider>,
     metrics: Arc<ReplicationMetricsCollector>,
+    acceleration: AccelerationContents,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -89,6 +206,9 @@ pub fn build_changes_stream(
         .as_ref()
         .is_some_and(accelerator_is_ephemeral);
     params_for_stream.ephemeral_accelerator = ephemeral;
+    // Observed by the runtime just before this stream was built, and only ever
+    // read to decide whether a *missing* watermark is evidence of a gap.
+    params_for_stream.acceleration = acceleration;
     if params_for_stream.initial_snapshot && ephemeral {
         params_for_stream.snapshot_on_resume = true;
         tracing::info!(
@@ -97,6 +217,26 @@ pub fn build_changes_stream(
              will run on every start, including replication-slot resume"
         );
     }
+
+    // Where this dataset's applied-LSN watermark lives. An ephemeral acceleration
+    // gets the no-op store: it boots empty and re-snapshots every start, so a
+    // recorded position would describe rows the restart already threw away, and
+    // resuming on it would skip everything before it.
+    //
+    // A durable acceleration with no reachable store also records nothing, which
+    // reads as "never loaded" — correct, since an acceleration that cannot persist a
+    // watermark cannot have persisted the rows one would describe.
+    let applied_lsn_store: Arc<dyn AppliedLsnStore> = if ephemeral {
+        Arc::new(NoopAppliedLsnStore)
+    } else {
+        match resolve_watermark_store(context, dataset).await {
+            Some(blobs) => Arc::new(SidecarAppliedLsnStore {
+                blobs,
+                identity: source_identity(&params_for_stream, &schema_name, &table_name),
+            }),
+            None => Arc::new(NoopAppliedLsnStore),
+        }
+    };
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -123,8 +263,8 @@ pub fn build_changes_stream(
         .unwrap_or_default();
     let engine_supports_upsert = !matches!(
         engine,
-        runtime::component::dataset::acceleration::Engine::Arrow
-            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+        runtime_component::dataset::acceleration::Engine::Arrow
+            | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
@@ -135,7 +275,7 @@ pub fn build_changes_stream(
         a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
                 a.on_conflict.get(pk),
-                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
@@ -146,17 +286,17 @@ pub fn build_changes_stream(
     // mid-stream (the runtime apply loop still enforces the per-policy
     // evolution set). `OnSchemaChange` is `Copy`, so capture it by value.
     let schema_evolution_policy = match dataset.on_schema_change {
-        runtime::component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
-        runtime::component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
-        runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
+        runtime_component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
+        runtime_component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
+        runtime_component::dataset::OnSchemaChange::AppendNewColumns => {
             SchemaEvolutionPolicy::AppendNewColumns
         }
         // A CDC stream cannot drop-and-recreate without losing un-replayable history, so
         // `drop_and_recreate` adopts widening changes like `sync_all_columns` and rejects
         // incompatible changes mid-stream. The accelerated table is recreated only on a
         // `refresh_mode: full` registration, not from the replication stream.
-        runtime::component::dataset::OnSchemaChange::SyncAllColumns
-        | runtime::component::dataset::OnSchemaChange::DropAndRecreate => {
+        runtime_component::dataset::OnSchemaChange::SyncAllColumns
+        | runtime_component::dataset::OnSchemaChange::DropAndRecreate => {
             SchemaEvolutionPolicy::SyncAllColumns
         }
     };
@@ -236,6 +376,7 @@ pub fn build_changes_stream(
             table_name,
             metrics,
             policy: schema_evolution_policy,
+            applied_lsn_store,
         };
 
         let mut inner = start_replication_stream(input);
@@ -687,9 +828,9 @@ impl MetricsProvider for PostgresMetricsProvider {
 /// accelerators must re-snapshot on every start — WAL replay from the slot's
 /// checkpoint can never reconstruct an accelerator that booted empty.
 fn accelerator_is_ephemeral(
-    acceleration: &runtime::component::dataset::acceleration::Acceleration,
+    acceleration: &runtime_component::dataset::acceleration::Acceleration,
 ) -> bool {
-    use runtime::component::dataset::acceleration::{Engine, Mode};
+    use runtime_component::dataset::acceleration::{Engine, Mode};
     // Matched exhaustively (no `_` arm) so a newly added engine has to make an
     // explicit durability claim here: defaulting a non-persistent engine to
     // "persistent" silently skips its resume snapshot and leaves the accelerator
@@ -798,6 +939,7 @@ fn replication_params_from_connector_params(
         // Derived from the dataset's accelerator, which this function does not
         // see; `build_changes_stream` sets it right after.
         ephemeral_accelerator: false,
+        acceleration: AccelerationContents::Unknown,
         status_interval,
         ready_lag,
         bootstrap_batch_size,
@@ -807,6 +949,10 @@ fn replication_params_from_connector_params(
         // formatting. Not a user-facing parameter; the per-column text fallback
         // still handles types Postgres emits as text.
         pg_output_format: PgOutputFormat::Binary,
+        unclaimed_reservation_grace:
+            data_components::postgres_replication::shared::DEFAULT_UNCLAIMED_RESERVATION_GRACE,
+        watermark_flush_interval:
+            data_components::postgres_replication::shared::DEFAULT_WATERMARK_FLUSH_INTERVAL,
     })
 }
 
@@ -1098,7 +1244,7 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
     /// than in production.
     #[test]
     fn accelerator_ephemerality_is_classified_per_engine_and_mode() {
-        use runtime::component::dataset::acceleration::{Acceleration, Engine, Mode};
+        use runtime_component::dataset::acceleration::{Acceleration, Engine, Mode};
 
         let ephemeral = |engine: Engine, mode: Mode| {
             accelerator_is_ephemeral(&Acceleration {

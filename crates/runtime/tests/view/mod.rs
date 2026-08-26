@@ -18,10 +18,9 @@ use arrow::array::RecordBatch;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::{
-    component::view::ViewBuilder,
-    dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
-};
+use runtime::{component::view::ViewBuilder, dataaccelerator::spice_sys::dataset_checkpointer};
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
 use spicepod::component::{
     dataset::{Dataset, TimeFormat},
@@ -96,10 +95,11 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
                 .build_with(Arc::clone(&rt), Arc::new(app_copy));
 
             // Ensure Checkpoint is created after initial view load (poll since checkpoint creation is async)
-            let checkpoint = DatasetCheckpoint::try_new(
+            let checkpoint = dataset_checkpointer(
                 &view,
                 rt.accelerator_engine_registry(),
                 OpenOption::OpenExisting,
+                SnapshotBehavior::Disabled,
             )
             .await
             .expect("Failed to create view checkpoint");

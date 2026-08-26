@@ -14,133 +14,120 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Per-dataset **blob** checkpoint store backed by a `PostgreSQL` accelerator.
+//! The `spice_sys_*` sidecar tables as stored by a `PostgreSQL` accelerator.
 //!
-//! Persists one opaque `String` payload keyed by `dataset_name` into a
-//! `(dataset_name PK, checkpoint_data TEXT, created_at, updated_at)` sidecar table
-//! whose name the caller chooses. Implements
-//! [`runtime_checkpoint_api::BlobCheckpointStore`]; the `runtime` crate resolves a
-//! dataset's accelerator connection and constructs it.
+//! One module per checkpoint shape, each implementing the matching
+//! `runtime-checkpoint-api` trait against a [`PostgresConnectionPool`].
+//!
+//! [`PostgresSidecar`] binds a pool to a dataset name and hands out those stores; the
+//! `PostgreSQL` accelerator returns one from `DataAccelerator::sidecar`, which is how
+//! the runtime reaches this engine's sidecar tables without naming the engine.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use runtime_checkpoint_api::{BlobCheckpoint, BlobCheckpointStore, CheckpointError};
+use runtime_acceleration::{
+    dataset_checkpoint::DatasetCheckpointer,
+    sidecar::{AcceleratorSidecar, unsupported_sidecar},
+    snapshot::SnapshotBehavior,
+};
+use runtime_checkpoint_api::{
+    BlobCheckpointStore, CheckpointError, debezium::DebeziumCheckpointStore,
+    kafka::KafkaCheckpointStore, mongodb::MongoCheckpointStore, mysql_binlog::MySqlBinlogStore,
+};
 
-/// Blob checkpoint store backed by a `PostgreSQL` accelerator.
-pub struct PostgresBlobCheckpointStore {
-    pool: PostgresConnectionPool,
-    dataset_name: String,
-    table_name: &'static str,
+mod blob;
+mod dataset_checkpoint;
+mod debezium;
+mod kafka;
+mod mongodb;
+mod mysql_binlog;
+
+pub use blob::PostgresBlobCheckpointStore;
+pub use dataset_checkpoint::PostgresDatasetCheckpointer;
+pub use debezium::PostgresDebeziumCheckpointStore;
+pub use kafka::PostgresKafkaCheckpointStore;
+pub use mongodb::PostgresMongoCheckpointStore;
+pub use mysql_binlog::PostgresMySqlBinlogStore;
+
+/// Wraps an engine-level failure as a store failure.
+pub(crate) fn store_error(
+    source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+) -> CheckpointError {
+    CheckpointError::Store {
+        source: source.into(),
+    }
 }
 
-impl PostgresBlobCheckpointStore {
+/// One dataset's sidecar tables inside a `PostgreSQL` accelerator.
+pub struct PostgresSidecar {
+    pool: Arc<PostgresConnectionPool>,
+    dataset_name: String,
+}
+
+impl PostgresSidecar {
     #[must_use]
-    pub fn new(
-        pool: PostgresConnectionPool,
-        dataset_name: String,
-        table_name: &'static str,
-    ) -> Self {
-        Self {
-            pool,
-            dataset_name,
-            table_name,
-        }
+    pub fn new(pool: Arc<PostgresConnectionPool>, dataset_name: String) -> Self {
+        Self { pool, dataset_name }
     }
 }
 
 #[async_trait]
-impl BlobCheckpointStore for PostgresBlobCheckpointStore {
-    async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .map_err(|source| CheckpointError::Store { source })?;
-        let table = self.table_name;
-
-        // Ensure the sidecar table exists so a fresh accelerator reads as "no
-        // checkpoint yet" (Ok(None)) rather than a missing-table store error.
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (
-                dataset_name TEXT PRIMARY KEY,
-                checkpoint_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.conn
-            .execute(&create_table, &[])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-
-        let query = format!(
-            "SELECT checkpoint_data, EXTRACT(EPOCH FROM updated_at) FROM {table} WHERE dataset_name = $1"
-        );
-        let stmt = conn
-            .conn
-            .prepare(&query)
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        let Some(row) = conn
-            .conn
-            .query_opt(&stmt, &[&self.dataset_name])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?
-        else {
-            return Ok(None);
-        };
-
-        let data: String = row.get(0);
-        let updated_at_epoch: Option<f64> = row.get(1);
-        let updated_at = updated_at_epoch.and_then(|epoch| {
-            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs_f64(epoch))
-        });
-        Ok(Some(BlobCheckpoint { data, updated_at }))
+impl AcceleratorSidecar for PostgresSidecar {
+    fn blob_checkpoint_store(
+        &self,
+        table_name: &'static str,
+    ) -> Result<Arc<dyn BlobCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(PostgresBlobCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+            table_name,
+        )))
     }
 
-    async fn upsert(&self, data: &str) -> Result<(), CheckpointError> {
-        let conn = self
-            .pool
-            .connect_direct()
-            .await
-            .map_err(|source| CheckpointError::Store { source })?;
-        let table = self.table_name;
+    fn kafka_checkpoint_store(&self) -> Result<Arc<dyn KafkaCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(PostgresKafkaCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (
-                dataset_name TEXT PRIMARY KEY,
-                checkpoint_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.conn
-            .execute(&create_table, &[])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
+    fn debezium_checkpoint_store(
+        &self,
+    ) -> Result<Arc<dyn DebeziumCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(PostgresDebeziumCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
 
-        let upsert = format!(
-            "INSERT INTO {table} (dataset_name, checkpoint_data, updated_at)
-             VALUES ($1, $2, CURRENT_TIMESTAMP)
-             ON CONFLICT (dataset_name) DO UPDATE SET
-                checkpoint_data = EXCLUDED.checkpoint_data,
-                updated_at = CURRENT_TIMESTAMP"
-        );
-        let checkpoint_data = data.to_string();
-        conn.conn
-            .execute(&upsert, &[&self.dataset_name, &checkpoint_data])
-            .await
-            .map_err(|source| CheckpointError::Store {
-                source: Box::new(source),
-            })?;
-        Ok(())
+    fn mysql_binlog_store(&self) -> Result<Arc<dyn MySqlBinlogStore>, CheckpointError> {
+        Ok(Arc::new(PostgresMySqlBinlogStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
+
+    fn mongo_checkpoint_store(&self) -> Result<Arc<dyn MongoCheckpointStore>, CheckpointError> {
+        Ok(Arc::new(PostgresMongoCheckpointStore::new(
+            Arc::clone(&self.pool),
+            self.dataset_name.clone(),
+        )))
+    }
+
+    async fn dataset_checkpointer(
+        &self,
+        _snapshot_behavior: SnapshotBehavior,
+    ) -> Result<Arc<dyn DatasetCheckpointer>, CheckpointError> {
+        // `PostgreSQL` has no snapshot support, so the behavior is not consulted.
+        Ok(Arc::new(
+            PostgresDatasetCheckpointer::try_new(Arc::clone(&self.pool), self.dataset_name.clone())
+                .await?,
+        ))
+    }
+
+    async fn update_caching_engine_fetched_at(&self) -> Result<(), CheckpointError> {
+        Err(unsupported_sidecar("postgres", "caching-engine"))
     }
 }

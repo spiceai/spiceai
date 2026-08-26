@@ -102,6 +102,10 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
     }
+
+    async fn delete(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -697,9 +701,9 @@ impl EngineType {
 
 /// Run contention test for a specific engine type
 async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<()> {
+    use data_accelerator_api::DataAccelerator;
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion_expr::CreateExternalTable;
-    use runtime::dataaccelerator::DataAccelerator;
     use std::collections::HashMap;
 
     let temp_root = unique_temp_dir(&format!("lock_contention_{engine_type}"));
@@ -721,7 +725,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
     let accelerator: Arc<dyn TableProvider> = match engine_type {
         #[cfg(feature = "duckdb")]
         EngineType::DuckDB => {
-            use runtime::dataaccelerator::duckdb::DuckDBAccelerator;
+            use accelerator_duckdb::DuckDBAccelerator;
 
             let mut options = HashMap::new();
             options.insert("open".to_string(), db_file.display().to_string());
@@ -751,7 +755,7 @@ async fn run_engine_contention_test(engine_type: EngineType) -> anyhow::Result<(
         }
         #[cfg(feature = "sqlite")]
         EngineType::Sqlite => {
-            use runtime::dataaccelerator::sqlite::SqliteAccelerator;
+            use accelerator_sqlite::SqliteAccelerator;
 
             let mut options = HashMap::new();
             options.insert("file".to_string(), db_file.display().to_string());

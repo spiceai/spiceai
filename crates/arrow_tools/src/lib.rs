@@ -16,6 +16,8 @@ limitations under the License.
 
 pub mod decimal;
 pub mod format;
+pub mod map_entries;
+pub mod metadata_keys;
 pub mod record_batch;
 pub mod schema;
 pub mod schema_evolution;

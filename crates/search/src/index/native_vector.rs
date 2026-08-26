@@ -41,7 +41,7 @@ use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, sql::TableReference};
-use runtime_datafusion_index::Index;
+use spice_table::Index;
 
 /// A vector index that scores rows in-table via Spice's SIMD similarity UDFs.
 ///

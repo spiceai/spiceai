@@ -24,12 +24,15 @@ description = "DuckDB data connector for Spice.ai runtime"
 
 [dependencies]
 async-trait.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
 linkme.workspace = true
 paste.workspace = true
-runtime = { path = "../../runtime", features = ["duckdb"] }
+runtime-component = { path = "../../runtime-component" }
+runtime-datafusion = { path = "../../runtime-datafusion" }
+runtime-parameters = { path = "../../runtime-parameters" }
 snafu.workspace = true
 duckdb = { workspace = true, features = [
 	"bundled",
@@ -39,6 +42,9 @@ duckdb = { workspace = true, features = [
 
 [features]
 default = []
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

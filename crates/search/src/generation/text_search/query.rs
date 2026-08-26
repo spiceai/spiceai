@@ -26,6 +26,7 @@ use datafusion::{
     catalog::{Session, TableProvider},
     datasource::TableType,
     error::DataFusionError,
+    logical_expr::TableProviderFilterPushDown,
     physical_plan::ExecutionPlan,
 };
 
@@ -76,6 +77,19 @@ impl TableProvider for FullTextSearchQuery {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    /// Classify SQL filters against the tantivy index. A filter reported `Exact` is fully applied
+    /// inside the index by [`FullTextSearchExec`]; `Inexact` is applied inside the index and
+    /// re-checked by DataFusion above the scan; `Unsupported` is left entirely to DataFusion
+    /// (post-filtering above the candidate scan). The classification stays in lockstep with the
+    /// executor's translation — both are derived from the same pass — so an `Exact` filter is
+    /// never left unapplied.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::prelude::Expr],
+    ) -> std::result::Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(self.index.classify_filters(filters))
     }
 
     async fn scan(

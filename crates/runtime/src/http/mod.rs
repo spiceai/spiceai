@@ -29,16 +29,16 @@ use tokio::sync::watch::{self, Receiver};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Runtime, config, tls::TlsConfig};
+use crate::{Runtime, config};
 use runtime_search::search_engine::SearchEngine;
 use runtime_search::search_engine::parse_explicit_primary_keys;
+use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
 mod mtls;
 mod response_outcome;
 mod routes;
-pub mod traceparent;
 
 pub mod v1;
 
@@ -226,7 +226,7 @@ fn process_tls_tcp_stream(
     acceptor: TlsAcceptor,
     routes: Router,
     identity_source: IdentitySource,
-    client_auth: crate::tls::ClientAuthEnforcement,
+    client_auth: runtime_tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
 ) {
     tokio::spawn(async move {

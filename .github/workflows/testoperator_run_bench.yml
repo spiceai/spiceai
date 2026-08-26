@@ -98,6 +98,14 @@ on:
         required: false
         type: boolean
         default: false
+      # Defaults on because a benchmark should time the engine, not the cache. Turn
+      # it off only for a spicepod that is benchmarking the cache itself, such as
+      # those under test/spicepods/tpch/sf5/cache.
+      disable_caching:
+        description: 'Bypass the SQL results cache so the timings measure query execution?'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run-bench:
@@ -119,11 +127,16 @@ jobs:
       # factors (SF100+) target benchmarking-postgres directly instead. Either
       # way the target starts empty and is seeded by the "Seed postgres..."
       # step below (a plain postgres image with no pre-baked data, unlike the
-      # earlier iteration of this fix). Excludes ducklake[postgres+s3], which
-      # provisions its own local postgres catalog DB on the same port, and
-      # clickbench, whose postgres source uses a different (unseeded) database.
+      # earlier iteration of this fix). Also serves clickbench's
+      # s3[parquet]-postgres run, whose postgres is purely an acceleration
+      # target (source data comes from s3) and so needs only the empty
+      # *_accelerated database the "Create postgres acceleration databases"
+      # step provides. Excludes ducklake[postgres+s3], which provisions its own
+      # local postgres catalog DB on the same port, and clickbench's
+      # postgres-source configs, which read the pre-loaded hits data on the
+      # hosted cluster (too large to seed inline).
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && 'postgres:16' || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && 'postgres:16' || '' }}
         ports:
           - 5432:5432
         env:
@@ -303,29 +316,24 @@ jobs:
           if [ "$PGHOST" != "127.0.0.1" ]; then
             echo "::error::$DB_NAME is missing or empty on the hosted $PGHOST cluster. Scale factor $SCALE_FACTOR is too large to safely generate and load inline from a CI runner. Pre-provision it first, e.g.:"
             echo "  cd test/tpc-bench && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME DBGEN_SCALE=$SCALE_FACTOR make tpch-clone tpch-fleet-gen pg-init && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCH_DATA_DIR=./tmp/fleet make pg-load && DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index"
-            echo "(substitute the tpcds-* targets for a tpcds run)"
+            echo "(for a tpcds run: make tpcds-clone tpcds-fleet-gen pg-tpcds-init, then TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load, then make pg-tpcds-create-index)"
             exit 1
           fi
 
           echo "$DB_NAME is missing or empty on $PGHOST - seeding it now."
           sudo apt-get install -y git
-          if [ "$QUERY_SET" = "tpcds" ]; then
-            # tpcds-kit's tools/Makefile hardcodes CC=gcc-9 on Linux; ubuntu-24.04's
-            # default gcc isn't named gcc-9, so install it explicitly via the PPA.
-            sudo add-apt-repository ppa:ubuntu-toolchain-r/ppa -y
-            sudo apt-get update -y
-            sudo apt-get install -y flex bison byacc gcc-9 g++-9
-          else
-            # TPC-H data comes from the pinned DuckDB CLI (see tpch-fleet-gen), so
-            # nothing is compiled here - tpch-kit is only cloned for dss.ddl.
-            sudo apt-get install -y unzip
-          fi
+          # Both query sets seed from the pinned DuckDB CLI (tpch-fleet-gen /
+          # tpcds-fleet-gen), so nothing is compiled here - the kits are only
+          # cloned for their DDL (dss.ddl / tpcds.sql, tpcds_ri.sql). Seeding
+          # from any other generator produces data the recorded expected
+          # answers don't match (see the fleet-gen comments in the Makefile).
+          sudo apt-get install -y unzip
 
           if [ "$QUERY_SET" = "tpcds" ]; then
-            make tpcds-init
-            DBGEN_SCALE=$SCALE_FACTOR make tpcds-gen
+            make tpcds-clone
+            DBGEN_SCALE=$SCALE_FACTOR make tpcds-fleet-gen
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-init
-            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-load
+            DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME TPCDS_DATA_DIR=./tmp/tpcds-fleet make pg-tpcds-load
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-tpcds-create-index
           else
             make tpch-clone
@@ -335,6 +343,34 @@ jobs:
             DB_HOST=$PGHOST DB_PORT=5432 DB_USER=postgres DB_NAME=$DB_NAME make pg-create-index
           fi
           echo "Seed complete: $DB_NAME on $PGHOST."
+
+      # Postgres-accelerator spicepods need a *_accelerated database that the
+      # empty postgres:16 container doesn't have yet - create it before spiced
+      # starts (idempotent), matching the PGHOST the spicepod will connect to.
+      - name: Create postgres acceleration databases
+        if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        env:
+          PGHOST: ${{ (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres'))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          PGPASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+        run: |
+          set -e
+          SPICEPOD="${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+          ACCEL_DBS="$(grep -oE 'pg_db: *[A-Za-z0-9_]+_accelerated' "$SPICEPOD" | awk '{print $2}' | sort -u)"
+          if [ -z "$ACCEL_DBS" ]; then
+            echo "No *_accelerated pg_db in $SPICEPOD - nothing to create."
+            exit 0
+          fi
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update -y && sudo apt-get install -y postgresql-client
+          fi
+          for db in $ACCEL_DBS; do
+            if psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$db'" | grep -q 1; then
+              echo "$db already exists on $PGHOST."
+            else
+              createdb -U postgres "$db"
+              echo "Created $db on $PGHOST."
+            fi
+          done
 
       - name: Setup ODBC
         if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
@@ -461,6 +497,12 @@ jobs:
           connection.close()
           PY
 
+      # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
+      # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
+      # default with a one-second `item_ttl`, and the harness runs one warmup query
+      # followed by N timed iterations of the identical SQL back-to-back. Without it
+      # the warmup populates the cache and every timed iteration is a cache read, so
+      # the recorded durations describe the cache rather than the engine.
       - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         run: |
           [ -z "$AWS_ENDPOINT_URL" ] && unset AWS_ENDPOINT_URL
@@ -475,6 +517,7 @@ jobs:
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
+            --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
@@ -510,7 +553,7 @@ jobs:
           MONGODB_HOST: ${{ vars.TEST_MONGODB_HOST }}
           MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
-          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
+          POSTGRES_RW_HOST: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && '127.0.0.1' || vars.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ vars.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
@@ -591,8 +634,14 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
-              gh pr merge --squash --auto ${BRANCH_NAME}
+              # Target the branch the run was dispatched on
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base "${{ github.ref_name }}" --head ${BRANCH_NAME} --label kind/bug
+              # Auto-merge only into trunk: on an unprotected feature branch
+              # --auto merges immediately, before the branch owner can review
+              # the snapshots.
+              if [ "${{ github.ref_name }}" = "trunk" ]; then
+                gh pr merge --squash --auto ${BRANCH_NAME}
+              fi
             fi
           fi
         env:

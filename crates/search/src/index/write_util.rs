@@ -238,6 +238,12 @@ pub async fn embed_column(
         }
     }
 
+    // Every row was null or empty; skip the embed call (some providers reject an
+    // empty input array) and return a None per row.
+    if column.is_empty() {
+        return Ok(vec![None; rb.num_rows()]);
+    }
+
     let embedded_data = model
         .embed(EmbeddingInput::StringArray(column))
         .await
@@ -328,7 +334,9 @@ pub fn create_embedding_array(
             builder.values().append_slice(embedding);
             builder.append(true);
         } else {
-            builder.values().append_nulls(expected_dim);
+            // Store `f32` child values, not `Option<f32>`. Use zero-valued
+            // child slots and represent a null embedding at the list level.
+            builder.values().append_value_n(0.0, expected_dim);
             builder.append(false);
         }
     }
@@ -382,7 +390,7 @@ mod tests {
                 builder.values().append_slice(&embedding);
                 builder.append(true);
             } else {
-                builder.values().append_nulls(dim as usize);
+                builder.values().append_value_n(0.0, dim as usize);
                 builder.append(false);
             }
         }
@@ -452,6 +460,11 @@ mod tests {
         assert!(!list_array.is_null(0));
         assert!(list_array.is_null(1));
         assert!(!list_array.is_null(2));
+        assert_eq!(
+            list_array.values().null_count(),
+            0,
+            "null vectors must not put nulls in a non-nullable child array"
+        );
 
         // Check first embedding values
         let first_values = list_array.value(0);

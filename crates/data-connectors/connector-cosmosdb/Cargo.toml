@@ -8,6 +8,7 @@ description = "Azure Cosmos DB data connector for Spice.ai runtime"
 
 [dependencies]
 arrow.workspace = true
+data-connector-api = { path = "../../data-connector-api" }
 linkme.workspace = true
 async-trait.workspace = true
 azure_core = "0.31.0"
@@ -19,13 +20,17 @@ datafusion.workspace = true
 datafusion-table-providers = { workspace = true }
 futures.workspace = true
 opentelemetry.workspace = true
-runtime = { path = "../../runtime" }
+runtime-component = { path = "../../runtime-component" }
 runtime-api-types = { path = "../../runtime-api-types" }
 runtime-metrics = { path = "../../runtime-metrics" }
+runtime-parameters = { path = "../../runtime-parameters" }
 serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+runtime = { path = "../../runtime" }
 
 [lints]
 workspace = true

@@ -4,6 +4,10 @@ expression: resp?
 ---
 [
   {
+    "id": 9,
+    "answer": "The statement \"T minus 50 seconds\" indicates that there are $\\boxed{50 \\text{ seconds}}$ remaining until lift-off."
+  },
+  {
     "id": 525,
     "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]"
   },

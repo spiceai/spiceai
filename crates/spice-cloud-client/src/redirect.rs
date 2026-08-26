@@ -81,8 +81,9 @@ pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
 
 #[cfg(test)]
 mod tests {
-    use super::is_same_origin;
-    use reqwest::Url;
+    use super::{MAX_REDIRECTS, is_same_origin, same_origin_redirect_policy};
+    use crate::test_support::{Stub, ok_with, redirect_to};
+    use reqwest::{StatusCode, Url};
 
     fn url(value: &str) -> Url {
         Url::parse(value).expect("test URL should parse")
@@ -148,5 +149,115 @@ mod tests {
         assert!(!is_same_origin(&one, &two));
         // Not even against itself, which is what makes the refusal unconditional.
         assert!(!is_same_origin(&one, &one));
+    }
+
+    /// The credential the policy exists to protect. A custom header is not one of the five
+    /// `reqwest` sanitises on a cross-origin hop, so nothing but the policy keeps it on
+    /// the origin it was minted for.
+    const API_KEY: &str = "test-api-key-value";
+
+    /// A client that differs from the default in nothing but the policy under test and a
+    /// deadline.
+    ///
+    /// The deadline is what a lost hop bound looks like from here: a policy that stopped
+    /// counting would follow this stub's redirects forever, so without it the hop-limit
+    /// test would hang instead of failing. Ten seconds is far above what a loopback
+    /// exchange of eleven requests needs, so it cannot make a working policy flaky.
+    fn client_under_test() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(same_origin_redirect_policy())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("test client should build")
+    }
+
+    /// The case the policy exists for: a `Location` pointing off origin is not followed at
+    /// all, so the credential header never reaches the other origin. The 3xx comes back to
+    /// the caller as an ordinary response, which is what keeps it diagnosable.
+    #[tokio::test]
+    async fn test_a_cross_origin_redirect_is_refused_and_the_credential_stays_put() {
+        let elsewhere = Stub::serve(|_| ok_with("collected"));
+        let collection_url = elsewhere.url("/collect");
+        let origin = Stub::serve(move |_| redirect_to(&collection_url));
+
+        let response = client_under_test()
+            .get(origin.url("/auth/token/exchange"))
+            .header("x-api-key", API_KEY)
+            .send()
+            .await
+            .expect("a refused redirect should come back as a response, not a transport error");
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            origin.requests().len(),
+            1,
+            "the request should be made once and not followed anywhere"
+        );
+        assert!(
+            elsewhere.requests().is_empty(),
+            "the other origin must not be contacted at all, so the credential cannot reach it"
+        );
+    }
+
+    /// The other half: a hop that stays on origin is still followed, credential included.
+    /// A policy that refused everything would pass the test above and break every real
+    /// redirect, so this is what keeps the refusal specific.
+    #[tokio::test]
+    async fn test_a_same_origin_redirect_is_followed_and_replays_the_credential() {
+        let origin = Stub::serve(|nth| {
+            if nth == 1 {
+                redirect_to("/auth/token")
+            } else {
+                ok_with("exchanged")
+            }
+        });
+
+        let response = client_under_test()
+            .get(origin.url("/auth/token/exchange"))
+            .header("x-api-key", API_KEY)
+            .send()
+            .await
+            .expect("a same-origin redirect should be followed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("the body should read back"),
+            "exchanged"
+        );
+
+        let requests = origin.requests();
+        assert_eq!(requests.len(), 2, "the redirect should be followed once");
+        assert!(requests[0].contains("get /auth/token/exchange"));
+        assert!(requests[1].contains("get /auth/token"));
+        for request in &requests {
+            assert!(
+                request.contains(&format!("x-api-key: {API_KEY}")),
+                "a same-origin hop keeps the credential, or the redirect is useless"
+            );
+        }
+    }
+
+    /// `Policy::custom` does not bound the chain for you, so the policy counts hops
+    /// itself. A server that redirects on origin forever must still terminate: the
+    /// initial request plus `MAX_REDIRECTS` follows, then the 3xx is returned.
+    #[tokio::test]
+    async fn test_a_same_origin_redirect_chain_stops_at_the_hop_limit() {
+        let origin = Stub::serve(|nth| redirect_to(&format!("/hop-{nth}")));
+
+        let response = client_under_test()
+            .get(origin.url("/hop-0"))
+            .send()
+            .await
+            .expect(
+                "a bounded chain should come back as a response; a timeout here means the \
+                 hop limit is no longer enforced",
+            );
+
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            origin.requests().len(),
+            MAX_REDIRECTS + 1,
+            "the chain should stop after {MAX_REDIRECTS} follows rather than run forever"
+        );
     }
 }

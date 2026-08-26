@@ -176,7 +176,8 @@ mod rrf_vector_search_tests {
             base_table: df.into_view(),
             embedded_columns,
             embedding_models,
-        }) as Arc<dyn TableProvider>
+        })
+        .into_table() as Arc<dyn TableProvider>
     }
 
     async fn make_fruit_dataframe(df: &Arc<DataFusion>) -> Result<DataFrame> {

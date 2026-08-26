@@ -18,28 +18,26 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use crate::accelerated_table::refresh::{self, RefreshOverrides};
-use crate::accelerated_table::refresh_task::changes::{
-    CdcSchemaEvolution, install_cdc_schema_evolution,
-};
-use crate::accelerated_table::snapshots::SnapshotRefreshState;
-use crate::accelerated_table::{
+use crate::accelerated::refresh::{self, RefreshOverrides};
+use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
+use crate::accelerated::refresh_task::probe_acceleration_contents;
+use crate::accelerated::snapshots::SnapshotRefreshState;
+use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
-use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::accelerated::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
-use crate::dataaccelerator::spice_sys::OpenOption;
-use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::swappable::SwappableTableProvider;
+use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataaccelerator::{self, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
+use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::dataconnector::sink::SINK_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
 use crate::dataconnector::{DataConnector, DataConnectorError};
@@ -48,7 +46,7 @@ use crate::dataupdate::{
     DataUpdate, DataUpdateBroadcaster, StreamingDataUpdate, StreamingDataUpdateExecutionPlan,
     UpdateType,
 };
-use crate::federated_table::FederatedTable;
+use crate::federated::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     dataset_constraint_columns, emit_schema_evolution_event, engine_supports_in_place_evolution,
@@ -59,6 +57,12 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use data_accelerator_api::swappable::SwappableTableProvider;
+use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration_source::resolved_refresh_mode;
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -81,10 +85,7 @@ use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::query::QueryResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
-use data_components::{
-    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
-    poly::PolyTableProvider,
-};
+use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -116,12 +117,12 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
+use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
-use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
-use spicepod::{metric::Metrics, semantic::Column};
+use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::{Mutex, Notify};
@@ -138,26 +139,28 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub use runtime_datafusion::composed_catalog;
-pub use runtime_datafusion::dialect;
-pub use runtime_datafusion::error;
-pub mod filter_converter;
+// `error` and `refresh_sql` below are named throughout the runtime through these
+// aliases, but they belong to `runtime-datafusion`. Crate-visible so a crate outside
+// the runtime has to depend on `runtime-datafusion` directly rather than route
+// through here.
+pub(crate) use runtime_datafusion::error;
+pub use runtime_table::filter_converter;
 pub mod flight_session_extension;
 pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
-pub mod pg_catalog;
+pub use runtime_datafusion::pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
-pub use runtime_datafusion::refresh_sql;
+pub(crate) use runtime_datafusion::refresh_sql;
 pub mod request_context_extension;
 pub use runtime_datafusion::retention_sql;
-pub mod schema;
+pub use runtime_table::table_provider_with_spicepod_metadata;
 pub mod secrets_context_extension;
 pub mod table;
 pub use runtime_datafusion::sort_columns;
 pub(crate) mod sql_validator;
-pub(crate) mod sync_table;
 pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
@@ -211,6 +214,13 @@ impl StreamingBroadcastBuffer {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl From<EnsureSchemaError> for Error {
+    fn from(value: EnsureSchemaError) -> Self {
+        let EnsureSchemaError::CatalogMissing { catalog } = value;
+        Error::CatalogMissing { catalog }
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -309,7 +319,7 @@ pub enum Error {
     #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
         dataset_name: String,
-        source: crate::accelerated_table::Error,
+        source: crate::accelerated::Error,
     },
 
     #[snafu(display(
@@ -733,51 +743,6 @@ pub enum Table {
     },
 }
 
-/// Pushes spicepod metadata enrichment to the base of the provider stack,
-/// rebuilding the index, embedding and vector-scan layers around it so each
-/// stays discoverable by downcast. The `IndexTableScan` analyzer and the CDC
-/// changes stream both rely on that discoverability: wrapping one of these
-/// layers opaquely instead hides it, so no changes stream is attached and
-/// `refresh_mode: changes` fails with "a changes stream is required".
-/// Restricted to the layers a registration-time source stack contains; see
-/// the layer table in [`crate::table_layers`].
-pub(crate) fn table_provider_with_spicepod_metadata(
-    provider: Arc<dyn TableProvider>,
-    table_metadata: &HashMap<String, String>,
-    columns: &[Column],
-) -> Arc<dyn TableProvider> {
-    let field_metadata = field_metadata_from_columns(columns);
-    if table_metadata.is_empty() && field_metadata.is_empty() {
-        return provider;
-    }
-
-    runtime_datafusion_index::rebuild_innermost_table_provider(
-        provider,
-        &[
-            crate::table_layers::INDEXED_LAYER,
-            crate::table_layers::EMBEDDING_LAYER,
-            crate::table_layers::VECTOR_SCAN_LAYER,
-        ],
-        &|innermost| {
-            metadata_enriched_table_provider(
-                innermost,
-                table_metadata.clone(),
-                field_metadata.clone(),
-            )
-        },
-    )
-}
-
-fn field_metadata_from_columns(columns: &[Column]) -> FieldMetadata {
-    columns
-        .iter()
-        .filter_map(|column| {
-            let metadata = column.metadata();
-            (!metadata.is_empty()).then(|| (column.name.clone(), metadata))
-        })
-        .collect()
-}
-
 struct PendingSinkRegistration {
     dataset: Arc<Dataset>,
     secrets: Arc<TokioRwLock<Secrets>>,
@@ -851,6 +816,12 @@ pub struct DataFusion {
     /// plan instead of re-running `EXPLAIN ANALYZE`. Default (unset) behaves
     /// as `TaskHistoryCapturedPlan::None`.
     plan_capture: OnceLock<query::plan_capture::PlanCaptureConfig>,
+    /// Drasi forwarders for the runtime's own tables, from `runtime.drasi`.
+    /// Installed before anything can write, ahead of the tables themselves —
+    /// the forwarders resolve a table's key lazily from the constraints handed
+    /// to them at write time, so the tables need not exist yet. Absent when
+    /// unconfigured.
+    pub(crate) drasi_forwarders: OnceLock<Arc<crate::drasi::internal::InternalForwarders>>,
 
     /// Signalled after each completed streaming write; the cluster executor
     /// statistics reporter listens so scheduler-side stats (and the COUNT(*)
@@ -1113,6 +1084,19 @@ impl DataFusion {
         self.plan_capture.get()
     }
 
+    /// Install the Drasi forwarders for the runtime's own tables. Idempotent-
+    /// tolerant: a second call is ignored with a warning.
+    pub(crate) fn set_drasi_forwarders(
+        &self,
+        forwarders: Arc<crate::drasi::internal::InternalForwarders>,
+    ) {
+        if self.drasi_forwarders.set(forwarders).is_err() {
+            tracing::warn!(
+                "Drasi forwarders already set on DataFusion; ignoring duplicate set_drasi_forwarders"
+            );
+        }
+    }
+
     pub async fn get_table(
         &self,
         table_reference: &TableReference,
@@ -1145,7 +1129,10 @@ impl DataFusion {
         // that caches its tables (`SpiceSchemaProvider`, the Iceberg catalog's
         // `IcebergSchemaProvider`, …). See `sync_table` for how to extend it to
         // another catalog.
-        sync_table::resolve_table_sync(schema_provider.as_ref(), table_reference.table())
+        runtime_execution_plans::sync_table::resolve_table_sync(
+            schema_provider.as_ref(),
+            table_reference.table(),
+        )
     }
 
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
@@ -1245,7 +1232,7 @@ impl DataFusion {
         dataset: Arc<Dataset>,
         table: Table,
     ) -> Result<Option<Arc<Notify>>> {
-        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let dataset_access_mode = dataset.access();
         let dataset_table_ref = dataset.name.clone();
@@ -1695,6 +1682,26 @@ impl DataFusion {
         // for it. `mem_tier_budget_bytes` is `None` when no configured table can
         // reach the tier (and for a non-Cayenne deployment): nothing to bound, so
         // nothing is installed and no tuning warning is emitted.
+        // Aggregate ceiling on the PK keyset caches. Each table derives its own
+        // from `pk_keyset_cache_mb` — ~1/32 of memory, clamped 256 MiB–8 GiB —
+        // with no view of its siblings, so a seven-table CDC pod on a 96 GiB host
+        // grants 21 GiB in total that no single table can ever exceed. Measured
+        // at SF-1000: ~14.5 GiB resident in keysets and not one over-budget
+        // event, because every table was correctly inside its own limit.
+        //
+        // 1/16 of the coordinated total, the same order as one table's own
+        // ceiling: generous enough that a single-table pod is unaffected (it
+        // clamps to its own figure anyway) while a fleet shares one bound
+        // instead of multiplying it. Over the ceiling a table degrades to its
+        // bloom, which is the fallback an over-budget table already takes.
+        let pk_keyset_budget_bytes = self.total_memory / 16;
+        cayenne::set_global_pk_keyset_bytes(pk_keyset_budget_bytes);
+        tracing::info!(
+            pk_keyset_budget_bytes,
+            total_memory = self.total_memory,
+            "Cayenne global PK keyset byte budget active (bounds the SUM of per-table keyset caches, which are sized independently)"
+        );
+
         if let Some(mem_tier_budget_bytes) = self.mem_tier_budget_bytes {
             cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
             // Mirror mem-tier `used` into the query MemoryPool so operators and
@@ -1824,7 +1831,7 @@ impl DataFusion {
                         total_memory,
                         pool_used,
                         compaction_used,
-                        crate::accelerator_memory_budget::duckdb_total_reservation_bytes(),
+                        runtime_acceleration::memory_budget::duckdb_total_reservation_bytes(),
                     )
                     .min(ceiling);
                     cayenne::update_global_mem_tier_total(dynamic);
@@ -1937,9 +1944,10 @@ impl DataFusion {
     pub async fn load_deferred_dataset(&self, table_reference: TableReference) -> Result<()> {
         let deferred_tables = self.deferred_tables.read().await;
         if let Some(deferred_registration) = deferred_tables.get(&table_reference.to_string()) {
+            let context = RuntimeConnectorContext::for_dataset(&deferred_registration.dataset);
             let read_provider = deferred_registration
                 .connector
-                .read_provider(&deferred_registration.dataset)
+                .read_provider(&context, &deferred_registration.dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?;
 
@@ -1974,7 +1982,7 @@ impl DataFusion {
         schema: arrow_schema::SchemaRef,
     ) -> Result<()> {
         use crate::datafusion::table::dataset_table_provider::DatasetTableProvider;
-        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+        ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
 
         let placeholder = Arc::new(DatasetTableProvider::new(
             dataset.name.clone(),
@@ -2187,58 +2195,62 @@ impl DataFusion {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<()> {
-        let pending_sink_registrations = self.pending_sink_tables.read().await;
-
-        let mut pending_registration = None;
-        for pending_sink_registration in pending_sink_registrations.iter() {
-            if pending_sink_registration.dataset.name == table_reference {
-                pending_registration = Some(pending_sink_registration);
-                break;
-            }
-        }
-
-        let Some(pending_registration) = pending_registration else {
-            return Ok(());
+        // Claim the pending registration by removing it under the write lock, so exactly one
+        // caller registers a given pending sink. Concurrent OpenTelemetry exports for the same
+        // metric would otherwise both find it under a shared read lock and both register it;
+        // worse, the second caller's removal pass — no longer finding the entry the first
+        // already removed — used to fall back to index 0 and evict an unrelated pending
+        // dataset, leaving it permanently unregistered ("Table ... not registered" on every
+        // later write). A caller that finds nothing to claim was beaten to it (or the dataset
+        // is not a pending sink) and has nothing to do.
+        let pending_registration = {
+            let mut pending_sink_registrations = self.pending_sink_tables.write().await;
+            let Some(idx) = pending_sink_registrations
+                .iter()
+                .position(|registration| registration.dataset.name == table_reference)
+            else {
+                return Ok(());
+            };
+            pending_sink_registrations.remove(idx)
         };
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
-        let read_provider = sink_connector
-            .read_provider(&pending_registration.dataset)
+        let registration = async {
+            let context = RuntimeConnectorContext::for_dataset(&pending_registration.dataset);
+            let read_provider = sink_connector
+                .read_provider(&context, &pending_registration.dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?;
+            let federated_table = FederatedTable::new_unchecked(read_provider);
+
+            tracing::info!(
+                "Dataset {} loading data...",
+                pending_registration.dataset.name
+            );
+            self.register_accelerated_table(
+                Arc::clone(&pending_registration.dataset),
+                Arc::clone(&sink_connector),
+                federated_table,
+                Arc::clone(&pending_registration.secrets),
+                BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
+                None,                    // Sink datasets are not partition-scoped
+            )
             .await
-            .context(UnableToResolveTableProviderSnafu)?;
-        let federated_table = FederatedTable::new_unchecked(read_provider);
+        }
+        .await;
 
-        tracing::info!(
-            "Dataset {} loading data...",
-            pending_registration.dataset.name
-        );
-        self.register_accelerated_table(
-            Arc::clone(&pending_registration.dataset),
-            sink_connector,
-            federated_table,
-            Arc::clone(&pending_registration.secrets),
-            BootstrapStatus::none(), // Sink datasets don't bootstrap from snapshots
-            None,                    // Sink datasets are not partition-scoped
-        )
-        .await?;
-
-        drop(pending_sink_registrations);
-
-        let mut pending_sink_registrations = self.pending_sink_tables.write().await;
-        let mut pending_registration_idx = Some(0);
-        for (pending_sink_registration_idx, pending_sink_registration) in
-            pending_sink_registrations.iter().enumerate()
-        {
-            if pending_sink_registration.dataset.name == table_reference {
-                pending_registration_idx = Some(pending_sink_registration_idx);
-                break;
+        match registration {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Registration failed after we claimed the entry: return it to the queue so a
+                // later write retries it, rather than leaving the dataset unregistered.
+                self.pending_sink_tables
+                    .write()
+                    .await
+                    .push(pending_registration);
+                Err(e)
             }
         }
-        if let Some(pending_registration_idx) = pending_registration_idx {
-            pending_sink_registrations.remove(pending_registration_idx);
-        }
-
-        Ok(())
     }
 
     pub async fn write_data(
@@ -2312,13 +2324,33 @@ impl DataFusion {
                 })?;
         }
 
+        // Queue the committed write for Drasi, when `runtime.drasi` names this
+        // table. After the write, so Drasi only sees rows the runtime kept; and
+        // a queue rather than an await, so a Drasi outage cannot stall the
+        // writer or fail a write a caller would then retry and duplicate.
+        if let Some(forwarders) = self.drasi_forwarders.get() {
+            forwarders
+                .forward(
+                    table_reference,
+                    &update_type,
+                    table_provider.constraints(),
+                    &update_schema,
+                    &update_data,
+                )
+                .await;
+        }
+
         // Invalidate cached query state for this table.
         // Both results and logical plans can become stale after a write:
         // - results cache may otherwise replay pre-write answers
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after write: {e}"
             );
@@ -2437,7 +2469,11 @@ impl DataFusion {
         // - plans cache may hold stale `Arc<dyn TableProvider>` references
         //   whose in-memory state (e.g. Cayenne protected snapshots / deletion
         //   caches) no longer reflects the latest write.
-        if let Err(e) = self.caching().invalidate_for_table(table_reference.clone()) {
+        if let Err(e) = self
+            .caching()
+            .invalidate_for_table(table_reference.clone())
+            .await
+        {
             tracing::warn!(
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
@@ -2584,7 +2620,7 @@ impl DataFusion {
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
@@ -2703,7 +2739,7 @@ impl DataFusion {
         // SQLite/Postgres/Cayenne backing table) before upgrading.
         let storage_schema = if matches!(refresh_mode, RefreshMode::Caching) {
             Arc::new(
-                crate::accelerated_table::caching::extend_schema_with_cache_namespace(
+                crate::accelerated::caching::extend_schema_with_cache_namespace(
                     &dataset.name.to_string(),
                     &refresh_schema,
                 )
@@ -2764,10 +2800,11 @@ impl DataFusion {
             // Caching mode datasets are always ready immediately
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
-        } else if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+        } else if let Ok(checkpoint) = dataset_checkpointer(
             dataset,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            acceleration_settings.snapshot_behavior.clone(),
         )
         .await
             && checkpoint.exists().await
@@ -2845,7 +2882,7 @@ impl DataFusion {
         // (executor owns no partition of this table) is preserved so the refresh
         // loads no rows rather than the entire source table.
         if let Some(filters) = initial_partition_filters {
-            use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
+            use crate::accelerated::refresh::{RefreshSQL, RefreshSQLColumns};
             if let Some(ref mut sql) = refresh.sql {
                 sql.set_partition_filters(Some(filters));
             } else {
@@ -2898,7 +2935,7 @@ impl DataFusion {
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
         accelerated_table_builder.cdc_param_overrides(
-            crate::accelerated_table::refresh_task::changes::extract_cdc_param_overrides(
+            crate::accelerated::refresh_task::changes::extract_cdc_param_overrides(
                 &acceleration_settings.params,
             )
             .map(Arc::new),
@@ -2985,9 +3022,7 @@ impl DataFusion {
                 let check_interval = retention_period.max(Duration::from_secs(30));
 
                 let cache_retention = Retention::builder()
-                    .time_column(Some(
-                        crate::accelerated_table::caching::CACHE_REFRESHED_AT_COLUMN,
-                    ))
+                    .time_column(Some(crate::accelerated::caching::CACHE_REFRESHED_AT_COLUMN))
                     .time_period(Some(retention_period))
                     .check_interval(Some(check_interval))
                     .enabled(true)
@@ -3057,17 +3092,13 @@ impl DataFusion {
         }
 
         accelerated_table_builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(
+            dataset_checkpointer(
                 dataset,
                 self.accelerator_engine_registry(),
                 OpenOption::CreateIfNotExists,
+                acceleration_settings.snapshot_behavior.clone(),
             )
             .await
-            .map(|checkpoint| {
-                checkpoint
-                    .with_snapshot_behavior(acceleration_settings.snapshot_behavior)
-                    .to_arc()
-            })
             .ok(),
         );
 
@@ -3105,7 +3136,23 @@ impl DataFusion {
                 },
             );
 
-            let changes_stream = source.changes_stream(Arc::clone(&source_table_provider), dataset);
+            // Observed before the stream exists, so the CDC writer — the only
+            // writer on this path — cannot have touched the acceleration yet.
+            // A source that cannot place an acceleration's contents has to
+            // assume they may be hiding rows deleted at the source; this is how
+            // it recognizes a load that starts from nothing instead. See
+            // `AccelerationContents`.
+            let acceleration =
+                probe_acceleration_contents(&accelerated_table_provider, &dataset.name).await;
+
+            let changes_stream = source
+                .changes_stream(
+                    &RuntimeConnectorContext::for_dataset(dataset),
+                    Arc::clone(&source_table_provider) as Arc<dyn FederatedTableProvider>,
+                    dataset,
+                    acceleration,
+                )
+                .await;
 
             if let Some(changes_stream) = changes_stream {
                 accelerated_table_builder.changes_stream(changes_stream);
@@ -3171,13 +3218,27 @@ impl DataFusion {
             && (acceleration_settings
                 .params
                 .get("cayenne_file_path")
-                .is_some_and(|path| crate::dataaccelerator::cayenne::s3::is_s3_express_path(path))
+                .is_some_and(|path| runtime_object_store::is_s3_express_path(path))
                 || acceleration_settings
                     .params
                     .contains_key("cayenne_s3_zone_ids"));
         #[cfg(windows)]
         let is_s3_express_acceleration = false;
         accelerated_table_builder.s3_express_acceleration(is_s3_express_acceleration);
+
+        // The engine rewrites some incoming types at table creation because its storage
+        // format cannot hold them (DuckDB stores every TIMESTAMPTZ at microsecond
+        // precision, Cayenne/Vortex has no half-precision float). The refresh sink
+        // compares the incoming schema against the accelerated one, so without these
+        // rules it reports the engine's own type as the acceleration lagging the source.
+        let engine_type_rewrites = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .map_or::<arrow_tools::type_rewrite::TypeRewriteRules, _>(&[], |accel| {
+                accel.type_rewrite_rules()
+            });
+        accelerated_table_builder.engine_type_rewrites(engine_type_rewrites);
 
         source
             .on_accelerator_setup(dataset, &mut accelerated_table_builder)
@@ -3245,10 +3306,11 @@ impl DataFusion {
             return Ok(None);
         }
 
-        let Ok(cp) = DatasetCheckpoint::try_new(
+        let Ok(cp) = dataset_checkpointer(
             dataset,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
         )
         .await
         else {
@@ -3375,7 +3437,7 @@ impl DataFusion {
                             .evolve_accelerated_table_schema(
                                 dataset,
                                 acceleration_settings,
-                                &cp,
+                                cp.as_ref(),
                                 &plan,
                             )
                             .await
@@ -3509,13 +3571,26 @@ impl DataFusion {
                 && let Some(accel_engine) =
                     engine_to_acceleration_engine(acceleration_settings.engine)
             {
-                dataaccelerator::snapshots::snapshot_before_recreate(
+                // The same engine-specific override the normal creation path resolves,
+                // so the archive is in the format that engine's bootstrap consumes —
+                // a Cayenne snapshot without its per-dataset metastore slice becomes
+                // the store's current snapshot and cannot be restored.
+                let snapshot_engine_override = match self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                {
+                    Some(accel) => accel.snapshot_engine_for_source(dataset).await,
+                    None => None,
+                };
+                data_accelerator_api::snapshots::snapshot_before_recreate(
                     acceleration_settings,
                     &dataset_name,
                     layout,
                     accel_engine,
                     Arc::clone(&existing_schema),
-                    None,
+                    snapshot_engine_override,
+                    resolved_refresh_mode(dataset, acceleration_settings),
                 )
                 .await;
             }
@@ -3564,7 +3639,7 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         acceleration_settings: &Acceleration,
-        checkpoint: &DatasetCheckpoint,
+        checkpoint: &dyn DatasetCheckpointer,
         plan: &WideningPlan,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(accelerator) = self
@@ -3712,10 +3787,11 @@ impl DataFusion {
                     return Ok(None);
                 }
 
-                let Ok(cp) = DatasetCheckpoint::try_new(
+                let Ok(cp) = dataset_checkpointer(
                     dataset.as_ref(),
                     self.accelerator_engine_registry(),
                     OpenOption::OpenExisting,
+                    SnapshotBehavior::Disabled,
                 )
                 .await
                 else {
@@ -3731,7 +3807,7 @@ impl DataFusion {
                 };
 
                 if let Err(e) = self
-                    .evolve_accelerated_table_schema(dataset, acceleration, &cp, &plan)
+                    .evolve_accelerated_table_schema(dataset, acceleration, cp.as_ref(), &plan)
                     .await
                 {
                     SCHEMA_EVOLUTION_FAILED.add(
@@ -3754,7 +3830,10 @@ impl DataFusion {
                 let sink_connector = Arc::new(SinkConnector::new(Arc::clone(&plan.evolved_schema)))
                     as Arc<dyn DataConnector>;
                 let read_provider = sink_connector
-                    .read_provider(dataset.as_ref())
+                    .read_provider(
+                        &RuntimeConnectorContext::for_dataset(dataset),
+                        dataset.as_ref(),
+                    )
                     .await
                     .context(UnableToResolveTableProviderSnafu)?;
                 let federated_table = FederatedTable::new_unchecked(read_provider);
@@ -3799,7 +3878,7 @@ impl DataFusion {
     /// It is safe to fallback to the existing acceleration behavior, but the refreshes won't be synchronized.
     pub async fn attempt_to_synchronize_accelerated_table(
         &self,
-        accelerated_table_builder: &mut accelerated_table::Builder,
+        accelerated_table_builder: &mut accelerated::Builder,
         dataset: &Dataset,
     ) {
         let parent_table_reference = TableReference::parse_str(dataset.path());
@@ -3839,7 +3918,10 @@ impl DataFusion {
             // Arrow accelerator).
             None => parent_table,
         };
-        let Some(parent_table) = parent_table.downcast_ref::<AcceleratedTable>() else {
+        let Some(parent_table) = spice_table::find_layer::<AcceleratedTable>(
+            parent_table.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) else {
             tracing::debug!(
                 "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not an accelerated table."
             );
@@ -3948,7 +4030,10 @@ impl DataFusion {
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) {
             let notifier = accelerated_table.refresher().on_complete_notification();
             accelerated_table.trigger_refresh(overrides).await.context(
                 UnableToTriggerRefreshSnafu {
@@ -3997,7 +4082,7 @@ impl DataFusion {
                 Some(
                     serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
                         dataset_name: dataset_name.to_string(),
-                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                        source: crate::accelerated::Error::FailedToTriggerRefresh {
                             source: tokio::sync::mpsc::error::SendError(None),
                         },
                     })?,
@@ -4082,7 +4167,10 @@ impl DataFusion {
             .fail();
         }
 
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) {
             accelerated_table.update_refresh_sql(parsed).await.context(
                 UnableToTriggerRefreshSnafu {
                     dataset_name: dataset_name.to_string(),
@@ -4107,7 +4195,10 @@ impl DataFusion {
             .get_accelerated_table_provider(&dataset_name.to_string())
             .await?;
 
-        if let Some(accelerated_table) = table.downcast_ref::<AcceleratedTable>() {
+        if let Some(accelerated_table) = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        ) {
             accelerated_table
                 .update_partition_filters(filters)
                 .await
@@ -4129,13 +4220,16 @@ impl DataFusion {
             .await
             .map_err(find_datafusion_root)
             .context(UnableToGetTableSnafu)?;
-        // Peel the wrappers that can sit between the catalog entry and the
-        // underlying `AcceleratedTable` so callers can downcast to it.
-        // PolyTableProvider-backed accelerators are wrapped in a
-        // `FederatedTableProviderAdaptor`, and datasets that declare table- or
-        // column-level metadata are wrapped in a `MetadataEnrichedTableProvider`
-        // by `register_accelerated_table`. The two can nest in either order, so
-        // loop until neither wrapper matches.
+        // Peel what registration stacks between the catalog entry and the
+        // accelerated table, so callers reach it. A `PolyTableProvider`-backed
+        // accelerator sits inside a `FederatedTableProviderAdaptor`, and a
+        // dataset declaring table- or column-level metadata gains a metadata
+        // layer; the two nest in either order, so loop.
+        //
+        // Stops *at* the accelerated table rather than peeling to its
+        // accelerator: that is the thing callers are looking for, and peeling
+        // past it makes an accelerated dataset look unaccelerated (refresh then
+        // reports "Table is not accelerated").
         loop {
             if let Some(adaptor) = table.downcast_ref::<FederatedTableProviderAdaptor>() {
                 if let Some(nested_table) = adaptor.table_provider.clone() {
@@ -4148,8 +4242,11 @@ impl DataFusion {
                 .fail();
             }
 
-            if let Some(enriched) = table.downcast_ref::<MetadataEnrichedTableProvider>() {
-                let inner = Arc::clone(enriched.get_inner_ref());
+            if let Some(layered) = table.downcast_ref::<spice_table::SpiceTable>() {
+                if layered.layer_as::<AcceleratedTable>().is_some() {
+                    break;
+                }
+                let inner = Arc::clone(layered.below());
                 table = inner;
                 continue;
             }
@@ -4177,7 +4274,7 @@ impl DataFusion {
         let source_table_provider: Arc<dyn TableProvider> = match dataset.access() {
             AccessMode::Read => federated_table_provider,
             AccessMode::ReadWrite | AccessMode::ReadWriteCreate => source
-                .read_write_provider(dataset)
+                .read_write_provider(&RuntimeConnectorContext::for_dataset(dataset), dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
@@ -4408,10 +4505,11 @@ impl DataFusion {
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
-        if let Ok(checkpoint) = DatasetCheckpoint::try_new(
+        if let Ok(checkpoint) = dataset_checkpointer(
             view,
             self.accelerator_engine_registry(),
             OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
         )
         .await
             && checkpoint.exists().await
@@ -4462,17 +4560,13 @@ impl DataFusion {
         builder.initial_load_complete(initial_load_complete);
         builder.caching(Some(Arc::clone(&self.caching)));
         builder.checkpointer_opt(
-            DatasetCheckpoint::try_new(
+            dataset_checkpointer(
                 view,
                 self.accelerator_engine_registry(),
                 OpenOption::CreateIfNotExists,
+                acceleration.snapshot_behavior.clone(),
             )
             .await
-            .map(|checkpoint| {
-                checkpoint
-                    .with_snapshot_behavior(acceleration.snapshot_behavior.clone())
-                    .to_arc()
-            })
             .ok(),
         );
         builder.refresh_on_startup(acceleration.refresh_on_startup);
@@ -5061,16 +5155,22 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         };
     }
 
-    if let Some(poly) = table_provider.downcast_ref::<PolyTableProvider>() {
+    if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+        table_provider.as_ref(),
+        spice_table::LayerWalk::Write,
+    ) {
         return partition_expr_from_table_provider(&poly.writer());
     }
 
-    if let Some(accelerated) = table_provider.downcast_ref::<AcceleratedTable>() {
+    if let Some(accelerated) = spice_table::find_layer::<AcceleratedTable>(
+        table_provider.as_ref(),
+        spice_table::LayerWalk::Read,
+    ) {
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
     }
 
-    if let Some(enriched) = table_provider.downcast_ref::<MetadataEnrichedTableProvider>() {
-        return partition_expr_from_table_provider(enriched.get_inner_ref());
+    if let Some(layered) = table_provider.downcast_ref::<spice_table::SpiceTable>() {
+        return partition_expr_from_table_provider(layered.below());
     }
 
     if let Some(adaptor) = table_provider.downcast_ref::<FederatedTableProviderAdaptor>()
@@ -5159,6 +5259,20 @@ async fn build_snapshot_creation_config(
     // both bootstrap and creation), snapshot refresh mode must not publish new
     // snapshots or run the refresh-complete snapshot creation path.
     if matches!(refresh_mode, RefreshMode::Snapshot) {
+        return Ok(None);
+    }
+
+    // A partitioned Cayenne dataset must not publish snapshots: its exported
+    // metastore slice omits the partition child tables, so the uploaded archive
+    // could not be restored, yet `create_snapshot` would still make it the
+    // store's `current-snapshot-id`. Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.engine == Engine::Cayenne
+        && !acceleration_settings.partition_by.is_empty()
+    {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for this dataset: snapshots of a partitioned Cayenne acceleration are not yet supported, and an archive without the partitions' metadata could not be restored"
+        );
         return Ok(None);
     }
 
@@ -5379,17 +5493,16 @@ async fn build_snapshot_refresh_state(
             let snapshot_behavior = snapshot_behavior_for_checkpointer.clone();
             let registry = Arc::clone(&registry_for_checkpointer);
             async move {
-                use crate::dataaccelerator::spice_sys::OpenOption;
-                use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
+                use runtime_acceleration::sidecar::OpenOption;
                 use snafu::ResultExt;
-                DatasetCheckpoint::try_new(source.as_ref(), registry, OpenOption::OpenExisting)
-                    .await
-                    .boxed()
-                    .map(|checkpoint| {
-                        checkpoint
-                            .with_snapshot_behavior(snapshot_behavior)
-                            .to_arc()
-                    })
+                crate::dataaccelerator::spice_sys::dataset_checkpointer(
+                    source.as_ref(),
+                    registry,
+                    OpenOption::OpenExisting,
+                    snapshot_behavior,
+                )
+                .await
+                .boxed()
             }
         });
     let manager = manager
@@ -5451,10 +5564,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use cache::{SimpleCache, key::CacheKey};
     use datafusion::datasource::MemTable;
+    use spicepod::semantic::Column;
 
     use crate::builder::RuntimeBuilder;
-    use runtime_datafusion_index::IndexedTableProvider;
-    use runtime_search::embeddings::table::EmbeddingTable;
 
     use super::*;
 
@@ -5628,203 +5740,6 @@ mod tests {
     }
 
     #[test]
-    fn embedding_table_metadata_wrap_preserves_downcast() {
-        // Regression test for CDC-over-embeddings: when a dataset carries table- or
-        // column-level metadata, `table_provider_with_spicepod_metadata` must keep an
-        // `EmbeddingTable` discoverable via `downcast_ref::<EmbeddingTable>()` (pushing
-        // the metadata onto the base table) rather than wrapping it opaquely in a
-        // `MetadataEnrichedTableProvider`. `EmbeddingConnector::changes_stream` unwraps
-        // the `EmbeddingTable` to its base table to build the source changes stream; an
-        // opaque wrapper hides it, so no stream is attached and `refresh_mode: changes`
-        // fails with "a changes stream is required".
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        let embedding_table = Arc::new(EmbeddingTable {
-            base_table,
-            embedded_columns: HashMap::new(),
-            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }) as Arc<dyn TableProvider>;
-
-        let mut table_metadata = HashMap::new();
-        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
-        let mut content_column = Column::new("content");
-        content_column.description = Some("post body".to_string());
-        let columns = vec![content_column];
-
-        let wrapped = table_provider_with_spicepod_metadata(
-            Arc::clone(&embedding_table),
-            &table_metadata,
-            &columns,
-        );
-
-        let wrapped_embedding = wrapped.downcast_ref::<EmbeddingTable>().expect(
-            "metadata wrap must keep the EmbeddingTable discoverable for the changes stream",
-        );
-
-        // Metadata enrichment is pushed onto the base table, not layered opaquely on top.
-        assert!(
-            wrapped_embedding
-                .base_table
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "base table should be metadata-enriched"
-        );
-    }
-
-    /// Builds the provider stack a dataset with `embeddings` produces:
-    /// `EmbeddingTable` over the source provider.
-    fn embedding_table_over_memtable() -> Arc<dyn TableProvider> {
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        Arc::new(EmbeddingTable {
-            base_table,
-            embedded_columns: HashMap::new(),
-            embedding_models: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-        }) as Arc<dyn TableProvider>
-    }
-
-    /// Builds the provider stack a dataset with `vectors` enabled produces:
-    /// `VectorScanTableProvider` over the source provider.
-    fn vector_scan_over_memtable() -> Arc<dyn TableProvider> {
-        let base_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, true),
-        ]));
-        let base_table = Arc::new(
-            MemTable::try_new(base_schema, vec![vec![]]).expect("mem table should be created"),
-        ) as Arc<dyn TableProvider>;
-
-        Arc::new(search::index::VectorScanTableProvider {
-            table_provider: base_table,
-            vector_index_list: Arc::new(datafusion::logical_expr::LogicalPlan::EmptyRelation(
-                datafusion::logical_expr::EmptyRelation {
-                    produce_one_row: false,
-                    schema: Arc::new(datafusion::common::DFSchema::empty()),
-                },
-            )),
-            primary_key: vec!["id".to_string()],
-        }) as Arc<dyn TableProvider>
-    }
-
-    fn spicepod_metadata_fixture() -> (HashMap<String, String>, Vec<Column>) {
-        let mut table_metadata = HashMap::new();
-        table_metadata.insert("source_owner".to_string(), "analytics".to_string());
-        let mut content_column = Column::new("content");
-        content_column.description = Some("post body".to_string());
-        (table_metadata, vec![content_column])
-    }
-
-    #[test]
-    fn embedding_table_metadata_wrap_preserves_table_metadata() {
-        // `EmbeddingTable::schema()` rebuilds the schema from its base table's fields.
-        // Pushing metadata enrichment onto the base table only works if that rebuild
-        // carries the base schema's metadata; otherwise dataset-level spicepod
-        // `metadata:` silently disappears from the source-facing schema.
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-
-        let wrapped = table_provider_with_spicepod_metadata(
-            embedding_table_over_memtable(),
-            &table_metadata,
-            &columns,
-        );
-
-        let schema = wrapped.schema();
-        assert_eq!(
-            schema.metadata().get("source_owner").map(String::as_str),
-            Some("analytics"),
-            "table-level spicepod metadata must survive the metadata wrap"
-        );
-        assert_eq!(
-            schema
-                .field_with_name("content")
-                .expect("content field")
-                .metadata()
-                .get("description")
-                .map(String::as_str),
-            Some("post body"),
-            "column-level spicepod metadata must survive the metadata wrap"
-        );
-    }
-
-    #[test]
-    fn embedding_table_under_indexed_provider_stays_discoverable() {
-        // A dataset with both `embeddings` and `full_text_search` nests an
-        // `EmbeddingTable` under the `IndexedTableProvider` the FTS connector builds.
-        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
-        // `EmbeddingConnector::changes_stream`, which downcasts to `EmbeddingTable`; if
-        // the metadata wrap hides it there, no changes stream is attached and
-        // `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
-            embedding_table_over_memtable(),
-            vec![],
-        )) as Arc<dyn TableProvider>;
-
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
-
-        let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
-
-        assert!(
-            found_indexed
-                .get_underlying()
-                .downcast_ref::<EmbeddingTable>()
-                .is_some(),
-            "EmbeddingTable nested under an IndexedTableProvider must stay discoverable"
-        );
-    }
-
-    #[test]
-    fn vector_scan_under_indexed_provider_stays_discoverable() {
-        // A dataset with `embeddings`, `full_text_search` and `vectors` enabled nests a
-        // `VectorScanTableProvider` under the `IndexedTableProvider` (the FTS index is
-        // added to the same provider the vector engine created).
-        // `FullTextConnector::with_indexed_stream` hands `get_underlying()` to
-        // `EmbeddingConnector::changes_stream`, which downcasts to
-        // `VectorScanTableProvider` to reach the raw source; if the metadata wrap hides
-        // it there, `refresh_mode: changes` fails with "a changes stream is required".
-        let indexed = Arc::new(IndexedTableProvider::with_indexes(
-            vector_scan_over_memtable(),
-            vec![],
-        )) as Arc<dyn TableProvider>;
-
-        let (table_metadata, columns) = spicepod_metadata_fixture();
-        let wrapped = table_provider_with_spicepod_metadata(indexed, &table_metadata, &columns);
-
-        let found_indexed = wrapped
-            .downcast_ref::<IndexedTableProvider>()
-            .expect("IndexedTableProvider must remain discoverable for the index analyzer");
-
-        let underlying = found_indexed.get_underlying();
-        let vector_scan = underlying
-            .downcast_ref::<search::index::VectorScanTableProvider>()
-            .expect("VectorScanTableProvider under an IndexedTableProvider must stay discoverable");
-
-        // Enrichment lands below the vector scan, on the raw source provider, so the
-        // source-facing bootstrap schema carries no synthetic embedding columns.
-        assert!(
-            vector_scan
-                .table_provider
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "metadata enrichment should be pushed onto the vector scan's source provider"
-        );
-    }
-
-    #[test]
     fn test_streaming_broadcast_buffer_records_within_limit() {
         let mut buffer = StreamingBroadcastBuffer::default();
 
@@ -5881,8 +5796,8 @@ mod tests {
     async fn test_get_accelerated_table_provider_peels_metadata_wrapper() {
         // Regression test: when a dataset declares table- or column-level
         // metadata, `register_accelerated_table` registers the AcceleratedTable
-        // behind a `MetadataEnrichedTableProvider`. `get_accelerated_table_provider`
-        // must peel that wrapper so callers (e.g. the
+        // behind a metadata-enrichment layer. `get_accelerated_table_provider`
+        // must peel that layer so callers (e.g. the
         // `/v1/datasets/{name}/acceleration/refresh` handler) can downcast to the
         // inner provider; otherwise refresh wrongly reports "Table is not
         // accelerated". Here a MemTable stands in for the inner AcceleratedTable —
@@ -5907,10 +5822,12 @@ mod tests {
         let wrapped =
             table_provider_with_spicepod_metadata(Arc::clone(&inner), &table_metadata, &[]);
         assert!(
-            wrapped
-                .downcast_ref::<MetadataEnrichedTableProvider>()
-                .is_some(),
-            "precondition: provider should be wrapped in MetadataEnrichedTableProvider"
+            spice_table::find_layer::<data_components::MetadataEnrichedTableProvider>(
+                wrapped.as_ref(),
+                spice_table::LayerWalk::Read
+            )
+            .is_some(),
+            "precondition: provider should carry a metadata-enrichment layer"
         );
 
         df.ctx
@@ -5924,7 +5841,7 @@ mod tests {
 
         assert!(
             resolved.is::<MemTable>(),
-            "get_accelerated_table_provider must peel MetadataEnrichedTableProvider to reach the inner provider"
+            "get_accelerated_table_provider must peel the metadata layer to reach the inner provider"
         );
     }
 
@@ -6017,6 +5934,7 @@ mod tests {
                     check_availability: crate::component::dataset::CheckAvailability::Disabled,
                     check_availability_interval: None,
                     on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                    drasi: None,
                 },
                 app: Arc::new(app::App::default()),
                 runtime: Arc::new(runtime),
