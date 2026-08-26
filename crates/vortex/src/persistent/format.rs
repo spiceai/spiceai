@@ -37,6 +37,7 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -486,11 +487,83 @@ impl VortexFormat {
         &self.opts
     }
 
-    /// Invalidates cached Vortex segments for the exact object-store paths and
-    /// physically evicts them before returning.
-    pub async fn invalidate_segment_cache_paths(&self, paths: HashSet<Path>) {
+    /// Invalidates every cached artifact Vortex holds for the exact object-store
+    /// paths — this format's decoded segments and the file footers in
+    /// `DataFusion`'s shared
+    /// [`FileMetadataCache`](datafusion_execution::cache::cache_manager::FileMetadataCache)
+    /// — and physically evicts them before returning.
+    ///
+    /// Callers pass the paths of objects a retirement has confirmed absent.
+    /// Neither cache has a TTL or any invalidation of its own, so a retired
+    /// artifact leaves only when another `put` pushes it out under capacity
+    /// pressure. Both outcomes cost something: pressure that does arrive
+    /// reclaims the entry, but until then it holds a share of a budget every
+    /// other table draws on and displaces a live artifact when it is finally
+    /// evicted, and pressure that never arrives — an idle or generously sized
+    /// cache — leaves it resident for the life of the process. This call is the
+    /// only way to hand that share back without waiting on that pressure.
+    ///
+    /// The two halves are not equally ordered against reads already in flight.
+    /// The segment half is: `SharedSegmentCache` registers per-path state and
+    /// drains in-flight puts before enumerating keys. The footer half is not —
+    /// `infer_schema` and `infer_stats` miss the cache, `await` the object-store
+    /// read, and only then insert what they read, so a scan that missed before
+    /// this call can insert after it and leave one entry per raced path behind,
+    /// on the same terms as any other un-evicted entry above. Giving the footer
+    /// side the same coordination is tracked in
+    /// <https://github.com/spiceai/spiceai/issues/13447>.
+    ///
+    /// Both caches key on the object-store location, so one path set addresses
+    /// both; taking them together is what stops a caller releasing one and
+    /// silently retaining the other. Evicting a path that turns out to still be
+    /// live costs a re-read, not correctness: a stale footer was never servable,
+    /// because every read site checks
+    /// [`CachedFileMetadataEntry::is_valid_for`](datafusion_execution::cache::cache_manager::CachedFileMetadataEntry::is_valid_for)
+    /// against the current object.
+    pub async fn invalidate_cached_paths(
+        &self,
+        runtime_env: &RuntimeEnv,
+        table: &str,
+        paths: HashSet<Path>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+
+        // One set clone so the footer sweep below still has the paths after the
+        // segment cache consumes them; that ordering is what keeps a failed join
+        // from also costing the segment invalidation.
+        let footer_paths = paths.clone();
         if let Some(cache) = self.segment_cache.as_ref() {
             cache.invalidate_paths(paths).await;
+        }
+
+        // This cache is shared by every table on the environment it belongs to,
+        // its lock is taken by every format's `get`/`put`, and dropping an entry
+        // deallocates a parsed footer — so a retirement spanning thousands of
+        // files would hold a runtime worker for milliseconds against a lock every
+        // other table's scans need. Same reasoning as the segment key scan, which
+        // is on the blocking pool for it.
+        //
+        // "the environment it belongs to" is load-bearing: the cache hangs off
+        // the `RuntimeEnv`, not the process. A deployment that carves a dedicated
+        // Cayenne compaction environment has a second one, which compaction fills
+        // and this sweep never reaches, because every retirement caller passes the
+        // table context's query environment. Tracked in
+        // spiceai/spiceai#13497 — the fix is in how the two environments are built,
+        // not here.
+        let footer_cache = runtime_env.cache_manager.get_file_metadata_cache();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            for path in &footer_paths {
+                footer_cache.remove(path);
+            }
+        })
+        .await
+        {
+            tracing::error!(
+                target: "vortex::footer_cache",
+                "Failed to release the memory cached for the files table '{table}' has just retired, so the runtime keeps holding it until another table's reads push it out. Restart the runtime to reclaim it immediately. Cause: {error}. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            );
         }
     }
 
@@ -1234,6 +1307,90 @@ mod tests {
                 .expect("projected total present")
                 < all_total,
             "projected total must drop the unprojected wide `data` column"
+        );
+
+        Ok(())
+    }
+
+    /// Footer eviction must not be conditional on this format owning a segment
+    /// cache. The two caches are independent — a format with no segment cache
+    /// still `put`s every footer it reads into the shared, process-wide
+    /// `FileMetadataCache` — so gating the eviction on the segment cache would
+    /// leave exactly those deployments unable to release anything.
+    ///
+    /// Also pins the blast radius: only the named paths are evicted.
+    #[tokio::test]
+    async fn invalidating_retired_paths_evicts_their_footers_with_no_segment_cache()
+    -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        for table in ["retired", "live"] {
+            ctx.session
+                .sql(&format!(
+                    "CREATE EXTERNAL TABLE {table} (id INT NOT NULL) \
+                     STORED AS vortex LOCATION '{table}/'"
+                ))
+                .await?
+                .collect()
+                .await?;
+            ctx.session
+                .sql(&format!("INSERT INTO {table} VALUES (1), (2), (3)"))
+                .await?
+                .collect()
+                .await?;
+            // Reading is what caches the footers (`infer_schema` / `infer_stats`).
+            ctx.session
+                .sql(&format!("SELECT * FROM {table}"))
+                .await?
+                .collect()
+                .await?;
+        }
+
+        let runtime_env = ctx.session.runtime_env();
+        // `LOCATION 'retired/'` resolves against the process working directory,
+        // so match the table's own directory rather than a leading prefix.
+        let cached = |table: &str| {
+            let dir = format!("/{table}/");
+            runtime_env
+                .cache_manager
+                .get_file_metadata_cache()
+                .list_entries()
+                .into_keys()
+                .filter(|path| path.as_ref().contains(&dir))
+                .collect::<HashSet<Path>>()
+        };
+
+        let retired = cached("retired");
+        let live_before = cached("live");
+        assert!(
+            !retired.is_empty() && !live_before.is_empty(),
+            "reading both tables must cache both tables' footers"
+        );
+
+        let format =
+            VortexFormat::new_with_options(VortexSession::default(), VortexTableOptions::default());
+        assert_eq!(
+            format.segment_cache_capacity_bytes(),
+            None,
+            "this test's whole point is a format with no segment cache of its own"
+        );
+
+        // Retire through the entry point production uses, so a footer eviction
+        // reached only when a segment cache happens to exist fails here. The
+        // extra path was never cached — it stands in for a retirement reporting
+        // a file whose footer no scan ever read, which must pass harmlessly.
+        let mut to_retire = retired.clone();
+        to_retire.insert(Path::from("retired/never-opened.vortex"));
+        format
+            .invalidate_cached_paths(&runtime_env, "retired", to_retire)
+            .await;
+        assert!(
+            cached("retired").is_empty(),
+            "a retired file's footer must not survive its file, segment cache or not"
+        );
+        assert_eq!(
+            cached("live"),
+            live_before,
+            "a table nothing retired must keep every footer it had"
         );
 
         Ok(())
