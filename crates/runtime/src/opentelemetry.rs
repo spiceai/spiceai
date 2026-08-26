@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -544,25 +545,57 @@ fn metric_data_type_name(data: &Data) -> &'static str {
     }
 }
 
-macro_rules! append_value {
-    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr) => {
-        match &mut $values_builder {
-            Some(builder) => {
-                if let Some(typed_builder) = builder.as_any_mut().downcast_mut::<$builder_type>() {
-                    typed_builder.append_value(*$value);
-                } else {
-                    tracing::warn!("Metric {} has data points with different types, skipping data point that introduces new type", $metric);
-                    continue;
-                }
+/// Appends `$converted` to `$builder` when both the downcast and the conversion succeeded.
+macro_rules! append_converted {
+    ($builder:expr, $builder_type:ty, $converted:expr) => {
+        match (
+            $builder.as_any_mut().downcast_mut::<$builder_type>(),
+            $converted,
+        ) {
+            (Some(builder), Some(value)) => {
+                builder.append_value(value);
+                true
             }
-            None => {
-                let mut new_builder = <$builder_type>::new();
-                new_builder.append_value(*$value);
-                $values_builder = Some(Box::new(new_builder));
-                $data_points_type = $data_type;
-            }
+            _ => false,
         }
     };
+}
+
+/// Appends a data point's value to the metric's `value` column, converting between integer
+/// and double when the conversion is exact. Returns `false` when it is not, so the caller can
+/// report the data point as rejected rather than store a rounded number.
+///
+/// A metric reported as an integer on one data point and a double on the next is common, and
+/// the whole point is still kept whenever the two forms agree exactly.
+fn append_number_value(builder: &mut dyn ArrayBuilder, value: &Value) -> bool {
+    if builder.as_any().is::<Float64Builder>() {
+        let converted = match value {
+            Value::AsDouble(v) => Some(*v),
+            Value::AsInt(v) => exact_f64_from_i64(*v),
+        };
+        return append_converted!(builder, Float64Builder, converted);
+    }
+    let converted = match value {
+        Value::AsInt(v) => Some(*v),
+        Value::AsDouble(v) => exact_i64_from_f64(*v),
+    };
+    append_converted!(builder, Int64Builder, converted)
+}
+
+/// The `value` column for a metric's first data point, taking its type from that value.
+fn new_number_value_column(value: &Value) -> (Box<dyn ArrayBuilder>, DataType) {
+    match value {
+        Value::AsDouble(v) => {
+            let mut builder = Float64Builder::new();
+            builder.append_value(*v);
+            (Box::new(builder), DataType::Float64)
+        }
+        Value::AsInt(v) => {
+            let mut builder = Int64Builder::new();
+            builder.append_value(*v);
+            (Box::new(builder), DataType::Int64)
+        }
+    }
 }
 
 fn number_data_points_to_record_batch(
@@ -600,29 +633,24 @@ fn number_data_points_to_record_batch(
         }
     }
 
+    let mut warned_value_type = false;
     for data_point in data_points {
         if let Some(value) = &data_point.value {
-            match value {
-                Value::AsDouble(double_value) => {
-                    append_value!(
-                        values_builder,
-                        values_type,
-                        double_value,
-                        Float64Builder,
-                        DataType::Float64,
-                        metric
-                    );
+            if let Some(builder) = &mut values_builder {
+                if !append_number_value(builder.as_mut(), value) {
+                    if !warned_value_type {
+                        warned_value_type = true;
+                        tracing::warn!(
+                            "Metric '{metric}' sent a value that does not fit the {} column already storing it, so that data point was rejected. Report '{metric}' with one value type from the exporter producing it. See: https://spiceai.org/docs/features/observability",
+                            column_type_name(&values_type),
+                        );
+                    }
+                    continue;
                 }
-                Value::AsInt(int_value) => {
-                    append_value!(
-                        values_builder,
-                        values_type,
-                        int_value,
-                        Int64Builder,
-                        DataType::Int64,
-                        metric
-                    );
-                }
+            } else {
+                let (builder, data_type) = new_number_value_column(value);
+                values_builder = Some(builder);
+                values_type = data_type;
             }
         } else if let Some(builder) = &mut values_builder {
             if (data_point.flags & DataPointFlags::NoRecordedValueMask as u32)
@@ -805,39 +833,243 @@ fn histogram_data_points_to_record_batch(
     }
 }
 
-macro_rules! append_attribute {
-    ($columns:expr, $fields:expr, $key:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr, $row_index:expr) => {{
-        let key_str = $key.as_str();
-        match $columns.get_mut(key_str) {
-            None => {
-                $fields.insert(
-                    $key.clone(),
-                    Arc::new(Field::new(key_str, $data_type, true)),
-                );
-                let mut builder = <$builder_type>::new();
-                // This attribute was absent from every preceding data point, so backfill a null
-                // for each so the value lands on the correct row ($row_index) and the column
-                // length matches the other columns.
-                for _ in 0..$row_index {
-                    builder.append_null();
-                }
-                builder.append_value($value);
-                $columns.insert($key.clone(), Box::new(builder));
-            }
-            Some(column) => {
-                if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
-                    builder.append_value($value);
-                } else {
-                    tracing::warn!(
-                        "Metric {} has attribute {} with different types, appending null for attribute that introduces new type",
-                        $metric,
-                        key_str
-                    );
-                    append_null(&mut $fields, &mut $columns, key_str);
-                }
-            }
-        };
+/// The value of an OTLP attribute as text, when it has one that is exact.
+///
+/// Every scalar has a faithful text form, so a string column accepts them all. Bytes do not:
+/// they are not required to be valid text.
+fn attribute_as_str(value: &any_value::Value) -> Option<Cow<'_, str>> {
+    match value {
+        any_value::Value::StringValue(v) => Some(Cow::Borrowed(v)),
+        any_value::Value::BoolValue(v) => Some(Cow::Owned(v.to_string())),
+        any_value::Value::IntValue(v) => Some(Cow::Owned(v.to_string())),
+        // `{}` prints the shortest text that parses back to the same value, so this is
+        // exact. Infinities and NaN have no numeric text form and are left out.
+        any_value::Value::DoubleValue(v) if v.is_finite() => Some(Cow::Owned(v.to_string())),
+        _ => None,
+    }
+}
+
+/// The value of an OTLP attribute as a boolean, when it is exactly one. Only the two words a
+/// boolean prints as are accepted from text.
+fn attribute_as_bool(value: &any_value::Value) -> Option<bool> {
+    match value {
+        any_value::Value::BoolValue(v) => Some(*v),
+        any_value::Value::StringValue(v) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+/// `value` as an `i64` that loses nothing: a whole double inside the `i64` range, or text
+/// that parses as one.
+fn attribute_as_i64(value: &any_value::Value) -> Option<i64> {
+    match value {
+        any_value::Value::IntValue(v) => Some(*v),
+        any_value::Value::DoubleValue(v) => exact_i64_from_f64(*v),
+        any_value::Value::StringValue(v) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+/// `value` as a `u64` that loses nothing. A negative integer has no `u64` form.
+fn attribute_as_u64(value: &any_value::Value) -> Option<u64> {
+    match value {
+        any_value::Value::IntValue(v) => u64::try_from(*v).ok(),
+        any_value::Value::DoubleValue(v) => exact_u64_from_f64(*v),
+        any_value::Value::StringValue(v) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+/// `value` as an `f64` that loses nothing. A large integer is refused when a double cannot
+/// hold it exactly, since storing a rounded value would report a number the client never
+/// sent.
+fn attribute_as_f64(value: &any_value::Value) -> Option<f64> {
+    match value {
+        any_value::Value::DoubleValue(v) => Some(*v),
+        any_value::Value::IntValue(v) => exact_f64_from_i64(*v),
+        any_value::Value::StringValue(v) => {
+            v.parse().ok().filter(|parsed: &f64| parsed.is_finite())
+        }
+        _ => None,
+    }
+}
+
+/// `value` as bytes. Text is stored as its UTF-8 bytes, which loses nothing.
+fn attribute_as_bytes(value: &any_value::Value) -> Option<&[u8]> {
+    match value {
+        any_value::Value::BytesValue(v) => Some(v),
+        any_value::Value::StringValue(v) => Some(v.as_bytes()),
+        _ => None,
+    }
+}
+
+/// Whether `d` holds a whole number, so converting it to an integer loses nothing.
+#[expect(
+    clippy::float_cmp,
+    reason = "an exact comparison is the point: a value that differs from its own truncation \
+              by any amount at all has no integer form"
+)]
+fn is_whole(d: f64) -> bool {
+    d.is_finite() && d == d.trunc()
+}
+
+/// `d` as an `i64`, if it is whole and inside the `i64` range. A whole double in range has an
+/// exact `i64` value, so the conversion loses nothing.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`is_whole` rules out a fraction and `i128` is far wider than the `f64` range, so \
+              the cast is exact; `try_from` then rejects anything outside `i64`"
+)]
+fn exact_i64_from_f64(d: f64) -> Option<i64> {
+    is_whole(d).then(|| i64::try_from(d as i128).ok()).flatten()
+}
+
+/// `d` as a `u64`, if it is whole, not negative, and inside the `u64` range.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "exact for the same reason as `exact_i64_from_f64`; `try_from` rejects a negative \
+              value and anything outside `u64`"
+)]
+fn exact_u64_from_f64(d: f64) -> Option<u64> {
+    is_whole(d).then(|| u64::try_from(d as i128).ok()).flatten()
+}
+
+/// `i` as an `f64`, if a double holds it exactly. A double carries 53 bits of integer
+/// precision, so a larger integer rounds; comparing in `i128` catches exactly that and
+/// refuses the value instead of storing a number the client never sent.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the possible precision loss is what this function detects and refuses"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`i128` covers the whole `f64` integer range, so this cast cannot truncate"
+)]
+fn exact_f64_from_i64(i: i64) -> Option<f64> {
+    let converted = i as f64;
+    (converted as i128 == i128::from(i)).then_some(converted)
+}
+
+/// Appends `value` to a column that already holds `target` values, converting it when the
+/// conversion is exact. Returns `false` when the value cannot be stored without changing it,
+/// which is when the caller stores NULL instead.
+///
+/// This is what lets one attribute arrive as an integer on one data point and a double, or a
+/// string, on the next: the column keeps the type it was created with and every value that
+/// fits it exactly is still stored.
+fn append_coerced_attribute(
+    builder: &mut dyn ArrayBuilder,
+    target: &DataType,
+    value: &any_value::Value,
+) -> bool {
+    match target {
+        DataType::Utf8 => append_converted!(builder, StringBuilder, attribute_as_str(value)),
+        DataType::Boolean => append_converted!(builder, BooleanBuilder, attribute_as_bool(value)),
+        DataType::Int64 => append_converted!(builder, Int64Builder, attribute_as_i64(value)),
+        DataType::UInt64 => append_converted!(builder, UInt64Builder, attribute_as_u64(value)),
+        DataType::Float64 => append_converted!(builder, Float64Builder, attribute_as_f64(value)),
+        DataType::Binary => append_converted!(builder, BinaryBuilder, attribute_as_bytes(value)),
+        // Lists hold a histogram's bucket arrays, which no attribute value maps onto.
+        _ => false,
+    }
+}
+
+macro_rules! new_attribute_column {
+    ($builder_type:ty, $data_type:expr, $value:expr, $nulls:expr) => {{
+        let mut builder = <$builder_type>::new();
+        // This attribute was absent from every preceding data point, so backfill a null for
+        // each. That puts the value on the right row and keeps every column the same length.
+        for _ in 0..$nulls {
+            builder.append_null();
+        }
+        builder.append_value($value);
+        Some((Box::new(builder) as Box<dyn ArrayBuilder>, $data_type))
     }};
+}
+
+/// The column for an attribute key seen for the first time, holding `nulls` leading nulls and
+/// then `value`. Its type is the value's own; later values of other types are converted into
+/// it by [`append_coerced_attribute`]. `None` for a value type with no column type.
+fn new_attribute_column(
+    value: &any_value::Value,
+    nulls: usize,
+) -> Option<(Box<dyn ArrayBuilder>, DataType)> {
+    match value {
+        any_value::Value::StringValue(v) => {
+            new_attribute_column!(StringBuilder, DataType::Utf8, v, nulls)
+        }
+        any_value::Value::BoolValue(v) => {
+            new_attribute_column!(BooleanBuilder, DataType::Boolean, *v, nulls)
+        }
+        any_value::Value::IntValue(v) => {
+            new_attribute_column!(Int64Builder, DataType::Int64, *v, nulls)
+        }
+        any_value::Value::DoubleValue(v) => {
+            new_attribute_column!(Float64Builder, DataType::Float64, *v, nulls)
+        }
+        any_value::Value::BytesValue(v) => {
+            new_attribute_column!(BinaryBuilder, DataType::Binary, v, nulls)
+        }
+        // Arrays and key-value lists have no column type yet.
+        _ => None,
+    }
+}
+
+/// Stores one attribute value in its column, creating the column if this is the first data
+/// point to carry the key. Returns `false` when the value cannot be stored, so the caller can
+/// report it and store NULL.
+fn append_attribute(
+    fields: &mut IndexMap<String, Arc<Field>>,
+    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    key: &String,
+    value: &any_value::Value,
+    row_index: usize,
+) -> bool {
+    if let Some(field) = fields.get(key) {
+        let target = field.data_type().clone();
+        return columns
+            .get_mut(key)
+            .is_some_and(|builder| append_coerced_attribute(builder.as_mut(), &target, value));
+    }
+
+    let Some((builder, data_type)) = new_attribute_column(value, row_index) else {
+        return false;
+    };
+    fields.insert(
+        key.clone(),
+        Arc::new(Field::new(key.as_str(), data_type, true)),
+    );
+    columns.insert(key.clone(), builder);
+    true
+}
+
+/// The name of an attribute value's type, as an OTLP user would say it.
+fn attribute_value_type_name(value: &any_value::Value) -> &'static str {
+    match value {
+        any_value::Value::StringValue(_) => "string",
+        any_value::Value::BoolValue(_) => "boolean",
+        any_value::Value::IntValue(_) => "integer",
+        any_value::Value::DoubleValue(_) => "double",
+        any_value::Value::BytesValue(_) => "bytes",
+        any_value::Value::ArrayValue(_) => "array",
+        any_value::Value::KvlistValue(_) => "key-value list",
+        // An index into the request's shared string table, which this ingest does not read.
+        any_value::Value::StringValueStrindex(_) => "interned string",
+    }
+}
+
+/// The name of a metric column's type, as an OTLP user would say it.
+fn column_type_name(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
+        DataType::Boolean => "boolean",
+        DataType::Int64 => "integer",
+        DataType::UInt64 => "unsigned integer",
+        DataType::Float64 => "double",
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "bytes",
+        DataType::List(_) => "list",
+        _ => "unsupported",
+    }
 }
 
 /// Merges the export's resource attributes into each data point's own attributes. Nothing is
@@ -895,6 +1127,7 @@ fn attributes_to_fields_and_columns(
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
     let mut warned_collisions: HashSet<&str> = HashSet::new();
     let mut warned_duplicates: HashSet<&str> = HashSet::new();
+    let mut warned_type_mismatch: HashSet<&str> = HashSet::new();
     let mut row_keys: HashSet<&str> = HashSet::new();
 
     initialize_attribute_schema(
@@ -934,74 +1167,25 @@ fn attributes_to_fields_and_columns(
             }
             if let Some(any_value) = &attribute.value {
                 if let Some(value) = &any_value.value {
-                    match value {
-                        any_value::Value::StringValue(string_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                string_value,
-                                StringBuilder,
-                                DataType::Utf8,
-                                metric,
-                                i
-                            );
+                    if !append_attribute(&mut fields, &mut columns, &attribute.key, value, i) {
+                        // The value does not fit this attribute's column and converting it
+                        // would change it, so store NULL and say so once per attribute.
+                        if warned_type_mismatch.insert(key_str) {
+                            let stored = fields
+                                .get(key_str)
+                                .map(|field| column_type_name(field.data_type()));
+                            let value_type = attribute_value_type_name(value);
+                            if let Some(stored) = stored {
+                                tracing::warn!(
+                                    "Metric '{metric}' sent attribute '{key_str}' as a {value_type} that does not fit the {stored} column already storing it, so it is recorded as NULL. Send '{key_str}' with one type, or with values that convert exactly, from the exporter producing this metric. See: https://spiceai.org/docs/features/observability"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "Metric '{metric}' sent attribute '{key_str}' as a {value_type}, which cannot be stored as a column, so it is recorded as NULL. Send '{key_str}' as a string, boolean, integer, double or bytes value from the exporter producing this metric. See: https://spiceai.org/docs/features/observability"
+                                );
+                            }
                         }
-                        any_value::Value::BoolValue(bool_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *bool_value,
-                                BooleanBuilder,
-                                DataType::Boolean,
-                                metric,
-                                i
-                            );
-                        }
-                        any_value::Value::IntValue(int_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *int_value,
-                                Int64Builder,
-                                DataType::Int64,
-                                metric,
-                                i
-                            );
-                        }
-                        any_value::Value::DoubleValue(double_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *double_value,
-                                Float64Builder,
-                                DataType::Float64,
-                                metric,
-                                i
-                            );
-                        }
-                        any_value::Value::BytesValue(bytes_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                bytes_value,
-                                BinaryBuilder,
-                                DataType::Binary,
-                                metric,
-                                i
-                            );
-                        }
-                        // TODO: Support List and Map attribute types
-                        _ => {
-                            tracing::warn!(
-                                "Metric {metric} has attribute {key_str} with unsupported type, appending null for attribute if possible"
-                            );
-                            append_null(&mut fields, &mut columns, key_str);
-                        }
+                        append_null(&mut fields, &mut columns, key_str);
                     }
                 } else {
                     tracing::warn!(
@@ -1190,6 +1374,7 @@ mod tests {
     use arrow::array::Array;
     use arrow::array::AsArray;
     use arrow::array::Float64Array;
+    use arrow::array::Int64Array;
     use arrow::array::UInt64Array;
     use arrow::datatypes::Float64Type;
     use arrow::datatypes::UInt64Type;
@@ -1224,6 +1409,27 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// An attribute carrying `value` verbatim, for the type-coercion tests.
+    fn typed_attribute(key: &str, value: any_value::Value) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue { value: Some(value) }),
+            ..Default::default()
+        }
+    }
+
+    fn int_attribute(key: &str, value: i64) -> KeyValue {
+        typed_attribute(key, any_value::Value::IntValue(value))
+    }
+
+    fn double_attribute(key: &str, value: f64) -> KeyValue {
+        typed_attribute(key, any_value::Value::DoubleValue(value))
+    }
+
+    fn bool_attribute(key: &str, value: bool) -> KeyValue {
+        typed_attribute(key, any_value::Value::BoolValue(value))
     }
 
     fn number_data_point(value: f64, attributes: Vec<KeyValue>) -> NumberDataPoint {
@@ -1714,6 +1920,342 @@ mod tests {
             .expect("payload must be carried over")
             .clone();
         assert_eq!(payload_field.data_type(), &DataType::Binary);
+    }
+
+    /// A stored column keeps its type, and a later value of another type is converted into it
+    /// whenever the conversion is exact. Without this every mismatch became NULL, losing a
+    /// value the table could hold perfectly well.
+    #[test]
+    fn attribute_values_are_converted_into_the_stored_column_type() {
+        // (stored column type, attribute value, expected text of the stored value)
+        let cases: Vec<(DataType, any_value::Value, &str)> = vec![
+            // An integer fits a double column exactly while it stays under 2^53.
+            (
+                DataType::Float64,
+                any_value::Value::IntValue(1 << 52),
+                "4503599627370496.0",
+            ),
+            // A whole double fits an integer column.
+            (DataType::Int64, any_value::Value::DoubleValue(42.0), "42"),
+            // A whole, non-negative double fits an unsigned column.
+            (DataType::UInt64, any_value::Value::DoubleValue(7.0), "7"),
+            // A non-negative integer fits an unsigned column.
+            (DataType::UInt64, any_value::Value::IntValue(7), "7"),
+            // Every scalar has a faithful text form.
+            (DataType::Utf8, any_value::Value::IntValue(-5), "-5"),
+            (DataType::Utf8, any_value::Value::DoubleValue(1.5), "1.5"),
+            (DataType::Utf8, any_value::Value::BoolValue(true), "true"),
+            // Text that parses exactly fits a numeric column.
+            (
+                DataType::Int64,
+                any_value::Value::StringValue("123".to_string()),
+                "123",
+            ),
+            (
+                DataType::Float64,
+                any_value::Value::StringValue("1.5".to_string()),
+                "1.5",
+            ),
+            (
+                DataType::UInt64,
+                any_value::Value::StringValue("9".to_string()),
+                "9",
+            ),
+            (
+                DataType::Boolean,
+                any_value::Value::StringValue("true".to_string()),
+                "true",
+            ),
+        ];
+
+        for (stored_type, value, expected) in cases {
+            let existing = Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new("label", stored_type.clone(), true),
+            ]);
+            let data = Data::Gauge(Gauge {
+                data_points: vec![number_data_point(
+                    1.0,
+                    vec![typed_attribute("label", value.clone())],
+                )],
+            });
+
+            let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+            let batch = result.expect("the batch must build");
+            let column = column(&batch, "label");
+            assert!(
+                !column.is_null(0),
+                "a {value:?} must be stored in a {stored_type} column, not dropped to NULL"
+            );
+            let stored = arrow::util::display::array_value_to_string(column, 0)
+                .expect("the stored value must be printable");
+            assert_eq!(
+                stored, expected,
+                "a {value:?} stored in a {stored_type} column"
+            );
+        }
+    }
+
+    /// Correctness comes first: a value the column cannot hold exactly is stored as NULL
+    /// rather than rounded, truncated or reinterpreted into a number the client never sent.
+    #[test]
+    fn attribute_values_that_would_lose_information_are_stored_as_null() {
+        let cases: Vec<(DataType, any_value::Value, &str)> = vec![
+            // 2^53 + 1 is the first integer a double cannot represent.
+            (
+                DataType::Float64,
+                any_value::Value::IntValue((1 << 53) + 1),
+                "an integer a double would round",
+            ),
+            (
+                DataType::Float64,
+                any_value::Value::IntValue(i64::MAX),
+                "the largest integer, which a double would round",
+            ),
+            // A fraction has no integer form.
+            (
+                DataType::Int64,
+                any_value::Value::DoubleValue(1.5),
+                "a fractional double",
+            ),
+            (
+                DataType::UInt64,
+                any_value::Value::DoubleValue(1.5),
+                "a fractional double",
+            ),
+            // A negative number has no unsigned form.
+            (
+                DataType::UInt64,
+                any_value::Value::IntValue(-1),
+                "a negative integer",
+            ),
+            (
+                DataType::UInt64,
+                any_value::Value::DoubleValue(-2.0),
+                "a negative double",
+            ),
+            // A double beyond the integer range.
+            (
+                DataType::Int64,
+                any_value::Value::DoubleValue(1e30),
+                "a double past the integer range",
+            ),
+            // Text that is not a number.
+            (
+                DataType::Int64,
+                any_value::Value::StringValue("not a number".to_string()),
+                "text that is not an integer",
+            ),
+            (
+                DataType::Float64,
+                any_value::Value::StringValue(String::new()),
+                "empty text",
+            ),
+            // Only the two words a boolean prints as are accepted.
+            (
+                DataType::Boolean,
+                any_value::Value::StringValue("yes".to_string()),
+                "text that is not a boolean",
+            ),
+            (
+                DataType::Boolean,
+                any_value::Value::IntValue(1),
+                "an integer, which is not a boolean",
+            ),
+            // Bytes are not required to be text.
+            (
+                DataType::Utf8,
+                any_value::Value::BytesValue(vec![0xff, 0xfe]),
+                "bytes, which have no text form",
+            ),
+            // Non-finite doubles have no numeric text form.
+            (
+                DataType::Utf8,
+                any_value::Value::DoubleValue(f64::NAN),
+                "NaN, which has no numeric text form",
+            ),
+        ];
+
+        for (stored_type, value, description) in cases {
+            let existing = Schema::new(vec![
+                Field::new(VALUE_COLUMN_NAME, DataType::Float64, true),
+                Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+                Field::new("label", stored_type.clone(), true),
+            ]);
+            let data = Data::Gauge(Gauge {
+                data_points: vec![number_data_point(
+                    1.0,
+                    vec![typed_attribute("label", value)],
+                )],
+            });
+
+            let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+            let batch = result.expect("the batch must still build");
+            assert!(
+                column(&batch, "label").is_null(0),
+                "{description} must be NULL in a {stored_type} column, never converted"
+            );
+        }
+    }
+
+    /// The column takes its type from the first data point that carries the attribute, and
+    /// later data points of other types are converted into it. Every column must still end up
+    /// the same length, or the batch fails to build.
+    #[test]
+    fn mixed_attribute_types_within_one_batch_keep_every_column_aligned() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![
+                // Establishes `port` as an integer column and `zone` as a string column.
+                number_data_point(
+                    1.0,
+                    vec![int_attribute("port", 8080), string_attribute("zone", "a")],
+                ),
+                // The same keys arrive as the other type; both convert exactly.
+                number_data_point(
+                    2.0,
+                    vec![string_attribute("port", "9090"), int_attribute("zone", 42)],
+                ),
+                // A fractional double cannot be an integer port, so that one is NULL.
+                number_data_point(
+                    3.0,
+                    vec![double_attribute("port", 1.5), bool_attribute("zone", true)],
+                ),
+            ],
+        });
+
+        let (result, count) = metric_data_to_record_batch("svc", &data, &[], None);
+        assert_eq!(count, 3);
+        let batch = result.expect("the batch must build");
+        assert_eq!(batch.num_rows(), 3);
+        for column in batch.columns() {
+            assert_eq!(column.len(), 3, "every column must have the same length");
+        }
+
+        let ports = column(&batch, "port")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("port keeps the integer type of its first value");
+        assert_eq!(ports.value(0), 8080);
+        assert_eq!(ports.value(1), 9090, "text that parses exactly is stored");
+        assert!(ports.is_null(2), "a fractional double cannot be an integer");
+
+        let zones = column(&batch, "zone").as_string::<i32>();
+        assert_eq!(zones.value(0), "a");
+        assert_eq!(zones.value(1), "42", "an integer has a faithful text form");
+        assert_eq!(zones.value(2), "true", "so does a boolean");
+    }
+
+    /// A metric reported as an integer on one data point and a double on the next keeps both,
+    /// as long as each value fits the column exactly. Previously the whole data point was
+    /// dropped.
+    #[test]
+    fn metric_values_are_converted_between_integer_and_double() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![
+                // Establishes an integer `value` column.
+                NumberDataPoint {
+                    value: Some(Value::AsInt(5)),
+                    ..number_data_point(0.0, vec![])
+                },
+                // A whole double fits it.
+                NumberDataPoint {
+                    value: Some(Value::AsDouble(6.0)),
+                    ..number_data_point(0.0, vec![])
+                },
+            ],
+        });
+
+        let (result, count) = metric_data_to_record_batch("svc", &data, &[], None);
+        assert_eq!(count, 2);
+        let batch = result.expect("the batch must build");
+        assert_eq!(batch.num_rows(), 2, "both data points must be kept");
+        let values = column(&batch, VALUE_COLUMN_NAME)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value keeps the integer type of its first data point");
+        assert_eq!(values.value(0), 5);
+        assert_eq!(values.value(1), 6);
+    }
+
+    /// A metric value that cannot be stored exactly is still rejected, so the table never
+    /// reports a number the client did not send.
+    #[test]
+    fn metric_values_that_would_lose_information_are_rejected() {
+        let data = Data::Gauge(Gauge {
+            data_points: vec![
+                NumberDataPoint {
+                    value: Some(Value::AsInt(5)),
+                    ..number_data_point(0.0, vec![])
+                },
+                // 1.5 has no integer form, so this data point is dropped from the batch.
+                NumberDataPoint {
+                    value: Some(Value::AsDouble(1.5)),
+                    ..number_data_point(0.0, vec![])
+                },
+            ],
+        });
+
+        let (result, count) = metric_data_to_record_batch("svc", &data, &[], None);
+        assert_eq!(count, 2, "both data points are counted");
+        let batch = result.expect("the batch must build");
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "the data point that cannot be stored exactly is left out, and the export reports \
+             it as rejected"
+        );
+    }
+
+    /// The stored `value` column type wins over the incoming one, so a double metric written
+    /// to an integer column is converted rather than dropped.
+    #[test]
+    fn metric_values_are_converted_into_the_stored_value_column_type() {
+        let existing = Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int64, true),
+            Field::new(TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+            Field::new(START_TIME_UNIX_NANO_COLUMN_NAME, DataType::UInt64, true),
+        ]);
+        let data = Data::Gauge(Gauge {
+            data_points: vec![number_data_point(12.0, vec![])],
+        });
+
+        let (result, _) = metric_data_to_record_batch("svc", &data, &[], Some(&existing));
+        let batch = result.expect("the batch must build");
+        let values = column(&batch, VALUE_COLUMN_NAME)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("the stored integer type is kept");
+        assert_eq!(values.value(0), 12);
+    }
+
+    /// The exact-conversion helpers are the whole correctness argument for coercion, so the
+    /// boundaries are pinned directly.
+    #[test]
+    fn exact_conversions_accept_only_values_that_round_trip() {
+        // The largest integer a double holds exactly, and the first one it does not.
+        assert_eq!(exact_f64_from_i64(1 << 53), Some(9_007_199_254_740_992.0));
+        assert_eq!(exact_f64_from_i64((1 << 53) + 1), None);
+        assert_eq!(exact_f64_from_i64(i64::MAX), None);
+        // i64::MIN is a power of two, so a double holds it exactly.
+        assert_eq!(
+            exact_f64_from_i64(i64::MIN),
+            Some(-9_223_372_036_854_775_808.0)
+        );
+
+        assert_eq!(exact_i64_from_f64(42.0), Some(42));
+        assert_eq!(exact_i64_from_f64(-42.0), Some(-42));
+        assert_eq!(exact_i64_from_f64(42.5), None);
+        assert_eq!(exact_i64_from_f64(1e30), None);
+        assert_eq!(exact_i64_from_f64(f64::NAN), None);
+        assert_eq!(exact_i64_from_f64(f64::INFINITY), None);
+
+        assert_eq!(exact_u64_from_f64(42.0), Some(42));
+        assert_eq!(exact_u64_from_f64(-1.0), None);
+        assert_eq!(exact_u64_from_f64(0.5), None);
+        assert_eq!(exact_u64_from_f64(f64::NEG_INFINITY), None);
     }
 
     fn field_names(schema: &Schema) -> Vec<&str> {
@@ -2518,21 +3060,21 @@ mod tests {
         assert_eq!(column(batch, "region").as_string::<i32>().value(0), "us");
     }
 
-    /// A data point whose value type differs from the metric's `value` column is skipped
-    /// while building the batch. The client must be told it was rejected, not that the whole
-    /// export was written.
+    /// A data point the batch cannot hold is skipped while building it. The client must be
+    /// told it was rejected, not that the whole export was written.
     #[tokio::test]
     async fn data_points_skipped_during_the_batch_build_are_reported_as_rejected() {
         let engine = Arc::new(WriteRecordingQueryEngine::new());
         let service = build_metrics_service(Arc::clone(&engine) as Arc<dyn QueryEngine>, None);
 
-        // The first data point makes the column Float64, so the second one's Int64 value
-        // does not fit and is skipped.
+        // The first data point makes the column a double. The second one's integer is past
+        // the 53 bits a double holds exactly, so storing it would round it and it is skipped.
+        // A smaller integer would convert exactly and be kept.
         let data = Data::Gauge(Gauge {
             data_points: vec![
                 number_data_point(1.0, vec![string_attribute("region", "us")]),
                 NumberDataPoint {
-                    value: Some(Value::AsInt(2)),
+                    value: Some(Value::AsInt((1 << 53) + 1)),
                     ..number_data_point(0.0, vec![string_attribute("region", "eu")])
                 },
             ],
